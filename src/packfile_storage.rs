@@ -745,6 +745,10 @@ impl StorageEngine for PackfileStorage {
             .purge_room(room_id)
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         self.indexes.write().remove(room_id);
+        // Without this, live_roots grows without bound over a server's
+        // lifetime as rooms are created and purged — nothing else ever
+        // removes an entry from it.
+        self.live_roots.write().remove(room_id);
         Ok(())
     }
 
@@ -1097,6 +1101,29 @@ mod tests {
         store.delete_room(&OTHER_ROOM).unwrap();
         assert!(store.repack.get_pack(&OTHER_ROOM).is_none());
         assert!(store.indexes.read().get(&OTHER_ROOM).is_none());
+    }
+
+    #[test]
+    fn test_delete_room_clears_live_roots() {
+        // Regression test: delete_room must also drop the room's
+        // live_roots entry, or that map grows without bound over a
+        // server's lifetime as rooms are created and purged — nothing
+        // else ever removes an entry from it.
+        let dir = test_dir("delete_live_roots");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let id = [0x01u8; 16];
+        store
+            .put(&OTHER_ROOM, &id, &NodeData::new(bytes::Bytes::from_static(b"x")))
+            .unwrap();
+        store.set_live_roots(&OTHER_ROOM, vec![id]);
+        assert!(store.live_roots.read().contains_key(&OTHER_ROOM));
+
+        store.delete_room(&OTHER_ROOM).unwrap();
+        assert!(
+            !store.live_roots.read().contains_key(&OTHER_ROOM),
+            "live_roots entry must be removed on delete_room, not leaked"
+        );
     }
 
     #[test]

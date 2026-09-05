@@ -24,8 +24,9 @@ check-cargo-sort:
 
 
 .PHONY: check
-check: ##H Type-check without building
+check: ##H Cargo check and code dupe
 	$(CARGO) check --all-targets
+	-jscpd $$(git diff HEAD~5 --name-only '*.rs')
 
 .PHONY: lint
 lint: ##H Run clippy lints
