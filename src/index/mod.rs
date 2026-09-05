@@ -1,0 +1,346 @@
+/// Per-slot entry in the lossy fanout index.
+///
+/// Layout: `[24-bit tag | 8-bit pack_id | 32-bit offset]` packed into a `u64`.
+///
+/// - **tag** (high 24 bits): truncated fingerprint for fast rejection.
+/// - **pack_id** (next 8 bits): which packfile generation this record lives in.
+/// - **offset** (low 32 bits): byte offset within the packfile.
+///
+/// Empty slots are all-zeros. The tag serves double duty: an empty slot
+/// (tag == 0) terminates a probe sequence, since hashes are uniformly random
+/// and the probability of a legitimate hash mapping to tag 0 is 1/16M.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexSlot(u64);
+
+impl IndexSlot {
+    const EMPTY: Self = Self(0);
+
+    const TAG_BITS: u64 = 24;
+    const PACK_BITS: u64 = 8;
+    const OFFSET_BITS: u64 = 32;
+
+    const TAG_SHIFT: u64 = Self::PACK_BITS + Self::OFFSET_BITS; // 40
+    const PACK_SHIFT: u64 = Self::OFFSET_BITS; // 32
+    const OFFSET_MASK: u64 = (1u64 << Self::OFFSET_BITS) - 1;
+    const PACK_MASK: u64 = 0xFF << Self::PACK_SHIFT;
+
+    pub fn new(tag: u32, pack_id: u8, offset: u64) -> Self {
+        assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
+        assert!(offset <= 0xFFFF_FFFF, "offset must fit in 32 bits");
+        Self(
+            ((tag as u64) << Self::TAG_SHIFT)
+                | ((pack_id as u64) << Self::PACK_SHIFT)
+                | (offset & Self::OFFSET_MASK),
+        )
+    }
+
+    pub fn empty() -> Self {
+        Self::EMPTY
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn tag(self) -> u32 {
+        ((self.0 >> Self::TAG_SHIFT) & 0xFF_FFFF) as u32
+    }
+
+    pub fn pack_id(self) -> u8 {
+        ((self.0 >> Self::PACK_SHIFT) & 0xFF) as u8
+    }
+
+    pub fn offset(self) -> u64 {
+        self.0 & Self::OFFSET_MASK
+    }
+}
+
+/// A per-room lossy fanout index for content-addressed records.
+///
+/// Uses open addressing with linear probing on a power-of-two sized table.
+/// The index is mmap-able (flat `u64` array) and small enough to stay
+/// resident in RAM for active rooms.
+///
+/// Design decisions (from docs):
+/// - Partition by room: ~8KB per 1000-node room, 100 active rooms < 1MB.
+/// - Empty slot terminates probe (write-once, no tombstones needed).
+/// - Tag collisions surface as verification failures (decode_v1_verified).
+/// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
+#[derive(Debug)]
+pub struct LossyIndex {
+    /// Power-of-two capacity.
+    capacity: u64,
+    /// Bitmask for bucket selection: capacity - 1.
+    mask: u64,
+    /// Shift to extract top bits from hash for bucket index.
+    shift: u32,
+    /// The flat slot array.
+    slots: Vec<IndexSlot>,
+    /// Number of occupied slots.
+    len: usize,
+}
+
+impl LossyIndex {
+    /// Create a new index with at least `min_capacity` slots.
+    /// Capacity is rounded up to the next power of two.
+    pub fn new(min_capacity: usize) -> Self {
+        let capacity = min_capacity.next_power_of_two().max(16);
+        let shift = 64 - (capacity as u32).leading_zeros();
+        Self {
+            capacity: capacity as u64,
+            mask: (capacity as u64) - 1,
+            shift,
+            slots: vec![IndexSlot::empty(); capacity],
+            len: 0,
+        }
+    }
+
+    /// Extract the bucket index from a 16-byte hash.
+    #[inline]
+    fn bucket(&self, hash: &[u8; 16]) -> usize {
+        let top_bytes = u64::from_be_bytes(hash[..8].try_into().unwrap());
+        ((top_bytes >> self.shift) & self.mask) as usize
+    }
+
+    /// Extract the 24-bit tag from a 16-byte hash.
+    #[inline]
+    fn tag(hash: &[u8; 16]) -> u32 {
+        let top = u32::from_be_bytes(hash[..4].try_into().unwrap());
+        top >> 8 // top 24 bits
+    }
+
+    /// Insert a (hash → pack_id, offset) mapping.
+    /// Returns `Err` if the table is too full (< 25% free slots remaining).
+    pub fn insert(&mut self, hash: &[u8; 16], pack_id: u8, offset: u64) -> Result<(), InsertError> {
+        if self.len >= (self.capacity * 3 / 4) as usize {
+            return Err(InsertError::TableFull);
+        }
+
+        let tag = Self::tag(hash);
+        let mut bucket = self.bucket(hash);
+
+        loop {
+            let slot = self.slots[bucket];
+            if slot.is_empty() {
+                self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
+                self.len += 1;
+                return Ok(());
+            }
+            // If same tag already exists at this bucket, overwrite
+            // (same hash, different offset after repack)
+            if slot.tag() == tag {
+                self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
+                return Ok(());
+            }
+            bucket = (bucket + 1) & (self.mask as usize);
+        }
+    }
+
+    /// Look up a hash in the index.
+    /// Returns `(pack_id, offset)` if found, `None` if absent.
+    ///
+    /// An empty slot terminates the probe — this is correct because:
+    /// 1. Class A tables are write-once with no deletes (no tombstones needed).
+    /// 2. An empty slot means the key was never inserted.
+    #[inline]
+    pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u8, u64)> {
+        let tag = Self::tag(hash);
+        let mut bucket = self.bucket(hash);
+
+        loop {
+            let slot = self.slots[bucket];
+            if slot.is_empty() {
+                return None; // empty terminates probe
+            }
+            if slot.tag() == tag {
+                return Some((slot.pack_id(), slot.offset()));
+            }
+            bucket = (bucket + 1) & (self.mask as usize);
+        }
+    }
+
+    /// Number of occupied slots.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Estimated memory usage in bytes.
+    pub fn memory_usage(&self) -> usize {
+        self.capacity as usize * 8 + std::mem::size_of::<Self>()
+    }
+
+    /// Serialize the index to bytes for persistence.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + self.capacity as usize * 8);
+        buf.extend_from_slice(&self.capacity.to_le_bytes());
+        for slot in &self.slots {
+            buf.extend_from_slice(&slot.0.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize an index from bytes.
+    pub fn deserialize(data: &[u8]) -> Result<Self, DeserializationError> {
+        if data.len() < 8 {
+            return Err(DeserializationError::TooShort);
+        }
+        let capacity = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+        let expected_len = 8 + capacity * 8;
+        if data.len() < expected_len {
+            return Err(DeserializationError::TooShort);
+        }
+
+        let mut slots = Vec::with_capacity(capacity);
+        let mut len = 0;
+        for i in 0..capacity {
+            let offset = 8 + i * 8;
+            let val = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            let slot = IndexSlot(val);
+            if !slot.is_empty() {
+                len += 1;
+            }
+            slots.push(slot);
+        }
+
+        let capacity_u64 = capacity as u64;
+        let shift = 64 - (capacity as u32).leading_zeros();
+
+        Ok(Self {
+            capacity: capacity_u64,
+            mask: capacity_u64 - 1,
+            shift,
+            slots,
+            len,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InsertError {
+    #[error("index table too full")]
+    TableFull,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DeserializationError {
+    #[error("data too short")]
+    TooShort,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_hash(byte: u8) -> [u8; 16] {
+        let mut h = [0u8; 16];
+        h[0] = byte;
+        h
+    }
+
+    #[test]
+    fn test_slot_packing() {
+        let slot = IndexSlot::new(0xABCDEF, 42, 0x12345678);
+        assert_eq!(slot.tag(), 0xABCDEF);
+        assert_eq!(slot.pack_id(), 42);
+        assert_eq!(slot.offset(), 0x12345678);
+        assert!(!slot.is_empty());
+    }
+
+    #[test]
+    fn test_slot_empty() {
+        let slot = IndexSlot::empty();
+        assert!(slot.is_empty());
+        assert_eq!(slot.tag(), 0);
+    }
+
+    #[test]
+    fn test_insert_and_lookup() {
+        let mut index = LossyIndex::new(128);
+        let h1 = test_hash(0x01);
+        let h2 = test_hash(0x02);
+        let h3 = test_hash(0xFF);
+
+        index.insert(&h1, 0, 100).unwrap();
+        index.insert(&h2, 1, 200).unwrap();
+        index.insert(&h3, 0, 999).unwrap();
+
+        assert_eq!(index.len(), 3);
+        assert_eq!(index.lookup(&h1), Some((0, 100)));
+        assert_eq!(index.lookup(&h2), Some((1, 200)));
+        assert_eq!(index.lookup(&h3), Some((0, 999)));
+        assert_eq!(index.lookup(&[0xFE; 16]), None);
+    }
+
+    #[test]
+    fn test_linear_probing() {
+        let mut index = LossyIndex::new(16); // small table
+                                             // Fill most slots
+        for i in 0..10u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            h[1] = 0xFF; // different second byte to avoid tag collisions
+            index.insert(&h, 0, i as u64 * 100).unwrap();
+        }
+        // Lookup still works via linear probing
+        for i in 0..10u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            h[1] = 0xFF;
+            assert!(index.lookup(&h).is_some());
+        }
+    }
+
+    #[test]
+    fn test_empty_terminates_probe() {
+        let index = LossyIndex::new(16);
+        let h = test_hash(0x42);
+        // Don't insert h — looking it up should return None immediately
+        // if the bucket it maps to is empty
+        assert_eq!(index.lookup(&h), None);
+    }
+
+    #[test]
+    fn test_overwrite_same_hash() {
+        let mut index = LossyIndex::new(128);
+        let h = test_hash(0x01);
+        index.insert(&h, 0, 100).unwrap();
+        index.insert(&h, 1, 200).unwrap(); // overwrite
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.lookup(&h), Some((1, 200)));
+    }
+
+    #[test]
+    fn test_serialize_roundtrip() {
+        let mut index = LossyIndex::new(128);
+        for i in 0..50u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            index.insert(&h, i % 3, i as u64 * 1000).unwrap();
+        }
+
+        let bytes = index.serialize();
+        let restored = LossyIndex::deserialize(&bytes).unwrap();
+
+        assert_eq!(restored.len(), index.len());
+        for i in 0..50u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            assert_eq!(restored.lookup(&h), index.lookup(&h));
+        }
+    }
+
+    #[test]
+    fn test_power_of_two_capacity() {
+        let index = LossyIndex::new(100);
+        assert_eq!(index.capacity, 128);
+        let index = LossyIndex::new(128);
+        assert_eq!(index.capacity, 128);
+        let index = LossyIndex::new(129);
+        assert_eq!(index.capacity, 256);
+    }
+}

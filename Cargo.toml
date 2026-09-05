@@ -1,0 +1,21 @@
+[package]
+name = "mdb"
+version = "0.1.0"
+edition = "2021"
+description = "Matrix Database: write-once packfile storage with lossy fanout index for content-addressed immutable data"
+license = "MIT"
+
+[dependencies]
+blake2 = "0.10"
+bytes = "1.5"
+crc32fast = "1.4"
+crossbeam-channel = "0.5"
+digest = "0.10"
+io-uring = { version = "0.6", optional = true }
+memmap2 = "0.9"
+parking_lot = "0.12"
+thiserror = "1.0"
+zerocopy = { version = "0.7", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.10"
