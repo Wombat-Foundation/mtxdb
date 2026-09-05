@@ -1,6 +1,7 @@
 # rust
 target/
 .coverage/
+lcov.info
 
 # other stuff
 docs/*.md

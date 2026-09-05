@@ -257,6 +257,28 @@ fn pack_dir_size(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Evict every `.pack` file under `dir` from the page cache, so a
+/// subsequent read is a genuine cold read rather than served from
+/// already-resident pages. No root required (unlike
+/// `/proc/sys/vm/drop_caches`, which also isn't scoped to one directory).
+///
+/// Uses `posix_fadvise(POSIX_FADV_DONTNEED)`, which only evicts *clean*
+/// pages — anything not yet fsynced won't be dropped, so callers should
+/// only rely on this after a write phase that has synced (or, as here,
+/// after reopening the store fresh so nothing is dirty in this process).
+fn drop_caches_for_dir(dir: &std::path::Path) {
+    // Shells out to `vmtouch -e`, which wraps the same posix_fadvise(2)
+    // eviction this needs, rather than adding a dependency (or an unsafe
+    // FFI call of our own) just for one syscall. Silently does nothing if
+    // vmtouch isn't installed — callers should treat this as best-effort.
+    let _ = std::process::Command::new("vmtouch")
+        .arg("-e")
+        .arg(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 // ── Benchmark harness ───────────────────────────────────────────────
 
 /// Measured results from one scenario run, used to drive the decision
@@ -383,32 +405,35 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  {label}: {total_events} events, cache={cache_entries} entries");
     eprintln!("═══════════════════════════════════════════════════════════════");
-    eprintln!("  Pack size:           {:.2} MB", pack_size as f64 / 1e6);
     eprintln!(
-        "  Write throughput:    {:.0} events/sec",
+        "  Pack size:               {:.2} MB",
+        pack_size as f64 / 1e6
+    );
+    eprintln!(
+        "  Write throughput:        {:.0} events/sec",
         total_events as f64 / write_elapsed.as_secs_f64()
     );
-    eprintln!("  Avg edges/event:    {avg_edges:.2}");
-    eprintln!("  Total edge refs:    {}", dag.total_edge_refs());
+    eprintln!("  Avg edges/event:         {avg_edges:.2}");
+    eprintln!("  Total edge refs:         {}", dag.total_edge_refs());
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric A: I/O (cold: cache cleared, packfile re-reads from disk)");
-    eprintln!("    rchar (logical):   {logical_reads} bytes");
-    eprintln!("    read_bytes (disk): {disk_reads} bytes");
-    eprintln!("    read syscalls:     {read_syscalls}");
+    eprintln!("    rchar (logical):       {logical_reads} bytes");
+    eprintln!("    read_bytes (disk):     {disk_reads} bytes");
+    eprintln!("    read syscalls:         {read_syscalls}");
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric B: Cache efficiency");
     eprintln!(
-        "    Cold hit rate:     {cold_hit_rate:.1}% (0% by construction — cache was cleared)"
+        "    Cold hit rate:         {cold_hit_rate:.1}% (0% by construction — cache was cleared)"
     );
-    eprintln!("    Warm hit rate:     {warm_hit_rate:.1}% ({warm_hits}/{warm_total})");
+    eprintln!("    Warm hit rate:         {warm_hit_rate:.1}% ({warm_hits}/{warm_total})");
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Index accuracy (lossy fanout)");
-    eprintln!("    Total get() calls: {get_calls}");
-    eprintln!("    Found by index:    {get_found}");
-    eprintln!("    Lost to collision: {get_not_found} ({index_loss_rate:.1}%)");
+    eprintln!("    Total get() calls:     {get_calls}");
+    eprintln!("    Found by index:        {get_found}");
+    eprintln!("    Lost to collision:     {get_not_found} ({index_loss_rate:.1}%)");
     eprintln!("  ───────────────────────────────────────────────────────────");
-    eprintln!("  Wall-clock (cold read): {read_elapsed:.2?} ({cold_gets_per_sec:.0} gets/sec)");
-    eprintln!("  Wall-clock (warm read): {warm_elapsed:.2?} ({warm_gets_per_sec:.0} gets/sec)");
+    eprintln!("  Wall-clock (cold read):  {read_elapsed:.2?} ({cold_gets_per_sec:.0} gets/sec)");
+    eprintln!("  Wall-clock (warm read):  {warm_elapsed:.2?} ({warm_gets_per_sec:.0} gets/sec)");
     eprintln!();
 
     let _ = fs::remove_dir_all(&dir);
@@ -696,9 +721,9 @@ fn run_intent_benchmark(total_events: usize) {
     eprintln!("  full event body. Byte share is shown for context only — it");
     eprintln!("  will systematically understate small-payload categories like");
     eprintln!("  StateTrie relative to their real I/O cost.");
-    eprintln!("  If GraphWalk dominates call share → DAG Sidecar (edge packing)");
-    eprintln!("  If StateTrie dominates call share  → invest in the packfile/index");
-    eprintln!("  If Timeline dominates call share   → neither matters much here");
+    eprintln!("  If GraphWalk dominates call share -> Edge packing");
+    eprintln!("  If StateTrie dominates call share -> invest in packfile/index");
+    eprintln!("  If Timeline dominates call share  -> neither helps here");
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!();
 }
@@ -767,25 +792,40 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
         .map(DagGenerator::node_id)
         .collect();
 
-    let measure = |label: &str, targets: &[NodeId]| {
+    struct Row {
+        mode: &'static str,
+        target: &'static str,
+        found: usize,
+        total: usize,
+        elapsed: std::time::Duration,
+        syscalls: u64,
+        disk_read_bytes: u64,
+    }
+
+    let measure = |mode: &'static str, target: &'static str, targets: &[NodeId]| -> Row {
         store.cache().clear();
+        drop_caches_for_dir(&dir);
         let io_before = IoStats::read_now();
         let t = Instant::now();
         let results = store.get_many(&ROOM, targets).unwrap();
         let elapsed = t.elapsed();
         let io_after = IoStats::read_now();
-        let found = results.iter().filter(|r| r.is_some()).count();
-        eprintln!(
-            "  {label:<12} {found:>6}/{:<6} found   {elapsed:>10.2?}   syscalls: {}",
-            targets.len(),
-            io_after.syscr.saturating_sub(io_before.syscr)
-        );
+        Row {
+            mode,
+            target,
+            found: results.iter().filter(|r| r.is_some()).count(),
+            total: targets.len(),
+            elapsed,
+            syscalls: io_after.syscr.saturating_sub(io_before.syscr),
+            disk_read_bytes: io_after.read_bytes.saturating_sub(io_before.read_bytes),
+        }
     };
 
     // Naive (unsorted, per-id) fetch for comparison — quantifies what
     // get_many's sort-then-read actually buys on this exact pattern.
-    let measure_naive = |label: &str, targets: &[NodeId]| {
+    let measure_naive = |mode: &'static str, target: &'static str, targets: &[NodeId]| -> Row {
         store.cache().clear();
+        drop_caches_for_dir(&dir);
         let io_before = IoStats::read_now();
         let t = Instant::now();
         let mut found = 0usize;
@@ -796,22 +836,42 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
         }
         let elapsed = t.elapsed();
         let io_after = IoStats::read_now();
-        eprintln!(
-            "  {label:<12} {found:>6}/{:<6} found   {elapsed:>10.2?}   syscalls: {}",
-            targets.len(),
-            io_after.syscr.saturating_sub(io_before.syscr)
-        );
+        Row {
+            mode,
+            target,
+            found,
+            total: targets.len(),
+            elapsed,
+            syscalls: io_after.syscr.saturating_sub(io_before.syscr),
+            disk_read_bytes: io_after.read_bytes.saturating_sub(io_before.read_bytes),
+        }
     };
+
+    let rows = [
+        measure("get_many", "adversarial", &adversarial_targets),
+        measure("get_many", "organic", &organic_targets),
+        measure_naive("naive", "adversarial", &adversarial_targets),
+        measure_naive("naive", "organic", &organic_targets),
+    ];
 
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  REACTION SWARM ({history_len} history events, {swarm_size} reactions)");
     eprintln!("═══════════════════════════════════════════════════════════════");
-    eprintln!("  get_many (sort-then-read):");
-    measure("adversarial", &adversarial_targets);
-    measure("organic", &organic_targets);
-    eprintln!("  naive get() loop (no sort):");
-    measure_naive("adversarial", &adversarial_targets);
-    measure_naive("organic", &organic_targets);
+    eprintln!(
+        "  {:<10} {:<12} {:>10} {:>12} {:>10} {:>14}",
+        "mode", "target", "found", "elapsed", "syscalls", "disk read"
+    );
+    for r in &rows {
+        eprintln!(
+            "  {:<10} {:<12} {:>10} {:>12.2?} {:>10} {:>11} B",
+            r.mode,
+            r.target,
+            format!("{}/{}", r.found, r.total),
+            r.elapsed,
+            r.syscalls,
+            r.disk_read_bytes
+        );
+    }
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  If adversarial >> organic under get_many: sort-then-read");
     eprintln!("  doesn't fully mitigate worst-case target selection — the");
@@ -842,16 +902,16 @@ fn main() {
     // ── Connectivity check ──
     eprintln!();
     eprintln!("═══════════════════════════════════════════════════════════════");
-    eprintln!("  GRAPH CONNECTIVITY DIAGNOSTIC");
+    eprintln!("  GRAPH CONNECTIVITY");
     eprintln!("═══════════════════════════════════════════════════════════════");
     let dag_check = DagGenerator::generate(100_000, 0.15, 10);
     let traversal_check = dag_check.traversal_order();
     let reachable = traversal_check.len();
     let total = dag_check.len();
     let pct = reachable as f64 / total as f64 * 100.0;
-    eprintln!("  Total events:      {total}");
-    eprintln!("  Reachable from tips: {reachable} ({pct:.1}%)");
-    eprintln!("  Tips:              {}", dag_check.tips.len());
+    eprintln!("  Total events:         {total}");
+    eprintln!("  Reachable from tips:  {reachable} ({pct:.1}%)");
+    eprintln!("  Tips:                 {}", dag_check.tips.len());
     eprintln!("═══════════════════════════════════════════════════════════════");
 
     eprintln!();
@@ -870,20 +930,18 @@ fn main() {
         large.warm_gets_per_sec,
         large.warm_gets_per_sec / large.cold_gets_per_sec
     );
-    eprintln!(
-        "  pressure (small cache) warm hit rate: {:.1}%",
-        pressure.warm_hit_rate
-    );
+    eprintln!("  small cache warm hit:  {:.1}%", pressure.warm_hit_rate);
     eprintln!("  ───────────────────────────────────────────────────────────");
-    eprintln!("  If read syscalls (cold) > 6:        → Concurrent Frontier I/O");
+    eprintln!("  If read syscalls (cold) > 6:     -> Concurrent Frontier I/O");
     eprintln!("    (mmap collapses per-record reads to O(1) syscalls; a rise");
     eprintln!("    here means the mmap path regressed or was bypassed.)");
+    eprintln!();
     eprintln!("  If warm hit rate < 50% at pressure cache size:");
-    eprintln!("                                       → DAG Sidecar (edge packing)");
+    eprintln!("                                 -> DAG Sidecar (edge packing)");
     eprintln!("    (cache_entries is smaller than the working set, so even a");
     eprintln!("    same-scan re-read gets no reuse; packing edges alongside");
     eprintln!("    nodes would cut re-fetches instead of relying on the LRU.)");
-    eprintln!("  If index loss rate > 0.1%:          → widen index capacity/tag");
-    eprintln!("  Else:                                → Ready for integration");
+    eprintln!();
+    eprintln!("  If index loss rate > 0.1%:        -> widen index capacity/tag");
     eprintln!("═══════════════════════════════════════════════════════════════");
 }
