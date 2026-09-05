@@ -15,14 +15,12 @@ pub struct IndexSlot(u64);
 impl IndexSlot {
     const EMPTY: Self = Self(0);
 
-    const TAG_BITS: u64 = 24;
     const PACK_BITS: u64 = 8;
     const OFFSET_BITS: u64 = 32;
 
     const TAG_SHIFT: u64 = Self::PACK_BITS + Self::OFFSET_BITS; // 40
     const PACK_SHIFT: u64 = Self::OFFSET_BITS; // 32
     const OFFSET_MASK: u64 = (1u64 << Self::OFFSET_BITS) - 1;
-    const PACK_MASK: u64 = 0xFF << Self::PACK_SHIFT;
 
     pub fn new(tag: u32, pack_id: u8, offset: u64) -> Self {
         assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
@@ -320,7 +318,7 @@ mod tests {
         for i in 0..50u8 {
             let mut h = [0u8; 16];
             h[0] = i;
-            index.insert(&h, i % 3, i as u64 * 1000).unwrap();
+            index.insert(&h, i % 3, i as u64 * 1000 + 1).unwrap();
         }
 
         let bytes = index.serialize();

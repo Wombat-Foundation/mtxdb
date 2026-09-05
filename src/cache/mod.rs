@@ -149,6 +149,7 @@ impl NodeCache {
 /// Represents the top two levels of a room's HAMT trie:
 /// - Level 0: 1 node (the root)
 /// - Level 1: up to 32 nodes
+///
 /// Total: ~33 nodes, ~17KB per room.
 ///
 /// Swizzling within the pinned set is free: children that are also
@@ -188,6 +189,10 @@ impl PinnedNodes {
     /// Number of pinned nodes.
     pub fn len(&self) -> usize {
         self.nodes.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.read().is_empty()
     }
 
     /// Clear all pinned nodes.

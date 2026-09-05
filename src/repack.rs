@@ -7,7 +7,10 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::packfile::{self, PackGeneration, Record};
-use crate::storage::{NodeData, NodeId, StorageEngine};
+use crate::storage::{NodeData, NodeId};
+
+/// A function that resolves a node hash to its data and child hashes.
+pub type ResolverFn = dyn Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>;
 
 /// A per-room repacked packfile.
 ///
@@ -76,7 +79,7 @@ impl RepackManager {
         &self,
         room_id: [u8; 16],
         root_hash: NodeId,
-        resolver: &dyn Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>,
+        resolver: impl Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>,
     ) -> Result<Arc<PackGeneration>, RepackError> {
         let pack_id = self.next_pack_id(&room_id);
         let pack_path = self.pack_path(&room_id, pack_id);
@@ -136,6 +139,7 @@ impl RepackManager {
             path: pack_path,
         });
 
+        self.swap_pack(room_id, generation.clone());
         Ok(generation)
     }
 
@@ -208,11 +212,11 @@ mod tests {
             nodes.insert(id, (data, children));
         }
 
-        let resolver = |hash: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
+        let resolver = move |hash: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
             nodes.get(hash).map(|(d, c)| (d.clone(), c.clone()))
         };
 
-        let gen = manager.repack_room([0xAA; 16], root_id, &resolver).unwrap();
+        let gen = manager.repack_room([0xAA; 16], root_id, resolver).unwrap();
         assert!(gen.path.exists());
         assert!(manager.get_pack(&[0xAA; 16]).is_some());
     }
