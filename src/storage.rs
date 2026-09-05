@@ -10,6 +10,16 @@ pub type NodeId = [u8; 16];
 #[derive(Debug, Clone)]
 pub struct NodeData {
     pub bytes: bytes::Bytes,
+    pub children: Vec<NodeRef>,
+}
+
+impl NodeData {
+    pub fn new(bytes: bytes::Bytes) -> Self {
+        Self {
+            bytes,
+            children: Vec::new(),
+        }
+    }
 }
 
 /// A reference to a node that may be resident in cache or need disk fetch.
@@ -216,9 +226,7 @@ mod tests {
     fn test_in_memory_roundtrip() {
         let store = InMemoryStorage::new();
         let id = [0x42u8; 16];
-        let data = NodeData {
-            bytes: bytes::Bytes::from_static(b"test node data"),
-        };
+        let data = NodeData::new(bytes::Bytes::from_static(b"test node data"));
 
         store.put(&TEST_ROOM, &id, &data).unwrap();
         let fetched = store.get(&TEST_ROOM, &id).unwrap().unwrap();
@@ -238,12 +246,7 @@ mod tests {
             .map(|i| {
                 let mut id = [0u8; 16];
                 id[0] = i;
-                (
-                    id,
-                    NodeData {
-                        bytes: bytes::Bytes::from(format!("node {i}")),
-                    },
-                )
+                (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
             })
             .collect();
 
@@ -261,9 +264,7 @@ mod tests {
     #[test]
     fn test_node_ref_resolved_carries_hash() {
         let id = [0xAAu8; 16];
-        let data = Arc::new(NodeData {
-            bytes: bytes::Bytes::from_static(b"hello"),
-        });
+        let data = Arc::new(NodeData::new(bytes::Bytes::from_static(b"hello")));
         let r#ref = NodeRef::Resolved(id, data.clone());
 
         assert!(r#ref.is_resolved());

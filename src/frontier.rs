@@ -150,18 +150,14 @@ mod tests {
             .put(
                 &room,
                 &id1,
-                &NodeData {
-                    bytes: bytes::Bytes::from_static(b"node1"),
-                },
+                &NodeData::new(bytes::Bytes::from_static(b"node1")),
             )
             .unwrap();
         engine
             .put(
                 &room,
                 &id2,
-                &NodeData {
-                    bytes: bytes::Bytes::from_static(b"node2"),
-                },
+                &NodeData::new(bytes::Bytes::from_static(b"node2")),
             )
             .unwrap();
 

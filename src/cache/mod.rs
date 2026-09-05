@@ -17,7 +17,7 @@ const NIL: LinkIdx = u32::MAX;
 
 /// A node in the intrusive doubly-linked list for LRU ordering.
 struct LruNode {
-    data: Arc<NodeData>,
+    data: Option<Arc<NodeData>>,
     key: NodeId,
     prev: LinkIdx,
     next: LinkIdx,
@@ -33,6 +33,8 @@ struct LruState {
     head: LinkIdx,
     /// Tail of the list (least recently used). NIL if empty.
     tail: LinkIdx,
+    /// Head of the free list for recycled slots. NIL if empty.
+    free_list: LinkIdx,
 }
 
 impl LruState {
@@ -42,6 +44,7 @@ impl LruState {
             nodes: Vec::with_capacity(cap),
             head: NIL,
             tail: NIL,
+            free_list: NIL,
         }
     }
 
@@ -90,6 +93,11 @@ impl LruState {
         }
 
         self.map.remove(&victim_key);
+
+        // Release the Arc and recycle the slot
+        self.nodes[victim as usize].data = None;
+        self.nodes[victim as usize].next = self.free_list;
+        self.free_list = victim;
     }
 }
 
@@ -129,7 +137,7 @@ impl NodeCache {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let data = state.nodes[idx as usize].data.clone();
+        let data = state.nodes[idx as usize].data.as_ref()?.clone();
         state.move_to_head(idx);
         drop(state);
 
@@ -143,10 +151,14 @@ impl NodeCache {
     /// # Panics
     /// Panics if the cache exceeds `u32::MAX` entries (impractical).
     pub fn insert(&self, id: NodeId, data: Arc<NodeData>) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let mut state = self.state.write();
 
         if let Some(&idx) = state.map.get(&id) {
-            state.nodes[idx as usize].data = data;
+            state.nodes[idx as usize].data = Some(data);
             state.move_to_head(idx);
             return;
         }
@@ -155,14 +167,26 @@ impl NodeCache {
             state.evict_lru();
         }
 
-        let idx = LinkIdx::try_from(state.nodes.len()).expect("cache exceeds u32::MAX entries");
-        let new_node = LruNode {
-            data,
-            key: id,
-            prev: NIL,
-            next: state.head,
+        let idx = if state.free_list == NIL {
+            let new_idx =
+                LinkIdx::try_from(state.nodes.len()).expect("cache exceeds u32::MAX entries");
+            state.nodes.push(LruNode {
+                data: None,
+                key: id,
+                prev: NIL,
+                next: NIL,
+            });
+            new_idx
+        } else {
+            let free_idx = state.free_list;
+            state.free_list = state.nodes[free_idx as usize].next;
+            free_idx
         };
-        state.nodes.push(new_node);
+
+        state.nodes[idx as usize].data = Some(data);
+        state.nodes[idx as usize].key = id;
+        state.nodes[idx as usize].prev = NIL;
+        state.nodes[idx as usize].next = state.head;
         if state.head != NIL {
             let head = state.head as usize;
             state.nodes[head].prev = idx;
@@ -178,7 +202,7 @@ impl NodeCache {
     pub fn remove(&self, id: &NodeId) -> Option<Arc<NodeData>> {
         let mut state = self.state.write();
         let idx = state.map.remove(id)?;
-        let data = state.nodes[idx as usize].data.clone();
+        let data = state.nodes[idx as usize].data.take()?;
 
         let prev = state.nodes[idx as usize].prev;
         let next = state.nodes[idx as usize].next;
@@ -195,7 +219,24 @@ impl NodeCache {
             state.tail = prev;
         }
 
+        state.nodes[idx as usize].next = state.free_list;
+        state.free_list = idx;
+
         Some(data)
+    }
+
+    /// Check which hashes are already resident in the cache.
+    ///
+    /// Returns a `Vec<bool>` of the same length as `hashes`, where `true`
+    /// means the hash is cached. Does NOT move entries in the LRU order
+    /// (this is a read-only probe, not an access).
+    ///
+    /// Used by the swizzling layer to identify which child pointers can be
+    /// rewritten from `Lazy(hash)` to `Resolved(Arc<NodeData>)` without
+    /// touching disk.
+    pub fn resolve_hashes(&self, hashes: &[NodeId]) -> Vec<bool> {
+        let state = self.state.read();
+        hashes.iter().map(|h| state.map.contains_key(h)).collect()
     }
 
     /// Number of entries currently cached.
@@ -235,8 +276,10 @@ impl NodeCache {
     pub fn clear(&self) {
         let mut state = self.state.write();
         state.map.clear();
+        state.nodes.clear();
         state.head = NIL;
         state.tail = NIL;
+        state.free_list = NIL;
     }
 }
 
@@ -305,9 +348,7 @@ mod tests {
     use super::*;
 
     fn test_data(s: &str) -> Arc<NodeData> {
-        Arc::new(NodeData {
-            bytes: bytes::Bytes::copy_from_slice(s.as_bytes()),
-        })
+        Arc::new(NodeData::new(bytes::Bytes::copy_from_slice(s.as_bytes())))
     }
 
     #[test]

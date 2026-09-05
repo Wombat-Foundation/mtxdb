@@ -216,9 +216,7 @@ mod tests {
     fn make_node(id: u8) -> (NodeId, NodeData, Vec<NodeId>) {
         let mut hash = [0u8; 16];
         hash[0] = id;
-        let data = NodeData {
-            bytes: bytes::Bytes::from(format!("node {id}")),
-        };
+        let data = NodeData::new(bytes::Bytes::from(format!("node {id}")));
         let children: Vec<NodeId> = (1..=3)
             .filter(|&i| i < id)
             .map(|i| {

@@ -7,11 +7,35 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::cache::NodeCache;
+use crate::cache::{NodeCache, PinnedNodes};
 use crate::index::LossyIndex;
 use crate::packfile::{self, PackGeneration, Record};
 use crate::repack::RepackManager;
-use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
+use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
+
+pub type NodeParserFn = fn(&[u8]) -> Vec<NodeId>;
+
+/// Callback that rewrites a node's child pointers for in-cache swizzling.
+///
+/// When a node is fetched from disk, this callback is invoked with:
+/// - `data`: the raw node data
+/// - `children`: the child hashes extracted from the node
+/// - `cached`: parallel bool array — `true` if the child is already in cache
+///
+/// The callback should rewrite `NodeRef::Lazy(hash)` to
+/// `NodeRef::Resolved(hash, Arc<NodeData>)` for children where `cached[i]`
+/// is `true`, then return the rewritten node data.
+///
+/// The callback is responsible for:
+/// 1. Parsing the HAMT node encoding from `data`
+/// 2. Identifying child `NodeRef::Lazy(hash)` entries
+/// 3. Swizzling cached children to `NodeRef::Resolved`
+/// 4. Re-encoding the node (the cache stores the swizzled version)
+///
+/// **Pinning constraint:** The callback should only swizzle children at
+/// levels 0 and 1 of the state trie (~33 nodes per room). Deeper nodes
+/// stay `Lazy` to avoid holding Arc references that prevent LRU eviction.
+pub type SwizzleFn = fn(&NodeData, &[NodeId], &[bool]) -> NodeData;
 
 /// A content-addressed packfile storage engine.
 ///
@@ -22,7 +46,7 @@ use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
 /// at ~8KB per 1000-node room (100 active rooms < 1MB total).
 ///
 /// Read path: cache → index lookup (with linear-probe collision retry)
-///            → packfile read → CRC verify → cache insert
+///            → packfile read → CRC verify → swizzle children → cache insert
 /// Write path: packfile append → index insert → cache insert
 pub struct PackfileStorage {
     /// Manages per-room pack generations and atomic repack.
@@ -31,8 +55,14 @@ pub struct PackfileStorage {
     indexes: RwLock<HashMap<[u8; 16], LossyIndex>>,
     /// Verify-once decoded node cache.
     cache: NodeCache,
+    /// Top-level pinned state trie nodes (L0/L1) safe for zero-eviction swizzling.
+    pinned: PinnedNodes,
     /// Base directory for all pack files.
     base_dir: PathBuf,
+    /// Optional swizzle callback for in-cache pointer resolution.
+    swizzle: Option<SwizzleFn>,
+    /// Optional HAMT node parser to extract child edges for cache swizzling.
+    parser: Option<NodeParserFn>,
 }
 
 impl PackfileStorage {
@@ -43,14 +73,42 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `io::Error` if the base directory cannot be read.
     pub fn open(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_cache(base_dir, NodeCache::with_default_capacity())
+        Self::open_with_options(base_dir, NodeCache::with_default_capacity(), None, None)
     }
 
     /// Create a new packfile storage with custom cache size.
     ///
     /// # Errors
-    /// Returns `io::Error` if the base directory cannot be read.
-    pub fn open_with_cache(base_dir: PathBuf, cache: NodeCache) -> Result<Self, std::io::Error> {
+    /// Returns `io::Error` if the base directory cannot be created or read.
+    pub fn open_with_cache(
+        base_dir: PathBuf,
+        cache: NodeCache,
+        parser: Option<NodeParserFn>,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(base_dir, cache, None, parser)
+    }
+
+    /// Create a new packfile storage with a swizzle callback.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the base directory cannot be created or read.
+    pub fn open_with_swizzle(
+        base_dir: PathBuf,
+        cache: NodeCache,
+        swizzle: SwizzleFn,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(base_dir, cache, Some(swizzle), None)
+    }
+
+    fn open_with_options(
+        base_dir: PathBuf,
+        cache: NodeCache,
+        swizzle: Option<SwizzleFn>,
+        parser: Option<NodeParserFn>,
+    ) -> Result<Self, std::io::Error> {
+        // Ensure directory exists so initial puts do not fail
+        fs::create_dir_all(&base_dir)?;
+
         let repack = RepackManager::new(base_dir.clone());
         let mut indexes = HashMap::new();
 
@@ -62,7 +120,10 @@ impl PackfileStorage {
             repack,
             indexes: RwLock::new(indexes),
             cache,
+            pinned: PinnedNodes::new(),
             base_dir,
+            swizzle,
+            parser,
         })
     }
 
@@ -134,6 +195,12 @@ impl PackfileStorage {
         &self.cache
     }
 
+    /// Get a reference to the pinned L0/L1 nodes set for explicit memory pinning.
+    #[must_use]
+    pub fn pinned(&self) -> &PinnedNodes {
+        &self.pinned
+    }
+
     /// Ensure a pack exists for the given room, creating one if needed.
     fn ensure_pack(&self, room_id: &[u8; 16]) -> Result<Arc<PackGeneration>, StorageError> {
         if let Some(gen) = self.repack.get_pack(room_id) {
@@ -175,6 +242,42 @@ impl PackfileStorage {
         reader.seek(std::io::SeekFrom::Start(offset))?;
         packfile::read_record(&mut reader)?
             .ok_or_else(|| StorageError::Corrupt("unexpected EOF at record boundary".into()))
+    }
+
+    /// Fetch a node and return it as a `NodeRef` with swizzled children.
+    ///
+    /// This is the swizzling entry point. After reading and verifying the
+    /// node from disk, if a swizzle callback is configured:
+    /// 1. Parse child hashes from the raw node data
+    /// 2. Check which children are already resident in cache
+    /// 3. Call the swizzle callback to rewrite `Lazy → Resolved` for cached children
+    /// 4. Cache the swizzled version
+    ///
+    /// Returns `NodeRef::Resolved(id, Arc::new(swizzled_data))` on success.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure.
+    pub fn get_swizzled(
+        &self,
+        room_id: &[u8; 16],
+        id: &NodeId,
+        extract_children: impl Fn(&NodeData) -> Vec<NodeId>,
+    ) -> Result<Option<NodeRef>, StorageError> {
+        let Some(data) = self.get(room_id, id)? else {
+            return Ok(None);
+        };
+
+        if let Some(swizzle_fn) = self.swizzle {
+            let children = extract_children(&data);
+            if !children.is_empty() {
+                let cached = self.cache.resolve_hashes(&children);
+                let swizzled = swizzle_fn(&data, &children, &cached);
+                self.cache.insert(*id, Arc::new(swizzled.clone()));
+                return Ok(Some(NodeRef::Resolved(*id, Arc::new(swizzled))));
+            }
+        }
+
+        Ok(Some(NodeRef::Resolved(*id, Arc::new(data))))
     }
 }
 
@@ -222,7 +325,21 @@ impl StorageEngine for PackfileStorage {
                 continue;
             }
 
-            let data = NodeData { bytes: record.data };
+            let mut children = Vec::new();
+            if let Some(parse) = self.parser {
+                for child_id in parse(&record.data) {
+                    if let Some(child_data) = self.pinned.get(&child_id) {
+                        children.push(NodeRef::Resolved(child_id, child_data));
+                    } else {
+                        children.push(NodeRef::Lazy(child_id));
+                    }
+                }
+            }
+
+            let data = NodeData {
+                bytes: record.data,
+                children,
+            };
             self.cache.insert(*id, Arc::new(data.clone()));
             return Ok(Some(data));
         }
@@ -267,8 +384,16 @@ impl StorageEngine for PackfileStorage {
             let _ = index.insert(id, gen.pack_id, offset);
         }
 
-        // Cache it
-        self.cache.insert(*id, Arc::new(data.clone()));
+        // Cache it, swizzling any lazy refs if they are in pinned
+        let mut data_to_cache = data.clone();
+        for child in &mut data_to_cache.children {
+            if let NodeRef::Lazy(child_id) = child {
+                if let Some(child_data) = self.pinned.get(child_id) {
+                    *child = NodeRef::Resolved(*child_id, child_data);
+                }
+            }
+        }
+        self.cache.insert(*id, Arc::new(data_to_cache));
 
         Ok(())
     }
@@ -323,9 +448,7 @@ mod tests {
         let store = PackfileStorage::open(dir).unwrap();
 
         let id = [0x42u8; 16];
-        let data = NodeData {
-            bytes: bytes::Bytes::from_static(b"hello world"),
-        };
+        let data = NodeData::new(bytes::Bytes::from_static(b"hello world"));
 
         store.put(&TEST_ROOM, &id, &data).unwrap();
         let got = store.get(&TEST_ROOM, &id).unwrap().unwrap();
@@ -345,9 +468,7 @@ mod tests {
         let store = PackfileStorage::open(dir).unwrap();
 
         let id = [0x01u8; 16];
-        let data = NodeData {
-            bytes: bytes::Bytes::from_static(b"cached"),
-        };
+        let data = NodeData::new(bytes::Bytes::from_static(b"cached"));
 
         store.put(&TEST_ROOM, &id, &data).unwrap();
 
@@ -365,9 +486,7 @@ mod tests {
         let store = PackfileStorage::open(dir).unwrap();
 
         let id = [0x01u8; 16];
-        let data = NodeData {
-            bytes: bytes::Bytes::from_static(b"room data"),
-        };
+        let data = NodeData::new(bytes::Bytes::from_static(b"room data"));
 
         // Manually set up a pack for this room
         let gen = store.ensure_pack(&OTHER_ROOM).unwrap();
@@ -402,12 +521,7 @@ mod tests {
             .map(|i| {
                 let mut id = [0u8; 16];
                 id[0] = i;
-                (
-                    id,
-                    NodeData {
-                        bytes: bytes::Bytes::from(format!("node {i}")),
-                    },
-                )
+                (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
             })
             .collect();
 
@@ -430,9 +544,7 @@ mod tests {
         for i in 0..5u8 {
             let mut id = [0u8; 16];
             id[0] = i;
-            let data = NodeData {
-                bytes: bytes::Bytes::from(format!("record {i}")),
-            };
+            let data = NodeData::new(bytes::Bytes::from(format!("record {i}")));
             store.put(&TEST_ROOM, &id, &data).unwrap();
         }
 
@@ -454,12 +566,8 @@ mod tests {
         // so the same logical data in different rooms produces different hashes.
         let id_a = [0x42u8; 16];
         let id_b = [0x43u8; 16];
-        let data_a = NodeData {
-            bytes: bytes::Bytes::from_static(b"room A data"),
-        };
-        let data_b = NodeData {
-            bytes: bytes::Bytes::from_static(b"room B data"),
-        };
+        let data_a = NodeData::new(bytes::Bytes::from_static(b"room A data"));
+        let data_b = NodeData::new(bytes::Bytes::from_static(b"room B data"));
 
         store.put(&TEST_ROOM, &id_a, &data_a).unwrap();
         store.put(&OTHER_ROOM, &id_b, &data_b).unwrap();
@@ -489,9 +597,7 @@ mod tests {
         let store = PackfileStorage::open(dir).unwrap();
 
         let id = [0x42u8; 16];
-        let data = NodeData {
-            bytes: bytes::Bytes::from_static(b"valid data"),
-        };
+        let data = NodeData::new(bytes::Bytes::from_static(b"valid data"));
         store.put(&TEST_ROOM, &id, &data).unwrap();
 
         // Clear cache so the next get must go to disk
@@ -503,5 +609,117 @@ mod tests {
 
         // Non-existent hash returns None (not a tag collision loop)
         assert!(store.get(&TEST_ROOM, &[0xFF; 16]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_swizzle_callback() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Track how many times the swizzle callback is invoked
+        static SWIZZLE_CALLS: AtomicU64 = AtomicU64::new(0);
+        static CACHED_CHILDREN_FOUND: AtomicU64 = AtomicU64::new(0);
+
+        fn test_swizzle(data: &NodeData, children: &[NodeId], cached: &[bool]) -> NodeData {
+            SWIZZLE_CALLS.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(children.len(), 2, "expected 2 children from parent node");
+            // Both children should be found in cache
+            for &is_cached in cached {
+                if is_cached {
+                    CACHED_CHILDREN_FOUND.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // In a real implementation, this would parse the HAMT encoding
+            // and rewrite Lazy → Resolved for cached[i] == true children.
+            // For this test, we return the data unchanged.
+            data.clone()
+        }
+
+        let dir = test_dir("swizzle");
+        let store =
+            PackfileStorage::open_with_swizzle(dir, NodeCache::new(100), test_swizzle).unwrap();
+
+        // Simulate a parent node with two children
+        let parent_id = [0x10u8; 16];
+        let child_a = [0x20u8; 16];
+        let child_b = [0x30u8; 16];
+
+        let data_a = NodeData::new(bytes::Bytes::from_static(b"child A"));
+        let data_b = NodeData::new(bytes::Bytes::from_static(b"child B"));
+        let parent_data = NodeData::new(bytes::Bytes::from_static(b"parent with children"));
+        let _ = &parent_data;
+
+        // Insert all three nodes
+        store.put(&TEST_ROOM, &child_a, &data_a).unwrap();
+        store.put(&TEST_ROOM, &child_b, &data_b).unwrap();
+        store.put(&TEST_ROOM, &parent_id, &parent_data).unwrap();
+
+        // Clear cache, then re-insert children (they must be resident for swizzle)
+        // Parent must NOT be in cache so get_swizzled goes to disk
+        store.cache.clear();
+        store.put(&TEST_ROOM, &child_a, &data_a).unwrap();
+        store.put(&TEST_ROOM, &child_b, &data_b).unwrap();
+
+        // Fetch parent via get_swizzled — callback should fire
+        let extract = |data: &NodeData| -> Vec<NodeId> {
+            // Simulated child extraction: in reality this would parse
+            // the HAMT node encoding. For this test we just return known children.
+            let _ = data; // unused
+            vec![child_a, child_b]
+        };
+
+        let result = store.get_swizzled(&TEST_ROOM, &parent_id, extract).unwrap();
+        assert!(result.is_some());
+        let node_ref = result.unwrap();
+        assert!(node_ref.is_resolved());
+        assert_eq!(node_ref.structural_hash(), &parent_id);
+
+        // Verify the callback was invoked exactly once
+        assert_eq!(SWIZZLE_CALLS.load(Ordering::Relaxed), 1);
+        // Both children should have been found in cache
+        assert_eq!(CACHED_CHILDREN_FOUND.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_in_cache_swizzling() {
+        fn dummy_parser(bytes: &[u8]) -> Vec<NodeId> {
+            if bytes == b"parent" {
+                vec![[0x11; 16], [0x22; 16]]
+            } else {
+                vec![]
+            }
+        }
+
+        let dir = test_dir("in_cache_swizzle");
+
+        let store = PackfileStorage::open_with_cache(
+            dir,
+            NodeCache::with_default_capacity(),
+            Some(dummy_parser),
+        )
+        .unwrap();
+
+        let child1_id = [0x11; 16];
+        let child1_data = Arc::new(NodeData::new(bytes::Bytes::from_static(b"child 1")));
+        store.pinned().pin(child1_id, child1_data.clone());
+
+        let parent_id = [0x42; 16];
+        let mut parent_data = NodeData::new(bytes::Bytes::from_static(b"parent"));
+        parent_data.children = vec![NodeRef::Lazy(child1_id), NodeRef::Lazy([0x22; 16])];
+
+        store.put(&TEST_ROOM, &parent_id, &parent_data).unwrap();
+        let fetched = store.get(&TEST_ROOM, &parent_id).unwrap().unwrap();
+        assert_eq!(fetched.children.len(), 2);
+
+        // Child 1 is Resolved directly from pinned L0/L1 cache
+        match &fetched.children[0] {
+            NodeRef::Resolved(id, data) => {
+                assert_eq!(*id, child1_id);
+                assert_eq!(data.bytes, child1_data.bytes);
+            }
+            NodeRef::Lazy(_) => panic!("Expected child 1 to be resolved"),
+        }
+
+        // Child 2 remains Lazy (not in pinned)
+        assert!(matches!(fetched.children[1], NodeRef::Lazy(_)));
     }
 }
