@@ -74,29 +74,33 @@ impl IndexSlot {
 #[derive(Debug)]
 pub struct LossyIndex {
     /// Power-of-two capacity.
-    capacity: usize,
+    capacity: u32,
     /// Bitmask for bucket selection: capacity - 1.
-    mask: usize,
+    mask: u32,
     /// Shift to extract top bits from hash for bucket index.
     shift: u32,
     /// The flat slot array.
     slots: Vec<IndexSlot>,
     /// Number of occupied slots.
-    len: usize,
+    len: u32,
 }
 
 impl LossyIndex {
     /// Create a new index with at least `min_capacity` slots.
     /// Capacity is rounded up to the next power of two.
+    ///
+    /// # Panics
+    /// Panics if `min_capacity` exceeds `u32::MAX` when rounded to a power of two.
     #[must_use]
     pub fn new(min_capacity: usize) -> Self {
-        let capacity = min_capacity.next_power_of_two().max(16);
-        let shift = 64 - (capacity as u32).leading_zeros();
+        let capacity_usize = min_capacity.next_power_of_two().max(16);
+        let capacity = u32::try_from(capacity_usize).expect("index capacity exceeds u32::MAX");
+        let shift = 64_u32.wrapping_sub(capacity.leading_zeros());
         Self {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
-            slots: vec![IndexSlot::empty(); capacity],
+            slots: vec![IndexSlot::empty(); capacity_usize],
             len: 0,
         }
     }
@@ -105,7 +109,9 @@ impl LossyIndex {
     #[inline]
     fn bucket(&self, hash: &[u8; 16]) -> usize {
         let top_bytes = u64::from_be_bytes(hash[..8].try_into().unwrap());
-        ((top_bytes >> self.shift) & self.mask as u64) as usize
+        let masked = (top_bytes >> self.shift) & u64::from(self.mask);
+        // Safety: masked is always <= mask < capacity which fits in usize on all platforms
+        usize::try_from(masked).unwrap_or(usize::MAX)
     }
 
     /// Extract the 24-bit tag from a 16-byte hash.
@@ -141,7 +147,7 @@ impl LossyIndex {
                 self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
                 return Ok(());
             }
-            bucket = bucket.wrapping_add(1) & self.mask;
+            bucket = bucket.wrapping_add(1) & self.mask as usize;
         }
     }
 
@@ -165,14 +171,14 @@ impl LossyIndex {
             if slot.tag() == tag {
                 return Some((slot.pack_id(), slot.offset()));
             }
-            bucket = bucket.wrapping_add(1) & self.mask;
+            bucket = bucket.wrapping_add(1) & self.mask as usize;
         }
     }
 
     /// Number of occupied slots.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
     /// Whether the index is empty.
@@ -184,7 +190,7 @@ impl LossyIndex {
     /// Estimated memory usage in bytes.
     #[must_use]
     pub fn memory_usage(&self) -> usize {
-        self.capacity
+        (self.capacity as usize)
             .wrapping_mul(8)
             .wrapping_add(std::mem::size_of::<Self>())
     }
@@ -192,9 +198,9 @@ impl LossyIndex {
     /// Serialize the index to bytes for persistence.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
-        let byte_len = self.capacity.wrapping_mul(8).wrapping_add(8);
+        let byte_len = 8_usize.wrapping_add((self.capacity as usize).wrapping_mul(8));
         let mut buf = Vec::with_capacity(byte_len);
-        buf.extend_from_slice(&(self.capacity as u64).to_le_bytes());
+        buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
         for slot in &self.slots {
             buf.extend_from_slice(&slot.0.to_le_bytes());
         }
@@ -207,22 +213,24 @@ impl LossyIndex {
     /// Returns `DeserializationError::TooShort` if the data is too short.
     ///
     /// # Panics
-    /// Panics if the capacity field cannot be read (guaranteed by the length check).
+    /// Panics if the 8-byte capacity header cannot be read (guaranteed by the length check).
     pub fn deserialize(data: &[u8]) -> Result<Self, DeserializationError> {
         if data.len() < 8 {
             return Err(DeserializationError::TooShort);
         }
-        let capacity = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        let expected_len = 8_usize.wrapping_add(capacity.wrapping_mul(8));
+        let capacity_wire = u64::from_le_bytes(data[..8].try_into().unwrap());
+        let capacity = u32::try_from(capacity_wire).map_err(|_| DeserializationError::TooShort)?;
+        let capacity_usize = capacity as usize;
+        let expected_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(8));
         if data.len() < expected_len {
             return Err(DeserializationError::TooShort);
         }
 
-        let mut slots = Vec::with_capacity(capacity);
-        let mut len: usize = 0;
-        for i in 0..capacity {
+        let mut slots = Vec::with_capacity(capacity_usize);
+        let mut len: u32 = 0;
+        for i in 0..capacity_usize {
             let offset = 8_usize.wrapping_add(i.wrapping_mul(8));
-            let val = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            let val = u64::from_le_bytes(data[offset..offset.wrapping_add(8)].try_into().unwrap());
             let slot = IndexSlot(val);
             if !slot.is_empty() {
                 len = len.wrapping_add(1);
@@ -230,7 +238,7 @@ impl LossyIndex {
             slots.push(slot);
         }
 
-        let shift = 64 - (capacity as u32).leading_zeros();
+        let shift = 64_u32.wrapping_sub(capacity.leading_zeros());
 
         Ok(Self {
             mask: capacity.wrapping_sub(1),

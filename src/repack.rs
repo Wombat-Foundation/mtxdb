@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -76,6 +77,9 @@ impl RepackManager {
     /// * `root_hash` - The root node to start the walk from.
     /// * `resolver` - Function to fetch a node's children given its hash.
     ///   Returns `(node_data, child_hashes)`.
+    ///
+    /// # Errors
+    /// Returns `RepackError::Io` on I/O failure during packfile write.
     pub fn repack_room(
         &self,
         room_id: [u8; 16],
@@ -145,6 +149,9 @@ impl RepackManager {
     }
 
     /// Delete all data for a room.
+    ///
+    /// # Errors
+    /// Always returns `Ok(())`. Provided for API consistency.
     pub fn purge_room(&self, room_id: &[u8; 16]) -> Result<(), RepackError> {
         if let Some(gen) = self.remove_room(room_id) {
             // Drop the Arc — if readers are still active, the file
@@ -160,7 +167,12 @@ impl RepackManager {
     }
 
     fn pack_path(&self, room_id: &[u8; 16], pack_id: u8) -> PathBuf {
-        let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = room_id
+            .iter()
+            .fold(String::with_capacity(32), |mut acc, &b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
         self.base_dir.join(format!("{hex}_{pack_id:02x}.pack"))
     }
 }

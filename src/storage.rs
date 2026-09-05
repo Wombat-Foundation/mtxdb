@@ -52,23 +52,41 @@ fn unresolved_hash() -> &'static NodeId {
 /// - `InMemoryStorage`: for tests.
 pub trait StorageEngine: Send + Sync {
     /// Fetch a single node by its structural hash.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure.
     fn get(&self, id: &NodeId) -> Result<Option<NodeData>, StorageError>;
 
     /// Fetch multiple nodes by their structural hashes.
     /// Returns results in the same order as the input keys.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure.
     fn get_many(&self, ids: &[NodeId]) -> Result<Vec<Option<NodeData>>, StorageError>;
 
     /// Store a new node. The caller must ensure the node is not already
     /// present (content-addressed: identical data produces identical hash).
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure.
     fn put(&self, id: &NodeId, data: &NodeData) -> Result<(), StorageError>;
 
     /// Store multiple new nodes in a single batch.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure.
     fn put_many(&self, entries: &[(NodeId, NodeData)]) -> Result<(), StorageError>;
 
     /// Delete all nodes for a given room (range delete).
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure.
     fn delete_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError>;
 
     /// Sync to disk (fsync).
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure.
     fn sync(&self) -> Result<(), StorageError>;
 }
 

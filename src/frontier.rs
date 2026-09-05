@@ -44,6 +44,9 @@ impl FrontierBatch {
 ///
 /// # Returns
 /// A vector of `(NodeId, Option<NodeData>)` in the same order as the input.
+///
+/// # Errors
+/// Returns `StorageError::Io` on I/O failure from the storage engine.
 pub fn fetch_frontier_concurrent<S: StorageEngine>(
     engine: &S,
     batch: &FrontierBatch,

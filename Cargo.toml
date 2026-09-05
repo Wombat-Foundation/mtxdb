@@ -7,6 +7,9 @@ repository = "https://github.com/Wombat-Foundation/mtxdb"
 description = "Matrix Database: write-once packfile storage with lossy fanout index for content-addressed immutable data"
 license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
+readme = "README.md"
+keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
+categories = ["database-implementations", "storage"]
 
 [dependencies]
 blake2 = "0.10"

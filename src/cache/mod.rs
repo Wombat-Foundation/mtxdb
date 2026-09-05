@@ -134,13 +134,12 @@ impl NodeCache {
         let h = self.hits.load(Ordering::Relaxed);
         let m = self.misses.load(Ordering::Relaxed);
         let total = h.saturating_add(m);
-        if total == 0 {
-            0.0
-        } else {
-            // Use integer division scaled to avoid precision loss
-            let scaled = h.saturating_mul(10_000) / total;
-            f64::from(scaled as u32) / 10_000.0
-        }
+        h.checked_mul(10_000)
+            .and_then(|v| v.checked_div(total))
+            .map_or(0.0, |scaled| {
+                let clamped = u32::try_from(scaled).unwrap_or(u32::MAX);
+                f64::from(clamped) / 10_000.0
+            })
     }
 
     /// Clear all entries.

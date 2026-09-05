@@ -134,6 +134,9 @@ impl ActiveRoomFrontier {
     /// For each parent in `raw_prevs` and `raw_auths`:
     /// - If the parent is already in the arena, creates a `resident` edge.
     /// - Otherwise, creates a `disk` edge with the parent's `local_id`.
+    ///
+    /// # Panics
+    /// Panics if the arena index exceeds `u32::MAX`.
     pub fn insert_event(&mut self, short_id: u64, raw_prevs: &[u64], raw_auths: &[u64]) -> usize {
         let local_id = self.register_id(short_id);
 
@@ -180,7 +183,7 @@ impl ActiveRoomFrontier {
     pub fn prev_edges(&self, node_idx: usize) -> &[GraphEdge] {
         let node = &self.nodes[node_idx];
         let start = node.prev.0 as usize;
-        let end = start + node.prev.1 as usize;
+        let end = start.wrapping_add(node.prev.1 as usize);
         &self.edges[start..end]
     }
 
@@ -189,7 +192,7 @@ impl ActiveRoomFrontier {
     pub fn auth_edges(&self, node_idx: usize) -> &[GraphEdge] {
         let node = &self.nodes[node_idx];
         let start = node.auth.0 as usize;
-        let end = start + node.auth.1 as usize;
+        let end = start.wrapping_add(node.auth.1 as usize);
         &self.edges[start..end]
     }
 

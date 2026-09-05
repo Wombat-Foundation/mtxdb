@@ -32,7 +32,10 @@ pub struct Record {
 impl Record {
     #[must_use]
     pub fn serialized_len(&self) -> usize {
-        4 + 16 + self.data.len() + 4
+        4_usize
+            .wrapping_add(16)
+            .wrapping_add(self.data.len())
+            .wrapping_add(4)
     }
 }
 
@@ -53,9 +56,15 @@ impl Drop for PackGeneration {
 }
 
 /// Write a single record into the packfile.
+///
+/// # Errors
+/// Returns `io::Error` on write failure.
+///
+/// # Panics
+/// Panics if the record payload exceeds `u32::MAX`.
 pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<()> {
-    let payload_len =
-        u32::try_from(16 + record.data.len()).expect("record payload exceeds u32::MAX");
+    let payload_len = u32::try_from(16_usize.wrapping_add(record.data.len()))
+        .expect("record payload exceeds u32::MAX");
     writer.write_all(&payload_len.to_le_bytes())?;
     writer.write_all(&record.hash)?;
     writer.write_all(&record.data)?;
@@ -72,6 +81,13 @@ pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<()> 
 }
 
 /// Read a single record from the packfile. Returns `None` on EOF.
+///
+/// # Errors
+/// Returns `io::Error` on read failure or `io::ErrorKind::InvalidData`
+/// if the record length is invalid or the CRC check fails.
+///
+/// # Panics
+/// Panics if `payload_len` (a `u32`) cannot be converted to `usize`.
 pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf) {
@@ -115,6 +131,9 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
 }
 
 /// Write the packfile header (magic + version).
+///
+/// # Errors
+/// Returns `io::Error` on write failure.
 pub fn write_header(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(&MAGIC)?;
     writer.write_all(&[0x01])?; // version 1
@@ -122,6 +141,9 @@ pub fn write_header(writer: &mut impl Write) -> io::Result<()> {
 }
 
 /// Read and validate the packfile header.
+///
+/// # Errors
+/// Returns `io::Error` on read failure.
 pub fn read_header(reader: &mut impl Read) -> io::Result<bool> {
     let mut buf = [0u8; 5];
     match reader.read_exact(&mut buf) {
@@ -133,6 +155,10 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<bool> {
 }
 
 /// Open or create a packfile, writing the header if it's new.
+///
+/// # Errors
+/// Returns `io::Error` on open/write failure or `io::ErrorKind::InvalidData`
+/// if the existing header is invalid.
 pub fn open_packfile(path: &Path, create: bool) -> io::Result<File> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -158,6 +184,10 @@ pub fn open_packfile(path: &Path, create: bool) -> io::Result<File> {
 
 /// Scan an existing packfile and rebuild a (hash → offset) map.
 /// Used for crash recovery of the in-memory index.
+///
+/// # Errors
+/// Returns `io::Error` on read failure (but stops gracefully on
+/// unexpected EOF or corrupt tail).
 pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
