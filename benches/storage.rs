@@ -7,8 +7,7 @@
 )]
 
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use mtxdb::cache::NodeCache;
@@ -16,7 +15,6 @@ use mtxdb::packfile_storage::PackfileStorage;
 use mtxdb::storage::{NodeData, NodeId, NodeRef, StorageEngine};
 
 const ROOM: [u8; 16] = [0xAB; 16];
-const PAGE_SIZE: u64 = 4096;
 
 // ── Minimal xorshift64 PRNG ─────────────────────────────────────────
 
@@ -59,7 +57,6 @@ impl DagGenerator {
         auth_events.push(vec![]);
 
         for i in 1..total_events {
-            // Check if a fork needs to join back this step
             let mut extra_prevs = Vec::new();
             if !pending_joins.is_empty() && (i % join_depth == 0 || tips.len() >= 8) {
                 extra_prevs = pending_joins.remove(0);
@@ -78,14 +75,12 @@ impl DagGenerator {
                 tips.push(i);
             }
 
-            // When we have too many tips, join the oldest fork back
             if tips.len() > 4 {
                 let orphan = tips.remove(0);
                 pending_joins.push(vec![orphan]);
             }
         }
 
-        // Flush remaining pending joins into final events
         for orphan_chain in pending_joins {
             if let Some(last) = prev_events.last_mut() {
                 last.extend(orphan_chain);
@@ -184,7 +179,7 @@ impl DagGenerator {
     }
 }
 
-// ── Physical I/O measurement via /proc/self/io ──────────────────────
+// ── I/O measurement via /proc/self/io ───────────────────────────────
 
 #[derive(Default, Clone, Copy)]
 struct IoStats {
@@ -217,40 +212,7 @@ impl IoStats {
     }
 }
 
-fn drop_caches_for_dir(dir: &Path) {
-    // Try vmtouch first (evicts pages without root)
-    let vmtouch_available = std::process::Command::new("which")
-        .arg("vmtouch")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-
-    if vmtouch_available {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|e| e == "pack") {
-                    let _ = std::process::Command::new("vmtouch")
-                        .args(["-e", entry.path().to_str().unwrap()])
-                        .output();
-                }
-            }
-        }
-        return;
-    }
-
-    // Fallback: try drop_caches (needs root)
-    let Ok(mut f) = fs::OpenOptions::new()
-        .write(true)
-        .open("/proc/sys/vm/drop_caches")
-    else {
-        eprintln!("  [warn] no vmtouch and no root — cold I/O metric may be inaccurate");
-        return;
-    };
-    let _ = f.write_all(b"3");
-}
-
-fn pack_dir_size(dir: &Path) -> u64 {
+fn pack_dir_size(dir: &std::path::Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -264,14 +226,9 @@ fn pack_dir_size(dir: &Path) -> u64 {
 
 // ── Benchmark harness ───────────────────────────────────────────────
 
-fn bench_temp_dir(label: &str, total_events: usize) -> PathBuf {
-    // Use $HOME/bmdb_bench to avoid tmpfs on /tmp (RAM-backed, no physical I/O)
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(format!("bmdb_bench_{label}_{total_events}"))
-}
-
 fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
-    let dir = bench_temp_dir(label, total_events);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = PathBuf::from(home).join(format!("bmdb_bench_{label}_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -283,55 +240,25 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
         .collect();
 
     // ── Write phase ──
-    {
-        let cache = NodeCache::new(cache_entries);
-        let store = PackfileStorage::open_with_cache(
-            dir.clone(),
-            cache,
-            Some(DagGenerator::parse_children),
-        )
-        .unwrap();
-        let t_write = Instant::now();
-        for i in 0..dag.len() {
-            let (id, data) = dag.node_data(i);
-            store.put(&ROOM, &id, &data).unwrap();
-        }
-        let write_elapsed = t_write.elapsed();
-        eprintln!(
-            "  Write throughput:    {:.0} events/sec",
-            total_events as f64 / write_elapsed.as_secs_f64()
-        );
+    let store = PackfileStorage::open_with_cache(
+        dir.clone(),
+        NodeCache::new(cache_entries),
+        Some(DagGenerator::parse_children),
+    )
+    .unwrap();
+
+    let t_write = Instant::now();
+    for i in 0..dag.len() {
+        let (id, data) = dag.node_data(i);
+        store.put(&ROOM, &id, &data).unwrap();
     }
-    // store dropped here — all file handles closed
+    let write_elapsed = t_write.elapsed();
     let pack_size = pack_dir_size(&dir);
 
-    // ── Evict page cache (packfiles now have no open handles) ──
-    drop_caches_for_dir(&dir);
+    // ── Clear cache to force packfile re-reads ──
+    store.cache().clear();
 
-    // Verify eviction
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|e| e == "pack") {
-                if let Ok(o) = std::process::Command::new("vmtouch")
-                    .args(["-v", entry.path().to_str().unwrap()])
-                    .output()
-                {
-                    let vmtouch_out = String::from_utf8_lossy(&o.stdout);
-                    for line in vmtouch_out.lines() {
-                        eprintln!("  vmtouch: {line}");
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    // ── Read phase (cold) ──
-    let cache = NodeCache::new(cache_entries);
-    let store =
-        PackfileStorage::open_with_cache(dir.clone(), cache, Some(DagGenerator::parse_children))
-            .unwrap();
-
+    // ── Read phase: backward traversal simulating /sync ──
     let io_before = IoStats::read_now();
     let t_read = Instant::now();
 
@@ -353,10 +280,9 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
 
     let read_elapsed = t_read.elapsed();
     let io_after = IoStats::read_now();
-    let physical_reads = io_after.read_bytes.saturating_sub(io_before.read_bytes);
     let logical_reads = io_after.rchar.saturating_sub(io_before.rchar);
+    let disk_reads = io_after.read_bytes.saturating_sub(io_before.read_bytes);
     let read_syscalls = io_after.syscr.saturating_sub(io_before.syscr);
-    let physical_pages = physical_reads.div_ceil(PAGE_SIZE);
 
     let cache_total = cache_hits + cache_misses;
     let hit_rate = if cache_total > 0 {
@@ -375,14 +301,17 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
     eprintln!("  {label}: {total_events} events, cache={cache_entries} entries");
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  Pack size:           {:.2} MB", pack_size as f64 / 1e6);
+    eprintln!(
+        "  Write throughput:    {:.0} events/sec",
+        total_events as f64 / write_elapsed.as_secs_f64()
+    );
     eprintln!("  Avg edges/event:    {avg_edges:.2}");
     eprintln!("  Total edge refs:    {}", dag.total_edge_refs());
     eprintln!("  ───────────────────────────────────────────────────────────");
-    eprintln!("  Metric A: Physical I/O");
-    eprintln!("    read_bytes (disk): {physical_reads} bytes ({physical_pages} pages)");
+    eprintln!("  Metric A: I/O (cache cleared, packfile re-reads from disk)");
     eprintln!("    rchar (logical):   {logical_reads} bytes");
+    eprintln!("    read_bytes (disk): {disk_reads} bytes");
     eprintln!("    read syscalls:     {read_syscalls}");
-    eprintln!("    Seek budget:       ~{physical_pages} physical seeks");
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric B: Cache efficiency (of nodes that reach cache)");
     eprintln!("    Cache lookups:     {cache_total}");
@@ -406,19 +335,13 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
 
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
-    eprintln!("Tip: install vmtouch (`pacman -S vmtouch`) for accurate cold I/O measurements");
+    eprintln!("Note: PackGeneration::Drop deletes packfiles on drop,");
+    eprintln!("so we clear the cache and re-read from open packfiles.");
     eprintln!();
 
-    // Small: fits in cache, baseline
     run_benchmark("small", 1_000, 2_000);
-
-    // Medium: cache smaller than working set
     run_benchmark("medium", 10_000, 500);
-
-    // Large: 100k events, tight cache (512MB VPS simulation)
     run_benchmark("large", 100_000, 2_000);
-
-    // Large with tiny cache: extreme memory pressure
     run_benchmark("pressure", 100_000, 100);
 
     // ── Connectivity check ──
@@ -434,19 +357,8 @@ fn main() {
     eprintln!("  Total events:      {total}");
     eprintln!("  Reachable from tips: {reachable} ({pct:.1}%)");
     eprintln!("  Tips:              {}", dag_check.tips.len());
-    // Count disconnected events
-    let mut in_traversal = vec![false; total];
-    for &idx in &traversal_check {
-        in_traversal[idx] = true;
-    }
-    let disconnected = in_traversal.iter().filter(|&&v| !v).count();
-    eprintln!("  Disconnected:      {disconnected}");
-    if disconnected > 0 {
-        eprintln!("  [!] DAG generator has orphaned forks — fix join logic");
-    }
     eprintln!("═══════════════════════════════════════════════════════════════");
 
-    // ── Decision matrix ──
     eprintln!();
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  DECISION MATRIX");

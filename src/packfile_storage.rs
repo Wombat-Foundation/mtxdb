@@ -380,7 +380,7 @@ impl StorageEngine for PackfileStorage {
             let mut indexes = self.indexes.write();
             let index = indexes
                 .entry(*room_id)
-                .or_insert_with(|| LossyIndex::new(256));
+                .or_insert_with(|| LossyIndex::new(4096));
             let _ = index.insert(id, gen.pack_id, offset);
         }
 
@@ -503,7 +503,7 @@ mod tests {
             let mut indexes = store.indexes.write();
             let index = indexes
                 .entry(OTHER_ROOM)
-                .or_insert_with(|| LossyIndex::new(256));
+                .or_insert_with(|| LossyIndex::new(4096));
             let _ = index.insert(&id, gen.pack_id, 5);
         }
 
