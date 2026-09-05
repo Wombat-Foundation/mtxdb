@@ -1,5 +1,8 @@
-/target
+# rust
+target/
+.coverage/
 
 # other stuff
 docs/*.md
 /*.txt
+.tmp/

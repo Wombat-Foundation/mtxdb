@@ -50,12 +50,21 @@ doc: ##H Build docs
 test: ##H Run tests
 	$(CARGO) test --lib --tests --timings
 
+
+# Drop the Regions/Branches columns from the per-file terminal summary.
+export LLVM_COV_FLAGS = -show-region-summary=false -show-branch-summary=false
+
 .PHONY: cov
 cov: ##H Run code coverage and generate HTML report
 	# TODO: include `src/bin/` in coverage
 	# Run coverage
 	$(CARGO) llvm-cov --lib --tests \
 		--html --output-dir .coverage \
+		--ignore-filename-regex 'src/bin/.*|scripts/.*'
+	# Print per-file summary to the terminal (functions/lines only)
+	@echo ''
+	@echo '══════════════ COVERAGE SUMMARY ══════════════'
+	$(CARGO) llvm-cov report \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Process report to codecov-compatible JSON
 	$(CARGO) llvm-cov report \
@@ -79,3 +88,4 @@ bench: ##H Run benchmarks
 .PHONY: clean
 clean: ##H Clean build artifacts
 	$(CARGO) clean
+	rm -rf .coverage/
