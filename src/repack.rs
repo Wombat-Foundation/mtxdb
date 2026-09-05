@@ -142,7 +142,7 @@ impl RepackManager {
             pack_id,
             file,
             path: pack_path,
-            mmap: OnceLock::new(),
+            mmap: parking_lot::RwLock::new(None),
         });
 
         self.swap_pack(room_id, generation.clone());
@@ -272,7 +272,7 @@ mod tests {
             pack_id: 0,
             file,
             path,
-            mmap: OnceLock::new(),
+            mmap: parking_lot::RwLock::new(None),
         });
         manager.swap_pack([0xBB; 16], gen);
 

@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 use memmap2::Mmap;
+use parking_lot::RwLock;
 
 /// Magic bytes identifying an mdb packfile: "MDB1"
 pub const MAGIC: [u8; 4] = *b"MDB1";
@@ -49,57 +50,67 @@ pub struct PackGeneration {
     pub pack_id: u8,
     pub file: File,
     pub path: PathBuf,
-    pub(crate) mmap: OnceLock<io::Result<Mmap>>,
+    /// Lazily-created mmap of the packfile. May be remapped when the file
+    /// grows (the active generation is appended to between repacks).
+    pub(crate) mmap: RwLock<Option<Mmap>>,
 }
 
 impl PackGeneration {
-    /// Get or create the memory-mapped view of this packfile.
+    /// Get the memory-mapped view of this packfile, creating it if absent.
     ///
-    /// The mmap is lazily created on first access and cached (including
-    /// failures) for subsequent calls. This enables zero-syscall reads
-    /// for the hot path.
+    /// The mmap is lazily created on first access. Unlike a `OnceLock`, the
+    /// map is *not* frozen: `read_at` may remap it to a larger size when the
+    /// active generation accumulates appends after the initial mapping.
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if the packfile cannot be opened for mapping
-    /// or the `mmap(2)` call fails. The error kind and message from the
-    /// underlying attempt are preserved, and the failure is cached so
-    /// subsequent calls return the same error without retrying.
-    pub fn mmap(&self) -> io::Result<&Mmap> {
-        let cached = self.mmap.get_or_init(|| map_pack(&self.file));
-        match cached {
-            Ok(m) => Ok(m),
-            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+    /// Returns an `io::Error` if the packfile cannot be mapped or `mmap(2)`
+    /// fails.
+    pub fn mmap(&self) -> io::Result<parking_lot::RwLockReadGuard<'_, Option<Mmap>>> {
+        let guard = self.mmap.read();
+        if guard.is_some() {
+            return Ok(guard);
         }
+        drop(guard);
+        let mut guard = self.mmap.write();
+        if guard.is_none() {
+            *guard = Some(map_pack(&self.file)?);
+        }
+        drop(guard);
+        Ok(self.mmap.read())
     }
 }
 
 /// Scaffold `Mmap::map`, isolating the single unsafe call in this crate.
 ///
 /// # Safety
-/// This is the only `unsafe` block in the codebase, and it is sound for the
-/// following reasons:
+/// This is the only `unsafe` block in the codebase. The mapping it creates
+/// is sound for the following reasons:
 ///
-/// 1. **No concurrent mutation.** A packfile's contents are write-once. All
-///    appends serialize through `put()`/`put_many()` on `PackfileStorage`,
-///    which complete before any reader can obtain the mmap (the mmap is
-///    created lazily on first read, which only happens after the write phase
-///    in the benchmark harness; in real use, reading a `PackGeneration`
-///    implies its writer finished appending that generation — the repacker
-///    swaps in a *new* generation rather than mutating a mapped one).
-/// 2. **No truncation or size change.** The mapped `File` is not
-///    `set_len`-shrunk or extended after the mapping is created. Reads beyond
-///    a live mapping fault would SIGBUS only if the file shrunk beneath the
-///    mapping, which cannot occur given the write-once invariant.
+/// 1. **Append-only file growth.** A packfile only ever grows by appends
+///    that serialize through `put()`/`put_many()`. `read_at` remaps when a
+///    read lands beyond the current mapping and the file has grown, so the
+///    mapping is never stale relative to the data being read. Bytes already
+///    written are never mutated, so existing mappings of those bytes stay
+///    valid.
+/// 2. **No truncation or size change.** A mapped `File` is never
+///    `set_len`-shrunk or extended after the mapping is created. Reads
+///    beyond a mapping's current end never fault because `read_at` bounds
+///    against `map.len()` before touching the map, and remaps (rather than
+///    raw faulting) when the file has grown. The only way to shrink is
+///    generation unlink at `Drop`, which happens only while readers hold the
+///    `Arc` and before any concurrent access could observe a map.
 /// 3. **Stable file descriptor.** `PackGeneration` owns the only `File`
 ///    handle and is kept alive by `Arc`s held by the repack manager and any
 ///    in-flight reader, so the descriptor remains valid for the mapping's
 ///    lifetime. `Mmap` also keeps the mapping alive independently of the
 ///    `File` drop.
 #[allow(unsafe_code)]
-fn map_pack(file: &File) -> io::Result<Mmap> {
-    // SAFETY: See the `map_pack` doc comment — write-once file, no concurrent
-    // mutation, no truncation, stable fd, and `Mmap` retains the mapping.
+pub(crate) fn map_pack(file: &File) -> io::Result<Mmap> {
+    // SAFETY: See the `map_pack` doc comment — append-only file, remapped on
+    // growth, never truncated or shrunk, and a stable fd for the mapping's
+    // lifetime. The only mutation mode is append, which does not invalidate
+    // the existing mapped bytes.
     unsafe { Mmap::map(file) }
 }
 

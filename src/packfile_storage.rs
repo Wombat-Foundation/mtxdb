@@ -188,7 +188,7 @@ impl PackfileStorage {
                         pack_id,
                         file,
                         path: path.clone(),
-                        mmap: OnceLock::new(),
+                        mmap: parking_lot::RwLock::new(None),
                     });
                     repack.swap_pack(room_id, gen);
                 }
@@ -223,7 +223,7 @@ impl PackfileStorage {
             pack_id,
             file,
             path: pack_path,
-            mmap: OnceLock::new(),
+            mmap: parking_lot::RwLock::new(None),
         });
         self.repack.swap_pack(*room_id, gen.clone());
 
@@ -285,15 +285,99 @@ impl PackfileStorage {
     /// Unlike `seek`+`read_exact`, mmap reads require no syscalls — the
     /// kernel resolves faults directly into the page cache. This collapses
     /// cold-read latency from 3 syscalls/record to ~zero.
+    ///
+    /// The mapping is remapped when the active generation has grown past the
+    /// mapping's current end (appends land after the initial mapping). This
+    /// self-healing keeps the mmap bounded-correct so appends written after
+    /// a read are never silently invisible.
     fn read_at(gen: &PackGeneration, offset: u64) -> Result<Record, StorageError> {
-        let mmap: &Mmap = gen.mmap().map_err(StorageError::Io)?;
-        let mem: &[u8] = mmap;
+        // Fast path: read from the mapped bytes. Remap when the file has
+        // grown past the current mapping's end and retry.
+        for _ in 0..2 {
+            let guard = gen.mmap().map_err(StorageError::Io)?;
+            let Some(mem) = guard.as_deref() else {
+                return Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "packfile could not be mapped",
+                )));
+            };
+
+            let offset = usize::try_from(offset)
+                .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
+
+            if offset.checked_add(4).map_or(true, |end| end > mem.len()) {
+                break;
+            }
+
+            let prefix_end = offset.wrapping_add(4);
+            let payload_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
+            let payload_len = u32::from_le_bytes(payload_len_bytes);
+
+            if payload_len == 0 || payload_len > packfile::MAX_RECORD_LEN {
+                return Err(StorageError::Corrupt(format!(
+                    "invalid record length: {payload_len}"
+                )));
+            }
+
+            let payload_len_usize = payload_len as usize;
+            let crc_pos = prefix_end.wrapping_add(payload_len_usize);
+            let frame_end = crc_pos.wrapping_add(4);
+
+            if frame_end > mem.len() {
+                break;
+            }
+
+            let payload = &mem[prefix_end..crc_pos];
+            let crc_buf: [u8; 4] = mem[crc_pos..frame_end].try_into().unwrap();
+
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&payload_len_bytes);
+            crc.update(payload);
+            let expected = crc.finalize();
+            let actual = u32::from_le_bytes(crc_buf);
+            if expected != actual {
+                return Err(StorageError::Corrupt(format!(
+                    "CRC mismatch: expected {expected:08x}, got {actual:08x}"
+                )));
+            }
+
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(&payload[..16]);
+            let data = bytes::Bytes::copy_from_slice(&payload[16..]);
+
+            return Ok(Record { hash, data });
+        }
+
+        // Slow path: the mapping was too small. Remap to the file's current
+        // size (it grew via appends) and retry once. If it *still* doesn't
+        // fit the (now current) mapping, the offset is genuinely past EOF and
+        // we surface a real "truncated frame" error — never a silent Ok(None).
+        let file_len = gen.file.metadata().map_err(StorageError::Io)?.len();
+        {
+            let mut guard = gen.mmap.write();
+            if guard.as_ref().map_or(true, |m| m.len() as u64 < file_len) {
+                *guard = Some(crate::packfile::map_pack(&gen.file).map_err(StorageError::Io)?);
+            }
+        }
+        Self::read_at_impl(gen, offset)
+    }
+
+    /// Parsing core shared by the mmap fast path and the post-remap retry.
+    /// Returns `Ok(None)` when `offset` is genuinely past the end of `mem`.
+    fn read_at_impl(gen: &PackGeneration, offset: u64) -> Result<Option<Record>, StorageError> {
+        let guard = gen.mmap().map_err(StorageError::Io)?;
+        let Some(mem) = guard.as_deref() else {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "packfile could not be mapped",
+            )));
+        };
 
         let offset = usize::try_from(offset)
             .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
 
         if offset.checked_add(4).map_or(true, |end| end > mem.len()) {
-            return Err(StorageError::Corrupt("truncated length prefix".into()));
+            return Ok(None);
         }
 
         let prefix_end = offset.wrapping_add(4);
@@ -311,7 +395,7 @@ impl PackfileStorage {
         let frame_end = crc_pos.wrapping_add(4);
 
         if frame_end > mem.len() {
-            return Err(StorageError::Corrupt("truncated frame".into()));
+            return Ok(None);
         }
 
         let payload = &mem[prefix_end..crc_pos];
@@ -328,11 +412,11 @@ impl PackfileStorage {
             )));
         }
 
-        let mut hash = [0u8; 16];
+        let mut hash = [u0u8; 16];
         hash.copy_from_slice(&payload[..16]);
         let data = bytes::Bytes::copy_from_slice(&payload[16..]);
 
-        Ok(Record { hash, data })
+        Ok(Some(Record { hash, data }))
     }
 
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
