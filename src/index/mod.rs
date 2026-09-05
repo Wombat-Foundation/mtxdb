@@ -19,6 +19,10 @@ impl IndexSlot {
     const PACK_SHIFT: u64 = 32; // OFFSET_BITS
     const OFFSET_MASK: u64 = 0xFFFF_FFFF;
 
+    /// Create a new slot from its components.
+    ///
+    /// # Panics
+    /// Panics if `tag` exceeds 24 bits or `offset` exceeds 32 bits.
     #[must_use]
     pub fn new(tag: u32, pack_id: u8, offset: u64) -> Self {
         assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
@@ -70,9 +74,9 @@ impl IndexSlot {
 #[derive(Debug)]
 pub struct LossyIndex {
     /// Power-of-two capacity.
-    capacity: u64,
+    capacity: usize,
     /// Bitmask for bucket selection: capacity - 1.
-    mask: u64,
+    mask: usize,
     /// Shift to extract top bits from hash for bucket index.
     shift: u32,
     /// The flat slot array.
@@ -89,8 +93,8 @@ impl LossyIndex {
         let capacity = min_capacity.next_power_of_two().max(16);
         let shift = 64 - (capacity as u32).leading_zeros();
         Self {
-            capacity: capacity as u64,
-            mask: capacity as u64 - 1,
+            mask: capacity.wrapping_sub(1),
+            capacity,
             shift,
             slots: vec![IndexSlot::empty(); capacity],
             len: 0,
@@ -101,7 +105,7 @@ impl LossyIndex {
     #[inline]
     fn bucket(&self, hash: &[u8; 16]) -> usize {
         let top_bytes = u64::from_be_bytes(hash[..8].try_into().unwrap());
-        ((top_bytes >> self.shift) & self.mask) as usize
+        ((top_bytes >> self.shift) & self.mask as u64) as usize
     }
 
     /// Extract the 24-bit tag from a 16-byte hash.
@@ -112,10 +116,12 @@ impl LossyIndex {
     }
 
     /// Insert a (hash → `pack_id`, offset) mapping.
-    /// Returns `Err` if the table is too full (< 25% free slots remaining).
+    ///
+    /// # Errors
+    /// Returns `InsertError::TableFull` if the table has less than 25% free slots.
     pub fn insert(&mut self, hash: &[u8; 16], pack_id: u8, offset: u64) -> Result<(), InsertError> {
-        let threshold = self.capacity.saturating_mul(3) / 4;
-        if self.len >= threshold as usize {
+        let threshold = self.capacity.wrapping_mul(3) / 4;
+        if self.len >= threshold {
             return Err(InsertError::TableFull);
         }
 
@@ -126,7 +132,7 @@ impl LossyIndex {
             let slot = self.slots[bucket];
             if slot.is_empty() {
                 self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
-                self.len = self.len.saturating_add(1);
+                self.len = self.len.wrapping_add(1);
                 return Ok(());
             }
             // If same tag already exists at this bucket, overwrite
@@ -135,7 +141,7 @@ impl LossyIndex {
                 self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
                 return Ok(());
             }
-            bucket = (bucket + 1) & (self.mask as usize);
+            bucket = bucket.wrapping_add(1) & self.mask;
         }
     }
 
@@ -159,7 +165,7 @@ impl LossyIndex {
             if slot.tag() == tag {
                 return Some((slot.pack_id(), slot.offset()));
             }
-            bucket = (bucket + 1) & (self.mask as usize);
+            bucket = bucket.wrapping_add(1) & self.mask;
         }
     }
 
@@ -178,14 +184,17 @@ impl LossyIndex {
     /// Estimated memory usage in bytes.
     #[must_use]
     pub fn memory_usage(&self) -> usize {
-        (self.capacity as usize) * 8 + std::mem::size_of::<Self>()
+        self.capacity
+            .wrapping_mul(8)
+            .wrapping_add(std::mem::size_of::<Self>())
     }
 
     /// Serialize the index to bytes for persistence.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + (self.capacity as usize) * 8);
-        buf.extend_from_slice(&self.capacity.to_le_bytes());
+        let byte_len = self.capacity.wrapping_mul(8).wrapping_add(8);
+        let mut buf = Vec::with_capacity(byte_len);
+        buf.extend_from_slice(&(self.capacity as u64).to_le_bytes());
         for slot in &self.slots {
             buf.extend_from_slice(&slot.0.to_le_bytes());
         }
@@ -193,12 +202,18 @@ impl LossyIndex {
     }
 
     /// Deserialize an index from bytes.
+    ///
+    /// # Errors
+    /// Returns `DeserializationError::TooShort` if the data is too short.
+    ///
+    /// # Panics
+    /// Panics if the capacity field cannot be read (guaranteed by the length check).
     pub fn deserialize(data: &[u8]) -> Result<Self, DeserializationError> {
         if data.len() < 8 {
             return Err(DeserializationError::TooShort);
         }
         let capacity = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        let expected_len = 8_usize.saturating_add(capacity.saturating_mul(8));
+        let expected_len = 8_usize.wrapping_add(capacity.wrapping_mul(8));
         if data.len() < expected_len {
             return Err(DeserializationError::TooShort);
         }
@@ -206,21 +221,20 @@ impl LossyIndex {
         let mut slots = Vec::with_capacity(capacity);
         let mut len: usize = 0;
         for i in 0..capacity {
-            let offset = 8_usize.saturating_add(i.saturating_mul(8));
+            let offset = 8_usize.wrapping_add(i.wrapping_mul(8));
             let val = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             let slot = IndexSlot(val);
             if !slot.is_empty() {
-                len = len.saturating_add(1);
+                len = len.wrapping_add(1);
             }
             slots.push(slot);
         }
 
-        let capacity_u64 = capacity as u64;
         let shift = 64 - (capacity as u32).leading_zeros();
 
         Ok(Self {
-            capacity: capacity_u64,
-            mask: capacity_u64 - 1,
+            mask: capacity.wrapping_sub(1),
+            capacity,
             shift,
             slots,
             len,

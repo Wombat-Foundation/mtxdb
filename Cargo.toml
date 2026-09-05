@@ -3,6 +3,7 @@ name = "mdb"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
+repository = "https://github.com/Wombat-Foundation/mtxdb"
 description = "Matrix Database: write-once packfile storage with lossy fanout index for content-addressed immutable data"
 license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
