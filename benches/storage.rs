@@ -703,6 +703,127 @@ fn run_intent_benchmark(total_events: usize) {
     eprintln!();
 }
 
+// ── Reaction-swarm adversarial scenario ──────────────────────────────
+//
+// repack_room is never actually invoked by PackfileStorage itself (it's a
+// manually-triggered, externally-scheduled API) — so a room's packfile just
+// grows monotonically in arrival order. That makes the real threat model
+// here "random-offset reads into a large, cold, ever-growing file", not
+// "did this survive a repack". This scenario measures whether an attacker
+// choosing reaction targets from the OLDEST part of a room's history (the
+// furthest possible physical offset from the write head) costs more than
+// organic reactions to RECENT messages, and whether the sort-then-read
+// fix in get_many (Part 3) narrows that gap.
+fn reaction_id(salt: u64, idx: u64) -> NodeId {
+    let seed = idx ^ salt ^ 0xDEAD_BEEF_1234_5678u64.rotate_left(3);
+    let a = splitmix64(seed);
+    let b = splitmix64(a ^ 0x0BAD_F00D_0BAD_F00D);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&a.to_le_bytes());
+    id[8..].copy_from_slice(&b.to_le_bytes());
+    id
+}
+
+fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = PathBuf::from(home).join(format!("bmdb_bench_swarm_{history_len}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    // A long, mostly-linear room history — the base messages that will be
+    // reacted to. Low fork probability: this is about history depth, not
+    // fork/join shape (that's what run_intent_benchmark covers).
+    let dag = DagGenerator::generate(history_len, 0.02, 50);
+    let store = PackfileStorage::open_with_cache(dir.clone(), NodeCache::new(2000), None).unwrap();
+
+    for i in 0..dag.len() {
+        let (id, data) = dag.node_data(i);
+        store.put(&ROOM, &id, &data).unwrap();
+    }
+
+    // The swarm itself: swarm_size small reaction stub events. Their own
+    // storage cost is trivial and, being appended together, physically
+    // contiguous for free — not what this measures.
+    let swarm_ids: Vec<NodeId> = (0..swarm_size as u64)
+        .map(|i| reaction_id(0xAAAA, i))
+        .collect();
+    for id in &swarm_ids {
+        store
+            .put(
+                &ROOM,
+                id,
+                &NodeData::new(bytes::Bytes::from_static(b"reaction")),
+            )
+            .unwrap();
+    }
+
+    // Adversarial targets: the OLDEST swarm_size events — maximally distant
+    // from the write head. Organic targets: the MOST RECENT swarm_size
+    // events prior to the swarm — where real reaction behavior clusters.
+    let adversarial_targets: Vec<NodeId> = (0..swarm_size.min(history_len))
+        .map(DagGenerator::node_id)
+        .collect();
+    let organic_targets: Vec<NodeId> = (history_len.saturating_sub(swarm_size)..history_len)
+        .map(DagGenerator::node_id)
+        .collect();
+
+    let measure = |label: &str, targets: &[NodeId]| {
+        store.cache().clear();
+        let io_before = IoStats::read_now();
+        let t = Instant::now();
+        let results = store.get_many(&ROOM, targets).unwrap();
+        let elapsed = t.elapsed();
+        let io_after = IoStats::read_now();
+        let found = results.iter().filter(|r| r.is_some()).count();
+        eprintln!(
+            "  {label:<12} {found:>6}/{:<6} found   {elapsed:>10.2?}   syscalls: {}",
+            targets.len(),
+            io_after.syscr.saturating_sub(io_before.syscr)
+        );
+    };
+
+    // Naive (unsorted, per-id) fetch for comparison — quantifies what
+    // get_many's sort-then-read actually buys on this exact pattern.
+    let measure_naive = |label: &str, targets: &[NodeId]| {
+        store.cache().clear();
+        let io_before = IoStats::read_now();
+        let t = Instant::now();
+        let mut found = 0usize;
+        for id in targets {
+            if store.get(&ROOM, id).unwrap().is_some() {
+                found += 1;
+            }
+        }
+        let elapsed = t.elapsed();
+        let io_after = IoStats::read_now();
+        eprintln!(
+            "  {label:<12} {found:>6}/{:<6} found   {elapsed:>10.2?}   syscalls: {}",
+            targets.len(),
+            io_after.syscr.saturating_sub(io_before.syscr)
+        );
+    };
+
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  REACTION SWARM ({history_len} history events, {swarm_size} reactions)");
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  get_many (sort-then-read):");
+    measure("adversarial", &adversarial_targets);
+    measure("organic", &organic_targets);
+    eprintln!("  naive get() loop (no sort):");
+    measure_naive("adversarial", &adversarial_targets);
+    measure_naive("organic", &organic_targets);
+    eprintln!("  ───────────────────────────────────────────────────────────");
+    eprintln!("  If adversarial >> organic under get_many: sort-then-read");
+    eprintln!("  doesn't fully mitigate worst-case target selection — the");
+    eprintln!("  attacker still forces genuinely scattered physical reads,");
+    eprintln!("  just visited in a sane order. Compare against the naive");
+    eprintln!("  rows to see how much of the gap sorting actually closes.");
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!();
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
     eprintln!("Note: PackGeneration::Drop deletes packfiles on drop,");
@@ -715,6 +836,8 @@ fn main() {
     let pressure = run_benchmark("pressure", 100_000, 100);
 
     run_intent_benchmark(20_000);
+
+    run_reaction_swarm_benchmark(50_000, 500);
 
     // ── Connectivity check ──
     eprintln!();
