@@ -69,6 +69,14 @@ pub struct PackfileStorage {
     swizzle: Option<SwizzleFn>,
     /// Optional HAMT node parser to extract child edges for cache swizzling.
     parser: Option<NodeParserFn>,
+    /// Serializes first-ever pack creation per room. `ensure_pack`'s fast
+    /// path (room already has a pack) never touches this — only the rare,
+    /// once-per-room-lifetime "create the first packfile" path does, via
+    /// double-checked locking. Without it, two threads racing to create
+    /// the same brand-new room's pack both see "doesn't exist yet" and
+    /// both write a header to the same file, corrupting it (confirmed via
+    /// `test_concurrent_federation_swarm`: "invalid packfile header").
+    ensure_pack_lock: parking_lot::Mutex<()>,
 }
 
 impl PackfileStorage {
@@ -130,6 +138,7 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             parser,
+            ensure_pack_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -210,6 +219,15 @@ impl PackfileStorage {
 
     /// Ensure a pack exists for the given room, creating one if needed.
     fn ensure_pack(&self, room_id: &[u8; 16]) -> Result<Arc<PackGeneration>, StorageError> {
+        if let Some(gen) = self.repack.get_pack(room_id) {
+            return Ok(gen);
+        }
+
+        // Slow path: this room may not have a pack yet, or another thread
+        // is racing to create it right now. Serialize first-ever creation
+        // per room and re-check after acquiring the lock — the winner of
+        // the race creates the pack, everyone else just observes it.
+        let _guard = self.ensure_pack_lock.lock();
         if let Some(gen) = self.repack.get_pack(room_id) {
             return Ok(gen);
         }
@@ -637,6 +655,136 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mdb_test_pfs_{name}_{id}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_concurrent_federation_swarm() {
+        // Simulates concurrent federation ingress (many writers) and client
+        // /sync (many readers) hammering ONE shared room — the maximum-
+        // contention case for the exact gap flagged this session: put()
+        // captures its offset from `file.seek(SeekFrom::End(0))` on a
+        // try_clone'd handle, with no explicit lock serializing the
+        // append+offset-capture critical section across threads. The file
+        // is opened O_APPEND, so each individual write() syscall always
+        // lands at the true current end regardless of a thread's seek
+        // position — but the *offset value this thread captured* can go
+        // stale if another thread's put() interleaves and appends more
+        // bytes before this thread's write_record finishes. That's a real,
+        // reachable race, not a hypothetical: this test proves whether it
+        // corrupts data or is merely benign under real contention.
+        use std::sync::Mutex;
+        use std::thread;
+
+        const NUM_WRITERS: usize = 8;
+        const EVENTS_PER_WRITER: usize = 500;
+        const NUM_READERS: usize = 8;
+        const READS_PER_READER: usize = 2000;
+
+        let dir = test_dir("concurrent_federation");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let room = [0x77u8; 16];
+        // Every written id + its expected bytes, so we can verify after
+        // the swarm that nothing was silently corrupted — not just that
+        // nothing panicked.
+        let written: Mutex<Vec<(NodeId, bytes::Bytes)>> = Mutex::new(Vec::new());
+        let read_ok = std::sync::atomic::AtomicUsize::new(0);
+        let read_not_found = std::sync::atomic::AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            for w in 0..NUM_WRITERS {
+                let store = &store;
+                let written = &written;
+                scope.spawn(move || {
+                    for i in 0..EVENTS_PER_WRITER {
+                        // Unique per (writer, event) — globally distinct
+                        // across all writers hammering the same room.
+                        let mut id = [0u8; 16];
+                        id[0] = u8::try_from(w).unwrap();
+                        id[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+                        let bytes = bytes::Bytes::from(format!("writer {w} event {i}"));
+                        let data = NodeData::new(bytes.clone());
+                        store.put(&room, &id, &data).unwrap();
+                        written.lock().unwrap().push((id, bytes));
+                    }
+                });
+            }
+
+            for _ in 0..NUM_READERS {
+                let store = &store;
+                let written = &written;
+                let read_ok = &read_ok;
+                let read_not_found = &read_not_found;
+                scope.spawn(move || {
+                    for i in 0..READS_PER_READER {
+                        // Read whatever's been published so far — may be
+                        // empty early on, which is fine, get() on an empty
+                        // room correctly returns Ok(None).
+                        let snapshot_len = written.lock().unwrap().len();
+                        if snapshot_len == 0 {
+                            continue;
+                        }
+                        let idx = i % snapshot_len;
+                        let (id, expected_bytes) = written.lock().unwrap()[idx].clone();
+                        match store.get(&room, &id).unwrap() {
+                            Some(data) => {
+                                assert_eq!(
+                                    data.bytes, expected_bytes,
+                                    "get() returned WRONG bytes for a concurrently-written \
+                                     record — silent data corruption under concurrent writes"
+                                );
+                                read_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            None => {
+                                // Under the flagged race, a stale-offset
+                                // write can make a record briefly (or
+                                // permanently) unreachable rather than
+                                // return wrong data — the hash-verification
+                                // safety net rejects a wrong-offset read
+                                // rather than returning it. Not silently
+                                // wrong, but also not what should happen.
+                                read_not_found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // Final integrity pass: every single record any writer claims to
+        // have successfully put() must be findable, with correct bytes,
+        // once all concurrent activity has settled.
+        let written = written.into_inner().unwrap();
+        assert_eq!(written.len(), NUM_WRITERS * EVENTS_PER_WRITER);
+
+        let mut lost = Vec::new();
+        for (id, expected_bytes) in &written {
+            match store.get(&room, id).unwrap() {
+                Some(data) => assert_eq!(
+                    data.bytes, *expected_bytes,
+                    "post-swarm read returned wrong bytes for {id:?} — data corruption"
+                ),
+                None => lost.push(*id),
+            }
+        }
+
+        eprintln!(
+            "concurrent federation swarm: {} writes, {} reads ok, {} reads not-found \
+             during the race window, {} lost post-swarm",
+            written.len(),
+            read_ok.load(std::sync::atomic::Ordering::Relaxed),
+            read_not_found.load(std::sync::atomic::Ordering::Relaxed),
+            lost.len()
+        );
+
+        assert!(
+            lost.is_empty(),
+            "{} of {} concurrently-written records are permanently unreachable \
+             after the swarm settled — the unprotected put() offset race causes \
+             real data loss, not just a benign transient miss: {lost:?}",
+            lost.len(),
+            written.len()
+        );
     }
 
     #[test]
