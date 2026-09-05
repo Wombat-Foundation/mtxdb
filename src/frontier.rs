@@ -42,6 +42,7 @@ impl FrontierBatch {
 ///
 /// # Arguments
 /// * `engine` - The storage engine to read from.
+/// * `room_id` - The room whose index and packfiles to search.
 /// * `batch` - The frontier batch with hashes to fetch.
 ///
 /// # Returns
@@ -51,14 +52,10 @@ impl FrontierBatch {
 /// Returns `StorageError::Io` on I/O failure from the storage engine.
 pub fn fetch_frontier_concurrent<S: StorageEngine>(
     engine: &S,
+    room_id: &[u8; 16],
     batch: &FrontierBatch,
 ) -> Result<Vec<(NodeId, Option<NodeData>)>, crate::storage::StorageError> {
-    // For now, delegate to batch get. The real implementation would:
-    // 1. Resolve hashes to (pack_id, offset) via the lossy index.
-    // 2. Sort by offset for HDD locality.
-    // 3. Issue concurrent pread calls via io_uring or thread pool.
-    // 4. Collect results.
-    let results = engine.get_many(&batch.hashes)?;
+    let results = engine.get_many(room_id, &batch.hashes)?;
 
     Ok(batch
         .hashes
@@ -145,11 +142,13 @@ mod tests {
         use crate::storage::InMemoryStorage;
 
         let engine = InMemoryStorage::new();
+        let room = [0x01; 16];
         let id1 = [1u8; 16];
         let id2 = [2u8; 16];
 
         engine
             .put(
+                &room,
                 &id1,
                 &NodeData {
                     bytes: bytes::Bytes::from_static(b"node1"),
@@ -158,6 +157,7 @@ mod tests {
             .unwrap();
         engine
             .put(
+                &room,
                 &id2,
                 &NodeData {
                     bytes: bytes::Bytes::from_static(b"node2"),
@@ -166,7 +166,7 @@ mod tests {
             .unwrap();
 
         let batch = FrontierBatch::new(vec![id1, id2, [3u8; 16]]); // id3 not in store
-        let results = fetch_frontier_concurrent(&engine, &batch).unwrap();
+        let results = fetch_frontier_concurrent(&engine, &room, &batch).unwrap();
 
         assert_eq!(results.len(), 3);
         assert!(results[0].1.is_some());

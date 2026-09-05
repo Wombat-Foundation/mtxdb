@@ -160,18 +160,28 @@ impl LossyIndex {
     #[inline]
     #[must_use]
     pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u8, u64)> {
-        let tag = Self::tag(hash);
-        let mut bucket = self.bucket(hash);
+        self.lookup_all(hash).next()
+    }
 
-        loop {
-            let slot = self.slots[bucket];
-            if slot.is_empty() {
-                return None; // empty terminates probe
-            }
-            if slot.tag() == tag {
-                return Some((slot.pack_id(), slot.offset()));
-            }
-            bucket = bucket.wrapping_add(1) & self.mask as usize;
+    /// Look up all candidate offsets for a hash, yielding tag collisions.
+    ///
+    /// The caller **must** verify each candidate against the caller-requested
+    /// hash. Tag collisions (0.1% at 24-bit tags) surface as candidates here;
+    /// only the one whose stored hash matches the request is valid.
+    ///
+    /// Yields `(pack_id, offset)` for each slot whose tag matches, then
+    /// terminates at the first empty slot or after `capacity` probes.
+    #[inline]
+    #[must_use]
+    pub fn lookup_all(&self, hash: &[u8; 16]) -> LookupIter<'_> {
+        let tag = Self::tag(hash);
+        let bucket = self.bucket(hash);
+        LookupIter {
+            slots: &self.slots,
+            tag,
+            bucket,
+            mask: self.mask as usize,
+            remaining: self.capacity as usize,
         }
     }
 
@@ -279,6 +289,40 @@ impl std::fmt::Display for DeserializationError {
 }
 
 impl std::error::Error for DeserializationError {}
+
+/// Iterator over candidate offsets for a hash lookup.
+///
+/// Yields `(pack_id, offset)` for each slot whose 24-bit tag matches,
+/// terminating at the first empty slot or after the full capacity is probed.
+pub struct LookupIter<'a> {
+    slots: &'a [IndexSlot],
+    tag: u32,
+    bucket: usize,
+    mask: usize,
+    remaining: usize,
+}
+
+impl Iterator for LookupIter<'_> {
+    type Item = (u8, u64);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.remaining > 0 {
+            self.remaining = self.remaining.wrapping_sub(1);
+            let slot = self.slots[self.bucket];
+            if slot.is_empty() {
+                return None;
+            }
+            let current = self.bucket;
+            self.bucket = self.bucket.wrapping_add(1) & self.mask;
+            if slot.tag() == self.tag {
+                return Some((slot.pack_id(), slot.offset()));
+            }
+            let _ = current;
+        }
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {

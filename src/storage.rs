@@ -49,35 +49,49 @@ impl NodeRef {
 /// The storage engine trait. Abstracts the backend so the packfile,
 /// index, cache, and frontier code don't depend on a specific engine.
 ///
+/// Every operation is scoped to a single room. The caller always knows
+/// which room a node belongs to; the engine uses this to select the
+/// correct per-room index and packfile, keeping each room's active index
+/// at ~8KB (100 active rooms < 1MB total).
+///
 /// Implementations:
 /// - `PackfileStorage`: the custom append-only packfile with lossy index.
 /// - `InMemoryStorage`: for tests.
 pub trait StorageEngine: Send + Sync {
-    /// Fetch a single node by its structural hash.
+    /// Fetch a single node by its structural hash within a room.
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn get(&self, id: &NodeId) -> Result<Option<NodeData>, StorageError>;
+    fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError>;
 
-    /// Fetch multiple nodes by their structural hashes.
+    /// Fetch multiple nodes by their structural hashes within a room.
     /// Returns results in the same order as the input keys.
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn get_many(&self, ids: &[NodeId]) -> Result<Vec<Option<NodeData>>, StorageError>;
+    fn get_many(
+        &self,
+        room_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError>;
 
-    /// Store a new node. The caller must ensure the node is not already
-    /// present (content-addressed: identical data produces identical hash).
+    /// Store a new node within a room. The caller must ensure the node
+    /// is not already present (content-addressed: identical data produces
+    /// identical hash).
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn put(&self, id: &NodeId, data: &NodeData) -> Result<(), StorageError>;
+    fn put(&self, room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError>;
 
-    /// Store multiple new nodes in a single batch.
+    /// Store multiple new nodes in a single batch within a room.
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn put_many(&self, entries: &[(NodeId, NodeData)]) -> Result<(), StorageError>;
+    fn put_many(
+        &self,
+        room_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError>;
 
     /// Delete all nodes for a given room (range delete).
     ///
@@ -129,6 +143,9 @@ impl From<std::io::Error> for StorageError {
 }
 
 /// In-memory storage engine for tests.
+///
+/// Does not partition by room; all rooms share a single `HashMap`.
+/// Accepts `room_id` parameters for trait conformance but ignores them.
 pub struct InMemoryStorage {
     nodes: RwLock<HashMap<NodeId, NodeData>>,
 }
@@ -149,21 +166,29 @@ impl Default for InMemoryStorage {
 }
 
 impl StorageEngine for InMemoryStorage {
-    fn get(&self, id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+    fn get(&self, _room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
         Ok(self.nodes.read().get(id).cloned())
     }
 
-    fn get_many(&self, ids: &[NodeId]) -> Result<Vec<Option<NodeData>>, StorageError> {
+    fn get_many(
+        &self,
+        _room_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
         let map = self.nodes.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
-    fn put(&self, id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
+    fn put(&self, _room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
         self.nodes.write().insert(*id, data.clone());
         Ok(())
     }
 
-    fn put_many(&self, entries: &[(NodeId, NodeData)]) -> Result<(), StorageError> {
+    fn put_many(
+        &self,
+        _room_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
         let mut map = self.nodes.write();
         for (id, data) in entries {
             map.insert(*id, data.clone());
@@ -185,6 +210,8 @@ impl StorageEngine for InMemoryStorage {
 mod tests {
     use super::*;
 
+    const TEST_ROOM: [u8; 16] = [0x01; 16];
+
     #[test]
     fn test_in_memory_roundtrip() {
         let store = InMemoryStorage::new();
@@ -193,15 +220,15 @@ mod tests {
             bytes: bytes::Bytes::from_static(b"test node data"),
         };
 
-        store.put(&id, &data).unwrap();
-        let fetched = store.get(&id).unwrap().unwrap();
+        store.put(&TEST_ROOM, &id, &data).unwrap();
+        let fetched = store.get(&TEST_ROOM, &id).unwrap().unwrap();
         assert_eq!(fetched.bytes, data.bytes);
     }
 
     #[test]
     fn test_in_memory_not_found() {
         let store = InMemoryStorage::new();
-        assert!(store.get(&[0x00; 16]).unwrap().is_none());
+        assert!(store.get(&TEST_ROOM, &[0x00; 16]).unwrap().is_none());
     }
 
     #[test]
@@ -220,10 +247,10 @@ mod tests {
             })
             .collect();
 
-        store.put_many(&entries).unwrap();
+        store.put_many(&TEST_ROOM, &entries).unwrap();
 
         let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
-        let results = store.get_many(&ids).unwrap();
+        let results = store.get_many(&TEST_ROOM, &ids).unwrap();
         assert_eq!(results.len(), 10);
         for (i, result) in results.iter().enumerate() {
             assert!(result.is_some());

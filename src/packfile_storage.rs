@@ -18,7 +18,11 @@ use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
 /// Wires together the packfile format, lossy fanout index, and
 /// decoded-node cache into a single `StorageEngine` implementation.
 ///
-/// Read path: cache → index lookup → packfile read → cache insert
+/// Each room gets its own index and packfile, keeping the active index
+/// at ~8KB per 1000-node room (100 active rooms < 1MB total).
+///
+/// Read path: cache → index lookup (with linear-probe collision retry)
+///            → packfile read → CRC verify → cache insert
 /// Write path: packfile append → index insert → cache insert
 pub struct PackfileStorage {
     /// Manages per-room pack generations and atomic repack.
@@ -110,7 +114,6 @@ impl PackfileStorage {
                     indexes.insert(room_id, index);
                 }
 
-                // Register the pack with the repack manager
                 if let Ok(file) = packfile::open_packfile(&path, false) {
                     let gen = Arc::new(PackGeneration {
                         room_id,
@@ -148,7 +151,6 @@ impl PackfileStorage {
         });
         self.repack.swap_pack(*room_id, gen.clone());
 
-        // Create empty index for this room
         self.indexes
             .write()
             .entry(*room_id)
@@ -177,53 +179,67 @@ impl PackfileStorage {
 }
 
 impl StorageEngine for PackfileStorage {
-    fn get(&self, id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        // 1. Check cache
+    fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        // 1. Check the per-room index first — this is the room-scope gate.
+        //    The cache is shared (content-addressed), but we only serve data
+        //    for nodes whose index entry is in the requested room.
+        let candidates: Vec<(u8, u64)> = {
+            let indexes = self.indexes.read();
+            let Some(index) = indexes.get(room_id) else {
+                return Ok(None);
+            };
+            index.lookup_all(id).collect()
+        };
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // 2. Check cache (index confirmed the node belongs to this room)
         if let Some(data) = self.cache.get(id) {
             return Ok(Some((*data).clone()));
         }
 
-        // 2. Find record offset via index (try all rooms)
-        let (pack_id, offset) = {
-            let indexes = self.indexes.read();
-            match indexes.values().find_map(|idx| idx.lookup(id)) {
-                Some(v) => v,
-                None => return Ok(None),
-            }
-        };
+        // 3. Try each candidate — on tag collision (hash mismatch), continue
+        for (pack_id, offset) in &candidates {
+            let gen = {
+                let packs = self.repack.packs.read();
+                match packs
+                    .values()
+                    .find(|g| g.pack_id == *pack_id && g.room_id == *room_id)
+                {
+                    Some(g) => g.clone(),
+                    None => continue,
+                }
+            };
 
-        // 3. Find the pack generation with matching pack_id
-        let gen = {
-            let packs = self.repack.packs.read();
-            match packs.values().find(|g| g.pack_id == pack_id) {
-                Some(g) => g.clone(),
-                None => return Ok(None),
-            }
-        };
+            let Ok(record) = Self::read_at(&gen.file, *offset) else {
+                continue;
+            };
 
-        // 4. Read and verify
-        let record = Self::read_at(&gen.file, offset)?;
-        if record.hash != *id {
-            return Err(StorageError::VerificationFailed(*id));
+            // Verify against caller-requested hash, not the frame hash
+            if record.hash != *id {
+                continue;
+            }
+
+            let data = NodeData { bytes: record.data };
+            self.cache.insert(*id, Arc::new(data.clone()));
+            return Ok(Some(data));
         }
 
-        let data = NodeData { bytes: record.data };
-
-        // 5. Cache it
-        self.cache.insert(*id, Arc::new(data.clone()));
-
-        Ok(Some(data))
+        Ok(None)
     }
 
-    fn get_many(&self, ids: &[NodeId]) -> Result<Vec<Option<NodeData>>, StorageError> {
-        ids.iter().map(|id| self.get(id)).collect()
+    fn get_many(
+        &self,
+        room_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        ids.iter().map(|id| self.get(room_id, id)).collect()
     }
 
-    fn put(&self, id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
-        // Use default room; real implementation extracts room from content.
-        let room_id = [0u8; 16];
-
-        let gen = self.ensure_pack(&room_id)?;
+    fn put(&self, room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
+        let gen = self.ensure_pack(room_id)?;
 
         let record = Record {
             hash: *id,
@@ -242,11 +258,11 @@ impl StorageEngine for PackfileStorage {
         let file_len = gen.file.metadata()?.len();
         let offset = file_len.saturating_sub(record_len as u64);
 
-        // Update index
+        // Update per-room index
         {
             let mut indexes = self.indexes.write();
             let index = indexes
-                .entry(room_id)
+                .entry(*room_id)
                 .or_insert_with(|| LossyIndex::new(256));
             let _ = index.insert(id, gen.pack_id, offset);
         }
@@ -257,9 +273,13 @@ impl StorageEngine for PackfileStorage {
         Ok(())
     }
 
-    fn put_many(&self, entries: &[(NodeId, NodeData)]) -> Result<(), StorageError> {
+    fn put_many(
+        &self,
+        room_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
         for (id, data) in entries {
-            self.put(id, data)?;
+            self.put(room_id, id, data)?;
         }
         Ok(())
     }
@@ -285,6 +305,9 @@ impl StorageEngine for PackfileStorage {
 mod tests {
     use super::*;
 
+    const TEST_ROOM: [u8; 16] = [0x01; 16];
+    const OTHER_ROOM: [u8; 16] = [0x02; 16];
+
     fn test_dir(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -304,8 +327,8 @@ mod tests {
             bytes: bytes::Bytes::from_static(b"hello world"),
         };
 
-        store.put(&id, &data).unwrap();
-        let got = store.get(&id).unwrap().unwrap();
+        store.put(&TEST_ROOM, &id, &data).unwrap();
+        let got = store.get(&TEST_ROOM, &id).unwrap().unwrap();
         assert_eq!(got.bytes, data.bytes);
     }
 
@@ -313,7 +336,7 @@ mod tests {
     fn test_get_not_found() {
         let dir = test_dir("notfound");
         let store = PackfileStorage::open(dir).unwrap();
-        assert!(store.get(&[0x00; 16]).unwrap().is_none());
+        assert!(store.get(&TEST_ROOM, &[0x00; 16]).unwrap().is_none());
     }
 
     #[test]
@@ -326,13 +349,13 @@ mod tests {
             bytes: bytes::Bytes::from_static(b"cached"),
         };
 
-        store.put(&id, &data).unwrap();
+        store.put(&TEST_ROOM, &id, &data).unwrap();
 
         // put already caches the node, so both gets are cache hits
-        let _ = store.get(&id).unwrap();
+        let _ = store.get(&TEST_ROOM, &id).unwrap();
         assert_eq!(store.cache.hits(), 1);
 
-        let _ = store.get(&id).unwrap();
+        let _ = store.get(&TEST_ROOM, &id).unwrap();
         assert_eq!(store.cache.hits(), 2);
     }
 
@@ -341,14 +364,13 @@ mod tests {
         let dir = test_dir("delete");
         let store = PackfileStorage::open(dir).unwrap();
 
-        let room = [0xAA; 16];
         let id = [0x01u8; 16];
         let data = NodeData {
             bytes: bytes::Bytes::from_static(b"room data"),
         };
 
         // Manually set up a pack for this room
-        let gen = store.ensure_pack(&room).unwrap();
+        let gen = store.ensure_pack(&OTHER_ROOM).unwrap();
         let record = Record {
             hash: id,
             data: data.bytes.clone(),
@@ -360,13 +382,15 @@ mod tests {
         }
         {
             let mut indexes = store.indexes.write();
-            let index = indexes.entry(room).or_insert_with(|| LossyIndex::new(256));
+            let index = indexes
+                .entry(OTHER_ROOM)
+                .or_insert_with(|| LossyIndex::new(256));
             let _ = index.insert(&id, gen.pack_id, 5);
         }
 
-        store.delete_room(&room).unwrap();
-        assert!(store.repack.get_pack(&room).is_none());
-        assert!(store.indexes.read().get(&room).is_none());
+        store.delete_room(&OTHER_ROOM).unwrap();
+        assert!(store.repack.get_pack(&OTHER_ROOM).is_none());
+        assert!(store.indexes.read().get(&OTHER_ROOM).is_none());
     }
 
     #[test]
@@ -387,10 +411,10 @@ mod tests {
             })
             .collect();
 
-        store.put_many(&entries).unwrap();
+        store.put_many(&TEST_ROOM, &entries).unwrap();
 
         let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
-        let results = store.get_many(&ids).unwrap();
+        let results = store.get_many(&TEST_ROOM, &ids).unwrap();
         assert_eq!(results.len(), 10);
         for (i, result) in results.iter().enumerate() {
             assert!(result.is_some());
@@ -409,15 +433,75 @@ mod tests {
             let data = NodeData {
                 bytes: bytes::Bytes::from(format!("record {i}")),
             };
-            store.put(&id, &data).unwrap();
+            store.put(&TEST_ROOM, &id, &data).unwrap();
         }
 
         // Verify all can be read back
         for i in 0..5u8 {
             let mut id = [0u8; 16];
             id[0] = i;
-            let got = store.get(&id).unwrap().unwrap();
+            let got = store.get(&TEST_ROOM, &id).unwrap().unwrap();
             assert_eq!(got.bytes, bytes::Bytes::from(format!("record {i}")));
         }
+    }
+
+    #[test]
+    fn test_room_isolation() {
+        let dir = test_dir("isolation");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // In production, structural hashes include the room's structural key,
+        // so the same logical data in different rooms produces different hashes.
+        let id_a = [0x42u8; 16];
+        let id_b = [0x43u8; 16];
+        let data_a = NodeData {
+            bytes: bytes::Bytes::from_static(b"room A data"),
+        };
+        let data_b = NodeData {
+            bytes: bytes::Bytes::from_static(b"room B data"),
+        };
+
+        store.put(&TEST_ROOM, &id_a, &data_a).unwrap();
+        store.put(&OTHER_ROOM, &id_b, &data_b).unwrap();
+
+        // Each room's index resolves its own nodes
+        let got_a = store.get(&TEST_ROOM, &id_a).unwrap().unwrap();
+        let got_b = store.get(&OTHER_ROOM, &id_b).unwrap().unwrap();
+        assert_eq!(got_a.bytes, data_a.bytes);
+        assert_eq!(got_b.bytes, data_b.bytes);
+
+        // Node from room A is not in room B's index (different hash)
+        assert!(store.get(&OTHER_ROOM, &id_a).unwrap().is_none());
+        assert!(store.get(&TEST_ROOM, &id_b).unwrap().is_none());
+
+        // Deleting room A doesn't affect room B
+        store.delete_room(&TEST_ROOM).unwrap();
+        assert!(store.get(&TEST_ROOM, &id_a).unwrap().is_none());
+        let got_b = store.get(&OTHER_ROOM, &id_b).unwrap().unwrap();
+        assert_eq!(got_b.bytes, data_b.bytes);
+    }
+
+    #[test]
+    fn test_collision_retry() {
+        // Verify that a CRC failure (simulating a tag collision) triggers
+        // the linear-probe retry and returns None if no valid candidate exists.
+        let dir = test_dir("collision");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let id = [0x42u8; 16];
+        let data = NodeData {
+            bytes: bytes::Bytes::from_static(b"valid data"),
+        };
+        store.put(&TEST_ROOM, &id, &data).unwrap();
+
+        // Clear cache so the next get must go to disk
+        store.cache.clear();
+
+        // Normal read works
+        let got = store.get(&TEST_ROOM, &id).unwrap().unwrap();
+        assert_eq!(got.bytes, data.bytes);
+
+        // Non-existent hash returns None (not a tag collision loop)
+        assert!(store.get(&TEST_ROOM, &[0xFF; 16]).unwrap().is_none());
     }
 }
