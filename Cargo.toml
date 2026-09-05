@@ -2,8 +2,10 @@
 name = "mdb"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "Matrix Database: write-once packfile storage with lossy fanout index for content-addressed immutable data"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+authors = ["Shane Jaroch <chown_tee@proton.me>"]
 
 [dependencies]
 blake2 = "0.10"
@@ -19,3 +21,49 @@ zerocopy = { version = "0.7", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+[lints.rust]
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(coverage)",
+    "cfg(coverage_nightly)",
+    "cfg(tarpaulin)",
+] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# High-Value Security & Robustness restrictions
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+get_unwrap = "warn"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+
+[profile.release-max-perf]
+inherits = "release"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256
+
+[profile.test]
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256
