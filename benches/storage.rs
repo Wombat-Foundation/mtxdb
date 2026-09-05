@@ -276,24 +276,39 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
     fs::create_dir_all(&dir).unwrap();
 
     let dag = DagGenerator::generate(total_events, 0.15, 10);
-    let cache = NodeCache::new(cache_entries);
-    let store =
-        PackfileStorage::open_with_cache(dir.clone(), cache, Some(DagGenerator::parse_children))
-            .unwrap();
+    let traversal = dag.traversal_order();
+    let node_ids: Vec<NodeId> = traversal
+        .iter()
+        .map(|&i| DagGenerator::node_id(i))
+        .collect();
 
     // ── Write phase ──
-    let t_write = Instant::now();
-    for i in 0..dag.len() {
-        let (id, data) = dag.node_data(i);
-        store.put(&ROOM, &id, &data).unwrap();
+    {
+        let cache = NodeCache::new(cache_entries);
+        let store = PackfileStorage::open_with_cache(
+            dir.clone(),
+            cache,
+            Some(DagGenerator::parse_children),
+        )
+        .unwrap();
+        let t_write = Instant::now();
+        for i in 0..dag.len() {
+            let (id, data) = dag.node_data(i);
+            store.put(&ROOM, &id, &data).unwrap();
+        }
+        let write_elapsed = t_write.elapsed();
+        eprintln!(
+            "  Write throughput:    {:.0} events/sec",
+            total_events as f64 / write_elapsed.as_secs_f64()
+        );
     }
-    let write_elapsed = t_write.elapsed();
+    // store dropped here — all file handles closed
     let pack_size = pack_dir_size(&dir);
 
-    // ── Drop page cache (cold read) ──
+    // ── Evict page cache (packfiles now have no open handles) ──
     drop_caches_for_dir(&dir);
 
-    // Verify vmtouch worked
+    // Verify eviction
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             if entry.path().extension().is_some_and(|e| e == "pack") {
@@ -302,7 +317,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
                     .output()
                 {
                     let vmtouch_out = String::from_utf8_lossy(&o.stdout);
-                    if let Some(line) = vmtouch_out.lines().next() {
+                    for line in vmtouch_out.lines() {
                         eprintln!("  vmtouch: {line}");
                     }
                 }
@@ -311,12 +326,11 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
         }
     }
 
-    // ── Read phase (backward traversal, simulates /sync) ──
-    let traversal = dag.traversal_order();
-    let node_ids: Vec<NodeId> = traversal
-        .iter()
-        .map(|&i| DagGenerator::node_id(i))
-        .collect();
+    // ── Read phase (cold) ──
+    let cache = NodeCache::new(cache_entries);
+    let store =
+        PackfileStorage::open_with_cache(dir.clone(), cache, Some(DagGenerator::parse_children))
+            .unwrap();
 
     let io_before = IoStats::read_now();
     let t_read = Instant::now();
@@ -361,10 +375,6 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
     eprintln!("  {label}: {total_events} events, cache={cache_entries} entries");
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  Pack size:           {:.2} MB", pack_size as f64 / 1e6);
-    eprintln!(
-        "  Write throughput:    {:.0} events/sec",
-        total_events as f64 / write_elapsed.as_secs_f64()
-    );
     eprintln!("  Avg edges/event:    {avg_edges:.2}");
     eprintln!("  Total edge refs:    {}", dag.total_edge_refs());
     eprintln!("  ───────────────────────────────────────────────────────────");
