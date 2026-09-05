@@ -230,10 +230,19 @@ mod tests {
         (hash, data, children)
     }
 
+    fn test_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mdb_test_{name}_{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn test_repack_creates_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = RepackManager::new(dir.path().to_path_buf());
+        let dir = test_dir("repack");
+        let manager = RepackManager::new(dir);
 
         let root_id = [3u8; 16];
         let mut nodes = HashMap::new();
@@ -253,11 +262,11 @@ mod tests {
 
     #[test]
     fn test_purge_removes_room() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = RepackManager::new(dir.path().to_path_buf());
+        let dir = test_dir("purge");
+        let manager = RepackManager::new(dir.clone());
 
         // Create a dummy pack generation
-        let path = dir.path().join("test.pack");
+        let path = dir.join("test.pack");
         let file = packfile::open_packfile(&path, true).unwrap();
         let gen = Arc::new(PackGeneration {
             room_id: [0xBB; 16],
