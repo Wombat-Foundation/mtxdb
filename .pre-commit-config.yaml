@@ -10,6 +10,10 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      - id: fix-byte-order-marker
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
       - id: check-yaml
       - id: check-toml
       - id: end-of-file-fixer
@@ -25,3 +29,20 @@ repos:
       - id: typos
         name: commit-msg-typos
         stages: [commit-msg]
+
+  - repo: https://github.com/crate-ci/committed
+    rev: v1.1.11
+    hooks:
+      - id: committed
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --
+        language: system
+        types: [rust]
+        exclude: ^ruma/
+        pass_filenames: false
+        stages:
+          - pre-commit

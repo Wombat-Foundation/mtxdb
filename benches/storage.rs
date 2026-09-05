@@ -6,8 +6,10 @@
     clippy::uninlined_format_args
 )]
 
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use mtxdb::cache::NodeCache;
@@ -64,6 +66,13 @@ impl DagGenerator {
         let mut rng = Rng::new(0xDEAD_BEEF);
         let mut pending_joins: Vec<Vec<usize>> = Vec::new();
 
+        // A small, slowly-rotating pool of "current create/power-levels/
+        // join-rules" events, standing in for the handful of auth events
+        // real Matrix events reference. This is deliberately shallow and
+        // heavily shared — distinct in shape from prev_events, which grows
+        // with every event.
+        let mut auth_pool: Vec<usize> = vec![0];
+
         prev_events.push(vec![]);
         auth_events.push(vec![]);
 
@@ -79,7 +88,11 @@ impl DagGenerator {
             let mut prev = vec![parent];
             prev.extend(extra_prevs);
             prev_events.push(prev);
-            auth_events.push(vec![0]);
+
+            // Reference the room's create event plus one other, more
+            // recently-rotated pool member (e.g. current power levels).
+            let recent = auth_pool[rng.next_u64() as usize % auth_pool.len()];
+            auth_events.push(vec![auth_pool[0], recent]);
             tips[tip_idx] = i;
 
             if rng.f64() < fork_prob && tips.len() < 8 {
@@ -89,6 +102,12 @@ impl DagGenerator {
             if tips.len() > 4 {
                 let orphan = tips.remove(0);
                 pending_joins.push(vec![orphan]);
+            }
+
+            // Power-levels/join-rules changes are rare; rotate the pool
+            // slowly rather than on every event.
+            if i % 1000 == 0 {
+                auth_pool.push(i);
             }
         }
 
@@ -403,6 +422,287 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     }
 }
 
+// ── Synthetic HAMT state trie (root + L1, structural sharing) ───────
+//
+// Fixed depth of 2 (root, then one of 32 L1 buckets) rather than a full
+// log32(N)-deep trie: this matches the "spine" this session already
+// identified as the universally-hot, small part of a real HAMT (root
+// rewritten every write, L1 rewritten roughly every 32nd write), and it's
+// enough to give a state lookup a real depth multiplier (2 reads, not 1)
+// with genuine cross-event sharing on untouched buckets — which is the
+// property that actually matters for these percentages, not modeling
+// arbitrary depth for its own sake.
+const HAMT_BUCKETS: u64 = 32;
+const HAMT_GENESIS: u64 = u64::MAX;
+
+fn hamt_node_id(kind: u8, idx: u64) -> NodeId {
+    let seed = idx ^ (u64::from(kind) << 60) ^ 0xC0FF_EE00_C0FF_EE00;
+    let a = splitmix64(seed);
+    let b = splitmix64(a ^ 0x1357_9BDF_2468_ACE0);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&a.to_le_bytes());
+    id[8..].copy_from_slice(&b.to_le_bytes());
+    id
+}
+
+/// Which event last touched `bucket`, as of event `as_of` (inclusive).
+/// Every event i touches bucket `i % HAMT_BUCKETS`, so the owner is the
+/// largest such i <= as_of — a closed form, no history table needed.
+fn l1_owner(as_of: u64, bucket: u64) -> u64 {
+    if as_of < bucket {
+        HAMT_GENESIS
+    } else {
+        as_of - ((as_of - bucket) % HAMT_BUCKETS)
+    }
+}
+
+// ── Read-intent instrumentation ──────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+enum Intent {
+    /// Fetching an event purely to extract its prev/auth routing.
+    GraphWalk,
+    /// Fetching a HAMT node to navigate the room state trie.
+    StateTrie,
+    /// Fetching an event because its JSON body is actually needed.
+    Timeline,
+}
+
+#[derive(Default)]
+struct IntentStats {
+    calls: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl IntentStats {
+    fn record(&self, len: usize) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Wraps a `PackfileStorage`, tagging every `get` with why it was fetched
+/// so the read budget can be split by intent instead of treated as one
+/// undifferentiated stream of `get()` calls.
+struct InstrumentedStorage {
+    inner: PackfileStorage,
+    graph_walk: IntentStats,
+    state_trie: IntentStats,
+    timeline: IntentStats,
+}
+
+impl InstrumentedStorage {
+    fn new(inner: PackfileStorage) -> Self {
+        Self {
+            inner,
+            graph_walk: IntentStats::default(),
+            state_trie: IntentStats::default(),
+            timeline: IntentStats::default(),
+        }
+    }
+
+    fn get_intent(&self, id: &NodeId, intent: Intent) -> bool {
+        match self.inner.get(&ROOM, id) {
+            Ok(Some(data)) => {
+                let stats = match intent {
+                    Intent::GraphWalk => &self.graph_walk,
+                    Intent::StateTrie => &self.state_trie,
+                    Intent::Timeline => &self.timeline,
+                };
+                stats.record(data.bytes.len());
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Backward auth-chain walk from `start`, bounded by `max_depth`. Real auth
+/// chains are shallow (bounded by how many times power-levels/join-rules
+/// actually changed), so this terminates naturally on the rotating pool
+/// long before `max_depth` matters in practice.
+fn auth_chain(dag: &DagGenerator, start: usize, max_depth: usize) -> HashSet<usize> {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((start, 0usize));
+    visited.insert(start);
+    while let Some((idx, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        for &a in &dag.auth_events[idx] {
+            if visited.insert(a) {
+                queue.push_back((a, depth + 1));
+            }
+        }
+    }
+    visited
+}
+
+/// Simulates a state-resolution-v2-shaped read workload — auth-chain
+/// fork/join edge-chasing plus HAMT descent — instead of a naive linear
+/// scan, and reports what fraction of reads are spent on graph edges vs.
+/// state-trie nodes vs. event bodies. This is the number the DAG-sidecar
+/// vs. materialized-state vs. integration-as-is decision should be made
+/// on, not a guess.
+fn run_intent_benchmark(total_events: usize) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = PathBuf::from(home).join(format!("bmdb_bench_intent_{total_events}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    // fork_prob high enough, join_depth short enough, to guarantee several
+    // divergent tips to reconcile — that's the workload this scenario
+    // exists to exercise.
+    let dag = DagGenerator::generate(total_events, 0.3, 5);
+
+    let store = PackfileStorage::open_with_cache(
+        dir.clone(),
+        NodeCache::new(2000),
+        Some(DagGenerator::parse_children),
+    )
+    .unwrap();
+
+    // Write phase: each event's own node, plus its as-of-that-event HAMT
+    // root and the L1 bucket it touches. See l1_owner: every event i
+    // touches bucket i % HAMT_BUCKETS, so this also writes exactly the
+    // nodes l1_owner will resolve to later.
+    for i in 0..dag.len() {
+        let (id, data) = dag.node_data(i);
+        store.put(&ROOM, &id, &data).unwrap();
+
+        let root_id = hamt_node_id(0, i as u64);
+        store
+            .put(
+                &ROOM,
+                &root_id,
+                &NodeData::new(bytes::Bytes::from_static(b"root")),
+            )
+            .unwrap();
+        let l1_id = hamt_node_id(1, i as u64);
+        store
+            .put(
+                &ROOM,
+                &l1_id,
+                &NodeData::new(bytes::Bytes::from_static(b"l1")),
+            )
+            .unwrap();
+    }
+    // Genesis L1 node for buckets no event has touched yet.
+    store
+        .put(
+            &ROOM,
+            &hamt_node_id(1, HAMT_GENESIS),
+            &NodeData::new(bytes::Bytes::from_static(b"l1-genesis")),
+        )
+        .unwrap();
+
+    store.cache().clear();
+    let inst = InstrumentedStorage::new(store);
+
+    // Reconcile 2+ divergent tips, the way state-res v2 actually shapes
+    // the work: walk each fork's auth chain, compute the auth-difference
+    // (union minus what's common to every fork), then auth-check each
+    // event in that difference against the fork's current state.
+    let tips: Vec<usize> = dag.tips.clone();
+    assert!(tips.len() >= 2, "scenario requires multiple divergent tips");
+
+    let chains: Vec<HashSet<usize>> = tips.iter().map(|&t| auth_chain(&dag, t, 64)).collect();
+
+    for chain in &chains {
+        for &idx in chain {
+            inst.get_intent(&DagGenerator::node_id(idx), Intent::GraphWalk);
+        }
+    }
+
+    let common: HashSet<usize> = chains.iter().skip(1).fold(chains[0].clone(), |acc, c| {
+        acc.intersection(c).copied().collect()
+    });
+    let union: HashSet<usize> = chains.iter().flatten().copied().collect();
+    let auth_difference: Vec<usize> = union.difference(&common).copied().collect();
+
+    for (tip, &tip_idx) in tips.iter().enumerate() {
+        for &idx in &auth_difference {
+            if !chains[tip].contains(&idx) {
+                continue;
+            }
+            inst.get_intent(&DagGenerator::node_id(idx), Intent::Timeline);
+
+            // Auth-check: resolve 2 representative state keys against this
+            // fork's current root — root + L1 bucket, real depth-2 descent.
+            let root_id = hamt_node_id(0, tip_idx as u64);
+            inst.get_intent(&root_id, Intent::StateTrie);
+            for bucket in [0u64, 7u64] {
+                let owner = l1_owner(tip_idx as u64, bucket);
+                inst.get_intent(&hamt_node_id(1, owner), Intent::StateTrie);
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+
+    let graph_calls = inst.graph_walk.calls();
+    let state_calls = inst.state_trie.calls();
+    let timeline_calls = inst.timeline.calls();
+    let total_calls = graph_calls + state_calls + timeline_calls;
+
+    let graph_bytes = inst.graph_walk.bytes();
+    let state_bytes = inst.state_trie.bytes();
+    let timeline_bytes = inst.timeline.bytes();
+    let total_bytes = graph_bytes + state_bytes + timeline_bytes;
+
+    let pct = |part: u64, total: u64| {
+        if total > 0 {
+            part as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
+    };
+
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!(
+        "  READ-INTENT BREAKDOWN ({total_events} events, {} tips)",
+        tips.len()
+    );
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!(
+        "  GraphWalk:  {graph_calls:>6} calls ({:5.1}%)   {graph_bytes:>8} bytes ({:5.1}%)",
+        pct(graph_calls, total_calls),
+        pct(graph_bytes, total_bytes)
+    );
+    eprintln!(
+        "  StateTrie:  {state_calls:>6} calls ({:5.1}%)   {state_bytes:>8} bytes ({:5.1}%)",
+        pct(state_calls, total_calls),
+        pct(state_bytes, total_bytes)
+    );
+    eprintln!(
+        "  Timeline:   {timeline_calls:>6} calls ({:5.1}%)   {timeline_bytes:>8} bytes ({:5.1}%)",
+        pct(timeline_calls, total_calls),
+        pct(timeline_bytes, total_bytes)
+    );
+    eprintln!("  ───────────────────────────────────────────────────────────");
+    eprintln!("  Decide on CALL SHARE, not byte share: on HDD-class media a");
+    eprintln!("  seek costs orders of magnitude more than the bytes it returns");
+    eprintln!("  (see the sequential-vs-random table in the blog post), so a");
+    eprintln!("  fetch of a few tiny HAMT-node bytes costs the same seek as a");
+    eprintln!("  full event body. Byte share is shown for context only — it");
+    eprintln!("  will systematically understate small-payload categories like");
+    eprintln!("  StateTrie relative to their real I/O cost.");
+    eprintln!("  If GraphWalk dominates call share → DAG Sidecar (edge packing)");
+    eprintln!("  If StateTrie dominates call share  → invest in the packfile/index");
+    eprintln!("  If Timeline dominates call share   → neither matters much here");
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!();
+}
+
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
     eprintln!("Note: PackGeneration::Drop deletes packfiles on drop,");
@@ -413,6 +713,8 @@ fn main() {
     run_benchmark("medium", 10_000, 500);
     let large = run_benchmark("large", 100_000, 2_000);
     let pressure = run_benchmark("pressure", 100_000, 100);
+
+    run_intent_benchmark(20_000);
 
     // ── Connectivity check ──
     eprintln!();

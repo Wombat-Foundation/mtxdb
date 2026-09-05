@@ -15,7 +15,6 @@ _help:
 format: check-cargo-sort ##H Format code
 	prettier -w $$(git ls-files '*.md' '*.y*ml')
 	pre-commit run --all-files
-	$(CARGO) fmt
 	$(CARGO) sort --workspace --grouped
 
 .PHONY: check-cargo-sort

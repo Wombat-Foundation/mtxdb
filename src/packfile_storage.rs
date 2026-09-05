@@ -739,6 +739,45 @@ mod tests {
     }
 
     #[test]
+    fn test_read_at_rejects_offset_past_old_mapping() {
+        // Distinct from test_read_survives_append_after_mmap_established:
+        // that test covers the general stale-mmap fix. This test targets
+        // the FIRST bounds check specifically (read_at line ~311):
+        // offset.checked_add(4).map_or(true, |end| end > mem.len()).
+        // We force an mmap at a known small size, then try to read at an
+        // offset that is >= that mapping's length — so offset+4 definitely
+        // exceeds it — without a full frame behind it. This exercises the
+        // attempt-0 branch that drops the guard, remaps, and retries.
+        let dir = test_dir("offset_past_mapping");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Write one record so we have a generation with content.
+        let a = [0xAAu8; 16];
+        let data_a = NodeData::new(bytes::Bytes::from_static(b"aaaa"));
+        store.put(&TEST_ROOM, &a, &data_a).unwrap();
+
+        // Force a disk read of A, which lazily creates the mmap covering
+        // exactly A's frame (length = frame_end of A).
+        let gen = store.repack.get_pack(&TEST_ROOM).unwrap();
+        store.cache().clear();
+        let _ = store.get(&TEST_ROOM, &a).unwrap();
+
+        // The mapping now ends exactly at A's frame_end. The next byte
+        // (A's frame_end) is past the mapping. Try to read at that offset.
+        let file_len = gen.file.metadata().unwrap().len();
+        let past_mapping_offset = file_len; // exactly at EOF, which is past mapping
+
+        // This read should hit the first bounds check (offset+4 > mem.len())
+        // on attempt 0, trigger remap, and on attempt 1 find that the
+        // offset is genuinely at EOF (no record there), failing with Corrupt.
+        let result = PackfileStorage::read_at(&gen, past_mapping_offset);
+        assert!(
+            matches!(result, Err(StorageError::Corrupt(_))),
+            "read at offset past old mapping must surface as Corrupt after remap retry, got {result:?}"
+        );
+    }
+
+    #[test]
     fn test_get_not_found() {
         let dir = test_dir("notfound");
         let store = PackfileStorage::open(dir).unwrap();
