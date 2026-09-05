@@ -32,7 +32,7 @@ pub type ResolverFn = dyn Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>;
 /// - The old pack is unlinked when the last reader releases its Arc.
 pub struct RepackManager {
     /// Per-room pack generations. Room ID → current pack generation.
-    packs: RwLock<HashMap<[u8; 16], Arc<PackGeneration>>>,
+    pub(crate) packs: RwLock<HashMap<[u8; 16], Arc<PackGeneration>>>,
     /// Base directory for pack files.
     base_dir: PathBuf,
 }

@@ -9,34 +9,98 @@ use crate::storage::{NodeData, NodeId};
 /// Maximum number of entries in the node cache.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
-/// An LRU entry tracking access time for eviction.
-#[derive(Debug, Clone)]
-struct CacheEntry {
+/// Index into the intrusive linked list Vec.
+type LinkIdx = u32;
+
+/// Sentinel index meaning "no node".
+const NIL: LinkIdx = u32::MAX;
+
+/// A node in the intrusive doubly-linked list for LRU ordering.
+struct LruNode {
     data: Arc<NodeData>,
-    last_access: u64,
+    key: NodeId,
+    prev: LinkIdx,
+    next: LinkIdx,
 }
 
-/// A verify-once decoded-node cache with pointer swizzling.
+/// The mutable inner state of the LRU cache, protected by a single lock.
+struct LruState {
+    /// Maps `NodeId` → index into the linked list.
+    map: HashMap<NodeId, LinkIdx>,
+    /// Doubly-linked list nodes.
+    nodes: Vec<LruNode>,
+    /// Head of the list (most recently used). NIL if empty.
+    head: LinkIdx,
+    /// Tail of the list (least recently used). NIL if empty.
+    tail: LinkIdx,
+}
+
+impl LruState {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap),
+            nodes: Vec::with_capacity(cap),
+            head: NIL,
+            tail: NIL,
+        }
+    }
+
+    fn move_to_head(&mut self, idx: LinkIdx) {
+        if self.head == idx {
+            return;
+        }
+        let prev = self.nodes[idx as usize].prev;
+        let next = self.nodes[idx as usize].next;
+
+        if prev != NIL {
+            self.nodes[prev as usize].next = next;
+        }
+        if next != NIL {
+            self.nodes[next as usize].prev = prev;
+        }
+        if self.tail == idx {
+            self.tail = prev;
+        }
+
+        self.nodes[idx as usize].prev = NIL;
+        self.nodes[idx as usize].next = self.head;
+        if self.head != NIL {
+            self.nodes[self.head as usize].prev = idx;
+        }
+        self.head = idx;
+        if self.tail == NIL {
+            self.tail = idx;
+        }
+    }
+
+    fn evict_lru(&mut self) {
+        let victim = self.tail;
+        if victim == NIL {
+            return;
+        }
+        let victim_prev = self.nodes[victim as usize].prev;
+        let victim_key = self.nodes[victim as usize].key;
+
+        if victim_prev != NIL {
+            self.nodes[victim_prev as usize].next = NIL;
+        }
+        self.tail = victim_prev;
+        if self.head == victim {
+            self.head = NIL;
+        }
+
+        self.map.remove(&victim_key);
+    }
+}
+
+/// A verify-once decoded-node cache with O(1) LRU eviction.
 ///
-/// Design principles from docs:
-/// - Stores `Arc<NodeData>`, never raw bytes. This enforces that all
-///   cache entries have been verified (`decode_v1_verified` is the only
-///   way to produce a `NodeData` from storage bytes).
-/// - Byte-bounded LRU eviction to prevent OOM.
-/// - Pointer swizzling: when a parent node's children are also resident,
-///   the parent can hold direct `Arc` references to them instead of
-///   re-hashing on each traversal.
-/// - Pinned prefix: for active rooms, the top ~33 nodes (L0+L1) are
-///   pinned and never evicted.
+/// Uses an intrusive doubly-linked list (Vec-backed, index-based)
+/// for O(1) access/eviction without external dependencies or unsafe.
 pub struct NodeCache {
-    entries: RwLock<HashMap<NodeId, CacheEntry>>,
-    /// Monotonic counter for LRU ordering.
-    counter: AtomicU64,
-    /// Maximum number of entries.
+    state: RwLock<LruState>,
     max_entries: usize,
-    /// Number of cache hits (for metrics).
     hits: AtomicU64,
-    /// Number of cache misses (for metrics).
     misses: AtomicU64,
 }
 
@@ -44,8 +108,7 @@ impl NodeCache {
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: RwLock::new(HashMap::with_capacity(max_entries)),
-            counter: AtomicU64::new(0),
+            state: RwLock::new(LruState::with_capacity(max_entries)),
             max_entries,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -60,62 +123,88 @@ impl NodeCache {
     /// Look up a node by its structural hash.
     /// Returns `None` if the node is not cached.
     pub fn get(&self, id: &NodeId) -> Option<Arc<NodeData>> {
-        let mut map = self.entries.write();
-        if let Some(entry) = map.get_mut(id) {
-            entry.last_access = self.counter.fetch_add(1, Ordering::Relaxed);
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(entry.data.clone())
-        } else {
+        let mut state = self.state.write();
+        let Some(&idx) = state.map.get(id) else {
+            drop(state);
             self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+            return None;
+        };
+        let data = state.nodes[idx as usize].data.clone();
+        state.move_to_head(idx);
+        drop(state);
+
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(data)
     }
 
     /// Insert a node into the cache.
     /// If the cache is full, evicts the least recently accessed entry.
+    ///
+    /// # Panics
+    /// Panics if the cache exceeds `u32::MAX` entries (impractical).
     pub fn insert(&self, id: NodeId, data: Arc<NodeData>) {
-        let now = self.counter.fetch_add(1, Ordering::Relaxed);
-        let mut map = self.entries.write();
+        let mut state = self.state.write();
 
-        // If already present, update
-        if let Some(entry) = map.get_mut(&id) {
-            entry.data = data;
-            entry.last_access = now;
+        if let Some(&idx) = state.map.get(&id) {
+            state.nodes[idx as usize].data = data;
+            state.move_to_head(idx);
             return;
         }
 
-        // Evict if full
-        if map.len() >= self.max_entries {
-            if let Some(evict_id) = map
-                .iter()
-                .min_by_key(|(_, e)| e.last_access)
-                .map(|(id, _)| *id)
-            {
-                map.remove(&evict_id);
-            }
+        if state.map.len() >= self.max_entries {
+            state.evict_lru();
         }
 
-        map.insert(
-            id,
-            CacheEntry {
-                data,
-                last_access: now,
-            },
-        );
+        let idx = LinkIdx::try_from(state.nodes.len()).expect("cache exceeds u32::MAX entries");
+        let new_node = LruNode {
+            data,
+            key: id,
+            prev: NIL,
+            next: state.head,
+        };
+        state.nodes.push(new_node);
+        if state.head != NIL {
+            let head = state.head as usize;
+            state.nodes[head].prev = idx;
+        }
+        state.head = idx;
+        if state.tail == NIL {
+            state.tail = idx;
+        }
+        state.map.insert(id, idx);
     }
 
     /// Remove a node from the cache.
     pub fn remove(&self, id: &NodeId) -> Option<Arc<NodeData>> {
-        self.entries.write().remove(id).map(|e| e.data)
+        let mut state = self.state.write();
+        let idx = state.map.remove(id)?;
+        let data = state.nodes[idx as usize].data.clone();
+
+        let prev = state.nodes[idx as usize].prev;
+        let next = state.nodes[idx as usize].next;
+        if prev != NIL {
+            state.nodes[prev as usize].next = next;
+        }
+        if next != NIL {
+            state.nodes[next as usize].prev = prev;
+        }
+        if state.head == idx {
+            state.head = next;
+        }
+        if state.tail == idx {
+            state.tail = prev;
+        }
+
+        Some(data)
     }
 
     /// Number of entries currently cached.
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.state.read().map.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
+        self.state.read().map.is_empty()
     }
 
     /// Cache hit count.
@@ -144,7 +233,10 @@ impl NodeCache {
 
     /// Clear all entries.
     pub fn clear(&self) {
-        self.entries.write().clear();
+        let mut state = self.state.write();
+        state.map.clear();
+        state.head = NIL;
+        state.tail = NIL;
     }
 }
 
@@ -155,10 +247,6 @@ impl NodeCache {
 /// - Level 1: up to 32 nodes
 ///
 /// Total: ~33 nodes, ~17KB per room.
-///
-/// Swizzling within the pinned set is free: children that are also
-/// pinned can be resolved to direct `Arc` references, eliminating
-/// hash lookups on traversal.
 pub struct PinnedNodes {
     nodes: RwLock<HashMap<NodeId, Arc<NodeData>>>,
 }
@@ -242,12 +330,33 @@ mod tests {
             cache.insert(*id, test_data(&format!("node {i}")));
         }
 
-        // First entry should be evicted
         assert!(cache.get(&ids[0]).is_none());
-        // Others should still be there
         assert!(cache.get(&ids[1]).is_some());
         assert!(cache.get(&ids[2]).is_some());
         assert!(cache.get(&ids[3]).is_some());
+    }
+
+    #[test]
+    fn test_lru_access_refreshes() {
+        let cache = NodeCache::new(3);
+        let a = [1u8; 16];
+        let b = [2u8; 16];
+        let c = [3u8; 16];
+        let d = [4u8; 16];
+
+        cache.insert(a, test_data("a"));
+        cache.insert(b, test_data("b"));
+        cache.insert(c, test_data("c"));
+
+        // Access a to make it recently used
+        cache.get(&a);
+
+        // Insert d — should evict b (least recently used), not a
+        cache.insert(d, test_data("d"));
+        assert!(cache.get(&a).is_some());
+        assert!(cache.get(&b).is_none());
+        assert!(cache.get(&c).is_some());
+        assert!(cache.get(&d).is_some());
     }
 
     #[test]
@@ -272,8 +381,18 @@ mod tests {
         let data = test_data("pinned");
 
         assert!(pinned.pin(id, data.clone()));
-        assert!(!pinned.pin(id, test_data("other"))); // already pinned
+        assert!(!pinned.pin(id, test_data("other")));
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned.get(&id).unwrap().bytes, data.bytes);
+    }
+
+    #[test]
+    fn test_remove() {
+        let cache = NodeCache::new(10);
+        let id = [0x01u8; 16];
+        cache.insert(id, test_data("data"));
+        assert!(cache.remove(&id).is_some());
+        assert!(cache.get(&id).is_none());
+        assert!(cache.is_empty());
     }
 }

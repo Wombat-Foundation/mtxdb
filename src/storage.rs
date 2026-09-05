@@ -16,32 +16,34 @@ pub struct NodeData {
 ///
 /// This is the swizzling enum inspired by `LeanStore`:
 /// - `Lazy(id)`: the node is on disk, identified by its hash.
-/// - `Resolved(data)`: the node is in memory, ready for use.
+/// - `Resolved(hash, data)`: the node is in memory, ready for use,
+///   with its structural hash stored alongside.
 #[derive(Debug, Clone)]
 pub enum NodeRef {
     Lazy(NodeId),
-    Resolved(Arc<NodeData>),
+    Resolved(NodeId, Arc<NodeData>),
 }
 
 impl NodeRef {
     #[must_use]
     pub fn structural_hash(&self) -> &NodeId {
         match self {
-            NodeRef::Lazy(id) => id,
-            NodeRef::Resolved(_data) => {
-                // For resolved nodes, the hash is derived from the data.
-                // In practice, the caller already knows the hash.
-                // This is a placeholder — the real system would store
-                // the hash alongside the data.
-                unresolved_hash()
-            }
+            Self::Lazy(id) | Self::Resolved(id, _) => id,
         }
     }
-}
 
-fn unresolved_hash() -> &'static NodeId {
-    static ZERO: NodeId = [0u8; 16];
-    &ZERO
+    #[must_use]
+    pub fn data(&self) -> Option<&Arc<NodeData>> {
+        match self {
+            Self::Lazy(_) => None,
+            Self::Resolved(_, data) => Some(data),
+        }
+    }
+
+    #[must_use]
+    pub fn is_resolved(&self) -> bool {
+        matches!(self, Self::Resolved(..))
+    }
 }
 
 /// The storage engine trait. Abstracts the backend so the packfile,
@@ -227,5 +229,28 @@ mod tests {
             assert!(result.is_some());
             assert_eq!(result.as_ref().unwrap().bytes, entries[i].1.bytes);
         }
+    }
+
+    #[test]
+    fn test_node_ref_resolved_carries_hash() {
+        let id = [0xAAu8; 16];
+        let data = Arc::new(NodeData {
+            bytes: bytes::Bytes::from_static(b"hello"),
+        });
+        let r#ref = NodeRef::Resolved(id, data.clone());
+
+        assert!(r#ref.is_resolved());
+        assert_eq!(r#ref.structural_hash(), &id);
+        assert_eq!(r#ref.data().unwrap().bytes, data.bytes);
+    }
+
+    #[test]
+    fn test_node_ref_lazy() {
+        let id = [0xBBu8; 16];
+        let r#ref = NodeRef::Lazy(id);
+
+        assert!(!r#ref.is_resolved());
+        assert_eq!(r#ref.structural_hash(), &id);
+        assert!(r#ref.data().is_none());
     }
 }

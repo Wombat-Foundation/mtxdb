@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::storage::{NodeData, NodeId, StorageEngine};
 
 /// Represents a batch of independent node hashes to fetch at one BFS level.
@@ -69,13 +71,16 @@ pub fn fetch_frontier_concurrent<S: StorageEngine>(
 /// A BFS layer of the HAMT trie traversal.
 ///
 /// Represents one level of the trie: a set of child hashes at the same
-/// depth, all to be fetched in parallel.
+/// depth, all to be fetched in parallel. Uses a `HashSet` for O(1)
+/// dedup on insert.
 #[derive(Debug)]
 pub struct BfsLayer {
     /// The hashes at this level.
     pub hashes: Vec<NodeId>,
     /// For each hash, which target keys are waiting on it.
     pub dependents: Vec<Vec<NodeId>>,
+    /// O(1) dedup: maps hash → index into `hashes`.
+    seen: HashMap<NodeId, usize>,
 }
 
 impl BfsLayer {
@@ -84,15 +89,18 @@ impl BfsLayer {
         Self {
             hashes: Vec::new(),
             dependents: Vec::new(),
+            seen: HashMap::new(),
         }
     }
 
     pub fn push(&mut self, hash: NodeId, dependent: NodeId) {
-        if let Some(pos) = self.hashes.iter().position(|h| *h == hash) {
+        if let Some(&pos) = self.seen.get(&hash) {
             self.dependents[pos].push(dependent);
         } else {
+            let pos = self.hashes.len();
             self.hashes.push(hash);
             self.dependents.push(vec![dependent]);
+            self.seen.insert(hash, pos);
         }
     }
 }
