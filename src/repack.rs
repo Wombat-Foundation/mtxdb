@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -199,13 +198,7 @@ impl RepackManager {
     }
 
     fn pack_path(&self, room_id: &[u8; 16], pack_id: u8) -> PathBuf {
-        let hex: String = room_id
-            .iter()
-            .fold(String::with_capacity(32), |mut acc, &b| {
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        self.base_dir.join(format!("{hex}_{pack_id:02x}.pack"))
+        packfile::pack_path(&self.base_dir, room_id, pack_id)
     }
 }
 

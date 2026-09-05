@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::fs;
 use std::io::Seek;
 use std::path::{Path, PathBuf};
@@ -389,13 +388,7 @@ impl PackfileStorage {
     }
 
     fn pack_path(&self, room_id: &[u8; 16], pack_id: u8) -> PathBuf {
-        let hex: String = room_id
-            .iter()
-            .fold(String::with_capacity(32), |mut acc, &b| {
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        self.base_dir.join(format!("{hex}_{pack_id:02x}.pack"))
+        packfile::pack_path(&self.base_dir, room_id, pack_id)
     }
 
     /// Read a record at the given offset from a memory-mapped packfile.
@@ -1114,7 +1107,11 @@ mod tests {
 
         let id = [0x01u8; 16];
         store
-            .put(&OTHER_ROOM, &id, &NodeData::new(bytes::Bytes::from_static(b"x")))
+            .put(
+                &OTHER_ROOM,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"x")),
+            )
             .unwrap();
         store.set_live_roots(&OTHER_ROOM, vec![id]);
         assert!(store.live_roots.read().contains_key(&OTHER_ROOM));

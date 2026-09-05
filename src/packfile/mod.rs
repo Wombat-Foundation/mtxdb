@@ -227,6 +227,23 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<bool> {
     Ok(buf[..4] == MAGIC && buf[4] == 0x01)
 }
 
+/// The on-disk path for a room's packfile generation: `<base_dir>/<32-hex
+/// room_id>_<2-hex pack_id>.pack`. The single source of this naming
+/// convention — `PackfileStorage` and `RepackManager` both need it and must
+/// agree on it exactly, since `PackfileStorage::scan_existing` parses this
+/// same format back out of existing filenames on startup.
+#[must_use]
+pub fn pack_path(base_dir: &Path, room_id: &[u8; 16], pack_id: u8) -> PathBuf {
+    use std::fmt::Write as _;
+    let hex: String = room_id
+        .iter()
+        .fold(String::with_capacity(32), |mut acc, &b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+    base_dir.join(format!("{hex}_{pack_id:02x}.pack"))
+}
+
 /// Open or create a packfile, writing the header if it's new.
 ///
 /// # Errors
