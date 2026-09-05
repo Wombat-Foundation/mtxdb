@@ -1,7 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use bytes::Bytes;
 use memmap2::Mmap;

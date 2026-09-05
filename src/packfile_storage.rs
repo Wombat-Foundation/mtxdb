@@ -3,9 +3,8 @@ use std::fmt::Write;
 use std::fs;
 use std::io::Seek;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use memmap2::Mmap;
 use parking_lot::RwLock;
 
 use crate::cache::{NodeCache, PinnedNodes};
@@ -291,13 +290,17 @@ impl PackfileStorage {
     /// self-healing keeps the mmap bounded-correct so appends written after
     /// a read are never silently invisible.
     fn read_at(gen: &PackGeneration, offset: u64) -> Result<Record, StorageError> {
-        // Fast path: read from the mapped bytes. Remap when the file has
-        // grown past the current mapping's end and retry.
-        for _ in 0..2 {
+        // Fast path: read from the mapped bytes. If the record's frame lies
+        // beyond the current mapping (the active generation grew after the
+        // existing map was created), drop the read guard, remap to the file's
+        // current length, and retry once. Remap is bounded to one retry, so a
+        // genuinely truncated frame still surfaces as `Corrupt` rather than
+        // an unbounded remap loop.
+        for attempt in 0..2 {
             let guard = gen.mmap().map_err(StorageError::Io)?;
             let Some(mem) = guard.as_deref() else {
-                return Err(StorageError::Io(io::Error::new(
-                    io::ErrorKind::Unsupported,
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
                     "packfile could not be mapped",
                 )));
             };
@@ -306,7 +309,12 @@ impl PackfileStorage {
                 .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
 
             if offset.checked_add(4).map_or(true, |end| end > mem.len()) {
-                break;
+                if attempt == 0 {
+                    drop(guard);
+                    Self::remap_mapping(gen)?;
+                    continue;
+                }
+                return Err(StorageError::Corrupt("truncated length prefix".into()));
             }
 
             let prefix_end = offset.wrapping_add(4);
@@ -324,7 +332,12 @@ impl PackfileStorage {
             let frame_end = crc_pos.wrapping_add(4);
 
             if frame_end > mem.len() {
-                break;
+                if attempt == 0 {
+                    drop(guard);
+                    Self::remap_mapping(gen)?;
+                    continue;
+                }
+                return Err(StorageError::Corrupt("truncated frame".into()));
             }
 
             let payload = &mem[prefix_end..crc_pos];
@@ -341,82 +354,29 @@ impl PackfileStorage {
                 )));
             }
 
+            // Copy the payload out of the mmap before releasing the guard;
+            // the mapping may be remapped by a concurrent append.
             let mut hash = [0u8; 16];
             hash.copy_from_slice(&payload[..16]);
             let data = bytes::Bytes::copy_from_slice(&payload[16..]);
 
             return Ok(Record { hash, data });
         }
-
-        // Slow path: the mapping was too small. Remap to the file's current
-        // size (it grew via appends) and retry once. If it *still* doesn't
-        // fit the (now current) mapping, the offset is genuinely past EOF and
-        // we surface a real "truncated frame" error — never a silent Ok(None).
-        let file_len = gen.file.metadata().map_err(StorageError::Io)?.len();
-        {
-            let mut guard = gen.mmap.write();
-            if guard.as_ref().map_or(true, |m| m.len() as u64 < file_len) {
-                *guard = Some(crate::packfile::map_pack(&gen.file).map_err(StorageError::Io)?);
-            }
-        }
-        Self::read_at_impl(gen, offset)
+        unreachable!("read_at remap-retry is bounded to two iterations")
     }
 
-    /// Parsing core shared by the mmap fast path and the post-remap retry.
-    /// Returns `Ok(None)` when `offset` is genuinely past the end of `mem`.
-    fn read_at_impl(gen: &PackGeneration, offset: u64) -> Result<Option<Record>, StorageError> {
-        let guard = gen.mmap().map_err(StorageError::Io)?;
-        let Some(mem) = guard.as_deref() else {
-            return Err(StorageError::Io(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "packfile could not be mapped",
-            )));
-        };
-
-        let offset = usize::try_from(offset)
-            .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
-
-        if offset.checked_add(4).map_or(true, |end| end > mem.len()) {
-            return Ok(None);
+    /// Re-map `gen`'s packfile to its current on-disk length.
+    ///
+    /// This is the self-healing path: the active generation accumulates
+    /// appends after the initial mapping, and reads must see those appends
+    /// rather than silently treating them as truncated/unreadable.
+    fn remap_mapping(gen: &PackGeneration) -> Result<(), StorageError> {
+        let file_len = gen.file.metadata().map_err(StorageError::Io)?.len();
+        let mut guard = gen.mmap.write();
+        if guard.as_ref().map_or(true, |m| (m.len() as u64) < file_len) {
+            *guard = Some(crate::packfile::map_pack(&gen.file).map_err(StorageError::Io)?);
         }
-
-        let prefix_end = offset.wrapping_add(4);
-        let payload_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
-        let payload_len = u32::from_le_bytes(payload_len_bytes);
-
-        if payload_len == 0 || payload_len > packfile::MAX_RECORD_LEN {
-            return Err(StorageError::Corrupt(format!(
-                "invalid record length: {payload_len}"
-            )));
-        }
-
-        let payload_len_usize = payload_len as usize;
-        let crc_pos = prefix_end.wrapping_add(payload_len_usize);
-        let frame_end = crc_pos.wrapping_add(4);
-
-        if frame_end > mem.len() {
-            return Ok(None);
-        }
-
-        let payload = &mem[prefix_end..crc_pos];
-        let crc_buf: [u8; 4] = mem[crc_pos..frame_end].try_into().unwrap();
-
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&payload_len_bytes);
-        crc.update(payload);
-        let expected = crc.finalize();
-        let actual = u32::from_le_bytes(crc_buf);
-        if expected != actual {
-            return Err(StorageError::Corrupt(format!(
-                "CRC mismatch: expected {expected:08x}, got {actual:08x}"
-            )));
-        }
-
-        let mut hash = [u0u8; 16];
-        hash.copy_from_slice(&payload[..16]);
-        let data = bytes::Bytes::copy_from_slice(&payload[16..]);
-
-        Ok(Some(Record { hash, data }))
+        Ok(())
     }
 
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
@@ -454,32 +414,19 @@ impl PackfileStorage {
 
         Ok(Some(NodeRef::Resolved(*id, Arc::new(data))))
     }
-}
 
-impl StorageEngine for PackfileStorage {
-    fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        // 1. Check the per-room index first — this is the room-scope gate.
-        //    The cache is shared (content-addressed), but we only serve data
-        //    for nodes whose index entry is in the requested room.
-        let candidates: Vec<(u8, u64)> = {
-            let indexes = self.indexes.read();
-            let Some(index) = indexes.get(room_id) else {
-                return Ok(None);
-            };
-            index.lookup_all(id).collect()
-        };
-
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-
-        // 2. Check cache (index confirmed the node belongs to this room)
-        if let Some(data) = self.cache.get(id) {
-            return Ok(Some((*data).clone()));
-        }
-
-        // 3. Try each candidate — on tag collision (hash mismatch), continue
-        for (pack_id, offset) in &candidates {
+    /// Try each `(pack_id, offset)` candidate in order, verifying against
+    /// `id`'s full hash — on tag collision, continue to the next candidate.
+    /// This is the shared tail of `get()`'s lookup, factored out so
+    /// `get_many` can supply candidates it already resolved (and sorted by
+    /// offset) instead of re-deriving them per call.
+    fn resolve_from_candidates(
+        &self,
+        room_id: &[u8; 16],
+        id: &NodeId,
+        candidates: &[(u8, u64)],
+    ) -> Option<NodeData> {
+        for (pack_id, offset) in candidates {
             let gen = {
                 let packs = self.repack.packs.read();
                 match packs
@@ -516,10 +463,36 @@ impl StorageEngine for PackfileStorage {
                 children,
             };
             self.cache.insert(*id, Arc::new(data.clone()));
-            return Ok(Some(data));
+            return Some(data);
         }
 
-        Ok(None)
+        None
+    }
+}
+
+impl StorageEngine for PackfileStorage {
+    fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        // 1. Check the per-room index first — this is the room-scope gate.
+        //    The cache is shared (content-addressed), but we only serve data
+        //    for nodes whose index entry is in the requested room.
+        let candidates: Vec<(u8, u64)> = {
+            let indexes = self.indexes.read();
+            let Some(index) = indexes.get(room_id) else {
+                return Ok(None);
+            };
+            index.lookup_all(id).collect()
+        };
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // 2. Check cache (index confirmed the node belongs to this room)
+        if let Some(data) = self.cache.get(id) {
+            return Ok(Some((*data).clone()));
+        }
+
+        Ok(self.resolve_from_candidates(room_id, id, &candidates))
     }
 
     fn get_many(
@@ -527,7 +500,44 @@ impl StorageEngine for PackfileStorage {
         room_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        ids.iter().map(|id| self.get(room_id, id)).collect()
+        let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
+
+        // Phase 1: resolve cache hits and index candidates for the rest, all
+        // in-RAM (no disk I/O yet). Keep the *full* candidate list per id
+        // (not just the first) so a tag collision on the first candidate
+        // still falls back to the rest, exactly as `get()` does — only the
+        // *order in which ids are visited* is driven by the first
+        // candidate's offset, not correctness.
+        let mut to_fetch: Vec<(usize, Vec<(u8, u64)>)> = Vec::new();
+        {
+            let indexes = self.indexes.read();
+            let index = indexes.get(room_id);
+            for (i, id) in ids.iter().enumerate() {
+                if let Some(data) = self.cache.get(id) {
+                    results[i] = Some((*data).clone());
+                    continue;
+                }
+                if let Some(index) = index {
+                    let candidates: Vec<(u8, u64)> = index.lookup_all(id).collect();
+                    if !candidates.is_empty() {
+                        to_fetch.push((i, candidates));
+                    }
+                }
+            }
+        }
+
+        // Phase 2: sort by the first candidate's physical offset so disk
+        // access is monotonic instead of scattered in the caller's
+        // requested order.
+        to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
+
+        // Phase 3: fetch in sorted order, reusing the already-resolved
+        // candidates directly — no second index lookup per id.
+        for (i, candidates) in &to_fetch {
+            results[*i] = self.resolve_from_candidates(room_id, &ids[*i], candidates);
+        }
+
+        Ok(results)
     }
 
     fn put(&self, room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
@@ -537,18 +547,22 @@ impl StorageEngine for PackfileStorage {
             hash: *id,
             data: data.bytes.clone(),
         };
-        let record_len = record.serialized_len();
 
-        // Append to packfile
-        {
+        // Capture the offset from the same seek that positions this write,
+        // on the same handle that performs it — not from a separate
+        // metadata().len() call afterward. The previous approach computed
+        // offset = file_len - record_len using gen.file's length queried
+        // after the write completed; under any future concurrent-writer
+        // scenario for the same room, another append landing between the
+        // write and that metadata() call would corrupt the computed offset
+        // for this record. Seeking to end returns the position the write
+        // will land at, on this same cloned handle, atomically with intent.
+        let offset = {
             let mut file = gen.file.try_clone()?;
-            file.seek(std::io::SeekFrom::End(0))?;
+            let offset = file.seek(std::io::SeekFrom::End(0))?;
             packfile::write_record(&mut file, &record)?;
-        }
-
-        // Calculate offset: end of file minus record length
-        let file_len = gen.file.metadata()?.len();
-        let offset = file_len.saturating_sub(record_len as u64);
+            offset
+        };
 
         // Update per-room index
         let index_full = {
@@ -639,6 +653,45 @@ mod tests {
     }
 
     #[test]
+    fn test_read_survives_append_after_mmap_established() {
+        // Regression test for the stale-mmap bug: put(A), get(A) (which
+        // lazily creates/caches the mmap at its length at that moment), then
+        // put(B) on the SAME generation, then get(B). Before the
+        // RwLock<Option<Mmap>> self-healing fix, the cached mapping never
+        // grew past A's length, so B's bytes fell outside it and get(B)
+        // silently returned Ok(None) even though B was correctly written
+        // and indexed.
+        let dir = test_dir("stale_mmap_regression");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let a = [0xAAu8; 16];
+        let b = [0xBBu8; 16];
+        let data_a = NodeData::new(bytes::Bytes::from_static(b"aaaa"));
+        let data_b = NodeData::new(bytes::Bytes::from_static(b"bbbb"));
+
+        store.put(&TEST_ROOM, &a, &data_a).unwrap();
+
+        // Force a disk read of A, which lazily creates the mmap for this
+        // generation at its current (pre-B) length.
+        store.cache().clear();
+        let got_a = store.get(&TEST_ROOM, &a).unwrap();
+        assert_eq!(got_a.unwrap().bytes, data_a.bytes);
+
+        // Append B to the SAME generation, after the mmap was established.
+        store.put(&TEST_ROOM, &b, &data_b).unwrap();
+
+        // B must be readable — not silently "not found".
+        store.cache().clear();
+        let got_b = store.get(&TEST_ROOM, &b).unwrap();
+        assert_eq!(
+            got_b
+                .expect("B must be found: it was written after the mmap was established")
+                .bytes,
+            data_b.bytes
+        );
+    }
+
+    #[test]
     fn test_get_not_found() {
         let dir = test_dir("notfound");
         let store = PackfileStorage::open(dir).unwrap();
@@ -716,6 +769,44 @@ mod tests {
         for (i, result) in results.iter().enumerate() {
             assert!(result.is_some());
             assert_eq!(result.as_ref().unwrap().bytes, entries[i].1.bytes);
+        }
+    }
+
+    #[test]
+    fn test_get_many_preserves_caller_order_despite_sorted_reads() {
+        // get_many sorts candidates by physical offset internally to keep
+        // disk access monotonic, but the returned Vec must still match the
+        // caller's requested id order — not the internal read order.
+        let dir = test_dir("batch_order");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let entries: Vec<(NodeId, NodeData)> = (0..10u8)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = i;
+                (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
+            })
+            .collect();
+
+        // Written in ascending order, so physical offsets are ascending too.
+        store.put_many(&TEST_ROOM, &entries).unwrap();
+
+        // Request them in REVERSED order — internal sort-then-read will
+        // visit them ascending-by-offset (the opposite of this request
+        // order), so this only passes if the results are reassembled back
+        // into the caller's order rather than left in read order.
+        let mut reversed_ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
+        reversed_ids.reverse();
+
+        let results = store.get_many(&TEST_ROOM, &reversed_ids).unwrap();
+        assert_eq!(results.len(), 10);
+        for (i, id) in reversed_ids.iter().enumerate() {
+            let expected = &entries.iter().find(|(eid, _)| eid == id).unwrap().1;
+            assert_eq!(
+                results[i].as_ref().expect("record must be found").bytes,
+                expected.bytes,
+                "result at position {i} must match the id requested at that position"
+            );
         }
     }
 

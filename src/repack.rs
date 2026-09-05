@@ -3,7 +3,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
