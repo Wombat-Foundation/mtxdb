@@ -250,17 +250,35 @@ impl LossyIndex {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum InsertError {
-    #[error("index table too full")]
     TableFull,
 }
 
-#[derive(Debug, thiserror::Error)]
+impl std::fmt::Display for InsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TableFull => write!(f, "index table too full"),
+        }
+    }
+}
+
+impl std::error::Error for InsertError {}
+
+#[derive(Debug)]
 pub enum DeserializationError {
-    #[error("data too short")]
     TooShort,
 }
+
+impl std::fmt::Display for DeserializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => write!(f, "data too short"),
+        }
+    }
+}
+
+impl std::error::Error for DeserializationError {}
 
 #[cfg(test)]
 mod tests {

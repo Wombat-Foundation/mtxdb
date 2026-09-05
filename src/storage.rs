@@ -90,22 +90,40 @@ pub trait StorageEngine: Send + Sync {
     fn sync(&self) -> Result<(), StorageError>;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum StorageError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("node not found: {0:?}")]
+    Io(std::io::Error),
     NotFound(NodeId),
-
-    #[error("verification failed for node {0:?}")]
     VerificationFailed(NodeId),
-
-    #[error("corrupt data: {0}")]
     Corrupt(String),
-
-    #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::NotFound(id) => write!(f, "node not found: {id:?}"),
+            Self::VerificationFailed(id) => write!(f, "verification failed for node {id:?}"),
+            Self::Corrupt(msg) => write!(f, "corrupt data: {msg}"),
+            Self::Internal(msg) => write!(f, "internal error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 /// In-memory storage engine for tests.

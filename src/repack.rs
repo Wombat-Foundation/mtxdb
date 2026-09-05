@@ -177,16 +177,36 @@ impl RepackManager {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum RepackError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("resolver returned no data for root hash")]
+    Io(std::io::Error),
     RootNotFound,
-
-    #[error("room not found")]
     RoomNotFound,
+}
+
+impl std::fmt::Display for RepackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::RootNotFound => write!(f, "resolver returned no data for root hash"),
+            Self::RoomNotFound => write!(f, "room not found"),
+        }
+    }
+}
+
+impl std::error::Error for RepackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for RepackError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 #[cfg(test)]
