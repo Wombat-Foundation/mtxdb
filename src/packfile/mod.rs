@@ -1,8 +1,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use bytes::Bytes;
+use memmap2::Mmap;
 
 /// Magic bytes identifying an mdb packfile: "MDB1"
 pub const MAGIC: [u8; 4] = *b"MDB1";
@@ -47,6 +49,51 @@ pub struct PackGeneration {
     pub pack_id: u8,
     pub file: File,
     pub path: PathBuf,
+    pub(crate) mmap: OnceLock<io::Result<Mmap>>,
+}
+
+impl PackGeneration {
+    /// Get or create the memory-mapped view of this packfile.
+    ///
+    /// The mmap is lazily created on first access and cached (including
+    /// failures) for subsequent calls. This enables zero-syscall reads
+    /// for the hot path.
+    pub fn mmap(&self) -> io::Result<&Mmap> {
+        let cached = self.mmap.get_or_init(|| map_pack(&self.file));
+        match cached {
+            Ok(m) => Ok(m),
+            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+        }
+    }
+}
+
+/// Scaffold `Mmap::map`, isolating the single unsafe call in this crate.
+///
+/// # Safety
+/// This is the only `unsafe` block in the codebase, and it is sound for the
+/// following reasons:
+///
+/// 1. **No concurrent mutation.** A packfile's contents are write-once. All
+///    appends serialize through `put()`/`put_many()` on `PackfileStorage`,
+///    which complete before any reader can obtain the mmap (the mmap is
+///    created lazily on first read, which only happens after the write phase
+///    in the benchmark harness; in real use, reading a `PackGeneration`
+///    implies its writer finished appending that generation — the repacker
+///    swaps in a *new* generation rather than mutating a mapped one).
+/// 2. **No truncation or size change.** The mapped `File` is not
+///    `set_len`-shrunk or extended after the mapping is created. Reads beyond
+///    a live mapping fault would SIGBUS only if the file shrunk beneath the
+///    mapping, which cannot occur given the write-once invariant.
+/// 3. **Stable file descriptor.** `PackGeneration` owns the only `File`
+///    handle and is kept alive by `Arc`s held by the repack manager and any
+///    in-flight reader, so the descriptor remains valid for the mapping's
+///    lifetime. `Mmap` also keeps the mapping alive independently of the
+///    `File` drop.
+#[allow(unsafe_code)]
+fn map_pack(file: &File) -> io::Result<Mmap> {
+    // SAFETY: See the `map_pack` doc comment — write-once file, no concurrent
+    // mutation, no truncation, stable fd, and `Mmap` retains the mapping.
+    unsafe { Mmap::map(file) }
 }
 
 impl Drop for PackGeneration {

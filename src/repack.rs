@@ -3,7 +3,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
@@ -142,6 +142,7 @@ impl RepackManager {
             pack_id,
             file,
             path: pack_path,
+            mmap: OnceLock::new(),
         });
 
         self.swap_pack(room_id, generation.clone());
@@ -271,6 +272,7 @@ mod tests {
             pack_id: 0,
             file,
             path,
+            mmap: OnceLock::new(),
         });
         manager.swap_pack([0xBB; 16], gen);
 

@@ -95,7 +95,7 @@ impl LossyIndex {
     pub fn new(min_capacity: usize) -> Self {
         let capacity_usize = min_capacity.next_power_of_two().max(16);
         let capacity = u32::try_from(capacity_usize).expect("index capacity exceeds u32::MAX");
-        let shift = 64_u32.wrapping_sub(capacity.leading_zeros());
+        let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
         Self {
             mask: capacity.wrapping_sub(1),
             capacity,
@@ -115,9 +115,16 @@ impl LossyIndex {
     }
 
     /// Extract the 24-bit tag from a 16-byte hash.
+    ///
+    /// Uses bytes 8..12, disjoint from the bytes `bucket()` reads (0..8).
+    /// If the tag were derived from bucket bits (or a superset of them),
+    /// same-bucket entries would already agree on those bits, collapsing
+    /// the tag's effective discriminating power from 2^-24 to roughly
+    /// 2^-(24 - bucket_bits) and causing far more spurious "same tag"
+    /// overwrites than the nominal 24-bit collision rate predicts.
     #[inline]
     fn tag(hash: &[u8; 16]) -> u32 {
-        let top = u32::from_be_bytes(hash[..4].try_into().unwrap());
+        let top = u32::from_be_bytes(hash[8..12].try_into().unwrap());
         top >> 8 // top 24 bits
     }
 
@@ -248,7 +255,7 @@ impl LossyIndex {
             slots.push(slot);
         }
 
-        let shift = 64_u32.wrapping_sub(capacity.leading_zeros());
+        let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
 
         Ok(Self {
             mask: capacity.wrapping_sub(1),
@@ -430,5 +437,54 @@ mod tests {
         assert_eq!(index.capacity, 128);
         let index = LossyIndex::new(129);
         assert_eq!(index.capacity, 256);
+    }
+
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    fn splitmix_hash(i: u64) -> [u8; 16] {
+        let a = splitmix64(i);
+        let b = splitmix64(a ^ 0x7372_9A1E_4288_1F7D);
+        let mut h = [0u8; 16];
+        h[..8].copy_from_slice(&a.to_le_bytes());
+        h[8..].copy_from_slice(&b.to_le_bytes());
+        h
+    }
+
+    /// Regression test for a shift-formula bug: with `capacity` a `u32`,
+    /// `64 - capacity.leading_zeros()` does not equal `64 - log2(capacity)`,
+    /// so at larger capacities the bucket function only used a fraction of
+    /// its intended hash bits, collapsing most of the table into a handful
+    /// of buckets and causing O(n) probes per insert. `trailing_zeros` gives
+    /// the correct shift for any power-of-two capacity.
+    #[test]
+    fn test_shift_uses_full_bucket_range() {
+        for &capacity in &[16u32, 1024, 65536, 131_072, 262_144] {
+            let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
+            assert_eq!(shift, 64 - capacity.ilog2());
+        }
+    }
+
+    /// Regression test: at scale, insert must not silently drop distinct
+    /// entries via spurious tag collisions caused by the tag and bucket
+    /// being derived from overlapping hash bits.
+    #[test]
+    fn test_insert_preserves_distinct_entries_at_scale() {
+        let n = 50_000usize;
+        let mut index = LossyIndex::new(n * 2);
+        for i in 0..n {
+            let h = splitmix_hash(i as u64);
+            index.insert(&h, 0, i as u64).unwrap();
+        }
+        // No distinct entry should have been silently overwritten.
+        assert_eq!(index.len(), n);
+        for i in 0..n {
+            let h = splitmix_hash(i as u64);
+            assert_eq!(index.lookup(&h), Some((0, i as u64)));
+        }
     }
 }

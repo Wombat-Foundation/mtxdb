@@ -37,6 +37,17 @@ impl Rng {
     }
 }
 
+/// Well-mixed 64-bit permutation (splitmix64). Real content-address hashes
+/// (BLAKE2b/SHA-256) are uniformly distributed, so the synthetic node IDs
+/// must be too — otherwise the lossy index's `hash[..8]` bucket selection
+/// collapses every entry into one linear-probe cluster.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 // ── Synthetic Matrix room DAG generator ─────────────────────────────
 
 struct DagGenerator {
@@ -100,7 +111,10 @@ impl DagGenerator {
 
     fn node_id(idx: usize) -> NodeId {
         let mut id = [0u8; 16];
-        id[..8].copy_from_slice(&idx.to_le_bytes());
+        let a = splitmix64(idx as u64);
+        let b = splitmix64(a ^ 0x7372_9A1E_4288_1F7D);
+        id[..8].copy_from_slice(&a.to_le_bytes());
+        id[8..].copy_from_slice(&b.to_le_bytes());
         id
     }
 
@@ -266,7 +280,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
     let mut get_found = 0u64;
     let mut get_not_found = 0u64;
 
-    for id in &node_ids {
+    for id in node_ids.iter() {
         get_calls += 1;
         match store.get(&ROOM, id) {
             Ok(Some(_)) => get_found += 1,

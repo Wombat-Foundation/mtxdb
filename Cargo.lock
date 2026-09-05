@@ -45,11 +45,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a5a03cefb0d953ec0be133036f14e109412fa594edc2f77227249db66cc3ed"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mtxdb"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32fast",
+ "memmap2",
  "parking_lot",
 ]
 

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::fs::{self, File};
-use std::io::{BufReader, Seek};
+use std::fs;
+use std::io::Seek;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use memmap2::Mmap;
 use parking_lot::RwLock;
 
 use crate::cache::{NodeCache, PinnedNodes};
@@ -181,6 +182,7 @@ impl PackfileStorage {
                         pack_id,
                         file,
                         path: path.clone(),
+                        mmap: OnceLock::new(),
                     });
                     repack.swap_pack(room_id, gen);
                 }
@@ -215,6 +217,7 @@ impl PackfileStorage {
             pack_id,
             file,
             path: pack_path,
+            mmap: OnceLock::new(),
         });
         self.repack.swap_pack(*room_id, gen.clone());
 
@@ -224,6 +227,41 @@ impl PackfileStorage {
             .or_insert_with(|| LossyIndex::new(4096));
 
         Ok(gen)
+    }
+
+    /// Rebuild a room's index from packfile records using their real hashes.
+    ///
+    /// Called when the index fills (`TableFull`). Unlike rehashing packed
+    /// 24-bit tags (which cannot reproduce the original bucket placement),
+    /// scanning the packfile yields the true 128-bit hashes and exact
+    /// offsets, so the rebuilt index preserves correct probe buckets.
+    fn rebuild_index(&self, room_id: &[u8; 16]) -> LossyIndex {
+        let packs: Vec<Arc<PackGeneration>> = {
+            let packs = self.repack.packs.read();
+            packs
+                .values()
+                .filter(|g| g.room_id == *room_id)
+                .cloned()
+                .collect()
+        };
+
+        let mut total = 0usize;
+        let mut scanned: Vec<(u8, Vec<([u8; 16], u64)>)> = Vec::new();
+        for gen in &packs {
+            if let Ok(entries) = packfile::scan_packfile(&gen.path) {
+                total += entries.len();
+                scanned.push((gen.pack_id, entries));
+            }
+        }
+
+        let mut index = LossyIndex::new(total.saturating_mul(2));
+        for (pack_id, entries) in scanned {
+            for (hash, offset) in entries {
+                // Insertion cannot fail: capacity is 2× the record count.
+                let _ = index.insert(&hash, pack_id, offset);
+            }
+        }
+        index
     }
 
     fn pack_path(&self, room_id: &[u8; 16], pack_id: u8) -> PathBuf {
@@ -236,12 +274,58 @@ impl PackfileStorage {
         self.base_dir.join(format!("{hex}_{pack_id:02x}.pack"))
     }
 
-    /// Read a record at the given offset from a file handle.
-    fn read_at(file: &File, offset: u64) -> Result<Record, StorageError> {
-        let mut reader = BufReader::new(file);
-        reader.seek(std::io::SeekFrom::Start(offset))?;
-        packfile::read_record(&mut reader)?
-            .ok_or_else(|| StorageError::Corrupt("unexpected EOF at record boundary".into()))
+    /// Read a record at the given offset from a memory-mapped packfile.
+    ///
+    /// Unlike `seek`+`read_exact`, mmap reads require no syscalls — the
+    /// kernel resolves faults directly into the page cache. This collapses
+    /// cold-read latency from 3 syscalls/record to ~zero.
+    fn read_at(gen: &PackGeneration, offset: u64) -> Result<Record, StorageError> {
+        let mmap: &Mmap = gen.mmap().map_err(StorageError::Io)?;
+        let mem: &[u8] = mmap;
+
+        let offset = usize::try_from(offset)
+            .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
+
+        if offset.checked_add(4).map_or(true, |end| end > mem.len()) {
+            return Err(StorageError::Corrupt("truncated length prefix".into()));
+        }
+
+        let payload_len_bytes: [u8; 4] = mem[offset..offset + 4].try_into().unwrap();
+        let payload_len = u32::from_le_bytes(payload_len_bytes);
+
+        if payload_len == 0 || payload_len > packfile::MAX_RECORD_LEN {
+            return Err(StorageError::Corrupt(format!(
+                "invalid record length: {payload_len}"
+            )));
+        }
+
+        let payload_len_usize = payload_len as usize;
+        let crc_pos = offset + 4 + payload_len_usize;
+        let frame_end = crc_pos + 4;
+
+        if frame_end > mem.len() {
+            return Err(StorageError::Corrupt("truncated frame".into()));
+        }
+
+        let payload = &mem[offset + 4..crc_pos];
+        let crc_buf: [u8; 4] = mem[crc_pos..frame_end].try_into().unwrap();
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&payload_len_bytes);
+        crc.update(payload);
+        let expected = crc.finalize();
+        let actual = u32::from_le_bytes(crc_buf);
+        if expected != actual {
+            return Err(StorageError::Corrupt(format!(
+                "CRC mismatch: expected {expected:08x}, got {actual:08x}"
+            )));
+        }
+
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&payload[..16]);
+        let data = bytes::Bytes::copy_from_slice(&payload[16..]);
+
+        Ok(Record { hash, data })
     }
 
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
@@ -316,7 +400,7 @@ impl StorageEngine for PackfileStorage {
                 }
             };
 
-            let Ok(record) = Self::read_at(&gen.file, *offset) else {
+            let Ok(record) = Self::read_at(&gen, *offset) else {
                 continue;
             };
 
@@ -376,12 +460,20 @@ impl StorageEngine for PackfileStorage {
         let offset = file_len.saturating_sub(record_len as u64);
 
         // Update per-room index
-        {
+        let index_full = {
             let mut indexes = self.indexes.write();
             let index = indexes
                 .entry(*room_id)
                 .or_insert_with(|| LossyIndex::new(4096));
-            let _ = index.insert(id, gen.pack_id, offset);
+            index.insert(id, gen.pack_id, offset).is_err()
+        };
+        if index_full {
+            // The index cannot rehash packed 24-bit tags onto the same
+            // buckets, so rebuild it from the packfile (real hashes, exact
+            // offsets). Scans happen without the index lock held.
+            let mut rebuilt = self.rebuild_index(room_id);
+            let _ = rebuilt.insert(id, gen.pack_id, offset);
+            self.indexes.write().insert(*room_id, rebuilt);
         }
 
         // Cache it, swizzling any lazy refs if they are in pinned
