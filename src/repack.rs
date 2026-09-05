@@ -68,13 +68,30 @@ impl RepackManager {
 
     /// Perform a reachability-order repack for a room.
     ///
-    /// This walks the reachable DAG from `root_hash` using the provided
-    /// resolver, and writes all reachable nodes into a new packfile
-    /// in BFS traversal order.
+    /// This walks the DAG reachable from `roots` using the provided
+    /// resolver, and writes all reachable nodes into a new packfile in BFS
+    /// traversal order.
+    ///
+    /// # Multiple roots, not one
+    ///
+    /// A room has more than one thing that must stay reachable: the current
+    /// HAMT state root, *and* every current forward-extremity (tip) of the
+    /// `prev_events` timeline DAG. Matrix requires a full chronological
+    /// ledger — an old message, reaction, or read receipt that isn't bound
+    /// into the active state trie is not garbage, it's history that
+    /// federation, backfill, and permalinks still need to resolve. A single
+    /// root here would mean any repack silently drops everything not
+    /// reachable from just the state trie, destroying the timeline on the
+    /// first background repack. The caller is responsible for supplying
+    /// every root that must survive — this function does not know or care
+    /// whether a given root is a state root or a timeline tip, it just
+    /// preserves the union of everything reachable from all of them.
     ///
     /// # Arguments
     /// * `room_id` - The room to repack.
-    /// * `root_hash` - The root node to start the walk from.
+    /// * `roots` - Every node that must remain reachable after this repack
+    ///   (the current state root plus every timeline forward-extremity, at
+    ///   minimum).
     /// * `resolver` - Function to fetch a node's children given its hash.
     ///   Returns `(node_data, child_hashes)`.
     ///
@@ -83,19 +100,30 @@ impl RepackManager {
     pub fn repack_room(
         &self,
         room_id: [u8; 16],
-        root_hash: NodeId,
+        roots: impl IntoIterator<Item = NodeId>,
         resolver: impl Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>,
     ) -> Result<Arc<PackGeneration>, RepackError> {
         let pack_id = self.next_pack_id(&room_id);
         let pack_path = self.pack_path(&room_id, pack_id);
 
-        // BFS traversal in reachability order
+        // BFS traversal in reachability order, seeded from every root.
+        // Roots are load-bearing — a root the caller explicitly named
+        // (the state root, a timeline tip) must resolve, or this repack
+        // would silently write a pack missing that entire subtree. A child
+        // discovered mid-walk failing to resolve is different: that's the
+        // ordinary shape of an incomplete local DAG, and packing what we
+        // have is the existing, correct behavior for that case.
         let mut visited = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         let mut records = Vec::new();
+        let mut initial_roots = HashSet::new();
 
-        queue.push_back(root_hash);
-        visited.insert(root_hash);
+        for root in roots {
+            if visited.insert(root) {
+                queue.push_back(root);
+                initial_roots.insert(root);
+            }
+        }
 
         while let Some(hash) = queue.pop_front() {
             if let Some((data, children)) = resolver(&hash) {
@@ -108,6 +136,8 @@ impl RepackManager {
                         queue.push_back(child);
                     }
                 }
+            } else if initial_roots.contains(&hash) {
+                return Err(RepackError::RootNotFound);
             }
         }
 
@@ -243,7 +273,13 @@ mod tests {
         let dir = test_dir("repack");
         let manager = RepackManager::new(dir);
 
-        let root_id = [3u8; 16];
+        // Must match make_node's hash shape (hash[0] = id) — not [3u8; 16],
+        // which is a distinct value that never actually resolves via the
+        // resolver below. That mismatch was latent before this test started
+        // checking record contents: the old repack_room silently wrote an
+        // empty pack on an unresolvable root instead of failing.
+        let mut root_id = [0u8; 16];
+        root_id[0] = 3;
         let mut nodes = HashMap::new();
         for i in 1..=3u8 {
             let (id, data, children) = make_node(i);
@@ -254,9 +290,77 @@ mod tests {
             nodes.get(hash).map(|(d, c)| (d.clone(), c.clone()))
         };
 
-        let gen = manager.repack_room([0xAA; 16], root_id, resolver).unwrap();
+        let gen = manager
+            .repack_room([0xAA; 16], [root_id], resolver)
+            .unwrap();
         assert!(gen.path.exists());
         assert!(manager.get_pack(&[0xAA; 16]).is_some());
+
+        // Now that the root actually resolves, verify the pack really
+        // contains the reachable closure {1, 2, 3} — not just that some
+        // file got created.
+        let entries = packfile::scan_packfile(&gen.path).unwrap();
+        let hashes: HashSet<NodeId> = entries.into_iter().map(|(h, _)| h).collect();
+        for i in 1..=3u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            assert!(hashes.contains(&h), "node {i} must be in the repacked pack");
+        }
+    }
+
+    #[test]
+    fn test_repack_preserves_all_roots_not_just_the_first() {
+        // Regression test: repack_room must preserve everything reachable
+        // from EVERY supplied root, not just the first. Two disjoint trees
+        // stand in for "the current HAMT state root" and "an old timeline
+        // forward-extremity" — a single-root walk from the state root alone
+        // would silently drop the timeline node, exactly the bug that would
+        // shred a room's chronological ledger on its first repack.
+        let dir = test_dir("repack_multiroot");
+        let manager = RepackManager::new(dir);
+
+        let mut nodes = HashMap::new();
+        for i in 1..=3u8 {
+            let (id, data, children) = make_node(i);
+            nodes.insert(id, (data, children));
+        }
+        let mut state_root = [0u8; 16];
+        state_root[0] = 3;
+
+        // A disjoint node — not reachable from state_root by any path —
+        // standing in for an old message with no living reference from the
+        // active state trie.
+        let mut timeline_root = [0u8; 16];
+        timeline_root[1] = 200;
+        nodes.insert(
+            timeline_root,
+            (
+                NodeData::new(bytes::Bytes::from_static(b"ancient message")),
+                vec![],
+            ),
+        );
+
+        let resolver = move |hash: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
+            nodes.get(hash).map(|(d, c)| (d.clone(), c.clone()))
+        };
+
+        let gen = manager
+            .repack_room([0xCC; 16], [state_root, timeline_root], resolver)
+            .unwrap();
+
+        let entries = packfile::scan_packfile(&gen.path).unwrap();
+        let hashes: HashSet<NodeId> = entries.into_iter().map(|(h, _)| h).collect();
+
+        for i in 1..=3u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            assert!(hashes.contains(&h), "state node {i} must survive repack");
+        }
+        assert!(
+            hashes.contains(&timeline_root),
+            "timeline root disjoint from the state trie must survive repack \
+             — a single-root walk would have silently dropped it"
+        );
     }
 
     #[test]
