@@ -344,6 +344,7 @@ impl Default for PinnedNodes {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
 

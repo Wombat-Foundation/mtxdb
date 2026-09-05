@@ -290,6 +290,7 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
     use std::io::Cursor;

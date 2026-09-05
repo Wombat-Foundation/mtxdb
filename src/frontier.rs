@@ -109,6 +109,7 @@ impl Default for BfsLayer {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
 

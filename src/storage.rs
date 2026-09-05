@@ -217,6 +217,7 @@ impl StorageEngine for InMemoryStorage {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
 

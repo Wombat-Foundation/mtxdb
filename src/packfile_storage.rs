@@ -758,6 +758,7 @@ impl StorageEngine for PackfileStorage {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
 

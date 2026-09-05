@@ -332,6 +332,7 @@ impl Iterator for LookupIter<'_> {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
 

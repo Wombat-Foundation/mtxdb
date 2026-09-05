@@ -242,6 +242,7 @@ impl From<std::io::Error> for RepackError {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
 

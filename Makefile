@@ -51,7 +51,7 @@ test: ##H Run tests
 
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
-export LLVM_COV_FLAGS = -show-region-summary=false -show-branch-summary=false
+LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 
 .PHONY: cov
 cov: ##H Run code coverage and generate HTML report
@@ -63,7 +63,7 @@ cov: ##H Run code coverage and generate HTML report
 	# Print per-file summary to the terminal (functions/lines only)
 	@echo ''
 	@echo '══════════════ COVERAGE SUMMARY ══════════════'
-	$(CARGO) llvm-cov report \
+	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Process report to codecov-compatible JSON
 	$(CARGO) llvm-cov report \

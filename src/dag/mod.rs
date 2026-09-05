@@ -224,6 +224,7 @@ impl Default for ActiveRoomFrontier {
 }
 
 #[cfg(test)]
+#[coverage(off)]
 mod tests {
     use super::*;
 
