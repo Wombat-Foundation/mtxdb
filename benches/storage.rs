@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mtxdb::cache::NodeCache;
@@ -188,9 +188,11 @@ impl DagGenerator {
 
 #[derive(Default, Clone, Copy)]
 struct IoStats {
+    rchar: u64,
     read_bytes: u64,
     #[allow(dead_code)]
     write_bytes: u64,
+    syscr: u64,
 }
 
 impl IoStats {
@@ -198,11 +200,17 @@ impl IoStats {
         let content = fs::read_to_string("/proc/self/io").unwrap_or_default();
         let mut stats = Self::default();
         for line in content.lines() {
+            if let Some(v) = line.strip_prefix("rchar: ") {
+                stats.rchar = v.trim().parse().unwrap_or(0);
+            }
             if let Some(v) = line.strip_prefix("read_bytes: ") {
                 stats.read_bytes = v.trim().parse().unwrap_or(0);
             }
             if let Some(v) = line.strip_prefix("write_bytes: ") {
                 stats.write_bytes = v.trim().parse().unwrap_or(0);
+            }
+            if let Some(v) = line.strip_prefix("syscr: ") {
+                stats.syscr = v.trim().parse().unwrap_or(0);
             }
         }
         stats
@@ -256,8 +264,14 @@ fn pack_dir_size(dir: &Path) -> u64 {
 
 // ── Benchmark harness ───────────────────────────────────────────────
 
+fn bench_temp_dir(label: &str, total_events: usize) -> PathBuf {
+    // Use $HOME/bmdb_bench to avoid tmpfs on /tmp (RAM-backed, no physical I/O)
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(format!("bmdb_bench_{label}_{total_events}"))
+}
+
 fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
-    let dir = std::env::temp_dir().join(format!("mdb_bench_{label}_{total_events}"));
+    let dir = bench_temp_dir(label, total_events);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -278,6 +292,24 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
 
     // ── Drop page cache (cold read) ──
     drop_caches_for_dir(&dir);
+
+    // Verify vmtouch worked
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|e| e == "pack") {
+                if let Ok(o) = std::process::Command::new("vmtouch")
+                    .args(["-v", entry.path().to_str().unwrap()])
+                    .output()
+                {
+                    let vmtouch_out = String::from_utf8_lossy(&o.stdout);
+                    if let Some(line) = vmtouch_out.lines().next() {
+                        eprintln!("  vmtouch: {line}");
+                    }
+                }
+                break;
+            }
+        }
+    }
 
     // ── Read phase (backward traversal, simulates /sync) ──
     let traversal = dag.traversal_order();
@@ -308,6 +340,8 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
     let read_elapsed = t_read.elapsed();
     let io_after = IoStats::read_now();
     let physical_reads = io_after.read_bytes.saturating_sub(io_before.read_bytes);
+    let logical_reads = io_after.rchar.saturating_sub(io_before.rchar);
+    let read_syscalls = io_after.syscr.saturating_sub(io_before.syscr);
     let physical_pages = physical_reads.div_ceil(PAGE_SIZE);
 
     let cache_total = cache_hits + cache_misses;
@@ -335,7 +369,9 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) {
     eprintln!("  Total edge refs:    {}", dag.total_edge_refs());
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric A: Physical I/O");
-    eprintln!("    Read bytes (cold): {physical_reads} bytes ({physical_pages} pages)");
+    eprintln!("    read_bytes (disk): {physical_reads} bytes ({physical_pages} pages)");
+    eprintln!("    rchar (logical):   {logical_reads} bytes");
+    eprintln!("    read syscalls:     {read_syscalls}");
     eprintln!("    Seek budget:       ~{physical_pages} physical seeks");
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric B: Cache efficiency (of nodes that reach cache)");
