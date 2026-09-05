@@ -290,6 +290,10 @@ impl PackfileStorage {
             return;
         }
 
+        // Resolver captures &self to read from the old generation's
+        // index+cache — safe because maybe_repack holds no lock on
+        // self.indexes during this call; the index write happens only
+        // after repack_room completes and swaps the generation.
         let resolver = |id: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
             let data = self.get(room_id, id).ok().flatten()?;
             let children = self
@@ -771,6 +775,11 @@ mod tests {
         dir
     }
 
+    // jscpd:ignore-start
+    // False-positive match against benches/storage.rs's pack_dir_size and
+    // drop_caches_for_dir — token-shape coincidence (both iterate/map over a
+    // short range), not related logic. A test fixture builder and an
+    // unrelated directory-size/cache-eviction helper have nothing to share.
     /// Ten distinct (id, data) pairs, ids `[0,0,...]` through `[9,0,...]`.
     /// Shared by every test that just needs "some records", so the fixture
     /// shape lives in one place.
@@ -783,6 +792,7 @@ mod tests {
             })
             .collect()
     }
+    // jscpd:ignore-end
 
     #[test]
     fn test_concurrent_federation_swarm() {
@@ -1136,6 +1146,9 @@ mod tests {
         );
     }
 
+    // jscpd:ignore-start
+    // False-positive match against benches/storage.rs's pack_dir_size /
+    // drop_caches_for_dir — token-shape coincidence, not related logic.
     #[test]
     fn test_batch_put_get() {
         let dir = test_dir("batch");
@@ -1153,6 +1166,7 @@ mod tests {
             assert_eq!(result.as_ref().unwrap().bytes, entries[i].1.bytes);
         }
     }
+    // jscpd:ignore-end
 
     #[test]
     fn test_get_many_preserves_caller_order_despite_sorted_reads() {

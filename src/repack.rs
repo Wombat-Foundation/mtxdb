@@ -219,6 +219,9 @@ impl std::fmt::Display for RepackError {
     }
 }
 
+// jscpd:ignore-start
+// False-positive match against benches/storage.rs's DagGenerator::node_data
+// — token-shape coincidence, not related logic.
 impl std::error::Error for RepackError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -227,6 +230,7 @@ impl std::error::Error for RepackError {
         }
     }
 }
+// jscpd:ignore-end
 
 impl From<std::io::Error> for RepackError {
     fn from(e: std::io::Error) -> Self {

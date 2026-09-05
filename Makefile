@@ -21,12 +21,10 @@ format: check-cargo-sort ##H Format code
 check-cargo-sort:
 	@command -v cargo-sort >/dev/null || { echo "cargo-sort is required; install it with: cargo install cargo-sort" >&2; exit 1; }
 
-N ?= 5
-
 .PHONY: check
 check: ##H Cargo check and code dupe
 	$(CARGO) check --all-targets
-	-jscpd $$(git diff HEAD~${N} --name-only '*.rs')
+	-jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
 lint: ##H Run clippy lints

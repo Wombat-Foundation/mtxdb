@@ -42,6 +42,10 @@ impl NodeRef {
         }
     }
 
+    // jscpd:ignore-start
+    // False-positive match against index/mod.rs's splitmix64 (a test-only
+    // hash mixer) — token-shape coincidence, not related logic. See the
+    // "why can't it be fixed" discussion: nothing to extract here.
     #[must_use]
     pub fn data(&self) -> Option<&Arc<NodeData>> {
         match self {
@@ -49,6 +53,7 @@ impl NodeRef {
             Self::Resolved(_, data) => Some(data),
         }
     }
+    // jscpd:ignore-end
 
     #[must_use]
     pub fn is_resolved(&self) -> bool {

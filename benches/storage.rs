@@ -137,6 +137,10 @@ impl DagGenerator {
         id
     }
 
+    // jscpd:ignore-start
+    // False-positive match against src/repack.rs's
+    // `impl std::error::Error for RepackError` — token-shape coincidence,
+    // not related logic.
     fn node_data(&self, idx: usize) -> (NodeId, NodeData) {
         let id = Self::node_id(idx);
         let prev: Vec<NodeId> = self.prev_events[idx]
@@ -167,6 +171,7 @@ impl DagGenerator {
         data.children = prev.into_iter().map(NodeRef::Lazy).collect();
         (id, data)
     }
+    // jscpd:ignore-end
 
     fn parse_children(bytes: &[u8]) -> Vec<NodeId> {
         if bytes.len() < 14 {
@@ -245,6 +250,11 @@ impl IoStats {
     }
 }
 
+// jscpd:ignore-start
+// pack_dir_size and drop_caches_for_dir below false-positive-match against
+// src/packfile_storage.rs's ten_record_fixture/test_batch_put_get —
+// token-shape coincidence (both iterate/map over a short range), not
+// related logic.
 fn pack_dir_size(dir: &std::path::Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = fs::read_dir(dir) {
@@ -278,6 +288,7 @@ fn drop_caches_for_dir(dir: &std::path::Path) {
         .stderr(std::process::Stdio::null())
         .status();
 }
+// jscpd:ignore-end
 
 // ── Benchmark harness ───────────────────────────────────────────────
 
