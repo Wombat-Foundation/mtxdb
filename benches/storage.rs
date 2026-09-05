@@ -800,38 +800,21 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
         disk_read_bytes: u64,
     }
 
-    let measure = |mode: &'static str, target: &'static str, targets: &[NodeId]| -> Row {
+    // Shared measurement scaffolding: clear cache, evict page cache, time
+    // an arbitrary read strategy `f` (which returns how many targets it
+    // found), and package the result. `measure`/`measure_naive` below
+    // differ only in `f` — get_many's sort-then-read vs. a naive per-id
+    // loop — not in setup or bookkeeping.
+    let timed_read = |mode: &'static str,
+                      target: &'static str,
+                      targets: &[NodeId],
+                      f: &dyn Fn(&[NodeId]) -> usize|
+     -> Row {
         store.cache().clear();
         drop_caches_for_dir(&dir);
         let io_before = IoStats::read_now();
         let t = Instant::now();
-        let results = store.get_many(&ROOM, targets).unwrap();
-        let elapsed = t.elapsed();
-        let io_after = IoStats::read_now();
-        Row {
-            mode,
-            target,
-            found: results.iter().filter(|r| r.is_some()).count(),
-            total: targets.len(),
-            elapsed,
-            syscalls: io_after.syscr.saturating_sub(io_before.syscr),
-            disk_read_bytes: io_after.read_bytes.saturating_sub(io_before.read_bytes),
-        }
-    };
-
-    // Naive (unsorted, per-id) fetch for comparison — quantifies what
-    // get_many's sort-then-read actually buys on this exact pattern.
-    let measure_naive = |mode: &'static str, target: &'static str, targets: &[NodeId]| -> Row {
-        store.cache().clear();
-        drop_caches_for_dir(&dir);
-        let io_before = IoStats::read_now();
-        let t = Instant::now();
-        let mut found = 0usize;
-        for id in targets {
-            if store.get(&ROOM, id).unwrap().is_some() {
-                found += 1;
-            }
-        }
+        let found = f(targets);
         let elapsed = t.elapsed();
         let io_after = IoStats::read_now();
         Row {
@@ -843,6 +826,28 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
             syscalls: io_after.syscr.saturating_sub(io_before.syscr),
             disk_read_bytes: io_after.read_bytes.saturating_sub(io_before.read_bytes),
         }
+    };
+
+    let measure = |mode: &'static str, target: &'static str, targets: &[NodeId]| -> Row {
+        timed_read(mode, target, targets, &|targets| {
+            store
+                .get_many(&ROOM, targets)
+                .unwrap()
+                .iter()
+                .filter(|r| r.is_some())
+                .count()
+        })
+    };
+
+    // Naive (unsorted, per-id) fetch for comparison — quantifies what
+    // get_many's sort-then-read actually buys on this exact pattern.
+    let measure_naive = |mode: &'static str, target: &'static str, targets: &[NodeId]| -> Row {
+        timed_read(mode, target, targets, &|targets| {
+            targets
+                .iter()
+                .filter(|id| store.get(&ROOM, id).unwrap().is_some())
+                .count()
+        })
     };
 
     let rows = [

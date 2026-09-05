@@ -771,6 +771,19 @@ mod tests {
         dir
     }
 
+    /// Ten distinct (id, data) pairs, ids `[0,0,...]` through `[9,0,...]`.
+    /// Shared by every test that just needs "some records", so the fixture
+    /// shape lives in one place.
+    fn ten_record_fixture() -> Vec<(NodeId, NodeData)> {
+        (0..10u8)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = i;
+                (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
+            })
+            .collect()
+    }
+
     #[test]
     fn test_concurrent_federation_swarm() {
         // Simulates concurrent federation ingress (many writers) and client
@@ -1128,13 +1141,7 @@ mod tests {
         let dir = test_dir("batch");
         let store = PackfileStorage::open(dir).unwrap();
 
-        let entries: Vec<(NodeId, NodeData)> = (0..10u8)
-            .map(|i| {
-                let mut id = [0u8; 16];
-                id[0] = i;
-                (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
-            })
-            .collect();
+        let entries = ten_record_fixture();
 
         store.put_many(&TEST_ROOM, &entries).unwrap();
 
@@ -1155,13 +1162,7 @@ mod tests {
         let dir = test_dir("batch_order");
         let store = PackfileStorage::open(dir).unwrap();
 
-        let entries: Vec<(NodeId, NodeData)> = (0..10u8)
-            .map(|i| {
-                let mut id = [0u8; 16];
-                id[0] = i;
-                (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
-            })
-            .collect();
+        let entries = ten_record_fixture();
 
         // Written in ascending order, so physical offsets are ascending too.
         store.put_many(&TEST_ROOM, &entries).unwrap();

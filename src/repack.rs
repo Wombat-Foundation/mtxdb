@@ -238,6 +238,7 @@ impl From<std::io::Error> for RepackError {
 #[coverage(off)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn make_node(id: u8) -> (NodeId, NodeData, Vec<NodeId>) {
         let mut hash = [0u8; 16];
@@ -263,6 +264,30 @@ mod tests {
         dir
     }
 
+    /// A resolver over a fixed, pre-built node map — the shape every
+    /// `repack_room` test needs, differing only in which map they pass.
+    fn make_resolver(
+        nodes: HashMap<NodeId, (NodeData, Vec<NodeId>)>,
+    ) -> impl Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)> {
+        move |hash: &NodeId| nodes.get(hash).map(|(d, c)| (d.clone(), c.clone()))
+    }
+
+    /// Assert that nodes with hash `[i, 0, ..., 0]` for `i` in `1..=3` are
+    /// present in the packfile at `path` — the reachable closure every
+    /// `make_node`-based test expects to survive a repack.
+    fn assert_pack_contains_make_node_ids(path: &Path, context: &str) {
+        let entries = packfile::scan_packfile(path).unwrap();
+        let hashes: HashSet<NodeId> = entries.into_iter().map(|(h, _)| h).collect();
+        for i in 1..=3u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            assert!(
+                hashes.contains(&h),
+                "{context}: node {i} must be in the repacked pack"
+            );
+        }
+    }
+
     #[test]
     fn test_repack_creates_file() {
         let dir = test_dir("repack");
@@ -281,12 +306,8 @@ mod tests {
             nodes.insert(id, (data, children));
         }
 
-        let resolver = move |hash: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
-            nodes.get(hash).map(|(d, c)| (d.clone(), c.clone()))
-        };
-
         let gen = manager
-            .repack_room([0xAA; 16], [root_id], resolver)
+            .repack_room([0xAA; 16], [root_id], make_resolver(nodes))
             .unwrap();
         assert!(gen.path.exists());
         assert!(manager.get_pack(&[0xAA; 16]).is_some());
@@ -294,13 +315,7 @@ mod tests {
         // Now that the root actually resolves, verify the pack really
         // contains the reachable closure {1, 2, 3} — not just that some
         // file got created.
-        let entries = packfile::scan_packfile(&gen.path).unwrap();
-        let hashes: HashSet<NodeId> = entries.into_iter().map(|(h, _)| h).collect();
-        for i in 1..=3u8 {
-            let mut h = [0u8; 16];
-            h[0] = i;
-            assert!(hashes.contains(&h), "node {i} must be in the repacked pack");
-        }
+        assert_pack_contains_make_node_ids(&gen.path, "test_repack_creates_file");
     }
 
     #[test]
@@ -335,22 +350,21 @@ mod tests {
             ),
         );
 
-        let resolver = move |hash: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
-            nodes.get(hash).map(|(d, c)| (d.clone(), c.clone()))
-        };
-
         let gen = manager
-            .repack_room([0xCC; 16], [state_root, timeline_root], resolver)
+            .repack_room(
+                [0xCC; 16],
+                [state_root, timeline_root],
+                make_resolver(nodes),
+            )
             .unwrap();
+
+        assert_pack_contains_make_node_ids(
+            &gen.path,
+            "test_repack_preserves_all_roots_not_just_the_first",
+        );
 
         let entries = packfile::scan_packfile(&gen.path).unwrap();
         let hashes: HashSet<NodeId> = entries.into_iter().map(|(h, _)| h).collect();
-
-        for i in 1..=3u8 {
-            let mut h = [0u8; 16];
-            h[0] = i;
-            assert!(hashes.contains(&h), "state node {i} must survive repack");
-        }
         assert!(
             hashes.contains(&timeline_root),
             "timeline root disjoint from the state trie must survive repack \
