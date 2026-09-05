@@ -1,0 +1,5 @@
+[default.extend-words]
+mis = "mis"
+
+[files]
+extend-exclude = []
