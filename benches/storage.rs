@@ -381,9 +381,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     eprintln!(
         "    Cold hit rate:     {cold_hit_rate:.1}% (0% by construction — cache was cleared)"
     );
-    eprintln!(
-        "    Warm hit rate:     {warm_hit_rate:.1}% ({warm_hits}/{warm_total}, repeat of the same non-repeating traversal — see comment above run_benchmark's warm phase)"
-    );
+    eprintln!("    Warm hit rate:     {warm_hit_rate:.1}% ({warm_hits}/{warm_total})");
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Index accuracy (lossy fanout)");
     eprintln!("    Total get() calls: {get_calls}");

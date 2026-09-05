@@ -692,6 +692,53 @@ mod tests {
     }
 
     #[test]
+    fn test_read_at_rejects_genuinely_torn_frame() {
+        // Distinct from test_read_survives_append_after_mmap_established:
+        // that test covers the "offset+4 exceeds the old mapping" bounds
+        // check (read_at line ~311). This test targets the OTHER bounds
+        // check — "frame_end exceeds the mapping" (read_at line ~334) —
+        // by writing a length prefix whose payload+crc were never actually
+        // written, simulating a reader observing a write mid-flight
+        // (write_record issues 4 separate write_all calls, so a concurrent
+        // mmap creation between them is a real, if narrow, window). This
+        // must fail cleanly with Corrupt after the bounded retry — never
+        // panic, never silently return Ok(None).
+        use std::io::Write as _;
+
+        let dir = test_dir("torn_frame");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let a = [0xAAu8; 16];
+        let data_a = NodeData::new(bytes::Bytes::from_static(b"aaaa"));
+        store.put(&TEST_ROOM, &a, &data_a).unwrap();
+
+        // Manually append ONLY a valid-looking 4-byte length prefix for a
+        // second record, with no payload/crc behind it.
+        let gen = store.repack.get_pack(&TEST_ROOM).unwrap();
+        {
+            let mut file = gen.file.try_clone().unwrap();
+            file.seek(std::io::SeekFrom::End(0)).unwrap();
+            let fake_payload_len: u32 = 20; // 16-byte hash + 4 bytes of "data"
+            file.write_all(&fake_payload_len.to_le_bytes()).unwrap();
+        }
+
+        // The offset where this truncated frame starts.
+        let torn_offset = {
+            let file_len = gen.file.metadata().unwrap().len();
+            file_len - 4
+        };
+
+        // First access lazily creates the mmap covering exactly what's on
+        // disk right now: A's full frame plus the 4-byte orphan prefix —
+        // not the (never-written) payload+crc.
+        let result = PackfileStorage::read_at(&gen, torn_offset);
+        assert!(
+            matches!(result, Err(StorageError::Corrupt(_))),
+            "a genuinely truncated frame must surface as Corrupt, got {result:?}"
+        );
+    }
+
+    #[test]
     fn test_get_not_found() {
         let dir = test_dir("notfound");
         let store = PackfileStorage::open(dir).unwrap();
@@ -790,6 +837,12 @@ mod tests {
 
         // Written in ascending order, so physical offsets are ascending too.
         store.put_many(&TEST_ROOM, &entries).unwrap();
+
+        // put_many populates the cache for every id it writes — clear it so
+        // get_many is forced through the index-lookup + sort-then-read path
+        // this test actually exists to exercise, not served entirely from
+        // cache (which would pass trivially without touching that code).
+        store.cache().clear();
 
         // Request them in REVERSED order — internal sort-then-read will
         // visit them ascending-by-offset (the opposite of this request
