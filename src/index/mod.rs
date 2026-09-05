@@ -3,7 +3,7 @@
 /// Layout: `[24-bit tag | 8-bit pack_id | 32-bit offset]` packed into a `u64`.
 ///
 /// - **tag** (high 24 bits): truncated fingerprint for fast rejection.
-/// - **pack_id** (next 8 bits): which packfile generation this record lives in.
+/// - **`pack_id`** (next 8 bits): which packfile generation this record lives in.
 /// - **offset** (low 32 bits): byte offset within the packfile.
 ///
 /// Empty slots are all-zeros. The tag serves double duty: an empty slot
@@ -15,39 +15,42 @@ pub struct IndexSlot(u64);
 impl IndexSlot {
     const EMPTY: Self = Self(0);
 
-    const PACK_BITS: u64 = 8;
-    const OFFSET_BITS: u64 = 32;
+    const TAG_SHIFT: u64 = 40; // PACK_BITS + OFFSET_BITS
+    const PACK_SHIFT: u64 = 32; // OFFSET_BITS
+    const OFFSET_MASK: u64 = 0xFFFF_FFFF;
 
-    const TAG_SHIFT: u64 = Self::PACK_BITS + Self::OFFSET_BITS; // 40
-    const PACK_SHIFT: u64 = Self::OFFSET_BITS; // 32
-    const OFFSET_MASK: u64 = (1u64 << Self::OFFSET_BITS) - 1;
-
+    #[must_use]
     pub fn new(tag: u32, pack_id: u8, offset: u64) -> Self {
         assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
         assert!(offset <= 0xFFFF_FFFF, "offset must fit in 32 bits");
         Self(
-            ((tag as u64) << Self::TAG_SHIFT)
-                | ((pack_id as u64) << Self::PACK_SHIFT)
+            (u64::from(tag) << Self::TAG_SHIFT)
+                | (u64::from(pack_id) << Self::PACK_SHIFT)
                 | (offset & Self::OFFSET_MASK),
         )
     }
 
+    #[must_use]
     pub fn empty() -> Self {
         Self::EMPTY
     }
 
+    #[must_use]
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    #[must_use]
     pub fn tag(self) -> u32 {
         ((self.0 >> Self::TAG_SHIFT) & 0xFF_FFFF) as u32
     }
 
+    #[must_use]
     pub fn pack_id(self) -> u8 {
         ((self.0 >> Self::PACK_SHIFT) & 0xFF) as u8
     }
 
+    #[must_use]
     pub fn offset(self) -> u64 {
         self.0 & Self::OFFSET_MASK
     }
@@ -62,7 +65,7 @@ impl IndexSlot {
 /// Design decisions (from docs):
 /// - Partition by room: ~8KB per 1000-node room, 100 active rooms < 1MB.
 /// - Empty slot terminates probe (write-once, no tombstones needed).
-/// - Tag collisions surface as verification failures (decode_v1_verified).
+/// - Tag collisions surface as verification failures (`decode_v1_verified`).
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
 #[derive(Debug)]
 pub struct LossyIndex {
@@ -81,12 +84,13 @@ pub struct LossyIndex {
 impl LossyIndex {
     /// Create a new index with at least `min_capacity` slots.
     /// Capacity is rounded up to the next power of two.
+    #[must_use]
     pub fn new(min_capacity: usize) -> Self {
         let capacity = min_capacity.next_power_of_two().max(16);
         let shift = 64 - (capacity as u32).leading_zeros();
         Self {
             capacity: capacity as u64,
-            mask: (capacity as u64) - 1,
+            mask: capacity as u64 - 1,
             shift,
             slots: vec![IndexSlot::empty(); capacity],
             len: 0,
@@ -107,10 +111,11 @@ impl LossyIndex {
         top >> 8 // top 24 bits
     }
 
-    /// Insert a (hash → pack_id, offset) mapping.
+    /// Insert a (hash → `pack_id`, offset) mapping.
     /// Returns `Err` if the table is too full (< 25% free slots remaining).
     pub fn insert(&mut self, hash: &[u8; 16], pack_id: u8, offset: u64) -> Result<(), InsertError> {
-        if self.len >= (self.capacity * 3 / 4) as usize {
+        let threshold = self.capacity.saturating_mul(3) / 4;
+        if self.len >= threshold as usize {
             return Err(InsertError::TableFull);
         }
 
@@ -121,7 +126,7 @@ impl LossyIndex {
             let slot = self.slots[bucket];
             if slot.is_empty() {
                 self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
-                self.len += 1;
+                self.len = self.len.saturating_add(1);
                 return Ok(());
             }
             // If same tag already exists at this bucket, overwrite
@@ -141,6 +146,7 @@ impl LossyIndex {
     /// 1. Class A tables are write-once with no deletes (no tombstones needed).
     /// 2. An empty slot means the key was never inserted.
     #[inline]
+    #[must_use]
     pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u8, u64)> {
         let tag = Self::tag(hash);
         let mut bucket = self.bucket(hash);
@@ -158,23 +164,27 @@ impl LossyIndex {
     }
 
     /// Number of occupied slots.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the index is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Estimated memory usage in bytes.
+    #[must_use]
     pub fn memory_usage(&self) -> usize {
-        self.capacity as usize * 8 + std::mem::size_of::<Self>()
+        (self.capacity as usize) * 8 + std::mem::size_of::<Self>()
     }
 
     /// Serialize the index to bytes for persistence.
+    #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + self.capacity as usize * 8);
+        let mut buf = Vec::with_capacity(8 + (self.capacity as usize) * 8);
         buf.extend_from_slice(&self.capacity.to_le_bytes());
         for slot in &self.slots {
             buf.extend_from_slice(&slot.0.to_le_bytes());
@@ -188,19 +198,19 @@ impl LossyIndex {
             return Err(DeserializationError::TooShort);
         }
         let capacity = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        let expected_len = 8 + capacity * 8;
+        let expected_len = 8_usize.saturating_add(capacity.saturating_mul(8));
         if data.len() < expected_len {
             return Err(DeserializationError::TooShort);
         }
 
         let mut slots = Vec::with_capacity(capacity);
-        let mut len = 0;
+        let mut len: usize = 0;
         for i in 0..capacity {
-            let offset = 8 + i * 8;
+            let offset = 8_usize.saturating_add(i.saturating_mul(8));
             let val = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             let slot = IndexSlot(val);
             if !slot.is_empty() {
-                len += 1;
+                len = len.saturating_add(1);
             }
             slots.push(slot);
         }
@@ -242,10 +252,10 @@ mod tests {
 
     #[test]
     fn test_slot_packing() {
-        let slot = IndexSlot::new(0xABCDEF, 42, 0x12345678);
-        assert_eq!(slot.tag(), 0xABCDEF);
+        let slot = IndexSlot::new(0x00AB_CDEF, 42, 0x1234_5678);
+        assert_eq!(slot.tag(), 0x00AB_CDEF);
         assert_eq!(slot.pack_id(), 42);
-        assert_eq!(slot.offset(), 0x12345678);
+        assert_eq!(slot.offset(), 0x1234_5678);
         assert!(!slot.is_empty());
     }
 
@@ -277,14 +287,12 @@ mod tests {
     #[test]
     fn test_linear_probing() {
         let mut index = LossyIndex::new(16); // small table
-                                             // Fill most slots
         for i in 0..10u8 {
             let mut h = [0u8; 16];
             h[0] = i;
             h[1] = 0xFF; // different second byte to avoid tag collisions
-            index.insert(&h, 0, i as u64 * 100).unwrap();
+            index.insert(&h, 0, u64::from(i) * 100).unwrap();
         }
-        // Lookup still works via linear probing
         for i in 0..10u8 {
             let mut h = [0u8; 16];
             h[0] = i;
@@ -297,8 +305,6 @@ mod tests {
     fn test_empty_terminates_probe() {
         let index = LossyIndex::new(16);
         let h = test_hash(0x42);
-        // Don't insert h — looking it up should return None immediately
-        // if the bucket it maps to is empty
         assert_eq!(index.lookup(&h), None);
     }
 
@@ -318,7 +324,7 @@ mod tests {
         for i in 0..50u8 {
             let mut h = [0u8; 16];
             h[0] = i;
-            index.insert(&h, i % 3, i as u64 * 1000 + 1).unwrap();
+            index.insert(&h, i % 3, u64::from(i) * 1000 + 1).unwrap();
         }
 
         let bytes = index.serialize();

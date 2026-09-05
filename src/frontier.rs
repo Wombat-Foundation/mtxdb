@@ -4,25 +4,28 @@ use crate::storage::{NodeData, NodeId, StorageEngine};
 ///
 /// This is the data structure that enables concurrent frontier submission:
 /// resolve all hashes to pack offsets in RAM, then issue all reads
-/// concurrently via io_uring or a thread pool.
+/// concurrently via `io_uring` or a thread pool.
 #[derive(Debug, Clone)]
 pub struct FrontierBatch {
     /// The hashes to fetch.
     pub hashes: Vec<NodeId>,
-    /// Optional: pre-resolved (pack_id, offset) pairs from the index.
+    /// Optional: pre-resolved (`pack_id`, offset) pairs from the index.
     pub resolved: Vec<Option<(u8, u64)>>,
 }
 
 impl FrontierBatch {
+    #[must_use]
     pub fn new(hashes: Vec<NodeId>) -> Self {
         let resolved = vec![None; hashes.len()];
         Self { hashes, resolved }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.hashes.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
     }
@@ -32,7 +35,7 @@ impl FrontierBatch {
 ///
 /// This is the key optimization for HDD: issue all reads simultaneously
 /// so the kernel's I/O scheduler (mq-deadline) can sort them into
-/// a head sweep. On NVMe this is purely parallel; on HDD it reduces
+/// a head sweep. On `NVMe` this is purely parallel; on HDD it reduces
 /// N full seeks to one sweep across N sorted positions.
 ///
 /// # Arguments
@@ -73,6 +76,7 @@ pub struct BfsLayer {
 }
 
 impl BfsLayer {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             hashes: Vec::new(),

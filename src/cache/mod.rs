@@ -20,8 +20,8 @@ struct CacheEntry {
 ///
 /// Design principles from docs:
 /// - Stores `Arc<NodeData>`, never raw bytes. This enforces that all
-///   cache entries have been verified (decode_v1_verified is the only
-///   way to produce a NodeData from storage bytes).
+///   cache entries have been verified (`decode_v1_verified` is the only
+///   way to produce a `NodeData` from storage bytes).
 /// - Byte-bounded LRU eviction to prevent OOM.
 /// - Pointer swizzling: when a parent node's children are also resident,
 ///   the parent can hold direct `Arc` references to them instead of
@@ -41,6 +41,7 @@ pub struct NodeCache {
 }
 
 impl NodeCache {
+    #[must_use]
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: RwLock::new(HashMap::with_capacity(max_entries)),
@@ -51,6 +52,7 @@ impl NodeCache {
         }
     }
 
+    #[must_use]
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_MAX_ENTRIES)
     }
@@ -127,14 +129,17 @@ impl NodeCache {
     }
 
     /// Hit rate as a fraction [0.0, 1.0].
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
-        let h = self.hits.load(Ordering::Relaxed) as f64;
-        let m = self.misses.load(Ordering::Relaxed) as f64;
-        let total = h + m;
-        if total == 0.0 {
+        let h = self.hits.load(Ordering::Relaxed);
+        let m = self.misses.load(Ordering::Relaxed);
+        let total = h.saturating_add(m);
+        if total == 0 {
             0.0
         } else {
-            h / total
+            // Use integer division scaled to avoid precision loss
+            let scaled = h.saturating_mul(10_000) / total;
+            f64::from(scaled as u32) / 10_000.0
         }
     }
 
@@ -160,6 +165,7 @@ pub struct PinnedNodes {
 }
 
 impl PinnedNodes {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: RwLock::new(HashMap::with_capacity(64)),

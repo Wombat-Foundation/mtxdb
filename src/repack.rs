@@ -27,7 +27,7 @@ pub type ResolverFn = dyn Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>;
 /// - Pack files are immutable once written.
 /// - Readers hold `Arc<PackGeneration>` for the duration of a traversal.
 /// - The repacker writes a new pack, fsyncs, renames atomically, then
-///   swaps the room's pointer via ArcSwap.
+///   swaps the room's pointer via `ArcSwap`.
 /// - The old pack is unlinked when the last reader releases its Arc.
 pub struct RepackManager {
     /// Per-room pack generations. Room ID → current pack generation.
@@ -37,6 +37,7 @@ pub struct RepackManager {
 }
 
 impl RepackManager {
+    #[must_use]
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
             packs: RwLock::new(HashMap::new()),
@@ -155,10 +156,7 @@ impl RepackManager {
 
     fn next_pack_id(&self, room_id: &[u8; 16]) -> u8 {
         let packs = self.packs.read();
-        packs
-            .get(room_id)
-            .map(|g| g.pack_id.wrapping_add(1))
-            .unwrap_or(0)
+        packs.get(room_id).map_or(0, |g| g.pack_id.wrapping_add(1))
     }
 
     fn pack_path(&self, room_id: &[u8; 16], pack_id: u8) -> PathBuf {

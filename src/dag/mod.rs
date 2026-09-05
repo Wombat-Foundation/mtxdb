@@ -25,29 +25,34 @@ impl GraphEdge {
     const PAYLOAD_MASK: u32 = !Self::RESIDENT_BIT;
 
     #[inline]
+    #[must_use]
     pub fn is_resident(self) -> bool {
         (self.0 & Self::RESIDENT_BIT) != 0
     }
 
     #[inline]
+    #[must_use]
     pub fn arena_index(self) -> usize {
         debug_assert!(self.is_resident());
         (self.0 & Self::PAYLOAD_MASK) as usize
     }
 
     #[inline]
+    #[must_use]
     pub fn local_id(self) -> LocalId {
         debug_assert!(!self.is_resident());
         self.0 & Self::PAYLOAD_MASK
     }
 
     #[inline]
-    pub fn resident(index: usize) -> Self {
-        debug_assert!(index as u32 <= Self::PAYLOAD_MASK);
-        Self(Self::RESIDENT_BIT | (index as u32 & Self::PAYLOAD_MASK))
+    #[must_use]
+    pub fn resident(index: u32) -> Self {
+        debug_assert!(index <= Self::PAYLOAD_MASK);
+        Self(Self::RESIDENT_BIT | (index & Self::PAYLOAD_MASK))
     }
 
     #[inline]
+    #[must_use]
     pub fn disk(id: LocalId) -> Self {
         debug_assert!(id <= Self::PAYLOAD_MASK);
         Self(id & Self::PAYLOAD_MASK)
@@ -61,9 +66,9 @@ pub struct EventNode {
     pub short_id: u64,
     /// Dense local ID within this room.
     pub local_id: LocalId,
-    /// Range into the edges array for prev_events: (start, len).
+    /// Range into the edges array for `prev_events`: (start, len).
     pub prev: (u32, u32),
-    /// Range into the edges array for auth_events: (start, len).
+    /// Range into the edges array for `auth_events`: (start, len).
     pub auth: (u32, u32),
 }
 
@@ -78,15 +83,16 @@ pub struct ActiveRoomFrontier {
     pub nodes: Vec<EventNode>,
     /// Contiguous edge storage. Edges for a node are at `edges[start..start+len]`.
     pub edges: Vec<GraphEdge>,
-    /// Maps global short_id → index into nodes Vec.
+    /// Maps global `short_id` → index into nodes Vec.
     pub resident: HashMap<u64, u32>,
-    /// Maps global short_id → dense local_id for this room.
+    /// Maps global `short_id` → dense `local_id` for this room.
     pub id_remap: HashMap<u64, LocalId>,
-    /// Next local_id to assign.
+    /// Next `local_id` to assign.
     next_local_id: LocalId,
 }
 
 impl ActiveRoomFrontier {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -97,59 +103,66 @@ impl ActiveRoomFrontier {
         }
     }
 
-    /// Register a global short_id and assign it a dense local_id.
+    /// Register a global `short_id` and assign it a dense `local_id`.
     pub fn register_id(&mut self, short_id: u64) -> LocalId {
         if let Some(&local) = self.id_remap.get(&short_id) {
             return local;
         }
         let local = self.next_local_id;
-        self.next_local_id += 1;
+        self.next_local_id = self.next_local_id.saturating_add(1);
         self.id_remap.insert(short_id, local);
         local
+    }
+
+    /// Resolve a parent edge: if the parent is in the arena, use a resident
+    /// edge; if it has a `local_id`, use a disk edge; otherwise assign a new
+    /// `local_id` and use a disk edge.
+    fn resolve_edge(&mut self, parent_id: u64) -> GraphEdge {
+        let local = match self.id_remap.get(&parent_id) {
+            Some(&local) => local,
+            None => self.register_id(parent_id),
+        };
+        if let Some(&slot) = self.resident.get(&parent_id) {
+            GraphEdge::resident(slot)
+        } else {
+            GraphEdge::disk(local)
+        }
     }
 
     /// Insert an event with its raw prev and auth edges.
     ///
     /// For each parent in `raw_prevs` and `raw_auths`:
     /// - If the parent is already in the arena, creates a `resident` edge.
-    /// - Otherwise, creates a `disk` edge with the parent's local_id.
+    /// - Otherwise, creates a `disk` edge with the parent's `local_id`.
     pub fn insert_event(&mut self, short_id: u64, raw_prevs: &[u64], raw_auths: &[u64]) -> usize {
         let local_id = self.register_id(short_id);
-        let node_idx = self.nodes.len() as u32;
 
-        let prev_start = self.edges.len() as u32;
+        let node_idx: u32 =
+            u32::try_from(self.nodes.len()).expect("too many events for u32 arena index");
+
+        let prev_start: u32 =
+            u32::try_from(self.edges.len()).expect("too many edges for u32 arena index");
         for &parent_id in raw_prevs {
-            let edge = self
-                .id_remap
-                .get(&parent_id)
-                .map(|&local| {
-                    if let Some(&slot) = self.resident.get(&parent_id) {
-                        GraphEdge::resident(slot as usize)
-                    } else {
-                        GraphEdge::disk(local)
-                    }
-                })
-                .unwrap_or_else(|| GraphEdge::disk(self.register_id(parent_id)));
+            let edge = self.resolve_edge(parent_id);
             self.edges.push(edge);
         }
-        let prev_len = self.edges.len() as u32 - prev_start;
+        let prev_end: u32 =
+            u32::try_from(self.edges.len()).expect("too many edges for u32 arena index");
+        let prev_len = prev_end
+            .checked_sub(prev_start)
+            .expect("prev_len underflow");
 
-        let auth_start = self.edges.len() as u32;
+        let auth_start: u32 =
+            u32::try_from(self.edges.len()).expect("too many edges for u32 arena index");
         for &parent_id in raw_auths {
-            let edge = self
-                .id_remap
-                .get(&parent_id)
-                .map(|&local| {
-                    if let Some(&slot) = self.resident.get(&parent_id) {
-                        GraphEdge::resident(slot as usize)
-                    } else {
-                        GraphEdge::disk(local)
-                    }
-                })
-                .unwrap_or_else(|| GraphEdge::disk(self.register_id(parent_id)));
+            let edge = self.resolve_edge(parent_id);
             self.edges.push(edge);
         }
-        let auth_len = self.edges.len() as u32 - auth_start;
+        let auth_end: u32 =
+            u32::try_from(self.edges.len()).expect("too many edges for u32 arena index");
+        let auth_len = auth_end
+            .checked_sub(auth_start)
+            .expect("auth_len underflow");
 
         self.nodes.push(EventNode {
             short_id,
@@ -162,16 +175,22 @@ impl ActiveRoomFrontier {
         node_idx as usize
     }
 
-    /// Get the prev_edges for a node by its arena index.
+    /// Get the `prev_edges` for a node by its arena index.
+    #[must_use]
     pub fn prev_edges(&self, node_idx: usize) -> &[GraphEdge] {
         let node = &self.nodes[node_idx];
-        &self.edges[node.prev.0 as usize..(node.prev.0 + node.prev.1) as usize]
+        let start = node.prev.0 as usize;
+        let end = start + node.prev.1 as usize;
+        &self.edges[start..end]
     }
 
-    /// Get the auth_edges for a node by its arena index.
+    /// Get the `auth_edges` for a node by its arena index.
+    #[must_use]
     pub fn auth_edges(&self, node_idx: usize) -> &[GraphEdge] {
         let node = &self.nodes[node_idx];
-        &self.edges[node.auth.0 as usize..(node.auth.0 + node.auth.1) as usize]
+        let start = node.auth.0 as usize;
+        let end = start + node.auth.1 as usize;
+        &self.edges[start..end]
     }
 
     /// Drop all data for this room. O(1).
@@ -184,10 +203,12 @@ impl ActiveRoomFrontier {
     }
 
     /// Number of events in this room's frontier.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -218,34 +239,30 @@ mod tests {
     fn test_insert_event_basic() {
         let mut frontier = ActiveRoomFrontier::new();
 
-        // Event A (no parents)
         let idx_a = frontier.insert_event(100, &[], &[]);
         assert_eq!(idx_a, 0);
         assert_eq!(frontier.len(), 1);
 
-        // Event B (parent is A)
         let idx_b = frontier.insert_event(101, &[100], &[100]);
         assert_eq!(idx_b, 1);
         assert_eq!(frontier.len(), 2);
 
-        // B's prev should be a resident edge pointing to A
         let prev = frontier.prev_edges(idx_b);
         assert_eq!(prev.len(), 1);
         assert!(prev[0].is_resident());
-        assert_eq!(prev[0].arena_index(), 0); // A is at index 0
+        assert_eq!(prev[0].arena_index(), 0);
     }
 
     #[test]
     fn test_insert_event_with_disk_parent() {
         let mut frontier = ActiveRoomFrontier::new();
 
-        // Event A with a parent that isn't in the arena
         let idx_a = frontier.insert_event(100, &[999], &[]);
         assert_eq!(idx_a, 0);
 
         let prev = frontier.prev_edges(idx_a);
         assert_eq!(prev.len(), 1);
-        assert!(!prev[0].is_resident()); // parent not in arena
+        assert!(!prev[0].is_resident());
     }
 
     #[test]
@@ -265,10 +282,10 @@ mod tests {
         let mut frontier = ActiveRoomFrontier::new();
         let local_a = frontier.register_id(100);
         let local_b = frontier.register_id(200);
-        let local_a2 = frontier.register_id(100); // same id
+        let local_a2 = frontier.register_id(100);
 
         assert_eq!(local_a, 0);
         assert_eq!(local_b, 1);
-        assert_eq!(local_a2, 0); // same as first
+        assert_eq!(local_a2, 0);
     }
 }

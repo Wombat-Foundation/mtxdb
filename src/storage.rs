@@ -14,7 +14,7 @@ pub struct NodeData {
 
 /// A reference to a node that may be resident in cache or need disk fetch.
 ///
-/// This is the swizzling enum inspired by LeanStore:
+/// This is the swizzling enum inspired by `LeanStore`:
 /// - `Lazy(id)`: the node is on disk, identified by its hash.
 /// - `Resolved(data)`: the node is in memory, ready for use.
 #[derive(Debug, Clone)]
@@ -24,6 +24,7 @@ pub enum NodeRef {
 }
 
 impl NodeRef {
+    #[must_use]
     pub fn structural_hash(&self) -> &NodeId {
         match self {
             NodeRef::Lazy(id) => id,
@@ -95,6 +96,7 @@ pub struct InMemoryStorage {
 }
 
 impl InMemoryStorage {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: RwLock::new(HashMap::new()),

@@ -30,6 +30,7 @@ pub struct Record {
 }
 
 impl Record {
+    #[must_use]
     pub fn serialized_len(&self) -> usize {
         4 + 16 + self.data.len() + 4
     }
@@ -53,7 +54,8 @@ impl Drop for PackGeneration {
 
 /// Write a single record into the packfile.
 pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<()> {
-    let payload_len = (16 + record.data.len()) as u32;
+    let payload_len =
+        u32::try_from(16 + record.data.len()).expect("record payload exceeds u32::MAX");
     writer.write_all(&payload_len.to_le_bytes())?;
     writer.write_all(&record.hash)?;
     writer.write_all(&record.data)?;
@@ -86,7 +88,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
         ));
     }
 
-    let mut payload = vec![0u8; payload_len as usize];
+    let mut payload = vec![0u8; usize::try_from(payload_len).expect("u32 always fits in usize")];
     reader.read_exact(&mut payload)?;
 
     let mut crc_buf = [0u8; 4];
