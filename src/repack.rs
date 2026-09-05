@@ -173,6 +173,7 @@ impl RepackManager {
             file,
             path: pack_path,
             mmap: parking_lot::RwLock::new(None),
+            append_lock: parking_lot::Mutex::new(()),
         });
 
         self.swap_pack(room_id, generation.clone());
@@ -377,6 +378,7 @@ mod tests {
             file,
             path,
             mmap: parking_lot::RwLock::new(None),
+            append_lock: parking_lot::Mutex::new(()),
         });
         manager.swap_pack([0xBB; 16], gen);
 

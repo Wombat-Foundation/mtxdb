@@ -197,6 +197,7 @@ impl PackfileStorage {
                         file,
                         path: path.clone(),
                         mmap: parking_lot::RwLock::new(None),
+                        append_lock: parking_lot::Mutex::new(()),
                     });
                     repack.swap_pack(room_id, gen);
                 }
@@ -241,6 +242,7 @@ impl PackfileStorage {
             file,
             path: pack_path,
             mmap: parking_lot::RwLock::new(None),
+            append_lock: parking_lot::Mutex::new(()),
         });
         self.repack.swap_pack(*room_id, gen.clone());
 
@@ -570,12 +572,25 @@ impl StorageEngine for PackfileStorage {
         // on the same handle that performs it — not from a separate
         // metadata().len() call afterward. The previous approach computed
         // offset = file_len - record_len using gen.file's length queried
-        // after the write completed; under any future concurrent-writer
-        // scenario for the same room, another append landing between the
-        // write and that metadata() call would corrupt the computed offset
-        // for this record. Seeking to end returns the position the write
-        // will land at, on this same cloned handle, atomically with intent.
+        // after the write completed; under any concurrent-writer scenario
+        // for the same room, another append landing between the write and
+        // that metadata() call would corrupt the computed offset for this
+        // record.
+        //
+        // gen.append_lock serializes this whole seek+write+offset-capture
+        // section per generation (not globally — a different room, or a
+        // different generation of this room after a repack swap, never
+        // contends here). Without it, two threads racing put() on the same
+        // generation could both capture the identical seek(End(0)) offset
+        // before either's write_record lands; O_APPEND still places both
+        // writes correctly at the true end, but the LossyIndex would then
+        // record that same offset for both ids, permanently orphaning one.
+        // Confirmed as a real, if narrow, gap — not fixed preemptively:
+        // the sibling ensure_pack race in this same file was reproduced
+        // directly under test_concurrent_federation_swarm, which is the
+        // standard this lock is held to.
         let offset = {
+            let _append_guard = gen.append_lock.lock();
             let mut file = gen.file.try_clone()?;
             let offset = file.seek(std::io::SeekFrom::End(0))?;
             packfile::write_record(&mut file, &record)?;

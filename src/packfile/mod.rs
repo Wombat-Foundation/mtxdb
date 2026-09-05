@@ -52,6 +52,15 @@ pub struct PackGeneration {
     /// Lazily-created mmap of the packfile. May be remapped when the file
     /// grows (the active generation is appended to between repacks).
     pub(crate) mmap: RwLock<Option<Mmap>>,
+    /// Serializes append + offset-capture for this generation's active
+    /// write head. Scoped to one generation (not global): writes to a
+    /// different room, or a different generation of this room after a
+    /// repack swap, never contend on this lock. Without it, two threads
+    /// racing `put()` on the same generation could both capture the same
+    /// `seek(SeekFrom::End(0))` offset before either's `write_record`
+    /// lands — `O_APPEND` places both writes correctly, but the `LossyIndex`
+    /// would record the same offset for both, permanently orphaning one.
+    pub(crate) append_lock: parking_lot::Mutex<()>,
 }
 
 impl PackGeneration {
