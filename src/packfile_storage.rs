@@ -221,7 +221,7 @@ impl PackfileStorage {
         self.indexes
             .write()
             .entry(*room_id)
-            .or_insert_with(|| LossyIndex::new(256));
+            .or_insert_with(|| LossyIndex::new(4096));
 
         Ok(gen)
     }

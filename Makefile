@@ -73,8 +73,8 @@ build: ##H Build the lib/binary
 
 
 .PHONY: bench
-bench: ##H Run benchmarks (p=<bench-name>, default: all)
-	$(CARGO) bench $(if $(p),--bench $(p) $(if $(filter serde_cmp,$(p)),--features serde-comparison))
+bench: ##H Run benchmarks
+	$(CARGO) bench --benches --profile release-max-perf
 
 .PHONY: clean
 clean: ##H Clean build artifacts

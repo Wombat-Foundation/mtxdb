@@ -45,7 +45,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mdb"
+name = "mtxdb"
 version = "0.1.0"
 dependencies = [
  "bytes",
