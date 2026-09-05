@@ -16,6 +16,12 @@ use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
 
 pub type NodeParserFn = fn(&[u8]) -> Vec<NodeId>;
 
+/// `(hash, offset)` entries scanned from a single packfile generation.
+type PackEntries = Vec<(NodeId, u64)>;
+
+/// Scanned entries grouped by pack id, in generation order.
+type ScannedPacks = Vec<(u8, PackEntries)>;
+
 /// Callback that rewrites a node's child pointers for in-cache swizzling.
 ///
 /// When a node is fetched from disk, this callback is invoked with:
@@ -246,10 +252,10 @@ impl PackfileStorage {
         };
 
         let mut total = 0usize;
-        let mut scanned: Vec<(u8, Vec<([u8; 16], u64)>)> = Vec::new();
+        let mut scanned: ScannedPacks = Vec::new();
         for gen in &packs {
             if let Ok(entries) = packfile::scan_packfile(&gen.path) {
-                total += entries.len();
+                total = total.saturating_add(entries.len());
                 scanned.push((gen.pack_id, entries));
             }
         }
@@ -290,7 +296,8 @@ impl PackfileStorage {
             return Err(StorageError::Corrupt("truncated length prefix".into()));
         }
 
-        let payload_len_bytes: [u8; 4] = mem[offset..offset + 4].try_into().unwrap();
+        let prefix_end = offset.wrapping_add(4);
+        let payload_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
         let payload_len = u32::from_le_bytes(payload_len_bytes);
 
         if payload_len == 0 || payload_len > packfile::MAX_RECORD_LEN {
@@ -300,14 +307,14 @@ impl PackfileStorage {
         }
 
         let payload_len_usize = payload_len as usize;
-        let crc_pos = offset + 4 + payload_len_usize;
-        let frame_end = crc_pos + 4;
+        let crc_pos = prefix_end.wrapping_add(payload_len_usize);
+        let frame_end = crc_pos.wrapping_add(4);
 
         if frame_end > mem.len() {
             return Err(StorageError::Corrupt("truncated frame".into()));
         }
 
-        let payload = &mem[offset + 4..crc_pos];
+        let payload = &mem[prefix_end..crc_pos];
         let crc_buf: [u8; 4] = mem[crc_pos..frame_end].try_into().unwrap();
 
         let mut crc = crc32fast::Hasher::new();

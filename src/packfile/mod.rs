@@ -58,6 +58,13 @@ impl PackGeneration {
     /// The mmap is lazily created on first access and cached (including
     /// failures) for subsequent calls. This enables zero-syscall reads
     /// for the hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the packfile cannot be opened for mapping
+    /// or the `mmap(2)` call fails. The error kind and message from the
+    /// underlying attempt are preserved, and the failure is cached so
+    /// subsequent calls return the same error without retrying.
     pub fn mmap(&self) -> io::Result<&Mmap> {
         let cached = self.mmap.get_or_init(|| map_pack(&self.file));
         match cached {

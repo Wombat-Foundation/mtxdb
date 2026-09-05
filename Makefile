@@ -74,7 +74,7 @@ build: ##H Build the lib/binary
 
 .PHONY: bench
 bench: ##H Run benchmarks
-	$(CARGO) bench --benches --profile release-max-perf
+	$(CARGO) bench --benches
 
 .PHONY: clean
 clean: ##H Clean build artifacts

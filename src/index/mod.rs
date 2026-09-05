@@ -120,7 +120,7 @@ impl LossyIndex {
     /// If the tag were derived from bucket bits (or a superset of them),
     /// same-bucket entries would already agree on those bits, collapsing
     /// the tag's effective discriminating power from 2^-24 to roughly
-    /// 2^-(24 - bucket_bits) and causing far more spurious "same tag"
+    /// 2^-(24 - `bucket_bits`) and causing far more spurious "same tag"
     /// overwrites than the nominal 24-bit collision rate predicts.
     #[inline]
     fn tag(hash: &[u8; 16]) -> u32 {
