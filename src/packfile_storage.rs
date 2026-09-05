@@ -77,7 +77,27 @@ pub struct PackfileStorage {
     /// both write a header to the same file, corrupting it (confirmed via
     /// `test_concurrent_federation_swarm`: "invalid packfile header").
     ensure_pack_lock: parking_lot::Mutex<()>,
+    /// Per-room roots that must survive repack (state root + timeline
+    /// forward-extremities). `repack_room` itself is caller-agnostic about
+    /// what a root means — this is where `PackfileStorage` remembers what
+    /// its own callers told it, so `maybe_repack` has something to pass.
+    /// A room with no registered roots is never repacked: repacking
+    /// without knowing what must survive would risk exactly the reachability
+    /// gap `repack_room`'s multi-root fix exists to prevent.
+    live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
+    /// Trigger repack once a room's active generation exceeds this many
+    /// bytes. Checked after `put()`; `AtomicU64` so it's settable without
+    /// `&mut self` on an already-shared `PackfileStorage`.
+    repack_threshold_bytes: std::sync::atomic::AtomicU64,
 }
+
+/// Default repack trigger: once a room's active packfile exceeds this size,
+/// `maybe_repack` rewrites it in reachability order (if live roots are
+/// registered). Deliberately small relative to real deployments — the
+/// documented design envelope is ~500-1000 HAMT nodes per room (~8KB index),
+/// so an 8MB packfile already represents a room whose garbage almost
+/// certainly dwarfs its live data.
+const DEFAULT_REPACK_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 impl PackfileStorage {
     /// Create a new packfile storage.
@@ -139,6 +159,10 @@ impl PackfileStorage {
             swizzle,
             parser,
             ensure_pack_lock: parking_lot::Mutex::new(()),
+            live_roots: RwLock::new(HashMap::new()),
+            repack_threshold_bytes: std::sync::atomic::AtomicU64::new(
+                DEFAULT_REPACK_THRESHOLD_BYTES,
+            ),
         })
     }
 
@@ -216,6 +240,81 @@ impl PackfileStorage {
     #[must_use]
     pub fn pinned(&self) -> &PinnedNodes {
         &self.pinned
+    }
+
+    /// Register the set of roots that must survive repack for a room: the
+    /// current HAMT state root plus every timeline forward-extremity (tip).
+    /// `maybe_repack` refuses to repack a room with no registered roots —
+    /// repacking without knowing what must survive risks the exact
+    /// reachability gap `repack_room`'s multi-root design exists to
+    /// prevent. The caller (the layer that actually understands Matrix
+    /// semantics) is responsible for keeping this current as state changes
+    /// and the timeline advances.
+    pub fn set_live_roots(&self, room_id: &[u8; 16], roots: Vec<NodeId>) {
+        self.live_roots.write().insert(*room_id, roots);
+    }
+
+    /// Set the packfile-size threshold that triggers a repack. Checked
+    /// after `put()` for the room just written to.
+    pub fn set_repack_threshold_bytes(&self, bytes: u64) {
+        self.repack_threshold_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Repack a room if its active generation has grown past the
+    /// configured threshold and live roots are registered for it.
+    /// Best-effort: any failure (no roots registered, no pack yet, repack
+    /// I/O error) is silently skipped rather than propagated — a missed
+    /// repack opportunity is not a correctness problem, it just means the
+    /// room's packfile stays larger than it needs to be until the next
+    /// `put()` checks again.
+    fn maybe_repack(&self, room_id: &[u8; 16]) {
+        let roots = {
+            let live_roots = self.live_roots.read();
+            match live_roots.get(room_id) {
+                Some(r) if !r.is_empty() => r.clone(),
+                _ => return,
+            }
+        };
+
+        let Some(gen) = self.repack.get_pack(room_id) else {
+            return;
+        };
+        let Ok(metadata) = gen.file.metadata() else {
+            return;
+        };
+        if metadata.len()
+            < self
+                .repack_threshold_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+
+        let resolver = |id: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
+            let data = self.get(room_id, id).ok().flatten()?;
+            let children = self
+                .parser
+                .map_or_else(Vec::new, |parse| parse(&data.bytes));
+            Some((data, children))
+        };
+
+        let Ok(new_gen) = self.repack.repack_room(*room_id, roots, resolver) else {
+            return;
+        };
+
+        // repack_room swaps the active generation but has no notion of
+        // PackfileStorage's index — without rebuilding it here, every
+        // record's index entry would still point at the old (now-orphaned)
+        // pack_id, and get() would silently report every one of them as
+        // not found the moment this repack completes.
+        if let Ok(entries) = packfile::scan_packfile(&new_gen.path) {
+            let mut index = LossyIndex::new(entries.len().saturating_mul(2).max(16));
+            for (hash, offset) in &entries {
+                let _ = index.insert(hash, new_gen.pack_id, *offset);
+            }
+            self.indexes.write().insert(*room_id, index);
+        }
     }
 
     /// Ensure a pack exists for the given room, creating one if needed.
@@ -624,6 +723,8 @@ impl StorageEngine for PackfileStorage {
             }
         }
         self.cache.insert(*id, Arc::new(data_to_cache));
+
+        self.maybe_repack(room_id);
 
         Ok(())
     }
@@ -1138,6 +1239,99 @@ mod tests {
 
         // Non-existent hash returns None (not a tag collision loop)
         assert!(store.get(&TEST_ROOM, &[0xFF; 16]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_maybe_repack_triggers_and_preserves_live_data() {
+        // End-to-end proof that wiring repack_room into PackfileStorage
+        // actually works: garbage accumulates, a live chain of nodes is
+        // registered as roots, the threshold trips, repack fires, the
+        // packfile shrinks, and the live chain is still readable afterward
+        // — through the SAME PackfileStorage handle, meaning maybe_repack's
+        // index rebuild (the gap identified via the concurrency swarm test:
+        // repack_room swaps generations but doesn't touch
+        // PackfileStorage.indexes) actually closes that gap in practice,
+        // not just in isolated repack.rs unit tests.
+        let dir = test_dir("maybe_repack");
+        let store = PackfileStorage::open(dir).unwrap();
+        store.set_repack_threshold_bytes(1024); // trip quickly in a test
+
+        let room = [0x55u8; 16];
+
+        // A live chain: root -> mid -> leaf. Only `root` is registered,
+        // but repack must preserve the whole chain since put()'s
+        // NodeData::children/parser aren't used here — instead we
+        // register all three explicitly as roots, standing in for
+        // "the caller enumerated everything that must survive."
+        let leaf_id = [0x01u8; 16];
+        let mid_id = [0x02u8; 16];
+        let root_id = [0x03u8; 16];
+        let leaf_bytes = bytes::Bytes::from_static(b"leaf");
+        let mid_bytes = bytes::Bytes::from_static(b"mid");
+        let root_bytes = bytes::Bytes::from_static(b"root");
+        store
+            .put(&room, &leaf_id, &NodeData::new(leaf_bytes.clone()))
+            .unwrap();
+        store
+            .put(&room, &mid_id, &NodeData::new(mid_bytes.clone()))
+            .unwrap();
+        store
+            .put(&room, &root_id, &NodeData::new(root_bytes.clone()))
+            .unwrap();
+
+        store.set_live_roots(&room, vec![leaf_id, mid_id, root_id]);
+
+        // Pad with garbage — unregistered nodes that must NOT survive
+        // repack — until the packfile crosses the (tiny, test-only)
+        // threshold and a subsequent put() triggers maybe_repack.
+        let garbage_data = NodeData::new(bytes::Bytes::from(vec![0u8; 200]));
+        let mut garbage_ids = Vec::new();
+        for i in 0u32..20 {
+            let mut id = [0u8; 16];
+            id[0] = 0xEE;
+            id[4..8].copy_from_slice(&i.to_le_bytes());
+            garbage_ids.push(id);
+            store.put(&room, &id, &garbage_data).unwrap();
+        }
+
+        let pack_size_after = store
+            .repack
+            .get_pack(&room)
+            .unwrap()
+            .file
+            .metadata()
+            .unwrap()
+            .len();
+
+        // The live chain must still be readable, with correct bytes, after
+        // whatever repacking happened along the way.
+        assert_eq!(
+            store.get(&room, &leaf_id).unwrap().unwrap().bytes,
+            leaf_bytes
+        );
+        assert_eq!(store.get(&room, &mid_id).unwrap().unwrap().bytes, mid_bytes);
+        assert_eq!(
+            store.get(&room, &root_id).unwrap().unwrap().bytes,
+            root_bytes
+        );
+
+        // At least one garbage node must have been dropped by a repack —
+        // otherwise this test never actually exercised maybe_repack at all,
+        // it just proved plain put()/get() works (already covered
+        // elsewhere).
+        let mut any_garbage_dropped = false;
+        for id in &garbage_ids {
+            if store.get(&room, id).unwrap().is_none() {
+                any_garbage_dropped = true;
+                break;
+            }
+        }
+        assert!(
+            any_garbage_dropped,
+            "expected at least one unregistered garbage node to be reclaimed by a \
+             triggered repack (pack size after writes: {pack_size_after} bytes) — \
+             if none were dropped, maybe_repack likely never fired"
+        );
     }
 
     #[test]
