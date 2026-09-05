@@ -422,9 +422,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     eprintln!("    read syscalls:         {read_syscalls}");
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric B: Cache efficiency");
-    eprintln!(
-        "    Cold hit rate:         {cold_hit_rate:.1}% (0% by construction — cache was cleared)"
-    );
+    eprintln!("    Cold hit rate:         {cold_hit_rate:.1}% (0% on purpose/cache clear)");
     eprintln!("    Warm hit rate:         {warm_hit_rate:.1}% ({warm_hits}/{warm_total})");
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Index accuracy (lossy fanout)");
