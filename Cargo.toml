@@ -13,14 +13,25 @@ categories = ["database-implementations", "storage"]
 
 [workspace]
 
-[[workspace.bench]]
+[lib]
+path = "mtxdb-core/lib.rs"
+
+[dependencies]
+bytes = "1.5"
+crc32fast = "1.4"
+memmap2 = "0.8"
+parking_lot = "0.12"
+
+[dev-dependencies]
+
+[[bench]]
 name = "storage"
 path = "benches/storage.rs"
 harness = false
 
 # LINTS
 
-[workspace.lints.rust]
+[lints.rust]
 unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(coverage)",
@@ -33,7 +44,7 @@ trivial_numeric_casts = "warn"
 unreachable_pub = "warn"
 unused_lifetimes = "warn"
 
-[workspace.lints.clippy]
+[lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
@@ -41,20 +52,17 @@ style = { level = "warn", priority = -1 }
 correctness = { level = "warn", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
-# High-Value Security & Robustness restrictions
+# Security / robustness concerns
 arithmetic_side_effects = "warn"
 undocumented_unsafe_blocks = "warn"
 dbg_macro = "warn"
 get_unwrap = "warn"
-# Quality & Correctness restrictions
+# Quality & correctness restrictions
 mutex_atomic = "warn"
 missing_assert_message = "warn"
 str_to_string = "warn"
 tests_outside_test_module = "warn"
 verbose_file_reads = "warn"
-
-[lib]
-path = "mtxdb-core/lib.rs"
 
 # BUILD PROFILES
 

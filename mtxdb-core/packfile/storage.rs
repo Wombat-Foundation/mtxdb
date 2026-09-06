@@ -312,12 +312,21 @@ impl PackfileStorage {
         // record's index entry would still point at the old (now-orphaned)
         // pack_id, and get() would silently report every one of them as
         // not found the moment this repack completes.
-        if let Ok(entries) = packfile::scan_packfile(&new_gen.path) {
-            let mut index = LossyIndex::new(entries.len().saturating_mul(2).max(16));
-            for (hash, offset) in &entries {
-                let _ = index.insert(hash, new_gen.pack_id, *offset);
+        match packfile::scan_packfile(&new_gen.path) {
+            Ok(entries) => {
+                eprintln!(
+                    "DEBUG maybe_repack: scan_packfile found {} entries for room",
+                    entries.len()
+                );
+                let mut index = LossyIndex::new(entries.len().saturating_mul(2).max(16));
+                for (hash, offset) in &entries {
+                    let _ = index.insert(hash, new_gen.pack_id, *offset);
+                }
+                self.indexes.write().insert(*room_id, index);
             }
-            self.indexes.write().insert(*room_id, index);
+            Err(e) => {
+                eprintln!("DEBUG maybe_repack: scan_packfile FAILED: {e}");
+            }
         }
     }
 
