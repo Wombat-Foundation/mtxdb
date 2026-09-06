@@ -31,6 +31,11 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(coverage_nightly)",
     "cfg(tarpaulin)",
 ] }
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -45,6 +50,12 @@ arithmetic_side_effects = "warn"
 undocumented_unsafe_blocks = "warn"
 dbg_macro = "warn"
 get_unwrap = "warn"
+# Quality & Correctness restrictions
+mutex_atomic = "warn"
+missing_assert_message = "warn"
+str_to_string = "warn"
+tests_outside_test_module = "warn"
+verbose_file_reads = "warn"
 
 [profile.release]
 strip = "symbols"
