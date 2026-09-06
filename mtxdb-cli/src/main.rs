@@ -1,10 +1,3 @@
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
-    clippy::pedantic
-)]
-
 mod cmd;
 
 use std::path::PathBuf;
@@ -40,6 +33,7 @@ pub enum Commands {
     Repack {
         room: String,
         root: Vec<String>,
+        topo: bool,
     },
     Delete {
         room: String,
@@ -101,12 +95,12 @@ fn build_cli() -> Command {
             Command::new("repack")
                 .about("Trigger a manual repack for a room")
                 .arg(Arg::new("room").short('r').long("room").required(true))
+                .arg(Arg::new("root").short('o').long("root").num_args(1..))
                 .arg(
-                    Arg::new("root")
-                        .short('o')
-                        .long("root")
-                        .num_args(1..)
-                        .required(true),
+                    Arg::new("topo")
+                        .long("topo")
+                        .action(ArgAction::SetTrue)
+                        .help("Repack in topological order (requires edge-capable data format)"),
                 ),
         )
         .subcommand(
@@ -160,7 +154,13 @@ fn parse_cli() -> Cli {
         },
         Some(("repack", m)) => Commands::Repack {
             room: m.get_one::<String>("room").unwrap().clone(),
-            root: m.get_many::<String>("root").unwrap().cloned().collect(),
+            root: m
+                .get_many::<String>("root")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            topo: m.get_flag("topo"),
         },
         Some(("delete", m)) => Commands::Delete {
             room: m.get_one::<String>("room").unwrap().clone(),

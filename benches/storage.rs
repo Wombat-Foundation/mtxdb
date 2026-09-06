@@ -718,16 +718,16 @@ fn run_intent_benchmark(total_events: usize) {
 
 // ── Reaction-swarm adversarial scenario ──────────────────────────────
 //
-// PackfileStorage::put() may invoke maybe_repack(), which can call
-// repack_room(). However, this benchmark never calls set_live_roots(),
-// so maybe_repack() returns early without repacking — the room's
-// packfile grows monotonically in arrival order. That makes the real
-// threat model here "random-offset reads into a large, cold, ever-growing
-// file", not "did this survive a repack". This scenario measures whether
-// an attacker choosing reaction targets from the OLDEST part of a room's
-// history (the furthest possible physical offset from the write head)
-// costs more than organic reactions to RECENT messages, and whether the
-// sort-then-read fix in get_many (Part 3) narrows that gap.
+// PackfileStorage::put() never triggers automatic repacks — repack is
+// purely caller-invoked (repack_room_rewrite / repack_room_topo). This
+// benchmark never calls either, so the room's packfile grows
+// monotonically in arrival order. That makes the real threat model here
+// "random-offset reads into a large, cold, ever-growing file", not "did
+// this survive a repack". This scenario measures whether an attacker
+// choosing reaction targets from the OLDEST part of a room's history
+// (the furthest possible physical offset from the write head) costs more
+// than organic reactions to RECENT messages, and whether the sort-then-read
+// fix in get_many (Part 3) narrows that gap.
 fn reaction_id(salt: u64, idx: u64) -> NodeId {
     let seed = idx ^ salt ^ 0xDEAD_BEEF_1234_5678u64.rotate_left(3);
     let a = splitmix64(seed);
@@ -878,6 +878,67 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── Repack amplification scenario ────────────────────────────────────
+//
+// repack_room_rewrite rewrites every live record on each call — no
+// size-tiering, no reachability pruning of a bounded live set. For a
+// room with zero garbage (true here: every id is unique, no
+// supersession — the common case for a PDU timeline), "live set" equals
+// "everything inserted so far", so each repack costs O(current size).
+// Triggering a repack every `repack_interval` inserts over `total_events`
+// gives a lifetime repack cost of approximately:
+//
+//   sum_{k=1}^{N/interval} (k * interval) ≈ N^2 / (2 * interval)
+//
+// i.e. quadratic in N for a fixed interval. Doubling total_events at the
+// same interval should show roughly 4x repack time, not 2x, if this
+// bound holds. This benchmark exists to measure that directly rather
+// than argue it from complexity class alone.
+fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_repack_{total_events}_{pid}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let store = PackfileStorage::open_with_cache(dir.clone(), 2000).unwrap();
+    let room_id = [0x99; 16];
+
+    let mut total_repack_time = std::time::Duration::ZERO;
+    let mut repack_count = 0;
+
+    let t_start = Instant::now();
+    for i in 0..total_events {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let data = NodeData::new(bytes::Bytes::from(format!("repack payload {i}")));
+        store.put(&room_id, &id, &data).unwrap();
+
+        // Simulate an external GC worker polling and triggering repack.
+        if (i + 1) % repack_interval == 0 {
+            let t_repack = Instant::now();
+            store.repack_room_rewrite(&room_id).unwrap();
+            total_repack_time += t_repack.elapsed();
+            repack_count += 1;
+        }
+    }
+    let total_elapsed = t_start.elapsed();
+    let write_only_time = total_elapsed.saturating_sub(total_repack_time);
+
+    eprintln!(
+        "bench: repack amplification ({total_events} events, repack every {repack_interval})"
+    );
+    eprintln!("  total time:   {total_elapsed:.2?}");
+    eprintln!("  write time:   {write_only_time:.2?}");
+    eprintln!("  repack time:  {total_repack_time:.2?} (across {repack_count} runs)");
+    eprintln!("  If total_events doubles and repack time roughly quadruples (not doubles),");
+    eprintln!("  that's the O(n^2) full-rewrite cost, empirically, not just argued.");
+    eprintln!();
+
+    store.delete_room(&room_id).unwrap();
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
     eprintln!("Note: shard Drop deletes superseded shard files on drop,");
@@ -892,6 +953,9 @@ fn main() {
     run_intent_benchmark(20_000);
 
     run_reaction_swarm_benchmark(50_000, 500);
+
+    run_repack_benchmark(10_000, 1_000);
+    run_repack_benchmark(20_000, 1_000);
 
     // ── Connectivity check ──
     eprintln!();

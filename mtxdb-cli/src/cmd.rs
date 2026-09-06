@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,16 @@ use simd_json::OwnedValue;
 
 use crate::{Cli, Commands};
 
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
+        |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        },
+    )
+}
+
 pub fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
@@ -19,7 +30,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { path } => cmd_scan(path),
         Commands::Import { path, room } => cmd_import(cli, path, room.as_deref()),
-        Commands::Repack { room, root } => cmd_repack(cli, room, root),
+        Commands::Repack { room, root, topo } => cmd_repack(cli, room, root, *topo),
         Commands::Delete { room, yes } => cmd_delete(cli, room, *yes),
         Commands::Bench { count } => cmd_bench(cli, *count),
     }
@@ -56,8 +67,8 @@ fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
     let store = open_store(cli)?;
     let node_data = NodeData::new(bytes::Bytes::from(data.as_bytes().to_vec()));
     store.put(&room_id, &node_id, &node_data)?;
-    let room_hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
-    let id_hex: String = node_id.iter().map(|b| format!("{b:02x}")).collect();
+    let room_hex = hex_encode(&room_id);
+    let id_hex = hex_encode(&node_id);
     eprintln!("put {id_hex} into room {room_hex} ({} bytes)", data.len());
     Ok(())
 }
@@ -85,7 +96,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         eprintln!("no rooms found");
     } else {
         for (i, (room_id, count, _mem)) in summaries.iter().enumerate() {
-            let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
+            let hex = hex_encode(room_id);
             eprintln!("  {i}: {hex} ({count} records)");
         }
     }
@@ -95,7 +106,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
 fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
     let store = open_store(cli)?;
-    let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex_encode(&room_id);
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
             eprintln!("room {hex}: {len} records, {mem} bytes index memory");
@@ -115,8 +126,8 @@ fn cmd_scan(path: &PathBuf) -> anyhow::Result<()> {
         records.len()
     );
     for (room_id, node_id, offset) in &records {
-        let room_hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
-        let id_hex: String = node_id.iter().map(|b| format!("{b:02x}")).collect();
+        let room_hex = hex_encode(room_id);
+        let id_hex = hex_encode(node_id);
         eprintln!("  room={room_hex} id={id_hex} @ {offset}");
     }
     Ok(())
@@ -148,7 +159,7 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
         id
     };
 
-    let room_hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
+    let room_hex = hex_encode(&room_id);
 
     let arr_pdus = val["pdus"].as_array();
     let arr_auth = val["auth_chain"].as_array();
@@ -164,12 +175,9 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
                 },
                 _ => None,
             };
-            let sha = match sha {
-                Some(s) => s,
-                None => {
-                    skipped += 1;
-                    continue;
-                }
+            let Some(sha) = sha else {
+                skipped = skipped.saturating_add(1);
+                continue;
             };
 
             let id_bytes = match base64::engine::general_purpose::STANDARD_NO_PAD.decode(sha) {
@@ -179,7 +187,7 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
                     id
                 }
                 _ => {
-                    skipped += 1;
+                    skipped = skipped.saturating_add(1);
                     continue;
                 }
             };
@@ -187,7 +195,7 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
             let event_bytes = ev.to_string().into_bytes();
             let data = NodeData::new(bytes::Bytes::from(event_bytes));
             store.put(&room_id, &id_bytes, &data)?;
-            event_count += 1;
+            event_count = event_count.saturating_add(1);
         }
     }
 
@@ -199,7 +207,7 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
     Ok(())
 }
 
-fn cmd_repack(cli: &Cli, room: &str, roots: &[String]) -> anyhow::Result<()> {
+fn cmd_repack(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
     let store = open_store(cli)?;
 
@@ -211,16 +219,45 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String]) -> anyhow::Result<()> {
         store.set_live_roots(&room_id, root_ids);
     }
 
-    store.repack_room_rewrite(&room_id)?;
+    if topo {
+        store.repack_room_topo(&room_id, extract_matrix_edges)?;
+    } else {
+        store.repack_room_rewrite(&room_id)?;
+    }
 
-    let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
-    eprintln!("repacked {hex}");
+    let hex = hex_encode(&room_id);
+    let mode = if topo { "topo" } else { "flat" };
+    eprintln!("repacked {hex} ({mode})");
     Ok(())
+}
+
+fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
+    let mut input = data.to_vec();
+    let val: simd_json::OwnedValue = match simd_json::to_owned_value(&mut input) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut edges = Vec::new();
+    if let Some(prev) = val["prev_events"].as_array() {
+        for ev in prev {
+            if let Some(s) = ev.as_str() {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(s) {
+                    if bytes.len() >= 16 {
+                        let mut id = [0u8; 16];
+                        id.copy_from_slice(&bytes[..16]);
+                        edges.push(id);
+                    }
+                }
+            }
+        }
+    }
+    edges
 }
 
 fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
-    let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex_encode(&room_id);
 
     if !yes {
         eprintln!("This will permanently delete all data for room {hex}.");
@@ -235,9 +272,7 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     }
 
     let store = open_store(cli)?;
-    let count = store
-        .room_index_info(&room_id)
-        .map_or(0, |(len, _)| len);
+    let count = store.room_index_info(&room_id).map_or(0, |(len, _)| len);
     store.delete_room(&room_id)?;
     eprintln!("deleted {count} records for room {hex}");
     Ok(())
@@ -266,19 +301,47 @@ fn cmd_bench(cli: &Cli, count: usize) -> anyhow::Result<()> {
     }
     let read_elapsed = read_start.elapsed();
 
-    let write_ops = count as f64 / write_elapsed.as_secs_f64();
-    let read_ops = count as f64 / read_elapsed.as_secs_f64();
-    let mb = (count * 256) as f64 / 1_000_000.0;
+    let write_nanos = write_elapsed.as_nanos();
+    let read_nanos = read_elapsed.as_nanos();
+    let count_128 = count as u128;
+    let write_ops = count_128
+        .saturating_mul(1_000_000_000)
+        .checked_div(write_nanos)
+        .unwrap_or(0);
+    let read_ops = count_128
+        .saturating_mul(1_000_000_000)
+        .checked_div(read_nanos)
+        .unwrap_or(0);
+    let total_bytes = count_128.saturating_mul(256);
+    let mb_total = total_bytes / 1_000_000;
+    let write_mbps = total_bytes
+        .saturating_mul(1_000_000_000)
+        .checked_div(write_nanos)
+        .unwrap_or(0)
+        / 1_000_000;
+    let write_mbps_frac = total_bytes
+        .saturating_mul(10_000_000_000)
+        .checked_div(write_nanos)
+        .unwrap_or(0)
+        / 1_000_000
+        % 10;
+    let read_mbps = total_bytes
+        .saturating_mul(1_000_000_000)
+        .checked_div(read_nanos)
+        .unwrap_or(0)
+        / 1_000_000;
+    let read_mbps_frac = total_bytes
+        .saturating_mul(10_000_000_000)
+        .checked_div(read_nanos)
+        .unwrap_or(0)
+        / 1_000_000
+        % 10;
 
-    eprintln!("bench: {count} records, 256 bytes payload");
+    eprintln!("bench: {count} records, 256 bytes payload ({mb_total} MB total)");
     eprintln!(
-        "  write: {write_elapsed:?} ({write_ops:.0} ops/sec, {:.1} MB/s)",
-        mb / write_elapsed.as_secs_f64()
+        "  write: {write_elapsed:?} ({write_ops} ops/sec, {write_mbps}.{write_mbps_frac} MB/s)"
     );
-    eprintln!(
-        "  read:  {read_elapsed:?} ({read_ops:.0} ops/sec, {:.1} MB/s)",
-        mb / read_elapsed.as_secs_f64()
-    );
+    eprintln!("  read:  {read_elapsed:?} ({read_ops} ops/sec, {read_mbps}.{read_mbps_frac} MB/s)");
 
     store.delete_room(&room_id)?;
     eprintln!("bench: cleaned up benchmark data");

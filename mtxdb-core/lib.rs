@@ -14,6 +14,8 @@
 
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
 pub mod cache;
+/// Compressed sparse row graph for deterministic topological ordering.
+pub mod csr;
 /// In-memory dependency DAG used to track unresolved node references.
 pub mod dag;
 /// Frontier tracking for nodes awaiting their dependencies before being writable.
