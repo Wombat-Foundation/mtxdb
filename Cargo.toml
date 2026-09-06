@@ -12,8 +12,6 @@ readme = "README.md"
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
 [workspace]
-members = [".", "mtxdb-ffi", "mtxdb-wasm"]
-resolver = "2"
 
 [dependencies]
 bytes = "1.5"

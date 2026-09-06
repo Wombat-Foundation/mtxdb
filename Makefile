@@ -79,18 +79,18 @@ build: ##H Build the lib/binary
 
 .PHONY: build-ffi
 build-ffi: ##H Build C shared/static libraries (.so/.a)
-	cargo build --release -p mtxdb-ffi
+	$(CARGO) build --release --manifest-path mtxdb-ffi/Cargo.toml
 	@echo ""
 	@echo '══════════════ FFI BUILD OUTPUT ══════════════'
-	@find target/release -maxdepth 1 \( -name 'libmtxdb_ffi.so' -o -name 'libmtxdb_ffi.a' \) -exec ls -lh {} \;
+	@find mtxdb-ffi/target/release -maxdepth 1 \( -name 'libmtxdb_ffi.so' -o -name 'libmtxdb_ffi.a' \) -exec ls -lh {} \;
 
 .PHONY: build-wasm
 build-wasm: ##H Build WebAssembly package (requires wasm32-wasip1 target)
 	rustup target add wasm32-wasip1 2>/dev/null || true
-	cargo build --release -p mtxdb-wasm --target wasm32-wasip1
+	$(CARGO) build --release --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 	@echo ""
 	@echo '══════════════ WASM BUILD OUTPUT ══════════════'
-	@ls -lh target/wasm32-wasip1/release/*.wasm 2>/dev/null || echo 'No .wasm output found'
+	@ls -lh mtxdb-wasm/target/wasm32-wasip1/release/*.wasm 2>/dev/null || echo 'No .wasm output found'
 
 
 
