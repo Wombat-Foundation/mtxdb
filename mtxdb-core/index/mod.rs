@@ -588,29 +588,23 @@ mod tests {
 
     #[test]
     fn test_lookup_iter_exhausts_remaining() {
-        // Fill a small table to capacity (75% threshold = 12 of 16)
-        // then deserialize a fully-packed version to hit the
-        // remaining==0 fallthrough (line 353).
-        let mut index = LossyIndex::new(16);
-        for i in 0..12u64 {
-            let h = splitmix_hash(i);
-            index.insert(&h, 0, i).unwrap();
-        }
-        // Serialize, then manually fill all 16 slots so no empty terminator
-        let mut bytes = index.serialize();
-        // Append 4 more non-zero slots (capacity 16, we wrote 12 + 8 header)
-        for i in 12..16u64 {
-            let h = splitmix_hash(i + 1000);
+        // Build a 16-slot index with all 16 slots occupied (no empty
+        // terminator) by constructing the serialized form directly.
+        let capacity: u64 = 16;
+        let mut bytes = Vec::with_capacity(8 + 16 * 8);
+        bytes.extend_from_slice(&capacity.to_le_bytes());
+        for i in 0..16u64 {
+            let h = splitmix_hash(i + 5000);
             let tag = LossyIndex::tag(&h);
             let slot = IndexSlot::new(tag, 0, i);
             bytes.extend_from_slice(&slot.0.to_le_bytes());
         }
-        // Now lookup a hash whose tag does NOT match any slot —
-        // the iterator must probe all 16 slots and return None.
-        let mut query = [0xFFu8; 16];
-        query[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
         let restored = LossyIndex::deserialize(&bytes).unwrap();
         assert_eq!(restored.len(), 16);
+        // Query a hash whose tag does NOT match any slot — the iterator
+        // must probe all 16 slots and return None.
+        let mut query = [0xFFu8; 16];
+        query[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
         assert_eq!(restored.lookup(&query), None);
     }
 }
