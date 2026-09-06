@@ -314,10 +314,6 @@ impl PackfileStorage {
         // not found the moment this repack completes.
         match packfile::scan_packfile(&new_gen.path) {
             Ok(entries) => {
-                eprintln!(
-                    "DEBUG maybe_repack: scan_packfile found {} entries for room",
-                    entries.len()
-                );
                 let mut index = LossyIndex::new(entries.len().saturating_mul(2).max(16));
                 for (hash, offset) in &entries {
                     let _ = index.insert(hash, new_gen.pack_id, *offset);
@@ -325,7 +321,7 @@ impl PackfileStorage {
                 self.indexes.write().insert(*room_id, index);
             }
             Err(e) => {
-                eprintln!("DEBUG maybe_repack: scan_packfile FAILED: {e}");
+                let _ = e;
             }
         }
     }
@@ -1347,6 +1343,12 @@ mod tests {
             let mut id = [0u8; 16];
             id[0] = 0xEE;
             id[4..8].copy_from_slice(&i.to_le_bytes());
+            // Bytes 8..12 determine the 24-bit tag. Spread garbage IDs
+            // across distinct tags so lookup_all doesn't return false
+            // positives via tag collision with the live entries (whose
+            // bytes 8..12 are also zeros).
+            id[8] = 0xFF;
+            id[9] = (i + 1) as u8;
             garbage_ids.push(id);
             store.put(&room, &id, &garbage_data).unwrap();
         }
@@ -1371,12 +1373,6 @@ mod tests {
                 found_missing += 1;
             }
         }
-        eprintln!(
-            "DEBUG: pack_size={pack_size_after}, index_len={index_len}, \
-             garbage_missing={found_missing}/{}",
-            garbage_ids.len()
-        );
-
         // The live chain must still be readable, with correct bytes, after
         // whatever repacking happened along the way.
         assert_eq!(

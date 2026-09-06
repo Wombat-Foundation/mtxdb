@@ -25,4 +25,9 @@ fi
 # before: when invoked through clippy-driver, $RUSTC is clippy-driver
 # itself and the real rustc path is the first element of "$@" -- it must
 # immediately follow, or clippy-driver misparses it as an input filename.
-exec "${CMD[@]}" "$@" -C target-cpu=native "${MOLD_ARGS[@]}"
+CPU_FLAGS=()
+if [[ "$*" != *"wasm32"* ]] && [[ "$*" != *"riscv"* ]]; then
+	CPU_FLAGS=("-C" "target-cpu=native")
+fi
+
+exec "${CMD[@]}" "$@" "${CPU_FLAGS[@]}" "${MOLD_ARGS[@]}"
