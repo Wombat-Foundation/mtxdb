@@ -111,7 +111,7 @@ impl PackfileStorage {
         let mut indexes = HashMap::new();
 
         // Scan all shard files, building per-room indexes
-        for shard_id in 0..shard::MAX_SHARDS as u8 {
+        for shard_id in 0..shard::MAX_SHARDS_U8 {
             let path = ShardPool::shard_path(&base_dir, shard_id);
             if !path.exists() {
                 continue;
@@ -254,16 +254,18 @@ impl PackfileStorage {
 
     /// Rebuild a room's index from shard records.
     fn rebuild_index(&self, room_id: &[u8; 16]) -> LossyIndex {
-        let mut total = 0usize;
-        let mut scanned: Vec<(u8, Vec<([u8; 16], u64)>)> = Vec::new();
+        type ShardHashOffset = ([u8; 16], u64);
 
-        for shard_id in 0..shard::MAX_SHARDS as u8 {
+        let mut total = 0usize;
+        let mut scanned: Vec<(u8, Vec<ShardHashOffset>)> = Vec::new();
+
+        for shard_id in 0..shard::MAX_SHARDS_U8 {
             let path = ShardPool::shard_path(&self.base_dir, shard_id);
             if !path.exists() {
                 continue;
             }
             if let Ok(entries) = packfile::scan_packfile(&path) {
-                let room_entries: Vec<_> = entries
+                let room_entries: Vec<ShardHashOffset> = entries
                     .into_iter()
                     .filter(|(rid, _, _)| rid == room_id)
                     .map(|(_, hash, offset)| (hash, offset))
@@ -283,6 +285,9 @@ impl PackfileStorage {
     }
 
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O failure or CRC mismatch.
     pub fn get_swizzled(
         &self,
         room_id: &[u8; 16],
@@ -431,10 +436,17 @@ impl StorageEngine for PackfileStorage {
             let mut file = shard.file.try_clone()?;
             let offset = file.seek(std::io::SeekFrom::End(0))?;
             packfile::write_record(&mut file, &record)?;
-            shard.file_len.store(
-                offset + record.serialized_len() as u64,
-                std::sync::atomic::Ordering::Release,
-            );
+            let new_len = offset
+                .checked_add(record.serialized_len() as u64)
+                .ok_or_else(|| {
+                    StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "offset + record_len overflow",
+                    ))
+                })?;
+            shard
+                .file_len
+                .store(new_len, std::sync::atomic::Ordering::Release);
             (shard.shard_id, offset)
         };
 

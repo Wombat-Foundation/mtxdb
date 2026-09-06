@@ -12,8 +12,16 @@ use crate::packfile::{self, Record};
 /// Maximum number of shards in the pool.
 pub const MAX_SHARDS: usize = 4;
 
+/// Maximum number of shards as `u8`. Primary constant for shard IDs
+/// and modular arithmetic — avoids `cast_possible_truncation` by
+/// defining the value directly without a `usize→u8` conversion.
+pub(crate) const MAX_SHARDS_U8: u8 = 4;
+
 /// Maximum shard size before rotation (2 GB).
 pub const MAX_SHARD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Scanned `(room_id, hash, offset)` entry from a shard file.
+pub type ShardEntry = ([u8; 16], [u8; 16], u64);
 
 /// A single global shard file shared across all rooms.
 pub struct Shard {
@@ -37,6 +45,9 @@ impl Shard {
     /// Get the memory-mapped view, creating it if absent.
     ///
     /// Remaps when the file grows past the current mapping.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the packfile cannot be mapped.
     pub fn mmap(&self) -> io::Result<parking_lot::RwLockReadGuard<'_, Option<Mmap>>> {
         let guard = self.mmap.read();
         if guard.is_some() {
@@ -77,10 +88,13 @@ pub struct ShardPool {
 
 impl ShardPool {
     /// Open or create a shard pool, scanning for existing shard files.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on directory read failure or packfile open failure.
     pub fn open(base_dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&base_dir)?;
 
-        let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS as u8).map(|_| None).collect();
+        let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS_U8).map(|_| None).collect();
         let mut highest_active: u8 = 0;
 
         // Scan for existing shard files
@@ -91,7 +105,7 @@ impl ShardPool {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if let Some(id_str) = stem.strip_prefix("shard_") {
                         if let Ok(id) = u8::from_str_radix(id_str, 16) {
-                            if (id as usize) < MAX_SHARDS {
+                            if id < MAX_SHARDS_U8 {
                                 let file = packfile::open_packfile(&path, false)?;
                                 let file_len = file.metadata()?.len();
                                 let shard = Arc::new(Shard {
@@ -145,11 +159,17 @@ impl ShardPool {
     }
 
     /// Get a reference to a shard by ID.
+    #[must_use]
     pub fn get_shard(&self, shard_id: u8) -> Option<Arc<Shard>> {
         self.shards.read().get(shard_id as usize)?.clone()
     }
 
     /// Get the current active write shard.
+    ///
+    /// # Panics
+    /// Panics if the active write shard slot is `None` (invariant:
+    /// `open()` always ensures at least shard 0 exists).
+    #[must_use]
     pub fn active_shard(&self) -> Arc<Shard> {
         let id = *self.active_write.lock();
         self.shards
@@ -161,6 +181,9 @@ impl ShardPool {
 
     /// Append a record to the active shard. Returns `(shard_id, offset)`.
     /// Rotates to a new shard if the current one is full.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on write or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u8, u64)> {
         loop {
             let shard = self.active_shard();
@@ -168,7 +191,10 @@ impl ShardPool {
             let current_len = shard.file_len.load(Ordering::Acquire);
 
             // Check if this record would exceed the shard capacity
-            if current_len + record_len > MAX_SHARD_BYTES && current_len > 5 {
+            let fits = current_len
+                .checked_add(record_len)
+                .is_some_and(|sum| sum <= MAX_SHARD_BYTES);
+            if !fits && current_len > 5 {
                 // Don't rotate if the shard is nearly empty (just header)
                 self.rotate()?;
                 continue;
@@ -179,7 +205,10 @@ impl ShardPool {
                 let mut file = shard.file.try_clone()?;
                 let offset = file.seek(io::SeekFrom::End(0))?;
                 packfile::write_record(&mut file, record)?;
-                shard.file_len.store(offset + record_len, Ordering::Release);
+                let new_len = offset.checked_add(record_len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "offset + record_len overflow")
+                })?;
+                shard.file_len.store(new_len, Ordering::Release);
                 offset
             };
 
@@ -188,6 +217,13 @@ impl ShardPool {
     }
 
     /// Read a record from a specific shard at the given offset.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Corrupt` on CRC mismatch or truncated frame,
+    /// `StorageError::Io` on I/O failure.
+    ///
+    /// # Panics
+    /// Panics only on internal invariant violation (unreachable path).
     pub fn read_at(shard: &Shard, offset: u64) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
@@ -212,7 +248,7 @@ impl ShardPool {
                 return Err(StorageError::Corrupt("truncated length prefix".into()));
             }
 
-            let prefix_end = offset + 4;
+            let prefix_end = offset.checked_add(4).expect("checked above");
             let payload_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
             let payload_len = u32::from_le_bytes(payload_len_bytes);
 
@@ -223,8 +259,12 @@ impl ShardPool {
             }
 
             let payload_len_usize = payload_len as usize;
-            let crc_pos = prefix_end + payload_len_usize;
-            let frame_end = crc_pos + 4;
+            let crc_pos = prefix_end
+                .checked_add(payload_len_usize)
+                .ok_or_else(|| StorageError::Corrupt("prefix_end + payload_len overflow".into()))?;
+            let frame_end = crc_pos
+                .checked_add(4)
+                .ok_or_else(|| StorageError::Corrupt("crc_pos + 4 overflow".into()))?;
 
             if frame_end > mem.len() {
                 if attempt == 0 {
@@ -281,6 +321,9 @@ impl ShardPool {
 
     /// Rotate to the next shard. Reuses a retired shard slot if available,
     /// otherwise creates a new shard file.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on shard file creation failure.
     fn rotate(&self) -> io::Result<()> {
         let _guard = self.rotation_lock.lock();
         let current = *self.active_write.lock();
@@ -288,10 +331,9 @@ impl ShardPool {
         let mut shards = self.shards.write();
 
         // Find the next available slot (skip current, prefer retired/empty)
-        for offset in 1..=MAX_SHARDS as u8 {
-            let candidate = current.wrapping_add(offset) % MAX_SHARDS as u8;
+        for offset in 1..=MAX_SHARDS_U8 {
+            let candidate = current.wrapping_add(offset).wrapping_rem(MAX_SHARDS_U8);
             if shards[candidate as usize].is_none() {
-                // Empty slot — create new shard here
                 let path = Self::shard_path(&self.base_dir, candidate);
                 let file = packfile::open_packfile(&path, true)?;
                 let file_len = file.metadata()?.len();
@@ -312,8 +354,7 @@ impl ShardPool {
         }
 
         // All slots occupied — pick the next one and overwrite it.
-        // The old shard's Drop will delete its file when the last Arc goes away.
-        let candidate = current.wrapping_add(1) % MAX_SHARDS as u8;
+        let candidate = current.wrapping_add(1).wrapping_rem(MAX_SHARDS_U8);
         if let Some(ref old) = shards[candidate as usize] {
             old.is_current.store(false, Ordering::Release);
         }
@@ -336,6 +377,9 @@ impl ShardPool {
     }
 
     /// Sync all shards to disk.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
         let shards = self.shards.read();
         for shard in shards.iter().flatten() {
@@ -346,7 +390,10 @@ impl ShardPool {
 
     /// Scan a shard file and return `(room_id, hash, offset)` entries.
     /// Used during startup to rebuild per-room indexes.
-    pub fn scan_shard(path: &Path) -> io::Result<Vec<([u8; 16], [u8; 16], u64)>> {
+    ///
+    /// # Errors
+    /// Returns `io::Error` on file open or header read failure.
+    pub fn scan_shard(path: &Path) -> io::Result<Vec<ShardEntry>> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();

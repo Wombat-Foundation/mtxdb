@@ -11,6 +11,9 @@ pub const MAGIC: [u8; 4] = *b"MDB1";
 /// Maximum record size (64KB). Reject anything larger during recovery scan.
 pub const MAX_RECORD_LEN: u32 = 64 * 1024;
 
+/// A scanned `(room_id, hash, file_offset)` entry from a packfile.
+pub type ScanEntry = ([u8; 16], [u8; 16], u64);
+
 /// A single record in the packfile.
 ///
 /// Frame layout on disk (v2 — global shard format):
@@ -58,6 +61,9 @@ impl Record {
 /// 3. **Stable file descriptor.** The `Shard` struct owns the only `File`
 ///    handle and is kept alive by `Arc`s, so the descriptor remains valid
 ///    for the mapping's lifetime.
+///
+/// # Errors
+/// Returns `io::Error` if the file cannot be memory-mapped.
 #[allow(unsafe_code)]
 pub fn map_pack(file: &File) -> io::Result<memmap2::Mmap> {
     // SAFETY: See the `map_pack` doc comment — append-only file, remapped on
@@ -104,6 +110,10 @@ pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<()> 
 /// # Errors
 /// Returns `io::Error` on read failure or `io::ErrorKind::InvalidData`
 /// if the record length is invalid or the CRC check fails.
+///
+/// # Panics
+/// Panics if the payload length does not fit in `usize` (always true on
+/// 64-bit targets where `usize >= 32 bits`).
 pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf) {
@@ -217,7 +227,7 @@ pub fn open_packfile(path: &Path, create: bool) -> io::Result<File> {
 /// # Errors
 /// Returns `io::Error` on I/O failure during open or header read, or on
 /// any read-loop error other than `UnexpectedEof`.
-pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], [u8; 16], u64)>> {
+pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -257,7 +267,7 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], [u8; 16], u64)>> 
 ///
 /// # Errors
 /// Returns `io::Error` on read or truncate failure.
-pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<([u8; 16], [u8; 16], u64)>> {
+pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();

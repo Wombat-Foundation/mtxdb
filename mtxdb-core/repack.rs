@@ -6,6 +6,9 @@ use crate::storage::{NodeData, NodeId};
 /// A function that resolves a node hash to its data and child hashes.
 pub type ResolverFn = dyn Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>;
 
+/// Result of a repack: `(room_id, hash, shard_id, offset)`.
+pub type RepackEntry = ([u8; 16], NodeId, u8, u64);
+
 /// Manages per-room repack lifecycle in the global shard pool model.
 ///
 /// Repack walks the DAG reachable from registered roots and writes
@@ -17,6 +20,12 @@ pub struct RepackManager {
 }
 
 use std::sync::Arc;
+
+impl Default for RepackManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RepackManager {
     #[must_use]
@@ -56,7 +65,7 @@ impl RepackManager {
         roots: impl IntoIterator<Item = NodeId>,
         resolver: impl Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>,
         shard_pool: &ShardPool,
-    ) -> Result<Vec<([u8; 16], NodeId, u8, u64)>, RepackError> {
+    ) -> Result<Vec<RepackEntry>, RepackError> {
         // Serialize the entire repack lifecycle per room.
         let room_arc = self.room_mutex(&room_id);
         let _room_guard = room_arc.lock();
