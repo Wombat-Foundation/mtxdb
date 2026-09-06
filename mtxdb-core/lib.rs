@@ -9,7 +9,7 @@
 //!
 //! Copyright (c) 2026 Shane Jaroch <chown_tee@proton.me>
 
-#![feature(coverage_attribute)]
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 pub mod cache;
 pub mod dag;
