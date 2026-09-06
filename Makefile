@@ -93,4 +93,6 @@ bench: ##H Run benchmarks
 .PHONY: clean
 clean: ##H Clean build artifacts
 	$(CARGO) clean
+	$(CARGO) clean --manifest-path mtxdb-ffi/Cargo.toml
+	$(CARGO) clean --manifest-path mtxdb-wasm/Cargo.toml
 	rm -rf .coverage/
