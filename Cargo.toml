@@ -35,6 +35,7 @@ harness = false
 # LINTS
 
 [lints.rust]
+missing_docs = "warn"
 unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(coverage)",
