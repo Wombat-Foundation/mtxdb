@@ -58,6 +58,12 @@ impl RepackManager {
         self.packs.read().get(room_id).cloned()
     }
 
+    /// Get a read-only reference to the per-room pack generations map.
+    #[must_use]
+    pub fn packs(&self) -> &RwLock<HashMap<[u8; 16], Arc<PackGeneration>>> {
+        &self.packs
+    }
+
     /// Swap in a new pack generation for a room.
     /// Returns the old generation (readers holding it keep the old file alive).
     /// Marks the old generation as no longer current so its Drop won't

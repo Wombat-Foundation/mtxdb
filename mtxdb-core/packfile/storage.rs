@@ -249,6 +249,18 @@ impl PackfileStorage {
         &self.pinned
     }
 
+    /// Get a reference to the repack manager.
+    #[must_use]
+    pub fn repack_manager(&self) -> &RepackManager {
+        &self.repack
+    }
+
+    /// Get a reference to the per-room indexes.
+    #[must_use]
+    pub fn indexes(&self) -> &RwLock<HashMap<[u8; 16], LossyIndex>> {
+        &self.indexes
+    }
+
     /// Register the set of roots that must survive repack for a room: the
     /// current HAMT state root plus every timeline forward-extremity (tip).
     /// `maybe_repack` refuses to repack a room with no registered roots —
