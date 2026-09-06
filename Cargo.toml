@@ -19,6 +19,7 @@ publish = false
 path = "mtxdb-core/lib.rs"
 
 [dependencies]
+arc-swap = "1"
 bytes = "1.5"
 crc32fast = "1.4"
 memmap2 = "0.8"

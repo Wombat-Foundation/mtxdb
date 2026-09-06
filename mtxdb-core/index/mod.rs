@@ -81,7 +81,7 @@ impl IndexSlot {
 /// - Empty slot terminates probe (write-once, no tombstones needed).
 /// - Tag collisions surface as verification failures (`decode_v1_verified`).
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LossyIndex {
     /// Power-of-two capacity.
     capacity: u32,

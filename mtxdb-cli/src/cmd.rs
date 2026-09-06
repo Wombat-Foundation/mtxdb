@@ -80,13 +80,13 @@ fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
 
 fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     let store = open_store(cli)?;
-    let indexes = store.indexes().read();
-    if indexes.is_empty() {
+    let summaries = store.room_summaries();
+    if summaries.is_empty() {
         eprintln!("no rooms found");
     } else {
-        for (i, (room_id, idx)) in indexes.iter().enumerate() {
+        for (i, (room_id, count, _mem)) in summaries.iter().enumerate() {
             let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
-            eprintln!("  {i}: {hex} ({} records)", idx.len());
+            eprintln!("  {i}: {hex} ({count} records)");
         }
     }
     Ok(())
@@ -96,14 +96,9 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
     let store = open_store(cli)?;
     let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
-    let indexes = store.indexes().read();
-    match indexes.get(&room_id) {
-        Some(idx) => {
-            eprintln!(
-                "room {hex}: {} records, {} bytes index memory",
-                idx.len(),
-                idx.memory_usage()
-            );
+    match store.room_index_info(&room_id) {
+        Some((len, mem)) => {
+            eprintln!("room {hex}: {len} records, {mem} bytes index memory");
         }
         None => {
             eprintln!("room {hex}: not found");
@@ -240,9 +235,9 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     }
 
     let store = open_store(cli)?;
-    let indexes = store.indexes().read();
-    let count = indexes.get(&room_id).map_or(0, |idx| idx.len());
-    drop(indexes);
+    let count = store
+        .room_index_info(&room_id)
+        .map_or(0, |(len, _)| len);
     store.delete_room(&room_id)?;
     eprintln!("deleted {count} records for room {hex}");
     Ok(())

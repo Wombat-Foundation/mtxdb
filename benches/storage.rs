@@ -11,7 +11,6 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use mtxdb::cache::NodeCache;
 use mtxdb::storage::{NodeData, NodeId, NodeRef, StorageEngine};
 use mtxdb::PackfileStorage;
 
@@ -172,25 +171,6 @@ impl DagGenerator {
     }
     // jscpd:ignore-end
 
-    fn parse_children(bytes: &[u8]) -> Vec<NodeId> {
-        if bytes.len() < 14 {
-            return vec![];
-        }
-        let prev_count = u16::from_le_bytes([bytes[12], bytes[13]]) as usize;
-        let mut children = Vec::with_capacity(prev_count);
-        let mut offset = 14;
-        for _ in 0..prev_count {
-            if offset + 16 > bytes.len() {
-                break;
-            }
-            let mut id = [0u8; 16];
-            id.copy_from_slice(&bytes[offset..offset + 16]);
-            children.push(id);
-            offset += 16;
-        }
-        children
-    }
-
     fn traversal_order(&self) -> Vec<usize> {
         let mut visited = vec![false; self.prev_events.len()];
         let mut order = Vec::with_capacity(self.prev_events.len());
@@ -315,12 +295,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
         .collect();
 
     // ── Write phase ──
-    let store = PackfileStorage::open_with_cache(
-        dir.clone(),
-        NodeCache::new(cache_entries),
-        Some(DagGenerator::parse_children),
-    )
-    .unwrap();
+    let store = PackfileStorage::open_with_cache(dir.clone(), cache_entries).unwrap();
 
     let t_write = Instant::now();
     for i in 0..dag.len() {
@@ -331,7 +306,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     let pack_size = pack_dir_size(&dir);
 
     // ── Clear cache to force packfile re-reads ──
-    store.cache().clear();
+    store.room_cache(&ROOM).clear();
 
     // ── Cold read phase: backward traversal simulating /sync, cache empty ──
     let io_before = IoStats::read_now();
@@ -351,8 +326,8 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
         }
     }
 
-    let cold_hits = store.cache().hits();
-    let cold_misses = store.cache().misses();
+    let cold_hits = store.room_cache(&ROOM).hits();
+    let cold_misses = store.room_cache(&ROOM).misses();
 
     let read_elapsed = t_read.elapsed();
     let io_after = IoStats::read_now();
@@ -390,8 +365,8 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     // this size buys nothing on a single full scan; only cross-request
     // temporal locality — e.g. repeated /sync of the same recent range —
     // would benefit, which this harness does not model). ──
-    let hits_before_warm = store.cache().hits();
-    let misses_before_warm = store.cache().misses();
+    let hits_before_warm = store.room_cache(&ROOM).hits();
+    let misses_before_warm = store.room_cache(&ROOM).misses();
     let t_warm = Instant::now();
 
     let mut warm_found = 0u64;
@@ -402,8 +377,8 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     }
 
     let warm_elapsed = t_warm.elapsed();
-    let warm_hits = store.cache().hits() - hits_before_warm;
-    let warm_misses = store.cache().misses() - misses_before_warm;
+    let warm_hits = store.room_cache(&ROOM).hits() - hits_before_warm;
+    let warm_misses = store.room_cache(&ROOM).misses() - misses_before_warm;
     let warm_total = warm_hits + warm_misses;
     let warm_hit_rate = if warm_total > 0 {
         (warm_hits as f64 / warm_total as f64) * 100.0
@@ -602,12 +577,7 @@ fn run_intent_benchmark(total_events: usize) {
     // exists to exercise.
     let dag = DagGenerator::generate(total_events, 0.3, 5);
 
-    let store = PackfileStorage::open_with_cache(
-        dir.clone(),
-        NodeCache::new(2000),
-        Some(DagGenerator::parse_children),
-    )
-    .unwrap();
+    let store = PackfileStorage::open_with_cache(dir.clone(), 2000).unwrap();
 
     // Write phase: each event's own node, plus its as-of-that-event HAMT
     // root and the L1 bucket it touches. See l1_owner: every event i
@@ -643,7 +613,7 @@ fn run_intent_benchmark(total_events: usize) {
         )
         .unwrap();
 
-    store.cache().clear();
+    store.room_cache(&ROOM).clear();
     let inst = InstrumentedStorage::new(store);
 
     // Reconcile 2+ divergent tips, the way state-res v2 actually shapes
@@ -773,7 +743,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
     // reacted to. Low fork probability: this is about history depth, not
     // fork/join shape (that's what run_intent_benchmark covers).
     let dag = DagGenerator::generate(history_len, 0.02, 50);
-    let store = PackfileStorage::open_with_cache(dir.clone(), NodeCache::new(2000), None).unwrap();
+    let store = PackfileStorage::open_with_cache(dir.clone(), 2000).unwrap();
 
     for i in 0..dag.len() {
         let (id, data) = dag.node_data(i);
@@ -826,7 +796,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
                       targets: &[NodeId],
                       f: &dyn Fn(&[NodeId]) -> usize|
      -> Row {
-        store.cache().clear();
+        store.room_cache(&ROOM).clear();
         drop_caches_for_dir(&dir);
         let io_before = IoStats::read_now();
         let t = Instant::now();

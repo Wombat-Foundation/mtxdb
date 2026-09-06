@@ -84,7 +84,7 @@ PROJECT_CRATES ?= mtxdb-cli/  mtxdb-core/ mtxdb-ffi/  mtxdb-wasm/
 .PHONY: sub
 sub:	##H Run a command for each create, c
 	test -n "${c}"
-	for d in $(PROJECT_CRATES); do cd $$d && ${c}; cd ..; done
+	for d in $(PROJECT_CRATES); do cd $$d && ${c} || true; cd ..; done
 
 
 .PHONY: clean

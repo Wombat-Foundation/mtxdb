@@ -17,7 +17,6 @@ pub mod dag;
 pub mod frontier;
 pub mod index;
 pub mod packfile;
-pub mod repack;
 pub mod shard;
 pub mod storage;
 

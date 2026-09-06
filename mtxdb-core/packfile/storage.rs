@@ -5,112 +5,96 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use crate::cache::{NodeCache, PinnedNodes};
 use crate::index::LossyIndex;
 use crate::packfile::{self, Record};
-use crate::repack::RepackManager;
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
 use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
 
-pub type NodeParserFn = fn(&[u8]) -> Vec<NodeId>;
-
-/// Callback that rewrites a node's child pointers for in-cache swizzling.
-///
-/// The callback is responsible for:
-/// 1. Parsing the HAMT node encoding from `data`
-/// 2. Identifying child `NodeRef::Lazy(hash)` entries
-/// 3. Swizzling cached children to `NodeRef::Resolved`
-/// 4. Re-encoding the node (the cache stores the swizzled version)
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
+
+/// Immutable snapshot of a room's in-memory state.
+///
+/// Index and cache are bundled so readers see a consistent triple
+/// via a single `ArcSwap::load()` — no three-lock coordination.
+#[derive(Clone)]
+struct RoomGeneration {
+    index: LossyIndex,
+    cache: Arc<NodeCache>,
+}
 
 /// A content-addressed packfile storage engine backed by a global shard pool.
 ///
 /// All rooms share a small pool of shard files (~4, each ~2GB), keeping
 /// file descriptor usage constant regardless of room count.
 ///
-/// Read path: cache → index lookup (with linear-probe collision retry)
-///            → shard read → CRC verify → swizzle children → cache insert
-/// Write path: shard append → index insert → cache insert
+/// Per-room state (index + cache) is bundled in an immutable
+/// `RoomGeneration` and swapped atomically via `ArcSwap`:
+///
+/// - **Reads**: `load_full()` once, see a consistent snapshot.
+/// - **Writes**: build new generation under put lock, swap atomically.
+/// - **Delete**: drop the generation — cache disappears with it.
 pub struct PackfileStorage {
-    /// Global shard pool shared across all rooms.
     shards: ShardPool,
-    /// Per-room lossy fanout index for (hash → `shard_id`, offset).
-    indexes: RwLock<HashMap<[u8; 16], LossyIndex>>,
-    /// Verify-once decoded node cache.
-    cache: NodeCache,
-    /// Top-level pinned state trie nodes (L0/L1) safe for zero-eviction swizzling.
+    rooms: RwLock<HashMap<[u8; 16], ArcSwap<RoomGeneration>>>,
     pinned: PinnedNodes,
-    /// Base directory for all shard files.
     base_dir: PathBuf,
-    /// Optional swizzle callback for in-cache pointer resolution.
     swizzle: Option<SwizzleFn>,
-    /// Optional HAMT node parser to extract child edges for cache swizzling.
-    parser: Option<NodeParserFn>,
-    /// Manages per-room repack lifecycle.
-    repack: RepackManager,
-    /// Serializes `put` + `maybe_repack` per room.
     put_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
-    /// Per-room roots that must survive repack.
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
-    /// Trigger repack once a room's index exceeds this many entries.
     repack_threshold_entries: AtomicU64,
+    cache_capacity: usize,
 }
 
-/// Default repack trigger: once a room's index exceeds this many entries,
-/// `maybe_repack` rewrites it in reachability order (if live roots are
-/// registered). ~2x the expected steady-state entry count for a room.
 const DEFAULT_REPACK_THRESHOLD_ENTRIES: u64 = 2048;
+const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 
 impl PackfileStorage {
-    /// Create a new packfile storage.
-    ///
-    /// On creation, scans existing shard files to rebuild in-memory indexes.
+    /// Open a packfile storage with default settings.
     ///
     /// # Errors
-    /// Returns `io::Error` if the base directory cannot be read.
+    /// Returns `io::Error` if the base directory cannot be created or read.
     pub fn open(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, NodeCache::with_default_capacity(), None, None)
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None)
     }
 
-    /// Create a new packfile storage with custom cache size.
+    /// Open a packfile storage with a custom per-room cache capacity.
     ///
     /// # Errors
     /// Returns `io::Error` if the base directory cannot be created or read.
     pub fn open_with_cache(
         base_dir: PathBuf,
-        cache: NodeCache,
-        parser: Option<NodeParserFn>,
+        cache_capacity: usize,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache, None, parser)
+        Self::open_with_options(base_dir, cache_capacity, None)
     }
 
-    /// Create a new packfile storage with a swizzle callback.
+    /// Open a packfile storage with a swizzle callback for in-cache pointer resolution.
     ///
     /// # Errors
     /// Returns `io::Error` if the base directory cannot be created or read.
     pub fn open_with_swizzle(
         base_dir: PathBuf,
-        cache: NodeCache,
+        cache_capacity: usize,
         swizzle: SwizzleFn,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache, Some(swizzle), None)
+        Self::open_with_options(base_dir, cache_capacity, Some(swizzle))
     }
 
     fn open_with_options(
         base_dir: PathBuf,
-        cache: NodeCache,
+        cache_capacity: usize,
         swizzle: Option<SwizzleFn>,
-        parser: Option<NodeParserFn>,
     ) -> Result<Self, std::io::Error> {
         fs::create_dir_all(&base_dir)?;
 
         let shards = ShardPool::open(base_dir.clone())?;
-        let mut indexes = HashMap::new();
+        let mut rooms: HashMap<[u8; 16], ArcSwap<RoomGeneration>> = HashMap::new();
 
-        // Scan all shard files, building per-room indexes
         for shard_id in 0..shard::MAX_SHARDS_U8 {
             let path = ShardPool::shard_path(&base_dir, shard_id);
             if !path.exists() {
@@ -142,128 +126,102 @@ impl PackfileStorage {
                     .push((*hash, *offset));
             }
             for (room_id, records) in room_entries {
-                let index = indexes
-                    .entry(room_id)
-                    .or_insert_with(|| LossyIndex::new(records.len().saturating_mul(2).max(16)));
+                let entry = rooms.entry(room_id).or_insert_with(|| {
+                    ArcSwap::from_pointee(RoomGeneration {
+                        index: LossyIndex::new(records.len().saturating_mul(2).max(16)),
+                        cache: Arc::new(NodeCache::new(cache_capacity)),
+                    })
+                });
+                let gen = entry.load();
+                let mut new_gen = (**gen).clone();
                 for (hash, offset) in &records {
-                    let _ = index.insert(hash, shard_id, *offset);
+                    let _ = new_gen.index.insert(hash, shard_id, *offset);
                 }
+                drop(gen);
+                entry.store(Arc::new(new_gen));
             }
         }
 
         Ok(Self {
             shards,
-            indexes: RwLock::new(indexes),
-            cache,
+            rooms: RwLock::new(rooms),
             pinned: PinnedNodes::new(),
             base_dir,
             swizzle,
-            parser,
-            repack: RepackManager::new(),
             put_locks: parking_lot::Mutex::new(HashMap::new()),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
+            cache_capacity,
         })
     }
 
-    /// Get a reference to the node cache.
-    #[must_use]
-    pub fn cache(&self) -> &NodeCache {
-        &self.cache
+    fn generation(&self, room_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
+        self.rooms
+            .read()
+            .get(room_id)
+            .map(arc_swap::ArcSwapAny::load)
     }
 
-    /// Get a reference to the pinned L0/L1 nodes set.
-    #[must_use]
-    pub fn pinned(&self) -> &PinnedNodes {
-        &self.pinned
+    pub fn room_ids(&self) -> Vec<[u8; 16]> {
+        let mut ids: Vec<[u8; 16]> = self.rooms.read().keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
-    /// Get a reference to the per-room indexes.
-    #[must_use]
-    pub fn indexes(&self) -> &RwLock<HashMap<[u8; 16], LossyIndex>> {
-        &self.indexes
+    pub fn room_index_info(&self, room_id: &[u8; 16]) -> Option<(usize, usize)> {
+        self.rooms
+            .read()
+            .get(room_id)
+            .map(|gen| {
+                let g = gen.load();
+                (g.index.len(), g.index.memory_usage())
+            })
     }
 
-    /// Register the set of roots that must survive repack for a room.
+    pub fn room_summaries(&self) -> Vec<([u8; 16], usize, usize)> {
+        let mut out: Vec<([u8; 16], usize, usize)> = self
+            .rooms
+            .read()
+            .iter()
+            .map(|(id, gen)| {
+                let g = gen.load();
+                (*id, g.index.len(), g.index.memory_usage())
+            })
+            .collect();
+        out.sort_unstable_by_key(|(id, _, _)| *id);
+        out
+    }
+
     pub fn set_live_roots(&self, room_id: &[u8; 16], roots: Vec<NodeId>) {
         self.live_roots.write().insert(*room_id, roots);
     }
 
-    /// Set the index entry count threshold that triggers a repack.
     pub fn set_repack_threshold_entries(&self, entries: u64) {
         self.repack_threshold_entries
             .store(entries, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Set the packfile-size threshold (legacy API, now maps to entries).
     pub fn set_repack_threshold_bytes(&self, bytes: u64) {
-        // Approximate: 1 entry ~ 200 bytes on average
         let entries = bytes / 200;
         self.set_repack_threshold_entries(entries.max(1));
     }
 
-    /// Repack a room if its index has grown past the configured threshold
-    /// and live roots are registered.
-    fn maybe_repack(&self, room_id: &[u8; 16]) {
-        let roots = {
-            let live_roots = self.live_roots.read();
-            match live_roots.get(room_id) {
-                Some(r) if !r.is_empty() => r.clone(),
-                _ => return,
-            }
-        };
-
-        let index_len = {
-            let indexes = self.indexes.read();
-            match indexes.get(room_id) {
-                Some(idx) => idx.len() as u64,
-                _ => return,
-            }
-        };
-
-        if index_len
-            < self
-                .repack_threshold_entries
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return;
-        }
-
-        let resolver = |id: &NodeId| -> Option<(NodeData, Vec<NodeId>)> {
-            let data = self.get(room_id, id).ok().flatten()?;
-            let children = self
-                .parser
-                .map_or_else(Vec::new, |parse| parse(&data.bytes));
-            Some((data, children))
-        };
-
-        let Ok(new_entries) = self
-            .repack
-            .repack_room(*room_id, roots, resolver, &self.shards)
-        else {
-            return;
-        };
-
-        // Rebuild index from repacked entries
-        let mut index = LossyIndex::new(new_entries.len().saturating_mul(2).max(16));
-        for (_room, hash, shard_id, offset) in &new_entries {
-            let _ = index.insert(hash, *shard_id, *offset);
-        }
-        self.indexes.write().insert(*room_id, index);
+    pub fn room_cache(&self, room_id: &[u8; 16]) -> Arc<NodeCache> {
+        self.generation(room_id).map_or_else(
+            || Arc::new(NodeCache::new(self.cache_capacity)),
+            |g| g.cache.clone(),
+        )
     }
 
-    /// Get or create a per-room mutex for serializing `put` and `maybe_repack`.
     fn put_mutex(&self, room_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
         let mut locks = self.put_locks.lock();
         locks.entry(*room_id).or_default().clone()
     }
 
-    /// Read a record at the given offset from a memory-mapped shard.
     fn read_at(shard: &Shard, offset: u64) -> Result<Record, StorageError> {
         ShardPool::read_at(shard, offset)
     }
 
-    /// Rebuild a room's index from shard records.
     fn rebuild_index(&self, room_id: &[u8; 16]) -> LossyIndex {
         type ShardHashOffset = ([u8; 16], u64);
 
@@ -317,9 +275,15 @@ impl PackfileStorage {
         if let Some(swizzle_fn) = self.swizzle {
             let children = extract_children(&data);
             if !children.is_empty() {
-                let cached = self.cache.resolve_hashes(&children);
+                let cached = if let Some(gen) = self.generation(room_id) {
+                    gen.cache.resolve_hashes(&children)
+                } else {
+                    vec![None; children.len()]
+                };
                 let swizzled = swizzle_fn(&data, &children, &cached);
-                self.cache.insert(*id, Arc::new(swizzled.clone()));
+                if let Some(gen) = self.generation(room_id) {
+                    gen.cache.insert(*id, Arc::new(swizzled.clone()));
+                }
                 return Ok(Some(NodeRef::Resolved(*id, Arc::new(swizzled))));
             }
         }
@@ -327,11 +291,9 @@ impl PackfileStorage {
         Ok(Some(NodeRef::Resolved(*id, Arc::new(data))))
     }
 
-    /// Try each `(shard_id, offset)` candidate in order, verifying against
-    /// `id`'s full hash — on tag collision, continue to the next candidate.
     fn resolve_from_candidates(
         &self,
-        _room_id: &[u8; 16],
+        gen: Option<&Arc<RoomGeneration>>,
         id: &NodeId,
         candidates: &[(u8, u64)],
     ) -> Result<Option<NodeData>, StorageError> {
@@ -343,27 +305,17 @@ impl PackfileStorage {
 
             match Self::read_at(&shard, *offset) {
                 Ok(record) => {
-                    // Verify against caller-requested hash, not the frame hash
                     if record.hash != *id {
                         continue;
                     }
 
-                    let mut children = Vec::new();
-                    if let Some(parse) = self.parser {
-                        for child_id in parse(&record.data) {
-                            if let Some(child_data) = self.pinned.get(&child_id) {
-                                children.push(NodeRef::Resolved(child_id, child_data));
-                            } else {
-                                children.push(NodeRef::Lazy(child_id));
-                            }
-                        }
-                    }
-
                     let data = NodeData {
                         bytes: record.data,
-                        children,
+                        children: Vec::new(),
                     };
-                    self.cache.insert(*id, Arc::new(data.clone()));
+                    if let Some(g) = gen {
+                        g.cache.insert(*id, Arc::new(data.clone()));
+                    }
                     return Ok(Some(data));
                 }
                 Err(e) => {
@@ -378,28 +330,17 @@ impl PackfileStorage {
         Ok(None)
     }
 
-    /// Rewrite every record for a room by scanning all shards, without
-    /// needing a HAMT parser. This performs a full compaction: every
-    /// record for the room is copied to the active shard, including
-    /// orphaned/dead nodes not reachable from any live root. This fixes
-    /// data loss from the parser-based BFS path but does NOT perform GC.
-    ///
-    /// To reclaim space from unreachable nodes, use `maybe_repack` with
-    /// a HAMT parser and live roots registered via `set_live_roots`.
-    ///
-    /// Note: the `--root` CLI argument is accepted but does not gate
-    /// which records are kept -- all room records are rewritten. Each entry is read from its current shard
-    /// and appended to the active shard. The per-room index is then
-    /// rebuilt from the written entries.
-    ///
-    /// This avoids the BFS-based `maybe_repack` path which requires a
-    /// parser to discover child nodes and silently drops descendants
-    /// when no parser is available.
+    /// Rewrite every record for a room by scanning all shards.
+    /// Full compaction: every record is copied to the active shard.
+    /// This does NOT perform GC (orphaned nodes are preserved).
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption.
     pub fn repack_room_rewrite(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
         type ShardHashOffset = ([u8; 16], u64);
+
+        let room_arc = self.put_mutex(room_id);
+        let _room_guard = room_arc.lock();
 
         let mut scanned: Vec<(u8, Vec<ShardHashOffset>)> = Vec::new();
 
@@ -447,32 +388,49 @@ impl PackfileStorage {
         for (hash, shard_id, offset) in &new_offsets {
             let _ = index.insert(hash, *shard_id, *offset);
         }
-        self.indexes.write().insert(*room_id, index);
+
+        let cache = self.generation(room_id).map_or_else(
+            || Arc::new(NodeCache::new(self.cache_capacity)),
+            |gen| gen.cache.clone(),
+        );
+        let new_gen = Arc::new(RoomGeneration { index, cache });
+
+        self.rooms
+            .write()
+            .entry(*room_id)
+            .or_insert_with(|| {
+                ArcSwap::from_pointee(RoomGeneration {
+                    index: LossyIndex::new(0),
+                    cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                })
+            })
+            .store(new_gen);
+
         Ok(())
     }
 }
 
 impl StorageEngine for PackfileStorage {
     fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        // 1. Check the per-room index first
-        let candidates: Vec<(u8, u64)> = {
-            let indexes = self.indexes.read();
-            let Some(index) = indexes.get(room_id) else {
-                return Ok(None);
-            };
-            index.lookup_all(id).collect()
+        let gen_guard = self.generation(room_id);
+        let gen = gen_guard.as_deref();
+
+        let candidates: Vec<(u8, u64)> = match gen {
+            Some(g) => g.index.lookup_all(id).collect(),
+            None => return Ok(None),
         };
 
         if candidates.is_empty() {
             return Ok(None);
         }
 
-        // 2. Check cache
-        if let Some(data) = self.cache.get(id) {
-            return Ok(Some((*data).clone()));
+        if let Some(g) = gen {
+            if let Some(data) = g.cache.get(id) {
+                return Ok(Some((*data).clone()));
+            }
         }
 
-        self.resolve_from_candidates(room_id, id, &candidates)
+        self.resolve_from_candidates(gen, id, &candidates)
     }
 
     fn get_many(
@@ -482,19 +440,18 @@ impl StorageEngine for PackfileStorage {
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
         let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
 
+        let gen_guard = self.generation(room_id);
+        let gen = gen_guard.as_deref();
+
         let mut to_fetch: Vec<(usize, Vec<(u8, u64)>)> = Vec::new();
-        {
-            let indexes = self.indexes.read();
-            let index = indexes.get(room_id);
+        if let Some(g) = gen {
             for (i, id) in ids.iter().enumerate() {
-                if let Some(index) = index {
-                    let candidates: Vec<(u8, u64)> = index.lookup_all(id).collect();
-                    if !candidates.is_empty() {
-                        if let Some(data) = self.cache.get(id) {
-                            results[i] = Some((*data).clone());
-                        } else {
-                            to_fetch.push((i, candidates));
-                        }
+                let candidates: Vec<(u8, u64)> = g.index.lookup_all(id).collect();
+                if !candidates.is_empty() {
+                    if let Some(data) = g.cache.get(id) {
+                        results[i] = Some((*data).clone());
+                    } else {
+                        to_fetch.push((i, candidates));
                     }
                 }
             }
@@ -503,7 +460,7 @@ impl StorageEngine for PackfileStorage {
         to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
 
         for (i, candidates) in &to_fetch {
-            results[*i] = self.resolve_from_candidates(room_id, &ids[*i], candidates)?;
+            results[*i] = self.resolve_from_candidates(gen, &ids[*i], candidates)?;
         }
 
         Ok(results)
@@ -539,32 +496,45 @@ impl StorageEngine for PackfileStorage {
             (shard.shard_id, offset)
         };
 
-        // Update per-room index
-        let index_full = {
-            let mut indexes = self.indexes.write();
-            let index = indexes
-                .entry(*room_id)
-                .or_insert_with(|| LossyIndex::new(4096));
-            index.insert(id, shard_id, offset).is_err()
-        };
-        if index_full {
-            let mut rebuilt = self.rebuild_index(room_id);
-            let _ = rebuilt.insert(id, shard_id, offset);
-            self.indexes.write().insert(*room_id, rebuilt);
-        }
+        let new_gen = {
+            let old_gen = self.generation(room_id);
+            let mut index = match &old_gen {
+                Some(g) => g.index.clone(),
+                None => LossyIndex::new(4096),
+            };
+            let index_full = index.insert(id, shard_id, offset).is_err();
+            if index_full {
+                index = self.rebuild_index(room_id);
+                let _ = index.insert(id, shard_id, offset);
+            }
+            let cache = match &old_gen {
+                Some(g) => g.cache.clone(),
+                None => Arc::new(NodeCache::new(self.cache_capacity)),
+            };
 
-        // Cache it, swizzling any lazy refs if they are in pinned
-        let mut data_to_cache = data.clone();
-        for child in &mut data_to_cache.children {
-            if let NodeRef::Lazy(child_id) = child {
-                if let Some(child_data) = self.pinned.get(child_id) {
-                    *child = NodeRef::Resolved(*child_id, child_data);
+            let mut data_to_cache = data.clone();
+            for child in &mut data_to_cache.children {
+                if let NodeRef::Lazy(child_id) = child {
+                    if let Some(child_data) = self.pinned.get(child_id) {
+                        *child = NodeRef::Resolved(*child_id, child_data);
+                    }
                 }
             }
-        }
-        self.cache.insert(*id, Arc::new(data_to_cache));
+            cache.insert(*id, Arc::new(data_to_cache));
 
-        self.maybe_repack(room_id);
+            Arc::new(RoomGeneration { index, cache })
+        };
+
+        self.rooms
+            .write()
+            .entry(*room_id)
+            .or_insert_with(|| {
+                ArcSwap::from_pointee(RoomGeneration {
+                    index: LossyIndex::new(0),
+                    cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                })
+            })
+            .store(new_gen);
 
         Ok(())
     }
@@ -581,11 +551,9 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn delete_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
-        self.repack.purge_room(room_id);
-        self.indexes.write().remove(room_id);
+        self.rooms.write().remove(room_id);
         self.live_roots.write().remove(room_id);
         self.put_locks.lock().remove(room_id);
-        self.cache.clear();
         Ok(())
     }
 
@@ -593,6 +561,7 @@ impl StorageEngine for PackfileStorage {
         Ok(self.shards.sync_all()?)
     }
 }
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -647,13 +616,17 @@ mod tests {
 
         store.put(&TEST_ROOM, &a, &data_a).unwrap();
 
-        store.cache().clear();
+        if let Some(gen) = store.generation(&TEST_ROOM) {
+            gen.cache.clear();
+        }
         let got_a = store.get(&TEST_ROOM, &a).unwrap();
         assert_eq!(got_a.unwrap().bytes, data_a.bytes);
 
         store.put(&TEST_ROOM, &b, &data_b).unwrap();
 
-        store.cache().clear();
+        if let Some(gen) = store.generation(&TEST_ROOM) {
+            gen.cache.clear();
+        }
         let got_b = store.get(&TEST_ROOM, &b).unwrap();
         assert_eq!(got_b.expect("B must be found").bytes, data_b.bytes);
     }
@@ -676,10 +649,11 @@ mod tests {
         store.put(&TEST_ROOM, &id, &data).unwrap();
 
         let _ = store.get(&TEST_ROOM, &id).unwrap();
-        assert_eq!(store.cache.hits(), 1);
+        let gen = store.generation(&TEST_ROOM).unwrap();
+        assert_eq!(gen.cache.hits(), 1);
 
         let _ = store.get(&TEST_ROOM, &id).unwrap();
-        assert_eq!(store.cache.hits(), 2);
+        assert_eq!(gen.cache.hits(), 2);
     }
 
     #[test]
@@ -694,7 +668,7 @@ mod tests {
 
         store.delete_room(&OTHER_ROOM).unwrap();
         assert!(store.get(&OTHER_ROOM, &id).unwrap().is_none());
-        assert!(store.indexes.read().get(&OTHER_ROOM).is_none());
+        assert!(store.generation(&OTHER_ROOM).is_none());
     }
 
     #[test]
@@ -742,7 +716,9 @@ mod tests {
 
         let entries = ten_record_fixture();
         store.put_many(&TEST_ROOM, &entries).unwrap();
-        store.cache().clear();
+        if let Some(gen) = store.generation(&TEST_ROOM) {
+            gen.cache.clear();
+        }
 
         let mut reversed_ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
         reversed_ids.reverse();
@@ -918,8 +894,7 @@ mod tests {
         }
 
         let dir = test_dir("swizzle");
-        let store =
-            PackfileStorage::open_with_swizzle(dir, NodeCache::new(100), test_swizzle).unwrap();
+        let store = PackfileStorage::open_with_swizzle(dir, 100, test_swizzle).unwrap();
 
         let parent_id = [0x10u8; 16];
         let child_a = [0x20u8; 16];
@@ -933,7 +908,9 @@ mod tests {
         store.put(&TEST_ROOM, &child_b, &data_b).unwrap();
         store.put(&TEST_ROOM, &parent_id, &parent_data).unwrap();
 
-        store.cache.clear();
+        if let Some(gen) = store.generation(&TEST_ROOM) {
+            gen.cache.clear();
+        }
         store.put(&TEST_ROOM, &child_a, &data_a).unwrap();
         store.put(&TEST_ROOM, &child_b, &data_b).unwrap();
 
@@ -947,47 +924,6 @@ mod tests {
 
         assert_eq!(SWIZZLE_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(CACHED_CHILDREN_FOUND.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn test_in_cache_swizzling() {
-        fn dummy_parser(bytes: &[u8]) -> Vec<NodeId> {
-            if bytes == b"parent" {
-                vec![[0x11; 16], [0x22; 16]]
-            } else {
-                vec![]
-            }
-        }
-
-        let dir = test_dir("in_cache_swizzle");
-        let store = PackfileStorage::open_with_cache(
-            dir,
-            NodeCache::with_default_capacity(),
-            Some(dummy_parser),
-        )
-        .unwrap();
-
-        let child1_id = [0x11; 16];
-        let child1_data = Arc::new(NodeData::new(bytes::Bytes::from_static(b"child 1")));
-        store.pinned().pin(child1_id, child1_data.clone());
-
-        let parent_id = [0x42; 16];
-        let mut parent_data = NodeData::new(bytes::Bytes::from_static(b"parent"));
-        parent_data.children = vec![NodeRef::Lazy(child1_id), NodeRef::Lazy([0x22; 16])];
-
-        store.put(&TEST_ROOM, &parent_id, &parent_data).unwrap();
-        let fetched = store.get(&TEST_ROOM, &parent_id).unwrap().unwrap();
-        assert_eq!(fetched.children.len(), 2);
-
-        match &fetched.children[0] {
-            NodeRef::Resolved(id, data) => {
-                assert_eq!(*id, child1_id);
-                assert_eq!(data.bytes, child1_data.bytes);
-            }
-            NodeRef::Lazy(_) => panic!("Expected child 1 to be resolved"),
-        }
-
-        assert!(matches!(fetched.children[1], NodeRef::Lazy(_)));
     }
 
     #[test]
@@ -1039,82 +975,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_from_candidates_parser_children() {
-        fn parser(data: &[u8]) -> Vec<NodeId> {
-            if data == b"parent" {
-                vec![[0x11; 16], [0x22; 16]]
-            } else {
-                vec![]
-            }
-        }
-
-        let dir = test_dir("resolve_parser");
-        let store =
-            PackfileStorage::open_with_cache(dir, NodeCache::with_default_capacity(), Some(parser))
-                .unwrap();
-
-        let child1_id = [0x11; 16];
-        let child1_data = NodeData::new(bytes::Bytes::from_static(b"child 1"));
-        store.put(&TEST_ROOM, &child1_id, &child1_data).unwrap();
-
-        let parent_id = [0x42; 16];
-        store
-            .put(
-                &TEST_ROOM,
-                &parent_id,
-                &NodeData::new(bytes::Bytes::from_static(b"parent")),
-            )
-            .unwrap();
-
-        store.cache().clear();
-
-        let fetched = store.get(&TEST_ROOM, &parent_id).unwrap().unwrap();
-        assert_eq!(fetched.children.len(), 2);
-        assert!(matches!(fetched.children[0], NodeRef::Lazy(id) if id == child1_id));
-        assert!(matches!(fetched.children[1], NodeRef::Lazy(id) if id == [0x22; 16]));
-    }
-
-    #[test]
-    fn test_resolve_from_candidates_pinned_child() {
-        fn parser(data: &[u8]) -> Vec<NodeId> {
-            if data == b"parent" {
-                vec![[0x11; 16]]
-            } else {
-                vec![]
-            }
-        }
-
-        let dir = test_dir("resolve_pinned");
-        let store =
-            PackfileStorage::open_with_cache(dir, NodeCache::with_default_capacity(), Some(parser))
-                .unwrap();
-
-        let child_id = [0x11; 16];
-        let child_data = Arc::new(NodeData::new(bytes::Bytes::from_static(b"child")));
-        store.pinned().pin(child_id, child_data.clone());
-
-        store
-            .put(
-                &TEST_ROOM,
-                &[0x42; 16],
-                &NodeData::new(bytes::Bytes::from_static(b"parent")),
-            )
-            .unwrap();
-
-        store.cache().clear();
-
-        let fetched = store.get(&TEST_ROOM, &[0x42; 16]).unwrap().unwrap();
-        assert_eq!(fetched.children.len(), 1);
-        match &fetched.children[0] {
-            NodeRef::Resolved(id, data) => {
-                assert_eq!(*id, child_id);
-                assert_eq!(data.bytes, child_data.bytes);
-            }
-            NodeRef::Lazy(_) => panic!("Expected child to be Resolved from pinned"),
-        }
-    }
-
-    #[test]
     fn test_scan_existing_skips_malformed_filenames() {
         let dir = test_dir("scan_existing_junk");
         std::fs::write(dir.join("nounderscore.pack"), b"").unwrap();
@@ -1128,7 +988,6 @@ mod tests {
             std::fs::write(path, b"").unwrap();
         }
 
-        // A valid shard file
         let valid_path = dir.join("shard_00.pack");
         let mut buf = Vec::new();
         packfile::write_header(&mut buf).unwrap();
@@ -1144,21 +1003,15 @@ mod tests {
         std::fs::write(&valid_path, &buf).unwrap();
 
         let store = PackfileStorage::open(dir).unwrap();
-        assert_eq!(
-            store
-                .indexes
-                .read()
-                .get(&[0x01u8; 16])
-                .map_or(0, crate::index::LossyIndex::len),
-            1
-        );
+        let gen = store.generation(&[0x01u8; 16]).unwrap();
+        assert_eq!(gen.index.len(), 1);
     }
+
     #[test]
     fn test_repack_room_rewrite_preserves_all_records() {
         let dir = test_dir("repack_rewrite");
         let store = PackfileStorage::open(dir.clone()).unwrap();
 
-        // Insert a "tree": root + 3 children (simulating a HAMT without needing a parser)
         let root = [0xAAu8; 16];
         let child1 = [0x01u8; 16];
         let child2 = [0x02u8; 16];
@@ -1172,13 +1025,11 @@ mod tests {
         ];
         store.put_many(&TEST_ROOM, &entries).unwrap();
 
-        assert_eq!(store.indexes.read().get(&TEST_ROOM).unwrap().len(), 4);
+        assert_eq!(store.generation(&TEST_ROOM).unwrap().index.len(), 4);
 
-        // Trigger repack_room_rewrite
         store.repack_room_rewrite(&TEST_ROOM).unwrap();
 
-        // All 4 records must survive
-        assert_eq!(store.indexes.read().get(&TEST_ROOM).unwrap().len(), 4);
+        assert_eq!(store.generation(&TEST_ROOM).unwrap().index.len(), 4);
         assert!(store.get(&TEST_ROOM, &root).unwrap().is_some());
         assert!(store.get(&TEST_ROOM, &child1).unwrap().is_some());
         assert!(store.get(&TEST_ROOM, &child2).unwrap().is_some());
@@ -1190,7 +1041,6 @@ mod tests {
         let dir = test_dir("delete_room_cache");
         let store = PackfileStorage::open(dir.clone()).unwrap();
 
-        // Populate two rooms
         let room_a = TEST_ROOM;
         let room_b = OTHER_ROOM;
         let id_a = [0x10u8; 16];
@@ -1201,17 +1051,65 @@ mod tests {
         store.put(&room_a, &id_a, &data_a).unwrap();
         store.put(&room_b, &id_b, &data_b).unwrap();
 
-        // Both should be retrievable
         assert!(store.get(&room_a, &id_a).unwrap().is_some());
         assert!(store.get(&room_b, &id_b).unwrap().is_some());
 
-        // Delete room A
+        let gen_b_before = store.generation(&room_b).unwrap();
+        let hits_b_before = gen_b_before.cache.hits();
+
         store.delete_room(&room_a).unwrap();
 
-        // Room A should be gone, room B should still be accessible
         assert!(store.get(&room_a, &id_a).unwrap().is_none());
-        assert!(store.indexes.read().get(&room_a).is_none());
-        // Room B index should still exist
-        assert!(store.indexes.read().get(&room_b).is_some());
+        assert!(store.generation(&room_a).is_none());
+        assert!(store.generation(&room_b).is_some());
+        assert!(store.get(&room_b, &id_b).unwrap().is_some());
+
+        let gen_b_after = store.generation(&room_b).unwrap();
+        assert!(gen_b_after.cache.hits() > hits_b_before);
+    }
+
+    #[test]
+    fn test_concurrent_put_repack_no_lost_writes() {
+        use std::thread;
+
+        let dir = test_dir("concurrent_put_repack");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let room = [0x55u8; 16];
+        let written_count = std::sync::atomic::AtomicU32::new(0);
+
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for i in 0..200u32 {
+                    let mut id = [0u8; 16];
+                    id[0..4].copy_from_slice(&i.to_le_bytes());
+                    let data = NodeData::new(bytes::Bytes::from(format!("entry {i}")));
+                    store.put(&room, &id, &data).unwrap();
+                    written_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+
+            let repacker = scope.spawn(|| {
+                for _ in 0..5 {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                    let _ = store.repack_room_rewrite(&room);
+                }
+            });
+
+            writer.join().unwrap();
+            repacker.join().unwrap();
+        });
+
+        let total = written_count.load(std::sync::atomic::Ordering::Relaxed);
+        let mut found = 0u32;
+        for i in 0..total {
+            let mut id = [0u8; 16];
+            id[0..4].copy_from_slice(&i.to_le_bytes());
+            if store.get(&room, &id).unwrap().is_some() {
+                found += 1;
+            }
+        }
+
+        assert_eq!(found, total, "lost writes during concurrent put+repack");
     }
 }
