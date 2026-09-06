@@ -325,7 +325,7 @@ mod tests {
         let b = frontier.insert_event(101, &[], &[100]);
         let c = frontier.insert_event(102, &[], &[100, 999]);
 
-        assert!(frontier.auth_edges(a).is_empty());
+        assert_eq!(frontier.auth_edges(a), &[]);
 
         let auth_b = frontier.auth_edges(b);
         assert_eq!(auth_b.len(), 1);

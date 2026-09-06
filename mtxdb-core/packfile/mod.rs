@@ -537,7 +537,7 @@ mod tests {
         let path = dir.join("00000000000000000000000000000000_00.pack");
         std::fs::write(&path, b"").unwrap();
         let entries = scan_packfile(&path).unwrap();
-        assert!(entries.is_empty());
+        assert_eq!(entries, vec![]);
     }
 
     #[test]
@@ -594,6 +594,6 @@ mod tests {
         let path = dir.join("00000000000000000000000000000000_00.pack");
         std::fs::write(&path, b"").unwrap();
         let entries = scan_and_recover_packfile(&path).unwrap();
-        assert!(entries.is_empty());
+        assert_eq!(entries, vec![]);
     }
 }

@@ -1509,4 +1509,96 @@ mod tests {
         // Child 2 remains Lazy (not in pinned)
         assert!(matches!(fetched.children[1], NodeRef::Lazy(_)));
     }
+
+    #[test]
+    fn test_sync() {
+        let dir = test_dir("sync");
+        let store = PackfileStorage::open(dir).unwrap();
+        store
+            .put(
+                &TEST_ROOM,
+                &[0xAA; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"hi")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+    }
+
+    #[test]
+    fn test_rebuild_index_triggers_on_full_table() {
+        let dir = test_dir("rebuild_index_full");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Fill the index beyond 75% capacity (4096 slot table, threshold 3072)
+        // by writing 3073 distinct records. Each record is small enough to
+        // stay within pack limits, and each has a unique hash.
+        let threshold = 3073u32;
+        for i in 0..threshold {
+            let mut id = [0u8; 16];
+            id[0..4].copy_from_slice(&i.to_le_bytes());
+            store
+                .put(
+                    &TEST_ROOM,
+                    &id,
+                    &NodeData::new(bytes::Bytes::from_static(b"x")),
+                )
+                .unwrap();
+        }
+
+        // This next put should trigger the index_full rebuild path
+        let mut extra = [0u8; 16];
+        extra[0..4].copy_from_slice(&threshold.to_le_bytes());
+        store
+            .put(
+                &TEST_ROOM,
+                &extra,
+                &NodeData::new(bytes::Bytes::from_static(b"y")),
+            )
+            .unwrap();
+
+        // Verify the extra record is readable after rebuild
+        let got = store.get(&TEST_ROOM, &extra).unwrap().unwrap();
+        assert_eq!(got.bytes, bytes::Bytes::from_static(b"y"));
+    }
+
+    #[test]
+    fn test_resolve_from_candidates_parser_children() {
+        fn parser(data: &bytes::Bytes) -> Vec<NodeId> {
+            if data.as_ref() == b"parent" {
+                vec![[0x11; 16], [0x22; 16]]
+            } else {
+                vec![]
+            }
+        }
+
+        let dir = test_dir("resolve_parser");
+        let store =
+            PackfileStorage::open_with_cache(dir, NodeCache::with_default_capacity(), Some(parser))
+                .unwrap();
+
+        let child_id = [0x11; 16];
+        let child_data = Arc::new(NodeData::new(bytes::Bytes::from_static(b"child")));
+        store.pinned().pin(child_id, child_data.clone());
+
+        store
+            .put(
+                &TEST_ROOM,
+                &[0x42; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"parent")),
+            )
+            .unwrap();
+
+        // Evict cache
+        store.cache().clear();
+
+        let fetched = store.get(&TEST_ROOM, &[0x42; 16]).unwrap().unwrap();
+        assert_eq!(fetched.children.len(), 1);
+        match &fetched.children[0] {
+            NodeRef::Resolved(id, data) => {
+                assert_eq!(*id, child_id);
+                assert_eq!(data.bytes, child_data.bytes);
+            }
+            NodeRef::Lazy(_) => panic!("Expected child to be Resolved from pinned"),
+        }
+    }
 }
