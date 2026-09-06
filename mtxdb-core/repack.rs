@@ -268,6 +268,7 @@ impl From<std::io::Error> for RepackError {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::error::Error;
     use std::path::Path;
 
     fn make_node(id: u8) -> (NodeId, NodeData, Vec<NodeId>) {
@@ -424,5 +425,28 @@ mod tests {
         assert!(manager.get_pack(&[0xBB; 16]).is_some());
         manager.purge_room(&[0xBB; 16]).unwrap();
         assert!(manager.get_pack(&[0xBB; 16]).is_none());
+    }
+
+    #[test]
+    fn test_repack_error_display_and_source() {
+        let io = std::io::Error::other("disk");
+        let e = RepackError::Io(io);
+        assert_eq!(e.to_string(), "I/O error: disk");
+        assert!(e.source().is_some());
+
+        let e = RepackError::RootNotFound;
+        assert_eq!(e.to_string(), "resolver returned no data for root hash");
+        assert!(e.source().is_none());
+
+        let e = RepackError::RoomNotFound;
+        assert_eq!(e.to_string(), "room not found");
+        assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn test_repack_error_from_io() {
+        let io = std::io::Error::other("z");
+        let e: RepackError = io.into();
+        assert!(matches!(e, RepackError::Io(_)));
     }
 }

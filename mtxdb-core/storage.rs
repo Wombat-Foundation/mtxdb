@@ -235,6 +235,7 @@ impl StorageEngine for InMemoryStorage {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::error::Error;
 
     const TEST_ROOM: [u8; 16] = [0x01; 16];
 
@@ -296,5 +297,67 @@ mod tests {
         assert!(!r#ref.is_resolved());
         assert_eq!(r#ref.structural_hash(), &id);
         assert!(r#ref.data().is_none());
+    }
+
+    #[test]
+    fn test_storage_error_display() {
+        let io_err = StorageError::Io(std::io::Error::other("boom"));
+        assert_eq!(io_err.to_string(), "I/O error: boom");
+
+        let id = [0x01; 16];
+        assert_eq!(
+            StorageError::NotFound(id).to_string(),
+            format!("node not found: {id:?}")
+        );
+        assert_eq!(
+            StorageError::VerificationFailed(id).to_string(),
+            format!("verification failed for node {id:?}")
+        );
+        assert_eq!(
+            StorageError::Corrupt("bad".into()).to_string(),
+            "corrupt data: bad"
+        );
+        assert_eq!(
+            StorageError::Internal("oops".into()).to_string(),
+            "internal error: oops"
+        );
+    }
+
+    #[test]
+    fn test_storage_error_source() {
+        let io = std::io::Error::other("x");
+        assert!(StorageError::Io(io).source().is_some());
+        assert!(StorageError::NotFound([0; 16]).source().is_none());
+        assert!(StorageError::Corrupt(String::new()).source().is_none());
+    }
+
+    #[test]
+    fn test_storage_error_from_io() {
+        let io = std::io::Error::other("y");
+        let e: StorageError = io.into();
+        assert!(matches!(e, StorageError::Io(_)));
+    }
+
+    #[test]
+    fn test_in_memory_default() {
+        let store = InMemoryStorage::default();
+        assert!(store.get(&TEST_ROOM, &[0; 16]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_in_memory_delete_and_sync() {
+        let store = InMemoryStorage::new();
+        let id = [0x42u8; 16];
+        store
+            .put(
+                &TEST_ROOM,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"d")),
+            )
+            .unwrap();
+        assert!(store.get(&TEST_ROOM, &id).unwrap().is_some());
+        store.delete_room(&TEST_ROOM).unwrap();
+        assert!(store.get(&TEST_ROOM, &id).unwrap().is_none());
+        store.sync().unwrap();
     }
 }
