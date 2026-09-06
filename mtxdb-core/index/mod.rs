@@ -424,6 +424,35 @@ mod tests {
     }
 
     #[test]
+    fn test_table_full_returns_error() {
+        let mut index = LossyIndex::new(16); // capacity 16, threshold 12
+        for i in 0..12u64 {
+            let h = splitmix_hash(i);
+            index.insert(&h, 0, i).unwrap();
+        }
+        assert_eq!(index.len(), 12);
+        let h = splitmix_hash(999);
+        assert!(matches!(
+            index.insert(&h, 0, 999),
+            Err(InsertError::TableFull)
+        ));
+    }
+
+    #[test]
+    fn test_is_empty_and_memory_usage() {
+        let index = LossyIndex::new(128);
+        assert!(index.is_empty());
+        assert_eq!(
+            index.memory_usage(),
+            128 * 8 + std::mem::size_of::<LossyIndex>()
+        );
+
+        let mut index = LossyIndex::new(128);
+        index.insert(&test_hash(0x01), 0, 1).unwrap();
+        assert!(!index.is_empty());
+    }
+
+    #[test]
     fn test_overwrite_same_hash() {
         let mut index = LossyIndex::new(128);
         let h = test_hash(0x01);
@@ -515,5 +544,73 @@ mod tests {
             let h = splitmix_hash(i as u64);
             assert_eq!(index.lookup(&h), Some((0, i as u64)));
         }
+    }
+
+    #[test]
+    fn test_deserialize_errors() {
+        // TooShort: data shorter than 8 bytes
+        assert!(matches!(
+            LossyIndex::deserialize(&[0u8; 4]),
+            Err(DeserializationError::TooShort)
+        ));
+        // TooShort: capacity header present but slots truncated
+        let mut buf = vec![0u8; 16];
+        buf[..8].copy_from_slice(&16u64.to_le_bytes());
+        assert!(matches!(
+            LossyIndex::deserialize(&buf),
+            Err(DeserializationError::TooShort)
+        ));
+        // InvalidCapacity: capacity < 16
+        let mut buf = vec![0u8; 8 + 8 * 8];
+        buf[..8].copy_from_slice(&8u64.to_le_bytes());
+        assert!(matches!(
+            LossyIndex::deserialize(&buf),
+            Err(DeserializationError::InvalidCapacity)
+        ));
+        // InvalidCapacity: capacity not power of two
+        let mut buf = vec![0u8; 8 + 20 * 8];
+        buf[..8].copy_from_slice(&20u64.to_le_bytes());
+        assert!(matches!(
+            LossyIndex::deserialize(&buf),
+            Err(DeserializationError::InvalidCapacity)
+        ));
+    }
+
+    #[test]
+    fn test_error_display() {
+        assert_eq!(InsertError::TableFull.to_string(), "index table too full");
+        assert_eq!(DeserializationError::TooShort.to_string(), "data too short");
+        assert_eq!(
+            DeserializationError::InvalidCapacity.to_string(),
+            "capacity must be a power of two and >= 16"
+        );
+    }
+
+    #[test]
+    fn test_lookup_iter_exhausts_remaining() {
+        // Fill a small table to capacity (75% threshold = 12 of 16)
+        // then deserialize a fully-packed version to hit the
+        // remaining==0 fallthrough (line 353).
+        let mut index = LossyIndex::new(16);
+        for i in 0..12u64 {
+            let h = splitmix_hash(i);
+            index.insert(&h, 0, i).unwrap();
+        }
+        // Serialize, then manually fill all 16 slots so no empty terminator
+        let mut bytes = index.serialize();
+        // Append 4 more non-zero slots (capacity 16, we wrote 12 + 8 header)
+        for i in 12..16u64 {
+            let h = splitmix_hash(i + 1000);
+            let tag = LossyIndex::tag(&h);
+            let slot = IndexSlot::new(tag, 0, i);
+            bytes.extend_from_slice(&slot.0.to_le_bytes());
+        }
+        // Now lookup a hash whose tag does NOT match any slot —
+        // the iterator must probe all 16 slots and return None.
+        let mut query = [0xFFu8; 16];
+        query[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let restored = LossyIndex::deserialize(&bytes).unwrap();
+        assert_eq!(restored.len(), 16);
+        assert_eq!(restored.lookup(&query), None);
     }
 }

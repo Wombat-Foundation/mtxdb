@@ -319,6 +319,34 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_edges_resident_and_disk() {
+        let mut frontier = ActiveRoomFrontier::new();
+        let a = frontier.insert_event(100, &[], &[]);
+        let b = frontier.insert_event(101, &[], &[100]);
+        let c = frontier.insert_event(102, &[], &[100, 999]);
+
+        assert!(frontier.auth_edges(a).is_empty());
+
+        let auth_b = frontier.auth_edges(b);
+        assert_eq!(auth_b.len(), 1);
+        assert!(auth_b[0].is_resident());
+        assert_eq!(auth_b[0].arena_index(), a);
+
+        let auth_c = frontier.auth_edges(c);
+        assert_eq!(auth_c.len(), 2);
+        assert!(auth_c[0].is_resident());
+        assert_eq!(auth_c[0].arena_index(), a);
+        assert!(!auth_c[1].is_resident());
+    }
+
+    #[test]
+    fn test_active_room_frontier_default() {
+        let frontier = ActiveRoomFrontier::default();
+        assert!(frontier.is_empty());
+        assert_eq!(frontier.len(), 0);
+    }
+
+    #[test]
     fn test_id_remap() {
         let mut frontier = ActiveRoomFrontier::new();
         let local_a = frontier.register_id(100);

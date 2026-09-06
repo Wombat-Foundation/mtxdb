@@ -375,12 +375,21 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_record(hash: [u8; 16], data: &[u8]) -> Record {
         Record {
             hash,
             data: Bytes::copy_from_slice(data),
         }
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mdb_test_pf_{name}_{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -456,5 +465,135 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         assert!(!read_header(&mut cursor).unwrap());
+    }
+
+    #[test]
+    fn test_header_empty_returns_false() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        assert!(!read_header(&mut cursor).unwrap());
+    }
+
+    #[test]
+    fn test_record_serialized_len() {
+        let r = Record {
+            hash: [0u8; 16],
+            data: Bytes::from_static(b"hello"),
+        };
+        assert_eq!(r.serialized_len(), 4 + 16 + 5 + 4);
+    }
+
+    #[test]
+    fn test_write_record_payload_too_large() {
+        let r = Record {
+            hash: [0u8; 16],
+            data: Bytes::from(vec![0u8; MAX_RECORD_LEN as usize]),
+        };
+        let mut buf = Vec::new();
+        let err = write_record(&mut buf, &r).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_read_record_non_eof_io_error() {
+        struct FailRead;
+        impl Read for FailRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe broke"))
+            }
+        }
+        let result = read_record(&mut FailRead);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn test_read_header_non_eof_io_error() {
+        struct FailRead;
+        impl Read for FailRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope"))
+            }
+        }
+        let result = read_header(&mut FailRead);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_open_packfile_invalid_header() {
+        let dir = test_dir("packfile_invalid_header");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000000000000000000000000000_00.pack");
+        std::fs::write(&path, b"BADC\x01extra").unwrap();
+        let result = open_packfile(&path, false);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_scan_packfile_empty_file() {
+        let dir = test_dir("scan_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000000000000000000000000000_00.pack");
+        std::fs::write(&path, b"").unwrap();
+        let entries = scan_packfile(&path).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_scan_packfile_torn_tail() {
+        let dir = test_dir("scan_torn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000000000000000000000000000_00.pack");
+        // Write header + one valid record + partial garbage
+        let mut buf = Vec::new();
+        write_header(&mut buf).unwrap();
+        write_record(&mut buf, &test_record([0xaa; 16], b"data")).unwrap();
+        buf.extend_from_slice(&[0xff; 10]); // torn trailing bytes
+        std::fs::write(&path, &buf).unwrap();
+        let entries = scan_packfile(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_and_recover_truncates_torn_tail() {
+        let dir = test_dir("recover_torn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000000000000000000000000000_00.pack");
+        let mut buf = Vec::new();
+        write_header(&mut buf).unwrap();
+        write_record(&mut buf, &test_record([0xaa; 16], b"good")).unwrap();
+        let valid_len = buf.len();
+        buf.extend_from_slice(&[0xff; 20]); // torn tail
+        std::fs::write(&path, &buf).unwrap();
+        let entries = scan_and_recover_packfile(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len as u64);
+    }
+
+    #[test]
+    fn test_scan_and_recover_clean_file() {
+        let dir = test_dir("recover_clean");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000000000000000000000000000_00.pack");
+        let mut buf = Vec::new();
+        write_header(&mut buf).unwrap();
+        write_record(&mut buf, &test_record([0xbb; 16], b"ok")).unwrap();
+        write_record(&mut buf, &test_record([0xcc; 16], b"ok2")).unwrap();
+        let expected_len = buf.len();
+        std::fs::write(&path, &buf).unwrap();
+        let entries = scan_and_recover_packfile(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len as u64);
+    }
+
+    #[test]
+    fn test_scan_and_recover_empty_header() {
+        let dir = test_dir("recover_noheader");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000000000000000000000000000_00.pack");
+        std::fs::write(&path, b"").unwrap();
+        let entries = scan_and_recover_packfile(&path).unwrap();
+        assert!(entries.is_empty());
     }
 }

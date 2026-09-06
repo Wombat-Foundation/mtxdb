@@ -181,6 +181,28 @@ mod tests {
     }
 
     #[test]
+    fn test_bfs_layer_hashes_and_is_empty() {
+        let layer = BfsLayer::new();
+        assert!(layer.is_empty());
+        assert!(layer.hashes().is_empty());
+
+        let mut layer = BfsLayer::new();
+        layer.push([1u8; 16], [0xFF; 16]);
+        layer.push([2u8; 16], [0xFF; 16]);
+        assert!(!layer.is_empty());
+        assert_eq!(layer.hashes().len(), 2);
+        assert_eq!(layer.hashes()[0], [1u8; 16]);
+        assert_eq!(layer.hashes()[1], [2u8; 16]);
+    }
+
+    #[test]
+    fn test_bfs_layer_default() {
+        let layer = BfsLayer::default();
+        assert!(layer.is_empty());
+        assert_eq!(layer.len(), 0);
+    }
+
+    #[test]
     fn test_fetch_frontier_concurrent() {
         use crate::storage::InMemoryStorage;
 
