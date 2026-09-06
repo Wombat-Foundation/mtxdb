@@ -23,30 +23,30 @@ check-cargo-sort:
 
 .PHONY: check
 check: ##H Cargo check and code dupe
-	$(CARGO) check --all-targets
+	$(CARGO) check --workspace --all-targets
 	-jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
 lint: ##H Run clippy lints
-	$(CARGO) clippy --all-targets --all-features -- $(if $(CI),-D warnings)
+	$(CARGO) clippy --workspace --all-targets --all-features -- $(if $(CI),-D warnings)
 
 .PHONY: fix
 fix: ##H Apply auto-fixes with clippy
-	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets
+	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --workspace --all-targets
 
 
 
 .PHONY: doc
 doc: ##H Build docs
-	$(CARGO) test --doc
-	$(CARGO) doc --no-deps
+	$(CARGO) test --workspace --doc
+	$(CARGO) doc --workspace --no-deps
 	echo '<meta http-equiv="refresh" content="0;url=mtx_slipstream/index.html">' > target/doc/index.html
 
 
 
 .PHONY: test
 test: ##H Run tests
-	$(CARGO) test --lib --tests --timings
+	$(CARGO) test --workspace --lib --tests --timings
 
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
@@ -76,6 +76,21 @@ cov: ##H Run code coverage and generate HTML report
 .PHONY: build
 build: ##H Build the lib/binary
 	cargo build --release --timings
+
+.PHONY: build-ffi
+build-ffi: ##H Build C shared/static libraries (.so/.a)
+	cargo build --release -p mtxdb-ffi
+	@echo ""
+	@echo '══════════════ FFI BUILD OUTPUT ══════════════'
+	@find target/release -maxdepth 1 \( -name 'libmtxdb_ffi.so' -o -name 'libmtxdb_ffi.a' \) -exec ls -lh {} \;
+
+.PHONY: build-wasm
+build-wasm: ##H Build WebAssembly package (requires wasm32-wasip1 target)
+	rustup target add wasm32-wasip1 2>/dev/null || true
+	cargo build --release -p mtxdb-wasm --target wasm32-wasip1
+	@echo ""
+	@echo '══════════════ WASM BUILD OUTPUT ══════════════'
+	@ls -lh target/wasm32-wasip1/release/*.wasm 2>/dev/null || echo 'No .wasm output found'
 
 
 

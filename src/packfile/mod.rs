@@ -307,6 +307,40 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
         return Ok(entries);
     }
 
+    loop {
+        let offset = reader.stream_position()?;
+        match read_record(&mut reader) {
+            Ok(Some(record)) => {
+                entries.push((record.hash, offset));
+            }
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                // Torn tail — stop at last good record
+                eprintln!("warning: packfile scan stopped at offset {offset}: {e}");
+                break;
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Scan a packfile and truncate any torn tail at the last valid record
+/// boundary. Used during explicit recovery to repair a packfile before
+/// reopening for append.
+///
+/// # Errors
+/// Returns `io::Error` on read or truncate failure.
+pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+
+    if !read_header(&mut reader)? {
+        return Ok(entries);
+    }
+
     let mut last_valid_offset = reader.stream_position()?;
     loop {
         let offset = reader.stream_position()?;
