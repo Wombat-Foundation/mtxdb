@@ -12,43 +12,42 @@ _help:
 
 
 .PHONY: format
-format: check-cargo-sort ##H Format code
+format: ##H Format code
 	prettier -w $$(git ls-files '*.md' '*.y*ml')
 	pre-commit run --all-files
-	$(CARGO) fmt
 	$(CARGO) sort --workspace --grouped
 
-.PHONY: check-cargo-sort
-check-cargo-sort:
-	@command -v cargo-sort >/dev/null || { echo "cargo-sort is required; install it with: cargo install cargo-sort" >&2; exit 1; }
-
-
-
 .PHONY: check
-check: ##H Type-check without building
+check: ##H Cargo check (core) and code dupe
 	$(CARGO) check --all-targets
+	@command -v jscpd >/dev/null || { echo "jscpd is required; install it with: npm install -g jscpd" >&2; exit 1; }
+	jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
-lint: ##H Run clippy lints
-	$(CARGO) clippy --all-targets -- $(if $(CI),-D warnings)
+lint: ##H Run clippy lints (only core, not full workspace)
+	$(CARGO) clippy --all-targets --all-features -- $(if $(CI),-D warnings)
 
 .PHONY: fix
-fix: ##H Apply auto-fixes with clippy
+fix: ##H Apply auto-fixes with clippy (only core)
 	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets
-
+	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets --manifest-path mtxdb-ffi/Cargo.toml
+	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets --manifest-path mtxdb-wasm/Cargo.toml
 
 
 .PHONY: doc
 doc: ##H Build docs
-	$(CARGO) test --doc
-	$(CARGO) doc --no-deps
-	echo '<meta http-equiv="refresh" content="0;url=mtx_slipstream/index.html">' > target/doc/index.html
+	$(CARGO) test --workspace --doc
+	$(CARGO) doc --workspace --no-deps
+	echo '<meta http-equiv="refresh" content="0;url=mtxdb/index.html">' > target/doc/index.html
 
 
 
 .PHONY: test
-test: ##H Run tests
+test: ##H Run tests (only core)
 	$(CARGO) test --lib --tests --timings
+
+# Drop the Regions/Branches columns from the per-file terminal summary.
+LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 
 .PHONY: cov
 cov: ##H Run code coverage and generate HTML report
@@ -56,6 +55,11 @@ cov: ##H Run code coverage and generate HTML report
 	# Run coverage
 	$(CARGO) llvm-cov --lib --tests \
 		--html --output-dir .coverage \
+		--ignore-filename-regex 'src/bin/.*|scripts/.*'
+	# Print per-file summary to the terminal (functions/lines only)
+	@echo ''
+	@echo '══════════════ COVERAGE SUMMARY ══════════════'
+	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Process report to codecov-compatible JSON
 	$(CARGO) llvm-cov report \
@@ -65,17 +69,29 @@ cov: ##H Run code coverage and generate HTML report
 	@echo firefox .coverage/html/index.html
 
 
-
 .PHONY: build
-build: ##H Build the lib/binary
-	cargo build --release --timings
-
+build: ##H Build all
+	$(CARGO) build --release --timings
+	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
+	RUSTFLAGS= $(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 
 
 .PHONY: bench
-bench: ##H Run benchmarks (p=<bench-name>, default: all)
-	$(CARGO) +nightly bench $(if $(p),--bench $(p) $(if $(filter serde_cmp,$(p)),--features serde-comparison))
+bench: ##H Run benchmarks
+	$(CARGO) bench --benches
+
+PROJECT_CRATES ?= mtxdb-cli/  mtxdb-core/ mtxdb-ffi/  mtxdb-wasm/
+
+.PHONY: sub
+sub:	##H Run a command for each create, c
+	test -n "${c}"
+	for d in $(PROJECT_CRATES); do cd $$d && ${c}; cd ..; done
+
 
 .PHONY: clean
 clean: ##H Clean build artifacts
 	$(CARGO) clean
+	cd mtxdb-cli && $(CARGO) clean
+	cd mtxdb-ffi && $(CARGO) clean
+	cd mtxdb-wasm && $(CARGO) clean
+	rm -rf .coverage/ lcov.info

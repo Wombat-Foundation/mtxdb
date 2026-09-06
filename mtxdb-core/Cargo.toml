@@ -1,0 +1,22 @@
+
+[package]
+name = "mtxdb-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+repository = "https://github.com/Wombat-Foundation/mtxdb"
+description = "mtxdb: core components and methods"
+license = "MIT OR Apache-2.0"
+authors = ["Shane Jaroch <chown_tee@proton.me>"]
+keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
+categories = ["database-implementations", "storage"]
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+bytes = "1.5"
+crc32fast = "1.4"
+memmap2 = "0.8"
+parking_lot = "0.12"

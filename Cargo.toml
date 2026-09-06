@@ -1,0 +1,93 @@
+[package]
+name = "mtxdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+repository = "https://github.com/Wombat-Foundation/mtxdb"
+description = "mtxdb: highly efficient, novel embedded database."
+license = "MIT OR Apache-2.0"
+authors = ["Shane Jaroch <chown_tee@proton.me>"]
+readme = "README.md"
+keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
+categories = ["database-implementations", "storage"]
+publish = false
+
+[workspace]
+# exclude = ["mtxdb-ffi", "mtxdb-wasm"]
+
+[lib]
+path = "mtxdb-core/lib.rs"
+
+[dependencies]
+bytes = "1.5"
+crc32fast = "1.4"
+memmap2 = "0.8"
+parking_lot = "0.12"
+
+[dev-dependencies]
+
+[[bench]]
+name = "storage"
+path = "benches/storage.rs"
+harness = false
+
+# LINTS
+
+[lints.rust]
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(coverage)",
+    "cfg(coverage_nightly)",
+    "cfg(tarpaulin)",
+] }
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Security / robustness concerns
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+get_unwrap = "warn"
+# Quality & correctness restrictions
+mutex_atomic = "warn"
+missing_assert_message = "warn"
+str_to_string = "warn"
+tests_outside_test_module = "warn"
+verbose_file_reads = "warn"
+
+# BUILD PROFILES
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+
+[profile.release-max-perf]
+inherits = "release"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256
+
+[profile.test]
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256
