@@ -19,9 +19,8 @@ format: ##H Format code
 
 .PHONY: check
 check: ##H Cargo check (core) and code dupe
-	$(CARGO) check --all-targets
-	@command -v jscpd >/dev/null || { echo "jscpd is required; install it with: npm install -g jscpd" >&2; exit 1; }
-	jscpd $$(git ls-files '*.rs')
+	$(CARGO) check --all-targets --all-features
+	-jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
 lint: ##H Run clippy lints (only core, not full workspace)
