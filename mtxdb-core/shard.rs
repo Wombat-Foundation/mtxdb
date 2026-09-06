@@ -477,4 +477,45 @@ mod tests {
         assert_eq!(entries[2].0[0], 0x01);
         assert_eq!(entries[2].1[0], 0x11);
     }
+
+    /// A retired shard's file must survive as long as any `Arc<Shard>`
+    /// reference is held (e.g. via `PackfileStorage::pin_shards`, so a
+    /// repack reading stale offsets from it can't be undercut), and must
+    /// be deleted once the last reference actually drops. This is the
+    /// invariant `pin_shards` relies on to fix the shard-rotation race:
+    /// pinning a shard for a repack's duration keeps this `Drop` from
+    /// firing early, regardless of what else happens to the pool's own
+    /// slot for that shard in the meantime.
+    #[test]
+    fn test_drop_deletes_retired_shard_only_after_last_reference() {
+        let dir = test_dir("drop_retire");
+        let pool = ShardPool::open(dir).unwrap();
+
+        let record = test_record(0x01, 0xAA, b"payload");
+        let (shard_id, _offset) = pool.put_record(&record).unwrap();
+
+        let pinned = pool.get_shard(shard_id).unwrap();
+        let path = pinned.path.clone();
+        assert!(path.exists());
+
+        // Simulate a future repack-driven retirement (nothing currently
+        // does this — see rotate()'s doc — but pin_shards must protect
+        // against it regardless of how it eventually gets triggered), then
+        // drop the pool's own reference the way replacing a recycled slot
+        // would.
+        pinned.is_current.store(false, Ordering::Release);
+        drop(pool);
+
+        // The pinned clone is still held, so the file must survive.
+        assert!(
+            path.exists(),
+            "file deleted while a pinned Arc<Shard> was still held"
+        );
+
+        drop(pinned);
+        assert!(
+            !path.exists(),
+            "retired shard's file should be deleted once its last reference drops"
+        );
+    }
 }

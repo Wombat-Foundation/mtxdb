@@ -221,15 +221,17 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Re
         eprintln!("warning: --topo without --root means no GC; all records preserved");
     }
 
-    if topo {
-        let (kept, dropped) = store.repack_room_reachable(&room_id, extract_matrix_edges)?;
-        let hex = hex_encode(&room_id);
-        eprintln!("repacked {hex} (topo reachable): {kept} kept, {dropped} dropped");
+    // repack_room_reachable is the engine's one repack entry point (see
+    // mtxdb-core). --topo controls whether real prev_events-derived edges
+    // are used for ordering; without it, every record is treated as its
+    // own root (dedup only, no dependency ordering).
+    let hex = hex_encode(&room_id);
+    let (kept, dropped) = if topo {
+        store.repack_room_reachable(&room_id, extract_matrix_edges)?
     } else {
-        store.repack_room_rewrite(&room_id)?;
-        let hex = hex_encode(&room_id);
-        eprintln!("repacked {hex} (flat rewrite)");
-    }
+        store.repack_room_reachable(&room_id, |_hash, _data| Vec::new())?
+    };
+    eprintln!("repacked {hex}: {kept} kept, {dropped} dropped");
 
     Ok(())
 }

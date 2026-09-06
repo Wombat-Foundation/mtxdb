@@ -235,8 +235,8 @@ impl PackfileStorage {
     ///
     /// Repacking is entirely caller-driven — nothing in this engine polls
     /// this on its own. A background GC worker is expected to call this
-    /// periodically and issue `repack_room_rewrite`/`repack_room_topo`
-    /// itself; nothing in `mtxdb-core` currently does so.
+    /// periodically and issue `repack_room_reachable` itself; nothing in
+    /// `mtxdb-core` currently does so.
     #[must_use]
     pub fn needs_repack(&self, room_id: &[u8; 16]) -> bool {
         let count = self
@@ -327,18 +327,40 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Copy a record from an old shard to the active shard.
-    /// Returns the new (, offset) or None if the old shard is gone.
+    /// Pin one `Arc<Shard>` per distinct shard id, keeping each shard's file
+    /// handle (and thus its `Drop`-triggered deletion, see `Shard::drop`)
+    /// alive for as long as the returned map is held — even if a later
+    /// write in the same operation triggers `ShardPool::rotate` and retires
+    /// that shard id's pool slot.
+    ///
+    /// This matters specifically for a scan-then-rewrite repack: without
+    /// it, re-querying `ShardPool::get_shard` on every loop iteration can
+    /// observe a shard that a *rotation triggered by the same repack's own
+    /// writes* just retired-and-recreated at the same path, turning a
+    /// stale-but-valid offset into a read into unrelated, freshly-written
+    /// bytes.
+    fn pin_shards(&self, shard_ids: impl Iterator<Item = u8>) -> HashMap<u8, Arc<Shard>> {
+        let unique: HashSet<u8> = shard_ids.collect();
+        unique
+            .into_iter()
+            .filter_map(|id| self.shards.get_shard(id).map(|shard| (id, shard)))
+            .collect()
+    }
+
+    /// Copy a record from an old (pinned) shard to the active shard.
+    /// Returns the new `(hash, shard_id, offset)` or None if `old_shard_id`
+    /// isn't in `pinned`.
     fn copy_record_to_shard(
         &self,
         room_id: &[u8; 16],
+        pinned: &HashMap<u8, Arc<Shard>>,
         old_shard_id: u8,
         old_offset: u64,
     ) -> Result<Option<([u8; 16], u8, u64)>, StorageError> {
-        let Some(old_shard) = self.shards.get_shard(old_shard_id) else {
+        let Some(old_shard) = pinned.get(&old_shard_id) else {
             return Ok(None);
         };
-        let record = Self::read_at(&old_shard, old_offset)?;
+        let record = Self::read_at(old_shard, old_offset)?;
         let (new_shard_id, new_offset) = self.shards.put_record(&Record {
             room_id: *room_id,
             hash: record.hash,
@@ -456,105 +478,23 @@ impl PackfileStorage {
         Ok(None)
     }
 
-    /// Rewrite every record for a room by scanning all shards.
-    /// Full compaction: every record is copied to the active shard.
-    /// This does NOT perform GC (orphaned nodes are preserved).
-    ///
-    /// # Errors
-    /// Returns `StorageError` on I/O or corruption.
-    pub fn repack_room_rewrite(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
-        let room_arc = self.put_mutex(room_id);
-        let _room_guard = room_arc.lock();
-
-        let scanned = self.scan_room_records(room_id);
-
-        let mut new_offsets: Vec<([u8; 16], u8, u64)> = Vec::new();
-        for (old_shard_id, entries) in &scanned {
-            for (_hash, offset) in entries {
-                if let Some(entry) = self.copy_record_to_shard(room_id, *old_shard_id, *offset)? {
-                    new_offsets.push(entry);
-                }
-            }
-        }
-
-        let index = Self::build_index(&new_offsets);
-        self.swap_generation(room_id, index);
-
-        Ok(())
-    }
-
-    /// Rewrite every record for a room in topological order.
-    ///
-    /// `extract_edges` receives a record's hash and raw bytes, and returns the
-    /// hashes of this record's outgoing-edge targets (e.g. `prev_events`). The
-    /// storage engine stays content-agnostic; the caller owns parsing.
-    ///
-    /// If `extract_edges` returns no edges for any record, that record
-    /// is treated as a root (zero in-degree) in the topological sort.
-    ///
-    /// # Errors
-    /// Returns `StorageError` on I/O or corruption.
-    ///
-    /// # Panics
-    /// Panics if any hash in the CSR exceeds `u32::MAX` local ID space.
-    pub fn repack_room_topo(
-        &self,
-        room_id: &[u8; 16],
-        extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
-    ) -> Result<(), StorageError> {
-        let room_arc = self.put_mutex(room_id);
-        let _room_guard = room_arc.lock();
-
-        let scanned = self.scan_room_records(room_id);
-
-        let mut all_hashes: Vec<[u8; 16]> = Vec::new();
-        let mut hash_to_shard_offset: HashMap<[u8; 16], (u8, u64)> = HashMap::new();
-        for (shard_id, entries) in &scanned {
-            for (hash, offset) in entries {
-                all_hashes.push(*hash);
-                hash_to_shard_offset.insert(*hash, (*shard_id, *offset));
-            }
-        }
-
-        let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
-        for (shard_id, entries) in &scanned {
-            for (hash, offset) in entries {
-                if let Some(old_shard) = self.shards.get_shard(*shard_id) {
-                    let record = Self::read_at(&old_shard, *offset)?;
-                    adjacency.insert(*hash, extract_edges(hash, &record.data));
-                }
-            }
-        }
-
-        let csr = Csr::build_from_edges(&all_hashes, &adjacency);
-        let topo = csr.topo_order();
-
-        let mut new_offsets: Vec<([u8; 16], u8, u64)> = Vec::with_capacity(topo.len());
-        for &local in &topo {
-            let hash = csr
-                .hash_of(local)
-                .expect("topo order contains valid local IDs");
-            let (old_shard_id, old_offset) = hash_to_shard_offset
-                .get(hash)
-                .expect("all hashes in CSR exist in shard map");
-            if let Some(entry) = self.copy_record_to_shard(room_id, *old_shard_id, *old_offset)? {
-                new_offsets.push(entry);
-            }
-        }
-
-        let index = Self::build_index(&new_offsets);
-        self.swap_generation(room_id, index);
-
-        Ok(())
-    }
+    // repack_room_rewrite and repack_room_topo were retired: both scanned
+    // for records without deduplicating physical duplicates (each prior
+    // repack's rewritten copies included), giving an exponential blowup on
+    // repeated calls against a growing room, and both re-fetched
+    // Arc<Shard> per loop iteration rather than pinning shards for the
+    // call's duration — vulnerable to the rotation race documented on
+    // `pin_shards`. `repack_room_reachable`'s no-live-roots fallback
+    // subsumes both: same topological ordering, correct dedup via
+    // `hash_to_shard_offset`, and pinned shards throughout.
 
     /// BFS outward from `roots` over `extract_edges`, reading only records
     /// actually reached. Returns the sorted, deduplicated live hash set and
     /// the adjacency discovered along the way.
     fn bfs_live_set(
-        &self,
         roots: &[[u8; 16]],
         hash_to_shard_offset: &HashMap<[u8; 16], (u8, u64)>,
+        pinned: &HashMap<u8, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<AdjacencyResult, StorageError> {
         let mut visited: HashSet<[u8; 16]> = HashSet::new();
@@ -571,10 +511,10 @@ impl PackfileStorage {
             let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
                 continue;
             };
-            let Some(old_shard) = self.shards.get_shard(shard_id) else {
+            let Some(old_shard) = pinned.get(&shard_id) else {
                 continue;
             };
-            let record = Self::read_at(&old_shard, offset)?;
+            let record = Self::read_at(old_shard, offset)?;
             let edges = extract_edges(&hash, &record.data);
             for edge in &edges {
                 if hash_to_shard_offset.contains_key(edge) && visited.insert(*edge) {
@@ -593,9 +533,9 @@ impl PackfileStorage {
     /// Used when a room has no configured live roots, so nothing is known
     /// to be garbage.
     fn scan_full_adjacency(
-        &self,
         scanned: &[ScannedShard],
         hash_to_shard_offset: &HashMap<[u8; 16], (u8, u64)>,
+        pinned: &HashMap<u8, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<AdjacencyResult, StorageError> {
         let mut all_hashes: Vec<[u8; 16]> = hash_to_shard_offset.keys().copied().collect();
@@ -603,8 +543,8 @@ impl PackfileStorage {
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
         for (shard_id, entries) in scanned {
             for (hash, offset) in entries {
-                if let Some(old_shard) = self.shards.get_shard(*shard_id) {
-                    let record = Self::read_at(&old_shard, *offset)?;
+                if let Some(old_shard) = pinned.get(shard_id) {
+                    let record = Self::read_at(old_shard, *offset)?;
                     let edges = extract_edges(hash, &record.data);
                     adjacency.insert(*hash, edges);
                 }
@@ -613,23 +553,26 @@ impl PackfileStorage {
         Ok((all_hashes, adjacency))
     }
 
-    /// Rewrite only the nodes reachable from a room's live roots, in
-    /// topological order — this is the one repack path that actually
-    /// performs garbage collection.
+    /// Rewrite a room's records in topological order, optionally performing
+    /// garbage collection — this is the engine's one repack entry point.
     ///
-    /// Unlike [`Self::repack_room_rewrite`] and [`Self::repack_room_topo`],
-    /// which preserve every record ever written for the room (including
-    /// orphaned/unreachable ones — see their docs), this traverses outward
-    /// from the room's configured live roots (see [`Self::set_live_roots`])
-    /// via `extract_edges`, and drops anything not reached. Only reachable
-    /// records are read from disk during the traversal — unreachable data
-    /// is never even fetched, not just excluded from the output.
+    /// If live roots are configured for this room (see
+    /// [`Self::set_live_roots`]), traverses outward from them via
+    /// `extract_edges` and drops anything not reached: only reachable
+    /// records are read from disk during the traversal, so unreachable
+    /// data is never even fetched, not just excluded from the output.
     ///
-    /// If no live roots are configured for this room (`set_live_roots` was
-    /// never called, or was called with an empty list), nothing is known to
-    /// be garbage, so this falls back to preserving every scanned record —
-    /// same as `repack_room_topo` — rather than risk deleting live data on
-    /// the assumption that "no roots" means "nothing is live".
+    /// If no live roots are configured (`set_live_roots` was never called,
+    /// or was called with an empty list), nothing is known to be garbage,
+    /// so every scanned record is preserved, still deduplicated and
+    /// rewritten in topological order — rather than risk deleting live
+    /// data on the assumption that "no roots" means "nothing is live".
+    ///
+    /// All shards this call will read from are pinned (held via an
+    /// `Arc<Shard>` for the whole call) before any writes happen, so a
+    /// rotation triggered by this call's own writes can never retire a
+    /// shard this
+    /// call still needs to read stale data from.
     ///
     /// Returns `(kept, dropped)`: the number of records written to the new
     /// generation, and the number of scanned records found unreachable and
@@ -659,15 +602,22 @@ impl PackfileStorage {
             }
         }
 
+        // Pin every shard this call could possibly read from before any
+        // writes happen — see pin_shards' doc for why this must come
+        // first.
+        let pinned = self.pin_shards(hash_to_shard_offset.values().map(|&(id, _)| id));
+
         let roots = self.live_roots.read().get(room_id).cloned();
 
         let (live_hashes, adjacency) = match roots {
             Some(roots) if !roots.is_empty() => {
-                self.bfs_live_set(&roots, &hash_to_shard_offset, &extract_edges)?
+                Self::bfs_live_set(&roots, &hash_to_shard_offset, &pinned, &extract_edges)?
             }
-            // No live roots configured: we don't know what's garbage,
-            // so preserve everything (same as repack_room_topo).
-            _ => self.scan_full_adjacency(&scanned, &hash_to_shard_offset, &extract_edges)?,
+            // No live roots configured: we don't know what's garbage, so
+            // preserve everything.
+            _ => {
+                Self::scan_full_adjacency(&scanned, &hash_to_shard_offset, &pinned, &extract_edges)?
+            }
         };
 
         let dropped = scanned_count.saturating_sub(live_hashes.len());
@@ -698,34 +648,17 @@ impl PackfileStorage {
             let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            if let Some(entry) = self.copy_record_to_shard(room_id, old_shard_id, old_offset)? {
+            if let Some(entry) =
+                self.copy_record_to_shard(room_id, &pinned, old_shard_id, old_offset)?
+            {
                 new_offsets.push(entry);
             }
         }
 
         let kept = new_offsets.len();
 
-        let mut index = LossyIndex::new(new_offsets.len().saturating_mul(2).max(16));
-        for (hash, shard_id, offset) in &new_offsets {
-            let _ = index.insert(hash, *shard_id, *offset);
-        }
-
-        let cache = self.generation(room_id).map_or_else(
-            || Arc::new(NodeCache::new(self.cache_capacity)),
-            |gen| gen.cache.clone(),
-        );
-        let new_gen = Arc::new(RoomGeneration { index, cache });
-
-        self.rooms
-            .write()
-            .entry(*room_id)
-            .or_insert_with(|| {
-                ArcSwap::from_pointee(RoomGeneration {
-                    index: LossyIndex::new(0),
-                    cache: Arc::new(NodeCache::new(self.cache_capacity)),
-                })
-            })
-            .store(new_gen);
+        let index = Self::build_index(&new_offsets);
+        self.swap_generation(room_id, index);
 
         Ok((kept, dropped))
     }
@@ -1316,35 +1249,6 @@ mod tests {
     }
 
     #[test]
-    fn test_repack_room_rewrite_preserves_all_records() {
-        let dir = test_dir("repack_rewrite");
-        let store = PackfileStorage::open(dir.clone()).unwrap();
-
-        let root = [0xAAu8; 16];
-        let child1 = [0x01u8; 16];
-        let child2 = [0x02u8; 16];
-        let child3 = [0x03u8; 16];
-
-        let entries: Vec<(NodeId, NodeData)> = vec![
-            (root, NodeData::new(bytes::Bytes::from_static(b"root"))),
-            (child1, NodeData::new(bytes::Bytes::from_static(b"child1"))),
-            (child2, NodeData::new(bytes::Bytes::from_static(b"child2"))),
-            (child3, NodeData::new(bytes::Bytes::from_static(b"child3"))),
-        ];
-        store.put_many(&TEST_ROOM, &entries).unwrap();
-
-        assert_eq!(store.generation(&TEST_ROOM).unwrap().index.len(), 4);
-
-        store.repack_room_rewrite(&TEST_ROOM).unwrap();
-
-        assert_eq!(store.generation(&TEST_ROOM).unwrap().index.len(), 4);
-        assert!(store.get(&TEST_ROOM, &root).unwrap().is_some());
-        assert!(store.get(&TEST_ROOM, &child1).unwrap().is_some());
-        assert!(store.get(&TEST_ROOM, &child2).unwrap().is_some());
-        assert!(store.get(&TEST_ROOM, &child3).unwrap().is_some());
-    }
-
-    #[test]
     fn test_delete_room_preserves_other_room_cache() {
         let dir = test_dir("delete_room_cache");
         let store = PackfileStorage::open(dir.clone()).unwrap();
@@ -1377,52 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_put_repack_no_lost_writes() {
-        use std::thread;
-
-        let dir = test_dir("concurrent_put_repack");
-        let store = PackfileStorage::open(dir).unwrap();
-
-        let room = [0x55u8; 16];
-        let written_count = std::sync::atomic::AtomicU32::new(0);
-
-        thread::scope(|scope| {
-            let writer = scope.spawn(|| {
-                for i in 0..200u32 {
-                    let mut id = [0u8; 16];
-                    id[0..4].copy_from_slice(&i.to_le_bytes());
-                    let data = NodeData::new(bytes::Bytes::from(format!("entry {i}")));
-                    store.put(&room, &id, &data).unwrap();
-                    written_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
-
-            let repacker = scope.spawn(|| {
-                for _ in 0..5 {
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                    let _ = store.repack_room_rewrite(&room);
-                }
-            });
-
-            writer.join().unwrap();
-            repacker.join().unwrap();
-        });
-
-        let total = written_count.load(std::sync::atomic::Ordering::Relaxed);
-        let mut found = 0u32;
-        for i in 0..total {
-            let mut id = [0u8; 16];
-            id[0..4].copy_from_slice(&i.to_le_bytes());
-            if store.get(&room, &id).unwrap().is_some() {
-                found += 1;
-            }
-        }
-
-        assert_eq!(found, total, "lost writes during concurrent put+repack");
-    }
-
-    #[test]
-    fn test_repack_room_topo_preserves_all_records() {
+    fn test_repack_room_reachable_no_roots_preserves_diamond_dag_in_topo_order() {
         let dir = test_dir("repack_topo");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -1470,10 +1329,14 @@ mod tests {
             (id_d, vec![id_b, id_c]),
         ]);
 
-        let result = store.repack_room_topo(&TEST_ROOM, |hash, _data| {
+        // No live roots configured for TEST_ROOM: preserves everything,
+        // still deduplicated and topologically ordered.
+        let result = store.repack_room_reachable(&TEST_ROOM, |hash, _data| {
             edges.get(hash).cloned().unwrap_or_default()
         });
-        result.unwrap();
+        let (kept, dropped) = result.unwrap();
+        assert_eq!(kept, 4);
+        assert_eq!(dropped, 0);
 
         for (id, expected) in [
             (id_a, b"A".as_slice()),
@@ -1585,6 +1448,43 @@ mod tests {
         assert_eq!(dropped, 0);
         assert!(store.get(&TEST_ROOM, &id_a).unwrap().is_some());
         assert!(store.get(&TEST_ROOM, &id_b).unwrap().is_some());
+    }
+
+    /// `pin_shards` must return a distinct `Arc<Shard>` per unique id, and
+    /// the returned handle must still resolve real, previously-written
+    /// data — i.e. it's the live pool's own shard, not a stand-in.
+    /// The deeper guarantee (pinning survives a shard being retired and
+    /// its slot recycled) is `Shard::drop`'s contract, tested directly in
+    /// `shard.rs` where `is_current` and the pool's internals are
+    /// accessible without going through `ShardPool::rotate`, which no
+    /// longer has any path to actually recycle a slot (see its doc).
+    #[test]
+    fn test_pin_shards_returns_readable_deduped_handles() {
+        let dir = test_dir("pin_shards_basic");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let id = [0x77u8; 16];
+        store
+            .put(
+                &TEST_ROOM,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"pin me")),
+            )
+            .unwrap();
+        let (shard_id, offset) = store
+            .generation(&TEST_ROOM)
+            .unwrap()
+            .index
+            .lookup(&id)
+            .expect("just-written record must be indexed");
+
+        // Duplicate ids in the input must collapse to one pinned entry.
+        let pinned = store.pin_shards([shard_id, shard_id, shard_id].into_iter());
+        assert_eq!(pinned.len(), 1);
+
+        let record = PackfileStorage::read_at(&pinned[&shard_id], offset)
+            .expect("pinned shard must resolve the real on-disk record");
+        assert_eq!(record.data.as_ref(), b"pin me");
     }
 
     #[test]
