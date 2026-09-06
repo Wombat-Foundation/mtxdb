@@ -425,7 +425,30 @@ mod tests {
         assert!(pinned.pin(id, data.clone()));
         assert!(!pinned.pin(id, test_data("other")));
         assert_eq!(pinned.len(), 1);
+        assert!(pinned.is_pinned(&id));
+        assert!(!pinned.is_pinned(&[0x02; 16]));
         assert_eq!(pinned.get(&id).unwrap().bytes, data.bytes);
+    }
+
+    #[test]
+    fn test_pinned_default_is_empty_clear() {
+        let pinned = PinnedNodes::default();
+        assert!(pinned.is_empty());
+        let id = [0x03u8; 16];
+        pinned.pin(id, test_data("x"));
+        assert!(!pinned.is_empty());
+        pinned.clear();
+        assert!(pinned.is_empty());
+    }
+
+    #[test]
+    fn test_cache_len() {
+        let cache = NodeCache::new(100);
+        assert_eq!(cache.len(), 0);
+        cache.insert([0x01; 16], test_data("a"));
+        assert_eq!(cache.len(), 1);
+        cache.insert([0x02; 16], test_data("b"));
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]

@@ -1529,13 +1529,14 @@ mod tests {
         let dir = test_dir("rebuild_index_full");
         let store = PackfileStorage::open(dir).unwrap();
 
-        // Fill the index beyond 75% capacity (4096 slot table, threshold 3072)
-        // by writing 3073 distinct records. Each record is small enough to
-        // stay within pack limits, and each has a unique hash.
+        // Fill the index beyond 75% capacity (4096 slot table, threshold 3072).
+        // Each hash must have a unique 24-bit tag (bytes 8..12) so insert()
+        // allocates a new slot instead of overwriting via tag collision.
         let threshold = 3073u32;
         for i in 0..threshold {
             let mut id = [0u8; 16];
             id[0..4].copy_from_slice(&i.to_le_bytes());
+            id[8..12].copy_from_slice(&(i + 1).to_le_bytes());
             store
                 .put(
                     &TEST_ROOM,
@@ -1548,6 +1549,7 @@ mod tests {
         // This next put should trigger the index_full rebuild path
         let mut extra = [0u8; 16];
         extra[0..4].copy_from_slice(&threshold.to_le_bytes());
+        extra[8..12].copy_from_slice(&(threshold + 1).to_le_bytes());
         store
             .put(
                 &TEST_ROOM,
@@ -1637,5 +1639,56 @@ mod tests {
             }
             NodeRef::Lazy(_) => panic!("Expected child to be Resolved from pinned"),
         }
+    }
+
+    #[test]
+    fn test_scan_existing_skips_malformed_filenames() {
+        let dir = test_dir("scan_existing_junk");
+        // Create various malformed .pack files that scan_existing must skip.
+        // Line 181: no underscore separator
+        std::fs::write(dir.join("nounderscore.pack"), b"").unwrap();
+        // Line 184: hex part not 32 chars
+        std::fs::write(dir.join("aabb_00.pack"), b"").unwrap();
+        // Line 192-193: invalid hex bytes in room id
+        std::fs::write(dir.join("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_00.pack"), b"").unwrap();
+        // Line 205: invalid hex in pack_id
+        std::fs::write(dir.join("00000000000000000000000000000000_gg.pack"), b"").unwrap();
+        // Line 178: non-UTF-8 filename stem (Linux filenames are raw bytes)
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let path = dir.join(OsStr::from_bytes(b"\xff\xfe.pack"));
+            std::fs::write(path, b"").unwrap();
+        }
+
+        // A valid pack file so scan_existing actually does real work too
+        let valid_path = dir.join("00000000000000000000000000000001_00.pack");
+        let mut buf = Vec::new();
+        packfile::write_header(&mut buf).unwrap();
+        packfile::write_record(
+            &mut buf,
+            &packfile::Record {
+                hash: [0xAA; 16],
+                data: bytes::Bytes::from_static(b"hello"),
+            },
+        )
+        .unwrap();
+        std::fs::write(&valid_path, &buf).unwrap();
+
+        // Should open without panicking — all junk files are skipped
+        let store = PackfileStorage::open(dir).unwrap();
+        let room_id = {
+            let mut id = [0u8; 16];
+            id[15] = 1;
+            id
+        };
+        assert_eq!(
+            store
+                .indexes
+                .read()
+                .get(&room_id)
+                .map_or(0, crate::index::LossyIndex::len),
+            1
+        );
     }
 }
