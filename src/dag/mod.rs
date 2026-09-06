@@ -26,44 +26,66 @@ impl GraphEdge {
 
     #[inline]
     #[must_use]
+    /// Returns whether this edge points to an arena-resident node.
     pub fn is_resident(self) -> bool {
         (self.0 & Self::RESIDENT_BIT) != 0
     }
 
+    /// Returns the arena index for a resident edge.
+    ///
+    /// # Panics
+    /// Panics if this is a disk-resident edge.
     #[inline]
     #[must_use]
     pub fn arena_index(self) -> usize {
-        debug_assert!(
+        assert!(
             self.is_resident(),
             "arena_index called on a disk-resident node"
         );
         (self.0 & Self::PAYLOAD_MASK) as usize
     }
 
+    /// Returns the local ID for a disk-resident edge.
+    ///
+    /// # Panics
+    /// Panics if this is an arena-resident edge.
     #[inline]
     #[must_use]
     pub fn local_id(self) -> LocalId {
-        debug_assert!(
+        assert!(
             !self.is_resident(),
             "local_id called on an arena-resident node"
         );
         self.0 & Self::PAYLOAD_MASK
     }
 
+    /// Create a resident edge pointing to an arena index.
+    ///
+    /// # Panics
+    /// Panics if `index` exceeds the 31-bit payload capacity.
     #[inline]
     #[must_use]
     pub fn resident(index: u32) -> Self {
-        debug_assert!(
+        assert!(
             index <= Self::PAYLOAD_MASK,
-            "resident index exceeds payload capacity"
+            "resident index exceeds payload capacity: {index} > {}",
+            Self::PAYLOAD_MASK
         );
         Self(Self::RESIDENT_BIT | (index & Self::PAYLOAD_MASK))
     }
 
+    /// Create a disk-resident edge with a local ID.
+    ///
+    /// # Panics
+    /// Panics if `id` exceeds the 31-bit payload capacity.
     #[inline]
     #[must_use]
     pub fn disk(id: LocalId) -> Self {
-        debug_assert!(id <= Self::PAYLOAD_MASK, "disk id exceeds payload capacity");
+        assert!(
+            id <= Self::PAYLOAD_MASK,
+            "disk id exceeds payload capacity: {id} > {}",
+            Self::PAYLOAD_MASK
+        );
         Self(id & Self::PAYLOAD_MASK)
     }
 }
@@ -188,6 +210,9 @@ impl ActiveRoomFrontier {
     }
 
     /// Get the `prev_edges` for a node by its arena index.
+    ///
+    /// # Panics
+    /// Panics if `node_idx` is out of bounds.
     #[must_use]
     pub fn prev_edges(&self, node_idx: usize) -> &[GraphEdge] {
         let node = &self.nodes[node_idx];
@@ -197,6 +222,9 @@ impl ActiveRoomFrontier {
     }
 
     /// Get the `auth_edges` for a node by its arena index.
+    ///
+    /// # Panics
+    /// Panics if `node_idx` is out of bounds.
     #[must_use]
     pub fn auth_edges(&self, node_idx: usize) -> &[GraphEdge] {
         let node = &self.nodes[node_idx];

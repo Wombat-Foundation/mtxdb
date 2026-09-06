@@ -4,7 +4,10 @@
 ///
 /// - **tag** (high 24 bits): truncated fingerprint for fast rejection.
 /// - **`pack_id`** (next 8 bits): which packfile generation this record lives in.
-/// - **offset** (low 32 bits): byte offset within the packfile.
+/// - **offset** (low 32 bits): byte offset within the packfile, stored as
+///   `offset + 1` so that the all-zeros encoding is reserved as the empty
+///   sentinel. Actual offset 0 is stored as 1, and `offset()` subtracts 1
+///   to recover the real value.
 ///
 /// Empty slots are all-zeros. The tag serves double duty: an empty slot
 /// (tag == 0) terminates a probe sequence, since hashes are uniformly random
@@ -21,16 +24,23 @@ impl IndexSlot {
 
     /// Create a new slot from its components.
     ///
+    /// The offset is stored as `offset + 1` so that the all-zeros `u64`
+    /// encoding is reserved as the empty sentinel. Actual offset 0 is
+    /// stored as 1 in the slot.
+    ///
     /// # Panics
-    /// Panics if `tag` exceeds 24 bits or `offset` exceeds 32 bits.
+    /// Panics if `tag` exceeds 24 bits or `offset` exceeds `u32::MAX - 1`.
     #[must_use]
     pub fn new(tag: u32, pack_id: u8, offset: u64) -> Self {
         assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
-        assert!(offset <= 0xFFFF_FFFF, "offset must fit in 32 bits");
+        assert!(
+            offset <= u64::from(u32::MAX - 1),
+            "offset must fit in 32 bits minus 1 (reserved for empty sentinel)"
+        );
         Self(
             (u64::from(tag) << Self::TAG_SHIFT)
                 | (u64::from(pack_id) << Self::PACK_SHIFT)
-                | (offset & Self::OFFSET_MASK),
+                | ((offset.wrapping_add(1)) & Self::OFFSET_MASK),
         )
     }
 
@@ -56,7 +66,7 @@ impl IndexSlot {
 
     #[must_use]
     pub fn offset(self) -> u64 {
-        self.0 & Self::OFFSET_MASK
+        (self.0 & Self::OFFSET_MASK).wrapping_sub(1)
     }
 }
 
@@ -131,19 +141,20 @@ impl LossyIndex {
     /// Insert a (hash → `pack_id`, offset) mapping.
     ///
     /// # Errors
-    /// Returns `InsertError::TableFull` if the table has less than 25% free slots.
+    /// Returns `InsertError::TableFull` if the table has less than 25% free slots
+    /// and the hash is not already present (overwrites are always allowed).
     pub fn insert(&mut self, hash: &[u8; 16], pack_id: u8, offset: u64) -> Result<(), InsertError> {
-        let threshold = self.capacity.wrapping_mul(3) / 4;
-        if self.len >= threshold {
-            return Err(InsertError::TableFull);
-        }
-
         let tag = Self::tag(hash);
         let mut bucket = self.bucket(hash);
 
         loop {
             let slot = self.slots[bucket];
             if slot.is_empty() {
+                // Only reject when actually inserting into a new slot
+                let threshold = self.capacity.wrapping_mul(3) / 4;
+                if self.len >= threshold {
+                    return Err(InsertError::TableFull);
+                }
                 self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
                 self.len = self.len.wrapping_add(1);
                 return Ok(());
@@ -227,7 +238,9 @@ impl LossyIndex {
     /// Deserialize an index from bytes.
     ///
     /// # Errors
-    /// Returns `DeserializationError::TooShort` if the data is too short.
+    /// Returns `DeserializationError::TooShort` if the data is too short,
+    /// or `DeserializationError::InvalidCapacity` if the capacity is not
+    /// a power of two or is less than 16.
     ///
     /// # Panics
     /// Panics if the 8-byte capacity header cannot be read (guaranteed by the length check).
@@ -238,6 +251,12 @@ impl LossyIndex {
         let capacity_wire = u64::from_le_bytes(data[..8].try_into().unwrap());
         let capacity = u32::try_from(capacity_wire).map_err(|_| DeserializationError::TooShort)?;
         let capacity_usize = capacity as usize;
+
+        // Reject unsupported capacities: must be power of two and >= 16
+        if capacity < 16 || !capacity.is_power_of_two() {
+            return Err(DeserializationError::InvalidCapacity);
+        }
+
         let expected_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(8));
         if data.len() < expected_len {
             return Err(DeserializationError::TooShort);
@@ -285,12 +304,16 @@ impl std::error::Error for InsertError {}
 #[derive(Debug)]
 pub enum DeserializationError {
     TooShort,
+    InvalidCapacity,
 }
 
 impl std::fmt::Display for DeserializationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooShort => write!(f, "data too short"),
+            Self::InvalidCapacity => {
+                write!(f, "capacity must be a power of two and >= 16")
+            }
         }
     }
 }

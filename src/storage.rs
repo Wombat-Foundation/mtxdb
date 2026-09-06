@@ -159,17 +159,17 @@ impl From<std::io::Error> for StorageError {
 
 /// In-memory storage engine for tests.
 ///
-/// Does not partition by room; all rooms share a single `HashMap`.
-/// Accepts `room_id` parameters for trait conformance but ignores them.
+/// Partitions nodes by room. Each room's nodes are tracked in a
+/// per-room `HashMap`, enabling correct `delete_room` behavior.
 pub struct InMemoryStorage {
-    nodes: RwLock<HashMap<NodeId, NodeData>>,
+    rooms: RwLock<HashMap<[u8; 16], HashMap<NodeId, NodeData>>>,
 }
 
 impl InMemoryStorage {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            nodes: RwLock::new(HashMap::new()),
+            rooms: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -181,38 +181,48 @@ impl Default for InMemoryStorage {
 }
 
 impl StorageEngine for InMemoryStorage {
-    fn get(&self, _room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        Ok(self.nodes.read().get(id).cloned())
+    fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        let rooms = self.rooms.read();
+        Ok(rooms.get(room_id).and_then(|r| r.get(id).cloned()))
     }
 
     fn get_many(
         &self,
-        _room_id: &[u8; 16],
+        room_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        let map = self.nodes.read();
-        Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
+        let rooms = self.rooms.read();
+        let room = rooms.get(room_id);
+        Ok(ids
+            .iter()
+            .map(|id| room.and_then(|r| r.get(id).cloned()))
+            .collect())
     }
 
-    fn put(&self, _room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
-        self.nodes.write().insert(*id, data.clone());
+    fn put(&self, room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
+        self.rooms
+            .write()
+            .entry(*room_id)
+            .or_default()
+            .insert(*id, data.clone());
         Ok(())
     }
 
     fn put_many(
         &self,
-        _room_id: &[u8; 16],
+        room_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<(), StorageError> {
-        let mut map = self.nodes.write();
+        let mut rooms = self.rooms.write();
+        let room = rooms.entry(*room_id).or_default();
         for (id, data) in entries {
-            map.insert(*id, data.clone());
+            room.insert(*id, data.clone());
         }
         Ok(())
     }
 
-    fn delete_room(&self, _room_id: &[u8; 16]) -> Result<(), StorageError> {
-        // In-memory storage doesn't track rooms; no-op.
+    fn delete_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
+        self.rooms.write().remove(room_id);
         Ok(())
     }
 

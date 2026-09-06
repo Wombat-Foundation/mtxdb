@@ -33,12 +33,13 @@ impl FrontierBatch {
     }
 }
 
-/// Concurrently fetch all nodes in a frontier batch.
+/// Batch-fetch all nodes in a frontier batch.
 ///
-/// This is the key optimization for HDD: issue all reads simultaneously
-/// so the kernel's I/O scheduler (mq-deadline) can sort them into
-/// a head sweep. On `NVMe` this is purely parallel; on HDD it reduces
-/// N full seeks to one sweep across N sorted positions.
+/// Currently performs sequential reads via `get_many`. The `FrontierBatch`
+/// data structure is designed for future concurrent I/O (pre-resolved
+/// offsets enable `io_uring` or thread-pool dispatch), but this
+/// implementation issues reads in sorted-offset order for sequential
+/// disk access rather than true concurrency.
 ///
 /// # Arguments
 /// * `engine` - The storage engine to read from.
@@ -50,7 +51,7 @@ impl FrontierBatch {
 ///
 /// # Errors
 /// Returns `StorageError::Io` on I/O failure from the storage engine.
-pub fn fetch_frontier_concurrent<S: StorageEngine>(
+pub fn fetch_frontier_batch<S: StorageEngine>(
     engine: &S,
     room_id: &[u8; 16],
     batch: &FrontierBatch,
@@ -65,6 +66,23 @@ pub fn fetch_frontier_concurrent<S: StorageEngine>(
         .collect())
 }
 
+/// Concurrently fetch all nodes in a frontier batch.
+///
+/// **Note:** This is an alias for [`fetch_frontier_batch`] and currently
+/// performs sequential I/O. A true concurrent implementation (`io_uring`,
+/// thread pool) that issues all reads in parallel is planned but not
+/// yet implemented.
+///
+/// # Errors
+/// Returns `StorageError::Io` on I/O failure from the storage engine.
+pub fn fetch_frontier_concurrent<S: StorageEngine>(
+    engine: &S,
+    room_id: &[u8; 16],
+    batch: &FrontierBatch,
+) -> Result<Vec<(NodeId, Option<NodeData>)>, crate::storage::StorageError> {
+    fetch_frontier_batch(engine, room_id, batch)
+}
+
 /// A BFS layer of the HAMT trie traversal.
 ///
 /// Represents one level of the trie: a set of child hashes at the same
@@ -73,9 +91,9 @@ pub fn fetch_frontier_concurrent<S: StorageEngine>(
 #[derive(Debug)]
 pub struct BfsLayer {
     /// The hashes at this level.
-    pub hashes: Vec<NodeId>,
+    hashes: Vec<NodeId>,
     /// For each hash, which target keys are waiting on it.
-    pub dependents: Vec<Vec<NodeId>>,
+    dependents: Vec<Vec<NodeId>>,
     /// O(1) dedup: maps hash → index into `hashes`.
     seen: HashMap<NodeId, usize>,
 }
@@ -99,6 +117,30 @@ impl BfsLayer {
             self.dependents.push(vec![dependent]);
             self.seen.insert(hash, pos);
         }
+    }
+
+    /// The hashes at this layer.
+    #[must_use]
+    pub fn hashes(&self) -> &[NodeId] {
+        &self.hashes
+    }
+
+    /// For each hash, which target keys are waiting on it.
+    #[must_use]
+    pub fn dependents(&self) -> &[Vec<NodeId>] {
+        &self.dependents
+    }
+
+    /// Number of unique hashes in this layer.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    /// Whether this layer is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
     }
 }
 
@@ -133,9 +175,9 @@ mod tests {
         layer.push(h1, [0xEE; 16]); // same hash, different dependent
         layer.push(h2, target);
 
-        assert_eq!(layer.hashes.len(), 2);
-        assert_eq!(layer.dependents[0].len(), 2); // h1 has 2 dependents
-        assert_eq!(layer.dependents[1].len(), 1); // h2 has 1 dependent
+        assert_eq!(layer.len(), 2);
+        assert_eq!(layer.dependents()[0].len(), 2); // h1 has 2 dependents
+        assert_eq!(layer.dependents()[1].len(), 1); // h2 has 1 dependent
     }
 
     #[test]

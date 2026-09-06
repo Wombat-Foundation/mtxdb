@@ -2,7 +2,7 @@
 name = "mtxdb"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.81"
 repository = "https://github.com/Wombat-Foundation/mtxdb"
 description = "Matrix Database: write-once packfile storage with lossy fanout index for content-addressed immutable data"
 license = "MIT OR Apache-2.0"

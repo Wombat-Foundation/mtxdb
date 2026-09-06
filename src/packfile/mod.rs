@@ -2,6 +2,7 @@ pub mod storage;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use memmap2::Mmap;
@@ -62,6 +63,11 @@ pub struct PackGeneration {
     /// lands — `O_APPEND` places both writes correctly, but the `LossyIndex`
     /// would record the same offset for both, permanently orphaning one.
     pub(crate) append_lock: parking_lot::Mutex<()>,
+    /// Whether this generation is still the active one for its room.
+    /// Set to `false` when `RepackManager::swap_pack` replaces it.
+    /// Drop only deletes the file when this is still `true`, preventing
+    /// a wrapped `pack_id` from unlinking a newer generation's file.
+    pub(crate) is_current: AtomicBool,
 }
 
 impl PackGeneration {
@@ -125,7 +131,14 @@ pub(crate) fn map_pack(file: &File) -> io::Result<Mmap> {
 
 impl Drop for PackGeneration {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Only delete the file if this generation is still the active one.
+        // When a room is repacked, swap_pack marks the old generation as
+        // no longer current — its file must survive until all readers drop
+        // their Arc. If the pack_id has wrapped and this generation is no
+        // longer current, deleting would unlink a newer generation's file.
+        if self.is_current.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -139,6 +152,12 @@ impl Drop for PackGeneration {
 pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<()> {
     let payload_len = u32::try_from(16_usize.wrapping_add(record.data.len()))
         .expect("record payload exceeds u32::MAX");
+    if payload_len > MAX_RECORD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("record payload too large: {payload_len} > {MAX_RECORD_LEN}"),
+        ));
+    }
     writer.write_all(&payload_len.to_le_bytes())?;
     writer.write_all(&record.hash)?;
     writer.write_all(&record.data)?;
@@ -171,7 +190,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     }
 
     let payload_len = u32::from_le_bytes(len_buf);
-    if payload_len == 0 || payload_len > MAX_RECORD_LEN {
+    if !(16..=MAX_RECORD_LEN).contains(&payload_len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid record length: {payload_len}"),
@@ -288,20 +307,30 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
         return Ok(entries);
     }
 
+    let mut last_valid_offset = reader.stream_position()?;
     loop {
         let offset = reader.stream_position()?;
         match read_record(&mut reader) {
             Ok(Some(record)) => {
                 entries.push((record.hash, offset));
+                last_valid_offset = reader.stream_position()?;
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => {
-                // Torn tail — stop at last good record
                 eprintln!("warning: packfile scan stopped at offset {offset}: {e}");
                 break;
             }
         }
+    }
+
+    // Truncate torn tail: if we stopped mid-record, rewind to the last
+    // valid record boundary so future appends don't land after a corrupt frame.
+    drop(reader);
+    {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(last_valid_offset)?;
+        file.sync_all()?;
     }
 
     Ok(entries)

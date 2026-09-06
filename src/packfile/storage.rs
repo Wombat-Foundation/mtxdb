@@ -221,6 +221,7 @@ impl PackfileStorage {
                         path: path.clone(),
                         mmap: parking_lot::RwLock::new(None),
                         append_lock: parking_lot::Mutex::new(()),
+                        is_current: std::sync::atomic::AtomicBool::new(true),
                     });
                     repack.swap_pack(room_id, gen);
                 }
@@ -345,6 +346,7 @@ impl PackfileStorage {
             path: pack_path,
             mmap: parking_lot::RwLock::new(None),
             append_lock: parking_lot::Mutex::new(()),
+            is_current: std::sync::atomic::AtomicBool::new(true),
         });
         self.repack.swap_pack(*room_id, gen.clone());
 
@@ -746,6 +748,12 @@ impl StorageEngine for PackfileStorage {
         // lifetime as rooms are created and purged — nothing else ever
         // removes an entry from it.
         self.live_roots.write().remove(room_id);
+        // Invalidate the cache: the cache is global (content-addressed)
+        // and doesn't track room membership. Without clearing, a node
+        // from the deleted room could be served if the same hash is
+        // reused in a different room (unlikely with content-addressed
+        // hashes, but possible with weak hash functions).
+        self.cache.clear();
         Ok(())
     }
 

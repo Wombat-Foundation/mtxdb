@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -52,12 +53,20 @@ impl RepackManager {
 
     /// Swap in a new pack generation for a room.
     /// Returns the old generation (readers holding it keep the old file alive).
+    /// Marks the old generation as no longer current so its Drop won't
+    /// delete the file (preventing `pack_id` wraparound from unlinking a
+    /// newer generation).
     pub fn swap_pack(
         &self,
         room_id: [u8; 16],
         new_gen: Arc<PackGeneration>,
     ) -> Option<Arc<PackGeneration>> {
-        self.packs.write().insert(room_id, new_gen)
+        let mut packs = self.packs.write();
+        let old = packs.insert(room_id, new_gen);
+        if let Some(ref old_gen) = old {
+            old_gen.is_current.store(false, Ordering::Release);
+        }
+        old
     }
 
     /// Remove a room's pack from the index (room purge).
@@ -154,14 +163,15 @@ impl RepackManager {
             file.sync_all()?;
         }
 
-        // fsync parent directory
-        if let Some(parent) = tmp_path.parent() {
+        // Atomic rename
+        fs::rename(&tmp_path, &pack_path)?;
+
+        // fsync parent directory AFTER rename to ensure the new
+        // directory entry is durable before we start using the file.
+        if let Some(parent) = pack_path.parent() {
             let dir = File::open(parent)?;
             dir.sync_all()?;
         }
-
-        // Atomic rename
-        fs::rename(&tmp_path, &pack_path)?;
 
         // Open the new pack
         let file = packfile::open_packfile(&pack_path, false)?;
@@ -173,6 +183,7 @@ impl RepackManager {
             path: pack_path,
             mmap: parking_lot::RwLock::new(None),
             append_lock: parking_lot::Mutex::new(()),
+            is_current: std::sync::atomic::AtomicBool::new(true),
         });
 
         self.swap_pack(room_id, generation.clone());
@@ -194,7 +205,22 @@ impl RepackManager {
 
     fn next_pack_id(&self, room_id: &[u8; 16]) -> u8 {
         let packs = self.packs.read();
-        packs.get(room_id).map_or(0, |g| g.pack_id.wrapping_add(1))
+        let current = packs.get(room_id).map_or(0, |g| g.pack_id);
+        // Skip to the next ID, but check if the target path already exists
+        // to avoid overwriting a file from a previous generation that is
+        // still referenced by active readers.
+        let mut next = current.wrapping_add(1);
+        for _ in 0..256 {
+            let path = packfile::pack_path(&self.base_dir, room_id, next);
+            if !path.exists() {
+                return next;
+            }
+            next = next.wrapping_add(1);
+        }
+        // All 256 slots occupied — return the current + 1 and let the
+        // caller handle the overwrite (this is an extremely unlikely edge
+        // case: 256 concurrent repacks for the same room).
+        current.wrapping_add(1)
     }
 
     fn pack_path(&self, room_id: &[u8; 16], pack_id: u8) -> PathBuf {
@@ -391,6 +417,7 @@ mod tests {
             path,
             mmap: parking_lot::RwLock::new(None),
             append_lock: parking_lot::Mutex::new(()),
+            is_current: std::sync::atomic::AtomicBool::new(true),
         });
         manager.swap_pack([0xBB; 16], gen);
 
