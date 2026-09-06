@@ -18,9 +18,9 @@ use std::path::PathBuf;
     author
 )]
 pub struct Cli {
-    /// Base directory for packfiles
-    #[arg(short, long, default_value = ".mtxdb")]
-    pub dir: PathBuf,
+    /// Base directory for packfiles (default: $HOME/.mtxdb)
+    #[arg(short, long, env = "MTXDB_DIR")]
+    pub dir: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Commands,

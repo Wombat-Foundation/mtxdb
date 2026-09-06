@@ -43,8 +43,12 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
 }
 
 fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
-    PackfileStorage::open(cli.dir.clone())
-        .with_context(|| format!("failed to open store at {}", cli.dir.display()))
+    let dir = cli.dir.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        std::path::PathBuf::from(home).join(".mtxdb")
+    });
+    PackfileStorage::open(dir.clone())
+        .with_context(|| format!("failed to open store at {}", dir.display()))
 }
 
 fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
@@ -98,7 +102,7 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let gen = store
         .repack_manager()
         .get_pack(&room_id)
-        .context("room not found")?;
+        .context("room not found — put a record first to create it")?;
 
     let size = gen.file.metadata().map_or(0, |m| m.len());
     let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
@@ -172,7 +176,11 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_bench(cli: &Cli, count: usize) -> anyhow::Result<()> {
-    let dir = cli.dir.join("__bench__");
+    let base = cli.dir.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        std::path::PathBuf::from(home).join(".mtxdb")
+    });
+    let dir = base.join("__bench__");
     fs::create_dir_all(&dir)?;
 
     let store = PackfileStorage::open(dir.clone())?;
