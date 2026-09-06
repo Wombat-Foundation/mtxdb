@@ -35,6 +35,12 @@ pub struct RepackManager {
     pub(crate) packs: RwLock<HashMap<[u8; 16], Arc<PackGeneration>>>,
     /// Base directory for pack files.
     base_dir: PathBuf,
+    /// Serializes the full repack and purge lifecycle per room.
+    /// A `repack_room` holds this lock across generation selection,
+    /// new-pack creation, and swap, preventing concurrent repacks from
+    /// reusing the same `pack_id` or path, and preventing a `purge_room`
+    /// from deleting a generation that a concurrent repack just published.
+    room_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
 }
 
 impl RepackManager {
@@ -43,6 +49,7 @@ impl RepackManager {
         Self {
             packs: RwLock::new(HashMap::new()),
             base_dir,
+            room_locks: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,6 +79,12 @@ impl RepackManager {
     /// Remove a room's pack from the index (room purge).
     pub fn remove_room(&self, room_id: &[u8; 16]) -> Option<Arc<PackGeneration>> {
         self.packs.write().remove(room_id)
+    }
+
+    /// Get or create a per-room mutex that serializes repack and purge.
+    fn room_mutex(&self, room_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
+        let mut locks = self.room_locks.lock();
+        locks.entry(*room_id).or_default().clone()
     }
 
     /// Perform a reachability-order repack for a room.
@@ -111,6 +124,11 @@ impl RepackManager {
         roots: impl IntoIterator<Item = NodeId>,
         resolver: impl Fn(&NodeId) -> Option<(NodeData, Vec<NodeId>)>,
     ) -> Result<Arc<PackGeneration>, RepackError> {
+        // Serialize the entire repack lifecycle per room: from pack_id
+        // selection through swap, no concurrent repack or purge can run.
+        let room_arc = self.room_mutex(&room_id);
+        let _room_guard = room_arc.lock();
+
         let pack_id = self.next_pack_id(&room_id);
         let pack_path = self.pack_path(&room_id, pack_id);
 
@@ -195,9 +213,11 @@ impl RepackManager {
     /// # Errors
     /// Always returns `Ok(())`. Provided for API consistency.
     pub fn purge_room(&self, room_id: &[u8; 16]) -> Result<(), RepackError> {
+        // Serialize with repack_room so we don't delete a generation
+        // that a concurrent repack just published.
+        let room_arc = self.room_mutex(room_id);
+        let _room_guard = room_arc.lock();
         if let Some(gen) = self.remove_room(room_id) {
-            // Drop the Arc — if readers are still active, the file
-            // will be unlinked when the last one releases.
             drop(gen);
         }
         Ok(())

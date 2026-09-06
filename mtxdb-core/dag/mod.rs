@@ -233,12 +233,14 @@ impl ActiveRoomFrontier {
         &self.edges[start..end]
     }
 
-    /// Drop all data for this room. O(1).
+    /// Drop all data for this room. O(1) — replaces backing stores
+    /// with empty containers; the old data is dropped when the returned
+    /// values go out of scope.
     pub fn clear(&mut self) {
-        self.nodes.clear();
-        self.edges.clear();
-        self.resident.clear();
-        self.id_remap.clear();
+        self.nodes = Vec::new();
+        self.edges = Vec::new();
+        self.resident = HashMap::new();
+        self.id_remap = HashMap::new();
         self.next_local_id = 0;
     }
 

@@ -8,7 +8,6 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -303,8 +302,7 @@ struct BenchResult {
 }
 
 fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> BenchResult {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    let dir = PathBuf::from(home).join(format!("bmdb_bench_{label}_{total_events}"));
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_{label}_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -341,13 +339,14 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     let mut get_calls = 0u64;
     let mut get_found = 0u64;
     let mut get_not_found = 0u64;
+    let mut get_errors = 0u64;
 
     for id in node_ids.iter() {
         get_calls += 1;
         match store.get(&ROOM, id) {
             Ok(Some(_)) => get_found += 1,
             Ok(None) => get_not_found += 1,
-            Err(_) => get_not_found += 1,
+            Err(_) => get_errors += 1,
         }
     }
 
@@ -440,6 +439,9 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     eprintln!("    Total get() calls:     {get_calls}");
     eprintln!("    Found by index:        {get_found}");
     eprintln!("    Lost to collision:     {get_not_found} ({index_loss_rate:.1}%)");
+    if get_errors > 0 {
+        eprintln!("    Read errors:           {get_errors}");
+    }
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Wall-clock (cold read):  {read_elapsed:.2?} ({cold_gets_per_sec:.0} gets/sec)");
     eprintln!("  Wall-clock (warm read):  {warm_elapsed:.2?} ({warm_gets_per_sec:.0} gets/sec)");
@@ -588,8 +590,7 @@ fn auth_chain(dag: &DagGenerator, start: usize, max_depth: usize) -> HashSet<usi
 /// vs. materialized-state vs. integration-as-is decision should be made
 /// on, not a guess.
 fn run_intent_benchmark(total_events: usize) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    let dir = PathBuf::from(home).join(format!("bmdb_bench_intent_{total_events}"));
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_intent_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -739,15 +740,16 @@ fn run_intent_benchmark(total_events: usize) {
 
 // ── Reaction-swarm adversarial scenario ──────────────────────────────
 //
-// repack_room is never actually invoked by PackfileStorage itself (it's a
-// manually-triggered, externally-scheduled API) — so a room's packfile just
-// grows monotonically in arrival order. That makes the real threat model
-// here "random-offset reads into a large, cold, ever-growing file", not
-// "did this survive a repack". This scenario measures whether an attacker
-// choosing reaction targets from the OLDEST part of a room's history (the
-// furthest possible physical offset from the write head) costs more than
-// organic reactions to RECENT messages, and whether the sort-then-read
-// fix in get_many (Part 3) narrows that gap.
+// PackfileStorage::put() may invoke maybe_repack(), which can call
+// repack_room(). However, this benchmark never calls set_live_roots(),
+// so maybe_repack() returns early without repacking — the room's
+// packfile grows monotonically in arrival order. That makes the real
+// threat model here "random-offset reads into a large, cold, ever-growing
+// file", not "did this survive a repack". This scenario measures whether
+// an attacker choosing reaction targets from the OLDEST part of a room's
+// history (the furthest possible physical offset from the write head)
+// costs more than organic reactions to RECENT messages, and whether the
+// sort-then-read fix in get_many (Part 3) narrows that gap.
 fn reaction_id(salt: u64, idx: u64) -> NodeId {
     let seed = idx ^ salt ^ 0xDEAD_BEEF_1234_5678u64.rotate_left(3);
     let a = splitmix64(seed);
@@ -759,8 +761,7 @@ fn reaction_id(salt: u64, idx: u64) -> NodeId {
 }
 
 fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    let dir = PathBuf::from(home).join(format!("bmdb_bench_swarm_{history_len}"));
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_swarm_{history_len}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 

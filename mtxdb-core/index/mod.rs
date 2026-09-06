@@ -343,12 +343,10 @@ impl Iterator for LookupIter<'_> {
             if slot.is_empty() {
                 return None;
             }
-            let current = self.bucket;
             self.bucket = self.bucket.wrapping_add(1) & self.mask;
             if slot.tag() == self.tag {
                 return Some((slot.pack_id(), slot.offset()));
             }
-            let _ = current;
         }
         None
     }

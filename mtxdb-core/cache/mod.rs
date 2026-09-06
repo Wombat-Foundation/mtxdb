@@ -227,16 +227,25 @@ impl NodeCache {
 
     /// Check which hashes are already resident in the cache.
     ///
-    /// Returns a `Vec<bool>` of the same length as `hashes`, where `true`
-    /// means the hash is cached. Does NOT move entries in the LRU order
-    /// (this is a read-only probe, not an access).
+    /// Returns a `Vec<Option<Arc<NodeData>>>` of the same length as
+    /// `hashes`, where `Some(data)` means the hash is cached with that
+    /// data. Does NOT move entries in the LRU order (this is a read-only
+    /// probe, not an access).
     ///
     /// Used by the swizzling layer to identify which child pointers can be
     /// rewritten from `Lazy(hash)` to `Resolved(Arc<NodeData>)` without
-    /// touching disk.
-    pub fn resolve_hashes(&self, hashes: &[NodeId]) -> Vec<bool> {
+    /// touching disk, providing the actual cached data for the callback.
+    pub fn resolve_hashes(&self, hashes: &[NodeId]) -> Vec<Option<Arc<NodeData>>> {
         let state = self.state.read();
-        hashes.iter().map(|h| state.map.contains_key(h)).collect()
+        hashes
+            .iter()
+            .map(|h| {
+                state
+                    .map
+                    .get(h)
+                    .and_then(|&idx| state.nodes[idx as usize].data.clone())
+            })
+            .collect()
     }
 
     /// Number of entries currently cached.

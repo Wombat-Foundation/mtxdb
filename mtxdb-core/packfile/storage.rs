@@ -25,11 +25,12 @@ type ScannedPacks = Vec<(u8, PackEntries)>;
 /// When a node is fetched from disk, this callback is invoked with:
 /// - `data`: the raw node data
 /// - `children`: the child hashes extracted from the node
-/// - `cached`: parallel bool array — `true` if the child is already in cache
+/// - `cached`: parallel array — `Some(Arc<NodeData>)` if the child is
+///   already in cache with its data, `None` otherwise
 ///
 /// The callback should rewrite `NodeRef::Lazy(hash)` to
 /// `NodeRef::Resolved(hash, Arc<NodeData>)` for children where `cached[i]`
-/// is `true`, then return the rewritten node data.
+/// is `Some(...)`, then return the rewritten node data.
 ///
 /// The callback is responsible for:
 /// 1. Parsing the HAMT node encoding from `data`
@@ -40,7 +41,7 @@ type ScannedPacks = Vec<(u8, PackEntries)>;
 /// **Pinning constraint:** The callback should only swizzle children at
 /// levels 0 and 1 of the state trie (~33 nodes per room). Deeper nodes
 /// stay `Lazy` to avoid holding Arc references that prevent LRU eviction.
-pub type SwizzleFn = fn(&NodeData, &[NodeId], &[bool]) -> NodeData;
+pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
 
 /// A content-addressed packfile storage engine.
 ///
@@ -76,6 +77,11 @@ pub struct PackfileStorage {
     /// both write a header to the same file, corrupting it (confirmed via
     /// `test_concurrent_federation_swarm`: "invalid packfile header").
     ensure_pack_lock: parking_lot::Mutex<()>,
+    /// Serializes `put` + `maybe_repack` per room. Without this, a `put` could
+    /// append to the pre-swap generation after `repack_room` has already
+    /// published a new one — the index entry would point at a generation
+    /// that no longer appears in the packs map, permanently losing the node.
+    put_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
     /// Per-room roots that must survive repack (state root + timeline
     /// forward-extremities). `repack_room` itself is caller-agnostic about
     /// what a root means — this is where `PackfileStorage` remembers what
@@ -158,6 +164,7 @@ impl PackfileStorage {
             swizzle,
             parser,
             ensure_pack_lock: parking_lot::Mutex::new(()),
+            put_locks: parking_lot::Mutex::new(HashMap::new()),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_bytes: std::sync::atomic::AtomicU64::new(
                 DEFAULT_REPACK_THRESHOLD_BYTES,
@@ -402,6 +409,12 @@ impl PackfileStorage {
         packfile::pack_path(&self.base_dir, room_id, pack_id)
     }
 
+    /// Get or create a per-room mutex for serializing `put` and `maybe_repack`.
+    fn put_mutex(&self, room_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
+        let mut locks = self.put_locks.lock();
+        locks.entry(*room_id).or_default().clone()
+    }
+
     /// Read a record at the given offset from a memory-mapped packfile.
     ///
     /// Unlike `seek`+`read_exact`, mmap reads require no syscalls — the
@@ -444,7 +457,7 @@ impl PackfileStorage {
             let payload_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
             let payload_len = u32::from_le_bytes(payload_len_bytes);
 
-            if payload_len == 0 || payload_len > packfile::MAX_RECORD_LEN {
+            if !(16..=packfile::MAX_RECORD_LEN).contains(&payload_len) {
                 return Err(StorageError::Corrupt(format!(
                     "invalid record length: {payload_len}"
                 )));
@@ -543,12 +556,17 @@ impl PackfileStorage {
     /// This is the shared tail of `get()`'s lookup, factored out so
     /// `get_many` can supply candidates it already resolved (and sorted by
     /// offset) instead of re-deriving them per call.
+    ///
+    /// Returns `Err` if a candidate frame is corrupt or unreadable (not
+    /// just a hash mismatch), so callers don't silently treat storage
+    /// damage as "not found".
     fn resolve_from_candidates(
         &self,
         room_id: &[u8; 16],
         id: &NodeId,
         candidates: &[(u8, u64)],
-    ) -> Option<NodeData> {
+    ) -> Result<Option<NodeData>, StorageError> {
+        let mut last_err: Option<StorageError> = None;
         for (pack_id, offset) in candidates {
             let gen = {
                 let packs = self.repack.packs.read();
@@ -561,35 +579,47 @@ impl PackfileStorage {
                 }
             };
 
-            let Ok(record) = Self::read_at(&gen, *offset) else {
-                continue;
-            };
-
-            // Verify against caller-requested hash, not the frame hash
-            if record.hash != *id {
-                continue;
-            }
-
-            let mut children = Vec::new();
-            if let Some(parse) = self.parser {
-                for child_id in parse(&record.data) {
-                    if let Some(child_data) = self.pinned.get(&child_id) {
-                        children.push(NodeRef::Resolved(child_id, child_data));
-                    } else {
-                        children.push(NodeRef::Lazy(child_id));
+            match Self::read_at(&gen, *offset) {
+                Ok(record) => {
+                    // Verify against caller-requested hash, not the frame hash
+                    if record.hash != *id {
+                        continue;
                     }
+
+                    let mut children = Vec::new();
+                    if let Some(parse) = self.parser {
+                        for child_id in parse(&record.data) {
+                            if let Some(child_data) = self.pinned.get(&child_id) {
+                                children.push(NodeRef::Resolved(child_id, child_data));
+                            } else {
+                                children.push(NodeRef::Lazy(child_id));
+                            }
+                        }
+                    }
+
+                    let data = NodeData {
+                        bytes: record.data,
+                        children,
+                    };
+                    self.cache.insert(*id, Arc::new(data.clone()));
+                    return Ok(Some(data));
+                }
+                Err(e) => {
+                    // Remember the error but keep trying other candidates —
+                    // the failure might be in an old generation while a
+                    // newer one has a valid copy.
+                    last_err = Some(e);
                 }
             }
-
-            let data = NodeData {
-                bytes: record.data,
-                children,
-            };
-            self.cache.insert(*id, Arc::new(data.clone()));
-            return Some(data);
         }
 
-        None
+        // If we exhausted candidates and saw an error (not just hash
+        // mismatches), propagate it — the index says the node exists but
+        // we can't read it.
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Ok(None)
     }
 }
 
@@ -615,7 +645,7 @@ impl StorageEngine for PackfileStorage {
             return Ok(Some((*data).clone()));
         }
 
-        Ok(self.resolve_from_candidates(room_id, id, &candidates))
+        self.resolve_from_candidates(room_id, id, &candidates)
     }
 
     fn get_many(
@@ -636,14 +666,16 @@ impl StorageEngine for PackfileStorage {
             let indexes = self.indexes.read();
             let index = indexes.get(room_id);
             for (i, id) in ids.iter().enumerate() {
-                if let Some(data) = self.cache.get(id) {
-                    results[i] = Some((*data).clone());
-                    continue;
-                }
+                // Room index check first — the cache is global (content-addressed),
+                // but we only serve data for nodes that belong to this room.
                 if let Some(index) = index {
                     let candidates: Vec<(u8, u64)> = index.lookup_all(id).collect();
                     if !candidates.is_empty() {
-                        to_fetch.push((i, candidates));
+                        if let Some(data) = self.cache.get(id) {
+                            results[i] = Some((*data).clone());
+                        } else {
+                            to_fetch.push((i, candidates));
+                        }
                     }
                 }
             }
@@ -657,13 +689,18 @@ impl StorageEngine for PackfileStorage {
         // Phase 3: fetch in sorted order, reusing the already-resolved
         // candidates directly — no second index lookup per id.
         for (i, candidates) in &to_fetch {
-            results[*i] = self.resolve_from_candidates(room_id, &ids[*i], candidates);
+            results[*i] = self.resolve_from_candidates(room_id, &ids[*i], candidates)?;
         }
 
         Ok(results)
     }
 
     fn put(&self, room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
+        // Serialize put + maybe_repack per room so a concurrent repack
+        // cannot swap the generation between our write and index update.
+        let room_arc = self.put_mutex(room_id);
+        let _room_guard = room_arc.lock();
+
         let gen = self.ensure_pack(room_id)?;
 
         let record = Record {
@@ -793,14 +830,15 @@ mod tests {
     // drop_caches_for_dir — token-shape coincidence (both iterate/map over a
     // short range), not related logic. A test fixture builder and an
     // unrelated directory-size/cache-eviction helper have nothing to share.
-    /// Ten distinct (id, data) pairs, ids `[0,0,...]` through `[9,0,...]`.
-    /// Shared by every test that just needs "some records", so the fixture
-    /// shape lives in one place.
+    /// Ten distinct (id, data) pairs. Each id has a unique 24-bit tag
+    /// (bytes 8..12) so index `insert` allocates a new slot instead of
+    /// overwriting via tag collision.
     fn ten_record_fixture() -> Vec<(NodeId, NodeData)> {
         (0..10u8)
             .map(|i| {
                 let mut id = [0u8; 16];
                 id[0] = i;
+                id[8..12].copy_from_slice(&(u32::from(i) + 1).to_le_bytes());
                 (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
             })
             .collect()
@@ -1406,17 +1444,21 @@ mod tests {
         static SWIZZLE_CALLS: AtomicU64 = AtomicU64::new(0);
         static CACHED_CHILDREN_FOUND: AtomicU64 = AtomicU64::new(0);
 
-        fn test_swizzle(data: &NodeData, children: &[NodeId], cached: &[bool]) -> NodeData {
+        fn test_swizzle(
+            data: &NodeData,
+            children: &[NodeId],
+            cached: &[Option<Arc<NodeData>>],
+        ) -> NodeData {
             SWIZZLE_CALLS.fetch_add(1, Ordering::Relaxed);
             assert_eq!(children.len(), 2, "expected 2 children from parent node");
             // Both children should be found in cache
-            for &is_cached in cached {
-                if is_cached {
+            for entry in cached {
+                if entry.is_some() {
                     CACHED_CHILDREN_FOUND.fetch_add(1, Ordering::Relaxed);
                 }
             }
             // In a real implementation, this would parse the HAMT encoding
-            // and rewrite Lazy → Resolved for cached[i] == true children.
+            // and rewrite Lazy → Resolved for cached children.
             // For this test, we return the data unchanged.
             data.clone()
         }

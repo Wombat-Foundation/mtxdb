@@ -1,8 +1,8 @@
 pub mod storage;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use bytes::Bytes;
 use memmap2::Mmap;
@@ -131,14 +131,10 @@ pub(crate) fn map_pack(file: &File) -> io::Result<Mmap> {
 
 impl Drop for PackGeneration {
     fn drop(&mut self) {
-        // Only delete the file if this generation is still the active one.
-        // When a room is repacked, swap_pack marks the old generation as
-        // no longer current — its file must survive until all readers drop
-        // their Arc. If the pack_id has wrapped and this generation is no
-        // longer current, deleting would unlink a newer generation's file.
-        if self.is_current.load(Ordering::Acquire) {
-            let _ = fs::remove_file(&self.path);
-        }
+        // Packfiles are persistent data. Never delete on drop — normal
+        // shutdown must not destroy the current generation's file. Cleanup
+        // happens only through explicit `purge_room`, which removes the
+        // generation from the map and lets the last reader unlink the file.
     }
 }
 

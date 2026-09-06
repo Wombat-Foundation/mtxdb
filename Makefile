@@ -24,7 +24,8 @@ check-cargo-sort:
 .PHONY: check
 check: ##H Cargo check (core) and code dupe
 	$(CARGO) check --all-targets
-	-jscpd $$(git ls-files '*.rs')
+	@command -v jscpd >/dev/null || { echo "jscpd is required; install it with: npm install -g jscpd" >&2; exit 1; }
+	jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
 lint: ##H Run clippy lints (only core, not full workspace)
@@ -40,7 +41,7 @@ fix: ##H Apply auto-fixes with clippy (only core)
 doc: ##H Build docs
 	$(CARGO) test --workspace --doc
 	$(CARGO) doc --workspace --no-deps
-	echo '<meta http-equiv="refresh" content="0;url=mtx_slipstream/index.html">' > target/doc/index.html
+	echo '<meta http-equiv="refresh" content="0;url=mtxdb/index.html">' > target/doc/index.html
 
 
 
