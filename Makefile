@@ -13,7 +13,7 @@ _help:
 
 .PHONY: format
 format: ##H Format code
-	prettier -w $$(git ls-files '*.md' '*.y*ml')
+	prettier -w $$(git ls-files '*.md' '*.y*ml' *.json)
 	pre-commit run --all-files
 	$(CARGO) sort --workspace --grouped
 
