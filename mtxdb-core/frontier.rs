@@ -184,7 +184,8 @@ mod tests {
     fn test_bfs_layer_hashes_and_is_empty() {
         let layer = BfsLayer::new();
         assert!(layer.is_empty());
-        assert_eq!(layer.hashes(), &[] as &[NodeId]);
+        let empty: &[NodeId] = &[];
+        assert_eq!(layer.hashes(), empty);
 
         let mut layer = BfsLayer::new();
         layer.push([1u8; 16], [0xFF; 16]);

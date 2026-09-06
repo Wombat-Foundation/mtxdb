@@ -1563,8 +1563,8 @@ mod tests {
 
     #[test]
     fn test_resolve_from_candidates_parser_children() {
-        fn parser(data: &bytes::Bytes) -> Vec<NodeId> {
-            if data.as_ref() == b"parent" {
+        fn parser(data: &[u8]) -> Vec<NodeId> {
+            if data == b"parent" {
                 vec![[0x11; 16], [0x22; 16]]
             } else {
                 vec![]
@@ -1572,6 +1572,43 @@ mod tests {
         }
 
         let dir = test_dir("resolve_parser");
+        let store =
+            PackfileStorage::open_with_cache(dir, NodeCache::with_default_capacity(), Some(parser))
+                .unwrap();
+
+        let child1_id = [0x11; 16];
+        let child1_data = NodeData::new(bytes::Bytes::from_static(b"child 1"));
+        store.put(&TEST_ROOM, &child1_id, &child1_data).unwrap();
+
+        let parent_id = [0x42; 16];
+        store
+            .put(
+                &TEST_ROOM,
+                &parent_id,
+                &NodeData::new(bytes::Bytes::from_static(b"parent")),
+            )
+            .unwrap();
+
+        // Evict cache so get() must go through resolve_from_candidates
+        store.cache().clear();
+
+        let fetched = store.get(&TEST_ROOM, &parent_id).unwrap().unwrap();
+        assert_eq!(fetched.children.len(), 2);
+        assert!(matches!(fetched.children[0], NodeRef::Lazy(id) if id == child1_id));
+        assert!(matches!(fetched.children[1], NodeRef::Lazy(id) if id == [0x22; 16]));
+    }
+
+    #[test]
+    fn test_resolve_from_candidates_pinned_child() {
+        fn parser(data: &[u8]) -> Vec<NodeId> {
+            if data == b"parent" {
+                vec![[0x11; 16]]
+            } else {
+                vec![]
+            }
+        }
+
+        let dir = test_dir("resolve_pinned");
         let store =
             PackfileStorage::open_with_cache(dir, NodeCache::with_default_capacity(), Some(parser))
                 .unwrap();
