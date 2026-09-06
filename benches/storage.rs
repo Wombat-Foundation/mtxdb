@@ -303,7 +303,7 @@ struct BenchResult {
 }
 
 fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> BenchResult {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
     let dir = PathBuf::from(home).join(format!("bmdb_bench_{label}_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -588,7 +588,7 @@ fn auth_chain(dag: &DagGenerator, start: usize, max_depth: usize) -> HashSet<usi
 /// vs. materialized-state vs. integration-as-is decision should be made
 /// on, not a guess.
 fn run_intent_benchmark(total_events: usize) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
     let dir = PathBuf::from(home).join(format!("bmdb_bench_intent_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -759,7 +759,7 @@ fn reaction_id(salt: u64, idx: u64) -> NodeId {
 }
 
 fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
     let dir = PathBuf::from(home).join(format!("bmdb_bench_swarm_{history_len}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
