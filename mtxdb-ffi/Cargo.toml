@@ -11,6 +11,8 @@ readme = "../README.md"
 keywords = ["matrix", "ffi", "packfile", "storage"]
 categories = ["database-implementations", "external-ffi-bindings"]
 
+[workspace]
+
 [lib]
 crate-type = ["cdylib", "staticlib"]
 

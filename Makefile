@@ -73,17 +73,9 @@ cov: ##H Run code coverage and generate HTML report
 
 .PHONY: build
 build: ##H Build all
-	$(CARGO) build --release --timings --all-targets --all-features --locked
-	$(CARGO) build --release -p mtxdb-ffi
-	@echo ""
-	@echo '══════════════ FFI BUILD OUTPUT ══════════════'
-	@find target/release -maxdepth 1 \( -name 'libmtxdb_ffi.so' -o -name 'libmtxdb_ffi.a' \) -exec ls -lh {} \;
-	rustup target add wasm32-wasip1 2>/dev/null || true
-	$(CARGO) build --release -p mtxdb-wasm --target wasm32-wasip1
-	@echo ""
-	@echo '══════════════ WASM BUILD OUTPUT ══════════════'
-	@ls -lh target/wasm32-wasip1/release/*.wasm 2>/dev/null || echo 'No .wasm output found'
-
+	$(CARGO) build --release --timings
+	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
+	$(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 
 
 .PHONY: bench
@@ -93,4 +85,5 @@ bench: ##H Run benchmarks
 .PHONY: clean
 clean: ##H Clean build artifacts
 	$(CARGO) clean
-	rm -rf .coverage/
+	cd mtxdb-ffi && $(CARGO) clean
+	cd mtxdb-wasm && $(CARGO) clean

@@ -11,6 +11,8 @@ readme = "../README.md"
 keywords = ["matrix", "wasm", "packfile", "storage"]
 categories = ["database-implementations", "wasm"]
 
+[workspace]
+
 [lib]
 crate-type = ["cdylib"]
 
