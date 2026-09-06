@@ -11,7 +11,11 @@ authors = ["Shane Jaroch <chown_tee@proton.me>"]
 readme = "README.md"
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
+
 [workspace]
+
+[lib]
+path = "mtxdb-core/lib.rs"
 
 [dependencies]
 bytes = "1.5"
