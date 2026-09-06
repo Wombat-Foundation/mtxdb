@@ -59,6 +59,7 @@ fn build_cli() -> Command {
                 .long("dir")
                 .env("MTXDB_DIR")
                 .value_name("DIR")
+                .global(true)
                 .help("Base directory for packfiles"),
         )
         .subcommand(
@@ -169,8 +170,11 @@ fn parse_cli() -> Cli {
             count: m
                 .get_one::<String>("count")
                 .unwrap()
-                .parse()
-                .expect("invalid count"),
+                .parse::<usize>()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: invalid count: {e}");
+                    std::process::exit(1);
+                }),
         },
         _ => {
             build_cli().print_help().unwrap();

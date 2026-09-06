@@ -147,10 +147,9 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
             _ => None,
         }
         .context("could not detect room_id")?;
+        let hash = blake3::hash(rid.as_bytes());
         let mut id = [0u8; 16];
-        let bytes = rid.as_bytes();
-        let len = bytes.len().min(16);
-        id[..len].copy_from_slice(&bytes[..len]);
+        id.copy_from_slice(&hash.as_bytes()[..16]);
         id
     };
 
@@ -209,17 +208,15 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String]) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
     let store = open_store(cli)?;
 
-    let root_ids: Vec<mtxdb::NodeId> = roots
-        .iter()
-        .map(|r| parse_node_id(r))
-        .collect::<anyhow::Result<_>>()?;
+    if !roots.is_empty() {
+        let root_ids: Vec<mtxdb::NodeId> = roots
+            .iter()
+            .map(|r| parse_node_id(r))
+            .collect::<anyhow::Result<_>>()?;
+        store.set_live_roots(&room_id, root_ids);
+    }
 
-    store.set_live_roots(&room_id, root_ids.clone());
-
-    // Trigger a repack by setting a very low threshold and writing a dummy record
-    store.set_repack_threshold_bytes(0);
-    let dummy = mtxdb::NodeData::new(bytes::Bytes::from_static(b""));
-    store.put(&room_id, &[0u8; 16], &dummy)?;
+    store.repack_room_rewrite(&room_id)?;
 
     let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
     eprintln!("repacked {hex}");
@@ -287,6 +284,9 @@ fn cmd_bench(cli: &Cli, count: usize) -> anyhow::Result<()> {
         "  read:  {read_elapsed:?} ({read_ops:.0} ops/sec, {:.1} MB/s)",
         mb / read_elapsed.as_secs_f64()
     );
+
+    store.delete_room(&room_id)?;
+    eprintln!("bench: cleaned up benchmark data");
 
     Ok(())
 }

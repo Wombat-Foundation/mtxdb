@@ -118,9 +118,20 @@ impl PackfileStorage {
             }
             let entries = match packfile::scan_and_recover_packfile(&path) {
                 Ok(e) => e,
-                Err(e) => {
-                    eprintln!("warning: recovery scan failed for shard {shard_id:02x}, falling back to partial scan: {e}");
-                    packfile::scan_packfile(&path)?
+                Err(recovery_err) => {
+                    eprintln!(
+                        "warning: recovery scan failed for shard {shard_id:02x}: {recovery_err}"
+                    );
+                    match packfile::scan_packfile(&path) {
+                        Ok(partial) => {
+                            eprintln!("warning: partial scan recovered {} records from shard {shard_id:02x}", partial.len());
+                            partial
+                        }
+                        Err(scan_err) => {
+                            eprintln!("warning: shard {shard_id:02x} skipped entirely: {scan_err}");
+                            continue;
+                        }
+                    }
                 }
             };
             let mut room_entries: HashMap<[u8; 16], Vec<([u8; 16], u64)>> = HashMap::new();
@@ -264,18 +275,23 @@ impl PackfileStorage {
             if !path.exists() {
                 continue;
             }
-            if let Ok(entries) = packfile::scan_packfile(&path) {
-                let room_entries: Vec<ShardHashOffset> = entries
-                    .into_iter()
-                    .filter(|(rid, _, _)| rid == room_id)
-                    .map(|(_, hash, offset)| (hash, offset))
-                    .collect();
-                total = total.saturating_add(room_entries.len());
-                scanned.push((shard_id, room_entries));
+            match packfile::scan_packfile(&path) {
+                Ok(entries) => {
+                    let room_entries: Vec<ShardHashOffset> = entries
+                        .into_iter()
+                        .filter(|(rid, _, _)| rid == room_id)
+                        .map(|(_, hash, offset)| (hash, offset))
+                        .collect();
+                    total = total.saturating_add(room_entries.len());
+                    scanned.push((shard_id, room_entries));
+                }
+                Err(e) => {
+                    eprintln!("warning: scan_packfile failed for shard {shard_id:02x} during rebuild_index for room: {e}");
+                }
             }
         }
 
-        let mut index = LossyIndex::new(total.saturating_mul(2));
+        let mut index = LossyIndex::new(total.saturating_mul(2).max(16));
         for (shard_id, entries) in scanned {
             for (hash, offset) in entries {
                 let _ = index.insert(&hash, shard_id, offset);
@@ -360,6 +376,79 @@ impl PackfileStorage {
             return Err(err);
         }
         Ok(None)
+    }
+
+    /// Rewrite every record for a room by scanning all shards, without
+    /// needing a HAMT parser. This performs a full compaction: every
+    /// record for the room is copied to the active shard, including
+    /// orphaned/dead nodes not reachable from any live root. This fixes
+    /// data loss from the parser-based BFS path but does NOT perform GC.
+    ///
+    /// To reclaim space from unreachable nodes, use `maybe_repack` with
+    /// a HAMT parser and live roots registered via `set_live_roots`.
+    ///
+    /// Note: the `--root` CLI argument is accepted but does not gate
+    /// which records are kept -- all room records are rewritten. Each entry is read from its current shard
+    /// and appended to the active shard. The per-room index is then
+    /// rebuilt from the written entries.
+    ///
+    /// This avoids the BFS-based `maybe_repack` path which requires a
+    /// parser to discover child nodes and silently drops descendants
+    /// when no parser is available.
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O or corruption.
+    pub fn repack_room_rewrite(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
+        type ShardHashOffset = ([u8; 16], u64);
+
+        let mut scanned: Vec<(u8, Vec<ShardHashOffset>)> = Vec::new();
+
+        for shard_id in 0..shard::MAX_SHARDS_U8 {
+            let path = ShardPool::shard_path(&self.base_dir, shard_id);
+            if !path.exists() {
+                continue;
+            }
+            match packfile::scan_packfile(&path) {
+                Ok(entries) => {
+                    let room_entries: Vec<ShardHashOffset> = entries
+                        .into_iter()
+                        .filter(|(rid, _, _)| rid == room_id)
+                        .map(|(_, hash, offset)| (hash, offset))
+                        .collect();
+                    if !room_entries.is_empty() {
+                        scanned.push((shard_id, room_entries));
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: scan_packfile failed for shard {shard_id:02x} during repack: {e}"
+                    );
+                }
+            }
+        }
+
+        let mut new_offsets: Vec<([u8; 16], u8, u64)> = Vec::new();
+        for (old_shard_id, entries) in &scanned {
+            for (hash, offset) in entries {
+                let Some(old_shard) = self.shards.get_shard(*old_shard_id) else {
+                    continue;
+                };
+                let record = Self::read_at(&old_shard, *offset)?;
+                let (new_shard_id, new_offset) = self.shards.put_record(&Record {
+                    room_id: *room_id,
+                    hash: *hash,
+                    data: record.data,
+                })?;
+                new_offsets.push((*hash, new_shard_id, new_offset));
+            }
+        }
+
+        let mut index = LossyIndex::new(new_offsets.len().saturating_mul(2).max(16));
+        for (hash, shard_id, offset) in &new_offsets {
+            let _ = index.insert(hash, *shard_id, *offset);
+        }
+        self.indexes.write().insert(*room_id, index);
+        Ok(())
     }
 }
 
@@ -504,7 +593,6 @@ impl StorageEngine for PackfileStorage {
         Ok(self.shards.sync_all()?)
     }
 }
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -1064,5 +1152,66 @@ mod tests {
                 .map_or(0, crate::index::LossyIndex::len),
             1
         );
+    }
+    #[test]
+    fn test_repack_room_rewrite_preserves_all_records() {
+        let dir = test_dir("repack_rewrite");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        // Insert a "tree": root + 3 children (simulating a HAMT without needing a parser)
+        let root = [0xAAu8; 16];
+        let child1 = [0x01u8; 16];
+        let child2 = [0x02u8; 16];
+        let child3 = [0x03u8; 16];
+
+        let entries: Vec<(NodeId, NodeData)> = vec![
+            (root, NodeData::new(bytes::Bytes::from_static(b"root"))),
+            (child1, NodeData::new(bytes::Bytes::from_static(b"child1"))),
+            (child2, NodeData::new(bytes::Bytes::from_static(b"child2"))),
+            (child3, NodeData::new(bytes::Bytes::from_static(b"child3"))),
+        ];
+        store.put_many(&TEST_ROOM, &entries).unwrap();
+
+        assert_eq!(store.indexes.read().get(&TEST_ROOM).unwrap().len(), 4);
+
+        // Trigger repack_room_rewrite
+        store.repack_room_rewrite(&TEST_ROOM).unwrap();
+
+        // All 4 records must survive
+        assert_eq!(store.indexes.read().get(&TEST_ROOM).unwrap().len(), 4);
+        assert!(store.get(&TEST_ROOM, &root).unwrap().is_some());
+        assert!(store.get(&TEST_ROOM, &child1).unwrap().is_some());
+        assert!(store.get(&TEST_ROOM, &child2).unwrap().is_some());
+        assert!(store.get(&TEST_ROOM, &child3).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_room_preserves_other_room_cache() {
+        let dir = test_dir("delete_room_cache");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        // Populate two rooms
+        let room_a = TEST_ROOM;
+        let room_b = OTHER_ROOM;
+        let id_a = [0x10u8; 16];
+        let id_b = [0x20u8; 16];
+        let data_a = NodeData::new(bytes::Bytes::from_static(b"room A data"));
+        let data_b = NodeData::new(bytes::Bytes::from_static(b"room B data"));
+
+        store.put(&room_a, &id_a, &data_a).unwrap();
+        store.put(&room_b, &id_b, &data_b).unwrap();
+
+        // Both should be retrievable
+        assert!(store.get(&room_a, &id_a).unwrap().is_some());
+        assert!(store.get(&room_b, &id_b).unwrap().is_some());
+
+        // Delete room A
+        store.delete_room(&room_a).unwrap();
+
+        // Room A should be gone, room B should still be accessible
+        assert!(store.get(&room_a, &id_a).unwrap().is_none());
+        assert!(store.indexes.read().get(&room_a).is_none());
+        // Room B index should still exist
+        assert!(store.indexes.read().get(&room_b).is_some());
     }
 }

@@ -164,7 +164,7 @@ pub unsafe extern "C" fn mdb_get_ex(
             Box::into_raw(Box::new(MdbNodeData { inner: data }))
         }
         Ok(None) => {
-            unsafe { *out_err = MdbError::Ok };
+            unsafe { *out_err = MdbError::NotFound };
             ptr::null_mut()
         }
         Err(e) => {
