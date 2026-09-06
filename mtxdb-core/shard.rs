@@ -44,7 +44,6 @@ pub struct Shard {
     pub(crate) file_len: AtomicU64,
 }
 
-
 impl Shard {
     fn new(shard_id: u8, file: File, path: PathBuf, file_len: u64) -> Self {
         Self {
@@ -343,7 +342,8 @@ impl ShardPool {
                 let path = Self::shard_path(&self.base_dir, candidate);
                 let file = packfile::open_packfile(&path, true)?;
                 let file_len = file.metadata()?.len();
-                shards[candidate as usize] = Some(Arc::new(Shard::new(candidate, file, path, file_len)));
+                shards[candidate as usize] =
+                    Some(Arc::new(Shard::new(candidate, file, path, file_len)));
                 drop(shards);
                 *self.active_write.lock() = candidate;
                 return Ok(());

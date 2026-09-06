@@ -327,11 +327,38 @@ impl PackfileStorage {
         Ok(())
     }
 
-        fn swap_generation(&self, room_id: &[u8; 16], index: LossyIndex) {
-        let cache = self.generation(room_id).map_or_else(
-            || Arc::new(NodeCache::new(self.cache_capacity)),
-            |gen| gen.cache.clone(),
-        );
+    /// Copy a record from an old shard to the active shard.
+    /// Returns the new (, offset) or None if the old shard is gone.
+    fn copy_record_to_shard(
+        &self,
+        room_id: &[u8; 16],
+        old_shard_id: u8,
+        old_offset: u64,
+    ) -> Result<Option<([u8; 16], u8, u64)>, StorageError> {
+        let Some(old_shard) = self.shards.get_shard(old_shard_id) else {
+            return Ok(None);
+        };
+        let record = Self::read_at(&old_shard, old_offset)?;
+        let (new_shard_id, new_offset) = self.shards.put_record(&Record {
+            room_id: *room_id,
+            hash: record.hash,
+            data: record.data,
+        })?;
+        Ok(Some((record.hash, new_shard_id, new_offset)))
+    }
+    fn swap_generation(&self, room_id: &[u8; 16], index: LossyIndex) {
+        let cache = self.generation(room_id).map(|g| g.cache.clone());
+        self.store_generation(room_id, index, cache);
+    }
+
+    /// Store a new generation for a room, reusing the existing cache if present.
+    fn store_generation(
+        &self,
+        room_id: &[u8; 16],
+        index: LossyIndex,
+        cache: Option<Arc<NodeCache>>,
+    ) {
+        let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
         let new_gen = Arc::new(RoomGeneration { index, cache });
         self.rooms
             .write()
@@ -443,17 +470,10 @@ impl PackfileStorage {
 
         let mut new_offsets: Vec<([u8; 16], u8, u64)> = Vec::new();
         for (old_shard_id, entries) in &scanned {
-            for (hash, offset) in entries {
-                let Some(old_shard) = self.shards.get_shard(*old_shard_id) else {
-                    continue;
-                };
-                let record = Self::read_at(&old_shard, *offset)?;
-                let (new_shard_id, new_offset) = self.shards.put_record(&Record {
-                    room_id: *room_id,
-                    hash: *hash,
-                    data: record.data,
-                })?;
-                new_offsets.push((*hash, new_shard_id, new_offset));
+            for (_hash, offset) in entries {
+                if let Some(entry) = self.copy_record_to_shard(room_id, *old_shard_id, *offset)? {
+                    new_offsets.push(entry);
+                }
             }
         }
 
@@ -517,16 +537,9 @@ impl PackfileStorage {
             let (old_shard_id, old_offset) = hash_to_shard_offset
                 .get(hash)
                 .expect("all hashes in CSR exist in shard map");
-            let Some(old_shard) = self.shards.get_shard(*old_shard_id) else {
-                continue;
-            };
-            let record = Self::read_at(&old_shard, *old_offset)?;
-            let (new_shard_id, new_offset) = self.shards.put_record(&Record {
-                room_id: *room_id,
-                hash: *hash,
-                data: record.data,
-            })?;
-            new_offsets.push((*hash, new_shard_id, new_offset));
+            if let Some(entry) = self.copy_record_to_shard(room_id, *old_shard_id, *old_offset)? {
+                new_offsets.push(entry);
+            }
         }
 
         let index = Self::build_index(&new_offsets);
@@ -685,16 +698,9 @@ impl PackfileStorage {
             let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            let Some(old_shard) = self.shards.get_shard(old_shard_id) else {
-                continue;
-            };
-            let record = Self::read_at(&old_shard, old_offset)?;
-            let (new_shard_id, new_offset) = self.shards.put_record(&Record {
-                room_id: *room_id,
-                hash: *hash,
-                data: record.data,
-            })?;
-            new_offsets.push((*hash, new_shard_id, new_offset));
+            if let Some(entry) = self.copy_record_to_shard(room_id, old_shard_id, old_offset)? {
+                new_offsets.push(entry);
+            }
         }
 
         let kept = new_offsets.len();
@@ -793,7 +799,7 @@ impl StorageEngine for PackfileStorage {
 
         let (shard_id, offset) = self.shards.put_record(&record)?;
 
-        let new_gen = {
+        let (index, cache) = {
             let old_gen = self.generation(room_id);
             let mut index = match &old_gen {
                 Some(g) => g.index.clone(),
@@ -819,19 +825,10 @@ impl StorageEngine for PackfileStorage {
             }
             cache.insert(*id, Arc::new(data_to_cache));
 
-            Arc::new(RoomGeneration { index, cache })
+            (index, cache)
         };
 
-        self.rooms
-            .write()
-            .entry(*room_id)
-            .or_insert_with(|| {
-                ArcSwap::from_pointee(RoomGeneration {
-                    index: LossyIndex::new(0),
-                    cache: Arc::new(NodeCache::new(self.cache_capacity)),
-                })
-            })
-            .store(new_gen);
+        self.store_generation(room_id, index, Some(cache));
 
         Ok(())
     }
