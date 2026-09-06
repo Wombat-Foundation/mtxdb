@@ -1351,6 +1351,19 @@ mod tests {
             .unwrap()
             .len();
 
+        let index_len = store.indexes.read().get(&room).map_or(0, |i| i.len());
+        let mut found_missing = 0u32;
+        for id in &garbage_ids {
+            if store.get(&room, id).unwrap().is_none() {
+                found_missing += 1;
+            }
+        }
+        eprintln!(
+            "DEBUG: pack_size={pack_size_after}, index_len={index_len}, \
+             garbage_missing={found_missing}/{}",
+            garbage_ids.len()
+        );
+
         // The live chain must still be readable, with correct bytes, after
         // whatever repacking happened along the way.
         assert_eq!(
@@ -1367,17 +1380,11 @@ mod tests {
         // otherwise this test never actually exercised maybe_repack at all,
         // it just proved plain put()/get() works (already covered
         // elsewhere).
-        let mut any_garbage_dropped = false;
-        for id in &garbage_ids {
-            if store.get(&room, id).unwrap().is_none() {
-                any_garbage_dropped = true;
-                break;
-            }
-        }
         assert!(
-            any_garbage_dropped,
+            found_missing > 0,
             "expected at least one unregistered garbage node to be reclaimed by a \
-             triggered repack (pack size after writes: {pack_size_after} bytes) — \
+             triggered repack (pack size after writes: {pack_size_after} bytes, \
+             index entries: {index_len}) — \
              if none were dropped, maybe_repack likely never fired"
         );
     }
