@@ -86,5 +86,7 @@ bench: ##H Run benchmarks
 .PHONY: clean
 clean: ##H Clean build artifacts
 	$(CARGO) clean
+	cd mtxdb-cli && $(CARGO) clean
 	cd mtxdb-ffi && $(CARGO) clean
 	cd mtxdb-wasm && $(CARGO) clean
+	rm -rf .coverage/ lcov.info

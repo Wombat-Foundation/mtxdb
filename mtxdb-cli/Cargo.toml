@@ -12,11 +12,13 @@ name = "mtxdb"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "=4.5.48", features = ["derive", "env"] }
 anyhow = "1.0"
+base64 = "0.23.1"
+bytes = "1.5"
+clap = { version = "=4.5.48", default-features = false, features = ["std", "env", "help", "usage", "error-context"] }
 hex = "0.4"
 mtxdb = { path = ".." }
-bytes = "1.5"
+simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
 [lints.rust]
 unsafe_code = "deny"
