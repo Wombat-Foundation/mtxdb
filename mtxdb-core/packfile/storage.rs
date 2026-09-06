@@ -1360,7 +1360,11 @@ mod tests {
             .unwrap()
             .len();
 
-        let index_len = store.indexes.read().get(&room).map_or(0, |i| i.len());
+        let index_len = store
+            .indexes
+            .read()
+            .get(&room)
+            .map_or(0, crate::index::LossyIndex::len);
         let mut found_missing = 0u32;
         for id in &garbage_ids {
             if store.get(&room, id).unwrap().is_none() {
