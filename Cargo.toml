@@ -13,6 +13,8 @@ keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
 
 [workspace]
+members = ["mtxdb-ffi", "mtxdb-wasm"]
+resolver = "2"
 
 [lib]
 path = "mtxdb-core/lib.rs"

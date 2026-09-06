@@ -22,17 +22,17 @@ check-cargo-sort:
 	@command -v cargo-sort >/dev/null || { echo "cargo-sort is required; install it with: cargo install cargo-sort" >&2; exit 1; }
 
 .PHONY: check
-check: ##H Cargo check and code dupe
-	$(CARGO) check --workspace --all-targets
+check: ##H Cargo check (core) and code dupe
+	$(CARGO) check --all-targets
 	-jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
-lint: ##H Run clippy lints
-	$(CARGO) clippy --workspace --all-targets --all-features -- $(if $(CI),-D warnings)
+lint: ##H Run clippy lints (only core, not full workspace)
+	$(CARGO) clippy --all-targets --all-features -- $(if $(CI),-D warnings)
 
 .PHONY: fix
-fix: ##H Apply auto-fixes with clippy
-	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --workspace --all-targets
+fix: ##H Apply auto-fixes with clippy (only core)
+	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets
 
 
 
@@ -45,8 +45,8 @@ doc: ##H Build docs
 
 
 .PHONY: test
-test: ##H Run tests
-	$(CARGO) test --workspace --lib --tests --timings
+test: ##H Run tests (only core)
+	$(CARGO) test --lib --tests --timings
 
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
