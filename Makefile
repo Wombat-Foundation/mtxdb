@@ -12,14 +12,10 @@ _help:
 
 
 .PHONY: format
-format: check-cargo-sort ##H Format code
+format: ##H Format code
 	prettier -w $$(git ls-files '*.md' '*.y*ml')
 	pre-commit run --all-files
 	$(CARGO) sort --workspace --grouped
-
-.PHONY: check-cargo-sort
-check-cargo-sort:
-	@command -v cargo-sort >/dev/null || { echo "cargo-sort is required; install it with: cargo install cargo-sort" >&2; exit 1; }
 
 .PHONY: check
 check: ##H Cargo check (core) and code dupe
@@ -34,7 +30,8 @@ lint: ##H Run clippy lints (only core, not full workspace)
 .PHONY: fix
 fix: ##H Apply auto-fixes with clippy (only core)
 	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets
-
+	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets --manifest-path mtxdb-ffi/Cargo.toml
+	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets --manifest-path mtxdb-wasm/Cargo.toml
 
 
 .PHONY: doc

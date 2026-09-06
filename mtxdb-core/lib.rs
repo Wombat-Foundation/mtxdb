@@ -10,6 +10,7 @@
 //! Copyright (c) 2026 Shane Jaroch <chown_tee@proton.me>
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![allow(clippy::module_name_repetitions)]
 
 pub mod cache;
 pub mod dag;

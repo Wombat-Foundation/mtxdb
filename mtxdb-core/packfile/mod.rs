@@ -64,9 +64,10 @@ pub struct PackGeneration {
     /// would record the same offset for both, permanently orphaning one.
     pub(crate) append_lock: parking_lot::Mutex<()>,
     /// Whether this generation is still the active one for its room.
-    /// Set to `false` when `RepackManager::swap_pack` replaces it.
-    /// Drop only deletes the file when this is still `true`, preventing
-    /// a wrapped `pack_id` from unlinking a newer generation's file.
+    /// Set to `false` when `RepackManager::swap_pack` replaces it or
+    /// `RepackManager::purge_room` retires it. Drop deletes the file only
+    /// when this is `false` — a generation still marked current (e.g. one
+    /// dropped during ordinary process shutdown) must never lose its file.
     pub(crate) is_current: AtomicBool,
 }
 
@@ -131,10 +132,17 @@ pub(crate) fn map_pack(file: &File) -> io::Result<Mmap> {
 
 impl Drop for PackGeneration {
     fn drop(&mut self) {
-        // Packfiles are persistent data. Never delete on drop — normal
-        // shutdown must not destroy the current generation's file. Cleanup
-        // happens only through explicit `purge_room`, which removes the
-        // generation from the map and lets the last reader unlink the file.
+        // Packfiles are persistent data — deleting one still marked
+        // current would destroy live state on ordinary process shutdown
+        // (every `Arc<PackGeneration>` drops then, including the one held
+        // by `RepackManager::packs`). Only a generation explicitly retired
+        // by `swap_pack` (superseded by a repack) or `purge_room` (room
+        // deleted) has `is_current == false`; that file's data has already
+        // been carried forward (or the whole room dropped), so it is safe
+        // to unlink once the last reader — this `Arc` — goes away.
+        if !self.is_current.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -289,11 +297,20 @@ pub fn open_packfile(path: &Path, create: bool) -> io::Result<File> {
 }
 
 /// Scan an existing packfile and rebuild a (hash → offset) map.
-/// Used for crash recovery of the in-memory index.
+/// Used for crash recovery of the in-memory index and index rebuilds.
+///
+/// Does **not** truncate the file — safe to call on the active generation
+/// while concurrent appends are landing. A torn tail (a crashed write that
+/// leaves an incomplete final frame) stops the scan gracefully and returns
+/// the entries found before it. Anything else `read_record` rejects — an
+/// invalid length, a CRC mismatch — is mid-file corruption, not a torn
+/// tail, and is propagated as an error rather than silently discarded:
+/// opening on a truncated `Ok` here would look identical to actual data
+/// loss to every caller downstream.
 ///
 /// # Errors
-/// Returns `io::Error` on read failure (but stops gracefully on
-/// unexpected EOF or corrupt tail).
+/// Returns `io::Error` on I/O failure during open or header read, or on
+/// any read-loop error other than `UnexpectedEof`.
 pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -312,9 +329,10 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => {
-                // Torn tail — stop at last good record
-                eprintln!("warning: packfile scan stopped at offset {offset}: {e}");
-                break;
+                // Propagate real corruption (CRC mismatch, invalid length)
+                // rather than silently discarding it — the caller decides
+                // whether to recover or fail.
+                return Err(e);
             }
         }
     }
@@ -325,6 +343,11 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>> {
 /// Scan a packfile and truncate any torn tail at the last valid record
 /// boundary. Used during explicit recovery to repair a packfile before
 /// reopening for append.
+///
+/// Only truncates on `UnexpectedEof` (a torn tail from a crashed write).
+/// Other errors (CRC mismatch, invalid length) are propagated without
+/// truncating — mid-file corruption should not discard valid records
+/// that follow the corrupt frame.
 ///
 /// # Errors
 /// Returns `io::Error` on read or truncate failure.
@@ -338,6 +361,7 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>
     }
 
     let mut last_valid_offset = reader.stream_position()?;
+    let mut truncated = false;
     loop {
         let offset = reader.stream_position()?;
         match read_record(&mut reader) {
@@ -346,18 +370,26 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>
                 last_valid_offset = reader.stream_position()?;
             }
             Ok(None) => break,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                eprintln!("warning: packfile scan stopped at offset {offset}: {e}");
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Torn tail: a write crashed mid-frame. Truncate to the
+                // last valid record boundary so future appends don't land
+                // after a corrupt frame.
+                truncated = true;
                 break;
+            }
+            Err(e) => {
+                // Real corruption (CRC mismatch, invalid length) — propagate
+                // without truncating. Later valid records may exist past the
+                // corrupt frame; truncating would lose them.
+                return Err(e);
             }
         }
     }
 
-    // Truncate torn tail: if we stopped mid-record, rewind to the last
-    // valid record boundary so future appends don't land after a corrupt frame.
-    drop(reader);
-    {
+    // Only truncate if we actually hit a torn tail — not on clean EOF
+    // or mid-file corruption (which was propagated as an error above).
+    if truncated {
+        drop(reader);
         let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(last_valid_offset)?;
         file.sync_all()?;
@@ -541,11 +573,15 @@ mod tests {
         let dir = test_dir("scan_torn");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("00000000000000000000000000000000_00.pack");
-        // Write header + one valid record + partial garbage
+        // Write header + one valid record + a torn tail: fewer than 4
+        // bytes, so read_record can't even complete reading the length
+        // prefix and hits UnexpectedEof — a genuine crash-mid-append,
+        // not a complete-but-invalid frame (which is corruption and must
+        // be propagated as an error, not tolerated here).
         let mut buf = Vec::new();
         write_header(&mut buf).unwrap();
         write_record(&mut buf, &test_record([0xaa; 16], b"data")).unwrap();
-        buf.extend_from_slice(&[0xff; 10]); // torn trailing bytes
+        buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes
         std::fs::write(&path, &buf).unwrap();
         let entries = scan_packfile(&path).unwrap();
         assert_eq!(entries.len(), 1);
@@ -560,7 +596,13 @@ mod tests {
         write_header(&mut buf).unwrap();
         write_record(&mut buf, &test_record([0xaa; 16], b"good")).unwrap();
         let valid_len = buf.len();
-        buf.extend_from_slice(&[0xff; 20]); // torn tail
+        // Simulate a realistic torn tail: valid length prefix + partial
+        // payload (missing CRC). This mimics a crash mid-write where
+        // write_record's 4 write_all calls were partially completed.
+        let partial_payload_len: u32 = 16 + 4; // 16-byte hash + 4 bytes of data
+        buf.extend_from_slice(&partial_payload_len.to_le_bytes());
+        buf.extend_from_slice(&[0xbb; 16]); // hash
+        buf.extend_from_slice(&[0xcc; 4]); // partial data (CRC never written)
         std::fs::write(&path, &buf).unwrap();
         let entries = scan_and_recover_packfile(&path).unwrap();
         assert_eq!(entries.len(), 1);

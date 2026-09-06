@@ -36,8 +36,8 @@ impl MdbStorage {
 
     /// Store a node. Both `room_id` and `node_id` must be 16-byte arrays.
     pub fn put(&self, room_id: &[u8], node_id: &[u8], data: &[u8]) -> Result<(), JsValue> {
-        let room = as_room_id(room_id)?;
-        let id = as_node_id(node_id)?;
+        let room = as_id(room_id, "room_id")?;
+        let id = as_id(node_id, "node_id")?;
         let node_data = NodeData::new(bytes::Bytes::copy_from_slice(data));
         self.inner
             .put(&room, &id, &node_data)
@@ -46,8 +46,8 @@ impl MdbStorage {
 
     /// Fetch a node. Returns `null` if not found.
     pub fn get(&self, room_id: &[u8], node_id: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
-        let room = as_room_id(room_id)?;
-        let id = as_node_id(node_id)?;
+        let room = as_id(room_id, "room_id")?;
+        let id = as_id(node_id, "node_id")?;
         match self
             .inner
             .get(&room, &id)
@@ -60,7 +60,7 @@ impl MdbStorage {
 
     /// Delete all data for a room.
     pub fn delete_room(&self, room_id: &[u8]) -> Result<(), JsValue> {
-        let room = as_room_id(room_id)?;
+        let room = as_id(room_id, "room_id")?;
         self.inner
             .delete_room(&room)
             .map_err(|e| JsValue::from_str(&e.to_string()))
@@ -74,18 +74,9 @@ impl MdbStorage {
     }
 }
 
-fn as_room_id(bytes: &[u8]) -> Result<[u8; 16], JsValue> {
+fn as_id(bytes: &[u8], label: &str) -> Result<[u8; 16], JsValue> {
     if bytes.len() != 16 {
-        return Err(JsValue::from_str("room_id must be 16 bytes"));
-    }
-    let mut id = [0u8; 16];
-    id.copy_from_slice(bytes);
-    Ok(id)
-}
-
-fn as_node_id(bytes: &[u8]) -> Result<[u8; 16], JsValue> {
-    if bytes.len() != 16 {
-        return Err(JsValue::from_str("node_id must be 16 bytes"));
+        return Err(JsValue::from_str(&format!("{label} must be 16 bytes")));
     }
     let mut id = [0u8; 16];
     id.copy_from_slice(bytes);

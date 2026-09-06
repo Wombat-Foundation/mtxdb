@@ -302,7 +302,8 @@ struct BenchResult {
 }
 
 fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> BenchResult {
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_{label}_{total_events}"));
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_{label}_{total_events}_{pid}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -365,8 +366,9 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     } else {
         0.0
     };
-    let index_loss_rate = if get_calls > 0 {
-        (get_not_found as f64 / get_calls as f64) * 100.0
+    let completed_lookups = get_found + get_not_found;
+    let index_loss_rate = if completed_lookups > 0 {
+        (get_not_found as f64 / completed_lookups as f64) * 100.0
     } else {
         0.0
     };
@@ -590,7 +592,8 @@ fn auth_chain(dag: &DagGenerator, start: usize, max_depth: usize) -> HashSet<usi
 /// vs. materialized-state vs. integration-as-is decision should be made
 /// on, not a guess.
 fn run_intent_benchmark(total_events: usize) {
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_intent_{total_events}"));
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_intent_{total_events}_{pid}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -761,7 +764,8 @@ fn reaction_id(salt: u64, idx: u64) -> NodeId {
 }
 
 fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_swarm_{history_len}"));
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_swarm_{history_len}_{pid}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 

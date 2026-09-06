@@ -224,8 +224,21 @@ impl RepackManager {
         let room_arc = self.room_mutex(room_id);
         let _room_guard = room_arc.lock();
         if let Some(gen) = self.remove_room(room_id) {
+            // Mark retired so PackGeneration::Drop unlinks the file once
+            // every other reader's Arc has also gone away — otherwise the
+            // file would sit on disk forever with no map entry pointing
+            // at it, exactly the "current" default a live generation
+            // relies on to survive an ordinary shutdown.
+            gen.is_current.store(false, Ordering::Release);
             drop(gen);
         }
+        // Same unbounded-growth problem as PackfileStorage::put_locks:
+        // nothing else ever removes an entry from room_locks, so a purged
+        // room would otherwise keep its Arc<Mutex<()>> alive forever. The
+        // Arc keeps the inner mutex alive for `_room_guard` regardless of
+        // map membership, so removing the map entry here is safe while
+        // still holding the guard.
+        self.room_locks.lock().remove(room_id);
         Ok(())
     }
 
@@ -451,6 +464,73 @@ mod tests {
         assert!(manager.get_pack(&[0xBB; 16]).is_some());
         manager.purge_room(&[0xBB; 16]).unwrap();
         assert!(manager.get_pack(&[0xBB; 16]).is_none());
+    }
+
+    #[test]
+    fn test_purge_deletes_file_from_disk() {
+        // Regression: purge_room used to drop the Arc without ever marking
+        // the generation retired, so PackGeneration::Drop (a no-op unless
+        // is_current == false) left the file sitting on disk forever with
+        // nothing in the map pointing at it.
+        let dir = test_dir("purge_disk");
+        let path = dir.join("test.pack");
+        let file = packfile::open_packfile(&path, true).unwrap();
+        let manager = RepackManager::new(dir);
+        let gen = Arc::new(PackGeneration {
+            room_id: [0xDD; 16],
+            pack_id: 0,
+            file,
+            path: path.clone(),
+            mmap: parking_lot::RwLock::new(None),
+            append_lock: parking_lot::Mutex::new(()),
+            is_current: std::sync::atomic::AtomicBool::new(true),
+        });
+        manager.swap_pack([0xDD; 16], gen);
+        assert!(path.exists());
+
+        manager.purge_room(&[0xDD; 16]).unwrap();
+
+        assert!(
+            !path.exists(),
+            "purge_room must unlink the packfile once the last Arc drops"
+        );
+    }
+
+    #[test]
+    fn test_repack_deletes_superseded_generation_file() {
+        // Regression: swap_pack marks the old generation not-current, but
+        // PackGeneration::Drop previously never acted on that flag at all
+        // — retired generations from every repack accumulated on disk
+        // forever.
+        let dir = test_dir("repack_gc");
+        let manager = RepackManager::new(dir);
+
+        let mut nodes = HashMap::new();
+        for i in 1..=3u8 {
+            let (id, data, children) = make_node(i);
+            nodes.insert(id, (data, children));
+        }
+        let mut root = [0u8; 16];
+        root[0] = 3;
+
+        let first_gen = manager
+            .repack_room([0xEE; 16], [root], make_resolver(nodes.clone()))
+            .unwrap();
+        let first_path = first_gen.path.clone();
+        assert!(first_path.exists());
+        drop(first_gen);
+
+        let second_gen = manager
+            .repack_room([0xEE; 16], [root], make_resolver(nodes))
+            .unwrap();
+        assert!(second_gen.path.exists());
+        assert_ne!(first_path, second_gen.path);
+
+        assert!(
+            !first_path.exists(),
+            "superseded generation's file must be unlinked once its last \
+             Arc (the local `first_gen` binding, dropped above) goes away"
+        );
     }
 
     #[test]

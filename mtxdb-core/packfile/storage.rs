@@ -177,6 +177,13 @@ impl PackfileStorage {
         repack: &RepackManager,
         indexes: &mut HashMap<[u8; 16], LossyIndex>,
     ) -> Result<(), std::io::Error> {
+        // Candidate packs per room, so directory iteration order (which is
+        // filesystem-dependent, not chronological) can never pick an older
+        // generation over a newer one: we see every pack for a room first,
+        // then select the newest by mtime before touching indexes/repack.
+        let mut candidates: HashMap<[u8; 16], Vec<(u8, std::time::SystemTime, PathBuf)>> =
+            HashMap::new();
+
         for entry in fs::read_dir(base_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -212,27 +219,55 @@ impl PackfileStorage {
                     continue;
                 };
 
-                if let Ok(entries) = packfile::scan_packfile(&path) {
-                    let mut index = LossyIndex::new(entries.len().saturating_mul(2));
-                    for (hash, offset) in &entries {
-                        let _ = index.insert(hash, pack_id, *offset);
-                    }
-                    indexes.insert(room_id, index);
-                }
-
-                if let Ok(file) = packfile::open_packfile(&path, false) {
-                    let gen = Arc::new(PackGeneration {
-                        room_id,
-                        pack_id,
-                        file,
-                        path: path.clone(),
-                        mmap: parking_lot::RwLock::new(None),
-                        append_lock: parking_lot::Mutex::new(()),
-                        is_current: std::sync::atomic::AtomicBool::new(true),
-                    });
-                    repack.swap_pack(room_id, gen);
-                }
+                let mtime = entry.metadata().and_then(|m| m.modified())?;
+                candidates
+                    .entry(room_id)
+                    .or_default()
+                    .push((pack_id, mtime, path));
             }
+        }
+
+        for (room_id, mut packs) in candidates {
+            // Newest generation wins: mtime survives pack_id wraparound,
+            // where numeric comparison alone can't tell a fresh generation
+            // from a retired one that happens to have a smaller ID.
+            packs.sort_unstable_by_key(|(_, mtime, _)| *mtime);
+            let Some((pack_id, _, path)) = packs.pop() else {
+                continue;
+            };
+
+            // Use the recovery variant at startup: it truncates torn tails
+            // (UnexpectedEof) so appends resume at a valid record boundary.
+            // If recovery itself fails (e.g. mid-file CRC corruption),
+            // fall back to the non-truncating scan to load whatever valid
+            // records exist — a corrupted tail should not prevent opening.
+            let entries = match packfile::scan_and_recover_packfile(&path) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!(
+                        "warning: recovery scan failed for {}, falling back to partial scan: {e}",
+                        path.display()
+                    );
+                    packfile::scan_packfile(&path)?
+                }
+            };
+            let mut index = LossyIndex::new(entries.len().saturating_mul(2).max(16));
+            for (hash, offset) in &entries {
+                let _ = index.insert(hash, pack_id, *offset);
+            }
+            indexes.insert(room_id, index);
+
+            let file = packfile::open_packfile(&path, false)?;
+            let gen = Arc::new(PackGeneration {
+                room_id,
+                pack_id,
+                file,
+                path: path.clone(),
+                mmap: parking_lot::RwLock::new(None),
+                append_lock: parking_lot::Mutex::new(()),
+                is_current: std::sync::atomic::AtomicBool::new(true),
+            });
+            repack.swap_pack(room_id, gen);
         }
         Ok(())
     }
@@ -802,6 +837,11 @@ impl StorageEngine for PackfileStorage {
         // lifetime as rooms are created and purged — nothing else ever
         // removes an entry from it.
         self.live_roots.write().remove(room_id);
+        // Same growth-without-bound problem for the per-room put/repack
+        // lock: nothing else ever drops an entry from this map, so every
+        // room ever created (even one later purged) would otherwise keep
+        // an `Arc<Mutex<()>>` alive for the process's lifetime.
+        self.put_locks.lock().remove(room_id);
         // Invalidate the cache: the cache is global (content-addressed)
         // and doesn't track room membership. Without clearing, a node
         // from the deleted room could be served if the same hash is
@@ -1320,6 +1360,58 @@ mod tests {
         assert!(store.get(&TEST_ROOM, &id_a).unwrap().is_none());
         let got_b = store.get(&OTHER_ROOM, &id_b).unwrap().unwrap();
         assert_eq!(got_b.bytes, data_b.bytes);
+    }
+
+    #[test]
+    fn test_scan_existing_picks_newest_generation() {
+        // Regression: scan_existing used to register whichever pack for a
+        // room it encountered LAST in fs::read_dir order — filesystem-
+        // dependent, not chronological — so an older generation left on
+        // disk (e.g. a repack whose retired file hadn't been unlinked yet)
+        // could win over the newer one and silently resurrect stale data.
+        let dir = test_dir("recover_newest");
+
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            let id_old = [0x10u8; 16];
+            store
+                .put(
+                    &TEST_ROOM,
+                    &id_old,
+                    &NodeData::new(bytes::Bytes::from_static(b"gen0 data")),
+                )
+                .unwrap();
+        }
+        // Reopen and write again under a manually-forced next generation
+        // by repacking, so we end up with two "*_00.pack"/"*_01.pack"
+        // files for the same room on disk simultaneously (retired file
+        // not yet unlinked because we still hold no live Arc across the
+        // reopen boundary — mtimes differ, which is exactly what the fix
+        // relies on since pack_id order alone is not reliable across
+        // wraparound).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let id_new = [0x11u8; 16];
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(
+                    &TEST_ROOM,
+                    &id_new,
+                    &NodeData::new(bytes::Bytes::from_static(b"gen0 reopened data")),
+                )
+                .unwrap();
+            store.set_live_roots(&TEST_ROOM, vec![id_new]);
+            store.set_repack_threshold_bytes(0);
+            store.maybe_repack(&TEST_ROOM);
+        }
+
+        // Reopen once more: recovery must pick the repacked (newest)
+        // generation, which contains id_new but not id_old.
+        let store = PackfileStorage::open(dir).unwrap();
+        assert!(
+            store.get(&TEST_ROOM, &id_new).unwrap().is_some(),
+            "recovery must select the newest generation for the room"
+        );
     }
 
     #[test]

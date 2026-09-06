@@ -104,7 +104,10 @@ pub unsafe extern "C" fn mdb_put(
     }
 }
 
-/// Fetch a node. Returns null if not found.
+/// Fetch a node. Returns null if not found or on error.
+///
+/// For distinguishing "not found" from I/O errors, use `mdb_get_ex`
+/// which writes the error code to an out-parameter.
 ///
 /// The caller must destroy the returned handle with `mdb_node_data_destroy`.
 ///
@@ -126,6 +129,53 @@ pub unsafe extern "C" fn mdb_get(
     match storage.inner.get(&room, &id) {
         Ok(Some(data)) => Box::into_raw(Box::new(MdbNodeData { inner: data })),
         _ => ptr::null_mut(),
+    }
+}
+
+/// Fetch a node with explicit error reporting.
+///
+/// Returns null if not found. On I/O error, writes the error code to
+/// `*out_err` and returns null. On success, writes `MdbError::Ok` to
+/// `*out_err` and returns the node handle.
+///
+/// The caller must destroy the returned handle with `mdb_node_data_destroy`.
+///
+/// # Safety
+/// - `handle` must be a valid pointer from `mdb_storage_open`.
+/// - `room_id` must point to at least 16 bytes.
+/// - `node_id` must point to at least 16 bytes.
+/// - `out_err` must be a valid mutable pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mdb_get_ex(
+    handle: *mut MdbStorage,
+    room_id: *const u8,
+    node_id: *const u8,
+    out_err: *mut MdbError,
+) -> *mut MdbNodeData {
+    let Some(storage) = (unsafe { handle.as_ref() }) else {
+        unsafe { *out_err = MdbError::InvalidInput };
+        return ptr::null_mut();
+    };
+    let room = unsafe { read_id(room_id) };
+    let id = unsafe { read_id(node_id) };
+    match storage.inner.get(&room, &id) {
+        Ok(Some(data)) => {
+            unsafe { *out_err = MdbError::Ok };
+            Box::into_raw(Box::new(MdbNodeData { inner: data }))
+        }
+        Ok(None) => {
+            unsafe { *out_err = MdbError::Ok };
+            ptr::null_mut()
+        }
+        Err(e) => {
+            let code = match e {
+                mtxdb::storage::StorageError::Io(_) => MdbError::Io,
+                mtxdb::storage::StorageError::Corrupt(_) => MdbError::Io,
+                _ => MdbError::Internal,
+            };
+            unsafe { *out_err = code };
+            ptr::null_mut()
+        }
     }
 }
 
@@ -201,7 +251,8 @@ mod tests {
 
     #[test]
     fn test_ffi_roundtrip() {
-        let dir = std::env::temp_dir().join("mdb_ffi_test");
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("mdb_ffi_test_{pid}"));
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = CString::new(dir.to_str().unwrap()).unwrap();
