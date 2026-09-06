@@ -17,7 +17,7 @@ pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 
 /// A single record in the packfile.
 ///
-/// Frame layout on disk (v2 — global shard format):
+/// Frame layout on disk (v1 — global shard format with `room_id`):
 /// ```text
 /// [u32 len]            — byte length of (room_id ++ hash ++ node_bytes), little-endian
 /// [16-byte room_id]    — room this record belongs to (for shard scan recovery)

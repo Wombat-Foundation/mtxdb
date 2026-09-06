@@ -217,17 +217,20 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Re
             .map(|r| parse_node_id(r))
             .collect::<anyhow::Result<_>>()?;
         store.set_live_roots(&room_id, root_ids);
+    } else if topo {
+        eprintln!("warning: --topo without --root means no GC; all records preserved");
     }
 
     if topo {
-        store.repack_room_topo(&room_id, extract_matrix_edges)?;
+        let (kept, dropped) = store.repack_room_reachable(&room_id, extract_matrix_edges)?;
+        let hex = hex_encode(&room_id);
+        eprintln!("repacked {hex} (topo reachable): {kept} kept, {dropped} dropped");
     } else {
         store.repack_room_rewrite(&room_id)?;
+        let hex = hex_encode(&room_id);
+        eprintln!("repacked {hex} (flat rewrite)");
     }
 
-    let hex = hex_encode(&room_id);
-    let mode = if topo { "topo" } else { "flat" };
-    eprintln!("repacked {hex} ({mode})");
     Ok(())
 }
 

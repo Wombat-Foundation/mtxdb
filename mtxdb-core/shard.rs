@@ -44,6 +44,21 @@ pub struct Shard {
     pub(crate) file_len: AtomicU64,
 }
 
+
+impl Shard {
+    fn new(shard_id: u8, file: File, path: PathBuf, file_len: u64) -> Self {
+        Self {
+            shard_id,
+            file,
+            path,
+            mmap: RwLock::new(None),
+            append_lock: parking_lot::Mutex::new(()),
+            is_current: AtomicBool::new(true),
+            file_len: AtomicU64::new(file_len),
+        }
+    }
+}
+
 impl Shard {
     /// Get the memory-mapped view, creating it if absent.
     ///
@@ -111,15 +126,7 @@ impl ShardPool {
                             if id < MAX_SHARDS_U8 {
                                 let file = packfile::open_packfile(&path, false)?;
                                 let file_len = file.metadata()?.len();
-                                let shard = Arc::new(Shard {
-                                    shard_id: id,
-                                    file,
-                                    path,
-                                    mmap: RwLock::new(None),
-                                    append_lock: parking_lot::Mutex::new(()),
-                                    is_current: AtomicBool::new(true),
-                                    file_len: AtomicU64::new(file_len),
-                                });
+                                let shard = Arc::new(Shard::new(id, file, path, file_len));
                                 shards[id as usize] = Some(shard);
                                 if id > highest_active {
                                     highest_active = id;
@@ -136,15 +143,7 @@ impl ShardPool {
             let path = Self::shard_path(&base_dir, 0);
             let file = packfile::open_packfile(&path, true)?;
             let file_len = file.metadata()?.len();
-            shards[0] = Some(Arc::new(Shard {
-                shard_id: 0,
-                file,
-                path,
-                mmap: RwLock::new(None),
-                append_lock: parking_lot::Mutex::new(()),
-                is_current: AtomicBool::new(true),
-                file_len: AtomicU64::new(file_len),
-            }));
+            shards[0] = Some(Arc::new(Shard::new(0, file, path, file_len)));
         }
 
         Ok(Self {
@@ -191,22 +190,26 @@ impl ShardPool {
         loop {
             let shard = self.active_shard();
             let record_len = record.serialized_len() as u64;
-            let current_len = shard.file_len.load(Ordering::Acquire);
-
-            // Check if this record would exceed the shard capacity
-            let fits = current_len
-                .checked_add(record_len)
-                .is_some_and(|sum| sum <= MAX_SHARD_BYTES);
-            if !fits && current_len > 5 {
-                // Don't rotate if the shard is nearly empty (just header)
-                self.rotate()?;
-                continue;
-            }
 
             let offset = {
-                let _guard = shard.append_lock.lock();
+                let guard = shard.append_lock.lock();
                 let mut file = shard.file.try_clone()?;
                 let offset = file.seek(io::SeekFrom::End(0))?;
+
+                // Check capacity while holding the append lock and after
+                // seeking to the true end — avoids TOCTOU race where two
+                // threads both pass the check then one exceeds the limit.
+                let current_len = shard.file_len.load(Ordering::Acquire);
+                let fits = current_len
+                    .checked_add(record_len)
+                    .is_some_and(|sum| sum <= MAX_SHARD_BYTES);
+                if !fits && current_len > 5 {
+                    drop(guard);
+                    drop(file);
+                    self.rotate()?;
+                    continue;
+                }
+
                 packfile::write_record(&mut file, record)?;
                 let new_len = offset.checked_add(record_len).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "offset + record_len overflow")
@@ -340,43 +343,20 @@ impl ShardPool {
                 let path = Self::shard_path(&self.base_dir, candidate);
                 let file = packfile::open_packfile(&path, true)?;
                 let file_len = file.metadata()?.len();
-                let shard = Arc::new(Shard {
-                    shard_id: candidate,
-                    file,
-                    path,
-                    mmap: RwLock::new(None),
-                    append_lock: parking_lot::Mutex::new(()),
-                    is_current: AtomicBool::new(true),
-                    file_len: AtomicU64::new(file_len),
-                });
-                shards[candidate as usize] = Some(shard);
+                shards[candidate as usize] = Some(Arc::new(Shard::new(candidate, file, path, file_len)));
                 drop(shards);
                 *self.active_write.lock() = candidate;
                 return Ok(());
             }
         }
 
-        // All slots occupied — pick the next one and overwrite it.
-        let candidate = current.wrapping_add(1).wrapping_rem(MAX_SHARDS_U8);
-        if let Some(ref old) = shards[candidate as usize] {
-            old.is_current.store(false, Ordering::Release);
-        }
-        let path = Self::shard_path(&self.base_dir, candidate);
-        let file = packfile::open_packfile(&path, true)?;
-        let file_len = file.metadata()?.len();
-        let shard = Arc::new(Shard {
-            shard_id: candidate,
-            file,
-            path,
-            mmap: RwLock::new(None),
-            append_lock: parking_lot::Mutex::new(()),
-            is_current: AtomicBool::new(true),
-            file_len: AtomicU64::new(file_len),
-        });
-        shards[candidate as usize] = Some(shard);
-        drop(shards);
-        *self.active_write.lock() = candidate;
-        Ok(())
+        // All slots occupied and none retired — fail rather than silently
+        // overwriting a shard that may still be referenced by room indexes.
+        // The caller must repack to reclaim retired shard slots before
+        // rotating again.
+        Err(io::Error::other(
+            "shard pool full: all slots occupied by active shards; repack to reclaim",
+        ))
     }
 
     /// Sync all shards to disk.
@@ -413,10 +393,7 @@ impl ShardPool {
                 }
                 Ok(None) => break,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => {
-                    eprintln!("warning: shard scan stopped at offset {offset}: {e}");
-                    break;
-                }
+                Err(e) => return Err(e),
             }
         }
 

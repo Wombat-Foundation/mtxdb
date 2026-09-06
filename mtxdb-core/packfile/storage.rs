@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Seek;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -101,11 +100,15 @@ impl PackfileStorage {
         cache_capacity: usize,
         swizzle: Option<SwizzleFn>,
     ) -> Result<Self, std::io::Error> {
+        type ShardRecord = (u8, [u8; 16], u64);
         fs::create_dir_all(&base_dir)?;
 
         let shards = ShardPool::open(base_dir.clone())?;
         let mut rooms: HashMap<[u8; 16], ArcSwap<RoomGeneration>> = HashMap::new();
 
+        // Phase 1: accumulate all records per room across every shard so
+        // the index can be sized once for the true total.
+        let mut room_entries: HashMap<[u8; 16], Vec<ShardRecord>> = HashMap::new();
         for shard_id in 0..shard::MAX_SHARDS_U8 {
             let path = ShardPool::shard_path(&base_dir, shard_id);
             if !path.exists() {
@@ -129,28 +132,33 @@ impl PackfileStorage {
                     }
                 }
             };
-            let mut room_entries: HashMap<[u8; 16], Vec<([u8; 16], u64)>> = HashMap::new();
-            for (room_id, hash, offset) in &entries {
+            for (room_id, hash, offset) in entries {
                 room_entries
-                    .entry(*room_id)
+                    .entry(room_id)
                     .or_default()
-                    .push((*hash, *offset));
+                    .push((shard_id, hash, offset));
             }
-            for (room_id, records) in room_entries {
-                let entry = rooms.entry(room_id).or_insert_with(|| {
-                    ArcSwap::from_pointee(RoomGeneration {
-                        index: LossyIndex::new(records.len().saturating_mul(2).max(16)),
-                        cache: Arc::new(NodeCache::new(cache_capacity)),
-                    })
-                });
-                let gen = entry.load();
-                let mut new_gen = (**gen).clone();
-                for (hash, offset) in &records {
-                    let _ = new_gen.index.insert(hash, shard_id, *offset);
-                }
-                drop(gen);
-                entry.store(Arc::new(new_gen));
+        }
+
+        // P1: load deleted rooms set (persisted to disk)
+        let deleted_rooms = Self::load_deleted_rooms(&base_dir);
+
+        // Phase 2: build per-room indexes sized to the true total.
+        for (room_id, records) in &room_entries {
+            if deleted_rooms.contains(room_id) {
+                continue;
             }
+            let mut index = LossyIndex::new(records.len().saturating_mul(2).max(16));
+            for (shard_id, hash, offset) in records {
+                let _ = index.insert(hash, *shard_id, *offset);
+            }
+            rooms.insert(
+                *room_id,
+                ArcSwap::from_pointee(RoomGeneration {
+                    index,
+                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                }),
+            );
         }
 
         Ok(Self {
@@ -291,7 +299,35 @@ impl PackfileStorage {
         index
     }
 
-    fn swap_generation(&self, room_id: &[u8; 16], index: LossyIndex) {
+    fn deleted_rooms_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join("deleted.rooms")
+    }
+
+    fn load_deleted_rooms(base_dir: &std::path::Path) -> HashSet<[u8; 16]> {
+        let path = Self::deleted_rooms_path(base_dir);
+        let Ok(bytes) = fs::read(&path) else {
+            return HashSet::new();
+        };
+        bytes
+            .chunks_exact(16)
+            .map(|chunk| {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(chunk);
+                id
+            })
+            .collect()
+    }
+
+    fn persist_deleted_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
+        let path = Self::deleted_rooms_path(&self.base_dir);
+        let mut set = Self::load_deleted_rooms(&self.base_dir);
+        set.insert(*room_id);
+        let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
+        fs::write(&path, &bytes).map_err(StorageError::Io)?;
+        Ok(())
+    }
+
+        fn swap_generation(&self, room_id: &[u8; 16], index: LossyIndex) {
         let cache = self.generation(room_id).map_or_else(
             || Arc::new(NodeCache::new(self.cache_capacity)),
             |gen| gen.cache.clone(),
@@ -596,36 +632,10 @@ impl PackfileStorage {
         room_id: &[u8; 16],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<(usize, usize), StorageError> {
-        type ShardHashOffset = ([u8; 16], u64);
-
         let room_arc = self.put_mutex(room_id);
         let _room_guard = room_arc.lock();
 
-        let mut scanned: Vec<(u8, Vec<ShardHashOffset>)> = Vec::new();
-
-        for shard_id in 0..shard::MAX_SHARDS_U8 {
-            let path = ShardPool::shard_path(&self.base_dir, shard_id);
-            if !path.exists() {
-                continue;
-            }
-            match packfile::scan_packfile(&path) {
-                Ok(entries) => {
-                    let room_entries: Vec<([u8; 16], u64)> = entries
-                        .into_iter()
-                        .filter(|(rid, _, _)| rid == room_id)
-                        .map(|(_, hash, offset)| (hash, offset))
-                        .collect();
-                    if !room_entries.is_empty() {
-                        scanned.push((shard_id, room_entries));
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: scan_packfile failed for shard {shard_id:02x} during repack: {e}"
-                    );
-                }
-            }
-        }
+        let scanned = self.scan_room_records(room_id);
 
         let scanned_count: usize = scanned.iter().map(|(_, entries)| entries.len()).sum();
 
@@ -781,25 +791,7 @@ impl StorageEngine for PackfileStorage {
             data: data.bytes.clone(),
         };
 
-        let (shard_id, offset) = {
-            let shard = self.shards.active_shard();
-            let _append_guard = shard.append_lock.lock();
-            let mut file = shard.file.try_clone()?;
-            let offset = file.seek(std::io::SeekFrom::End(0))?;
-            packfile::write_record(&mut file, &record)?;
-            let new_len = offset
-                .checked_add(record.serialized_len() as u64)
-                .ok_or_else(|| {
-                    StorageError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "offset + record_len overflow",
-                    ))
-                })?;
-            shard
-                .file_len
-                .store(new_len, std::sync::atomic::Ordering::Release);
-            (shard.shard_id, offset)
-        };
+        let (shard_id, offset) = self.shards.put_record(&record)?;
 
         let new_gen = {
             let old_gen = self.generation(room_id);
@@ -859,6 +851,7 @@ impl StorageEngine for PackfileStorage {
         self.rooms.write().remove(room_id);
         self.live_roots.write().remove(room_id);
         self.put_locks.lock().remove(room_id);
+        self.persist_deleted_room(room_id)?;
         Ok(())
     }
 

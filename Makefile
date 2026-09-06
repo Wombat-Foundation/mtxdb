@@ -79,12 +79,12 @@ build: ##H Build all
 bench: ##H Run benchmarks
 	$(CARGO) bench --benches
 
-PROJECT_CRATES ?= mtxdb-cli/  mtxdb-core/ mtxdb-ffi/  mtxdb-wasm/
+PROJECT_CRATES ?= mtxdb-cli/ mtxdb-core/ mtxdb-ffi/ mtxdb-wasm/
 
 .PHONY: sub
-sub:	##H Run a command for each create, c
-	test -n "${c}"
-	for d in $(PROJECT_CRATES); do cd $$d && ${c} || true; cd ..; done
+sub:	##H Run a command for each crate (set c= command)
+	@test -n "${c}" || (echo "error: set c=<command>"; exit 1)
+	@for d in $(PROJECT_CRATES); do echo "--- $$d ---"; (cd $$d && ${c}) || exit 1; done
 
 
 .PHONY: clean
