@@ -33,28 +33,37 @@ impl GraphEdge {
     #[inline]
     #[must_use]
     pub fn arena_index(self) -> usize {
-        debug_assert!(self.is_resident());
+        debug_assert!(
+            self.is_resident(),
+            "arena_index called on a disk-resident node"
+        );
         (self.0 & Self::PAYLOAD_MASK) as usize
     }
 
     #[inline]
     #[must_use]
     pub fn local_id(self) -> LocalId {
-        debug_assert!(!self.is_resident());
+        debug_assert!(
+            !self.is_resident(),
+            "local_id called on an arena-resident node"
+        );
         self.0 & Self::PAYLOAD_MASK
     }
 
     #[inline]
     #[must_use]
     pub fn resident(index: u32) -> Self {
-        debug_assert!(index <= Self::PAYLOAD_MASK);
+        debug_assert!(
+            index <= Self::PAYLOAD_MASK,
+            "resident index exceeds payload capacity"
+        );
         Self(Self::RESIDENT_BIT | (index & Self::PAYLOAD_MASK))
     }
 
     #[inline]
     #[must_use]
     pub fn disk(id: LocalId) -> Self {
-        debug_assert!(id <= Self::PAYLOAD_MASK);
+        debug_assert!(id <= Self::PAYLOAD_MASK, "disk id exceeds payload capacity");
         Self(id & Self::PAYLOAD_MASK)
     }
 }

@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use mtxdb::cache::NodeCache;
-use mtxdb::packfile_storage::PackfileStorage;
 use mtxdb::storage::{NodeData, NodeId, NodeRef, StorageEngine};
+use mtxdb::PackfileStorage;
 
 const ROOM: [u8; 16] = [0xAB; 16];
 
