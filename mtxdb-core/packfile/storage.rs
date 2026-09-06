@@ -15,6 +15,8 @@ use crate::shard;
 use crate::shard::{Shard, ShardPool};
 use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
 
+/// Callback that rewrites a node's child references given resolved child data,
+/// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
 
 /// Immutable snapshot of a room's in-memory state.
@@ -162,22 +164,23 @@ impl PackfileStorage {
             .map(arc_swap::ArcSwapAny::load)
     }
 
+    /// Room IDs currently known to this engine, sorted for deterministic output.
     pub fn room_ids(&self) -> Vec<[u8; 16]> {
         let mut ids: Vec<[u8; 16]> = self.rooms.read().keys().copied().collect();
         ids.sort_unstable();
         ids
     }
 
+    /// A room's `(entry count, memory usage in bytes)`, if the room exists.
     pub fn room_index_info(&self, room_id: &[u8; 16]) -> Option<(usize, usize)> {
-        self.rooms
-            .read()
-            .get(room_id)
-            .map(|gen| {
-                let g = gen.load();
-                (g.index.len(), g.index.memory_usage())
-            })
+        self.rooms.read().get(room_id).map(|gen| {
+            let g = gen.load();
+            (g.index.len(), g.index.memory_usage())
+        })
     }
 
+    /// `(room_id, entry count, memory usage in bytes)` for every known room,
+    /// sorted by room ID, in a single pass over the room map.
     pub fn room_summaries(&self) -> Vec<([u8; 16], usize, usize)> {
         let mut out: Vec<([u8; 16], usize, usize)> = self
             .rooms
@@ -192,20 +195,25 @@ impl PackfileStorage {
         out
     }
 
+    /// Set the live roots to preserve for a room on its next repack.
     pub fn set_live_roots(&self, room_id: &[u8; 16], roots: Vec<NodeId>) {
         self.live_roots.write().insert(*room_id, roots);
     }
 
+    /// Set the repack trigger threshold directly, in index entries.
     pub fn set_repack_threshold_entries(&self, entries: u64) {
         self.repack_threshold_entries
             .store(entries, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set the repack trigger threshold from an approximate byte budget
+    /// (assumes ~200 bytes/entry).
     pub fn set_repack_threshold_bytes(&self, bytes: u64) {
         let entries = bytes / 200;
         self.set_repack_threshold_entries(entries.max(1));
     }
 
+    /// The room-scoped node cache for `room_id`, or a fresh empty one if the room is unknown.
     pub fn room_cache(&self, room_id: &[u8; 16]) -> Arc<NodeCache> {
         self.generation(room_id).map_or_else(
             || Arc::new(NodeCache::new(self.cache_capacity)),

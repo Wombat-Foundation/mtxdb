@@ -25,8 +25,11 @@ pub type ShardEntry = ([u8; 16], [u8; 16], u64);
 
 /// A single global shard file shared across all rooms.
 pub struct Shard {
+    /// Identifier for this shard within the pool.
     pub shard_id: u8,
+    /// The open file handle backing this shard.
     pub file: File,
+    /// Filesystem path to this shard's file.
     pub path: PathBuf,
     /// Lazily-created mmap. Remapped when the file grows.
     pub(crate) mmap: RwLock<Option<Mmap>>,

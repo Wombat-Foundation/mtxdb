@@ -1,3 +1,8 @@
+//! Throughput/latency microbenchmarks for `PackfileStorage`.
+//!
+//! Not part of the public crate API — run via `cargo bench`. Lints are
+//! relaxed here since bench code favors straightforward arithmetic and
+//! formatting over the pedantic style enforced on the library itself.
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::cast_precision_loss,

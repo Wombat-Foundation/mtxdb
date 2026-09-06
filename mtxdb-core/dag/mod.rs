@@ -123,6 +123,7 @@ pub struct ActiveRoomFrontier {
 }
 
 impl ActiveRoomFrontier {
+    /// Create an empty frontier arena.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -250,6 +251,7 @@ impl ActiveRoomFrontier {
         self.nodes.len()
     }
 
+    /// Returns `true` if this room's frontier has no events.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()

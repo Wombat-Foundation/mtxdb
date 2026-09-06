@@ -16,17 +16,20 @@ pub struct FrontierBatch {
 }
 
 impl FrontierBatch {
+    /// Create a batch for the given hashes with all offsets unresolved.
     #[must_use]
     pub fn new(hashes: Vec<NodeId>) -> Self {
         let resolved = vec![None; hashes.len()];
         Self { hashes, resolved }
     }
 
+    /// Number of hashes in this batch.
     #[must_use]
     pub fn len(&self) -> usize {
         self.hashes.len()
     }
 
+    /// Returns `true` if this batch has no hashes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
@@ -99,6 +102,7 @@ pub struct BfsLayer {
 }
 
 impl BfsLayer {
+    /// Create an empty BFS layer.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -108,6 +112,7 @@ impl BfsLayer {
         }
     }
 
+    /// Record that `dependent` is waiting on `hash`, deduping `hash` entries.
     pub fn push(&mut self, hash: NodeId, dependent: NodeId) {
         if let Some(&pos) = self.seen.get(&hash) {
             self.dependents[pos].push(dependent);

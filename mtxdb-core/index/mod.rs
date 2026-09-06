@@ -44,26 +44,31 @@ impl IndexSlot {
         )
     }
 
+    /// The sentinel value representing an empty slot.
     #[must_use]
     pub fn empty() -> Self {
         Self::EMPTY
     }
 
+    /// Returns `true` if this slot is the empty sentinel.
     #[must_use]
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// The 24-bit tag stored in this slot.
     #[must_use]
     pub fn tag(self) -> u32 {
         ((self.0 >> Self::TAG_SHIFT) & 0xFF_FFFF) as u32
     }
 
+    /// The shard ID stored in this slot.
     #[must_use]
     pub fn shard_id(self) -> u8 {
         ((self.0 >> Self::SHARD_SHIFT) & 0xFF) as u8
     }
 
+    /// The byte offset within the shard stored in this slot.
     #[must_use]
     pub fn offset(self) -> u64 {
         (self.0 & Self::OFFSET_MASK).wrapping_sub(1)
@@ -291,8 +296,10 @@ impl LossyIndex {
     }
 }
 
+/// Errors that can occur while inserting into a [`LossyIndex`].
 #[derive(Debug)]
 pub enum InsertError {
+    /// The table has no free slots left for a new entry.
     TableFull,
 }
 
@@ -306,9 +313,12 @@ impl std::fmt::Display for InsertError {
 
 impl std::error::Error for InsertError {}
 
+/// Errors that can occur while deserializing a [`LossyIndex`] from bytes.
 #[derive(Debug)]
 pub enum DeserializationError {
+    /// The input buffer was too short to contain a valid header.
     TooShort,
+    /// The header declared a capacity that is not a valid power of two.
     InvalidCapacity,
 }
 

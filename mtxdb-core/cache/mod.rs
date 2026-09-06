@@ -113,6 +113,7 @@ pub struct NodeCache {
 }
 
 impl NodeCache {
+    /// Create a cache holding at most `max_entries` decoded nodes.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         Self {
@@ -123,6 +124,7 @@ impl NodeCache {
         }
     }
 
+    /// Create a cache using the default capacity (100,000 entries).
     #[must_use]
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_MAX_ENTRIES)
@@ -253,6 +255,7 @@ impl NodeCache {
         self.state.read().map.len()
     }
 
+    /// Returns `true` if the cache holds no entries.
     pub fn is_empty(&self) -> bool {
         self.state.read().map.is_empty()
     }
@@ -304,6 +307,7 @@ pub struct PinnedNodes {
 }
 
 impl PinnedNodes {
+    /// Create an empty pinned-node set.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -336,6 +340,7 @@ impl PinnedNodes {
         self.nodes.read().len()
     }
 
+    /// Returns `true` if no nodes are pinned.
     pub fn is_empty(&self) -> bool {
         self.nodes.read().is_empty()
     }

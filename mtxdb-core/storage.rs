@@ -9,11 +9,14 @@ pub type NodeId = [u8; 16];
 /// Opaque node data as raw bytes (the encoded HAMT node or PDU).
 #[derive(Debug, Clone)]
 pub struct NodeData {
+    /// The raw encoded node bytes.
     pub bytes: bytes::Bytes,
+    /// Child references, if this node has been decoded/swizzled.
     pub children: Vec<NodeRef>,
 }
 
 impl NodeData {
+    /// Wrap raw bytes as node data with no resolved children.
     pub fn new(bytes: bytes::Bytes) -> Self {
         Self {
             bytes,
@@ -30,11 +33,14 @@ impl NodeData {
 ///   with its structural hash stored alongside.
 #[derive(Debug, Clone)]
 pub enum NodeRef {
+    /// The node lives on disk, identified by its hash.
     Lazy(NodeId),
+    /// The node is resolved in memory, alongside its structural hash.
     Resolved(NodeId, Arc<NodeData>),
 }
 
 impl NodeRef {
+    /// The structural hash of the referenced node, regardless of residency.
     #[must_use]
     pub fn structural_hash(&self) -> &NodeId {
         match self {
@@ -46,6 +52,7 @@ impl NodeRef {
     // False-positive match against index/mod.rs's splitmix64 (a test-only
     // hash mixer) — token-shape coincidence, not related logic. See the
     // "why can't it be fixed" discussion: nothing to extract here.
+    /// The resolved node data, if this reference is already in memory.
     #[must_use]
     pub fn data(&self) -> Option<&Arc<NodeData>> {
         match self {
@@ -55,6 +62,7 @@ impl NodeRef {
     }
     // jscpd:ignore-end
 
+    /// Returns `true` if this reference is already resolved in memory.
     #[must_use]
     pub fn is_resolved(&self) -> bool {
         matches!(self, Self::Resolved(..))
@@ -121,12 +129,18 @@ pub trait StorageEngine: Send + Sync {
     fn sync(&self) -> Result<(), StorageError>;
 }
 
+/// Errors returned by [`StorageEngine`] operations.
 #[derive(Debug)]
 pub enum StorageError {
+    /// An underlying I/O operation failed.
     Io(std::io::Error),
+    /// The requested node was not found.
     NotFound(NodeId),
+    /// The node's content did not match its requested hash.
     VerificationFailed(NodeId),
+    /// The stored data is malformed or fails an integrity check.
     Corrupt(String),
+    /// An internal invariant was violated.
     Internal(String),
 }
 
@@ -166,6 +180,7 @@ pub struct InMemoryStorage {
 }
 
 impl InMemoryStorage {
+    /// Create an empty in-memory storage engine.
     #[must_use]
     pub fn new() -> Self {
         Self {

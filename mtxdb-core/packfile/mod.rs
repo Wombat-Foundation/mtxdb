@@ -1,3 +1,4 @@
+/// The [`PackfileStorage`](storage::PackfileStorage) engine and its supporting types.
 pub mod storage;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
@@ -30,12 +31,16 @@ pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 /// against the hash stored in the frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
+    /// The room this record belongs to.
     pub room_id: [u8; 16],
+    /// The structural hash framed alongside the record (index-rebuild metadata only).
     pub hash: [u8; 16],
+    /// The opaque node payload.
     pub data: Bytes,
 }
 
 impl Record {
+    /// Total on-disk frame size for this record, including length prefix and CRC.
     #[must_use]
     pub fn serialized_len(&self) -> usize {
         4_usize

@@ -12,12 +12,19 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::module_name_repetitions)]
 
+/// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
 pub mod cache;
+/// In-memory dependency DAG used to track unresolved node references.
 pub mod dag;
+/// Frontier tracking for nodes awaiting their dependencies before being writable.
 pub mod frontier;
+/// Lossy, append-only index mapping content hashes to packfile locations.
 pub mod index;
+/// On-disk packfile format and the storage engine built on top of it.
 pub mod packfile;
+/// Fixed-size shard file pool that packfiles are written into.
 pub mod shard;
+/// Core node/storage types and the top-level `StorageEngine`.
 pub mod storage;
 
 pub use cache::NodeCache;
