@@ -158,7 +158,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
 /// Returns `io::Error` on write failure.
 pub fn write_header(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(&MAGIC)?;
-    writer.write_all(&[0x02])?; // version 2: global shard format with room_id
+    writer.write_all(&[0x01])?; // version 1: global shard format with room_id
     Ok(())
 }
 
@@ -173,7 +173,7 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(e) => return Err(e),
     }
-    Ok(buf[..4] == MAGIC && buf[4] == 0x02)
+    Ok(buf[..4] == MAGIC && buf[4] == 0x01)
 }
 
 /// Open or create a packfile, writing the header if it's new.
