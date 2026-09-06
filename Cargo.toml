@@ -10,6 +10,7 @@ authors = ["Shane Jaroch <chown_tee@proton.me>"]
 readme = "README.md"
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
+publish = false
 
 [workspace]
 # exclude = ["mtxdb-ffi", "mtxdb-wasm"]
