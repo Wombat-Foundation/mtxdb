@@ -905,7 +905,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
 
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
-    eprintln!("Note: PackGeneration::Drop deletes packfiles on drop,");
+    eprintln!("Note: shard Drop deletes superseded shard files on drop,");
     eprintln!("so we clear the cache and re-read from open packfiles.");
     eprintln!();
 

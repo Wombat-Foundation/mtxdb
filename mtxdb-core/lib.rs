@@ -18,9 +18,11 @@ pub mod frontier;
 pub mod index;
 pub mod packfile;
 pub mod repack;
+pub mod shard;
 pub mod storage;
 
 pub use cache::NodeCache;
 pub use index::LossyIndex;
 pub use packfile::{storage::PackfileStorage, Record};
+pub use shard::ShardPool;
 pub use storage::{NodeData, NodeId, StorageEngine};

@@ -115,13 +115,14 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
 fn cmd_scan(path: &PathBuf) -> anyhow::Result<()> {
     let records = mtxdb::packfile::scan_packfile(path)?;
     eprintln!(
-        "packfile: {} bytes, {} records",
+        "shard: {} bytes, {} records",
         std::fs::metadata(path)?.len(),
         records.len()
     );
-    for (node_id, offset) in &records {
-        let hex: String = node_id.iter().map(|b| format!("{b:02x}")).collect();
-        eprintln!("  {hex} @ {offset}");
+    for (room_id, node_id, offset) in &records {
+        let room_hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
+        let id_hex: String = node_id.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("  room={room_hex} id={id_hex} @ {offset}");
     }
     Ok(())
 }
@@ -215,17 +216,13 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String]) -> anyhow::Result<()> {
 
     store.set_live_roots(&room_id, root_ids.clone());
 
-    let resolver = |id: &mtxdb::NodeId| -> Option<(NodeData, Vec<mtxdb::NodeId>)> {
-        let data = store.get(&room_id, id).ok().flatten()?;
-        Some((data, vec![]))
-    };
-
-    let gen = store
-        .repack_manager()
-        .repack_room(room_id, root_ids, resolver)?;
+    // Trigger a repack by setting a very low threshold and writing a dummy record
+    store.set_repack_threshold_bytes(0);
+    let dummy = mtxdb::NodeData::new(bytes::Bytes::from_static(b""));
+    store.put(&room_id, &[0u8; 16], &dummy)?;
 
     let hex: String = room_id.iter().map(|b| format!("{b:02x}")).collect();
-    eprintln!("repacked {hex} -> pack {:02x}", gen.pack_id);
+    eprintln!("repacked {hex}");
     Ok(())
 }
 

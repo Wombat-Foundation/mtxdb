@@ -1,10 +1,10 @@
 /// Per-slot entry in the lossy fanout index.
 ///
-/// Layout: `[24-bit tag | 8-bit pack_id | 32-bit offset]` packed into a `u64`.
+/// Layout: `[24-bit tag | 8-bit shard_id | 32-bit offset]` packed into a `u64`.
 ///
 /// - **tag** (high 24 bits): truncated fingerprint for fast rejection.
-/// - **`pack_id`** (next 8 bits): which packfile generation this record lives in.
-/// - **offset** (low 32 bits): byte offset within the packfile, stored as
+/// - **`shard_id`** (next 8 bits): which shard file this record lives in.
+/// - **offset** (low 32 bits): byte offset within the shard, stored as
 ///   `offset + 1` so that the all-zeros encoding is reserved as the empty
 ///   sentinel. Actual offset 0 is stored as 1, and `offset()` subtracts 1
 ///   to recover the real value.
@@ -18,8 +18,8 @@ pub struct IndexSlot(u64);
 impl IndexSlot {
     const EMPTY: Self = Self(0);
 
-    const TAG_SHIFT: u64 = 40; // PACK_BITS + OFFSET_BITS
-    const PACK_SHIFT: u64 = 32; // OFFSET_BITS
+    const TAG_SHIFT: u64 = 40; // SHARD_BITS + OFFSET_BITS
+    const SHARD_SHIFT: u64 = 32; // OFFSET_BITS
     const OFFSET_MASK: u64 = 0xFFFF_FFFF;
 
     /// Create a new slot from its components.
@@ -31,7 +31,7 @@ impl IndexSlot {
     /// # Panics
     /// Panics if `tag` exceeds 24 bits or `offset` exceeds `u32::MAX - 1`.
     #[must_use]
-    pub fn new(tag: u32, pack_id: u8, offset: u64) -> Self {
+    pub fn new(tag: u32, shard_id: u8, offset: u64) -> Self {
         assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
         assert!(
             offset <= u64::from(u32::MAX - 1),
@@ -39,7 +39,7 @@ impl IndexSlot {
         );
         Self(
             (u64::from(tag) << Self::TAG_SHIFT)
-                | (u64::from(pack_id) << Self::PACK_SHIFT)
+                | (u64::from(shard_id) << Self::SHARD_SHIFT)
                 | ((offset.wrapping_add(1)) & Self::OFFSET_MASK),
         )
     }
@@ -60,8 +60,8 @@ impl IndexSlot {
     }
 
     #[must_use]
-    pub fn pack_id(self) -> u8 {
-        ((self.0 >> Self::PACK_SHIFT) & 0xFF) as u8
+    pub fn shard_id(self) -> u8 {
+        ((self.0 >> Self::SHARD_SHIFT) & 0xFF) as u8
     }
 
     #[must_use]
@@ -138,12 +138,17 @@ impl LossyIndex {
         top >> 8 // top 24 bits
     }
 
-    /// Insert a (hash → `pack_id`, offset) mapping.
+    /// Insert a (hash → `shard_id`, offset) mapping.
     ///
     /// # Errors
     /// Returns `InsertError::TableFull` if the table has less than 25% free slots
     /// and the hash is not already present (overwrites are always allowed).
-    pub fn insert(&mut self, hash: &[u8; 16], pack_id: u8, offset: u64) -> Result<(), InsertError> {
+    pub fn insert(
+        &mut self,
+        hash: &[u8; 16],
+        shard_id: u8,
+        offset: u64,
+    ) -> Result<(), InsertError> {
         let tag = Self::tag(hash);
         let mut bucket = self.bucket(hash);
 
@@ -155,14 +160,14 @@ impl LossyIndex {
                 if self.len >= threshold {
                     return Err(InsertError::TableFull);
                 }
-                self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
+                self.slots[bucket] = IndexSlot::new(tag, shard_id, offset);
                 self.len = self.len.wrapping_add(1);
                 return Ok(());
             }
             // If same tag already exists at this bucket, overwrite
             // (same hash, different offset after repack)
             if slot.tag() == tag {
-                self.slots[bucket] = IndexSlot::new(tag, pack_id, offset);
+                self.slots[bucket] = IndexSlot::new(tag, shard_id, offset);
                 return Ok(());
             }
             bucket = bucket.wrapping_add(1) & self.mask as usize;
@@ -170,7 +175,7 @@ impl LossyIndex {
     }
 
     /// Look up a hash in the index.
-    /// Returns `(pack_id, offset)` if found, `None` if absent.
+    /// Returns `(shard_id, offset)` if found, `None` if absent.
     ///
     /// An empty slot terminates the probe — this is correct because:
     /// 1. Class A tables are write-once with no deletes (no tombstones needed).
@@ -187,7 +192,7 @@ impl LossyIndex {
     /// hash. Tag collisions (0.1% at 24-bit tags) surface as candidates here;
     /// only the one whose stored hash matches the request is valid.
     ///
-    /// Yields `(pack_id, offset)` for each slot whose tag matches, then
+    /// Yields `(shard_id, offset)` for each slot whose tag matches, then
     /// terminates at the first empty slot or after `capacity` probes.
     #[inline]
     #[must_use]
@@ -322,7 +327,7 @@ impl std::error::Error for DeserializationError {}
 
 /// Iterator over candidate offsets for a hash lookup.
 ///
-/// Yields `(pack_id, offset)` for each slot whose 24-bit tag matches,
+/// Yields `(shard_id, offset)` for each slot whose 24-bit tag matches,
 /// terminating at the first empty slot or after the full capacity is probed.
 pub struct LookupIter<'a> {
     slots: &'a [IndexSlot],
@@ -345,7 +350,7 @@ impl Iterator for LookupIter<'_> {
             }
             self.bucket = self.bucket.wrapping_add(1) & self.mask;
             if slot.tag() == self.tag {
-                return Some((slot.pack_id(), slot.offset()));
+                return Some((slot.shard_id(), slot.offset()));
             }
         }
         None
@@ -367,7 +372,7 @@ mod tests {
     fn test_slot_packing() {
         let slot = IndexSlot::new(0x00AB_CDEF, 42, 0x1234_5678);
         assert_eq!(slot.tag(), 0x00AB_CDEF);
-        assert_eq!(slot.pack_id(), 42);
+        assert_eq!(slot.shard_id(), 42);
         assert_eq!(slot.offset(), 0x1234_5678);
         assert!(!slot.is_empty());
     }
