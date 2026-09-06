@@ -51,6 +51,7 @@ struct RoomGeneration {
 pub struct PackfileStorage {
     shards: ShardPool,
     rooms: RwLock<HashMap<[u8; 16], ArcSwap<RoomGeneration>>>,
+    room_order: Vec<[u8; 16]>,
     pinned: PinnedNodes,
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
@@ -109,6 +110,7 @@ impl PackfileStorage {
         // Phase 1: accumulate all records per room across every shard so
         // the index can be sized once for the true total.
         let mut room_entries: HashMap<[u8; 16], Vec<ShardRecord>> = HashMap::new();
+        let mut room_order: Vec<[u8; 16]> = Vec::new();
         for shard_id in 0..shard::MAX_SHARDS_U8 {
             let path = ShardPool::shard_path(&base_dir, shard_id);
             if !path.exists() {
@@ -135,7 +137,10 @@ impl PackfileStorage {
             for (room_id, hash, offset) in entries {
                 room_entries
                     .entry(room_id)
-                    .or_default()
+                    .or_insert_with(|| {
+                        room_order.push(room_id);
+                        Vec::new()
+                    })
                     .push((shard_id, hash, offset));
             }
         }
@@ -144,7 +149,8 @@ impl PackfileStorage {
         let deleted_rooms = Self::load_deleted_rooms(&base_dir);
 
         // Phase 2: build per-room indexes sized to the true total.
-        for (room_id, records) in &room_entries {
+        for room_id in &room_order {
+            let records = &room_entries[room_id];
             if deleted_rooms.contains(room_id) {
                 continue;
             }
@@ -164,6 +170,7 @@ impl PackfileStorage {
         Ok(Self {
             shards,
             rooms: RwLock::new(rooms),
+            room_order,
             pinned: PinnedNodes::new(),
             base_dir,
             swizzle,
@@ -199,17 +206,16 @@ impl PackfileStorage {
     /// `(room_id, entry count, memory usage in bytes)` for every known room,
     /// sorted by room ID, in a single pass over the room map.
     pub fn room_summaries(&self) -> Vec<([u8; 16], usize, usize)> {
-        let mut out: Vec<([u8; 16], usize, usize)> = self
-            .rooms
-            .read()
+        let rooms = self.rooms.read();
+        self.room_order
             .iter()
-            .map(|(id, gen)| {
-                let g = gen.load();
-                (*id, g.index.len(), g.index.memory_usage())
+            .filter_map(|id| {
+                rooms.get(id).map(|gen| {
+                    let g = gen.load();
+                    (*id, g.index.len(), g.index.memory_usage())
+                })
             })
-            .collect();
-        out.sort_unstable_by_key(|(id, _, _)| *id);
-        out
+            .collect()
     }
 
     /// Set the live roots to preserve for a room on its next repack.
