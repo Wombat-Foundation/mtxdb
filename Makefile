@@ -48,7 +48,6 @@ doc: ##H Build docs
 test: ##H Run tests (only core)
 	$(CARGO) test --lib --tests --timings
 
-
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 
@@ -72,25 +71,18 @@ cov: ##H Run code coverage and generate HTML report
 	@echo firefox .coverage/html/index.html
 
 
-
 .PHONY: build
-build: ##H Build the lib/binary
-	cargo build --release --timings
-
-.PHONY: build-ffi
-build-ffi: ##H Build C shared/static libraries (.so/.a)
+build: ##H Build all
+	cargo build --release --timings --all-targets --all-features --locked
 	$(CARGO) build --release --manifest-path mtxdb-ffi/Cargo.toml
 	@echo ""
 	@echo '══════════════ FFI BUILD OUTPUT ══════════════'
-	@find mtxdb-ffi/target/release -maxdepth 1 \( -name 'libmtxdb_ffi.so' -o -name 'libmtxdb_ffi.a' \) -exec ls -lh {} \;
-
-.PHONY: build-wasm
-build-wasm: ##H Build WebAssembly package (requires wasm32-wasip1 target)
+	find mtxdb-ffi/target/release -maxdepth 1 \( -name 'libmtxdb_ffi.so' -o -name 'libmtxdb_ffi.a' \) -exec ls -lh {} \;
 	rustup target add wasm32-wasip1 2>/dev/null || true
 	$(CARGO) build --release --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 	@echo ""
 	@echo '══════════════ WASM BUILD OUTPUT ══════════════'
-	@ls -lh mtxdb-wasm/target/wasm32-wasip1/release/*.wasm 2>/dev/null || echo 'No .wasm output found'
+	ls -lh mtxdb-wasm/target/wasm32-wasip1/release/*.wasm 2>/dev/null || echo 'No .wasm output found'
 
 
 

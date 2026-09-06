@@ -12,6 +12,7 @@ keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
 
 [workspace]
+# exclude = ["mtxdb-ffi", "mtxdb-wasm"]
 
 [lib]
 path = "mtxdb-core/lib.rs"
