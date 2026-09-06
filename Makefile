@@ -75,7 +75,7 @@ cov: ##H Run code coverage and generate HTML report
 build: ##H Build all
 	$(CARGO) build --release --timings
 	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
-	$(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
+	RUSTFLAGS= $(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 
 
 .PHONY: bench

@@ -1348,7 +1348,7 @@ mod tests {
             // positives via tag collision with the live entries (whose
             // bytes 8..12 are also zeros).
             id[8] = 0xFF;
-            id[9] = (i + 1) as u8;
+            id[9] = u8::try_from(i + 1).expect("id[9] fits in u8");
             garbage_ids.push(id);
             store.put(&room, &id, &garbage_data).unwrap();
         }
