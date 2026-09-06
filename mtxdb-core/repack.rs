@@ -265,7 +265,7 @@ impl From<std::io::Error> for RepackError {
 }
 
 #[cfg(test)]
-#[coverage(off)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::path::Path;

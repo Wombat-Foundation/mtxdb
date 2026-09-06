@@ -371,7 +371,7 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<([u8; 16], u64)>
 }
 
 #[cfg(test)]
-#[coverage(off)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::io::Cursor;
