@@ -4,6 +4,7 @@ target/
 lcov.info
 
 # other stuff
+.env
 docs/*.md
 /*.txt
 .tmp/

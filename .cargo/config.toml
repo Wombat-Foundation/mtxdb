@@ -1,0 +1,15 @@
+[alias]
+test-ffi = "test --manifest-path mtxdb-ffi/Cargo.toml"
+test-wasm = "test --manifest-path mtxdb-wasm/Cargo.toml"
+test-all = "!cargo test && cargo test-ffi && cargo test-wasm"
+
+[build]
+target-dir = "target"
+rustc-wrapper = ".cargo/cargo-wrapper.sh"
+
+[env]
+# RUSTC_WRAPPER = { value = "sccache", force = false }
+
+# `make install` / `make build` already pass `--features cli`; use those
+# rather than a bare `cargo install`/`cargo build`, which will build a
+# `rezzy` binary without any CLI/TLS wiring in place (see network.rs).
