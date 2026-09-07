@@ -40,6 +40,7 @@ pub enum Commands {
         room: String,
         yes: bool,
     },
+    Sync,
 }
 
 fn build_cli() -> Command {
@@ -116,6 +117,7 @@ fn build_cli() -> Command {
                         .help("Skip confirmation prompt"),
                 ),
         )
+        .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
 }
 
 fn parse_cli() -> Cli {
@@ -159,6 +161,7 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").unwrap().clone(),
             yes: m.get_flag("yes"),
         },
+        Some(("sync", _)) => Commands::Sync,
         _ => {
             build_cli().print_help().unwrap();
             std::process::exit(0);

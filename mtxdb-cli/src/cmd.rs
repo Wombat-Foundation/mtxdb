@@ -55,6 +55,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Import { path, room } => cmd_import(cli, path, room.as_deref()),
         Commands::Repack { room, root, topo } => cmd_repack(cli, room, root, *topo),
         Commands::Delete { room, yes } => cmd_delete(cli, room, *yes),
+        Commands::Sync => cmd_sync(cli),
     }
 }
 
@@ -487,5 +488,18 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     let count = store.room_index_info(&room_id).map_or(0, |(len, _)| len);
     store.delete_room(&room_id)?;
     eprintln!("deleted {count} records for room {hex}");
+    Ok(())
+}
+
+/// Opens the store as writer (which always does a full scan and builds
+/// the shard→room directory and shard stats in memory regardless of
+/// whether either has ever been persisted), then persists both —
+/// bootstrapping `shard_stats.bin`/`shard_rooms.bin` for a store whose
+/// writer process has never called `sync_all`, or just refreshing them
+/// on demand.
+fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
+    let store = open_store(cli)?;
+    store.sync_all()?;
+    eprintln!("synced: persisted shard IO stats and shard\u{2192}room directory");
     Ok(())
 }
