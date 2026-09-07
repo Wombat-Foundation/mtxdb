@@ -185,7 +185,7 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Glob `shard_*.pack` files in `dir`, parsing slot_id, generation,
+/// Glob `shard_*.pack` files in `dir`, parsing `slot_id`, generation,
 /// and file size from each filename and its metadata.
 fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
     let mut entries = Vec::new();
@@ -213,16 +213,15 @@ fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
     Ok(entries)
 }
 
+/// Composite `(shard_id, generation)` key to `(write_count,
+/// bytes_written, sync_count)`, as decoded from `shard_stats.bin`.
+type ShardStatsMap = std::collections::HashMap<u64, (u64, u64, u64)>;
+
 /// Decode `shard_stats.bin` — same binary format as
 /// `ShardPool::restore_persisted_stats`, but standalone. Returns a map
 /// from a composite `(shard_id, generation)` key to `(write_count,
 /// bytes_written, sync_count)` and the snapshot's persisted-at timestamp.
-fn decode_stats_snapshot(
-    dir: &Path,
-) -> (
-    std::collections::HashMap<u64, (u64, u64, u64)>,
-    Option<u64>,
-) {
+fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
     const STATS_HEADER_LEN: usize = 4 + 1 + 8; // magic + version + persisted_at
     const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
@@ -256,10 +255,7 @@ fn decode_stats_snapshot(
 }
 
 /// Print the shard table header and rows.
-fn print_shard_table(
-    shard_entries: &[(u16, u64, u64)],
-    stats_map: &std::collections::HashMap<u64, (u64, u64, u64)>,
-) {
+fn print_shard_table(shard_entries: &[(u16, u64, u64)], stats_map: &ShardStatsMap) {
     const GEN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     eprintln!(
@@ -417,11 +413,20 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
 
 fn cmd_repack(
     cli: &Cli,
-    room: &str,
+    room: Option<&str>,
+    shard: Option<u16>,
     roots: &[String],
     topo: bool,
 ) -> anyhow::Result<()> {
-    cmd_repack_room(cli, room, roots, topo)
+    match (room, shard) {
+        (Some(room), None) => cmd_repack_room(cli, room, roots, topo),
+        (None, Some(shard_id)) => cmd_repack_shard(cli, shard_id, roots, topo),
+        // clap's ArgGroup(required, conflicting) already rules both of
+        // these out before we get here; kept as a hard error rather than
+        // silently picking one, since reaching it means that guarantee
+        // broke.
+        _ => bail!("exactly one of --room or --shard is required"),
+    }
 }
 
 fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Result<()> {
@@ -486,7 +491,10 @@ fn cmd_repack_shard(cli: &Cli, shard_id: u16, roots: &[String], topo: bool) -> a
         return Ok(());
     }
     for (room_id, kept, dropped) in &results {
-        eprintln!("repacked {}: {kept} kept, {dropped} dropped", hex_encode(room_id));
+        eprintln!(
+            "repacked {}: {kept} kept, {dropped} dropped",
+            hex_encode(room_id)
+        );
     }
     let (total_kept, total_dropped) = results
         .iter()
