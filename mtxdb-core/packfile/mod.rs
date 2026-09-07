@@ -261,6 +261,53 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     Ok(entries)
 }
 
+/// Scan a packfile starting from `start_offset`, returning only records
+/// whose byte position is >= `start_offset`. Used for incremental repack:
+/// the caller tracks how far through each shard file it has already scanned
+/// and only needs the newly-appended bytes.
+///
+/// The offset must point to a valid record boundary (the start of a `[u32
+/// len]` frame) — typically the byte position immediately after the last
+/// record returned by a previous scan. Passing the file's end position
+/// returns an empty vec without error.
+///
+/// Unlike [`scan_and_recover_packfile`], this never truncates — a
+/// concurrent writer may be actively appending, so mutating the file is
+/// unsafe. Torn tails are treated as EOF (same as [`scan_packfile`]).
+///
+/// # Errors
+/// Returns `io::Error` on I/O failure other than `UnexpectedEof`.
+pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<ScanEntry>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    // Seek past the header (8 bytes) to the first record. If start_offset
+    // is already past the header, seek directly there.
+    if start_offset == 0 {
+        if !read_header(&mut reader)? {
+            return Ok(Vec::new());
+        }
+    } else {
+        use std::io::Seek;
+        reader.seek(io::SeekFrom::Start(start_offset))?;
+    }
+
+    let mut entries = Vec::new();
+    loop {
+        let offset = reader.stream_position()?;
+        match read_record(&mut reader) {
+            Ok(Some(record)) => {
+                entries.push((record.room_id, record.hash, offset));
+            }
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(entries)
+}
+
 /// Scan a packfile and truncate any torn tail at the last valid record
 /// boundary. Used during explicit recovery to repair a packfile before
 /// reopening for append.

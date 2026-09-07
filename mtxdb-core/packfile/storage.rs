@@ -68,6 +68,23 @@ pub struct PackfileStorage {
     repack_dropped_total: AtomicU64,
     /// Per-room repack counts, so a hot room's churn is visible individually.
     repack_counts_by_room: RwLock<HashMap<[u8; 16], u64>>,
+    /// Per-room incremental repack state. Each entry tracks the byte
+    /// offset up to which each shard has been scanned for this room and
+    /// the deduplicated hash → (`shard_id`, offset) map from the last repack.
+    /// On the next repack, only bytes after these offsets are scanned and
+    /// merged into the existing map — turning O(n²) full rescan into
+    /// O(n) total work across all repack calls.
+    repack_incremental: RwLock<HashMap<[u8; 16], RepackIncrementalState>>,
+}
+
+/// Per-room state for incremental repack.
+struct RepackIncrementalState {
+    /// Per-shard byte offset: next scan starts here (file length at end
+    /// of last scan). Shards not in this map haven't been scanned yet.
+    scan_offsets: HashMap<u16, u64>,
+    /// The deduplicated hash → (`shard_id`, offset) map from the last repack.
+    /// The next repack merges newly-scanned entries into this map.
+    live_map: HashMap<[u8; 16], (u16, u64)>,
 }
 
 const DEFAULT_REPACK_THRESHOLD_ENTRIES: u64 = 2048;
@@ -249,6 +266,7 @@ impl PackfileStorage {
             repack_kept_total: AtomicU64::new(0),
             repack_dropped_total: AtomicU64::new(0),
             repack_counts_by_room: RwLock::new(HashMap::new()),
+            repack_incremental: RwLock::new(HashMap::new()),
         })
     }
 
@@ -699,11 +717,13 @@ impl PackfileStorage {
         Ok((live_hashes, adjacency))
     }
 
-    /// Read every scanned record's edges, with no reachability filtering.
+    /// Read every record's edges, with no reachability filtering.
     /// Used when a room has no configured live roots, so nothing is known
-    /// to be garbage.
+    /// to be garbage. Iterates `hash_to_shard_offset` directly rather
+    /// than the raw scan output, so it works for both full and incremental
+    /// repack (where the map was built by merging new entries into a
+    /// previous state rather than scanning every packfile from byte zero).
     fn scan_full_adjacency(
-        scanned: &[ScannedShard],
         hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
         pinned: &HashMap<u16, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
@@ -711,13 +731,11 @@ impl PackfileStorage {
         let mut all_hashes: Vec<[u8; 16]> = hash_to_shard_offset.keys().copied().collect();
         all_hashes.sort_unstable();
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
-        for (shard_id, entries) in scanned {
-            for (hash, offset) in entries {
-                if let Some(old_shard) = pinned.get(shard_id) {
-                    let record = Self::read_at(old_shard, *offset)?;
-                    let edges = extract_edges(hash, &record.data);
-                    adjacency.insert(*hash, edges);
-                }
+        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
+            if let Some(shard) = pinned.get(&shard_id) {
+                let record = Self::read_at(shard, offset)?;
+                let edges = extract_edges(hash, &record.data);
+                adjacency.insert(*hash, edges);
             }
         }
         Ok((all_hashes, adjacency))
@@ -751,6 +769,84 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `StorageError` on I/O or corruption.
     ///
+    /// Builds this repack's deduped `hash → (shard_id, offset)` map,
+    /// incrementally where possible.
+    ///
+    /// If a previous repack left cursor state for this room, starts from
+    /// that repack's `live_map` and scans each shard only from the byte
+    /// offset it had reached last time (via
+    /// [`packfile::scan_packfile_from`]), merging newly-appended records
+    /// in. Otherwise (first repack for this room) falls back to a full
+    /// scan of every shard from byte zero. This is what turns the O(n²)
+    /// cost of repeatedly rescanning a growing room from scratch into
+    /// O(n) total scan work across all repack calls.
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O failure scanning a shard.
+    fn repack_scan_incremental(
+        &self,
+        room_id: &[u8; 16],
+    ) -> Result<HashMap<[u8; 16], (u16, u64)>, StorageError> {
+        let cursors = self.repack_incremental.read();
+        if let Some(prev) = cursors.get(room_id) {
+            // Incremental: start from the previous live_map and scan only
+            // bytes appended since the last repack.
+            let mut map = prev.live_map.clone();
+            for (shard_id, shard) in self.shards.all_shards() {
+                let start = prev.scan_offsets.get(&shard_id).copied().unwrap_or(0);
+                let entries =
+                    packfile::scan_packfile_from(&shard.path, start).map_err(StorageError::Io)?;
+                for (rid, hash, offset) in entries {
+                    if rid == *room_id {
+                        map.insert(hash, (shard_id, offset));
+                    }
+                }
+            }
+            Ok(map)
+        } else {
+            // First repack: full scan of every shard.
+            drop(cursors);
+            let scanned = self.scan_room_records(room_id)?;
+            let mut map = HashMap::new();
+            for (shard_id, entries) in &scanned {
+                for (hash, offset) in entries {
+                    map.insert(*hash, (*shard_id, *offset));
+                }
+            }
+            Ok(map)
+        }
+    }
+
+    /// Saves the cursor state a future call to [`Self::repack_scan_incremental`]
+    /// needs: each shard's current byte length (the next repack's scan
+    /// start point) and the deduped live map restricted to hashes that
+    /// actually survived into `new_offsets` — anything this repack dropped
+    /// must not resurface via the carried-forward map next time.
+    fn repack_save_incremental_state(
+        &self,
+        room_id: &[u8; 16],
+        new_offsets: &[([u8; 16], u16, u64)],
+    ) {
+        let mut scan_offsets = HashMap::new();
+        for (shard_id, shard) in self.shards.all_shards() {
+            scan_offsets.insert(shard_id, shard.file_len());
+        }
+        let next_live_map: HashMap<[u8; 16], (u16, u64)> = new_offsets
+            .iter()
+            .map(|&(hash, shard_id, offset)| (hash, (shard_id, offset)))
+            .collect();
+        self.repack_incremental.write().insert(
+            *room_id,
+            RepackIncrementalState {
+                scan_offsets,
+                live_map: next_live_map,
+            },
+        );
+    }
+
+    /// # Errors
+    /// Returns `StorageError` on I/O or corruption.
+    ///
     /// # Panics
     /// Panics if any hash in the CSR exceeds `u32::MAX` local ID space.
     pub fn repack_room_reachable(
@@ -761,29 +857,7 @@ impl PackfileStorage {
         let room_arc = self.put_mutex(room_id);
         let _room_guard = room_arc.lock();
 
-        let mut scanned = self.scan_room_records(room_id)?;
-
-        let mut hash_to_shard_offset: HashMap<[u8; 16], (u16, u64)> = HashMap::new();
-        for (shard_id, entries) in &scanned {
-            for (hash, offset) in entries {
-                hash_to_shard_offset.insert(*hash, (*shard_id, *offset));
-            }
-        }
-
-        // Packfiles are append-only: previous repacks leave stale copies
-        // of records in the same shard file.  hash_to_shard_offset already
-        // deduplicates by hash (last write wins), so filter scanned to keep
-        // only the entries that survived dedup — otherwise scanned_count
-        // inflates with stale copies and the dropped count is wrong.
-        for (_shard_id, entries) in &mut scanned {
-            entries.retain(|(hash, offset)| {
-                hash_to_shard_offset
-                    .get(hash)
-                    .is_some_and(|&(_, o)| o == *offset)
-            });
-        }
-
-        let scanned_count: usize = scanned.iter().map(|(_, entries)| entries.len()).sum();
+        let hash_to_shard_offset = self.repack_scan_incremental(room_id)?;
 
         // Pin every shard this call could possibly read from before any
         // writes happen — see pin_shards' doc for why this must come
@@ -798,12 +872,10 @@ impl PackfileStorage {
             }
             // No live roots configured: we don't know what's garbage, so
             // preserve everything.
-            _ => {
-                Self::scan_full_adjacency(&scanned, &hash_to_shard_offset, &pinned, &extract_edges)?
-            }
+            _ => Self::scan_full_adjacency(&hash_to_shard_offset, &pinned, &extract_edges)?,
         };
 
-        let dropped = scanned_count.saturating_sub(live_hashes.len());
+        let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
 
         // Evict garbage-collected hashes from the room's cache. Repack
         // carries the same cache forward into the new generation (below);
@@ -867,6 +939,8 @@ impl PackfileStorage {
             .entry(*room_id)
             .and_modify(|c| *c = c.saturating_add(1))
             .or_insert(1);
+
+        self.repack_save_incremental_state(room_id, &new_offsets);
 
         // Fsync the shards this repack just wrote into and persist the
         // updated stats snapshot as part of finishing the repack, rather
@@ -1802,20 +1876,19 @@ mod tests {
         assert_eq!(stats.dropped_total, 2);
         assert_eq!(store.repack_count_for_room(&TEST_ROOM), 1);
 
-        // A second repack rescans shards that still hold this room's
-        // bytes from disk (repack rewrites live records into a fresh
-        // generation but doesn't erase the old shard's bytes unless
-        // that shard gets retired). The dedup filter in
-        // repack_room_reachable discards stale packfile entries whose
-        // offset no longer matches the current generation's index, so
-        // the second repack sees the same 3 live + 2 garbage as the
-        // first — no inflation from stale copies.
+        // A second repack uses the incremental path: it clones the
+        // previous live_map (3 entries from the first repack's output)
+        // and scans only newly-appended bytes (none here).  The garbage
+        // entries in the old shard are never re-scanned — the live_map
+        // already excludes them, so dropped is 0.  This is the O(n)
+        // behavior: each repack does bounded work proportional to new
+        // bytes, not proportional to total shard size.
         let (kept2, dropped2) = store
             .repack_room_reachable(&TEST_ROOM, |hash, _data| {
                 edges.get(hash).cloned().unwrap_or_default()
             })
             .unwrap();
-        assert_eq!((kept2, dropped2), (3, 2));
+        assert_eq!((kept2, dropped2), (3, 0));
 
         let stats2 = store.repack_stats();
         assert_eq!(stats2.repack_count, 2);
