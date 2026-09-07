@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -60,6 +60,14 @@ pub struct PackfileStorage {
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
+    /// Total number of `repack_room_reachable` calls across all rooms.
+    repack_count: AtomicU64,
+    /// Total records kept (rewritten into the new generation) across all repacks.
+    repack_kept_total: AtomicU64,
+    /// Total records dropped (found unreachable) across all repacks.
+    repack_dropped_total: AtomicU64,
+    /// Per-room repack counts, so a hot room's churn is visible individually.
+    repack_counts_by_room: RwLock<HashMap<[u8; 16], u64>>,
 }
 
 const DEFAULT_REPACK_THRESHOLD_ENTRIES: u64 = 2048;
@@ -184,6 +192,10 @@ impl PackfileStorage {
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
+            repack_count: AtomicU64::new(0),
+            repack_kept_total: AtomicU64::new(0),
+            repack_dropped_total: AtomicU64::new(0),
+            repack_counts_by_room: RwLock::new(HashMap::new()),
         })
     }
 
@@ -699,6 +711,17 @@ impl PackfileStorage {
         self.swap_generation(room_id, index);
         self.retire_empty_shards(room_id);
 
+        self.repack_count.fetch_add(1, Ordering::Relaxed);
+        self.repack_kept_total
+            .fetch_add(kept as u64, Ordering::Relaxed);
+        self.repack_dropped_total
+            .fetch_add(dropped as u64, Ordering::Relaxed);
+        self.repack_counts_by_room
+            .write()
+            .entry(*room_id)
+            .and_modify(|c| *c = c.saturating_add(1))
+            .or_insert(1);
+
         Ok((kept, dropped))
     }
 
@@ -901,6 +924,68 @@ impl PackfileStorage {
     pub fn shard_stats_for(&self, shard_id: u16) -> Option<crate::shard::ShardStats> {
         self.shards.stats(shard_id)
     }
+
+    /// Total number of shards retired (garbage-collected after a repack)
+    /// over this storage's lifetime.
+    #[must_use]
+    pub fn shards_retired(&self) -> u64 {
+        self.shards.retired_count()
+    }
+
+    /// Snapshot global repack stats across all rooms.
+    #[must_use]
+    pub fn repack_stats(&self) -> RepackStats {
+        RepackStats {
+            repack_count: self.repack_count.load(Ordering::Relaxed),
+            kept_total: self.repack_kept_total.load(Ordering::Relaxed),
+            dropped_total: self.repack_dropped_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Number of times a specific room has been repacked. 0 if it has
+    /// never been repacked (or doesn't exist).
+    #[must_use]
+    pub fn repack_count_for_room(&self, room_id: &[u8; 16]) -> u64 {
+        self.repack_counts_by_room
+            .read()
+            .get(room_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Cache hit/miss stats for a room's decoded-node cache, if the room
+    /// currently has one loaded.
+    #[must_use]
+    pub fn cache_stats_for(&self, room_id: &[u8; 16]) -> Option<CacheStats> {
+        let gen = self.generation(room_id)?;
+        Some(CacheStats {
+            hits: gen.cache.hits(),
+            misses: gen.cache.misses(),
+            hit_rate: gen.cache.hit_rate(),
+        })
+    }
+}
+
+/// Snapshot of global repack activity across all rooms.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepackStats {
+    /// Total number of `repack_room_reachable` calls across all rooms.
+    pub repack_count: u64,
+    /// Total records kept (rewritten into a new generation) across all repacks.
+    pub kept_total: u64,
+    /// Total records dropped (found unreachable) across all repacks.
+    pub dropped_total: u64,
+}
+
+/// Snapshot of a room's decoded-node cache hit/miss stats.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheStats {
+    /// Number of cache hits.
+    pub hits: u64,
+    /// Number of cache misses.
+    pub misses: u64,
+    /// Hit rate as a fraction in `[0.0, 1.0]`.
+    pub hit_rate: f64,
 }
 
 #[cfg(test)]
@@ -1249,8 +1334,6 @@ mod tests {
 
     #[test]
     fn test_swizzle_callback() {
-        use std::sync::atomic::Ordering;
-
         static SWIZZLE_CALLS: AtomicU64 = AtomicU64::new(0);
         static CACHED_CHILDREN_FOUND: AtomicU64 = AtomicU64::new(0);
 
@@ -1546,6 +1629,32 @@ mod tests {
                 "garbage record survived reachable repack"
             );
         }
+
+        let stats = store.repack_stats();
+        assert_eq!(stats.repack_count, 1);
+        assert_eq!(stats.kept_total, 3);
+        assert_eq!(stats.dropped_total, 2);
+        assert_eq!(store.repack_count_for_room(&TEST_ROOM), 1);
+
+        // A second repack rescans every shard still holding this room's
+        // bytes from disk (repack rewrites live records into a fresh
+        // generation but doesn't erase the old shard's bytes unless that
+        // shard gets retired), so it now sees both the freshly-written
+        // generation (3 live) and the original shard's full 5 records
+        // (3 live + 2 garbage) again, dropping the garbage a second time.
+        // Stats should accumulate across both calls rather than reset.
+        let (kept2, dropped2) = store
+            .repack_room_reachable(&TEST_ROOM, |hash, _data| {
+                edges.get(hash).cloned().unwrap_or_default()
+            })
+            .unwrap();
+        assert_eq!((kept2, dropped2), (3, 5));
+
+        let stats2 = store.repack_stats();
+        assert_eq!(stats2.repack_count, 2);
+        assert_eq!(stats2.kept_total, stats.kept_total + kept2 as u64);
+        assert_eq!(stats2.dropped_total, stats.dropped_total + dropped2 as u64);
+        assert_eq!(store.repack_count_for_room(&TEST_ROOM), 2);
     }
 
     /// Repack drops unreachable *records* from the index (`dropped` count),
@@ -1615,6 +1724,10 @@ mod tests {
             .unwrap();
         assert_eq!(kept, 1, "only root should survive");
         assert!(dropped > 0, "the garbage records should have been dropped");
+        assert!(
+            store.shards_retired() > 0,
+            "retire_empty_shards should have retired at least one now-garbage-only shard"
+        );
 
         // Every shard except the current active one held nothing but
         // garbage, and that garbage is now unreachable -- those slots

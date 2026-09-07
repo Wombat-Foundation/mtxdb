@@ -158,6 +158,9 @@ pub struct ShardPool {
     /// reused slot never collides on-disk with a still-referenced old
     /// shard at the same slot.
     next_generation: AtomicU64,
+    /// Total number of shards retired (garbage-collected after a repack)
+    /// over the pool's lifetime.
+    retired_count: AtomicU64,
 }
 
 impl ShardPool {
@@ -256,6 +259,7 @@ impl ShardPool {
             base_dir,
             dirty: parking_lot::Mutex::new(HashSet::new()),
             next_generation: AtomicU64::new(max_generation),
+            retired_count: AtomicU64::new(0),
         })
     }
 
@@ -562,8 +566,15 @@ impl ShardPool {
             if let Some(shard) = slot.take() {
                 shard.is_current.store(false, Ordering::Release);
                 self.dirty.lock().remove(&shard_id);
+                self.retired_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Total number of shards retired over the pool's lifetime.
+    #[must_use]
+    pub fn retired_count(&self) -> u64 {
+        self.retired_count.load(Ordering::Relaxed)
     }
 
     /// Scan a shard file and return `(room_id, hash, offset)` entries.
