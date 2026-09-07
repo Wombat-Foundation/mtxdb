@@ -8,3 +8,5 @@ lcov.info
 docs/*.md
 /*.txt
 .tmp/
+*.pack
+*.idx

@@ -20,6 +20,7 @@ pub enum Commands {
         id: String,
     },
     Rooms,
+    Shards,
     Info {
         room: String,
     },
@@ -70,6 +71,10 @@ fn build_cli() -> Command {
                 .arg(Arg::new("id").short('i').long("id").required(true)),
         )
         .subcommand(Command::new("rooms").about("List rooms in the store"))
+        .subcommand(
+            Command::new("shards")
+                .about("List open shards with size, generation, and IO/sync stats"),
+        )
         .subcommand(
             Command::new("info")
                 .about("Show storage info for a room")
@@ -142,6 +147,7 @@ fn parse_cli() -> Cli {
             id: m.get_one::<String>("id").unwrap().clone(),
         },
         Some(("rooms", _)) => Commands::Rooms,
+        Some(("shards", _)) => Commands::Shards,
         Some(("info", m)) => Commands::Info {
             room: m.get_one::<String>("room").unwrap().clone(),
         },

@@ -27,6 +27,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
         Commands::Get { room, id } => cmd_get(cli, room, id),
         Commands::Rooms => cmd_rooms(cli),
+        Commands::Shards => cmd_shards(cli),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { path } => cmd_scan(path),
         Commands::Import { path, room } => cmd_import(cli, path, room.as_deref()),
@@ -100,6 +101,39 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
             eprintln!("  {i}: {hex} ({count} records)");
         }
     }
+    Ok(())
+}
+
+fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
+    let store = open_store(cli)?;
+    let mut shards = store.shard_summaries();
+    if shards.is_empty() {
+        eprintln!("no shards found");
+        return Ok(());
+    }
+    shards.sort_unstable_by_key(|s| s.shard_id);
+    eprintln!(
+        "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>8}  {:>12}  {:>6}",
+        "shard", "generation", "bytes", "writes", "written", "reads", "read", "syncs"
+    );
+    for s in &shards {
+        eprintln!(
+            "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>8}  {:>12}  {:>6}",
+            s.shard_id,
+            s.generation,
+            s.file_bytes,
+            s.stats.write_count,
+            s.stats.bytes_written,
+            s.stats.read_count,
+            s.stats.bytes_read,
+            s.stats.sync_count,
+        );
+    }
+    eprintln!(
+        "{} shards, {} retired over lifetime",
+        shards.len(),
+        store.shards_retired()
+    );
     Ok(())
 }
 

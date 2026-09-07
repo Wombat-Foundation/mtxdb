@@ -106,6 +106,12 @@ impl Shard {
             sync_count: self.sync_count.load(Ordering::Relaxed),
         }
     }
+
+    /// Current on-disk file length, as tracked without a `metadata()` syscall.
+    #[must_use]
+    pub fn file_len(&self) -> u64 {
+        self.file_len.load(Ordering::Acquire)
+    }
 }
 
 impl Shard {

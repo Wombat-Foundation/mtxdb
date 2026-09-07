@@ -932,6 +932,22 @@ impl PackfileStorage {
         self.shards.retired_count()
     }
 
+    /// List every currently-open shard with basic size, generation, and
+    /// IO/sync stats — the data behind a `shards` CLI listing.
+    #[must_use]
+    pub fn shard_summaries(&self) -> Vec<ShardSummary> {
+        self.shards
+            .all_shards()
+            .into_iter()
+            .map(|(shard_id, shard)| ShardSummary {
+                shard_id,
+                generation: shard.generation,
+                file_bytes: shard.file_len(),
+                stats: shard.stats(),
+            })
+            .collect()
+    }
+
     /// Snapshot global repack stats across all rooms.
     #[must_use]
     pub fn repack_stats(&self) -> RepackStats {
@@ -964,6 +980,19 @@ impl PackfileStorage {
             hit_rate: gen.cache.hit_rate(),
         })
     }
+}
+
+/// Basic size, generation, and IO/sync info for one open shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardSummary {
+    /// Shard ID within the pool.
+    pub shard_id: u16,
+    /// Monotonically increasing generation counter for this shard's slot.
+    pub generation: u64,
+    /// Current on-disk file length in bytes.
+    pub file_bytes: u64,
+    /// IO/sync counters for this shard.
+    pub stats: shard::ShardStats,
 }
 
 /// Snapshot of global repack activity across all rooms.
