@@ -9,6 +9,13 @@ use bytes::Bytes;
 /// Magic bytes identifying an mdb packfile: "MDB1"
 pub const MAGIC: [u8; 4] = *b"MDB1";
 
+/// Packfile format version byte following `MAGIC` in the header (see
+/// [`write_header`]/[`read_header`]). Version 1: global shard format
+/// with `room_id` framed in every record. The only version this format
+/// has ever had — `write_header` has never produced anything else, and
+/// `read_header` accepts nothing else.
+pub const VERSION: u8 = 0x01;
+
 /// Maximum record size (64KB). Reject anything larger during recovery scan.
 pub const MAX_RECORD_LEN: u32 = 64 * 1024;
 
@@ -173,12 +180,12 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
 /// Returns `io::Error` on write failure.
 pub fn write_header(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(&MAGIC)?;
-    writer.write_all(&[0x01])?; // version 1: global shard format with room_id
+    writer.write_all(&[VERSION])?;
     Ok(())
 }
 
-/// Read and validate the packfile header. Accepts version 0x01 (current
-/// and, so far, only format `write_header` has ever produced).
+/// Read and validate the packfile header. Accepts [`VERSION`] (the only
+/// format `write_header` has ever produced).
 ///
 /// # Errors
 /// Returns `io::Error` on read failure.
@@ -189,7 +196,7 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(e) => return Err(e),
     }
-    Ok(buf[..4] == MAGIC && buf[4] == 0x01)
+    Ok(buf[..4] == MAGIC && buf[4] == VERSION)
 }
 
 /// Open or create a packfile, writing the header if it's new.
