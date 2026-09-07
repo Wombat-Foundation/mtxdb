@@ -462,15 +462,28 @@ fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyho
     Ok(())
 }
 
-/// Repacks every room still referencing `shard_id` — the shard-scoped
-/// counterpart to `cmd_repack_room`, backed by
-/// `PackfileStorage::repack_shard` (which finds the referencing rooms in
-/// O(1) via the shard→room directory rather than scanning the shard
-/// file). `--root` doesn't apply here since live roots are inherently
-/// per-room — the same `--topo`/no-`--topo` edge-extraction choice
-/// applies uniformly across every room this shard touches.
-fn cmd_repack_shard(cli: &Cli, shard_id: u16, roots: &[String], topo: bool) -> anyhow::Result<()> {
-    if !roots.is_empty() {
+/// Compacts every shard transitively touched by rooms referencing
+/// `shard_id` — not just `shard_id` itself. A room's live data can span
+/// more than one shard (`PackfileStorage::repack_closure` finds the full
+/// closure), and repacking a room always rewrites its *entire* live set
+/// regardless of which shard triggered the repack, so a shard-scoped
+/// compaction has to account for everything that repack will actually
+/// touch, not just the one shard named on the command line.
+///
+/// Runs a non-mutating preflight first (`PackfileStorage::plan_room_repack`
+/// per room in the closure): prints how many rooms and shards are
+/// involved and the expected shard count/slack after compaction, then
+/// prompts for confirmation before performing any real repack. `--root`
+/// doesn't apply here since live roots are inherently per-room — the
+/// same `--topo`/no-`--topo` edge-extraction choice applies uniformly
+/// across every room the closure touches.
+fn cmd_repack_shard(
+    cli: &Cli,
+    shard_id: u16,
+    live_roots: &[String],
+    topo: bool,
+) -> anyhow::Result<()> {
+    if !live_roots.is_empty() {
         bail!("--root requires --room — live roots are per-room, not meaningful for --shard");
     }
     if topo {
@@ -480,29 +493,74 @@ fn cmd_repack_shard(cli: &Cli, shard_id: u16, roots: &[String], topo: bool) -> a
     }
 
     let store = open_store(cli)?;
-    let results = if topo {
-        store.repack_shard(shard_id, extract_matrix_edges)?
-    } else {
-        store.repack_shard(shard_id, |_hash, _data| Vec::new())?
-    };
-
-    if results.is_empty() {
+    let (rooms, touched_shards) = store.repack_closure(shard_id)?;
+    if rooms.is_empty() {
         eprintln!("no rooms reference shard {shard_id}");
         return Ok(());
     }
-    for (room_id, kept, dropped) in &results {
+
+    let mut total_kept_bytes: u64 = 0;
+    let mut total_kept = 0usize;
+    let mut total_dropped = 0usize;
+    for room_id in &rooms {
+        let plan = if topo {
+            store.plan_room_repack(room_id, extract_matrix_edges)?
+        } else {
+            store.plan_room_repack(room_id, |_hash, _data| Vec::new())?
+        };
+        total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
+        total_kept = total_kept.saturating_add(plan.kept);
+        total_dropped = total_dropped.saturating_add(plan.dropped);
+    }
+
+    let max_shard_bytes = mtxdb::shard::MAX_SHARD_BYTES;
+    let expected_shards = total_kept_bytes
+        .checked_add(max_shard_bytes.saturating_sub(1))
+        .map_or(1, |rounded| rounded / max_shard_bytes)
+        .max(1);
+    let slop = expected_shards
+        .saturating_mul(max_shard_bytes)
+        .saturating_sub(total_kept_bytes);
+
+    eprintln!(
+        "this will repack {} room{} across {} shard{} ({touched_shards:?})",
+        rooms.len(),
+        if rooms.len() == 1 { "" } else { "s" },
+        touched_shards.len(),
+        if touched_shards.len() == 1 { "" } else { "s" },
+    );
+    eprintln!(
+        "expected result: ~{expected_shards} shard{} ({} kept, {} dropped, ~{} slack in the last shard)",
+        if expected_shards == 1 { "" } else { "s" },
+        total_kept,
+        total_dropped,
+        fmt_bytes(slop),
+    );
+    eprint!("press Enter to continue, Ctrl+C to abort: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    let mut results = Vec::with_capacity(rooms.len());
+    for room_id in &rooms {
+        let (kept, dropped) = if topo {
+            store.repack_room_reachable(room_id, extract_matrix_edges)?
+        } else {
+            store.repack_room_reachable(room_id, |_hash, _data| Vec::new())?
+        };
         eprintln!(
             "repacked {}: {kept} kept, {dropped} dropped",
             hex_encode(room_id)
         );
+        results.push((kept, dropped));
     }
-    let (total_kept, total_dropped) = results
+    let (final_kept, final_dropped) = results
         .iter()
-        .fold((0usize, 0usize), |(k, d), &(_, kept, dropped)| {
+        .fold((0usize, 0usize), |(k, d), &(kept, dropped)| {
             (k.saturating_add(kept), d.saturating_add(dropped))
         });
     eprintln!(
-        "shard {shard_id}: {} rooms repacked, {total_kept} kept, {total_dropped} dropped",
+        "done: {} rooms repacked, {final_kept} kept, {final_dropped} dropped",
         results.len()
     );
     Ok(())
