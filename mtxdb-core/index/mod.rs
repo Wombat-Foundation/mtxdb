@@ -1,10 +1,10 @@
 /// Per-slot entry in the lossy fanout index.
 ///
-/// Layout: `[24-bit tag | 8-bit shard_id | 32-bit offset]` packed into a `u64`.
+/// Layout: `[24-bit tag | 12-bit shard_id | 28-bit offset]` packed into a `u64`.
 ///
 /// - **tag** (high 24 bits): truncated fingerprint for fast rejection.
-/// - **`shard_id`** (next 8 bits): which shard file this record lives in.
-/// - **offset** (low 32 bits): byte offset within the shard, stored as
+/// - **`shard_id`** (next 12 bits): which shard file this record lives in.
+/// - **offset** (low 28 bits): byte offset within the shard, stored as
 ///   `offset + 1` so that the all-zeros encoding is reserved as the empty
 ///   sentinel. Actual offset 0 is stored as 1, and `offset()` subtracts 1
 ///   to recover the real value.
@@ -19,8 +19,8 @@ impl IndexSlot {
     const EMPTY: Self = Self(0);
 
     const TAG_SHIFT: u64 = 40; // SHARD_BITS + OFFSET_BITS
-    const SHARD_SHIFT: u64 = 32; // OFFSET_BITS
-    const OFFSET_MASK: u64 = 0xFFFF_FFFF;
+    const SHARD_SHIFT: u64 = 28; // OFFSET_BITS
+    const OFFSET_MASK: u64 = 0x0FFF_FFFF;
 
     /// Create a new slot from its components.
     ///
@@ -29,13 +29,15 @@ impl IndexSlot {
     /// stored as 1 in the slot.
     ///
     /// # Panics
-    /// Panics if `tag` exceeds 24 bits or `offset` exceeds `u32::MAX - 1`.
+    /// Panics if `tag` exceeds 24 bits, `shard_id` exceeds 12 bits, or
+    /// `offset` exceeds `2^28 - 2`.
     #[must_use]
-    pub fn new(tag: u32, shard_id: u8, offset: u64) -> Self {
+    pub fn new(tag: u32, shard_id: u16, offset: u64) -> Self {
         assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
+        assert!(shard_id <= 0xFFF, "shard_id must fit in 12 bits");
         assert!(
-            offset <= u64::from(u32::MAX - 1),
-            "offset must fit in 32 bits minus 1 (reserved for empty sentinel)"
+            offset <= (1u64 << 28) - 2,
+            "offset must fit in 28 bits minus 1 (reserved for empty sentinel)"
         );
         Self(
             (u64::from(tag) << Self::TAG_SHIFT)
@@ -62,10 +64,10 @@ impl IndexSlot {
         ((self.0 >> Self::TAG_SHIFT) & 0xFF_FFFF) as u32
     }
 
-    /// The shard ID stored in this slot.
+    /// The 12-bit shard ID stored in this slot.
     #[must_use]
-    pub fn shard_id(self) -> u8 {
-        ((self.0 >> Self::SHARD_SHIFT) & 0xFF) as u8
+    pub fn shard_id(self) -> u16 {
+        ((self.0 >> Self::SHARD_SHIFT) & 0xFFF) as u16
     }
 
     /// The byte offset within the shard stored in this slot.
@@ -151,7 +153,7 @@ impl LossyIndex {
     pub fn insert(
         &mut self,
         hash: &[u8; 16],
-        shard_id: u8,
+        shard_id: u16,
         offset: u64,
     ) -> Result<(), InsertError> {
         let tag = Self::tag(hash);
@@ -187,7 +189,7 @@ impl LossyIndex {
     /// 2. An empty slot means the key was never inserted.
     #[inline]
     #[must_use]
-    pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u8, u64)> {
+    pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u16, u64)> {
         self.lookup_all(hash).next()
     }
 
@@ -366,7 +368,7 @@ pub struct LookupIter<'a> {
 }
 
 impl Iterator for LookupIter<'_> {
-    type Item = (u8, u64);
+    type Item = (u16, u64);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -398,10 +400,10 @@ mod tests {
 
     #[test]
     fn test_slot_packing() {
-        let slot = IndexSlot::new(0x00AB_CDEF, 42, 0x1234_5678);
+        let slot = IndexSlot::new(0x00AB_CDEF, 42, 0x0FFF_FFF0);
         assert_eq!(slot.tag(), 0x00AB_CDEF);
         assert_eq!(slot.shard_id(), 42);
-        assert_eq!(slot.offset(), 0x1234_5678);
+        assert_eq!(slot.offset(), 0x0FFF_FFF0);
         assert!(!slot.is_empty());
     }
 
@@ -496,9 +498,9 @@ mod tests {
     #[test]
     fn test_serialize_roundtrip() {
         let mut index = LossyIndex::new(128);
-        for i in 0..50u8 {
+        for i in 0..50u16 {
             let mut h = [0u8; 16];
-            h[0] = i;
+            h[0] = (i & 0xFF) as u8;
             index.insert(&h, i % 3, u64::from(i) * 1000 + 1).unwrap();
         }
 
@@ -506,9 +508,9 @@ mod tests {
         let restored = LossyIndex::deserialize(&bytes).unwrap();
 
         assert_eq!(restored.len(), index.len());
-        for i in 0..50u8 {
+        for i in 0..50u16 {
             let mut h = [0u8; 16];
-            h[0] = i;
+            h[0] = (i & 0xFF) as u8;
             assert_eq!(restored.lookup(&h), index.lookup(&h));
         }
     }

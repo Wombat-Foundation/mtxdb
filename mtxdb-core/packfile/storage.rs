@@ -26,7 +26,7 @@ type AdjacencyResult = (Vec<[u8; 16]>, HashMap<[u8; 16], Vec<[u8; 16]>>);
 
 /// One shard's scanned `(hash, offset)` entries for a single room, as
 /// produced by a repack's initial shard scan.
-type ScannedShard = (u8, Vec<([u8; 16], u64)>);
+type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 
 /// Immutable snapshot of a room's in-memory state.
 ///
@@ -102,7 +102,7 @@ impl PackfileStorage {
         cache_capacity: usize,
         swizzle: Option<SwizzleFn>,
     ) -> Result<Self, std::io::Error> {
-        type ShardRecord = (u8, [u8; 16], u64);
+        type ShardRecord = (u16, [u8; 16], u64);
         fs::create_dir_all(&base_dir)?;
 
         let shards = ShardPool::open(base_dir.clone())?;
@@ -115,7 +115,7 @@ impl PackfileStorage {
 
         // Collect open shard info (slot, path) before the scan loop so we
         // don't hold the shards read-lock across the I/O-heavy scan.
-        let open_shards: Vec<(u8, PathBuf)> = shards
+        let open_shards: Vec<(u16, PathBuf)> = shards
             .all_shards()
             .into_iter()
             .map(|(id, shard)| (id, shard.path.clone()))
@@ -299,7 +299,7 @@ impl PackfileStorage {
         scanned
     }
 
-    fn build_index(offsets: &[([u8; 16], u8, u64)]) -> LossyIndex {
+    fn build_index(offsets: &[([u8; 16], u16, u64)]) -> LossyIndex {
         let mut index = LossyIndex::new(offsets.len().saturating_mul(2).max(16));
         for (hash, shard_id, offset) in offsets {
             let _ = index.insert(hash, *shard_id, *offset);
@@ -347,8 +347,8 @@ impl PackfileStorage {
     /// writes* just retired-and-recreated at the same path, turning a
     /// stale-but-valid offset into a read into unrelated, freshly-written
     /// bytes.
-    fn pin_shards(&self, shard_ids: impl Iterator<Item = u8>) -> HashMap<u8, Arc<Shard>> {
-        let unique: HashSet<u8> = shard_ids.collect();
+    fn pin_shards(&self, shard_ids: impl Iterator<Item = u16>) -> HashMap<u16, Arc<Shard>> {
+        let unique: HashSet<u16> = shard_ids.collect();
         unique
             .into_iter()
             .filter_map(|id| self.shards.get_shard(id).map(|shard| (id, shard)))
@@ -361,10 +361,10 @@ impl PackfileStorage {
     fn copy_record_to_shard(
         &self,
         room_id: &[u8; 16],
-        pinned: &HashMap<u8, Arc<Shard>>,
-        old_shard_id: u8,
+        pinned: &HashMap<u16, Arc<Shard>>,
+        old_shard_id: u16,
         old_offset: u64,
-    ) -> Result<Option<([u8; 16], u8, u64)>, StorageError> {
+    ) -> Result<Option<([u8; 16], u16, u64)>, StorageError> {
         let Some(old_shard) = pinned.get(&old_shard_id) else {
             return Ok(None);
         };
@@ -451,7 +451,7 @@ impl PackfileStorage {
         &self,
         gen: Option<&Arc<RoomGeneration>>,
         id: &NodeId,
-        candidates: &[(u8, u64)],
+        candidates: &[(u16, u64)],
     ) -> Result<Option<NodeData>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for (shard_id, offset) in candidates {
@@ -501,8 +501,8 @@ impl PackfileStorage {
     /// the adjacency discovered along the way.
     fn bfs_live_set(
         roots: &[[u8; 16]],
-        hash_to_shard_offset: &HashMap<[u8; 16], (u8, u64)>,
-        pinned: &HashMap<u8, Arc<Shard>>,
+        hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
+        pinned: &HashMap<u16, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<AdjacencyResult, StorageError> {
         let mut visited: HashSet<[u8; 16]> = HashSet::new();
@@ -542,8 +542,8 @@ impl PackfileStorage {
     /// to be garbage.
     fn scan_full_adjacency(
         scanned: &[ScannedShard],
-        hash_to_shard_offset: &HashMap<[u8; 16], (u8, u64)>,
-        pinned: &HashMap<u8, Arc<Shard>>,
+        hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
+        pinned: &HashMap<u16, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<AdjacencyResult, StorageError> {
         let mut all_hashes: Vec<[u8; 16]> = hash_to_shard_offset.keys().copied().collect();
@@ -603,7 +603,7 @@ impl PackfileStorage {
 
         let scanned_count: usize = scanned.iter().map(|(_, entries)| entries.len()).sum();
 
-        let mut hash_to_shard_offset: HashMap<[u8; 16], (u8, u64)> = HashMap::new();
+        let mut hash_to_shard_offset: HashMap<[u8; 16], (u16, u64)> = HashMap::new();
         for (shard_id, entries) in &scanned {
             for (hash, offset) in entries {
                 hash_to_shard_offset.insert(*hash, (*shard_id, *offset));
@@ -653,7 +653,7 @@ impl PackfileStorage {
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
         let topo = csr.topo_order();
 
-        let mut new_offsets: Vec<([u8; 16], u8, u64)> = Vec::with_capacity(topo.len());
+        let mut new_offsets: Vec<([u8; 16], u16, u64)> = Vec::with_capacity(topo.len());
         for &local in &topo {
             let hash = csr
                 .hash_of(local)
@@ -714,7 +714,7 @@ impl PackfileStorage {
         }
 
         // Retire any shard not in the union.
-        for id in 0..shard::MAX_SHARDS_U8 {
+        for id in 0..u16::try_from(shard::MAX_SHARDS).unwrap() {
             if !referenced[id as usize] {
                 self.shards.retire_slot(id);
             }
@@ -727,7 +727,7 @@ impl StorageEngine for PackfileStorage {
         let gen_guard = self.generation(room_id);
         let gen = gen_guard.as_deref();
 
-        let candidates: Vec<(u8, u64)> = match gen {
+        let candidates: Vec<(u16, u64)> = match gen {
             Some(g) => g.index.lookup_all(id).collect(),
             None => return Ok(None),
         };
@@ -755,10 +755,10 @@ impl StorageEngine for PackfileStorage {
         let gen_guard = self.generation(room_id);
         let gen = gen_guard.as_deref();
 
-        let mut to_fetch: Vec<(usize, Vec<(u8, u64)>)> = Vec::new();
+        let mut to_fetch: Vec<(usize, Vec<(u16, u64)>)> = Vec::new();
         if let Some(g) = gen {
             for (i, id) in ids.iter().enumerate() {
-                let candidates: Vec<(u8, u64)> = g.index.lookup_all(id).collect();
+                let candidates: Vec<(u16, u64)> = g.index.lookup_all(id).collect();
                 if !candidates.is_empty() {
                     if let Some(data) = g.cache.get(id) {
                         results[i] = Some((*data).clone());
@@ -1490,14 +1490,16 @@ mod tests {
     /// production triggers it). `rotate()`'s error message says "repack to
     /// reclaim", but repack currently reclaims nothing at the shard level.
     ///
-    /// This fills every one of the pool's `MAX_SHARDS` slots, repacks away
+    /// This fills a small fixed number of pool slots (4), repacks away
     /// everything in the non-active ones (100% garbage, nothing live left),
     /// and then expects one more rotation to succeed by reusing a
-    /// now-empty slot. It fails today: the pool reports "shard pool full"
-    /// even immediately after a repack that emptied three of its four
-    /// shards, because repack never frees a slot for `rotate()` to reuse.
+    /// now-empty slot.
     #[test]
     fn test_repack_reclaims_shard_slots_for_rotation() {
+        // Use a fixed small count rather than MAX_SHARDS — with 4096 slots
+        // and 256MB each that would be a 1TB test.
+        const TEST_SHARDS: usize = 4;
+
         let dir = test_dir("repack_reclaims_slots");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -1512,16 +1514,16 @@ mod tests {
             .unwrap();
 
         // `root` already occupies the first slot; force rotation through
-        // the remaining MAX_SHARDS - 1 slots, dumping garbage into each so
+        // the remaining TEST_SHARDS - 1 slots, dumping garbage into each so
         // every shard but the last ends up fully unreachable once we
         // repack with `root` as the only live node.
-        for i in 0..shard::MAX_SHARDS - 1 {
+        for i in 0..TEST_SHARDS - 1 {
             store.shards.active_shard().file_len.store(
                 shard::MAX_SHARD_BYTES - 10,
                 std::sync::atomic::Ordering::Release,
             );
             let mut garbage = [0u8; 16];
-            garbage[0] = u8::try_from(i).unwrap() + 1;
+            garbage[0] = u8::try_from(i + 1).unwrap();
             store
                 .put(
                     &TEST_ROOM,
@@ -1531,13 +1533,12 @@ mod tests {
                 .unwrap();
         }
 
-        // Every slot (MAX_SHARDS of them) should now be occupied.
-        let occupied = (0..u8::try_from(shard::MAX_SHARDS).unwrap())
+        // Every slot should now be occupied.
+        let occupied = (0..u16::try_from(TEST_SHARDS).unwrap())
             .filter(|&id| store.shards.get_shard(id).is_some())
             .count();
         assert_eq!(
-            occupied,
-            shard::MAX_SHARDS,
+            occupied, TEST_SHARDS,
             "test setup should have filled every shard slot"
         );
 
