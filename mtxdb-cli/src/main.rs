@@ -19,9 +19,7 @@ pub enum Commands {
         room: String,
         id: String,
     },
-    Rooms {
-        rescan: bool,
-    },
+    Rooms,
     Shards,
     Info {
         room: String,
@@ -34,7 +32,8 @@ pub enum Commands {
         room: Option<String>,
     },
     Repack {
-        room: String,
+        room: Option<String>,
+        shard: Option<u16>,
         root: Vec<String>,
         topo: bool,
     },
@@ -70,17 +69,7 @@ fn build_cli() -> Command {
                 .arg(Arg::new("room").short('r').long("room").required(true))
                 .arg(Arg::new("id").short('i').long("id").required(true)),
         )
-        .subcommand(
-            Command::new("rooms")
-                .about("List rooms in the store")
-                .arg(
-                    Arg::new("rescan")
-                        .short('r')
-                        .long("rescan")
-                        .action(ArgAction::SetTrue)
-                        .help("Force a full packfile scan instead of the fast persisted directory"),
-                ),
-        )
+        .subcommand(Command::new("rooms").about("List rooms in the store"))
         .subcommand(
             Command::new("shards")
                 .about("List open shards with size, generation, and IO/sync stats"),
@@ -165,9 +154,7 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").unwrap().clone(),
             id: m.get_one::<String>("id").unwrap().clone(),
         },
-        Some(("rooms", m)) => Commands::Rooms {
-            rescan: m.get_flag("rescan"),
-        },
+        Some(("rooms", _)) => Commands::Rooms,
         Some(("shards", _)) => Commands::Shards,
         Some(("info", m)) => Commands::Info {
             room: m.get_one::<String>("room").unwrap().clone(),
@@ -180,7 +167,8 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").cloned(),
         },
         Some(("repack", m)) => Commands::Repack {
-            room: m.get_one::<String>("room").unwrap().clone(),
+            room: m.get_one::<String>("room").cloned(),
+            shard: m.get_one::<u16>("shard").copied(),
             root: m
                 .get_many::<String>("root")
                 .into_iter()

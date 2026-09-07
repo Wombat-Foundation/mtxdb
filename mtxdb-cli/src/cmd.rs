@@ -48,7 +48,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
         Commands::Get { room, id } => cmd_get(cli, room, id),
-        Commands::Rooms { rescan } => cmd_rooms(cli, *rescan),
+        Commands::Rooms => cmd_rooms(cli),
         Commands::Shards => cmd_shards(cli),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { path } => cmd_scan(path),
@@ -127,37 +127,8 @@ fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
 /// exists inside the packfile, but this skips building a `LossyIndex`
 /// and `NodeCache` per room, which `open_store_read_only` would do
 /// purely to hand back counts and then throw everything away.
-/// Lists rooms and their record counts. Tries the persisted shard→room
-/// directory first (`PackfileStorage::room_directory_from_disk`) — a
-/// single small-file read, no shard scanning at all. Falls back to the
-/// full-scan path only if that directory doesn't exist yet (a store
-/// predating the feature, or one whose writer has never called
-/// `sync_all`/`maybe_persist_shard_rooms`). Pass `-r`/`--rescan` to
-/// bypass the persisted directory and always do the live scan.
-fn cmd_rooms(cli: &Cli, force_rescan: bool) -> anyhow::Result<()> {
+fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
-
-    if !force_rescan {
-        let from_disk = PackfileStorage::room_directory_from_disk(dir);
-        if !from_disk.is_empty() {
-            if let Some(persisted_at) = PackfileStorage::room_directory_persisted_at(dir) {
-                let age_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |now| now.as_secs().saturating_sub(persisted_at));
-                eprintln!(
-                    "(from persisted directory, {} old — may not reflect writes since then)",
-                    fmt_duration(age_secs)
-                );
-            }
-            for (i, (room_id, count)) in from_disk.iter().enumerate() {
-                let hex = hex_encode(room_id);
-                eprintln!("  {i}: 0x{hex} ({count} records)");
-            }
-            return Ok(());
-        }
-        eprintln!("(no persisted directory yet — falling back to a full scan)");
-    }
-
     let mut counts: std::collections::HashMap<[u8; 16], usize> = std::collections::HashMap::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -193,19 +164,26 @@ fn cmd_rooms(cli: &Cli, force_rescan: bool) -> anyhow::Result<()> {
 /// for the IO/sync counters. Zero `File::open` calls; the only I/O is
 /// `stat()` per shard file and one read of the small stats snapshot.
 /// Safe to run against a directory a live writer process owns.
-#[allow(clippy::too_many_lines)]
 fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
-    // Binary format for shard_stats.bin — same layout as
-    // ShardPool::restore_persisted_stats, decoded standalone.
-    const STATS_MAGIC: &[u8; 4] = b"MSTA";
-    const STATS_HEADER_LEN: usize = 4 + 1 + 8; // magic + version + persisted_at
-    const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
-    const GEN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
-    let mut shard_entries = Vec::new();
+    let mut shard_entries = glob_shard_files(dir)?;
+    shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
 
-    // Glob shard files — parse slot_id and generation from the filename.
+    if shard_entries.is_empty() {
+        eprintln!("no shards found");
+        return Ok(());
+    }
+
+    let (stats_map, persisted_at) = decode_stats_snapshot(dir);
+    print_shard_table(&shard_entries, &stats_map);
+    print_stats_age(persisted_at);
+    Ok(())
+}
+
+/// Glob `shard_*.pack` files in `dir`, parsing slot_id, generation,
+/// and file size from each filename and its metadata.
+fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
+    let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -221,55 +199,69 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
                     };
                     if let Ok(slot_id) = u16::from_str_radix(slot_hex, 16) {
                         let file_bytes = entry.metadata()?.len();
-                        shard_entries.push((slot_id, generation, file_bytes));
+                        entries.push((slot_id, generation, file_bytes));
                     }
                 }
             }
         }
     }
-    shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
+    Ok(entries)
+}
 
-    if shard_entries.is_empty() {
-        eprintln!("no shards found");
-        return Ok(());
-    }
+/// Decode `shard_stats.bin` — same binary format as
+/// `ShardPool::restore_persisted_stats`, but standalone. Returns a map
+/// from a composite `(shard_id, generation)` key to `(write_count,
+/// bytes_written, sync_count)` and the snapshot's persisted-at timestamp.
+fn decode_stats_snapshot(
+    dir: &Path,
+) -> (
+    std::collections::HashMap<u64, (u64, u64, u64)>,
+    Option<u64>,
+) {
+    const STATS_MAGIC: &[u8; 4] = b"MSTA";
+    const STATS_HEADER_LEN: usize = 4 + 1 + 8; // magic + version + persisted_at
+    const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
+    const GEN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-    // Decode the stats snapshot — same binary format as
-    // ShardPool::restore_persisted_stats, but standalone.
-    let mut stats_map: std::collections::HashMap<u64, (u64, u64, u64)> =
-        std::collections::HashMap::new(); // generation → (write_count, bytes_written, sync_count)
-    let mut persisted_at: Option<u64> = None;
+    let mut stats_map = std::collections::HashMap::new();
+    let mut persisted_at = None;
 
     let stats_path = dir.join("shard_stats.bin");
-    if let Ok(buf) = fs::read(&stats_path) {
-        if buf.len() >= STATS_HEADER_LEN && &buf[0..4] == STATS_MAGIC && buf[4] == 3
-        // v3
-        {
-            persisted_at = Some(u64::from_le_bytes(buf[5..13].try_into().unwrap_or([0; 8])));
-            let body = &buf[STATS_HEADER_LEN..];
-            for chunk in body.chunks(STATS_RECORD_LEN) {
-                if let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) {
-                    let shard_id = u16::from_le_bytes(rec[0..2].try_into().unwrap());
-                    let generation = u64::from_le_bytes(rec[2..10].try_into().unwrap());
-                    let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
-                    let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
-                    let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
-                    // Key by (shard_id, generation) — match the stats
-                    // snapshot to the right shard file.  Encode both
-                    // into a single u64 key: upper 16 bits = shard_id,
-                    // lower 48 bits = generation.
-                    let key = u64::from(shard_id) << 48 | (generation & GEN_MASK);
-                    stats_map.insert(key, (write_count, bytes_written, sync_count));
-                }
-            }
+    let Ok(buf) = fs::read(stats_path) else {
+        return (stats_map, persisted_at);
+    };
+    if buf.len() < STATS_HEADER_LEN || &buf[0..4] != STATS_MAGIC || buf[4] != 3 {
+        return (stats_map, persisted_at);
+    }
+
+    persisted_at = Some(u64::from_le_bytes(buf[5..13].try_into().unwrap_or([0; 8])));
+    let body = &buf[STATS_HEADER_LEN..];
+    for chunk in body.chunks(STATS_RECORD_LEN) {
+        if let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) {
+            let shard_id = u16::from_le_bytes(rec[0..2].try_into().unwrap());
+            let generation = u64::from_le_bytes(rec[2..10].try_into().unwrap());
+            let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
+            let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
+            let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
+            let key = u64::from(shard_id) << 48 | (generation & GEN_MASK);
+            stats_map.insert(key, (write_count, bytes_written, sync_count));
         }
     }
+    (stats_map, persisted_at)
+}
+
+/// Print the shard table header and rows.
+fn print_shard_table(
+    shard_entries: &[(u16, u64, u64)],
+    stats_map: &std::collections::HashMap<u64, (u64, u64, u64)>,
+) {
+    const GEN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     eprintln!(
         "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
         "shard", "generation", "bytes", "writes", "written", "syncs"
     );
-    for &(slot_id, generation, file_bytes) in &shard_entries {
+    for &(slot_id, generation, file_bytes) in shard_entries {
         let key = u64::from(slot_id) << 48 | (generation & GEN_MASK);
         let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
         eprintln!(
@@ -283,6 +275,10 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
         );
     }
     eprintln!("{} shards", shard_entries.len());
+}
+
+/// Print how old the stats snapshot is (or that none exists).
+fn print_stats_age(persisted_at: Option<u64>) {
     match persisted_at {
         Some(ts) => {
             let age_secs = std::time::SystemTime::now()
@@ -297,7 +293,6 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
             "stats snapshot: none persisted yet — counters above are all zero by default, not necessarily real"
         ),
     }
-    Ok(())
 }
 
 /// Formats a duration in seconds as a short human-readable age string.
@@ -415,7 +410,16 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
     Ok(())
 }
 
-fn cmd_repack(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Result<()> {
+fn cmd_repack(
+    cli: &Cli,
+    room: &str,
+    roots: &[String],
+    topo: bool,
+) -> anyhow::Result<()> {
+    cmd_repack_room(cli, room, roots, topo)
+}
+
+fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
     let store = open_store(cli)?;
 
@@ -445,6 +449,49 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Re
     };
     eprintln!("repacked {hex}: {kept} kept, {dropped} dropped");
 
+    Ok(())
+}
+
+/// Repacks every room still referencing `shard_id` — the shard-scoped
+/// counterpart to `cmd_repack_room`, backed by
+/// `PackfileStorage::repack_shard` (which finds the referencing rooms in
+/// O(1) via the shard→room directory rather than scanning the shard
+/// file). `--root` doesn't apply here since live roots are inherently
+/// per-room — the same `--topo`/no-`--topo` edge-extraction choice
+/// applies uniformly across every room this shard touches.
+fn cmd_repack_shard(cli: &Cli, shard_id: u16, roots: &[String], topo: bool) -> anyhow::Result<()> {
+    if !roots.is_empty() {
+        bail!("--root requires --room — live roots are per-room, not meaningful for --shard");
+    }
+    if topo {
+        eprintln!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
+    } else {
+        eprintln!("warning: --topo without --root means no GC; all records preserved");
+    }
+
+    let store = open_store(cli)?;
+    let results = if topo {
+        store.repack_shard(shard_id, extract_matrix_edges)?
+    } else {
+        store.repack_shard(shard_id, |_hash, _data| Vec::new())?
+    };
+
+    if results.is_empty() {
+        eprintln!("no rooms reference shard {shard_id}");
+        return Ok(());
+    }
+    for (room_id, kept, dropped) in &results {
+        eprintln!("repacked {}: {kept} kept, {dropped} dropped", hex_encode(room_id));
+    }
+    let (total_kept, total_dropped) = results
+        .iter()
+        .fold((0usize, 0usize), |(k, d), &(_, kept, dropped)| {
+            (k.saturating_add(kept), d.saturating_add(dropped))
+        });
+    eprintln!(
+        "shard {shard_id}: {} rooms repacked, {total_kept} kept, {total_dropped} dropped",
+        results.len()
+    );
     Ok(())
 }
 
