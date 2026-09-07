@@ -1435,6 +1435,95 @@ mod tests {
         }
     }
 
+    /// Repack drops unreachable *records* from the index (`dropped` count),
+    /// but today nothing ever retires the *shard file* they lived in: no
+    /// code path sets `Shard::is_current` to `false` or clears the pool's
+    /// slot for it (see `Shard::drop`'s doc and
+    /// `test_drop_deletes_retired_shard_only_after_last_reference` in
+    /// shard.rs, which has to simulate retirement manually because nothing
+    /// production triggers it). `rotate()`'s error message says "repack to
+    /// reclaim", but repack currently reclaims nothing at the shard level.
+    ///
+    /// This fills every one of the pool's `MAX_SHARDS` slots, repacks away
+    /// everything in the non-active ones (100% garbage, nothing live left),
+    /// and then expects one more rotation to succeed by reusing a
+    /// now-empty slot. It fails today: the pool reports "shard pool full"
+    /// even immediately after a repack that emptied three of its four
+    /// shards, because repack never frees a slot for `rotate()` to reuse.
+    #[test]
+    fn test_repack_reclaims_shard_slots_for_rotation() {
+        let dir = test_dir("repack_reclaims_slots");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let mut root = [0u8; 16];
+        root[0] = 0xFF;
+        store
+            .put(
+                &TEST_ROOM,
+                &root,
+                &NodeData::new(bytes::Bytes::from_static(b"root")),
+            )
+            .unwrap();
+
+        // `root` already occupies the first slot; force rotation through
+        // the remaining MAX_SHARDS - 1 slots, dumping garbage into each so
+        // every shard but the last ends up fully unreachable once we
+        // repack with `root` as the only live node.
+        for i in 0..shard::MAX_SHARDS - 1 {
+            store.shards.active_shard().file_len.store(
+                shard::MAX_SHARD_BYTES - 10,
+                std::sync::atomic::Ordering::Release,
+            );
+            let mut garbage = [0u8; 16];
+            garbage[0] = u8::try_from(i).unwrap() + 1;
+            store
+                .put(
+                    &TEST_ROOM,
+                    &garbage,
+                    &NodeData::new(bytes::Bytes::from_static(b"garbage")),
+                )
+                .unwrap();
+        }
+
+        // Every slot (MAX_SHARDS of them) should now be occupied.
+        let occupied = (0..u8::try_from(shard::MAX_SHARDS).unwrap())
+            .filter(|&id| store.shards.get_shard(id).is_some())
+            .count();
+        assert_eq!(
+            occupied,
+            shard::MAX_SHARDS,
+            "test setup should have filled every shard slot"
+        );
+
+        store.set_live_roots(&TEST_ROOM, vec![root]);
+        let (kept, dropped) = store
+            .repack_room_reachable(&TEST_ROOM, |_hash, _data| Vec::new())
+            .unwrap();
+        assert_eq!(kept, 1, "only root should survive");
+        assert!(dropped > 0, "the garbage records should have been dropped");
+
+        // Every shard except the current active one held nothing but
+        // garbage, and that garbage is now unreachable -- those slots
+        // should be reclaimable. Forcing one more rotation should reuse
+        // one of them rather than failing.
+        store.shards.active_shard().file_len.store(
+            shard::MAX_SHARD_BYTES - 10,
+            std::sync::atomic::Ordering::Release,
+        );
+        let mut one_more = [0u8; 16];
+        one_more[0] = 0xEE;
+        store
+            .put(
+                &TEST_ROOM,
+                &one_more,
+                &NodeData::new(bytes::Bytes::from_static(b"one more")),
+            )
+            .expect(
+                "rotation should reclaim a garbage-only shard slot after repack, \
+                 not report the pool as permanently full",
+            );
+    }
+
     #[test]
     fn test_repack_room_reachable_without_live_roots_preserves_everything() {
         let dir = test_dir("repack_reachable_no_roots");
