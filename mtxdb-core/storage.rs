@@ -12,8 +12,8 @@ pub type NodeId = [u8; 16];
 
 /// Tag byte prepended to values to identify their record type.
 /// Legacy/untagged data (written before this scheme) is detected by the
-/// absence of a recognized tag (first byte not in 0x01..=0x08) or by
-/// zero-length values (tombstones).
+/// absence of a recognized tag (first byte not in the set of defined tag
+/// constants) or by zero-length values (tombstones).
 ///
 /// Tag byte for generic key-value records.
 pub const ENTRY_TYPE_GENERIC_KV: u8 = 0x00;

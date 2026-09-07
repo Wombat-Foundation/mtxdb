@@ -52,7 +52,7 @@ struct RoomGeneration {
 pub struct PackfileStorage {
     shards: ShardPool,
     rooms: RwLock<HashMap<[u8; 16], ArcSwap<RoomGeneration>>>,
-    room_order: Vec<[u8; 16]>,
+    room_order: RwLock<Vec<[u8; 16]>>,
     pinned: PinnedNodes,
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
@@ -176,7 +176,7 @@ impl PackfileStorage {
         Ok(Self {
             shards,
             rooms: RwLock::new(rooms),
-            room_order,
+            room_order: RwLock::new(room_order),
             pinned: PinnedNodes::new(),
             base_dir,
             swizzle,
@@ -214,6 +214,7 @@ impl PackfileStorage {
     pub fn room_summaries(&self) -> Vec<([u8; 16], usize, usize)> {
         let rooms = self.rooms.read();
         self.room_order
+            .read()
             .iter()
             .filter_map(|id| {
                 rooms.get(id).map(|gen| {
@@ -270,7 +271,7 @@ impl PackfileStorage {
         ShardPool::read_at(shard, offset)
     }
 
-    fn scan_room_records(&self, room_id: &[u8; 16]) -> Vec<ScannedShard> {
+    fn scan_room_records(&self, room_id: &[u8; 16]) -> Result<Vec<ScannedShard>, StorageError> {
         let mut scanned: Vec<ScannedShard> = Vec::new();
         for (shard_id, shard) in self.shards.all_shards() {
             match packfile::scan_packfile(&shard.path) {
@@ -285,11 +286,11 @@ impl PackfileStorage {
                     }
                 }
                 Err(e) => {
-                    eprintln!("warning: scan_packfile failed for shard {shard_id:02x}: {e}");
+                    return Err(StorageError::Io(e));
                 }
             }
         }
-        scanned
+        Ok(scanned)
     }
 
     fn build_index(offsets: &[([u8; 16], u16, u64)]) -> LossyIndex {
@@ -325,6 +326,16 @@ impl PackfileStorage {
         set.insert(*room_id);
         let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
         fs::write(&path, &bytes).map_err(StorageError::Io)?;
+        Ok(())
+    }
+
+    fn clear_deleted_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
+        let path = Self::deleted_rooms_path(&self.base_dir);
+        let mut set = Self::load_deleted_rooms(&self.base_dir);
+        if set.remove(room_id) {
+            let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
+            fs::write(&path, &bytes).map_err(StorageError::Io)?;
+        }
         Ok(())
     }
 
@@ -375,6 +386,11 @@ impl PackfileStorage {
     }
 
     /// Store a new generation for a room, reusing the existing cache if present.
+    ///
+    /// If the room is new (not yet in the `rooms` map), it is added to
+    /// `room_order` so that [`Self::room_summaries`] will include it, and
+    /// any prior tombstone in `deleted.rooms` is cleared so the room
+    /// survives a restart.
     fn store_generation(
         &self,
         room_id: &[u8; 16],
@@ -383,6 +399,9 @@ impl PackfileStorage {
     ) {
         let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
         let new_gen = Arc::new(RoomGeneration { index, cache });
+
+        let is_new = self.rooms.read().get(room_id).is_none();
+
         self.rooms
             .write()
             .entry(*room_id)
@@ -393,10 +412,15 @@ impl PackfileStorage {
                 })
             })
             .store(new_gen);
+
+        if is_new {
+            self.room_order.write().push(*room_id);
+            let _ = self.clear_deleted_room(room_id);
+        }
     }
 
-    fn rebuild_index(&self, room_id: &[u8; 16]) -> LossyIndex {
-        let scanned = self.scan_room_records(room_id);
+    fn rebuild_index(&self, room_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
+        let scanned = self.scan_room_records(room_id)?;
         let total: usize = scanned.iter().map(|(_, e)| e.len()).sum();
         let mut index = LossyIndex::new(total.saturating_mul(2).max(16));
         for (shard_id, entries) in scanned {
@@ -404,7 +428,7 @@ impl PackfileStorage {
                 let _ = index.insert(&hash, shard_id, offset);
             }
         }
-        index
+        Ok(index)
     }
 
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
@@ -592,7 +616,7 @@ impl PackfileStorage {
         let room_arc = self.put_mutex(room_id);
         let _room_guard = room_arc.lock();
 
-        let scanned = self.scan_room_records(room_id);
+        let scanned = self.scan_room_records(room_id)?;
 
         let scanned_count: usize = scanned.iter().map(|(_, entries)| entries.len()).sum();
 
@@ -799,7 +823,7 @@ impl StorageEngine for PackfileStorage {
             };
             let index_full = index.insert(id, shard_id, offset).is_err();
             if index_full {
-                index = self.rebuild_index(room_id);
+                index = self.rebuild_index(room_id)?;
                 let _ = index.insert(id, shard_id, offset);
             }
             let cache = match &old_gen {

@@ -919,7 +919,13 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
     let t_start = Instant::now();
     for i in 0..total_events {
         let mut id = [0u8; 16];
-        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        // splitmix64 on i to spread sequential counters across many buckets
+        let mut x = i as u64;
+        x = x.wrapping_add(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x = x ^ (x >> 31);
+        id[..8].copy_from_slice(&x.to_le_bytes());
         let data = NodeData::new(bytes::Bytes::from(format!("repack payload {i}")));
         store.put(&room_id, &id, &data).unwrap();
 

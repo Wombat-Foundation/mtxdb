@@ -134,9 +134,10 @@ pub unsafe extern "C" fn mdb_get(
 
 /// Fetch a node with explicit error reporting.
 ///
-/// Returns null if not found. On I/O error, writes the error code to
-/// `*out_err` and returns null. On success, writes `MdbError::Ok` to
-/// `*out_err` and returns the node handle.
+/// Returns null if not found (writes `MdbError::NotFound` to `*out_err`).
+/// On I/O error, writes the error code to `*out_err` and returns null.
+/// On success, writes `MdbError::Ok` to `*out_err` and returns the node
+/// handle.
 ///
 /// The caller must destroy the returned handle with `mdb_node_data_destroy`.
 ///

@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 const CSR_VERSION: u8 = 1;
 
@@ -112,22 +113,22 @@ impl Csr {
             i = i.wrapping_add(1);
         }
 
-        let mut queue: VecDeque<u32> = VecDeque::new();
+        let mut queue: BinaryHeap<Reverse<u32>> = BinaryHeap::new();
         i = 0;
         while (i as usize) < n {
             if in_degree[i as usize] == 0 {
-                queue.push_back(i);
+                queue.push(Reverse(i));
             }
             i = i.wrapping_add(1);
         }
 
         let mut order = Vec::with_capacity(n);
-        while let Some(node) = queue.pop_front() {
+        while let Some(Reverse(node)) = queue.pop() {
             order.push(node);
             for &target in self.neighbors(node) {
                 in_degree[target as usize] = in_degree[target as usize].wrapping_sub(1);
                 if in_degree[target as usize] == 0 {
-                    queue.push_back(target);
+                    queue.push(Reverse(target));
                 }
             }
         }
@@ -170,7 +171,8 @@ impl Csr {
     ///
     /// # Errors
     /// Returns [`CsrError::TooShort`] if the buffer is too small,
-    /// or [`CsrError::UnsupportedVersion`] if the version byte is unrecognized.
+    /// [`CsrError::UnsupportedVersion`] if the version byte is unrecognized,
+    /// or [`CsrError::Malformed`] if the offsets or targets are inconsistent.
     ///
     /// # Panics
     /// Panics if the 8-byte header fields cannot be read (guaranteed by the length check).
@@ -184,8 +186,10 @@ impl Csr {
             return Err(CsrError::UnsupportedVersion(version));
         }
 
-        let n = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-        let e = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
+        let n_u32 = u32::from_le_bytes(data[1..5].try_into().unwrap());
+        let e_u32 = u32::from_le_bytes(data[5..9].try_into().unwrap());
+        let n = n_u32 as usize;
+        let e = e_u32 as usize;
 
         let offsets_len = n.wrapping_add(1);
         let expected = 9usize
@@ -210,6 +214,19 @@ impl Csr {
             targets.push(u32::from_le_bytes(
                 data[off..off.wrapping_add(4)].try_into().unwrap(),
             ));
+        }
+
+        if offsets[0] != 0 {
+            return Err(CsrError::Malformed);
+        }
+        if offsets.windows(2).any(|w| w[1] < w[0]) {
+            return Err(CsrError::Malformed);
+        }
+        if n > 0 && *offsets.last().unwrap() != e_u32 {
+            return Err(CsrError::Malformed);
+        }
+        if targets.iter().any(|&t| t >= n_u32) {
+            return Err(CsrError::Malformed);
         }
 
         Ok(Self {
@@ -240,6 +257,8 @@ pub enum CsrError {
     TooShort,
     /// The CSR version byte is not supported.
     UnsupportedVersion(u8),
+    /// The offsets or targets are inconsistent (malformed data).
+    Malformed,
 }
 
 impl std::fmt::Display for CsrError {
@@ -247,6 +266,7 @@ impl std::fmt::Display for CsrError {
         match self {
             Self::TooShort => write!(f, "csr data too short"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported csr version: {v}"),
+            Self::Malformed => write!(f, "csr data is malformed"),
         }
     }
 }
@@ -361,5 +381,70 @@ mod tests {
         assert_eq!(csr.node_count(), 0);
         assert_eq!(csr.edge_count(), 0);
         assert_eq!(csr.topo_order().len(), 0);
+    }
+
+    #[test]
+    fn test_topo_order_tie_break_by_local_id() {
+        // Node 0 -> Node 3, Node 3 -> Node 1, Node 3 -> Node 2
+        // When Node 3 is processed, both 1 and 2 become ready simultaneously.
+        // Local-ID tie-break: 1 before 2. Expected order: [0, 3, 1, 2].
+        let nodes = vec![h(0), h(1), h(2), h(3)];
+        let mut adj = HashMap::new();
+        adj.insert(h(0), vec![h(3)]);
+        adj.insert(h(3), vec![h(1), h(2)]);
+
+        let csr = Csr::build_from_edges(&nodes, &adj);
+        let order = csr.topo_order();
+        assert_eq!(order, vec![0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn test_deserialize_malformed_first_offset_not_zero() {
+        let nodes = vec![h(1), h(2)];
+        let mut adj = HashMap::new();
+        adj.insert(h(1), vec![h(2)]);
+        let csr = Csr::build_from_edges(&nodes, &adj);
+        let mut bytes = csr.serialize();
+        // Corrupt offsets[0]: change first offset byte from 0 to 1
+        bytes[9] = 1;
+        assert!(matches!(Csr::deserialize(&bytes), Err(CsrError::Malformed)));
+    }
+
+    #[test]
+    fn test_deserialize_malformed_offsets_not_monotonic() {
+        let nodes = vec![h(1), h(2), h(3)];
+        let mut adj = HashMap::new();
+        adj.insert(h(1), vec![h(2), h(3)]);
+        let csr = Csr::build_from_edges(&nodes, &adj);
+        let mut bytes = csr.serialize();
+        // offsets = [0, 2, 2, 2]; corrupt offsets[3] from 2 to 1 → [0, 2, 2, 1]
+        // offsets[3] < offsets[2] → decreasing
+        bytes[21] = 1;
+        assert!(matches!(Csr::deserialize(&bytes), Err(CsrError::Malformed)));
+    }
+
+    #[test]
+    fn test_deserialize_malformed_final_offset_wrong() {
+        let nodes = vec![h(1), h(2)];
+        let mut adj = HashMap::new();
+        adj.insert(h(1), vec![h(2)]);
+        let csr = Csr::build_from_edges(&nodes, &adj);
+        let mut bytes = csr.serialize();
+        // Corrupt offsets[2]: should be 1 (edge count), change to 2
+        bytes[17] = 2;
+        assert!(matches!(Csr::deserialize(&bytes), Err(CsrError::Malformed)));
+    }
+
+    #[test]
+    fn test_deserialize_malformed_target_out_of_range() {
+        let nodes = vec![h(1), h(2)];
+        let mut adj = HashMap::new();
+        adj.insert(h(1), vec![h(2)]);
+        let csr = Csr::build_from_edges(&nodes, &adj);
+        let mut bytes = csr.serialize();
+        // Corrupt targets[0]: should be 1 (local id for h(2)), change to 99
+        let targets_offset = 9 + 3 * 4; // version + (n+1)*4 offsets
+        bytes[targets_offset] = 99;
+        assert!(matches!(Csr::deserialize(&bytes), Err(CsrError::Malformed)));
     }
 }

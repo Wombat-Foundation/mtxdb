@@ -2,6 +2,6 @@
   "threshold": 0,
   "minLines": 20,
   "minTokens": 150,
-  "format": "rust",
+  "formats": ["rust"],
   "reporters": ["console"]
 }

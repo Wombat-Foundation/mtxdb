@@ -212,6 +212,9 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Re
     let store = open_store(cli)?;
 
     if !roots.is_empty() {
+        if !topo {
+            bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+        }
         let root_ids: Vec<mtxdb::NodeId> = roots
             .iter()
             .map(|r| parse_node_id(r))
@@ -227,6 +230,7 @@ fn cmd_repack(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Re
     // own root (dedup only, no dependency ordering).
     let hex = hex_encode(&room_id);
     let (kept, dropped) = if topo {
+        eprintln!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
         store.repack_room_reachable(&room_id, extract_matrix_edges)?
     } else {
         store.repack_room_reachable(&room_id, |_hash, _data| Vec::new())?
@@ -285,7 +289,7 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
 
 fn cmd_bench(cli: &Cli, count: usize) -> anyhow::Result<()> {
     let store = open_store(cli)?;
-    let room_id = [0u8; 16];
+    let room_id = [0xBB; 16];
 
     let payload = vec![0xABu8; 256];
     let mut ids: Vec<[u8; 16]> = Vec::with_capacity(count);
