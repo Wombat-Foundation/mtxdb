@@ -718,9 +718,7 @@ impl PackfileStorage {
         let room_arc = self.put_mutex(room_id);
         let _room_guard = room_arc.lock();
 
-        let scanned = self.scan_room_records(room_id)?;
-
-        let scanned_count: usize = scanned.iter().map(|(_, entries)| entries.len()).sum();
+        let mut scanned = self.scan_room_records(room_id)?;
 
         let mut hash_to_shard_offset: HashMap<[u8; 16], (u16, u64)> = HashMap::new();
         for (shard_id, entries) in &scanned {
@@ -728,6 +726,21 @@ impl PackfileStorage {
                 hash_to_shard_offset.insert(*hash, (*shard_id, *offset));
             }
         }
+
+        // Packfiles are append-only: previous repacks leave stale copies
+        // of records in the same shard file.  hash_to_shard_offset already
+        // deduplicates by hash (last write wins), so filter scanned to keep
+        // only the entries that survived dedup — otherwise scanned_count
+        // inflates with stale copies and the dropped count is wrong.
+        for (_shard_id, entries) in &mut scanned {
+            entries.retain(|(hash, offset)| {
+                hash_to_shard_offset
+                    .get(hash)
+                    .is_some_and(|&(_, o)| o == *offset)
+            });
+        }
+
+        let scanned_count: usize = scanned.iter().map(|(_, entries)| entries.len()).sum();
 
         // Pin every shard this call could possibly read from before any
         // writes happen — see pin_shards' doc for why this must come
@@ -1763,19 +1776,20 @@ mod tests {
         assert_eq!(stats.dropped_total, 2);
         assert_eq!(store.repack_count_for_room(&TEST_ROOM), 1);
 
-        // A second repack rescans every shard still holding this room's
+        // A second repack rescans shards that still hold this room's
         // bytes from disk (repack rewrites live records into a fresh
-        // generation but doesn't erase the old shard's bytes unless that
-        // shard gets retired), so it now sees both the freshly-written
-        // generation (3 live) and the original shard's full 5 records
-        // (3 live + 2 garbage) again, dropping the garbage a second time.
-        // Stats should accumulate across both calls rather than reset.
+        // generation but doesn't erase the old shard's bytes unless
+        // that shard gets retired). The dedup filter in
+        // repack_room_reachable discards stale packfile entries whose
+        // offset no longer matches the current generation's index, so
+        // the second repack sees the same 3 live + 2 garbage as the
+        // first — no inflation from stale copies.
         let (kept2, dropped2) = store
             .repack_room_reachable(&TEST_ROOM, |hash, _data| {
                 edges.get(hash).cloned().unwrap_or_default()
             })
             .unwrap();
-        assert_eq!((kept2, dropped2), (3, 5));
+        assert_eq!((kept2, dropped2), (3, 2));
 
         let stats2 = store.repack_stats();
         assert_eq!(stats2.repack_count, 2);
