@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -637,6 +638,11 @@ impl PackfileStorage {
             if let Some(gen) = self.generation(room_id) {
                 for hash in hash_to_shard_offset.keys() {
                     if !live_set.contains(hash) {
+                        let mut hex = String::with_capacity(32);
+                        for b in hash {
+                            let _ = write!(hex, "{b:02x}");
+                        }
+                        eprintln!("  dropped: {hex}");
                         gen.cache.remove(hash);
                     }
                 }
