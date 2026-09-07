@@ -14,13 +14,21 @@ pub type NodeId = [u8; 16];
 /// Legacy/untagged data (written before this scheme) is detected by the
 /// absence of a recognized tag (first byte not in 0x01..=0x08) or by
 /// zero-length values (tombstones).
-pub const ENTRY_TYPE_HAMT_ROOT_FLAT: u8 = 0x01; // already in use
-pub const ENTRY_TYPE_HAMT_ROOT_TYPED: u8 = 0x02; // already in use
+/// Tag byte for HAMT root (flat v1) — already in use.
+pub const ENTRY_TYPE_HAMT_ROOT_FLAT: u8 = 0x01;
+/// Tag byte for HAMT root (typed v2) — already in use.
+pub const ENTRY_TYPE_HAMT_ROOT_TYPED: u8 = 0x02;
+/// Tag byte for HAMT internal nodes.
 pub const ENTRY_TYPE_HAMT_NODE: u8 = 0x03;
+/// Tag byte for event JSON records.
 pub const ENTRY_TYPE_EVENT_JSON: u8 = 0x04;
+/// Tag byte for event-to-state-group mappings.
 pub const ENTRY_TYPE_EVENT_STATE_GROUP: u8 = 0x05;
+/// Tag byte for state group reference counts.
 pub const ENTRY_TYPE_STATE_GROUP_REFCOUNT: u8 = 0x06;
+/// Tag byte for auth chain link manifests.
 pub const ENTRY_TYPE_AUTH_CHAIN_LINKS: u8 = 0x07;
+/// Tag byte for generic key-value records.
 pub const ENTRY_TYPE_GENERIC_KV: u8 = 0x08;
 
 /// Returns true if the first byte is a recognized entry type tag.
