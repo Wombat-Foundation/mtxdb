@@ -2589,7 +2589,7 @@ mod tests {
 
         let valid_path = dir.join("shard_00.pack");
         let mut buf = Vec::new();
-        packfile::write_header(&mut buf).unwrap();
+        packfile::write_header(&mut buf, 0, 0).unwrap();
         packfile::write_record(
             &mut buf,
             &packfile::Record {

@@ -399,7 +399,7 @@ impl ShardPool {
                         let _ = fs::remove_file(&old.path);
                     }
 
-                    let file = packfile::open_packfile(&path, false)?;
+                    let file = packfile::open_packfile(&path, false, id, generation)?;
                     let file_len = file.metadata()?.len();
                     let shard = Arc::new(Shard::new(id, generation, file, path, file_len));
                     best_generation[id_usize] = Some(generation);
@@ -428,7 +428,7 @@ impl ShardPool {
                 ));
             }
             let path = Self::shard_path(&base_dir, 0, 0);
-            let file = packfile::open_packfile(&path, true)?;
+            let file = packfile::open_packfile(&path, true, 0, 0)?;
             let file_len = file.metadata()?.len();
             shards[0] = Some(Arc::new(Shard::new(0, 0, file, path, file_len)));
             max_generation = 1;
@@ -920,7 +920,7 @@ impl ShardPool {
             if shards[candidate as usize].is_none() {
                 let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 let path = Self::shard_path(&self.base_dir, candidate, gen);
-                let file = packfile::open_packfile(&path, true)?;
+                let file = packfile::open_packfile(&path, true, candidate, gen)?;
                 let file_len = file.metadata()?.len();
                 shards[candidate as usize] =
                     Some(Arc::new(Shard::new(candidate, gen, file, path, file_len)));
@@ -1081,7 +1081,7 @@ impl ShardPool {
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
 
-        if !packfile::read_header(&mut reader)? {
+        if packfile::read_header(&mut reader)?.is_none() {
             return Ok(entries);
         }
 
@@ -1564,21 +1564,39 @@ mod tests {
         let dir = test_dir("scan_generation_dedup");
         let pool = ShardPool::open(dir.clone()).unwrap();
 
-        // Write a record so shard 0 exists (generation 0).
+        // Write a record so shard 0 exists (generation 0), then discard it —
+        // this test hand-constructs both on-disk files below instead, since
+        // each one's embedded header must genuinely match its own filename
+        // (renaming a real gen-0 file to a gen-99 path wouldn't update the
+        // header baked in at that file's actual creation, which is exactly
+        // the "copied/renamed inconsistently" case open_packfile now
+        // rejects — correctly, just not what this test is trying to model).
         let record = test_record(0x01, 0xAA, b"live data");
         pool.put_record(&record).unwrap();
         drop(pool);
-
-        // Promote the live file to generation 99 (simulating that rotate()
-        // created a newer generation before a crash left a stale gen-0 file
-        // behind).
-        let live_path = ShardPool::shard_path(&dir, 0, 99);
         let old_path = ShardPool::shard_path(&dir, 0, 0);
-        std::fs::rename(&old_path, &live_path).unwrap();
+        std::fs::remove_file(&old_path).unwrap();
+
+        // Simulate that rotate() created a newer generation before a crash
+        // left a stale gen-0 file behind: a genuine gen-99 file whose header
+        // matches its filename.
+        let live_path = ShardPool::shard_path(&dir, 0, 99);
+        let mut live_buf = Vec::new();
+        packfile::write_header(&mut live_buf, 0, 99).unwrap();
+        packfile::write_record(
+            &mut live_buf,
+            &packfile::Record {
+                room_id: [0x01; 16],
+                hash: [0xAA; 16],
+                data: bytes::Bytes::from_static(b"live data"),
+            },
+        )
+        .unwrap();
+        std::fs::write(&live_path, &live_buf).unwrap();
 
         // Create a stale gen-0 file (the crash leftover).
         let mut buf = Vec::new();
-        packfile::write_header(&mut buf).unwrap();
+        packfile::write_header(&mut buf, 0, 0).unwrap();
         packfile::write_record(
             &mut buf,
             &packfile::Record {
@@ -1659,10 +1677,13 @@ mod tests {
     fn test_scan_parses_three_filename_formats() {
         let dir = test_dir("scan_three_formats");
 
-        // Manually create one file in each format.
-        let make_pack = |room_byte: u8| -> Vec<u8> {
+        // Manually create one file in each format. Each file's header must
+        // genuinely match the (shard_id, generation) implied by its own
+        // filename — that's exactly what open_packfile's identity check
+        // verifies now, so this fixture has to be honest about it too.
+        let make_pack = |room_byte: u8, shard_id: u16, generation: u64| -> Vec<u8> {
             let mut buf = Vec::new();
-            packfile::write_header(&mut buf).unwrap();
+            packfile::write_header(&mut buf, shard_id, generation).unwrap();
             packfile::write_record(
                 &mut buf,
                 &packfile::Record {
@@ -1680,15 +1701,19 @@ mod tests {
         };
 
         // Slot 0: legacy format "shard_00.pack" → gen 0
-        std::fs::write(dir.join("shard_00.pack"), make_pack(0x01)).unwrap();
+        std::fs::write(dir.join("shard_00.pack"), make_pack(0x01, 0, 0)).unwrap();
 
         // Slot 1: 2-digit with generation "shard_01_0000000000000005.pack" → gen 5
-        std::fs::write(dir.join("shard_01_0000000000000005.pack"), make_pack(0x02)).unwrap();
+        std::fs::write(
+            dir.join("shard_01_0000000000000005.pack"),
+            make_pack(0x02, 1, 5),
+        )
+        .unwrap();
 
         // Slot 2: 4-digit with generation "shard_0002_0000000000000003.pack" → gen 3
         std::fs::write(
             dir.join("shard_0002_0000000000000003.pack"),
-            make_pack(0x03),
+            make_pack(0x03, 2, 3),
         )
         .unwrap();
 

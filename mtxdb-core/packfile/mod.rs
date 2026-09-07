@@ -10,11 +10,53 @@ use bytes::Bytes;
 pub const MAGIC: [u8; 4] = *b"MDB1";
 
 /// Packfile format version byte following `MAGIC` in the header (see
-/// [`write_header`]/[`read_header`]). Version 1: global shard format
-/// with `room_id` framed in every record. The only version this format
-/// has ever had — `write_header` has never produced anything else, and
-/// `read_header` accepts nothing else.
-pub const VERSION: u8 = 0x01;
+/// [`write_header`]/[`read_header`]).
+///
+/// Version 2: a fixed [`HEADER_LEN`]-byte reserved shard descriptor
+/// (magic, version, header length, shard slot, generation, creation
+/// time, feature flags, CRC — zero-padded to `HEADER_LEN`) precedes the
+/// first record, instead of v1's bare 5-byte magic+version. Written once
+/// at shard creation and never mutated afterward — an append-only file
+/// that's actively `mmap`'d and may be read concurrently by another
+/// process has no safe way to update bytes in place, so anything that
+/// changes over a shard's life (IO/sync counters, the room→count
+/// directory) stays in the existing sidecar files (`shard_stats.bin`,
+/// `shard_rooms.bin`), not here. This is a hard format cutover, not a
+/// migration: v1 files are not recognized by v2 readers.
+pub const VERSION: u8 = 0x02;
+
+/// Total reserved header size in bytes: every shard file's first record
+/// starts at exactly this offset. One 4KiB page — ample room for the
+/// descriptor fields plus future growth, with no benefit to a larger
+/// reservation (see [`write_header`] for the field layout).
+pub const HEADER_LEN: usize = 4096;
+
+/// Byte layout within the reserved header, up to where the CRC starts.
+/// Everything from `CRC_COVERED_LEN` to `HEADER_LEN` is the CRC itself
+/// (4 bytes) followed by zero padding.
+const CRC_COVERED_LEN: usize = 4 // magic
+    + 1 // version
+    + 4 // header_len (u32)
+    + 2 // shard_id (u16)
+    + 8 // generation (u64)
+    + 8 // created_at (u64, unix seconds)
+    + 4; // feature_flags (u32, reserved)
+
+/// A shard's immutable descriptor, parsed from its reserved header.
+///
+/// Recording `shard_id`/`generation` in the file itself (not just its
+/// filename) lets a reader detect a shard file that's been copied or
+/// renamed inconsistently with its own history — the two should always
+/// agree, and a mismatch means something outside mtxdb moved this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardHeader {
+    /// The shard slot id this file was created for.
+    pub shard_id: u16,
+    /// The generation counter this file was created with.
+    pub generation: u64,
+    /// Unix-seconds creation timestamp.
+    pub created_at: u64,
+}
 
 /// Maximum record size (64KB). Reject anything larger during recovery scan.
 pub const MAX_RECORD_LEN: u32 = 64 * 1024;
@@ -174,37 +216,122 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     }))
 }
 
-/// Write the packfile header (magic + version).
+/// Write a new shard file's [`HEADER_LEN`]-byte reserved header: magic,
+/// version, header length, `shard_id`, `generation`, creation time, and
+/// a CRC over all of the above — zero-padded to fill `HEADER_LEN`.
+/// Written once, at creation, and never mutated again (see [`VERSION`]'s
+/// doc for why).
 ///
 /// # Errors
-/// Returns `io::Error` on write failure.
-pub fn write_header(writer: &mut impl Write) -> io::Result<()> {
-    writer.write_all(&MAGIC)?;
-    writer.write_all(&[VERSION])?;
-    Ok(())
+/// Returns `io::Error` on write failure, or if the system clock is
+/// before the Unix epoch (treated as a hard error rather than silently
+/// recording a wrong creation time).
+///
+/// # Panics
+/// Never in practice: the only internal conversion (`HEADER_LEN` as
+/// `u32`) is a compile-time constant well within range.
+pub fn write_header(writer: &mut impl Write, shard_id: u16, generation: u64) -> io::Result<()> {
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs();
+
+    let mut buf = [0u8; HEADER_LEN];
+    buf[0..4].copy_from_slice(&MAGIC);
+    buf[4] = VERSION;
+    let header_len = u32::try_from(HEADER_LEN).expect("HEADER_LEN fits in u32");
+    buf[5..9].copy_from_slice(&header_len.to_le_bytes());
+    buf[9..11].copy_from_slice(&shard_id.to_le_bytes());
+    buf[11..19].copy_from_slice(&generation.to_le_bytes());
+    buf[19..27].copy_from_slice(&created_at.to_le_bytes());
+    // buf[27..31] (feature_flags) stays zero — reserved for future use.
+
+    let crc = crc32fast::hash(&buf[..CRC_COVERED_LEN]);
+    buf[CRC_COVERED_LEN..CRC_COVERED_LEN.wrapping_add(4)].copy_from_slice(&crc.to_le_bytes());
+    // The rest of buf is already zero-initialized padding out to HEADER_LEN.
+
+    writer.write_all(&buf)
 }
 
-/// Read and validate the packfile header. Accepts [`VERSION`] (the only
-/// format `write_header` has ever produced).
+/// Read and validate a shard file's reserved header.
+///
+/// Returns `Ok(None)` for anything that isn't a recognized mdb v2
+/// packfile — empty file (EOF before a full header), wrong magic, or a
+/// different version. Returns `Err` for a header that *is* recognized
+/// (right magic, version, and length) but fails its own CRC — that's a
+/// distinct, worse condition than "not a packfile at all" and is
+/// reported as corruption rather than silently treated as absent.
 ///
 /// # Errors
-/// Returns `io::Error` on read failure.
-pub fn read_header(reader: &mut impl Read) -> io::Result<bool> {
-    let mut buf = [0u8; 5];
+/// Returns `io::Error` on I/O failure or a CRC mismatch.
+///
+/// # Panics
+/// Never in practice: every internal `try_into`/`from_le_bytes` slices a
+/// fixed, in-range region of the just-read `HEADER_LEN`-byte buffer.
+pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
+    let mut buf = [0u8; HEADER_LEN];
     match reader.read_exact(&mut buf) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    Ok(buf[..4] == MAGIC && buf[4] == VERSION)
+    if buf[..4] != MAGIC || buf[4] != VERSION {
+        return Ok(None);
+    }
+    let header_len = u32::from_le_bytes(buf[5..9].try_into().unwrap());
+    if header_len as usize != HEADER_LEN {
+        // A version byte we recognize but a header length we don't is
+        // still "not this format" rather than corruption — but since
+        // VERSION and HEADER_LEN have only ever shipped together, this
+        // is defensive, not a case that's expected to occur.
+        return Ok(None);
+    }
+
+    let expected_crc = u32::from_le_bytes(
+        buf[CRC_COVERED_LEN..CRC_COVERED_LEN.wrapping_add(4)]
+            .try_into()
+            .unwrap(),
+    );
+    let actual_crc = crc32fast::hash(&buf[..CRC_COVERED_LEN]);
+    if actual_crc != expected_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("shard header CRC mismatch: expected {expected_crc:08x}, got {actual_crc:08x}"),
+        ));
+    }
+
+    let shard_id = u16::from_le_bytes(buf[9..11].try_into().unwrap());
+    let generation = u64::from_le_bytes(buf[11..19].try_into().unwrap());
+    let created_at = u64::from_le_bytes(buf[19..27].try_into().unwrap());
+
+    Ok(Some(ShardHeader {
+        shard_id,
+        generation,
+        created_at,
+    }))
 }
 
 /// Open or create a packfile, writing the header if it's new.
 ///
+/// `shard_id`/`generation` are the caller's expectation for this file —
+/// derived from its filename, which already encodes both (see
+/// `ShardPool::shard_path`). On creation they're written into the new
+/// header; on opening an existing file they're cross-checked against
+/// what the header actually says, so a shard file that's been copied or
+/// renamed inconsistently with its own recorded identity is caught here
+/// rather than silently trusted.
+///
 /// # Errors
-/// Returns `io::Error` on open/write failure or `io::ErrorKind::InvalidData`
-/// if the existing header is invalid.
-pub fn open_packfile(path: &Path, create: bool) -> io::Result<File> {
+/// Returns `io::Error` on open/write failure, `io::ErrorKind::InvalidData`
+/// if the existing header is invalid or its CRC fails, or
+/// `io::ErrorKind::InvalidData` if the header's recorded `shard_id`/
+/// `generation` don't match what the filename says they should be.
+pub fn open_packfile(
+    path: &Path,
+    create: bool,
+    shard_id: u16,
+    generation: u64,
+) -> io::Result<File> {
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
@@ -212,14 +339,27 @@ pub fn open_packfile(path: &Path, create: bool) -> io::Result<File> {
         .open(path)?;
 
     if file.metadata()?.len() == 0 {
-        write_header(&mut file)?;
+        write_header(&mut file, shard_id, generation)?;
         file.sync_all()?;
     } else {
         let mut reader = BufReader::new(&file);
-        if !read_header(&mut reader)? {
+        let Some(header) = read_header(&mut reader)? else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid packfile header",
+            ));
+        };
+        if header.shard_id != shard_id || header.generation != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "shard file {} identifies itself as shard {} generation {} in its header, \
+                     but its filename says shard {shard_id} generation {generation} — \
+                     copied or renamed inconsistently with its own history",
+                    path.display(),
+                    header.shard_id,
+                    header.generation,
+                ),
             ));
         }
     }
@@ -245,7 +385,7 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
 
-    if !read_header(&mut reader)? {
+    if read_header(&mut reader)?.is_none() {
         return Ok(entries);
     }
 
@@ -289,10 +429,11 @@ pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<Scan
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
-    // Seek past the header (8 bytes) to the first record. If start_offset
-    // is already past the header, seek directly there.
+    // Seek past the reserved header (HEADER_LEN bytes) to the first
+    // record. If start_offset is already past the header, seek directly
+    // there.
     if start_offset == 0 {
-        if !read_header(&mut reader)? {
+        if read_header(&mut reader)?.is_none() {
             return Ok(Vec::new());
         }
     } else {
@@ -332,7 +473,7 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
 
-    if !read_header(&mut reader)? {
+    if read_header(&mut reader)?.is_none() {
         return Ok(entries);
     }
 
@@ -467,25 +608,43 @@ mod tests {
     #[test]
     fn test_header_roundtrip() {
         let mut buf = Vec::new();
-        write_header(&mut buf).unwrap();
+        write_header(&mut buf, 7, 42).unwrap();
+        assert_eq!(buf.len(), HEADER_LEN);
 
         let mut cursor = Cursor::new(&buf);
-        assert!(read_header(&mut cursor).unwrap());
+        let header = read_header(&mut cursor).unwrap().expect("valid header");
+        assert_eq!(header.shard_id, 7);
+        assert_eq!(header.generation, 42);
+        assert!(header.created_at > 0);
     }
 
     #[test]
     fn test_header_invalid_magic() {
-        let mut buf = vec![0u8; 5];
+        let mut buf = vec![0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(b"BADC");
 
         let mut cursor = Cursor::new(&buf);
-        assert!(!read_header(&mut cursor).unwrap());
+        assert!(read_header(&mut cursor).unwrap().is_none());
     }
 
     #[test]
-    fn test_header_empty_returns_false() {
+    fn test_header_empty_returns_none() {
         let mut cursor = Cursor::new(Vec::<u8>::new());
-        assert!(!read_header(&mut cursor).unwrap());
+        assert!(read_header(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_header_crc_mismatch_is_an_error_not_none() {
+        let mut buf = Vec::new();
+        write_header(&mut buf, 1, 1).unwrap();
+        // Corrupt a byte inside the CRC-covered region (the generation
+        // field) without touching magic/version/header_len — this must
+        // surface as corruption, not as "not a packfile".
+        buf[12] ^= 0xFF;
+
+        let mut cursor = Cursor::new(&buf);
+        let err = read_header(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -542,7 +701,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         std::fs::write(&path, b"BADC\x02extra").unwrap();
-        let result = open_packfile(&path, false);
+        let result = open_packfile(&path, false, 0, 0);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
@@ -566,7 +725,7 @@ mod tests {
         // bytes, so read_record can't even complete reading the length
         // prefix and hits UnexpectedEof.
         let mut buf = Vec::new();
-        write_header(&mut buf).unwrap();
+        write_header(&mut buf, 0, 0).unwrap();
         write_record(&mut buf, &test_record_raw([0xaa; 16], b"data")).unwrap();
         buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes
         std::fs::write(&path, &buf).unwrap();
@@ -580,7 +739,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         let mut buf = Vec::new();
-        write_header(&mut buf).unwrap();
+        write_header(&mut buf, 0, 0).unwrap();
         write_record(&mut buf, &test_record_raw([0xaa; 16], b"good")).unwrap();
         let valid_len = buf.len();
         // Simulate a realistic torn tail: valid length prefix + partial
@@ -602,7 +761,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         let mut buf = Vec::new();
-        write_header(&mut buf).unwrap();
+        write_header(&mut buf, 0, 0).unwrap();
         write_record(&mut buf, &test_record_raw([0xbb; 16], b"ok")).unwrap();
         write_record(&mut buf, &test_record_raw([0xcc; 16], b"ok2")).unwrap();
         let expected_len = buf.len();
@@ -630,7 +789,7 @@ mod tests {
         let room1 = [0x01; 16];
         let room2 = [0x02; 16];
         let mut buf = Vec::new();
-        write_header(&mut buf).unwrap();
+        write_header(&mut buf, 0, 0).unwrap();
         write_record(&mut buf, &test_record(room1, [0xAA; 16], b"room1 msg")).unwrap();
         write_record(&mut buf, &test_record(room2, [0xBB; 16], b"room2 msg")).unwrap();
         std::fs::write(&path, &buf).unwrap();
