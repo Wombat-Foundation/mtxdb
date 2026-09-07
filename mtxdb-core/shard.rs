@@ -4,7 +4,6 @@ use std::io::{self, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
 use parking_lot::RwLock;
@@ -471,66 +470,54 @@ impl ShardPool {
         }
     }
 
-    /// Atomically create the lock file and write our PID and creation
-    /// timestamp into it. No `sync_all` here: the PID is advisory only,
-    /// and `lock_holder_is_dead` already fails closed (treats an
-    /// unparseable file as "might be alive") on a torn write from a crash
-    /// mid-write — there's no correctness reason to pay an fsync on every
-    /// lock acquisition to protect against that.
+    /// Atomically create the lock file and write our PID into it. No
+    /// `sync_all` here: the PID is advisory only, and `lock_holder_is_dead`
+    /// already fails closed (treats an unparsable file as "might be
+    /// alive") on a torn write from a crash mid-write — there's no
+    /// correctness reason to pay an fsync on every lock acquisition to
+    /// protect against that.
     #[cfg(not(target_arch = "wasm32"))]
     fn try_create_lock_file(lock_path: &Path) -> io::Result<()> {
         let mut file = File::options()
             .write(true)
             .create_new(true)
             .open(lock_path)?;
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        write!(file, "{}\n{created_at}", std::process::id())
+        write!(file, "{}", std::process::id())
     }
 
-    /// Conservative upper bound on how old an unrefreshed lock file may be
-    /// before [`Self::lock_holder_is_dead`] treats it as abandoned when it
-    /// has no other liveness signal. Nothing refreshes this timestamp
-    /// while a writer holds the lock, so age alone can't distinguish
-    /// "crashed" from "long-lived and quiet" — this is a last-resort
-    /// self-heal for non-Linux platforms (or a corrupt/torn lock file),
-    /// not a real liveness check. Set high enough that a legitimate
-    /// long-running writer is very unlikely to still hold an unrefreshed
-    /// lock past it.
-    #[cfg(not(target_arch = "wasm32"))]
-    const STALE_LOCK_MAX_AGE_SECS: u64 = 24 * 60 * 60;
-
-    /// Liveness check for whoever wrote `lock_path`'s PID and timestamp.
-    /// On Linux, checks `/proc/<pid>` directly — authoritative. Anywhere
-    /// else (or if the PID can't be parsed at all), falls back to
-    /// [`Self::STALE_LOCK_MAX_AGE_SECS`] lock-file age so a crash still
-    /// self-heals eventually instead of requiring manual cleanup,
-    /// trading a small risk of reclaiming a lock a writer legitimately
-    /// still holds for not staying stuck forever.
+    /// Liveness check for whoever wrote `lock_path`'s PID. Only verifies
+    /// anything on Linux (`/proc/<pid>`); everywhere else this
+    /// conservatively assumes the holder might still be alive.
+    ///
+    /// A time-based fallback ("reclaim if the lock file is older than N")
+    /// was considered and rejected: a long-lived, mostly-idle writer (a
+    /// Synapse process sitting quiet for hours is normal, not an edge
+    /// case) looks indistinguishable from an abandoned lock once it
+    /// crosses any fixed age threshold, since nothing refreshes the
+    /// timestamp while the lock is held — that trades a rare stuck-lock
+    /// annoyance (fixable by deleting the file) for an occasional silent
+    /// second writer and packfile corruption, the wrong side of that
+    /// trade. A real fix needs a refreshed heartbeat/lease or a real OS
+    /// advisory lock per platform, not a bare creation timestamp; until
+    /// one of those lands, non-Linux platforms fail closed and require
+    /// manual recovery from a hard crash.
     #[cfg(not(target_arch = "wasm32"))]
     fn lock_holder_is_dead(lock_path: &Path) -> bool {
-        let Ok(contents) = fs::read_to_string(lock_path) else {
-            return false;
-        };
-        let mut lines = contents.lines();
-        let pid: Option<u32> = lines.next().and_then(|s| s.trim().parse().ok());
-        let created_at: Option<u64> = lines.next().and_then(|s| s.trim().parse().ok());
-
         #[cfg(target_os = "linux")]
-        if let Some(pid) = pid {
-            return !Path::new(&format!("/proc/{pid}")).exists();
+        {
+            let Ok(contents) = fs::read_to_string(lock_path) else {
+                return false;
+            };
+            let Ok(pid) = contents.trim().parse::<u32>() else {
+                return false;
+            };
+            !Path::new(&format!("/proc/{pid}")).exists()
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = pid;
-
-        created_at.is_some_and(|created_at| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .is_ok_and(|now| {
-                    now.as_secs().saturating_sub(created_at) > Self::STALE_LOCK_MAX_AGE_SECS
-                })
-        })
+        {
+            let _ = lock_path;
+            false
+        }
     }
 
     /// Seed a room's home shard — used at startup to approximate where a

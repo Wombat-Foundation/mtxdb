@@ -37,35 +37,27 @@ pub struct WalkLimits {
 /// Lazy, ancestor-first iterator over the result of
 /// [`PackfileStorage::walk_ancestors`].
 ///
-/// Holds the shards the walk reads from pinned for its own lifetime, so
-/// they can't be retired mid-walk by a concurrent repack even if the
-/// caller only partially drains the iterator.
-pub struct DagWalk<'a> {
-    store: &'a PackfileStorage,
-    room_id: &'a [u8; 16],
+/// Every node was already resolved (hash-verified, same as [`PackfileStorage::get`])
+/// against one frozen generation snapshot while [`PackfileStorage::walk_ancestors`]
+/// built the walk — this iterator just replays that in ancestor-first
+/// order. No further store access happens here, so a repack that runs
+/// after the walk was built can't cause a node to go missing partway
+/// through iteration.
+pub struct DagWalk {
     order: std::vec::IntoIter<[u8; 16]>,
-    _pinned: HashMap<u16, Arc<Shard>>,
+    resolved: HashMap<[u8; 16], NodeData>,
 }
 
-impl Iterator for DagWalk<'_> {
+impl Iterator for DagWalk {
     type Item = Result<(NodeId, NodeData), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let hash = self.order.next()?;
-            match self.store.get(self.room_id, &hash) {
-                Ok(Some(data)) => return Some(Ok((hash, data))),
-                // Every hash in `order` came from a record this same walk
-                // just read off disk, so a `None` here would mean the
-                // record vanished between the scan and this lookup (e.g.
-                // a concurrent repack rewrote it into the same generation
-                // it came from) rather than "was never there" — skip
-                // rather than fail, but this should not happen in
-                // practice given the shards are pinned for the walk.
-                Ok(None) => {}
-                Err(e) => return Some(Err(e)),
-            }
-        }
+        let hash = self.order.next()?;
+        let data = self
+            .resolved
+            .remove(&hash)
+            .expect("order only contains hashes this walk itself resolved");
+        Some(Ok((hash, data)))
     }
 }
 
@@ -767,8 +759,25 @@ impl PackfileStorage {
     }
 
     /// BFS backward (toward ancestors) from `frontier` over `extract_edges`,
-    /// same walk shape as [`Self::bfs_live_set`], except it stops expanding
-    /// (and excludes from the result) anything in `stop_at`.
+    /// stopping expansion (and excluding from the result) anything in
+    /// `stop_at`. Unlike [`Self::bfs_live_set`]/[`Self::bfs_bounded`]'s
+    /// repack-side sibling, this resolves each node through `gen`'s index
+    /// — a single frozen generation snapshot taken once before the walk
+    /// starts — one hash lookup at a time, rather than pre-scanning every
+    /// shard for the whole room up front. Cost is proportional to the
+    /// number of nodes actually walked, not room size.
+    ///
+    /// Pinning `gen` for the whole walk (instead of re-resolving through
+    /// `self.get()` per node against whatever generation happens to be
+    /// live at call time) is also what makes this concurrency-safe: a
+    /// repack that runs mid-walk and GCs a hash this walk already needs
+    /// swaps in a *new* generation rather than mutating this one, so a
+    /// node this walk has already committed to visiting can't vanish out
+    /// from under it and get silently skipped.
+    ///
+    /// Returns the resolved `NodeData` for each visited node alongside the
+    /// adjacency, so the caller has everything it needs without a second
+    /// per-node fetch.
     ///
     /// This is an **ancestor walk with stop markers**, not a "span between
     /// two frontiers": a branch whose history never crosses any `stop_at`
@@ -782,55 +791,71 @@ impl PackfileStorage {
     /// finish resolving their own edges into `adjacency`, but no new nodes
     /// are enqueued past the cap) — the safety valve for exactly the
     /// runaway case above, where `stop_at` never gets hit.
-    fn bfs_bounded(
+    fn bfs_ancestors(
+        &self,
+        gen: &Arc<RoomGeneration>,
         frontier: &[[u8; 16]],
         stop_at: &[[u8; 16]],
-        hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
-        pinned: &HashMap<u16, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
         limits: WalkLimits,
-    ) -> Result<AdjacencyResult, StorageError> {
+    ) -> Result<(AdjacencyResult, HashMap<[u8; 16], NodeData>), StorageError> {
         let boundary: HashSet<[u8; 16]> = stop_at.iter().copied().collect();
         let mut visited: HashSet<[u8; 16]> = HashSet::new();
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
+        let mut resolved: HashMap<[u8; 16], NodeData> = HashMap::new();
         let at_cap =
             |visited: &HashSet<[u8; 16]>| limits.max_nodes.is_some_and(|max| visited.len() >= max);
 
         for root in frontier {
-            if !boundary.contains(root)
-                && hash_to_shard_offset.contains_key(root)
-                && !at_cap(&visited)
-                && visited.insert(*root)
-            {
+            if !boundary.contains(root) && !at_cap(&visited) && visited.insert(*root) {
                 queue.push_back(*root);
             }
         }
 
         while let Some(hash) = queue.pop_front() {
-            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
+            let Some(data) = self.resolve_pinned(gen, &hash)? else {
+                // Not actually present under this generation — nothing to
+                // expand from and nothing to yield.
                 continue;
             };
-            let Some(old_shard) = pinned.get(&shard_id) else {
-                continue;
-            };
-            let record = Self::read_at(old_shard, offset)?;
-            let edges = extract_edges(&hash, &record.data);
+            let edges = extract_edges(&hash, &data.bytes);
             for edge in &edges {
-                if !boundary.contains(edge)
-                    && hash_to_shard_offset.contains_key(edge)
-                    && !at_cap(&visited)
-                    && visited.insert(*edge)
-                {
+                if !boundary.contains(edge) && !at_cap(&visited) && visited.insert(*edge) {
                     queue.push_back(*edge);
                 }
             }
             adjacency.insert(hash, edges);
+            resolved.insert(hash, data);
         }
 
-        let mut live_hashes: Vec<[u8; 16]> = visited.into_iter().collect();
+        // live_hashes tracks only nodes actually resolved, not everything
+        // `visited` touched — a hash that turned out absent under `gen`
+        // was marked visited to prevent re-queueing, but never belongs in
+        // the CSR or the output.
+        let mut live_hashes: Vec<[u8; 16]> = resolved.keys().copied().collect();
         live_hashes.sort_unstable();
-        Ok((live_hashes, adjacency))
+        Ok(((live_hashes, adjacency), resolved))
+    }
+
+    /// Resolves `id` within a specific, already-loaded generation snapshot
+    /// rather than whatever generation happens to be live when called —
+    /// the building block [`Self::bfs_ancestors`] uses to keep an entire
+    /// walk consistent against one point-in-time view of the room, immune
+    /// to a repack swapping in a new generation partway through.
+    fn resolve_pinned(
+        &self,
+        gen: &Arc<RoomGeneration>,
+        id: &NodeId,
+    ) -> Result<Option<NodeData>, StorageError> {
+        let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        if let Some(data) = gen.cache.get(id) {
+            return Ok(Some((*data).clone()));
+        }
+        self.resolve_from_candidates(Some(gen), id, &candidates)
     }
 
     /// Read every record's edges, with no reachability filtering.
@@ -1086,18 +1111,17 @@ impl PackfileStorage {
     /// `limits.max_nodes` bounds the runaway case above.
     ///
     /// Returns nodes lazily, ancestor-first (parents before children,
-    /// topologically), as a [`DagWalk`] iterator — nothing is buffered
-    /// beyond the walk's hash list, and every yielded record has been
-    /// through the same hash-verified resolution path as [`Self::get`]
-    /// (candidates are matched by content hash, not just index tag, so an
-    /// index-tag collision can't surface the wrong record).
+    /// topologically), as a [`DagWalk`] iterator over data already
+    /// resolved during the walk itself (no second per-node fetch against
+    /// whatever generation happens to be live when the iterator is
+    /// drained) — every record was matched by content hash, not just
+    /// index tag, so an index-tag collision can't surface the wrong one.
     ///
-    /// Read-only: pins shards for the walk's duration but takes no
-    /// `put_mutex` and never writes. Each shard is scanned in full to
-    /// build this call's `hash → (shard, offset)` map — the same
-    /// first-time cost `repack_room_reachable` pays before it has
-    /// incremental cursor state, paid on every call here since this walk
-    /// has no cursor to carry forward between calls.
+    /// Read-only: resolves against one frozen generation snapshot (see
+    /// [`Self::bfs_ancestors`]) and takes no `put_mutex`. Cost is
+    /// proportional to the number of ancestors actually walked — one
+    /// index lookup per node — not room size, since it doesn't pre-scan
+    /// every shard the way `repack_room_reachable` does.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption, or if the walk finds a
@@ -1106,32 +1130,23 @@ impl PackfileStorage {
     ///
     /// # Panics
     /// Panics if any hash in the CSR exceeds `u32::MAX` local ID space.
-    pub fn walk_ancestors<'a>(
-        &'a self,
-        room_id: &'a [u8; 16],
+    pub fn walk_ancestors(
+        &self,
+        room_id: &[u8; 16],
         frontier: &[[u8; 16]],
         stop_at: &[[u8; 16]],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
         limits: WalkLimits,
-    ) -> Result<DagWalk<'a>, StorageError> {
-        let scanned = self.scan_room_records(room_id)?;
-        let mut hash_to_shard_offset = HashMap::new();
-        for (shard_id, entries) in &scanned {
-            for (hash, offset) in entries {
-                hash_to_shard_offset.insert(*hash, (*shard_id, *offset));
-            }
-        }
+    ) -> Result<DagWalk, StorageError> {
+        let Some(gen) = self.generation(room_id).map(|g| Arc::clone(&g)) else {
+            return Ok(DagWalk {
+                order: Vec::new().into_iter(),
+                resolved: HashMap::new(),
+            });
+        };
 
-        let pinned = self.pin_shards(hash_to_shard_offset.values().map(|&(id, _)| id));
-
-        let (live_hashes, adjacency) = Self::bfs_bounded(
-            frontier,
-            stop_at,
-            &hash_to_shard_offset,
-            &pinned,
-            &extract_edges,
-            limits,
-        )?;
+        let ((live_hashes, adjacency), resolved) =
+            self.bfs_ancestors(&gen, frontier, stop_at, &extract_edges, limits)?;
 
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
         let mut topo = csr.topo_order();
@@ -1160,10 +1175,8 @@ impl PackfileStorage {
             .collect();
 
         Ok(DagWalk {
-            store: self,
-            room_id,
             order: order.into_iter(),
-            _pinned: pinned,
+            resolved,
         })
     }
 
@@ -1838,6 +1851,64 @@ mod tests {
         assert!(
             walked.len() <= 5,
             "max_nodes must bound the walk even though stop_at was never reached"
+        );
+    }
+
+    #[test]
+    fn test_walk_ancestors_survives_concurrent_repack_gc() {
+        // Regression test for the exact concurrency bug flagged in review:
+        // an earlier draft resolved each node lazily, at drain time,
+        // against whatever generation happened to be live *then* — so a
+        // repack that GC'd a node between building the walk and draining
+        // it would silently drop that node from the results. Resolving
+        // eagerly against one frozen generation snapshot up front (what
+        // walk_ancestors does now) must not exhibit that.
+        let dir = test_dir("walk_survives_repack");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let a = distinct_id(0);
+        let b = distinct_id(1);
+        store
+            .put(
+                &TEST_ROOM,
+                &a,
+                &NodeData::new(bytes::Bytes::from_static(b"A")),
+            )
+            .unwrap();
+        store
+            .put(
+                &TEST_ROOM,
+                &b,
+                &NodeData::new(bytes::Bytes::from_static(b"B")),
+            )
+            .unwrap();
+        let edges = std::collections::HashMap::from([(b, vec![a])]);
+        let extract = |hash: &[u8; 16], _data: &[u8]| edges.get(hash).cloned().unwrap_or_default();
+
+        // Build the walk (resolves and captures A and B eagerly)...
+        let walk = store
+            .walk_ancestors(&TEST_ROOM, &[b], &[], extract, WalkLimits::default())
+            .unwrap();
+
+        // ...then, before draining it, run a repack that only keeps B as
+        // a live root — A becomes unreachable and gets GC'd out of the
+        // room's index/cache entirely.
+        store.set_live_roots(&TEST_ROOM, vec![b]);
+        let (kept, dropped) = store
+            .repack_room_reachable(&TEST_ROOM, |_hash, _data| Vec::new())
+            .unwrap();
+        assert_eq!((kept, dropped), (1, 1), "repack must have GC'd A");
+
+        // The already-built walk must still yield both A and B: it
+        // captured its data before the repack ran, so it isn't affected
+        // by the generation swap that just happened.
+        let results: Vec<(NodeId, NodeData)> = walk.collect::<Result<_, _>>().unwrap();
+        let mut bytes: Vec<u8> = results.iter().map(|(_, d)| d.bytes[0]).collect();
+        bytes.sort_unstable();
+        assert_eq!(
+            bytes,
+            vec![b'A', b'B'],
+            "a walk built before a concurrent repack must not lose nodes that repack GC'd afterward"
         );
     }
 
