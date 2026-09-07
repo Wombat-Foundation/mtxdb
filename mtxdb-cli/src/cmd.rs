@@ -271,7 +271,7 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
         eprintln!(
             "{:>6}  {:>10}  {:>10}  {:>8}  {:>10}  {:>6}",
             slot_id,
-            format!("{:016x}", generation),
+            format!("{generation:#x}"),
             fmt_bytes(file_bytes),
             wc,
             fmt_bytes(bw),
