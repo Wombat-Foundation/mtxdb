@@ -679,6 +679,17 @@ impl ShardPool {
         ))
     }
 
+    /// Best-effort stats snapshot write, same contract as the `Drop` impl:
+    /// the persisted stats file is pure observability, not correctness, so
+    /// a failure here (e.g. the base directory momentarily gone during test
+    /// teardown) is logged and swallowed -- it must never turn a durable
+    /// data sync that actually succeeded into a hard error for the caller.
+    fn persist_stats_best_effort(&self) {
+        if let Err(e) = self.persist_stats() {
+            eprintln!("mtxdb: failed to persist shard IO/sync stats: {e}");
+        }
+    }
+
     /// Sync all shards to disk.
     ///
     /// # Errors
@@ -691,7 +702,8 @@ impl ShardPool {
                 shard.sync_count.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.persist_stats()
+        self.persist_stats_best_effort();
+        Ok(())
     }
 
     /// Sync only shards written to since the last sync.
@@ -717,7 +729,8 @@ impl ShardPool {
                 }
             }
         }
-        self.persist_stats()
+        self.persist_stats_best_effort();
+        Ok(())
     }
 
     /// Retire a shard: mark it for deletion and free its pool slot.
@@ -788,7 +801,7 @@ impl Drop for ShardPool {
     /// a failed stats write on shutdown must never panic or mask the
     /// original error path the caller was already on.
     fn drop(&mut self) {
-        let _ = self.persist_stats();
+        self.persist_stats_best_effort();
     }
 }
 
@@ -862,6 +875,33 @@ mod tests {
 
         // A second sync with nothing new written is a no-op, not an error.
         pool.sync_dirty().unwrap();
+    }
+
+    /// A real fsync succeeding must never be turned into a hard error by a
+    /// failure in the best-effort stats snapshot write -- e.g. the base
+    /// directory getting removed out from under a live pool (test teardown,
+    /// or any other external interference) must not make `sync_all`/
+    /// `sync_dirty` (and by extension every `maybe_sync(DURABLE)` caller
+    /// upstream) return `Err` when the actual shard data is safely synced.
+    #[test]
+    fn test_sync_survives_persist_stats_failure() {
+        let dir = test_dir("sync_survives_stats_failure");
+        let pool = ShardPool::open(dir.clone()).unwrap();
+
+        let record = test_record(0x01, 0xDD, b"data that must stay durable");
+        pool.put_record(&record).unwrap();
+
+        // Remove the base directory itself, so persist_stats' File::create
+        // for its temp file fails with ENOENT -- while the shard's already-
+        // open file descriptor (and thus its real fsync) is unaffected.
+        fs::remove_dir_all(&dir).unwrap();
+
+        pool.sync_all()
+            .expect("sync_all must succeed even if stats persistence fails");
+        pool.put_record(&test_record(0x01, 0xEE, b"more data"))
+            .unwrap();
+        pool.sync_dirty()
+            .expect("sync_dirty must succeed even if stats persistence fails");
     }
 
     #[test]
