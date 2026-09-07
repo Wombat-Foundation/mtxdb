@@ -20,6 +20,55 @@ use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
 /// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
 
+/// Bounds on a [`PackfileStorage::walk_ancestors`] call.
+///
+/// Without a cap, a walk whose `stop_at` set is never reached (e.g. the
+/// caller passed a stale or wrong boundary) silently degrades into "walk
+/// the entire history of this branch" — `max_nodes` is the safety valve
+/// for that case.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalkLimits {
+    /// Stop discovering new ancestors once this many nodes have been
+    /// visited. `None` means unbounded (walk until `stop_at` or the
+    /// room's true roots are reached).
+    pub max_nodes: Option<usize>,
+}
+
+/// Lazy, ancestor-first iterator over the result of
+/// [`PackfileStorage::walk_ancestors`].
+///
+/// Holds the shards the walk reads from pinned for its own lifetime, so
+/// they can't be retired mid-walk by a concurrent repack even if the
+/// caller only partially drains the iterator.
+pub struct DagWalk<'a> {
+    store: &'a PackfileStorage,
+    room_id: &'a [u8; 16],
+    order: std::vec::IntoIter<[u8; 16]>,
+    _pinned: HashMap<u16, Arc<Shard>>,
+}
+
+impl Iterator for DagWalk<'_> {
+    type Item = Result<(NodeId, NodeData), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let hash = self.order.next()?;
+            match self.store.get(self.room_id, &hash) {
+                Ok(Some(data)) => return Some(Ok((hash, data))),
+                // Every hash in `order` came from a record this same walk
+                // just read off disk, so a `None` here would mean the
+                // record vanished between the scan and this lookup (e.g.
+                // a concurrent repack rewrote it into the same generation
+                // it came from) rather than "was never there" — skip
+                // rather than fail, but this should not happen in
+                // practice given the shards are pinned for the walk.
+                Ok(None) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
 /// A live hash set plus the adjacency discovered while determining it, as
 /// returned by the reachability repacker's live-set computation.
 type AdjacencyResult = (Vec<[u8; 16]>, HashMap<[u8; 16], Vec<[u8; 16]>>);
@@ -717,6 +766,73 @@ impl PackfileStorage {
         Ok((live_hashes, adjacency))
     }
 
+    /// BFS backward (toward ancestors) from `frontier` over `extract_edges`,
+    /// same walk shape as [`Self::bfs_live_set`], except it stops expanding
+    /// (and excludes from the result) anything in `stop_at`.
+    ///
+    /// This is an **ancestor walk with stop markers**, not a "span between
+    /// two frontiers": a branch whose history never crosses any `stop_at`
+    /// node is walked all the way back to the room's true roots, not
+    /// truncated at some implied boundary. A real from/to span would need
+    /// `ancestors(frontier) ∩ descendants(stop_at)`, which requires
+    /// reverse adjacency this call doesn't have — out of scope here.
+    ///
+    /// `limits.max_nodes`, if set, caps how many nodes this walk will visit
+    /// before giving up on expanding further (existing queued nodes still
+    /// finish resolving their own edges into `adjacency`, but no new nodes
+    /// are enqueued past the cap) — the safety valve for exactly the
+    /// runaway case above, where `stop_at` never gets hit.
+    fn bfs_bounded(
+        frontier: &[[u8; 16]],
+        stop_at: &[[u8; 16]],
+        hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
+        pinned: &HashMap<u16, Arc<Shard>>,
+        extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+        limits: WalkLimits,
+    ) -> Result<AdjacencyResult, StorageError> {
+        let boundary: HashSet<[u8; 16]> = stop_at.iter().copied().collect();
+        let mut visited: HashSet<[u8; 16]> = HashSet::new();
+        let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
+        let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
+        let at_cap =
+            |visited: &HashSet<[u8; 16]>| limits.max_nodes.is_some_and(|max| visited.len() >= max);
+
+        for root in frontier {
+            if !boundary.contains(root)
+                && hash_to_shard_offset.contains_key(root)
+                && !at_cap(&visited)
+                && visited.insert(*root)
+            {
+                queue.push_back(*root);
+            }
+        }
+
+        while let Some(hash) = queue.pop_front() {
+            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
+                continue;
+            };
+            let Some(old_shard) = pinned.get(&shard_id) else {
+                continue;
+            };
+            let record = Self::read_at(old_shard, offset)?;
+            let edges = extract_edges(&hash, &record.data);
+            for edge in &edges {
+                if !boundary.contains(edge)
+                    && hash_to_shard_offset.contains_key(edge)
+                    && !at_cap(&visited)
+                    && visited.insert(*edge)
+                {
+                    queue.push_back(*edge);
+                }
+            }
+            adjacency.insert(hash, edges);
+        }
+
+        let mut live_hashes: Vec<[u8; 16]> = visited.into_iter().collect();
+        live_hashes.sort_unstable();
+        Ok((live_hashes, adjacency))
+    }
+
     /// Read every record's edges, with no reachability filtering.
     /// Used when a room has no configured live roots, so nothing is known
     /// to be garbage. Iterates `hash_to_shard_offset` directly rather
@@ -951,6 +1067,104 @@ impl PackfileStorage {
         self.shards.sync_dirty()?;
 
         Ok((kept, dropped))
+    }
+
+    /// Fetches the ancestors of `frontier`, walking `extract_edges`
+    /// backward and stopping expansion at (and excluding) anything in
+    /// `stop_at` — a bounded ancestor walk, e.g. for auth-chain or
+    /// prev-event traversal from a caller-supplied frontier back to
+    /// caller-supplied already-known boundary nodes.
+    ///
+    /// This is **not** a from/to range or span: if a branch's history
+    /// never crosses any `stop_at` node (a fork off the main line, say),
+    /// that branch is walked all the way back to the room's true roots,
+    /// not truncated at an implied boundary. A genuine "everything between
+    /// these two frontiers" query is `ancestors(frontier) ∩
+    /// descendants(stop_at)`, which needs reverse adjacency this doesn't
+    /// build — `NodeId`s are content hashes with no key order to slice a
+    /// real range query over, and this walk only covers the ancestor half.
+    /// `limits.max_nodes` bounds the runaway case above.
+    ///
+    /// Returns nodes lazily, ancestor-first (parents before children,
+    /// topologically), as a [`DagWalk`] iterator — nothing is buffered
+    /// beyond the walk's hash list, and every yielded record has been
+    /// through the same hash-verified resolution path as [`Self::get`]
+    /// (candidates are matched by content hash, not just index tag, so an
+    /// index-tag collision can't surface the wrong record).
+    ///
+    /// Read-only: pins shards for the walk's duration but takes no
+    /// `put_mutex` and never writes. Each shard is scanned in full to
+    /// build this call's `hash → (shard, offset)` map — the same
+    /// first-time cost `repack_room_reachable` pays before it has
+    /// incremental cursor state, paid on every call here since this walk
+    /// has no cursor to carry forward between calls.
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O or corruption, or if the walk finds a
+    /// cycle (an event graph must be acyclic; a cycle means the extracted
+    /// edges are wrong or the data is corrupt).
+    ///
+    /// # Panics
+    /// Panics if any hash in the CSR exceeds `u32::MAX` local ID space.
+    pub fn walk_ancestors<'a>(
+        &'a self,
+        room_id: &'a [u8; 16],
+        frontier: &[[u8; 16]],
+        stop_at: &[[u8; 16]],
+        extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+        limits: WalkLimits,
+    ) -> Result<DagWalk<'a>, StorageError> {
+        let scanned = self.scan_room_records(room_id)?;
+        let mut hash_to_shard_offset = HashMap::new();
+        for (shard_id, entries) in &scanned {
+            for (hash, offset) in entries {
+                hash_to_shard_offset.insert(*hash, (*shard_id, *offset));
+            }
+        }
+
+        let pinned = self.pin_shards(hash_to_shard_offset.values().map(|&(id, _)| id));
+
+        let (live_hashes, adjacency) = Self::bfs_bounded(
+            frontier,
+            stop_at,
+            &hash_to_shard_offset,
+            &pinned,
+            &extract_edges,
+            limits,
+        )?;
+
+        let csr = Csr::build_from_edges(&live_hashes, &adjacency);
+        let mut topo = csr.topo_order();
+
+        if topo.len() != live_hashes.len() {
+            return Err(StorageError::Corrupt(format!(
+                "walk_ancestors: cyclic graph detected — topo_order produced {} nodes from {} live hashes",
+                topo.len(),
+                live_hashes.len(),
+            )));
+        }
+
+        // `extract_edges` points each node at its parents, so Kahn's
+        // algorithm (which surfaces zero-incoming nodes first) naturally
+        // yields children before parents. Reverse it: callers of an
+        // ancestor walk want parents-before-children, the order data
+        // could actually be replayed in.
+        topo.reverse();
+
+        let order: Vec<[u8; 16]> = topo
+            .into_iter()
+            .map(|local| {
+                *csr.hash_of(local)
+                    .expect("topo order contains valid local IDs")
+            })
+            .collect();
+
+        Ok(DagWalk {
+            store: self,
+            room_id,
+            order: order.into_iter(),
+            _pinned: pinned,
+        })
     }
 
     /// After a repack, scan all rooms' indexes and retire any shard that
@@ -1434,6 +1648,197 @@ mod tests {
                 "result at position {i} must match the id requested at that position"
             );
         }
+    }
+
+    #[test]
+    fn test_walk_ancestors_stops_at_boundary() {
+        let dir = test_dir("walk_basic");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // A -> B -> C -> D -> E, linear chain, edges point to predecessors.
+        let ids: Vec<NodeId> = (0..5u8).map(distinct_id).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let byte = u8::try_from(i).unwrap();
+            store
+                .put(
+                    &TEST_ROOM,
+                    id,
+                    &NodeData::new(bytes::Bytes::from(vec![b'A' + byte])),
+                )
+                .unwrap();
+        }
+        let edges = std::collections::HashMap::from([
+            (ids[1], vec![ids[0]]),
+            (ids[2], vec![ids[1]]),
+            (ids[3], vec![ids[2]]),
+            (ids[4], vec![ids[3]]),
+        ]);
+        let extract = |hash: &[u8; 16], _data: &[u8]| edges.get(hash).cloned().unwrap_or_default();
+
+        // frontier=[D], stop_at=[B]: should yield C, D in ancestor-first
+        // order — stopping at and excluding B, including the D frontier.
+        let walked: Vec<(NodeId, NodeData)> = store
+            .walk_ancestors(
+                &TEST_ROOM,
+                &[ids[3]],
+                &[ids[1]],
+                extract,
+                WalkLimits::default(),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let bytes: Vec<u8> = walked.iter().map(|(_, d)| d.bytes[0]).collect();
+        assert_eq!(
+            bytes,
+            vec![b'C', b'D'],
+            "walk must be ancestor-first, excluding the stop_at boundary"
+        );
+
+        // Empty stop_at: walks all the way back to the room's true roots.
+        let full: Vec<(NodeId, NodeData)> = store
+            .walk_ancestors(&TEST_ROOM, &[ids[4]], &[], extract, WalkLimits::default())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let full_bytes: Vec<u8> = full.iter().map(|(_, d)| d.bytes[0]).collect();
+        assert_eq!(full_bytes, vec![b'A', b'B', b'C', b'D', b'E']);
+    }
+
+    #[test]
+    fn test_walk_ancestors_branching_dag() {
+        let dir = test_dir("walk_branch");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        //   A
+        //  / \
+        // B   C
+        //  \ /
+        //   D
+        let ids: Vec<NodeId> = (0..4u8).map(distinct_id).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let byte = u8::try_from(i).unwrap();
+            store
+                .put(
+                    &TEST_ROOM,
+                    id,
+                    &NodeData::new(bytes::Bytes::from(vec![b'A' + byte])),
+                )
+                .unwrap();
+        }
+        let edges = std::collections::HashMap::from([
+            (ids[1], vec![ids[0]]),
+            (ids[2], vec![ids[0]]),
+            (ids[3], vec![ids[1], ids[2]]),
+        ]);
+        let extract = |hash: &[u8; 16], _data: &[u8]| edges.get(hash).cloned().unwrap_or_default();
+
+        // frontier=[D], stop_at=[A]: should yield exactly {B, C, D} — A
+        // excluded as the boundary, both branches merge back in correctly.
+        let walked: Vec<(NodeId, NodeData)> = store
+            .walk_ancestors(
+                &TEST_ROOM,
+                &[ids[3]],
+                &[ids[0]],
+                extract,
+                WalkLimits::default(),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut bytes: Vec<u8> = walked.iter().map(|(_, d)| d.bytes[0]).collect();
+        // D must come last (ancestor-first order); B/C order between them
+        // is unconstrained since they're siblings.
+        assert_eq!(*bytes.last().unwrap(), b'D');
+        bytes.sort_unstable();
+        assert_eq!(bytes, vec![b'B', b'C', b'D']);
+    }
+
+    #[test]
+    fn test_walk_ancestors_never_reaching_stop_at_walks_to_roots() {
+        // A fork that never crosses the supplied stop_at boundary must not
+        // be silently truncated there — it's an ancestor walk with stop
+        // markers, not a from/to span, so it walks to the room's true
+        // roots instead.
+        let dir = test_dir("walk_fork_misses_boundary");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        //   ROOT
+        //   /  \
+        // MAIN  FORK
+        //  |
+        // TIP
+        let root = distinct_id(0);
+        let main = distinct_id(1);
+        let fork = distinct_id(2);
+        let tip = distinct_id(3);
+        for (id, byte) in [(root, b'R'), (main, b'M'), (fork, b'F'), (tip, b'T')] {
+            store
+                .put(
+                    &TEST_ROOM,
+                    &id,
+                    &NodeData::new(bytes::Bytes::from(vec![byte])),
+                )
+                .unwrap();
+        }
+        let edges = std::collections::HashMap::from([
+            (main, vec![root]),
+            (fork, vec![root]),
+            (tip, vec![main]),
+        ]);
+        let extract = |hash: &[u8; 16], _data: &[u8]| edges.get(hash).cloned().unwrap_or_default();
+
+        // stop_at names `fork`, which TIP's history never crosses — the
+        // walk from TIP must still reach ROOT rather than stopping short.
+        let walked: Vec<(NodeId, NodeData)> = store
+            .walk_ancestors(&TEST_ROOM, &[tip], &[fork], extract, WalkLimits::default())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut bytes: Vec<u8> = walked.iter().map(|(_, d)| d.bytes[0]).collect();
+        bytes.sort_unstable();
+        assert_eq!(bytes, vec![b'M', b'R', b'T']);
+    }
+
+    #[test]
+    fn test_walk_ancestors_max_nodes_bounds_a_runaway_walk() {
+        let dir = test_dir("walk_max_nodes");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // A long chain with a stop_at that never gets hit — max_nodes is
+        // the only thing that keeps this walk from covering the chain.
+        let ids: Vec<NodeId> = (0..20u8).map(distinct_id).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let byte = u8::try_from(i % 26).unwrap();
+            store
+                .put(
+                    &TEST_ROOM,
+                    id,
+                    &NodeData::new(bytes::Bytes::from(vec![b'a' + byte])),
+                )
+                .unwrap();
+        }
+        let mut edges = std::collections::HashMap::new();
+        for i in 1..ids.len() {
+            edges.insert(ids[i], vec![ids[i - 1]]);
+        }
+        let extract = |hash: &[u8; 16], _data: &[u8]| edges.get(hash).cloned().unwrap_or_default();
+
+        let walked: Vec<(NodeId, NodeData)> = store
+            .walk_ancestors(
+                &TEST_ROOM,
+                &[ids[19]],
+                &[],
+                extract,
+                WalkLimits { max_nodes: Some(5) },
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            walked.len() <= 5,
+            "max_nodes must bound the walk even though stop_at was never reached"
+        );
     }
 
     #[test]
