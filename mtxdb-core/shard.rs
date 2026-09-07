@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Seek};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,8 @@ pub struct ShardPool {
     /// Serializes shard rotation (finding/creating the next shard).
     rotation_lock: parking_lot::Mutex<()>,
     base_dir: PathBuf,
+    /// Shard IDs written to since the last sync, for scoped fsync.
+    dirty: parking_lot::Mutex<HashSet<u8>>,
 }
 
 impl ShardPool {
@@ -150,6 +153,7 @@ impl ShardPool {
             active_write: parking_lot::Mutex::new(highest_active),
             rotation_lock: parking_lot::Mutex::new(()),
             base_dir,
+            dirty: parking_lot::Mutex::new(HashSet::new()),
         })
     }
 
@@ -217,6 +221,7 @@ impl ShardPool {
                 offset
             };
 
+            self.dirty.lock().insert(shard.shard_id);
             return Ok((shard.shard_id, offset));
         }
     }
@@ -371,6 +376,26 @@ impl ShardPool {
         Ok(())
     }
 
+    /// Sync only shards written to since the last sync.
+    ///
+    /// Each shard's dirty bit is cleared only after a successful fsync,
+    /// so a partial failure leaves the untried shards marked dirty for
+    /// the next call.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on sync failure.
+    pub fn sync_dirty(&self) -> io::Result<()> {
+        let dirty: Vec<u8> = { self.dirty.lock().iter().copied().collect() };
+        let shards = self.shards.read();
+        for &id in &dirty {
+            if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
+                shard.file.sync_all()?;
+                self.dirty.lock().remove(&id);
+            }
+        }
+        Ok(())
+    }
+
     /// Scan a shard file and return `(room_id, hash, offset)` entries.
     /// Used during startup to rebuild per-room indexes.
     ///
@@ -443,6 +468,34 @@ mod tests {
         assert_eq!(read.room_id[0], 0x01);
         assert_eq!(read.hash[0], 0xAA);
         assert_eq!(read.data.as_ref(), b"hello shard");
+    }
+
+    #[test]
+    fn test_sync_dirty_noop_when_nothing_written() {
+        let dir = test_dir("sync_dirty_noop");
+        let pool = ShardPool::open(dir).unwrap();
+        assert!(pool.dirty.lock().is_empty());
+        pool.sync_dirty().unwrap();
+        assert!(pool.dirty.lock().is_empty());
+    }
+
+    #[test]
+    fn test_sync_dirty_clears_only_written_shards() {
+        let dir = test_dir("sync_dirty_clears");
+        let pool = ShardPool::open(dir).unwrap();
+
+        let record = test_record(0x01, 0xCC, b"needs sync");
+        let (shard_id, _offset) = pool.put_record(&record).unwrap();
+        assert!(pool.dirty.lock().contains(&shard_id));
+
+        pool.sync_dirty().unwrap();
+        assert!(
+            pool.dirty.lock().is_empty(),
+            "dirty bit must clear after a successful sync"
+        );
+
+        // A second sync with nothing new written is a no-op, not an error.
+        pool.sync_dirty().unwrap();
     }
 
     #[test]

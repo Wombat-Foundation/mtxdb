@@ -798,6 +798,16 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn sync(&self) -> Result<(), StorageError> {
+        Ok(self.shards.sync_dirty()?)
+    }
+}
+
+impl PackfileStorage {
+    /// Sync all open shards to disk (full pool, not just dirty).
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O failure.
+    pub fn sync_all(&self) -> Result<(), StorageError> {
         Ok(self.shards.sync_all()?)
     }
 }
