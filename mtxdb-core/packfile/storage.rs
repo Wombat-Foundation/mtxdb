@@ -223,6 +223,65 @@ impl PackfileStorage {
         ids
     }
 
+    /// Room IDs whose live index currently references at least one record
+    /// physically stored in `shard_id`.
+    ///
+    /// Shards are shared, so this is normally more than one room; it's the
+    /// set `repack_shard` needs to touch before that shard can retire.
+    #[must_use]
+    pub fn rooms_referencing_shard(&self, shard_id: u16) -> Vec<[u8; 16]> {
+        let rooms = self.rooms.read();
+        rooms
+            .iter()
+            .filter_map(|(room_id, gen_swap)| {
+                let gen = gen_swap.load();
+                gen.index
+                    .referenced_shard_ids()
+                    .get(shard_id as usize)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(*room_id)
+            })
+            .collect()
+    }
+
+    /// Repack every room that still references `shard_id`.
+    ///
+    /// A shard only ever retires once *every* room referencing it has
+    /// repacked past its data there (see `retire_empty_shards`) — there's
+    /// no per-shard compaction primitive, since reachability (what's
+    /// live vs. garbage) is inherently a per-room concept, not a shard
+    /// one. This is the targeted way to reclaim one specific shard: find
+    /// every room still pinning it live and repack each of them, instead
+    /// of waiting for each room to independently cross its own repack
+    /// threshold. Live records get moved to whatever's currently that
+    /// room's home shard (`ShardPool::room_home`) — not necessarily the
+    /// pool's single "main" shard, since homes are per-room, not global.
+    ///
+    /// Returns `(room_id, kept, dropped)` for each room repacked, in the
+    /// order `rooms_referencing_shard` returned them. Does not itself
+    /// guarantee the shard retires — a room with `set_live_roots` never
+    /// called preserves everything (nothing is provably garbage) and its
+    /// repack is a no-op for this purpose.
+    ///
+    /// # Errors
+    /// Returns `StorageError` if any room's repack fails; already-repacked
+    /// rooms in this call are not rolled back.
+    pub fn repack_shard(
+        &self,
+        shard_id: u16,
+        extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+    ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
+        let rooms = self.rooms_referencing_shard(shard_id);
+        let mut results = Vec::with_capacity(rooms.len());
+        for room_id in rooms {
+            let (kept, dropped) =
+                self.repack_room_reachable(&room_id, |hash, data| extract_edges(hash, data))?;
+            results.push((room_id, kept, dropped));
+        }
+        Ok(results)
+    }
+
     /// A room's `(entry count, memory usage in bytes)`, if the room exists.
     pub fn room_index_info(&self, room_id: &[u8; 16]) -> Option<(usize, usize)> {
         self.rooms.read().get(room_id).map(|gen| {
@@ -1866,6 +1925,66 @@ mod tests {
             got.is_some(),
             "room B root must survive repack of room A — shared shard must not be retired",
         );
+    }
+
+    /// `repack_shard` must find and repack every room sharing a shard —
+    /// the targeted way to reclaim one shard without waiting for each
+    /// room to independently cross its own repack threshold.
+    #[test]
+    fn test_repack_shard_repacks_every_referencing_room() {
+        let dir = test_dir("repack_shard");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let mut root_a = [0u8; 16];
+        root_a[0] = 0xAA;
+        let mut garbage_a = [0u8; 16];
+        garbage_a[0] = 0xA1;
+        store
+            .put(
+                &TEST_ROOM,
+                &root_a,
+                &NodeData::new(bytes::Bytes::from_static(b"room A root")),
+            )
+            .unwrap();
+        store
+            .put(
+                &TEST_ROOM,
+                &garbage_a,
+                &NodeData::new(bytes::Bytes::from_static(b"room A garbage")),
+            )
+            .unwrap();
+        store.set_live_roots(&TEST_ROOM, vec![root_a]);
+
+        let mut root_b = [0u8; 16];
+        root_b[0] = 0xBB;
+        store
+            .put(
+                &OTHER_ROOM,
+                &root_b,
+                &NodeData::new(bytes::Bytes::from_static(b"room B root")),
+            )
+            .unwrap();
+        // No set_live_roots for room B: everything must survive its repack.
+
+        // Fresh pool, both rooms' first writes land on shard 0 (shared).
+        let referencing = store.rooms_referencing_shard(0);
+        assert_eq!(referencing.len(), 2);
+        assert!(referencing.contains(&TEST_ROOM));
+        assert!(referencing.contains(&OTHER_ROOM));
+
+        let mut results = store.repack_shard(0, |_hash, _data| Vec::new()).unwrap();
+        results.sort_unstable_by_key(|(room_id, _, _)| *room_id);
+
+        let mut expected = vec![(TEST_ROOM, 1usize, 1usize), (OTHER_ROOM, 1usize, 0usize)];
+        expected.sort_unstable_by_key(|(room_id, _, _)| *room_id);
+        assert_eq!(
+            results, expected,
+            "repack_shard must repack both rooms sharing shard 0"
+        );
+
+        assert!(store.get(&TEST_ROOM, &root_a).unwrap().is_some());
+        assert!(store.get(&TEST_ROOM, &garbage_a).unwrap().is_none());
+        assert!(store.get(&OTHER_ROOM, &root_b).unwrap().is_some());
     }
 
     #[test]
