@@ -38,7 +38,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().fold(
         String::with_capacity(bytes.len().saturating_mul(2)),
         |mut s, b| {
-            let _ = write!(s, "{b:02x}");
+            let _ = write!(s, "{b:02X}");
             s
         },
     )
@@ -158,7 +158,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     rooms.sort_unstable_by_key(|&(id, _)| id);
     for (i, (room_id, count)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
-        eprintln!("  {i}: 0x{hex} ({count} records)");
+        println!("  {i}: 0x{hex} ({count} records)");
     }
     Ok(())
 }
@@ -258,14 +258,14 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 fn print_shard_table(shard_entries: &[(u16, u64, u64)], stats_map: &ShardStatsMap) {
     const GEN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-    eprintln!(
+    println!(
         "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
         "shard", "generation", "bytes", "writes", "written", "syncs"
     );
     for &(slot_id, generation, file_bytes) in shard_entries {
         let key = u64::from(slot_id) << 48 | (generation & GEN_MASK);
         let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
-        eprintln!(
+        println!(
             "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
             slot_id,
             format!("{generation:#018x}"),
@@ -275,7 +275,7 @@ fn print_shard_table(shard_entries: &[(u16, u64, u64)], stats_map: &ShardStatsMa
             sc,
         );
     }
-    eprintln!("{} shards", shard_entries.len());
+    println!("{} shards", shard_entries.len());
 }
 
 /// Print how old the stats snapshot is (or that none exists).
@@ -313,7 +313,7 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let hex = hex_encode(&room_id);
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
-            eprintln!("room {hex}: {len} records, {mem} bytes index memory");
+            println!("room {hex}: {len} records, {mem} bytes index memory");
         }
         None => {
             eprintln!("room {hex}: not found");
@@ -324,7 +324,7 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
 
 fn cmd_scan(path: &PathBuf) -> anyhow::Result<()> {
     let records = mtxdb::packfile::scan_packfile(path)?;
-    eprintln!(
+    println!(
         "shard: {} bytes, {} records",
         std::fs::metadata(path)?.len(),
         records.len()
@@ -332,7 +332,7 @@ fn cmd_scan(path: &PathBuf) -> anyhow::Result<()> {
     for (room_id, node_id, offset) in &records {
         let room_hex = hex_encode(room_id);
         let id_hex = hex_encode(node_id);
-        eprintln!("  room={room_hex} id={id_hex} @ {offset}");
+        println!("  room={room_hex} id={id_hex} @ {offset}");
     }
     Ok(())
 }
@@ -555,7 +555,7 @@ fn cmd_repack_shard(
     };
 
     eprint!("press Enter to continue, Ctrl+C to abort: ");
-    io::stdout().flush()?;
+    io::stderr().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
 
@@ -635,7 +635,7 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     if !yes {
         eprintln!("This will permanently delete all data for room {hex}.");
         eprint!("Are you sure? [y/N] ");
-        io::stdout().flush()?;
+        io::stderr().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {
