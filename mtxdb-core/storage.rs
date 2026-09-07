@@ -39,9 +39,9 @@ pub const ENTRY_TYPE_STATE_GROUP_REFCOUNT: u8 = 0x1B;
 pub fn is_known_tag(byte: u8) -> bool {
     matches!(
         byte,
-        ENTRY_TYPE_HAMT_ROOT_FLAT
-            | ENTRY_TYPE_HAMT_ROOT_TYPED
+        ENTRY_TYPE_HAMT_ROOT_TYPED
             | ENTRY_TYPE_HAMT_NODE
+            | ENTRY_TYPE_PREV_EVENT_EDGES
             | ENTRY_TYPE_EVENT_JSON
             | ENTRY_TYPE_EVENT_STATE_GROUP
             | ENTRY_TYPE_STATE_GROUP_REFCOUNT
@@ -54,9 +54,9 @@ pub fn is_known_tag(byte: u8) -> bool {
 #[must_use]
 pub fn tag_name(byte: u8) -> Option<&'static str> {
     match byte {
-        ENTRY_TYPE_HAMT_ROOT_FLAT => Some("hamt_root_flat"),
-        ENTRY_TYPE_HAMT_ROOT_TYPED => Some("hamt_root_typed"),
+        ENTRY_TYPE_HAMT_ROOT_TYPED => Some("hamt_root"),
         ENTRY_TYPE_HAMT_NODE => Some("hamt_node"),
+        ENTRY_TYPE_PREV_EVENT_EDGES => Some("prev_event_edges"),
         ENTRY_TYPE_EVENT_JSON => Some("event_json"),
         ENTRY_TYPE_EVENT_STATE_GROUP => Some("event_state_group"),
         ENTRY_TYPE_STATE_GROUP_REFCOUNT => Some("state_group_refcount"),
