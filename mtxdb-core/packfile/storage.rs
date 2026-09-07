@@ -235,13 +235,6 @@ impl PackfileStorage {
             .store(entries, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Set the repack trigger threshold from an approximate byte budget
-    /// (assumes ~200 bytes/entry).
-    pub fn set_repack_threshold_bytes(&self, bytes: u64) {
-        let entries = bytes / 200;
-        self.set_repack_threshold_entries(entries.max(1));
-    }
-
     /// Returns `true` if a room's index has reached the configured repack
     /// threshold.
     ///
