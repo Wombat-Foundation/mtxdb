@@ -69,6 +69,33 @@ type AdjacencyResult = (Vec<[u8; 16]>, HashMap<[u8; 16], Vec<[u8; 16]>>);
 /// produced by a repack's initial shard scan.
 type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 
+/// One scanned record's `(shard_id, hash, offset)`, as accumulated per
+/// room during `PackfileStorage::open_with_options`'s initial scan.
+type ShardRecord = (u16, [u8; 16], u64);
+
+/// Accumulator for `PackfileStorage::open_with_options`'s phase 2 —
+/// bundles the three maps `init_room_from_scan` fills in per room, so
+/// that function takes one out-parameter instead of three.
+#[derive(Default)]
+struct RoomScanOutput {
+    rooms: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
+    shard_rooms: HashMap<u16, HashMap<[u8; 16], u64>>,
+    room_shards: HashMap<[u8; 16], HashSet<u16>>,
+}
+
+/// Magic bytes + version identifying the persisted shard→room directory
+/// format (see `PackfileStorage::persist_shard_rooms`).
+const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
+const SHARD_ROOMS_VERSION: u8 = 1;
+/// Header size: magic(4) + version(1) + `persisted_at`(8).
+const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8;
+/// On-disk size of one entry: `shard_id`(2) + `room_id`(16) + count(8).
+const SHARD_ROOMS_RECORD_LEN: usize = 2 + 16 + 8;
+/// Disambiguates concurrent `persist_shard_rooms` tmp filenames within
+/// this process, paired with the process id for uniqueness across
+/// processes — same rationale as `shard::STATS_TMP_COUNTER`.
+static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Immutable snapshot of a room's in-memory state.
 ///
 /// Index and cache are bundled so readers see a consistent triple
@@ -116,6 +143,22 @@ pub struct PackfileStorage {
     /// merged into the existing map — turning O(n²) full rescan into
     /// O(n) total work across all repack calls.
     repack_incremental: RwLock<HashMap<[u8; 16], RepackIncrementalState>>,
+    /// Persisted directory: which rooms have live records in each shard,
+    /// and how many. Maintained incrementally (a plain `put` just
+    /// increments one counter; a full index rebuild/repack/initial scan
+    /// replaces one room's contribution wholesale via
+    /// `LossyIndex::shard_counts`) rather than ever re-derived by
+    /// scanning a shard file, which is what made `rooms_referencing_shard`
+    /// and a `rooms`-style listing expensive before this existed.
+    shard_rooms: RwLock<HashMap<u16, HashMap<[u8; 16], u64>>>,
+    /// Reverse index of `shard_rooms`: which shards a given room currently
+    /// contributes a nonzero count to. Lets a room's full-index-rebuild
+    /// path (`replace_room_shard_counts`) clear exactly the shard entries
+    /// it used to occupy without scanning every shard in `shard_rooms`.
+    room_shards: RwLock<HashMap<[u8; 16], HashSet<u16>>>,
+    /// Wall-clock instant of the last `maybe_persist_shard_rooms` flush,
+    /// used to rate-limit that timer-driven path.
+    last_shard_rooms_flush: RwLock<Option<std::time::Instant>>,
 }
 
 /// Per-room state for incremental repack.
@@ -185,7 +228,6 @@ impl PackfileStorage {
         swizzle: Option<SwizzleFn>,
         writable: bool,
     ) -> Result<Self, std::io::Error> {
-        type ShardRecord = (u16, [u8; 16], u64);
         fs::create_dir_all(&base_dir)?;
 
         let shards = if writable {
@@ -193,7 +235,6 @@ impl PackfileStorage {
         } else {
             ShardPool::open_read_only(base_dir.clone())?
         };
-        let mut rooms: HashMap<[u8; 16], ArcSwap<RoomGeneration>> = HashMap::new();
 
         // Phase 1: accumulate all records per room across every shard so
         // the index can be sized once for the true total.
@@ -263,38 +304,25 @@ impl PackfileStorage {
         // P1: load deleted rooms set (persisted to disk)
         let deleted_rooms = Self::load_deleted_rooms(&base_dir);
 
+        let mut scan_out = RoomScanOutput::default();
+
         // Phase 2: build per-room indexes sized to the true total.
         for room_id in &room_order {
-            let records = &room_entries[room_id];
             if deleted_rooms.contains(room_id) {
                 continue;
             }
-            // Seed each room's home shard from the scan: the shard of its
-            // last-scanned record is a best-effort proxy for "most recent"
-            // (shards are scanned in ascending ID order, and IDs generally
-            // increase over time via rotation) — not exact chronology
-            // across shards, but enough to keep a resumed room's writes
-            // landing near its existing data instead of restarting at
-            // whatever the pool's active shard happens to be.
-            if let Some(&(last_shard_id, _, _)) = records.last() {
-                shards.set_room_home(room_id, last_shard_id);
-            }
-            let mut index = LossyIndex::new(records.len().saturating_mul(2).max(16));
-            for (shard_id, hash, offset) in records {
-                let _ = index.insert(hash, *shard_id, *offset);
-            }
-            rooms.insert(
-                *room_id,
-                ArcSwap::from_pointee(RoomGeneration {
-                    index,
-                    cache: Arc::new(NodeCache::new(cache_capacity)),
-                }),
+            Self::init_room_from_scan(
+                room_id,
+                &room_entries[room_id],
+                &shards,
+                cache_capacity,
+                &mut scan_out,
             );
         }
 
         Ok(Self {
             shards,
-            rooms: RwLock::new(rooms),
+            rooms: RwLock::new(scan_out.rooms),
             room_order: RwLock::new(room_order),
             pinned: PinnedNodes::new(),
             base_dir,
@@ -308,7 +336,54 @@ impl PackfileStorage {
             repack_dropped_total: AtomicU64::new(0),
             repack_counts_by_room: RwLock::new(HashMap::new()),
             repack_incremental: RwLock::new(HashMap::new()),
+            shard_rooms: RwLock::new(scan_out.shard_rooms),
+            room_shards: RwLock::new(scan_out.room_shards),
+            last_shard_rooms_flush: RwLock::new(None),
         })
+    }
+
+    /// Builds one room's index, cache, and shard-directory contribution
+    /// from its scanned records, and inserts all three into `out` — the
+    /// per-room body of `open_with_options`'s phase 2, factored out to
+    /// keep that function under the line-count lint rather than
+    /// suppressing it.
+    fn init_room_from_scan(
+        room_id: &[u8; 16],
+        records: &[ShardRecord],
+        shards: &ShardPool,
+        cache_capacity: usize,
+        out: &mut RoomScanOutput,
+    ) {
+        // Seed each room's home shard from the scan: the shard of its
+        // last-scanned record is a best-effort proxy for "most recent"
+        // (shards are scanned in ascending ID order, and IDs generally
+        // increase over time via rotation) — not exact chronology across
+        // shards, but enough to keep a resumed room's writes landing near
+        // its existing data instead of restarting at whatever the pool's
+        // active shard happens to be.
+        if let Some(&(last_shard_id, _, _)) = records.last() {
+            shards.set_room_home(room_id, last_shard_id);
+        }
+        let mut index = LossyIndex::new(records.len().saturating_mul(2).max(16));
+        for (shard_id, hash, offset) in records {
+            let _ = index.insert(hash, *shard_id, *offset);
+        }
+        let counts = index.shard_counts();
+        for (&shard_id, &count) in &counts {
+            out.shard_rooms
+                .entry(shard_id)
+                .or_default()
+                .insert(*room_id, count);
+        }
+        out.room_shards
+            .insert(*room_id, counts.keys().copied().collect());
+        out.rooms.insert(
+            *room_id,
+            ArcSwap::from_pointee(RoomGeneration {
+                index,
+                cache: Arc::new(NodeCache::new(cache_capacity)),
+            }),
+        );
     }
 
     fn generation(&self, room_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
@@ -344,28 +419,22 @@ impl PackfileStorage {
     /// Returns `StorageError` if the shard's file can't be read, or if
     /// `shard_id` doesn't correspond to a currently-open shard.
     pub fn rooms_referencing_shard(&self, shard_id: u16) -> Result<Vec<[u8; 16]>, StorageError> {
-        let Some(shard) = self.shards.get_shard(shard_id) else {
+        if self.shards.get_shard(shard_id).is_none() {
             return Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("no open shard with id {shard_id}"),
             )));
-        };
-        let scanned = shard::ShardPool::scan_shard(&shard.path).map_err(StorageError::Io)?;
-
-        let mut seen = HashSet::with_capacity(scanned.len());
-        let rooms = self.rooms.read();
-        let mut result = Vec::new();
-        for (room_id, _hash, _offset) in scanned {
-            if !seen.insert(room_id) {
-                continue;
-            }
-            if let Some(gen_swap) = rooms.get(&room_id) {
-                if gen_swap.load().index.references_shard(shard_id) {
-                    result.push(room_id);
-                }
-            }
         }
-        Ok(result)
+        // O(1) against the incrementally-maintained shard→room directory
+        // instead of scanning the shard file — this used to be the
+        // dominant cost of shard retirement/evacuation-style operations
+        // on a large shard.
+        Ok(self
+            .shard_rooms
+            .read()
+            .get(&shard_id)
+            .map(|rooms| rooms.keys().copied().collect())
+            .unwrap_or_default())
     }
 
     /// Repack every room that still references `shard_id`.
@@ -541,6 +610,194 @@ impl PackfileStorage {
             fs::write(&path, &bytes).map_err(StorageError::Io)?;
         }
         Ok(())
+    }
+
+    /// Records one new record landing in `shard_id` for `room_id` — the
+    /// cheap, O(1) path for a plain `put` that only appends, never moves
+    /// or drops anything. Kept separate from
+    /// [`Self::replace_room_shard_counts`], which pays for a full
+    /// per-shard recount and is reserved for the cases that actually
+    /// change a room's existing distribution (an index rebuild or a
+    /// repack), so a normal write never regresses to O(room size).
+    fn record_new_shard_room(&self, shard_id: u16, room_id: &[u8; 16]) {
+        let mut shard_rooms = self.shard_rooms.write();
+        let count = shard_rooms
+            .entry(shard_id)
+            .or_default()
+            .entry(*room_id)
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        drop(shard_rooms);
+        self.room_shards
+            .write()
+            .entry(*room_id)
+            .or_default()
+            .insert(shard_id);
+    }
+
+    /// Replaces `room_id`'s entire contribution to `shard_rooms` with
+    /// `counts` (typically `LossyIndex::shard_counts()` on a freshly
+    /// rebuilt or repacked index) — clears it out of any shard it no
+    /// longer occupies and installs the fresh per-shard counts. Used
+    /// wherever a room's index is replaced wholesale rather than
+    /// incrementally appended to, since only then can its distribution
+    /// across shards actually change.
+    fn replace_room_shard_counts(&self, room_id: &[u8; 16], counts: &HashMap<u16, u64>) {
+        let old_shards = self
+            .room_shards
+            .write()
+            .insert(*room_id, counts.keys().copied().collect());
+        let mut shard_rooms = self.shard_rooms.write();
+        if let Some(old_shards) = old_shards {
+            for shard_id in &old_shards {
+                if !counts.contains_key(shard_id) {
+                    if let Some(m) = shard_rooms.get_mut(shard_id) {
+                        m.remove(room_id);
+                        if m.is_empty() {
+                            shard_rooms.remove(shard_id);
+                        }
+                    }
+                }
+            }
+        }
+        for (&shard_id, &count) in counts {
+            shard_rooms
+                .entry(shard_id)
+                .or_default()
+                .insert(*room_id, count);
+        }
+    }
+
+    /// Removes `room_id` from `shard_rooms`/`room_shards` entirely —
+    /// used on room deletion, where nothing of the room survives in any
+    /// shard.
+    fn remove_room_shard_counts(&self, room_id: &[u8; 16]) {
+        let Some(old_shards) = self.room_shards.write().remove(room_id) else {
+            return;
+        };
+        let mut shard_rooms = self.shard_rooms.write();
+        for shard_id in old_shards {
+            if let Some(m) = shard_rooms.get_mut(&shard_id) {
+                m.remove(room_id);
+                if m.is_empty() {
+                    shard_rooms.remove(&shard_id);
+                }
+            }
+        }
+    }
+
+    /// Path to the persisted shard→room directory for a base directory.
+    fn shard_rooms_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join("shard_rooms.bin")
+    }
+
+    /// Persist the current `shard_rooms` directory to disk: which rooms
+    /// have live records in each shard, and how many. Read by
+    /// [`Self::room_directory_from_disk`] — a free function a separate,
+    /// short-lived process (a `rooms`-style CLI listing) can call without
+    /// opening a full `PackfileStorage` (which would otherwise mean
+    /// scanning and index-building every shard just to answer "what rooms
+    /// exist and how big are they").
+    ///
+    /// Writes to a temp file and renames into place, same crash-safety
+    /// pattern as `ShardPool::persist_stats`.
+    ///
+    /// # Errors
+    /// Returns `StorageError` on write or rename failure.
+    pub fn persist_shard_rooms(&self) -> Result<(), StorageError> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(SHARD_ROOMS_MAGIC);
+        buf.push(SHARD_ROOMS_VERSION);
+        let persisted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        buf.extend_from_slice(&persisted_at.to_le_bytes());
+        for (shard_id, rooms) in self.shard_rooms.read().iter() {
+            for (room_id, count) in rooms {
+                buf.extend_from_slice(&shard_id.to_le_bytes());
+                buf.extend_from_slice(room_id);
+                buf.extend_from_slice(&count.to_le_bytes());
+            }
+        }
+
+        let unique = SHARD_ROOMS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = Self::shard_rooms_path(&self.base_dir)
+            .with_extension(format!("bin.tmp.{}.{unique}", std::process::id()));
+        let final_path = Self::shard_rooms_path(&self.base_dir);
+        let write_result = (|| -> std::io::Result<()> {
+            let mut tmp = fs::File::create(&tmp_path)?;
+            std::io::Write::write_all(&mut tmp, &buf)?;
+            tmp.sync_all()
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(StorageError::Io(e));
+        }
+        fs::rename(&tmp_path, &final_path).map_err(StorageError::Io)?;
+        Ok(())
+    }
+
+    /// Best-effort wrapper around [`Self::persist_shard_rooms`] — logs and
+    /// swallows a failure rather than turning it into a hard error, same
+    /// contract as `ShardPool`'s stats persistence: this is observability
+    /// data, not something worth failing an otherwise-successful sync
+    /// over.
+    fn persist_shard_rooms_best_effort(&self) {
+        if let Err(e) = self.persist_shard_rooms() {
+            eprintln!("mtxdb: failed to persist shard→room directory: {e}");
+        }
+    }
+
+    /// Reads a persisted shard→room directory directly off disk, with no
+    /// `ShardPool`/`PackfileStorage` construction at all — the fast path
+    /// for a `rooms`-style CLI listing. Returns each room's total record
+    /// count summed across every shard it appears in, sorted by room id.
+    ///
+    /// Best-effort: a missing, truncated, or corrupt file just yields an
+    /// empty result rather than an error — the caller decides whether to
+    /// fall back to a full scan (e.g. because this store predates the
+    /// feature, or a writer hasn't flushed it yet).
+    #[must_use]
+    pub fn room_directory_from_disk(base_dir: &std::path::Path) -> Vec<([u8; 16], u64)> {
+        let Ok(buf) = fs::read(Self::shard_rooms_path(base_dir)) else {
+            return Vec::new();
+        };
+        if buf.len() < SHARD_ROOMS_HEADER_LEN
+            || &buf[0..4] != SHARD_ROOMS_MAGIC
+            || buf[4] != SHARD_ROOMS_VERSION
+        {
+            return Vec::new();
+        }
+        let mut totals: HashMap<[u8; 16], u64> = HashMap::new();
+        for chunk in buf[SHARD_ROOMS_HEADER_LEN..].chunks_exact(SHARD_ROOMS_RECORD_LEN) {
+            let mut room_id = [0u8; 16];
+            room_id.copy_from_slice(&chunk[2..18]);
+            let Ok(count_bytes) = <[u8; 8]>::try_from(&chunk[18..26]) else {
+                continue;
+            };
+            let count = u64::from_le_bytes(count_bytes);
+            let entry = totals.entry(room_id).or_insert(0);
+            *entry = entry.saturating_add(count);
+        }
+        let mut result: Vec<([u8; 16], u64)> = totals.into_iter().collect();
+        result.sort_unstable_by_key(|(room_id, _)| *room_id);
+        result
+    }
+
+    /// Unix-seconds timestamp of the persisted shard→room directory, if
+    /// one exists — lets a reader (e.g. a `rooms` CLI listing) label how
+    /// stale the counts it's showing are, the same way
+    /// `ShardPool::stats_persisted_at` does for shard IO stats.
+    #[must_use]
+    pub fn room_directory_persisted_at(base_dir: &std::path::Path) -> Option<u64> {
+        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
+        if buf.len() < SHARD_ROOMS_HEADER_LEN
+            || &buf[0..4] != SHARD_ROOMS_MAGIC
+            || buf[4] != SHARD_ROOMS_VERSION
+        {
+            return None;
+        }
+        Some(u64::from_le_bytes(buf[5..13].try_into().ok()?))
     }
 
     /// Pin one `Arc<Shard>` per distinct shard id, keeping each shard's file
@@ -1067,6 +1324,7 @@ impl PackfileStorage {
         let kept = new_offsets.len();
 
         let index = Self::build_index(&new_offsets);
+        self.replace_room_shard_counts(room_id, &index.shard_counts());
         self.swap_generation(room_id, index);
         self.retire_empty_shards(room_id);
 
@@ -1303,6 +1561,12 @@ impl StorageEngine for PackfileStorage {
             if index_full {
                 index = self.rebuild_index(room_id)?;
                 let _ = index.insert(id, shard_id, offset);
+                // The rebuild re-derived the room's entire live set from
+                // scratch, so its shard distribution needs a full
+                // recompute too, not just crediting this one record.
+                self.replace_room_shard_counts(room_id, &index.shard_counts());
+            } else {
+                self.record_new_shard_room(shard_id, room_id);
             }
             let cache = match &old_gen {
                 Some(g) => g.cache.clone(),
@@ -1348,6 +1612,7 @@ impl StorageEngine for PackfileStorage {
         self.rooms.write().remove(room_id);
         self.live_roots.write().remove(room_id);
         self.put_locks.lock().remove(room_id);
+        self.remove_room_shard_counts(room_id);
         self.persist_deleted_room(room_id)?;
         Ok(())
     }
@@ -1360,10 +1625,32 @@ impl StorageEngine for PackfileStorage {
 impl PackfileStorage {
     /// Sync all open shards to disk (full pool, not just dirty).
     ///
+    /// Also persists the shard→room directory as a side effect, same as
+    /// `ShardPool::sync_all` persists shard IO stats — an explicit sync is
+    /// a natural point to flush this observability data too.
+    ///
     /// # Errors
     /// Returns `StorageError` on I/O failure.
     pub fn sync_all(&self) -> Result<(), StorageError> {
-        Ok(self.shards.sync_all()?)
+        self.shards.sync_all()?;
+        self.persist_shard_rooms_best_effort();
+        Ok(())
+    }
+
+    /// Best-effort, rate-limited flush of the shard→room directory for a
+    /// writer's own periodic tick — same contract as
+    /// `ShardPool::maybe_persist_stats`: a no-op if called again before
+    /// `min_interval` has passed since the last flush from here.
+    pub fn maybe_persist_shard_rooms(&self, min_interval: std::time::Duration) {
+        let now = std::time::Instant::now();
+        {
+            let mut last = self.last_shard_rooms_flush.write();
+            if last.is_some_and(|prev| now.duration_since(prev) < min_interval) {
+                return;
+            }
+            *last = Some(now);
+        }
+        self.persist_shard_rooms_best_effort();
     }
 
     /// Snapshot IO/sync stats for every currently-open shard.
@@ -2717,6 +3004,94 @@ mod tests {
                 .unwrap()
                 .contains(&TEST_ROOM),
             "the room's current shard must still be reported"
+        );
+    }
+
+    #[test]
+    fn test_room_directory_from_disk_matches_room_summaries_after_sync() {
+        let dir = test_dir("room_directory_roundtrip");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        for i in 0..5u8 {
+            store
+                .put(
+                    &TEST_ROOM,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        for i in 0..3u8 {
+            store
+                .put(
+                    &OTHER_ROOM,
+                    &distinct_id(100 + i),
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        store.sync_all().unwrap();
+
+        let mut from_disk = PackfileStorage::room_directory_from_disk(&dir);
+        from_disk.sort_unstable_by_key(|(room_id, _)| *room_id);
+
+        let mut expected: Vec<([u8; 16], u64)> = store
+            .room_summaries()
+            .into_iter()
+            .map(|(room_id, count, _mem)| (room_id, count as u64))
+            .collect();
+        expected.sort_unstable_by_key(|(room_id, _)| *room_id);
+
+        assert_eq!(
+            from_disk, expected,
+            "the persisted directory's per-room totals must match the live index's own counts"
+        );
+        assert!(PackfileStorage::room_directory_persisted_at(&dir).is_some());
+    }
+
+    #[test]
+    fn test_room_directory_from_disk_empty_when_never_persisted() {
+        let dir = test_dir("room_directory_never_persisted");
+        let _store = PackfileStorage::open(dir.clone()).unwrap();
+        // No sync_all call: nothing has been persisted yet.
+        assert_eq!(PackfileStorage::room_directory_from_disk(&dir), Vec::new());
+        assert_eq!(PackfileStorage::room_directory_persisted_at(&dir), None);
+    }
+
+    #[test]
+    fn test_room_directory_reflects_delete_and_repack() {
+        let dir = test_dir("room_directory_delete_repack");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        let a = distinct_id(0);
+        let b = distinct_id(1);
+        store
+            .put(
+                &TEST_ROOM,
+                &a,
+                &NodeData::new(bytes::Bytes::from_static(b"a")),
+            )
+            .unwrap();
+        store
+            .put(
+                &OTHER_ROOM,
+                &b,
+                &NodeData::new(bytes::Bytes::from_static(b"b")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        let directory = PackfileStorage::room_directory_from_disk(&dir);
+        assert_eq!(directory.len(), 2, "both rooms must appear before deletion");
+
+        store.delete_room(&TEST_ROOM).unwrap();
+        store.sync_all().unwrap();
+
+        let directory = PackfileStorage::room_directory_from_disk(&dir);
+        assert_eq!(
+            directory,
+            vec![(OTHER_ROOM, 1)],
+            "a deleted room must not linger in the persisted directory"
         );
     }
 

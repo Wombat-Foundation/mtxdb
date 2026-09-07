@@ -253,6 +253,25 @@ impl LossyIndex {
         seen
     }
 
+    /// Tally of how many occupied slots point into each shard.
+    ///
+    /// Used to maintain the persisted per-shard room directory (see
+    /// `PackfileStorage`'s `shard_rooms` tracking): whenever a room's
+    /// index is rebuilt or swapped in, this gives the exact per-shard
+    /// contribution to record against that room, without a second scan
+    /// of the packfile itself.
+    #[must_use]
+    pub fn shard_counts(&self) -> std::collections::HashMap<u16, u64> {
+        let mut counts = std::collections::HashMap::new();
+        for slot in &self.slots {
+            if !slot.is_empty() {
+                let entry = counts.entry(slot.shard_id()).or_insert(0u64);
+                *entry = entry.saturating_add(1);
+            }
+        }
+        counts
+    }
+
     /// Whether this room's index currently has any live entry pointing
     /// into `shard_id`. Short-circuits on the first match — unlike
     /// `referenced_shard_ids`, which always builds a full `MAX_SHARDS`
