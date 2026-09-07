@@ -477,6 +477,16 @@ fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyho
 /// doesn't apply here since live roots are inherently per-room — the
 /// same `--topo`/no-`--topo` edge-extraction choice applies uniformly
 /// across every room the closure touches.
+///
+/// The preflight runs against a **read-only** open, not the exclusive
+/// writer — an interactive confirmation pause can take arbitrarily long,
+/// and holding the writer lock for that whole window would lock out a
+/// real writer process (e.g. Synapse) for however long the person takes
+/// to respond. The writer lock is only acquired after confirmation, and
+/// the closure is recomputed fresh under it before any repack runs — if
+/// it's grown since the read-only preview (a write landed in the gap),
+/// that's reported rather than silently repacking a larger scope than
+/// what was shown.
 fn cmd_repack_shard(
     cli: &Cli,
     shard_id: u16,
@@ -492,54 +502,82 @@ fn cmd_repack_shard(
         eprintln!("warning: --topo without --root means no GC; all records preserved");
     }
 
-    let store = open_store(cli)?;
-    let (rooms, touched_shards) = store.repack_closure(shard_id)?;
-    if rooms.is_empty() {
-        eprintln!("no rooms reference shard {shard_id}");
-        return Ok(());
-    }
+    let (preview_rooms, preview_shards) = {
+        let preview_store = open_store_read_only(cli)?;
+        let (rooms, shards) = preview_store.repack_closure(shard_id)?;
+        if rooms.is_empty() {
+            eprintln!("no rooms reference shard {shard_id}");
+            return Ok(());
+        }
 
-    let mut total_kept_bytes: u64 = 0;
-    let mut total_kept = 0usize;
-    let mut total_dropped = 0usize;
-    for room_id in &rooms {
-        let plan = if topo {
-            store.plan_room_repack(room_id, extract_matrix_edges)?
-        } else {
-            store.plan_room_repack(room_id, |_hash, _data| Vec::new())?
-        };
-        total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
-        total_kept = total_kept.saturating_add(plan.kept);
-        total_dropped = total_dropped.saturating_add(plan.dropped);
-    }
+        let mut total_kept_bytes: u64 = 0;
+        let mut total_kept = 0usize;
+        let mut total_dropped = 0usize;
+        for room_id in &rooms {
+            let plan = if topo {
+                preview_store.plan_room_repack(room_id, extract_matrix_edges)?
+            } else {
+                preview_store.plan_room_repack(room_id, |_hash, _data| Vec::new())?
+            };
+            total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
+            total_kept = total_kept.saturating_add(plan.kept);
+            total_dropped = total_dropped.saturating_add(plan.dropped);
+        }
 
-    let max_shard_bytes = mtxdb::shard::MAX_SHARD_BYTES;
-    let expected_shards = total_kept_bytes
-        .checked_add(max_shard_bytes.saturating_sub(1))
-        .map_or(1, |rounded| rounded / max_shard_bytes)
-        .max(1);
-    let slop = expected_shards
-        .saturating_mul(max_shard_bytes)
-        .saturating_sub(total_kept_bytes);
+        let max_shard_bytes = mtxdb::shard::MAX_SHARD_BYTES;
+        let expected_shards = total_kept_bytes
+            .checked_add(max_shard_bytes.saturating_sub(1))
+            .map_or(1, |rounded| rounded / max_shard_bytes)
+            .max(1);
+        let slop = expected_shards
+            .saturating_mul(max_shard_bytes)
+            .saturating_sub(total_kept_bytes);
 
-    eprintln!(
-        "this will repack {} room{} across {} shard{} ({touched_shards:?})",
-        rooms.len(),
-        if rooms.len() == 1 { "" } else { "s" },
-        touched_shards.len(),
-        if touched_shards.len() == 1 { "" } else { "s" },
-    );
-    eprintln!(
-        "expected result: ~{expected_shards} shard{} ({} kept, {} dropped, ~{} slack in the last shard)",
-        if expected_shards == 1 { "" } else { "s" },
-        total_kept,
-        total_dropped,
-        fmt_bytes(slop),
-    );
+        eprintln!(
+            "this will repack {} room{} across {} shard{} ({shards:?})",
+            rooms.len(),
+            if rooms.len() == 1 { "" } else { "s" },
+            shards.len(),
+            if shards.len() == 1 { "" } else { "s" },
+        );
+        eprintln!(
+            "expected result: ~{expected_shards} shard{} ({} kept, {} dropped, ~{} slack in the last shard)",
+            if expected_shards == 1 { "" } else { "s" },
+            total_kept,
+            total_dropped,
+            fmt_bytes(slop),
+        );
+        (rooms, shards)
+        // preview_store (and its non-exclusive read-only handle) drops
+        // here, before the confirmation prompt — nothing about a
+        // read-only open blocks a real writer anyway, but there's no
+        // reason to keep it open through an indefinite human pause.
+    };
+
     eprint!("press Enter to continue, Ctrl+C to abort: ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
+
+    // Only now do we take the exclusive writer lock — and the very first
+    // thing done under it is recomputing the closure fresh, since the
+    // read-only preview above is, by construction, a snapshot that could
+    // be arbitrarily stale by the time a human finishes reading it.
+    let store = open_store(cli)?;
+    let (rooms, touched_shards) = store.repack_closure(shard_id)?;
+    if rooms.is_empty() {
+        eprintln!("shard {shard_id} is no longer referenced by any room — nothing to do");
+        return Ok(());
+    }
+    let grew = rooms.iter().any(|r| !preview_rooms.contains(r))
+        || touched_shards.iter().any(|s| !preview_shards.contains(s));
+    if grew {
+        eprintln!(
+            "note: the closure grew since the preview (now {} rooms / {} shards) — repacking the current, authoritative closure",
+            rooms.len(),
+            touched_shards.len()
+        );
+    }
 
     let mut results = Vec::with_capacity(rooms.len());
     for room_id in &rooms {
