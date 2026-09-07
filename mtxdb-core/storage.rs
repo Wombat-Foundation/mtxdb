@@ -28,7 +28,7 @@ pub const ENTRY_TYPE_PREV_EVENT_EDGES: u8 = 0x0B;
 /// Tag byte for HAMT internal nodes.
 pub const ENTRY_TYPE_HAMT_NODE: u8 = 0x10;
 /// Tag byte for HAMT root.
-pub const ENTRY_TYPE_HAMT_ROOT_TYPED: u8 = 0x11;
+pub const ENTRY_TYPE_HAMT_ROOT: u8 = 0x11;
 /// Tag byte for event-to-state-group mappings.
 pub const ENTRY_TYPE_EVENT_STATE_GROUP: u8 = 0x1A;
 /// Tag byte for state group reference counts.
@@ -39,7 +39,7 @@ pub const ENTRY_TYPE_STATE_GROUP_REFCOUNT: u8 = 0x1B;
 pub fn is_known_tag(byte: u8) -> bool {
     matches!(
         byte,
-        ENTRY_TYPE_HAMT_ROOT_TYPED
+        ENTRY_TYPE_HAMT_ROOT
             | ENTRY_TYPE_HAMT_NODE
             | ENTRY_TYPE_PREV_EVENT_EDGES
             | ENTRY_TYPE_EVENT_JSON
@@ -54,7 +54,7 @@ pub fn is_known_tag(byte: u8) -> bool {
 #[must_use]
 pub fn tag_name(byte: u8) -> Option<&'static str> {
     match byte {
-        ENTRY_TYPE_HAMT_ROOT_TYPED => Some("hamt_root"),
+        ENTRY_TYPE_HAMT_ROOT => Some("hamt_root"),
         ENTRY_TYPE_HAMT_NODE => Some("hamt_node"),
         ENTRY_TYPE_PREV_EVENT_EDGES => Some("prev_event_edges"),
         ENTRY_TYPE_EVENT_JSON => Some("event_json"),
