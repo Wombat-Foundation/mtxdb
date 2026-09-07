@@ -1,3 +1,4 @@
 [submodule "docs"]
 	path = docs
-	url = https://gitlab.com/wombat-foundation/mtxdb-res.git
+    url = https://gitlab.com/wombat-foundation/mtxdb-res.git
+    update = none

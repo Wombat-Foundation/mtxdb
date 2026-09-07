@@ -33,7 +33,6 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Import { path, room } => cmd_import(cli, path, room.as_deref()),
         Commands::Repack { room, root, topo } => cmd_repack(cli, room, root, *topo),
         Commands::Delete { room, yes } => cmd_delete(cli, room, *yes),
-        Commands::Bench { count } => cmd_bench(cli, *count),
     }
 }
 
@@ -319,73 +318,3 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_bench(cli: &Cli, count: usize) -> anyhow::Result<()> {
-    let store = open_store(cli)?;
-    let room_id = [0xBB; 16];
-
-    let payload = vec![0xABu8; 256];
-    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(count);
-
-    let write_start = std::time::Instant::now();
-    for i in 0..count {
-        let mut id = [0u8; 16];
-        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
-        let data = NodeData::new(bytes::Bytes::from(payload.clone()));
-        store.put(&room_id, &id, &data)?;
-        ids.push(id);
-    }
-    let write_elapsed = write_start.elapsed();
-
-    let read_start = std::time::Instant::now();
-    for id in &ids {
-        let _ = store.get(&room_id, id)?;
-    }
-    let read_elapsed = read_start.elapsed();
-
-    let write_nanos = write_elapsed.as_nanos();
-    let read_nanos = read_elapsed.as_nanos();
-    let count_128 = count as u128;
-    let write_ops = count_128
-        .saturating_mul(1_000_000_000)
-        .checked_div(write_nanos)
-        .unwrap_or(0);
-    let read_ops = count_128
-        .saturating_mul(1_000_000_000)
-        .checked_div(read_nanos)
-        .unwrap_or(0);
-    let total_bytes = count_128.saturating_mul(256);
-    let mb_total = total_bytes / 1_000_000;
-    let write_mbps = total_bytes
-        .saturating_mul(1_000_000_000)
-        .checked_div(write_nanos)
-        .unwrap_or(0)
-        / 1_000_000;
-    let write_mbps_frac = total_bytes
-        .saturating_mul(10_000_000_000)
-        .checked_div(write_nanos)
-        .unwrap_or(0)
-        / 1_000_000
-        % 10;
-    let read_mbps = total_bytes
-        .saturating_mul(1_000_000_000)
-        .checked_div(read_nanos)
-        .unwrap_or(0)
-        / 1_000_000;
-    let read_mbps_frac = total_bytes
-        .saturating_mul(10_000_000_000)
-        .checked_div(read_nanos)
-        .unwrap_or(0)
-        / 1_000_000
-        % 10;
-
-    eprintln!("bench: {count} records, 256 bytes payload ({mb_total} MB total)");
-    eprintln!(
-        "  write: {write_elapsed:?} ({write_ops} ops/sec, {write_mbps}.{write_mbps_frac} MB/s)"
-    );
-    eprintln!("  read:  {read_elapsed:?} ({read_ops} ops/sec, {read_mbps}.{read_mbps_frac} MB/s)");
-
-    store.delete_room(&room_id)?;
-    eprintln!("bench: cleaned up benchmark data");
-
-    Ok(())
-}

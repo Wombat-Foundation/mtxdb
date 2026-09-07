@@ -228,21 +228,42 @@ impl PackfileStorage {
     ///
     /// Shards are shared, so this is normally more than one room; it's the
     /// set `repack_shard` needs to touch before that shard can retire.
-    #[must_use]
-    pub fn rooms_referencing_shard(&self, shard_id: u16) -> Vec<[u8; 16]> {
+    ///
+    /// Sweeps the shard's own file content (bounded by `MAX_SHARD_BYTES`,
+    /// not by how many unrelated rooms happen to be loaded) rather than
+    /// scanning every room's index to ask "does this touch shard N" — a
+    /// candidate set from the raw scan is then filtered against each
+    /// candidate room's *current* live index, since the scan alone can't
+    /// tell a still-live reference from a room that already repacked past
+    /// this shard (its old bytes just haven't been overwritten — they
+    /// never are, shards are append-only).
+    ///
+    /// # Errors
+    /// Returns `StorageError` if the shard's file can't be read, or if
+    /// `shard_id` doesn't correspond to a currently-open shard.
+    pub fn rooms_referencing_shard(&self, shard_id: u16) -> Result<Vec<[u8; 16]>, StorageError> {
+        let Some(shard) = self.shards.get_shard(shard_id) else {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no open shard with id {shard_id}"),
+            )));
+        };
+        let scanned = shard::ShardPool::scan_shard(&shard.path).map_err(StorageError::Io)?;
+
+        let mut seen = HashSet::with_capacity(scanned.len());
         let rooms = self.rooms.read();
-        rooms
-            .iter()
-            .filter_map(|(room_id, gen_swap)| {
-                let gen = gen_swap.load();
-                gen.index
-                    .referenced_shard_ids()
-                    .get(shard_id as usize)
-                    .copied()
-                    .unwrap_or(false)
-                    .then_some(*room_id)
-            })
-            .collect()
+        let mut result = Vec::new();
+        for (room_id, _hash, _offset) in scanned {
+            if !seen.insert(room_id) {
+                continue;
+            }
+            if let Some(gen_swap) = rooms.get(&room_id) {
+                if gen_swap.load().index.references_shard(shard_id) {
+                    result.push(room_id);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Repack every room that still references `shard_id`.
@@ -272,7 +293,7 @@ impl PackfileStorage {
         shard_id: u16,
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
-        let rooms = self.rooms_referencing_shard(shard_id);
+        let rooms = self.rooms_referencing_shard(shard_id)?;
         let mut results = Vec::with_capacity(rooms.len());
         for room_id in rooms {
             let (kept, dropped) =
@@ -1967,7 +1988,7 @@ mod tests {
         // No set_live_roots for room B: everything must survive its repack.
 
         // Fresh pool, both rooms' first writes land on shard 0 (shared).
-        let referencing = store.rooms_referencing_shard(0);
+        let referencing = store.rooms_referencing_shard(0).unwrap();
         assert_eq!(referencing.len(), 2);
         assert!(referencing.contains(&TEST_ROOM));
         assert!(referencing.contains(&OTHER_ROOM));
@@ -1985,6 +2006,80 @@ mod tests {
         assert!(store.get(&TEST_ROOM, &root_a).unwrap().is_some());
         assert!(store.get(&TEST_ROOM, &garbage_a).unwrap().is_none());
         assert!(store.get(&OTHER_ROOM, &root_b).unwrap().is_some());
+    }
+
+    /// `rooms_referencing_shard` must filter the shard-scan's candidate
+    /// set against each room's *current* index, not just report every room
+    /// whose bytes ever physically touched the shard. A room that has
+    /// since repacked its live data onto a different shard leaves its old
+    /// bytes sitting there untouched (shards are append-only, never
+    /// rewritten in place) — that room must NOT show up as still
+    /// referencing the shard its data moved away from.
+    #[test]
+    fn test_rooms_referencing_shard_excludes_rooms_already_repacked_away() {
+        let dir = test_dir("rooms_referencing_shard_stale");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let mut root = [0u8; 16];
+        root[0] = 0xAA;
+        store
+            .put(
+                &TEST_ROOM,
+                &root,
+                &NodeData::new(bytes::Bytes::from_static(b"root")),
+            )
+            .unwrap();
+
+        // OTHER_ROOM also lands on shard 0 (shared, still the pool's
+        // active shard) and stays live there — this is what keeps shard 0
+        // from being retired outright once TEST_ROOM moves off it, so the
+        // "stale reference" case below is actually reachable to query.
+        let mut other_root = [0u8; 16];
+        other_root[0] = 0xBB;
+        store
+            .put(
+                &OTHER_ROOM,
+                &other_root,
+                &NodeData::new(bytes::Bytes::from_static(b"other room root")),
+            )
+            .unwrap();
+
+        // Force TEST_ROOM's home (shard 0) to look full, so its next write
+        // rotates *its own* home to shard 1 — root stays physically on
+        // shard 0, but TEST_ROOM's home moves on.
+        store.shards.active_shard().file_len.store(
+            shard::MAX_SHARD_BYTES - 10,
+            std::sync::atomic::Ordering::Release,
+        );
+        let mut garbage = [0u8; 16];
+        garbage[0] = 0xA1;
+        store
+            .put(
+                &TEST_ROOM,
+                &garbage,
+                &NodeData::new(bytes::Bytes::from_static(b"garbage")),
+            )
+            .unwrap();
+
+        // Repack with only root live: the kept copy is rewritten into
+        // TEST_ROOM's *current* home (shard 1), leaving shard 0 holding
+        // only now-superseded bytes no live index entry points at.
+        store.set_live_roots(&TEST_ROOM, vec![root]);
+        store
+            .repack_room_reachable(&TEST_ROOM, |_hash, _data| Vec::new())
+            .unwrap();
+
+        // Shard 0's raw bytes still physically contain TEST_ROOM's
+        // original root record — a naive scan-only approach would still
+        // report it. The current index must exclude it.
+        assert!(
+            !store.rooms_referencing_shard(0).unwrap().contains(&TEST_ROOM),
+            "a room whose live data has moved off a shard must not be reported as still referencing it"
+        );
+        assert!(
+            store.rooms_referencing_shard(1).unwrap().contains(&TEST_ROOM),
+            "the room's current shard must still be reported"
+        );
     }
 
     #[test]

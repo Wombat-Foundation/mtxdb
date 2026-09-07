@@ -40,9 +40,6 @@ pub enum Commands {
         room: String,
         yes: bool,
     },
-    Bench {
-        count: usize,
-    },
 }
 
 fn build_cli() -> Command {
@@ -119,16 +116,6 @@ fn build_cli() -> Command {
                         .help("Skip confirmation prompt"),
                 ),
         )
-        .subcommand(
-            Command::new("bench")
-                .about("Run a quick write/read benchmark")
-                .arg(
-                    Arg::new("count")
-                        .short('c')
-                        .long("count")
-                        .default_value("10000"),
-                ),
-        )
 }
 
 fn parse_cli() -> Cli {
@@ -171,16 +158,6 @@ fn parse_cli() -> Cli {
         Some(("delete", m)) => Commands::Delete {
             room: m.get_one::<String>("room").unwrap().clone(),
             yes: m.get_flag("yes"),
-        },
-        Some(("bench", m)) => Commands::Bench {
-            count: m
-                .get_one::<String>("count")
-                .unwrap()
-                .parse::<usize>()
-                .unwrap_or_else(|e| {
-                    eprintln!("error: invalid count: {e}");
-                    std::process::exit(1);
-                }),
         },
         _ => {
             build_cli().print_help().unwrap();

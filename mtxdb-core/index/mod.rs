@@ -253,6 +253,20 @@ impl LossyIndex {
         seen
     }
 
+    /// Whether this room's index currently has any live entry pointing
+    /// into `shard_id`. Short-circuits on the first match — unlike
+    /// `referenced_shard_ids`, which always builds a full `MAX_SHARDS`
+    /// membership map, this is the cheap check for "does this one room
+    /// still reference this one shard," used to filter a shard-scan's
+    /// candidate room list down to rooms that haven't already repacked
+    /// past it.
+    #[must_use]
+    pub fn references_shard(&self, shard_id: u16) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| !slot.is_empty() && slot.shard_id() == shard_id)
+    }
+
     /// Serialize the index to bytes for persistence.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
