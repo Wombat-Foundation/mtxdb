@@ -53,7 +53,12 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { path } => cmd_scan(path),
         Commands::Import { path, room } => cmd_import(cli, path, room.as_deref()),
-        Commands::Repack { room, root, topo } => cmd_repack(cli, room, root, *topo),
+        Commands::Repack {
+            room,
+            shard,
+            root,
+            topo,
+        } => cmd_repack(cli, room.as_deref(), *shard, root, *topo),
         Commands::Delete { room, yes } => cmd_delete(cli, room, *yes),
         Commands::Sync => cmd_sync(cli),
     }
