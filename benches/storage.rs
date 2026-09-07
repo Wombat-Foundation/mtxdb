@@ -114,8 +114,15 @@ impl DagGenerator {
             }
         }
 
-        for orphan_chain in pending_joins {
-            if let Some(last) = prev_events.last_mut() {
+        // Absorb remaining orphan chains into the last event's prev_events,
+        // but cap the total to stay under the 64KB record payload limit
+        // (each prev_event is 16 bytes, header+auth ~46 bytes).
+        let max_prevs = 4000;
+        if let Some(last) = prev_events.last_mut() {
+            for orphan_chain in pending_joins {
+                if last.len() >= max_prevs {
+                    break;
+                }
                 last.extend(orphan_chain);
             }
         }
@@ -429,6 +436,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     eprintln!("  Wall-clock (warm read):  {warm_elapsed:.2?} ({warm_gets_per_sec:.0} gets/sec)");
     eprintln!();
 
+    drop(store);
     let _ = fs::remove_dir_all(&dir);
 
     BenchResult {
@@ -660,8 +668,6 @@ fn run_intent_benchmark(total_events: usize) {
         }
     }
 
-    let _ = fs::remove_dir_all(&dir);
-
     let graph_calls = inst.graph_walk.calls();
     let state_calls = inst.state_trie.calls();
     let timeline_calls = inst.timeline.calls();
@@ -671,6 +677,9 @@ fn run_intent_benchmark(total_events: usize) {
     let state_bytes = inst.state_trie.bytes();
     let timeline_bytes = inst.timeline.bytes();
     let total_bytes = graph_bytes + state_bytes + timeline_bytes;
+
+    drop(inst);
+    let _ = fs::remove_dir_all(&dir);
 
     let pct = |part: u64, total: u64| {
         if total > 0 {
@@ -875,6 +884,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!();
 
+    drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
 
