@@ -4,6 +4,7 @@ use std::io::{self, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
 use parking_lot::RwLock;
@@ -94,10 +95,18 @@ const STATS_FILENAME: &str = "shard_stats.bin";
 
 /// Magic bytes + version identifying the stats file format.
 const STATS_MAGIC: &[u8; 4] = b"MSTA";
-const STATS_VERSION: u8 = 2;
+/// v3 adds an 8-byte persisted-at unix-seconds timestamp right after the
+/// version byte, so a reader (e.g. `mtxdb shards`) can tell how stale a
+/// snapshot is instead of just trusting whatever numbers happen to be on
+/// disk. A v2 file is simply not restored — best-effort, same as any
+/// other unreadable snapshot — rather than migrated in place.
+const STATS_VERSION: u8 = 3;
 
 /// On-disk size of one stats record: `shard_id`(2) + generation(8) + 3×counter(8) = 34 bytes.
 const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
+
+/// Header size: magic(4) + version(1) + `persisted_at`(8).
+const STATS_HEADER_LEN: usize = 4 + 1 + 8;
 
 /// Disambiguates concurrent `persist_stats` tmp filenames within this
 /// process (paired with the process id, which disambiguates across
@@ -253,6 +262,19 @@ pub struct ShardPool {
     /// home until that shard fills, rather than following the global
     /// cursor wherever unrelated rooms have since moved it.
     room_home: RwLock<HashMap<[u8; 16], u16>>,
+    /// Unix-seconds timestamp of the currently-persisted stats snapshot,
+    /// if one has ever been restored or written by this pool — restored
+    /// at open time from an existing `shard_stats.bin`, and updated on
+    /// every successful `persist_stats`. Lets a caller (e.g. `mtxdb
+    /// shards`) show how stale the counters it's displaying are, since a
+    /// read-only pool only ever sees whatever the real writer last
+    /// flushed, not live in-process counters.
+    stats_persisted_at: RwLock<Option<u64>>,
+    /// Wall-clock instant of the last `maybe_persist_stats` flush (or
+    /// `None` if it's never been called), used to rate-limit that
+    /// timer-driven path — separate from `stats_persisted_at`, which is
+    /// the on-disk snapshot's own unix-seconds timestamp.
+    last_stats_flush: RwLock<Option<Instant>>,
     /// Whether this pool holds the writer lock on `base_dir` (see `open`
     /// vs `open_read_only`). Gates `persist_stats`: a read-only pool
     /// never writes anything, including its own (always-zero) stats
@@ -419,7 +441,7 @@ impl ShardPool {
         // it absolutely should show whatever the real writer already
         // persisted — that's the entire point of a `shards`-style
         // inspection tool being able to see real numbers at all.
-        Self::restore_persisted_stats(&base_dir, &shards);
+        let stats_persisted_at = Self::restore_persisted_stats(&base_dir, &shards);
 
         Ok(Self {
             shards: RwLock::new(shards),
@@ -430,6 +452,8 @@ impl ShardPool {
             next_generation: AtomicU64::new(max_generation),
             retired_count: AtomicU64::new(0),
             room_home: RwLock::new(HashMap::new()),
+            stats_persisted_at: RwLock::new(stats_persisted_at),
+            last_stats_flush: RwLock::new(None),
             writable,
             #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
@@ -572,19 +596,19 @@ impl ShardPool {
     /// Load a persisted stats snapshot, if one exists, and restore each
     /// shard's counters when its generation still matches — a stale
     /// snapshot entry (from a slot since retired and reused) is silently
-    /// skipped rather than misapplied.
+    /// skipped rather than misapplied. Returns the snapshot's persisted-at
+    /// unix timestamp, if the file was readable and current-format.
     ///
     /// Best-effort: a missing, truncated, or corrupt file just means no
     /// stats are restored — never a startup failure over stats alone.
-    fn restore_persisted_stats(base_dir: &Path, shards: &[Option<Arc<Shard>>]) {
+    fn restore_persisted_stats(base_dir: &Path, shards: &[Option<Arc<Shard>>]) -> Option<u64> {
         let path = Self::stats_path(base_dir);
-        let Ok(buf) = fs::read(&path) else {
-            return;
-        };
-        if buf.len() < 5 || &buf[0..4] != STATS_MAGIC || buf[4] != STATS_VERSION {
-            return;
+        let buf = fs::read(&path).ok()?;
+        if buf.len() < STATS_HEADER_LEN || &buf[0..4] != STATS_MAGIC || buf[4] != STATS_VERSION {
+            return None;
         }
-        let body = &buf[5..];
+        let persisted_at = u64::from_le_bytes(buf[5..13].try_into().ok()?);
+        let body = &buf[STATS_HEADER_LEN..];
         for chunk in body.chunks(STATS_RECORD_LEN) {
             let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) else {
                 break;
@@ -596,6 +620,7 @@ impl ShardPool {
                 }
             }
         }
+        Some(persisted_at)
     }
 
     /// Persist every currently-open shard's IO/sync counters to disk,
@@ -611,6 +636,10 @@ impl ShardPool {
         let mut buf = Vec::new();
         buf.extend_from_slice(STATS_MAGIC);
         buf.push(STATS_VERSION);
+        let persisted_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        buf.extend_from_slice(&persisted_at.to_le_bytes());
         for (shard_id, shard) in self.all_shards() {
             shard.stats().encode(shard_id, shard.generation, &mut buf);
         }
@@ -638,6 +667,7 @@ impl ShardPool {
             return Err(e);
         }
         fs::rename(&tmp_path, &final_path)?;
+        *self.stats_persisted_at.write() = Some(persisted_at);
         Ok(())
     }
 
@@ -927,6 +957,44 @@ impl ShardPool {
         }
     }
 
+    /// Best-effort, rate-limited stats flush for a writer's own periodic
+    /// tick (e.g. a ~1s flush loop), so a `mtxdb shards`-style reader in
+    /// another process sees reasonably fresh counters between real
+    /// `sync_all`/`sync_dirty` calls — those already persist stats as a
+    /// side effect, but a write-heavy, rarely-syncing process could
+    /// otherwise leave a live writer's snapshot stale indefinitely.
+    ///
+    /// No-op on a read-only pool, and a no-op if called again before
+    /// `min_interval` has passed since the last flush from here — the
+    /// caller can tick this on every write without it turning into
+    /// `persist_stats`' full snapshot-write-and-rename on every call.
+    /// Never fsyncs anything beyond what `persist_stats` itself does for
+    /// the snapshot file's own durability — this is observability data,
+    /// not something worth slowing writes down to protect.
+    pub fn maybe_persist_stats(&self, min_interval: Duration) {
+        if !self.writable {
+            return;
+        }
+        let now = Instant::now();
+        {
+            let mut last = self.last_stats_flush.write();
+            if last.is_some_and(|prev| now.duration_since(prev) < min_interval) {
+                return;
+            }
+            *last = Some(now);
+        }
+        self.persist_stats_best_effort();
+    }
+
+    /// Unix-seconds timestamp of the currently-known stats snapshot: the
+    /// most recent of what this pool has itself persisted and whatever it
+    /// restored from disk at open time. `None` if no snapshot has ever
+    /// existed for this `base_dir`.
+    #[must_use]
+    pub fn stats_persisted_at(&self) -> Option<u64> {
+        *self.stats_persisted_at.read()
+    }
+
     /// Sync all shards to disk.
     ///
     /// # Errors
@@ -1093,6 +1161,85 @@ mod tests {
         assert!(pool.dirty.lock().is_empty());
         pool.sync_dirty().unwrap();
         assert!(pool.dirty.lock().is_empty());
+    }
+
+    #[test]
+    fn test_stats_persisted_at_none_until_first_flush() {
+        let dir = test_dir("stats_persisted_at_none");
+        let pool = ShardPool::open(dir).unwrap();
+        assert_eq!(pool.stats_persisted_at(), None);
+    }
+
+    #[test]
+    fn test_stats_persisted_at_set_after_sync_and_survives_reopen() {
+        let dir = test_dir("stats_persisted_at_roundtrip");
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        let record = test_record(0x01, 0xAA, b"hello");
+        pool.put_record(&record).unwrap();
+        pool.sync_all().unwrap();
+
+        let persisted_at = pool
+            .stats_persisted_at()
+            .expect("sync_all must persist stats");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now.saturating_sub(persisted_at) < 5,
+            "persisted_at must be a recent timestamp, not zero or garbage"
+        );
+        drop(pool);
+
+        // A fresh pool reading the same base_dir must restore the
+        // timestamp along with the counters, not just the counters —
+        // otherwise a read-only `mtxdb shards` invocation could show a
+        // real snapshot's numbers next to a `None`/unknown age.
+        let reopened = ShardPool::open(dir).unwrap();
+        assert_eq!(reopened.stats_persisted_at(), Some(persisted_at));
+    }
+
+    #[test]
+    fn test_maybe_persist_stats_rate_limited() {
+        let dir = test_dir("maybe_persist_rate_limited");
+        let pool = ShardPool::open(dir).unwrap();
+        assert_eq!(pool.stats_persisted_at(), None);
+
+        // First call always flushes (nothing to rate-limit against yet).
+        pool.maybe_persist_stats(Duration::from_secs(3600));
+        let first = pool
+            .stats_persisted_at()
+            .expect("first maybe_persist_stats call must flush");
+
+        // A second call inside the interval must not re-flush. There's no
+        // observable-from-here difference if it did (the timestamp is in
+        // whole seconds), so this mainly documents the contract; the real
+        // guard is that it doesn't pay a write+rename every call.
+        pool.maybe_persist_stats(Duration::from_secs(3600));
+        assert_eq!(pool.stats_persisted_at(), Some(first));
+
+        // Zero interval must always flush.
+        pool.maybe_persist_stats(Duration::ZERO);
+        assert!(pool.stats_persisted_at().is_some());
+    }
+
+    #[test]
+    fn test_maybe_persist_stats_noop_on_read_only_pool() {
+        let dir = test_dir("maybe_persist_read_only");
+        // Keep the writer open (not dropped) with no explicit sync, so no
+        // shard_stats.bin exists yet — Drop's own best-effort persist
+        // would otherwise write one and confound what this test checks.
+        let writer = ShardPool::open(dir.clone()).unwrap();
+        writer.put_record(&test_record(0x01, 0xAA, b"x")).unwrap();
+
+        let reader = ShardPool::open_read_only(dir).unwrap();
+        assert_eq!(reader.stats_persisted_at(), None);
+        reader.maybe_persist_stats(Duration::ZERO);
+        // A read-only pool must never write a stats snapshot of its own
+        // (always-zero) counters — it must still show nothing persisted,
+        // not conjure a snapshot the real writer never flushed.
+        assert_eq!(reader.stats_persisted_at(), None);
+        drop(writer);
     }
 
     #[test]

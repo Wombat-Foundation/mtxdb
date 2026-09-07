@@ -170,7 +170,32 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
         shards.len(),
         pool.retired_count()
     );
+    match pool.stats_persisted_at() {
+        Some(persisted_at) => {
+            let age_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |now| now.as_secs().saturating_sub(persisted_at));
+            eprintln!(
+                "stats snapshot: {} old (counters above may lag a live writer between its flushes)",
+                fmt_duration(age_secs)
+            );
+        }
+        None => eprintln!(
+            "stats snapshot: none persisted yet — counters above are all zero by default, not necessarily real"
+        ),
+    }
     Ok(())
+}
+
+/// Formats a duration in seconds as a short human-readable age string.
+fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
