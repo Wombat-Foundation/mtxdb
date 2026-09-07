@@ -46,6 +46,34 @@ pub struct Shard {
     /// Current file length, tracked atomically for rotation decisions
     /// without a `metadata()` syscall on every put.
     pub(crate) file_len: AtomicU64,
+    /// Number of records appended to this shard.
+    write_count: AtomicU64,
+    /// Total payload bytes appended to this shard (serialized record length).
+    bytes_written: AtomicU64,
+    /// Number of records read from this shard via `read_at`.
+    read_count: AtomicU64,
+    /// Total payload bytes read from this shard via `read_at`.
+    bytes_read: AtomicU64,
+    /// Number of times this shard's file has been fsynced.
+    sync_count: AtomicU64,
+}
+
+/// Point-in-time snapshot of a shard's IO/sync counters.
+///
+/// Loaded with `Ordering::Relaxed` — cheap to take, not synchronized
+/// against concurrent activity on the shard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardStats {
+    /// Number of records written to this shard.
+    pub write_count: u64,
+    /// Total bytes written to this shard.
+    pub bytes_written: u64,
+    /// Number of records read from this shard.
+    pub read_count: u64,
+    /// Total bytes read from this shard.
+    pub bytes_read: u64,
+    /// Number of fsync calls on this shard.
+    pub sync_count: u64,
 }
 
 impl Shard {
@@ -59,6 +87,23 @@ impl Shard {
             append_lock: parking_lot::Mutex::new(()),
             is_current: AtomicBool::new(true),
             file_len: AtomicU64::new(file_len),
+            write_count: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            read_count: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+            sync_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot this shard's IO/sync counters.
+    #[must_use]
+    pub fn stats(&self) -> ShardStats {
+        ShardStats {
+            write_count: self.write_count.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            read_count: self.read_count.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            sync_count: self.sync_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -226,6 +271,21 @@ impl ShardPool {
         self.shards.read().get(shard_id as usize)?.clone()
     }
 
+    /// Snapshot IO/sync stats for every currently-open shard, as
+    /// `(shard_id, ShardStats)` pairs.
+    #[must_use]
+    pub fn all_stats(&self) -> Vec<(u16, ShardStats)> {
+        self.shards
+            .read()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                slot.as_ref()
+                    .map(|shard| (u16::try_from(i).unwrap_or(u16::MAX), shard.stats()))
+            })
+            .collect()
+    }
+
     /// Return all currently-open shards as `(slot_id, Arc<Shard>)` pairs.
     #[must_use]
     pub fn all_shards(&self) -> Vec<(u16, Arc<Shard>)> {
@@ -292,6 +352,8 @@ impl ShardPool {
                 offset
             };
 
+            shard.write_count.fetch_add(1, Ordering::Relaxed);
+            shard.bytes_written.fetch_add(record_len, Ordering::Relaxed);
             self.dirty.lock().insert(shard.shard_id);
             return Ok((shard.shard_id, offset));
         }
@@ -376,6 +438,10 @@ impl ShardPool {
             hash.copy_from_slice(&payload[16..32]);
             let data = bytes::Bytes::copy_from_slice(&payload[32..]);
 
+            shard.read_count.fetch_add(1, Ordering::Relaxed);
+            shard
+                .bytes_read
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             return Ok(Record {
                 room_id,
                 hash,
@@ -444,6 +510,7 @@ impl ShardPool {
         let shards = self.shards.read();
         for shard in shards.iter().flatten() {
             shard.file.sync_all()?;
+            shard.sync_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -462,6 +529,7 @@ impl ShardPool {
         for &id in &dirty {
             if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
                 shard.file.sync_all()?;
+                shard.sync_count.fetch_add(1, Ordering::Relaxed);
                 self.dirty.lock().remove(&id);
             }
         }
@@ -718,6 +786,44 @@ mod tests {
             !old_path.exists(),
             "stale generation file should be deleted during scan"
         );
+    }
+
+    /// `stats()` must reflect actual write/read/sync activity, so callers
+    /// can distinguish "many small fsyncs" (seek-bound, noisy) from
+    /// "few large writes, batched syncs" (quiet) without guessing from
+    /// disk sound.
+    #[test]
+    fn test_shard_stats_track_write_read_sync() {
+        let dir = test_dir("stats_tracking");
+        let pool = ShardPool::open(dir).unwrap();
+
+        let record = test_record(0x01, 0xAA, b"payload for stats");
+        let (shard_id, offset) = pool.put_record(&record).unwrap();
+
+        let shard = pool.get_shard(shard_id).unwrap();
+        let stats = shard.stats();
+        assert_eq!(stats.write_count, 1);
+        assert_eq!(stats.bytes_written, record.serialized_len() as u64);
+        assert_eq!(stats.read_count, 0);
+        assert_eq!(stats.sync_count, 0);
+
+        ShardPool::read_at(&shard, offset).unwrap();
+        let stats = shard.stats();
+        assert_eq!(stats.read_count, 1);
+        assert_eq!(stats.bytes_read, record.data.len() as u64);
+
+        pool.sync_dirty().unwrap();
+        let stats = shard.stats();
+        assert_eq!(stats.sync_count, 1, "sync_dirty must bump sync_count");
+
+        // A second sync_dirty with nothing new written must not double-count.
+        pool.sync_dirty().unwrap();
+        assert_eq!(shard.stats().sync_count, 1);
+
+        let all = pool.all_stats();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, shard_id);
+        assert_eq!(all[0].1, shard.stats());
     }
 
     /// Backward compatibility: the startup scan must correctly parse all

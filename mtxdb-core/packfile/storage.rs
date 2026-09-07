@@ -887,6 +887,14 @@ impl PackfileStorage {
     pub fn sync_all(&self) -> Result<(), StorageError> {
         Ok(self.shards.sync_all()?)
     }
+
+    /// Snapshot IO/sync stats for every currently-open shard.
+    ///
+    /// Shards are shared across rooms, so this is per-shard, not per-room.
+    #[must_use]
+    pub fn shard_stats(&self) -> Vec<(u16, crate::shard::ShardStats)> {
+        self.shards.all_stats()
+    }
 }
 
 #[cfg(test)]
