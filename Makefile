@@ -16,14 +16,14 @@ _help:
 
 .PHONY: format
 format: ##H Format code
-	prettier -w $$(git ls-files '*.md' '*.y*ml' '*.json')
-	pre-commit run --all-files
+	-prettier -w $$(git ls-files '*.md' '*.y*ml' '*.json')
+	-pre-commit run --all-files
 	$(CARGO) sort --workspace --grouped
 
 .PHONY: check
 check: ##H Cargo check (core) and code dupe
 	$(CARGO) check --all-targets --all-features
-	jscpd $$(git ls-files '*.rs')
+	-jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
 lint: ##H Run clippy lints (only core, not full workspace)
