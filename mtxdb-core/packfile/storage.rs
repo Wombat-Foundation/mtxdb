@@ -653,6 +653,14 @@ impl PackfileStorage {
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
         let topo = csr.topo_order();
 
+        if topo.len() != live_hashes.len() {
+            return Err(StorageError::Corrupt(format!(
+                "repack: cyclic graph detected — topo_order produced {} nodes from {} live hashes",
+                topo.len(),
+                live_hashes.len(),
+            )));
+        }
+
         let mut new_offsets: Vec<([u8; 16], u16, u64)> = Vec::with_capacity(topo.len());
         for &local in &topo {
             let hash = csr
@@ -836,6 +844,12 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn delete_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
+        // Acquire the room's put mutex to serialize with any in-flight put,
+        // preventing a concurrent put from resurrecting the room after we
+        // remove it from the generation map.
+        let room_arc = self.put_mutex(room_id);
+        let _room_guard = room_arc.lock();
+
         self.rooms.write().remove(room_id);
         self.live_roots.write().remove(room_id);
         self.put_locks.lock().remove(room_id);

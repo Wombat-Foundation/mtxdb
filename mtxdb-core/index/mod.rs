@@ -320,6 +320,7 @@ impl LossyIndex {
 #[derive(Debug)]
 pub enum InsertError {
     /// The table has no free slots left for a new entry.
+    /// Returned when the table reaches 75% occupancy to keep probe sequences short.
     TableFull,
 }
 
