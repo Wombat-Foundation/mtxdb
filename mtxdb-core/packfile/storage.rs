@@ -995,6 +995,28 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_room_does_not_resurrect_on_reopen() {
+        let dir = test_dir("delete_no_resurrect");
+
+        let id = [0x01u8; 16];
+        let data = NodeData::new(bytes::Bytes::from_static(b"room data"));
+
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store.put(&OTHER_ROOM, &id, &data).unwrap();
+            store.delete_room(&OTHER_ROOM).unwrap();
+            store.sync_all().unwrap();
+        }
+
+        // Reopen from scratch: the on-disk deleted.rooms marker must make
+        // the startup scan skip OTHER_ROOM's leftover packfile records,
+        // rather than resurrecting them into a fresh index.
+        let store = PackfileStorage::open(dir).unwrap();
+        assert!(store.get(&OTHER_ROOM, &id).unwrap().is_none());
+        assert!(store.generation(&OTHER_ROOM).is_none());
+    }
+
+    #[test]
     fn test_delete_room_clears_live_roots() {
         let dir = test_dir("delete_live_roots");
         let store = PackfileStorage::open(dir).unwrap();
