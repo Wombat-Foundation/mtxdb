@@ -10,6 +10,9 @@ _help:
 	@grep -E '^[a-zA-Z_/%-]+:.*?##H' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?##H "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Format, lint, and make docs
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .PHONY: format
 format: ##H Format code
@@ -40,6 +43,9 @@ doc: ##H Build docs
 	echo '<meta http-equiv="refresh" content="0;url=mtxdb/index.html">' > target/doc/index.html
 
 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Test & bench
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .PHONY: test
 test: ##H Run tests (only core)
@@ -68,23 +74,24 @@ cov: ##H Run code coverage and generate HTML report
 	@echo firefox .coverage/html/index.html
 
 
+.PHONY: bench
+bench: ##H Run benchmarks
+	$(CARGO) bench --benches
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Build, install, & clean
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 .PHONY: build
 build: ##H Build all
 	$(CARGO) build --release --timings
 	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
 	RUSTFLAGS= $(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 
-
-.PHONY: bench
-bench: ##H Run benchmarks
-	$(CARGO) bench --benches
-
-PROJECT_CRATES ?= mtxdb-cli/ mtxdb-core/ mtxdb-ffi/ mtxdb-wasm/
-
-.PHONY: sub
-sub:	##H Run a command for each crate (set c= command)
-	@test -n "${c}" || (echo "error: set c=<command>"; exit 1)
-	@for d in $(PROJECT_CRATES); do echo "--- $$d ---"; (cd $$d && ${c}) || exit 1; done
+.PHONY: install
+install:	##H Install CLI from source
+	cd mtxdb-cli && $(CARGO) install --path .
 
 
 .PHONY: clean
@@ -94,3 +101,15 @@ clean: ##H Clean build artifacts
 	cd mtxdb-ffi && $(CARGO) clean
 	cd mtxdb-wasm && $(CARGO) clean
 	rm -rf .coverage/ lcov.info
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Execute command for reach submodule
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+PROJECT_CRATES ?= mtxdb-cli/ mtxdb-core/ mtxdb-ffi/ mtxdb-wasm/
+
+.PHONY: sub
+sub:	##H Run a command for each crate (set c)
+	@test -n "${c}" || (echo "error: set c=<command>"; exit 1)
+	@for d in $(PROJECT_CRATES); do echo "--- $$d ---"; (cd $$d && ${c}) || exit 1; done
