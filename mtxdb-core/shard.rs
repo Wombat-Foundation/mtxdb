@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Seek};
+use std::io::{self, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -76,6 +76,49 @@ pub struct ShardStats {
     pub sync_count: u64,
 }
 
+/// Filename for the persisted stats snapshot, stored alongside shard files.
+const STATS_FILENAME: &str = "shard_stats.bin";
+
+/// Magic bytes + version identifying the stats file format.
+const STATS_MAGIC: &[u8; 4] = b"MSTA";
+const STATS_VERSION: u8 = 1;
+
+/// On-disk size of one stats record: `shard_id`(2) + generation(8) + 5×counter(8) = 50 bytes.
+const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 5;
+
+impl ShardStats {
+    fn encode(self, shard_id: u16, generation: u64, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&shard_id.to_le_bytes());
+        buf.extend_from_slice(&generation.to_le_bytes());
+        buf.extend_from_slice(&self.write_count.to_le_bytes());
+        buf.extend_from_slice(&self.bytes_written.to_le_bytes());
+        buf.extend_from_slice(&self.read_count.to_le_bytes());
+        buf.extend_from_slice(&self.bytes_read.to_le_bytes());
+        buf.extend_from_slice(&self.sync_count.to_le_bytes());
+    }
+
+    fn decode(rec: &[u8; STATS_RECORD_LEN]) -> (u16, u64, Self) {
+        let shard_id = u16::from_le_bytes(rec[0..2].try_into().unwrap());
+        let generation = u64::from_le_bytes(rec[2..10].try_into().unwrap());
+        let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
+        let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
+        let read_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
+        let bytes_read = u64::from_le_bytes(rec[34..42].try_into().unwrap());
+        let sync_count = u64::from_le_bytes(rec[42..50].try_into().unwrap());
+        (
+            shard_id,
+            generation,
+            Self {
+                write_count,
+                bytes_written,
+                read_count,
+                bytes_read,
+                sync_count,
+            },
+        )
+    }
+}
+
 impl Shard {
     fn new(shard_id: u16, generation: u64, file: File, path: PathBuf, file_len: u64) -> Self {
         Self {
@@ -111,6 +154,17 @@ impl Shard {
     #[must_use]
     pub fn file_len(&self) -> u64 {
         self.file_len.load(Ordering::Acquire)
+    }
+
+    /// Restore counters from a persisted snapshot. Only called at startup,
+    /// before the shard is shared, so `Relaxed` stores are fine.
+    fn restore_stats(&self, stats: ShardStats) {
+        self.write_count.store(stats.write_count, Ordering::Relaxed);
+        self.bytes_written
+            .store(stats.bytes_written, Ordering::Relaxed);
+        self.read_count.store(stats.read_count, Ordering::Relaxed);
+        self.bytes_read.store(stats.bytes_read, Ordering::Relaxed);
+        self.sync_count.store(stats.sync_count, Ordering::Relaxed);
     }
 }
 
@@ -167,6 +221,15 @@ pub struct ShardPool {
     /// Total number of shards retired (garbage-collected after a repack)
     /// over the pool's lifetime.
     retired_count: AtomicU64,
+    /// Each room's current "home" shard: writes for a room are routed here
+    /// instead of always following the pool-wide active-write cursor, so a
+    /// room's records stay contiguous within a shard rather than
+    /// interleaving with whichever other rooms happen to write around the
+    /// same time. Shards remain shared — multiple rooms' homes can and do
+    /// coincide, especially low-traffic rooms — a room just sticks to its
+    /// home until that shard fills, rather than following the global
+    /// cursor wherever unrelated rooms have since moved it.
+    room_home: RwLock<HashMap<[u8; 16], u16>>,
 }
 
 impl ShardPool {
@@ -258,6 +321,8 @@ impl ShardPool {
             max_generation = 1;
         }
 
+        Self::restore_persisted_stats(&base_dir, &shards);
+
         Ok(Self {
             shards: RwLock::new(shards),
             active_write: parking_lot::Mutex::new(highest_active),
@@ -266,7 +331,114 @@ impl ShardPool {
             dirty: parking_lot::Mutex::new(HashSet::new()),
             next_generation: AtomicU64::new(max_generation),
             retired_count: AtomicU64::new(0),
+            room_home: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Seed a room's home shard — used at startup to approximate where a
+    /// room's most recent data already lives (from a content scan elsewhere,
+    /// since `ShardPool::open` itself only discovers shard *files*, not
+    /// their room contents). Normal routing updates the home automatically
+    /// from then on via `put_record`.
+    pub(crate) fn set_room_home(&self, room_id: &[u8; 16], shard_id: u16) {
+        self.room_home.write().insert(*room_id, shard_id);
+    }
+
+    /// The shard a room's writes should go to: its remembered home if one
+    /// exists and the slot is still occupied, otherwise a freshly assigned
+    /// home (the pool's current active shard, the same fallback every room
+    /// used before per-room routing existed).
+    fn shard_for_room(&self, room_id: &[u8; 16]) -> Arc<Shard> {
+        if let Some(id) = self.room_home.read().get(room_id).copied() {
+            if let Some(shard) = self.get_shard(id) {
+                return shard;
+            }
+        }
+        let shard = self.active_shard();
+        self.room_home.write().insert(*room_id, shard.shard_id);
+        shard
+    }
+
+    /// A room's home shard just filled up: rotate the pool forward (unless
+    /// another room already did, in which case just adopt whatever's now
+    /// active) and point the room at the result.
+    fn rotate_room_full_home(
+        &self,
+        room_id: &[u8; 16],
+        full_shard_id: u16,
+    ) -> io::Result<Arc<Shard>> {
+        {
+            let active = self.active_write.lock();
+            if *active == full_shard_id {
+                drop(active);
+                self.rotate()?;
+            }
+        }
+        let shard = self.active_shard();
+        self.room_home.write().insert(*room_id, shard.shard_id);
+        Ok(shard)
+    }
+
+    /// Path to the persisted stats snapshot for a base directory.
+    fn stats_path(base_dir: &Path) -> PathBuf {
+        base_dir.join(STATS_FILENAME)
+    }
+
+    /// Load a persisted stats snapshot, if one exists, and restore each
+    /// shard's counters when its generation still matches — a stale
+    /// snapshot entry (from a slot since retired and reused) is silently
+    /// skipped rather than misapplied.
+    ///
+    /// Best-effort: a missing, truncated, or corrupt file just means no
+    /// stats are restored — never a startup failure over stats alone.
+    fn restore_persisted_stats(base_dir: &Path, shards: &[Option<Arc<Shard>>]) {
+        let path = Self::stats_path(base_dir);
+        let Ok(buf) = fs::read(&path) else {
+            return;
+        };
+        if buf.len() < 5 || &buf[0..4] != STATS_MAGIC || buf[4] != STATS_VERSION {
+            return;
+        }
+        let body = &buf[5..];
+        for chunk in body.chunks(STATS_RECORD_LEN) {
+            let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) else {
+                break;
+            };
+            let (shard_id, generation, stats) = ShardStats::decode(rec);
+            if let Some(Some(shard)) = shards.get(shard_id as usize) {
+                if shard.generation == generation {
+                    shard.restore_stats(stats);
+                }
+            }
+        }
+    }
+
+    /// Persist every currently-open shard's IO/sync counters to disk,
+    /// keyed by `(shard_id, generation)` so a retired/reused slot's stale
+    /// numbers are never mistakenly restored onto a new shard.
+    ///
+    /// Writes to a temp file and renames into place, so a crash mid-write
+    /// leaves the previous snapshot (or none) rather than a torn file.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on write or rename failure.
+    fn persist_stats(&self) -> io::Result<()> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(STATS_MAGIC);
+        buf.push(STATS_VERSION);
+        for (shard_id, shard) in self.all_shards() {
+            shard.stats().encode(shard_id, shard.generation, &mut buf);
+        }
+
+        let tmp_path = Self::stats_path(&self.base_dir).with_extension("bin.tmp");
+        let final_path = Self::stats_path(&self.base_dir);
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(&buf)?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
     }
 
     /// On-disk path for a shard file.
@@ -335,14 +507,15 @@ impl ShardPool {
             .expect("active write shard must exist")
     }
 
-    /// Append a record to the active shard. Returns `(shard_id, offset)`.
-    /// Rotates to a new shard if the current one is full.
+    /// Append a record to its room's home shard (see `room_home`).
+    /// Returns `(shard_id, offset)`. Rotates the room to a new home shard
+    /// if its current one is full.
     ///
     /// # Errors
     /// Returns `io::Error` on write or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
+        let mut shard = self.shard_for_room(&record.room_id);
         loop {
-            let shard = self.active_shard();
             let record_len = record.serialized_len() as u64;
 
             let offset = {
@@ -360,7 +533,7 @@ impl ShardPool {
                 if !fits && current_len > 5 {
                     drop(guard);
                     drop(file);
-                    self.rotate()?;
+                    shard = self.rotate_room_full_home(&record.room_id, shard.shard_id)?;
                     continue;
                 }
 
@@ -527,12 +700,14 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
-        let shards = self.shards.read();
-        for shard in shards.iter().flatten() {
-            shard.file.sync_all()?;
-            shard.sync_count.fetch_add(1, Ordering::Relaxed);
+        {
+            let shards = self.shards.read();
+            for shard in shards.iter().flatten() {
+                shard.file.sync_all()?;
+                shard.sync_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        Ok(())
+        self.persist_stats()
     }
 
     /// Sync only shards written to since the last sync.
@@ -545,15 +720,20 @@ impl ShardPool {
     /// Returns `io::Error` on sync failure.
     pub fn sync_dirty(&self) -> io::Result<()> {
         let dirty: Vec<u16> = { self.dirty.lock().iter().copied().collect() };
-        let shards = self.shards.read();
-        for &id in &dirty {
-            if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
-                shard.file.sync_all()?;
-                shard.sync_count.fetch_add(1, Ordering::Relaxed);
-                self.dirty.lock().remove(&id);
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        {
+            let shards = self.shards.read();
+            for &id in &dirty {
+                if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
+                    shard.file.sync_all()?;
+                    shard.sync_count.fetch_add(1, Ordering::Relaxed);
+                    self.dirty.lock().remove(&id);
+                }
             }
         }
-        Ok(())
+        self.persist_stats()
     }
 
     /// Retire a shard: mark it for deletion and free its pool slot.
@@ -573,6 +753,12 @@ impl ShardPool {
                 shard.is_current.store(false, Ordering::Release);
                 self.dirty.lock().remove(&shard_id);
                 self.retired_count.fetch_add(1, Ordering::Relaxed);
+                drop(shards);
+                // Any room whose home was this slot must re-home on its
+                // next write — otherwise, once the slot is reused, that
+                // room's writes would silently land in an unrelated
+                // shard that happens to have been assigned the same slot.
+                self.room_home.write().retain(|_, home| *home != shard_id);
             }
         }
     }
@@ -610,6 +796,15 @@ impl ShardPool {
         }
 
         Ok(entries)
+    }
+}
+
+impl Drop for ShardPool {
+    /// Best-effort final flush of IO/sync stats. Errors are swallowed —
+    /// a failed stats write on shutdown must never panic or mask the
+    /// original error path the caller was already on.
+    fn drop(&mut self) {
+        let _ = self.persist_stats();
     }
 }
 
@@ -696,6 +891,68 @@ mod tests {
         let record = test_record(0x01, 0xBB, b"trigger rotation");
         let (shard_id, _offset) = pool.put_record(&record).unwrap();
         assert_eq!(shard_id, 1);
+    }
+
+    /// Core fix: a room's writes must stay on its own home shard even
+    /// after *unrelated* activity rotates the pool's global active-write
+    /// cursor far ahead. Before per-room home routing, every room simply
+    /// followed that single pool-wide cursor, so any other room's churn
+    /// (with nothing to do with room A, and no capacity reason for room
+    /// A specifically to move) would silently redirect room A's next
+    /// write too — destroying locality room A never had a reason to lose.
+    #[test]
+    fn test_room_stays_on_home_shard_despite_unrelated_pool_rotation() {
+        let dir = test_dir("room_locality");
+        let pool = ShardPool::open(dir).unwrap();
+
+        // Room A's first write establishes its home on shard 0.
+        let room_a = test_record(0x01, 0x01, b"room A first");
+        let (shard_a1, _) = pool.put_record(&room_a).unwrap();
+        assert_eq!(shard_a1, 0);
+
+        // Simulate unrelated churn (other rooms' own rotations) dragging
+        // the pool-wide cursor far ahead — room A is not involved at all,
+        // and shard 0 still has essentially all its capacity free.
+        for _ in 0..5 {
+            pool.rotate().unwrap();
+        }
+
+        // Room A writes again: it must still land on shard 0, its own
+        // home — not wherever unrelated rotations left the pool cursor.
+        let room_a2 = test_record(0x01, 0x03, b"room A second");
+        let (shard_a2, _) = pool.put_record(&room_a2).unwrap();
+        assert_eq!(
+            shard_a2, 0,
+            "room A must stay on its own home shard, unaffected by unrelated pool rotation"
+        );
+    }
+
+    /// Once a room's own home shard actually fills up, that room (and
+    /// only that room) rotates to a new home — independent of whatever
+    /// the pool-wide cursor is doing for other rooms.
+    #[test]
+    fn test_room_rotates_its_own_home_when_full() {
+        let dir = test_dir("room_locality_own_rotation");
+        let pool = ShardPool::open(dir).unwrap();
+
+        let room_a = test_record(0x01, 0x01, b"room A first");
+        let (shard_a1, _) = pool.put_record(&room_a).unwrap();
+        assert_eq!(shard_a1, 0);
+
+        // Fill room A's own home shard (shard 0) — not some other shard —
+        // and confirm room A itself rotates off it.
+        pool.get_shard(0)
+            .unwrap()
+            .file_len
+            .store(MAX_SHARD_BYTES - 10, Ordering::Release);
+        let room_a2 = test_record(0x01, 0x02, b"room A triggers its own rotation");
+        let (shard_a2, _) = pool.put_record(&room_a2).unwrap();
+        assert_eq!(shard_a2, 1);
+
+        // And room A stays on its new home from then on.
+        let room_a3 = test_record(0x01, 0x03, b"room A third");
+        let (shard_a3, _) = pool.put_record(&room_a3).unwrap();
+        assert_eq!(shard_a3, 1);
     }
 
     #[test]

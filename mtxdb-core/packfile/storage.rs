@@ -168,6 +168,16 @@ impl PackfileStorage {
             if deleted_rooms.contains(room_id) {
                 continue;
             }
+            // Seed each room's home shard from the scan: the shard of its
+            // last-scanned record is a best-effort proxy for "most recent"
+            // (shards are scanned in ascending ID order, and IDs generally
+            // increase over time via rotation) — not exact chronology
+            // across shards, but enough to keep a resumed room's writes
+            // landing near its existing data instead of restarting at
+            // whatever the pool's active shard happens to be.
+            if let Some(&(last_shard_id, _, _)) = records.last() {
+                shards.set_room_home(room_id, last_shard_id);
+            }
             let mut index = LossyIndex::new(records.len().saturating_mul(2).max(16));
             for (shard_id, hash, offset) in records {
                 let _ = index.insert(hash, *shard_id, *offset);
@@ -721,6 +731,14 @@ impl PackfileStorage {
             .entry(*room_id)
             .and_modify(|c| *c = c.saturating_add(1))
             .or_insert(1);
+
+        // Fsync the shards this repack just wrote into and persist the
+        // updated stats snapshot as part of finishing the repack, rather
+        // than leaving both to whatever the next unrelated sync_dirty()
+        // call happens to be — a crash right after a repack should not
+        // lose durability for data this repack itself just wrote, nor
+        // leave the persisted stats stale relative to what's on disk.
+        self.shards.sync_dirty()?;
 
         Ok((kept, dropped))
     }
