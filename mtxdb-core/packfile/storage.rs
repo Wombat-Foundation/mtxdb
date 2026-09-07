@@ -895,6 +895,12 @@ impl PackfileStorage {
     pub fn shard_stats(&self) -> Vec<(u16, crate::shard::ShardStats)> {
         self.shards.all_stats()
     }
+
+    /// Get IO/sync stats for a single shard by ID.
+    #[must_use]
+    pub fn shard_stats_for(&self, shard_id: u16) -> Option<crate::shard::ShardStats> {
+        self.shards.stats(shard_id)
+    }
 }
 
 #[cfg(test)]

@@ -271,6 +271,16 @@ impl ShardPool {
         self.shards.read().get(shard_id as usize)?.clone()
     }
 
+    /// Get IO/sync stats for a single shard by ID.
+    #[must_use]
+    pub fn stats(&self, shard_id: u16) -> Option<ShardStats> {
+        self.shards
+            .read()
+            .get(shard_id as usize)?
+            .as_ref()
+            .map(|shard| shard.stats())
+    }
+
     /// Snapshot IO/sync stats for every currently-open shard, as
     /// `(shard_id, ShardStats)` pairs.
     #[must_use]
@@ -824,6 +834,9 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0, shard_id);
         assert_eq!(all[0].1, shard.stats());
+
+        assert_eq!(pool.stats(shard_id), Some(shard.stats()));
+        assert_eq!(pool.stats(shard_id.wrapping_add(1)), None);
     }
 
     /// Backward compatibility: the startup scan must correctly parse all
