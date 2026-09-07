@@ -86,6 +86,11 @@ const STATS_VERSION: u8 = 2;
 /// On-disk size of one stats record: `shard_id`(2) + generation(8) + 3×counter(8) = 34 bytes.
 const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
 
+/// Disambiguates concurrent `persist_stats` tmp filenames within this
+/// process (paired with the process id, which disambiguates across
+/// processes sharing the same `base_dir`).
+static STATS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl ShardStats {
     fn encode(self, shard_id: u16, generation: u64, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&shard_id.to_le_bytes());
@@ -418,12 +423,27 @@ impl ShardPool {
             shard.stats().encode(shard_id, shard.generation, &mut buf);
         }
 
-        let tmp_path = Self::stats_path(&self.base_dir).with_extension("bin.tmp");
+        // Unique per (process, call) — the same base_dir can be opened by
+        // more than one process at once (e.g. a long-running embedder plus
+        // a short-lived `mtxdb shards` CLI invocation), and a fixed tmp
+        // filename shared across them races: one process's rename() can
+        // consume the shared tmp path out from under another's, which
+        // then sees ENOENT on its own rename despite having written its
+        // tmp file successfully moments earlier.
+        let unique = STATS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = Self::stats_path(&self.base_dir)
+            .with_extension(format!("bin.tmp.{}.{unique}", std::process::id()));
         let final_path = Self::stats_path(&self.base_dir);
-        {
+        let write_result = (|| -> io::Result<()> {
             let mut tmp = File::create(&tmp_path)?;
             tmp.write_all(&buf)?;
-            tmp.sync_all()?;
+            tmp.sync_all()
+        })();
+        if let Err(e) = write_result {
+            // Don't leave a half-written tmp file behind under its
+            // now-unique name — best-effort, the write already failed.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
         }
         fs::rename(&tmp_path, &final_path)?;
         Ok(())
@@ -977,6 +997,59 @@ mod tests {
         let room_a3 = test_record(0x01, 0x03, b"room A third");
         let (shard_a3, _) = pool.put_record(&room_a3).unwrap();
         assert_eq!(shard_a3, 1);
+    }
+
+    /// `persist_stats` used a fixed tmp filename, so two `ShardPool`s
+    /// pointed at the same `base_dir` (e.g. a long-running embedder and a
+    /// short-lived `mtxdb shards` CLI invocation) could race: one's
+    /// `rename()` consumes the shared tmp path out from under the
+    /// other's, which then fails its own `rename()` with ENOENT despite
+    /// having written its tmp file successfully. Each pool now uses a
+    /// tmp filename unique to its own process id and an internal counter,
+    /// so concurrent persists from separate pools never collide.
+    #[test]
+    fn test_concurrent_persist_stats_does_not_race() {
+        let dir = test_dir("persist_stats_race");
+
+        // Multiple ShardPool instances sharing one base_dir, standing in
+        // for multiple processes (real cross-process contention needs a
+        // shared dir between separate binaries, which a unit test can't
+        // spawn — but the tmp-path race is per-`persist_stats`-call, not
+        // tied to any single pool's other state, so racing several
+        // in-process pools against the same directory exercises the same
+        // failure mode).
+        let pools: Vec<ShardPool> = (0..8)
+            .map(|_| ShardPool::open(dir.clone()).unwrap())
+            .collect();
+
+        let handles: Vec<_> = pools
+            .into_iter()
+            .map(|pool| {
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        pool.persist_stats().unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The final file must be well-formed, not torn by a partial
+        // overlapping write.
+        let path = ShardPool::stats_path(&dir);
+        let buf = fs::read(&path).unwrap();
+        assert_eq!(&buf[0..4], STATS_MAGIC);
+        assert_eq!(buf[4], STATS_VERSION);
+
+        // No leftover tmp files from a failed/interrupted attempt.
+        let leftover_tmp = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!leftover_tmp, "a persist_stats tmp file was left behind");
     }
 
     #[test]
