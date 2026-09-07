@@ -48,7 +48,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
         Commands::Get { room, id } => cmd_get(cli, room, id),
-        Commands::Rooms => cmd_rooms(cli),
+        Commands::Rooms { rescan } => cmd_rooms(cli, *rescan),
         Commands::Shards => cmd_shards(cli),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { path } => cmd_scan(path),
@@ -132,29 +132,32 @@ fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
 /// single small-file read, no shard scanning at all. Falls back to the
 /// full-scan path only if that directory doesn't exist yet (a store
 /// predating the feature, or one whose writer has never called
-/// `sync_all`/`maybe_persist_shard_rooms`).
-fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
+/// `sync_all`/`maybe_persist_shard_rooms`). Pass `-r`/`--rescan` to
+/// bypass the persisted directory and always do the live scan.
+fn cmd_rooms(cli: &Cli, force_rescan: bool) -> anyhow::Result<()> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
 
-    let from_disk = PackfileStorage::room_directory_from_disk(dir);
-    if !from_disk.is_empty() {
-        if let Some(persisted_at) = PackfileStorage::room_directory_persisted_at(dir) {
-            let age_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |now| now.as_secs().saturating_sub(persisted_at));
-            eprintln!(
-                "(from persisted directory, {} old — may not reflect writes since then)",
-                fmt_duration(age_secs)
-            );
+    if !force_rescan {
+        let from_disk = PackfileStorage::room_directory_from_disk(dir);
+        if !from_disk.is_empty() {
+            if let Some(persisted_at) = PackfileStorage::room_directory_persisted_at(dir) {
+                let age_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |now| now.as_secs().saturating_sub(persisted_at));
+                eprintln!(
+                    "(from persisted directory, {} old — may not reflect writes since then)",
+                    fmt_duration(age_secs)
+                );
+            }
+            for (i, (room_id, count)) in from_disk.iter().enumerate() {
+                let hex = hex_encode(room_id);
+                eprintln!("  {i}: 0x{hex} ({count} records)");
+            }
+            return Ok(());
         }
-        for (i, (room_id, count)) in from_disk.iter().enumerate() {
-            let hex = hex_encode(room_id);
-            eprintln!("  {i}: {hex} ({count} records)");
-        }
-        return Ok(());
+        eprintln!("(no persisted directory yet — falling back to a full scan)");
     }
 
-    eprintln!("(no persisted directory yet — falling back to a full scan)");
     let mut counts: std::collections::HashMap<[u8; 16], usize> = std::collections::HashMap::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -179,7 +182,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     rooms.sort_unstable_by_key(|&(id, _)| id);
     for (i, (room_id, count)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
-        eprintln!("  {i}: {hex} ({count} records)");
+        eprintln!("  {i}: 0x{hex} ({count} records)");
     }
     Ok(())
 }
@@ -190,6 +193,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
 /// for the IO/sync counters. Zero `File::open` calls; the only I/O is
 /// `stat()` per shard file and one read of the small stats snapshot.
 /// Safe to run against a directory a live writer process owns.
+#[allow(clippy::too_many_lines)]
 fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     // Binary format for shard_stats.bin — same layout as
     // ShardPool::restore_persisted_stats, decoded standalone.
@@ -262,16 +266,16 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     }
 
     eprintln!(
-        "{:>6}  {:>10}  {:>10}  {:>8}  {:>10}  {:>6}",
+        "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
         "shard", "generation", "bytes", "writes", "written", "syncs"
     );
     for &(slot_id, generation, file_bytes) in &shard_entries {
         let key = u64::from(slot_id) << 48 | (generation & GEN_MASK);
         let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
         eprintln!(
-            "{:>6}  {:>10}  {:>10}  {:>8}  {:>10}  {:>6}",
+            "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
             slot_id,
-            format!("{generation:#x}"),
+            format!("{generation:#018x}"),
             fmt_bytes(file_bytes),
             wc,
             fmt_bytes(bw),
