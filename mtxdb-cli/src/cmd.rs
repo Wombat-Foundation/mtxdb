@@ -113,19 +113,17 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     }
     shards.sort_unstable_by_key(|s| s.shard_id);
     eprintln!(
-        "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>8}  {:>12}  {:>6}",
-        "shard", "generation", "bytes", "writes", "written", "reads", "read", "syncs"
+        "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>6}",
+        "shard", "generation", "bytes", "writes", "written", "syncs"
     );
     for s in &shards {
         eprintln!(
-            "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>8}  {:>12}  {:>6}",
+            "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>6}",
             s.shard_id,
             s.generation,
             s.file_bytes,
             s.stats.write_count,
             s.stats.bytes_written,
-            s.stats.read_count,
-            s.stats.bytes_read,
             s.stats.sync_count,
         );
     }

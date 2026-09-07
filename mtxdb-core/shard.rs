@@ -50,10 +50,6 @@ pub struct Shard {
     write_count: AtomicU64,
     /// Total payload bytes appended to this shard (serialized record length).
     bytes_written: AtomicU64,
-    /// Number of records read from this shard via `read_at`.
-    read_count: AtomicU64,
-    /// Total payload bytes read from this shard via `read_at`.
-    bytes_read: AtomicU64,
     /// Number of times this shard's file has been fsynced.
     sync_count: AtomicU64,
 }
@@ -62,16 +58,20 @@ pub struct Shard {
 ///
 /// Loaded with `Ordering::Relaxed` — cheap to take, not synchronized
 /// against concurrent activity on the shard.
+///
+/// Deliberately write/sync-only, not read-tracking: `read_at` goes through
+/// an mmap, so a "read" often just touches an already page-cache-resident
+/// page — no disk I/O at all — while counting it would still cost a real
+/// cache-line-contending atomic write on every call, on the hottest path
+/// in the engine, for a number that doesn't answer any disk-I/O question.
+/// `write_count`/`bytes_written`/`sync_count` are the ones tied to actual fsync
+/// calls, the only genuinely disk-relevant signal here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShardStats {
     /// Number of records written to this shard.
     pub write_count: u64,
     /// Total bytes written to this shard.
     pub bytes_written: u64,
-    /// Number of records read from this shard.
-    pub read_count: u64,
-    /// Total bytes read from this shard.
-    pub bytes_read: u64,
     /// Number of fsync calls on this shard.
     pub sync_count: u64,
 }
@@ -81,10 +81,10 @@ const STATS_FILENAME: &str = "shard_stats.bin";
 
 /// Magic bytes + version identifying the stats file format.
 const STATS_MAGIC: &[u8; 4] = b"MSTA";
-const STATS_VERSION: u8 = 1;
+const STATS_VERSION: u8 = 2;
 
-/// On-disk size of one stats record: `shard_id`(2) + generation(8) + 5×counter(8) = 50 bytes.
-const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 5;
+/// On-disk size of one stats record: `shard_id`(2) + generation(8) + 3×counter(8) = 34 bytes.
+const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
 
 impl ShardStats {
     fn encode(self, shard_id: u16, generation: u64, buf: &mut Vec<u8>) {
@@ -92,8 +92,6 @@ impl ShardStats {
         buf.extend_from_slice(&generation.to_le_bytes());
         buf.extend_from_slice(&self.write_count.to_le_bytes());
         buf.extend_from_slice(&self.bytes_written.to_le_bytes());
-        buf.extend_from_slice(&self.read_count.to_le_bytes());
-        buf.extend_from_slice(&self.bytes_read.to_le_bytes());
         buf.extend_from_slice(&self.sync_count.to_le_bytes());
     }
 
@@ -102,17 +100,13 @@ impl ShardStats {
         let generation = u64::from_le_bytes(rec[2..10].try_into().unwrap());
         let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
         let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
-        let read_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
-        let bytes_read = u64::from_le_bytes(rec[34..42].try_into().unwrap());
-        let sync_count = u64::from_le_bytes(rec[42..50].try_into().unwrap());
+        let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
         (
             shard_id,
             generation,
             Self {
                 write_count,
                 bytes_written,
-                read_count,
-                bytes_read,
                 sync_count,
             },
         )
@@ -132,8 +126,6 @@ impl Shard {
             file_len: AtomicU64::new(file_len),
             write_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
-            read_count: AtomicU64::new(0),
-            bytes_read: AtomicU64::new(0),
             sync_count: AtomicU64::new(0),
         }
     }
@@ -144,8 +136,6 @@ impl Shard {
         ShardStats {
             write_count: self.write_count.load(Ordering::Relaxed),
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
-            read_count: self.read_count.load(Ordering::Relaxed),
-            bytes_read: self.bytes_read.load(Ordering::Relaxed),
             sync_count: self.sync_count.load(Ordering::Relaxed),
         }
     }
@@ -162,8 +152,6 @@ impl Shard {
         self.write_count.store(stats.write_count, Ordering::Relaxed);
         self.bytes_written
             .store(stats.bytes_written, Ordering::Relaxed);
-        self.read_count.store(stats.read_count, Ordering::Relaxed);
-        self.bytes_read.store(stats.bytes_read, Ordering::Relaxed);
         self.sync_count.store(stats.sync_count, Ordering::Relaxed);
     }
 }
@@ -631,10 +619,6 @@ impl ShardPool {
             hash.copy_from_slice(&payload[16..32]);
             let data = bytes::Bytes::copy_from_slice(&payload[32..]);
 
-            shard.read_count.fetch_add(1, Ordering::Relaxed);
-            shard
-                .bytes_read
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
             return Ok(Record {
                 room_id,
                 hash,
@@ -1075,9 +1059,11 @@ mod tests {
     /// `stats()` must reflect actual write/read/sync activity, so callers
     /// can distinguish "many small fsyncs" (seek-bound, noisy) from
     /// "few large writes, batched syncs" (quiet) without guessing from
-    /// disk sound.
+    /// disk sound. Deliberately no read counters — see `ShardStats`' doc
+    /// for why counting reads isn't worth the cache-line contention on
+    /// that path.
     #[test]
-    fn test_shard_stats_track_write_read_sync() {
+    fn test_shard_stats_track_write_sync() {
         let dir = test_dir("stats_tracking");
         let pool = ShardPool::open(dir).unwrap();
 
@@ -1088,13 +1074,9 @@ mod tests {
         let stats = shard.stats();
         assert_eq!(stats.write_count, 1);
         assert_eq!(stats.bytes_written, record.serialized_len() as u64);
-        assert_eq!(stats.read_count, 0);
         assert_eq!(stats.sync_count, 0);
 
         ShardPool::read_at(&shard, offset).unwrap();
-        let stats = shard.stats();
-        assert_eq!(stats.read_count, 1);
-        assert_eq!(stats.bytes_read, record.data.len() as u64);
 
         pool.sync_dirty().unwrap();
         let stats = shard.stats();
