@@ -28,10 +28,12 @@ check: ##H Cargo check (core) and code dupe
 .PHONY: lint
 lint: ##H Run clippy lints (only core, not full workspace)
 	$(CARGO) clippy --all-targets --all-features -- $(if $(CI),-D warnings)
+	$(CARGO) clippy --all-targets --all-features  --manifest-path mtxdb-cli/Cargo.toml -- $(if $(CI),-D warnings)
 
 .PHONY: fix
 fix: ##H Apply auto-fixes with clippy (only core)
 	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets
+	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets --manifest-path mtxdb-cli/Cargo.toml
 	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets --manifest-path mtxdb-ffi/Cargo.toml
 	$(CARGO) clippy --fix --allow-dirty --allow-staged --allow-no-vcs --all-targets --manifest-path mtxdb-wasm/Cargo.toml
 
@@ -50,6 +52,7 @@ doc: ##H Build docs
 .PHONY: test
 test: ##H Run tests (only core)
 	$(CARGO) test --lib --tests --timings
+	$(CARGO) test --tests --timings --manifest-path mtxdb-cli/Cargo.toml
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false

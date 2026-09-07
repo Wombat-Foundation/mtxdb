@@ -79,7 +79,23 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `io::Error` if the base directory cannot be created or read.
     pub fn open(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None)
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true)
+    }
+
+    /// Open a packfile storage as a read-only observer, coexisting with a
+    /// concurrent writer on the same directory (see
+    /// `ShardPool::open_read_only`'s doc for the locking contract).
+    ///
+    /// Intended for inspection tooling (e.g. a `shards`/`rooms`/`info` CLI
+    /// command) that needs to run alongside a live writer process without
+    /// either racing its on-disk state or being mistaken for a second
+    /// writer and rejected.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the directory can't be read, has no shards
+    /// yet, or a writer already holds the exclusive lock.
+    pub fn open_read_only(base_dir: PathBuf) -> Result<Self, std::io::Error> {
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, false)
     }
 
     /// Open a packfile storage with a custom per-room cache capacity.
@@ -90,7 +106,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         cache_capacity: usize,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, None)
+        Self::open_with_options(base_dir, cache_capacity, None, true)
     }
 
     /// Open a packfile storage with a swizzle callback for in-cache pointer resolution.
@@ -102,18 +118,23 @@ impl PackfileStorage {
         cache_capacity: usize,
         swizzle: SwizzleFn,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, Some(swizzle))
+        Self::open_with_options(base_dir, cache_capacity, Some(swizzle), true)
     }
 
     fn open_with_options(
         base_dir: PathBuf,
         cache_capacity: usize,
         swizzle: Option<SwizzleFn>,
+        writable: bool,
     ) -> Result<Self, std::io::Error> {
         type ShardRecord = (u16, [u8; 16], u64);
         fs::create_dir_all(&base_dir)?;
 
-        let shards = ShardPool::open(base_dir.clone())?;
+        let shards = if writable {
+            ShardPool::open(base_dir.clone())?
+        } else {
+            ShardPool::open_read_only(base_dir.clone())?
+        };
         let mut rooms: HashMap<[u8; 16], ArcSwap<RoomGeneration>> = HashMap::new();
 
         // Phase 1: accumulate all records per room across every shard so
@@ -130,21 +151,43 @@ impl PackfileStorage {
             .collect();
 
         for (shard_id, path) in open_shards {
-            let entries = match packfile::scan_and_recover_packfile(&path) {
-                Ok(e) => e,
-                Err(recovery_err) => {
-                    eprintln!(
-                        "warning: recovery scan failed for shard {shard_id:02x}: {recovery_err}"
-                    );
-                    match packfile::scan_packfile(&path) {
-                        Ok(partial) => {
-                            eprintln!("warning: partial scan recovered {} records from shard {shard_id:02x}", partial.len());
-                            partial
+            // A read-only open must never touch the file at all — the
+            // truncating recovery scan below is only safe when we're the
+            // sole writer (guaranteed by the writer lock); a read-only
+            // opener can run concurrently with an active writer (no lock
+            // taken at all — see ShardPool::open_read_only), so it must
+            // use the non-mutating scan_packfile, which just stops
+            // cleanly at a torn tail (indistinguishable from a writer's
+            // in-flight append) instead of truncating it away.
+            let entries = if writable {
+                match packfile::scan_and_recover_packfile(&path) {
+                    Ok(e) => e,
+                    Err(recovery_err) => {
+                        eprintln!(
+                            "warning: recovery scan failed for shard {shard_id:02x}: {recovery_err}"
+                        );
+                        match packfile::scan_packfile(&path) {
+                            Ok(partial) => {
+                                eprintln!("warning: partial scan recovered {} records from shard {shard_id:02x}", partial.len());
+                                partial
+                            }
+                            Err(scan_err) => {
+                                eprintln!(
+                                    "warning: shard {shard_id:02x} skipped entirely: {scan_err}"
+                                );
+                                continue;
+                            }
                         }
-                        Err(scan_err) => {
-                            eprintln!("warning: shard {shard_id:02x} skipped entirely: {scan_err}");
-                            continue;
-                        }
+                    }
+                }
+            } else {
+                match packfile::scan_packfile(&path) {
+                    Ok(e) => e,
+                    Err(scan_err) => {
+                        eprintln!(
+                            "warning: read-only scan of shard {shard_id:02x} skipped: {scan_err}"
+                        );
+                        continue;
                     }
                 }
             };
@@ -1045,18 +1088,14 @@ impl PackfileStorage {
 
     /// List every currently-open shard with basic size, generation, and
     /// IO/sync stats — the data behind a `shards` CLI listing.
+    ///
+    /// This needs no room data at all; a caller that only wants shard-level
+    /// info (e.g. a `shards`-only inspection tool that must coexist with a
+    /// live writer) should call `ShardPool::summaries` directly instead of
+    /// opening a full `PackfileStorage`, which rebuilds every room's index.
     #[must_use]
-    pub fn shard_summaries(&self) -> Vec<ShardSummary> {
-        self.shards
-            .all_shards()
-            .into_iter()
-            .map(|(shard_id, shard)| ShardSummary {
-                shard_id,
-                generation: shard.generation,
-                file_bytes: shard.file_len(),
-                stats: shard.stats(),
-            })
-            .collect()
+    pub fn shard_summaries(&self) -> Vec<shard::ShardSummary> {
+        self.shards.summaries()
     }
 
     /// Snapshot global repack stats across all rooms.
@@ -1091,19 +1130,6 @@ impl PackfileStorage {
             hit_rate: gen.cache.hit_rate(),
         })
     }
-}
-
-/// Basic size, generation, and IO/sync info for one open shard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShardSummary {
-    /// Shard ID within the pool.
-    pub shard_id: u16,
-    /// Monotonically increasing generation counter for this shard's slot.
-    pub generation: u64,
-    /// Current on-disk file length in bytes.
-    pub file_bytes: u64,
-    /// IO/sync counters for this shard.
-    pub stats: shard::ShardStats,
 }
 
 /// Snapshot of global repack activity across all rooms.
@@ -1962,6 +1988,52 @@ mod tests {
         );
     }
 
+    /// `open_read_only` must actually coexist with a live writer end to
+    /// end — not just take no lock, but also not touch/truncate the
+    /// writer's files via the room-index rebuild scan (the real risk this
+    /// whole design exists to avoid). Also confirms it sees the writer's
+    /// already-durable data and that the writer is unaffected afterward.
+    #[test]
+    fn test_open_read_only_coexists_with_active_writer() {
+        let dir = test_dir("open_read_only_coexist");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+
+        let mut id = [0u8; 16];
+        id[0] = 0xAA;
+        writer
+            .put(
+                &TEST_ROOM,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"hello")),
+            )
+            .unwrap();
+
+        // Open read-only while the writer is still alive — must succeed
+        // (no lock conflict) and see the write above.
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        assert_eq!(
+            reader.get(&TEST_ROOM, &id).unwrap().map(|d| d.bytes),
+            Some(bytes::Bytes::from_static(b"hello"))
+        );
+        drop(reader);
+
+        // The writer must be completely unaffected — still open, still
+        // able to write more data afterward.
+        let mut id2 = [0u8; 16];
+        id2[0] = 0xBB;
+        writer
+            .put(
+                &TEST_ROOM,
+                &id2,
+                &NodeData::new(bytes::Bytes::from_static(b"world")),
+            )
+            .unwrap();
+        assert_eq!(
+            writer.get(&TEST_ROOM, &id2).unwrap().map(|d| d.bytes),
+            Some(bytes::Bytes::from_static(b"world"))
+        );
+    }
+
     /// `repack_shard` must find and repack every room sharing a shard —
     /// the targeted way to reclaim one shard without waiting for each
     /// room to independently cross its own repack threshold.
@@ -2091,7 +2163,10 @@ mod tests {
             "a room whose live data has moved off a shard must not be reported as still referencing it"
         );
         assert!(
-            store.rooms_referencing_shard(1).unwrap().contains(&TEST_ROOM),
+            store
+                .rooms_referencing_shard(1)
+                .unwrap()
+                .contains(&TEST_ROOM),
             "the room's current shard must still be reported"
         );
     }

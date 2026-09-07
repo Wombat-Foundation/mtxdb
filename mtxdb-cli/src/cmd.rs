@@ -6,11 +6,33 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use base64::Engine as _;
 use mtxdb::storage::{NodeData, StorageEngine};
-use mtxdb::PackfileStorage;
+use mtxdb::{PackfileStorage, ShardPool};
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
 
 use crate::{Cli, Commands};
+
+/// Human-readable byte count (`512 B`, `4.3 KB`, `1.2 MB`, `2.1 GB`) —
+/// raw byte counts in a shard listing are unreadable past a few digits.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only rounding to 1 decimal place; losing bits below f64's 52-bit mantissa at exabyte scale is invisible at that precision"
+)]
+fn fmt_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let max_unit = UNITS.len().saturating_sub(1);
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < max_unit {
+        value /= 1024.0;
+        unit = unit.saturating_add(1);
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().fold(
@@ -56,9 +78,19 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
+/// Open the store as its exclusive writer. Fails fast if another process
+/// (e.g. a live embedder) already holds the writer lock — required for
+/// any command that mutates data.
 fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
     PackfileStorage::open(dir.into()).context("failed to open store")
+}
+
+/// Open the store read-only — coexists with a live writer process rather
+/// than contending with it. For commands that only ever read room data.
+fn open_store_read_only(cli: &Cli) -> anyhow::Result<PackfileStorage> {
+    let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    PackfileStorage::open_read_only(dir.into()).context("failed to open store")
 }
 
 fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
@@ -76,7 +108,7 @@ fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
 fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
     let node_id = parse_node_id(id)?;
-    let store = open_store(cli)?;
+    let store = open_store_read_only(cli)?;
     match store.get(&room_id, &node_id)? {
         Some(data) => {
             io::stdout().write_all(&data.bytes)?;
@@ -90,7 +122,7 @@ fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
-    let store = open_store(cli)?;
+    let store = open_store_read_only(cli)?;
     let summaries = store.room_summaries();
     if summaries.is_empty() {
         eprintln!("no rooms found");
@@ -103,40 +135,47 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Deliberately bypasses `PackfileStorage` entirely — it needs no room
+/// data at all, so going through `open_store_read_only` would pay for
+/// (and pointlessly limit itself to) rebuilding every room's index. This
+/// is the one command genuinely safe to run against a directory a live
+/// writer process owns: `ShardPool::open_read_only` takes no lock and
+/// never touches record content, only shard file metadata.
 fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
-    let store = open_store(cli)?;
-    let mut shards = store.shard_summaries();
+    let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    let pool = ShardPool::open_read_only(dir.into()).context("failed to open store")?;
+    let mut shards = pool.summaries();
     if shards.is_empty() {
         eprintln!("no shards found");
         return Ok(());
     }
     shards.sort_unstable_by_key(|s| s.shard_id);
     eprintln!(
-        "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>6}",
+        "{:>6}  {:>10}  {:>10}  {:>8}  {:>10}  {:>6}",
         "shard", "generation", "bytes", "writes", "written", "syncs"
     );
     for s in &shards {
         eprintln!(
-            "{:>6}  {:>10}  {:>12}  {:>8}  {:>12}  {:>6}",
+            "{:>6}  {:>10}  {:>10}  {:>8}  {:>10}  {:>6}",
             s.shard_id,
             s.generation,
-            s.file_bytes,
+            fmt_bytes(s.file_bytes),
             s.stats.write_count,
-            s.stats.bytes_written,
+            fmt_bytes(s.stats.bytes_written),
             s.stats.sync_count,
         );
     }
     eprintln!(
         "{} shards, {} retired over lifetime",
         shards.len(),
-        store.shards_retired()
+        pool.retired_count()
     );
     Ok(())
 }
 
 fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
-    let store = open_store(cli)?;
+    let store = open_store_read_only(cli)?;
     let hex = hex_encode(&room_id);
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
@@ -317,4 +356,3 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     eprintln!("deleted {count} records for room {hex}");
     Ok(())
 }
-

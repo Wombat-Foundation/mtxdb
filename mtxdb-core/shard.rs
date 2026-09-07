@@ -76,6 +76,19 @@ pub struct ShardStats {
     pub sync_count: u64,
 }
 
+/// Basic size, generation, and IO/sync info for one open shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardSummary {
+    /// Shard ID within the pool.
+    pub shard_id: u16,
+    /// Monotonically increasing generation counter for this shard's slot.
+    pub generation: u64,
+    /// Current on-disk file length in bytes.
+    pub file_bytes: u64,
+    /// IO/sync counters for this shard.
+    pub stats: ShardStats,
+}
+
 /// Filename for the persisted stats snapshot, stored alongside shard files.
 const STATS_FILENAME: &str = "shard_stats.bin";
 
@@ -191,6 +204,23 @@ impl Drop for Shard {
     }
 }
 
+/// Holds the writer's exclusive claim on a `base_dir` (see
+/// `ShardPool::acquire_writer_lock`). Removing the marker file on drop is
+/// what makes a clean shutdown release the lock instantly, same as real
+/// `flock` releasing on fd close — a crash instead leaves it for the next
+/// opener's staleness check (`lock_holder_is_dead`) to reclaim.
+#[cfg(not(target_arch = "wasm32"))]
+struct WriterLock {
+    path: PathBuf,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Pool of global shard files shared across all rooms.
 ///
 /// Only `MAX_SHARDS` files are open at any time, capping file descriptor
@@ -223,15 +253,72 @@ pub struct ShardPool {
     /// home until that shard fills, rather than following the global
     /// cursor wherever unrelated rooms have since moved it.
     room_home: RwLock<HashMap<[u8; 16], u16>>,
+    /// Whether this pool holds the writer lock on `base_dir` (see `open`
+    /// vs `open_read_only`). Gates `persist_stats`: a read-only pool
+    /// never writes anything, including its own (always-zero) stats
+    /// snapshot, so it can't race the real writer's.
+    writable: bool,
+    /// Present only for a writable pool — `open_read_only` takes no lock
+    /// at all, since it never writes or truncates anything (that risk
+    /// lives one layer up, in `PackfileStorage`'s room-index rebuild, not
+    /// here), so there's nothing for a reader to need exclusivity from.
+    ///
+    /// Never read: this is an RAII guard held purely for its `Drop` side
+    /// effect (removing the `.mtxdb.lock` marker file when the pool
+    /// itself drops). Its value is deliberately never inspected — only
+    /// its lifetime matters — so `#[allow(dead_code)]` here is correct,
+    /// not a lint dodge: the field genuinely has no read access by
+    /// design, the same way a `MutexGuard` binding is never "used" either.
+    /// `None` on wasm32, where there's no cross-process model to guard.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
+    writer_lock: Option<WriterLock>,
 }
 
 impl ShardPool {
-    /// Open or create a shard pool, scanning for existing shard files.
+    /// Open or create a shard pool as its exclusive writer, scanning for
+    /// existing shard files.
+    ///
+    /// Acquires an exclusive lock on `base_dir` (a `.mtxdb.lock` marker
+    /// file within it) for the pool's lifetime. A second writer opening
+    /// the same directory while this one is alive fails fast here instead
+    /// of silently risking corruption — nothing else in this engine
+    /// coordinates concurrent writers across processes; `active_write`,
+    /// `file_len`, and `append_lock` are all purely in-process state, so
+    /// two processes racing on the same shard file would interleave
+    /// writes into it with no protection at all.
     ///
     /// # Errors
-    /// Returns `io::Error` on directory read failure or packfile open failure.
+    /// Returns `io::Error` on directory read failure, packfile open
+    /// failure, or if another process already holds the writer lock.
     pub fn open(base_dir: PathBuf) -> io::Result<Self> {
+        Self::open_internal(base_dir, true)
+    }
+
+    /// Open a shard pool as a read-only observer, coexisting with a
+    /// concurrent writer on the same directory (or none at all).
+    ///
+    /// Takes no lock at all: unlike `open`, this never writes or
+    /// truncates anything — no shard creation on an empty directory
+    /// (errors instead: a read-only open of a store that doesn't exist
+    /// yet makes no sense), no persisted-stats snapshot (its own
+    /// counters, on a pool that never writes, would always be zero) —
+    /// so there's nothing here for a writer to need protecting from.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on directory read failure, or if the directory
+    /// has no shards yet.
+    pub fn open_read_only(base_dir: PathBuf) -> io::Result<Self> {
+        Self::open_internal(base_dir, false)
+    }
+
+    fn open_internal(base_dir: PathBuf, writable: bool) -> io::Result<Self> {
         fs::create_dir_all(&base_dir)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let writer_lock = writable
+            .then(|| Self::acquire_writer_lock(&base_dir))
+            .transpose()?;
 
         let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
         let mut highest_active: u16 = 0;
@@ -305,8 +392,19 @@ impl ShardPool {
             }
         }
 
-        // If no shards exist, create the initial shard 0
+        // If no shards exist, create the initial shard 0 — but a read-only
+        // open of a store that doesn't exist yet makes no sense; error
+        // instead of a read-only pool silently creating on-disk state.
         if shards.iter().all(std::option::Option::is_none) {
+            if !writable {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no shards found in {} (nothing to read)",
+                        base_dir.display()
+                    ),
+                ));
+            }
             let path = Self::shard_path(&base_dir, 0, 0);
             let file = packfile::open_packfile(&path, true)?;
             let file_len = file.metadata()?.len();
@@ -314,6 +412,13 @@ impl ShardPool {
             max_generation = 1;
         }
 
+        // Restoring is a pure read of shard_stats.bin applied to our own
+        // in-memory Shard objects — unconditional regardless of writable.
+        // A read-only pool must never *write* a new snapshot (its own
+        // counters are always zero, since it never writes or syncs), but
+        // it absolutely should show whatever the real writer already
+        // persisted — that's the entire point of a `shards`-style
+        // inspection tool being able to see real numbers at all.
         Self::restore_persisted_stats(&base_dir, &shards);
 
         Ok(Self {
@@ -325,7 +430,79 @@ impl ShardPool {
             next_generation: AtomicU64::new(max_generation),
             retired_count: AtomicU64::new(0),
             room_home: RwLock::new(HashMap::new()),
+            writable,
+            #[cfg(not(target_arch = "wasm32"))]
+            writer_lock,
         })
+    }
+
+    /// Claim the writer lock on `base_dir`: atomically create a
+    /// `.mtxdb.lock` marker file, which fails with `AlreadyExists` if
+    /// another writer already holds it. Pure `std::fs` — no OS-level
+    /// advisory-lock API and no dependency, so it needs one thing real
+    /// `flock` gives for free: recovery if the previous holder crashed
+    /// without cleaning up (`WriterLock`'s `Drop` handles the clean-exit
+    /// case). We store our PID in the file and, if creation fails because
+    /// it already exists, check whether that PID is still alive
+    /// (`/proc/<pid>` on Linux) before concluding the lock is genuinely
+    /// held — a stale file from a killed process is removed and retried
+    /// once rather than wrongly blocking forever.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn acquire_writer_lock(base_dir: &Path) -> io::Result<WriterLock> {
+        let lock_path = base_dir.join(".mtxdb.lock");
+        match Self::try_create_lock_file(&lock_path) {
+            Ok(()) => Ok(WriterLock { path: lock_path }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if Self::lock_holder_is_dead(&lock_path) {
+                    let _ = fs::remove_file(&lock_path);
+                    Self::try_create_lock_file(&lock_path)?;
+                    return Ok(WriterLock { path: lock_path });
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is already locked by another writer process",
+                        base_dir.display()
+                    ),
+                ))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Atomically create the lock file and write our PID into it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_create_lock_file(lock_path: &Path) -> io::Result<()> {
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)?;
+        write!(file, "{}", std::process::id())?;
+        file.sync_all()
+    }
+
+    /// Best-effort liveness check for whoever wrote `lock_path`'s PID.
+    /// Only actually verifies anything on Linux (`/proc/<pid>`); anywhere
+    /// else this conservatively assumes the holder might still be alive
+    /// (never falsely steals a lock, at the cost of a stale lock from a
+    /// hard crash needing manual cleanup on those platforms).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lock_holder_is_dead(lock_path: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(contents) = fs::read_to_string(lock_path) else {
+                return false;
+            };
+            let Ok(pid) = contents.trim().parse::<u32>() else {
+                return false;
+            };
+            !Path::new(&format!("/proc/{pid}")).exists()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = lock_path;
+            false
+        }
     }
 
     /// Seed a room's home shard — used at startup to approximate where a
@@ -482,6 +659,24 @@ impl ShardPool {
             .filter_map(|(i, slot)| {
                 slot.as_ref()
                     .map(|shard| (u16::try_from(i).unwrap_or(u16::MAX), shard.stats()))
+            })
+            .collect()
+    }
+
+    /// List every currently-open shard with basic size, generation, and
+    /// IO/sync stats. Needs no room data at all — the shard-only path a
+    /// `mtxdb shards`-style inspection tool should use directly (via
+    /// `open_read_only`) rather than opening a full `PackfileStorage`,
+    /// which rebuilds every room's index and thus needs the writer lock.
+    #[must_use]
+    pub fn summaries(&self) -> Vec<ShardSummary> {
+        self.all_shards()
+            .into_iter()
+            .map(|(shard_id, shard)| ShardSummary {
+                shard_id,
+                generation: shard.generation,
+                file_bytes: shard.file_len(),
+                stats: shard.stats(),
             })
             .collect()
     }
@@ -704,7 +899,14 @@ impl ShardPool {
     /// a failure here (e.g. the base directory momentarily gone during test
     /// teardown) is logged and swallowed -- it must never turn a durable
     /// data sync that actually succeeded into a hard error for the caller.
+    ///
+    /// No-op for a read-only pool: it never writes anything, so its own
+    /// counters are always zero and would only ever overwrite the real
+    /// writer's snapshot with nothing of value.
     fn persist_stats_best_effort(&self) {
+        if !self.writable {
+            return;
+        }
         if let Err(e) = self.persist_stats() {
             eprintln!("mtxdb: failed to persist shard IO/sync stats: {e}");
         }
@@ -1009,22 +1211,18 @@ mod tests {
     /// so concurrent persists from separate pools never collide.
     #[test]
     fn test_concurrent_persist_stats_does_not_race() {
+        // A single writable pool (only one can ever exist per directory
+        // now — see the writer-lock tests below), shared across threads
+        // within this one process — the realistic scenario for the
+        // tmp-filename-uniqueness fix, since cross-process contention on
+        // the same directory is now prevented entirely by the writer lock
+        // rather than needing to be tolerated here.
         let dir = test_dir("persist_stats_race");
+        let pool = Arc::new(ShardPool::open(dir.clone()).unwrap());
 
-        // Multiple ShardPool instances sharing one base_dir, standing in
-        // for multiple processes (real cross-process contention needs a
-        // shared dir between separate binaries, which a unit test can't
-        // spawn — but the tmp-path race is per-`persist_stats`-call, not
-        // tied to any single pool's other state, so racing several
-        // in-process pools against the same directory exercises the same
-        // failure mode).
-        let pools: Vec<ShardPool> = (0..8)
-            .map(|_| ShardPool::open(dir.clone()).unwrap())
-            .collect();
-
-        let handles: Vec<_> = pools
-            .into_iter()
-            .map(|pool| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
                 std::thread::spawn(move || {
                     for _ in 0..25 {
                         pool.persist_stats().unwrap();
@@ -1050,6 +1248,88 @@ mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
         assert!(!leftover_tmp, "a persist_stats tmp file was left behind");
+    }
+
+    /// Core invariant of the writer lock: at most one writer per
+    /// `base_dir`. A second `open` while the first is still alive must
+    /// fail fast rather than silently risking the interleaved-append
+    /// corruption this lock exists to prevent.
+    #[test]
+    fn test_second_writer_fails_while_first_is_open() {
+        let dir = test_dir("writer_lock_exclusive");
+        let _first = ShardPool::open(dir.clone()).unwrap();
+
+        let second = ShardPool::open(dir.clone());
+        assert!(
+            second.is_err(),
+            "a second writer must not be able to open the same base_dir concurrently"
+        );
+    }
+
+    /// Dropping the writer releases its lock immediately (via
+    /// `WriterLock`'s `Drop` removing the marker file), so a subsequent
+    /// open — not concurrent with the first — must succeed normally.
+    #[test]
+    fn test_writer_lock_releases_on_drop() {
+        let dir = test_dir("writer_lock_release");
+        let first = ShardPool::open(dir.clone()).unwrap();
+        drop(first);
+
+        let second = ShardPool::open(dir.clone());
+        assert!(
+            second.is_ok(),
+            "a new writer must be able to open once the previous one has dropped"
+        );
+    }
+
+    /// A read-only open takes no lock at all (it never writes or
+    /// truncates anything), so it must succeed even while a writer is
+    /// actively holding the directory — this is the actual scenario a
+    /// `mtxdb shards`-style inspection tool needs to work at all.
+    #[test]
+    fn test_read_only_coexists_with_active_writer() {
+        let dir = test_dir("writer_lock_reader_coexist");
+        let writer = ShardPool::open(dir.clone()).unwrap();
+
+        let reader = ShardPool::open_read_only(dir.clone());
+        assert!(
+            reader.is_ok(),
+            "a read-only open must coexist with an active writer, not be excluded by its lock"
+        );
+
+        drop(writer);
+    }
+
+    /// A read-only pool must never write a stats snapshot (its own
+    /// counters are always zero), but it absolutely must *restore* the
+    /// real writer's already-persisted one — otherwise a `shards`-style
+    /// inspection tool built on `open_read_only` would always show
+    /// `write_count`/`bytes_written`/`sync_count` as 0 regardless of how much
+    /// real activity the writer has persisted, while file size (read
+    /// live off disk, independent of the stats file) correctly grows —
+    /// exactly the confusing "bytes climbing, everything else frozen at
+    /// zero" symptom this test guards against.
+    #[test]
+    fn test_read_only_open_restores_persisted_stats() {
+        let dir = test_dir("read_only_restores_stats");
+
+        let writer = ShardPool::open(dir.clone()).unwrap();
+        let record = test_record(0x01, 0xAA, b"payload");
+        writer.put_record(&record).unwrap();
+        writer.sync_dirty().unwrap();
+        let persisted = writer.get_shard(0).unwrap().stats();
+        assert!(
+            persisted.write_count > 0,
+            "test setup: writer must have written something"
+        );
+        drop(writer);
+
+        let reader = ShardPool::open_read_only(dir).unwrap();
+        let restored = reader.get_shard(0).unwrap().stats();
+        assert_eq!(
+            restored, persisted,
+            "a read-only open must restore the real writer's persisted stats, not start at zero"
+        );
     }
 
     #[test]
