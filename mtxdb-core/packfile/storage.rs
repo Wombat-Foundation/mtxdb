@@ -20,6 +20,21 @@ use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
 /// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
 
+/// Result of [`PackfileStorage::plan_room_repack`] — what a real repack
+/// of this room would do, computed exactly (same scan + reachability
+/// pass) but without performing any writes.
+#[derive(Debug, Clone, Default)]
+pub struct RepackPlan {
+    /// Records that would survive (be kept) by this repack.
+    pub kept: usize,
+    /// Records that would be dropped (found unreachable) by this repack.
+    pub dropped: usize,
+    /// Total on-disk frame bytes of the records that would be kept.
+    pub kept_bytes: u64,
+    /// Every shard id at least one kept record currently lives in.
+    pub shards_touched: Vec<u16>,
+}
+
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
 ///
 /// Without a cap, a walk whose `stop_at` set is never reached (e.g. the
@@ -1240,6 +1255,128 @@ impl PackfileStorage {
                 live_map: next_live_map,
             },
         );
+    }
+
+    /// Non-mutating preview of what [`Self::repack_room_reachable`] would
+    /// do for `room_id`: runs the exact same scan + reachability
+    /// computation (so kept/dropped counts are exact, not estimates), but
+    /// performs no writes, no index swap, and no incremental-repack
+    /// cursor update. Used to preview a repack's effect before committing
+    /// to it — e.g. a shard-compaction preflight that needs "how many
+    /// bytes would survive, and which shards do they currently live in"
+    /// without actually rewriting anything.
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O or corruption.
+    pub fn plan_room_repack(
+        &self,
+        room_id: &[u8; 16],
+        extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+    ) -> Result<RepackPlan, StorageError> {
+        let hash_to_shard_offset = self.repack_scan_incremental(room_id)?;
+        let pinned = self.pin_shards(hash_to_shard_offset.values().map(|&(id, _)| id));
+
+        let roots = self.live_roots.read().get(room_id).cloned();
+        let (live_hashes, _adjacency) = match roots {
+            Some(roots) if !roots.is_empty() => {
+                Self::bfs_live_set(&roots, &hash_to_shard_offset, &pinned, &extract_edges)?
+            }
+            _ => Self::scan_full_adjacency(&hash_to_shard_offset, &pinned, &extract_edges)?,
+        };
+        let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
+
+        let mut kept_bytes: u64 = 0;
+        let mut shards_touched: HashSet<u16> = HashSet::new();
+        for hash in &live_hashes {
+            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(hash) else {
+                continue;
+            };
+            shards_touched.insert(shard_id);
+            if let Some(shard) = pinned.get(&shard_id) {
+                if let Ok(record) = Self::read_at(shard, offset) {
+                    kept_bytes = kept_bytes
+                        .saturating_add(u64::try_from(record.serialized_len()).unwrap_or(u64::MAX));
+                }
+            }
+        }
+
+        let mut shards_touched: Vec<u16> = shards_touched.into_iter().collect();
+        shards_touched.sort_unstable();
+        Ok(RepackPlan {
+            kept: live_hashes.len(),
+            dropped,
+            kept_bytes,
+            shards_touched,
+        })
+    }
+
+    /// Finds every room and shard transitively reachable from
+    /// `start_shard` via the room↔shard reference relation: rooms
+    /// referencing this shard, the other shards those rooms reference,
+    /// the rooms referencing *those* shards, and so on until nothing new
+    /// is found. In practice this converges immediately in almost every
+    /// case — a room typically has a live footprint on only one or two
+    /// shards (sticky home routing) — but the closure has to be computed
+    /// rather than assumed, since a room-scoped repack can't correctly
+    /// judge liveness by looking at only one shard's slice of that room's
+    /// data (see [`Self::rooms_referencing_shard`]'s doc).
+    ///
+    /// This is the basis for a shard-compaction preflight: you can't
+    /// truthfully say "this touches N rooms across K shards" without
+    /// first finding the full closure, not just the one shard the
+    /// operation was originally pointed at.
+    ///
+    /// # Errors
+    /// Returns `StorageError` if `start_shard` isn't an open shard.
+    pub fn repack_closure(
+        &self,
+        start_shard: u16,
+    ) -> Result<(Vec<[u8; 16]>, Vec<u16>), StorageError> {
+        let mut rooms: HashSet<[u8; 16]> = HashSet::new();
+        let mut shards: HashSet<u16> = HashSet::new();
+        let mut shard_queue = vec![start_shard];
+        let mut room_queue: Vec<[u8; 16]> = Vec::new();
+
+        loop {
+            if let Some(shard_id) = shard_queue.pop() {
+                if shards.insert(shard_id) {
+                    for room_id in self.rooms_referencing_shard(shard_id)? {
+                        if rooms.insert(room_id) {
+                            room_queue.push(room_id);
+                        }
+                    }
+                }
+            } else if let Some(room_id) = room_queue.pop() {
+                for shard_id in self.room_referenced_shards(&room_id) {
+                    if !shards.contains(&shard_id) {
+                        shard_queue.push(shard_id);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let mut rooms: Vec<[u8; 16]> = rooms.into_iter().collect();
+        rooms.sort_unstable();
+        let mut shards: Vec<u16> = shards.into_iter().collect();
+        shards.sort_unstable();
+        Ok((rooms, shards))
+    }
+
+    /// Every shard id `room_id`'s current index has at least one live
+    /// entry pointing into. Empty if the room doesn't exist.
+    #[must_use]
+    pub fn room_referenced_shards(&self, room_id: &[u8; 16]) -> Vec<u16> {
+        let Some(gen) = self.generation(room_id) else {
+            return Vec::new();
+        };
+        gen.index
+            .referenced_shard_ids()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &referenced)| referenced.then(|| u16::try_from(i).ok()).flatten())
+            .collect()
     }
 
     /// # Errors
@@ -3093,6 +3230,114 @@ mod tests {
             vec![(OTHER_ROOM, 1)],
             "a deleted room must not linger in the persisted directory"
         );
+    }
+
+    #[test]
+    fn test_plan_room_repack_matches_real_repack_without_mutating() {
+        let dir = test_dir("plan_matches_real");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        for i in 0..5u8 {
+            store
+                .put(
+                    &TEST_ROOM,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        // Duplicate a hash's payload under a fresh id to create something
+        // dedup would drop... actually LossyIndex already dedups by hash
+        // on insert, so instead exercise the "no live roots: keep
+        // everything" path, which is what --root-less usage always hits.
+        let plan = store
+            .plan_room_repack(&TEST_ROOM, |_hash, _data| Vec::new())
+            .unwrap();
+        assert_eq!(plan.kept, 5);
+        assert_eq!(plan.dropped, 0);
+        assert!(plan.kept_bytes > 0);
+        assert_eq!(plan.shards_touched, vec![0]);
+
+        // The dry run must not have mutated anything: a real repack run
+        // right after must see the exact same room state and produce the
+        // exact same result.
+        let (kept, dropped) = store
+            .repack_room_reachable(&TEST_ROOM, |_hash, _data| Vec::new())
+            .unwrap();
+        assert_eq!(kept, plan.kept);
+        assert_eq!(dropped, plan.dropped);
+    }
+
+    #[test]
+    fn test_repack_closure_single_room_single_shard() {
+        let dir = test_dir("closure_trivial");
+        let store = PackfileStorage::open(dir).unwrap();
+        store
+            .put(
+                &TEST_ROOM,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"x")),
+            )
+            .unwrap();
+
+        let (rooms, shards) = store.repack_closure(0).unwrap();
+        assert_eq!(rooms, vec![TEST_ROOM]);
+        assert_eq!(shards, vec![0]);
+    }
+
+    #[test]
+    fn test_repack_closure_pulls_in_rooms_second_shard_transitively() {
+        // Room A lives on shards {0, 1} (spans a rotation). Room B lives
+        // only on shard 1. Starting the closure from shard 0 must still
+        // discover shard 1 (because room A references it) and, through
+        // shard 1, room B — even though room B never touched shard 0 at
+        // all.
+        let dir = test_dir("closure_transitive");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        store
+            .put(
+                &TEST_ROOM,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"a-on-shard-0")),
+            )
+            .unwrap();
+
+        // Force rotation so TEST_ROOM's next write lands on a new shard.
+        store.shards.active_shard().file_len.store(
+            shard::MAX_SHARD_BYTES - 10,
+            std::sync::atomic::Ordering::Release,
+        );
+        store
+            .put(
+                &TEST_ROOM,
+                &distinct_id(1),
+                &NodeData::new(bytes::Bytes::from_static(b"a-on-shard-1")),
+            )
+            .unwrap();
+
+        store
+            .put(
+                &OTHER_ROOM,
+                &distinct_id(2),
+                &NodeData::new(bytes::Bytes::from_static(b"b-on-shard-1")),
+            )
+            .unwrap();
+
+        let (mut rooms, mut shards) = store.repack_closure(0).unwrap();
+        rooms.sort_unstable();
+        shards.sort_unstable();
+        let mut expected_rooms = vec![TEST_ROOM, OTHER_ROOM];
+        expected_rooms.sort_unstable();
+        assert_eq!(rooms, expected_rooms);
+        assert_eq!(shards, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_room_referenced_shards_empty_for_unknown_room() {
+        let dir = test_dir("referenced_shards_unknown");
+        let store = PackfileStorage::open(dir).unwrap();
+        assert_eq!(store.room_referenced_shards(&TEST_ROOM), Vec::<u16>::new());
     }
 
     #[test]
