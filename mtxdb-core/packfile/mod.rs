@@ -177,7 +177,8 @@ pub fn write_header(writer: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Read and validate the packfile header. Accepts version 0x02 (current).
+/// Read and validate the packfile header. Accepts version 0x01 (current
+/// and, so far, only format `write_header` has ever produced).
 ///
 /// # Errors
 /// Returns `io::Error` on read failure.
