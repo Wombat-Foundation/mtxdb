@@ -233,6 +233,24 @@ impl LossyIndex {
             .wrapping_add(std::mem::size_of::<Self>())
     }
 
+    /// Returns which shard IDs are referenced by at least one occupied slot.
+    ///
+    /// Used by shard retirement to determine which shards are still live
+    /// across all rooms before freeing a pool slot.
+    #[must_use]
+    pub fn referenced_shard_ids(&self) -> [bool; crate::shard::MAX_SHARDS] {
+        let mut seen = [false; crate::shard::MAX_SHARDS];
+        for slot in &self.slots {
+            if !slot.is_empty() {
+                let id = slot.shard_id() as usize;
+                if id < crate::shard::MAX_SHARDS {
+                    seen[id] = true;
+                }
+            }
+        }
+        seen
+    }
+
     /// Serialize the index to bytes for persistence.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {

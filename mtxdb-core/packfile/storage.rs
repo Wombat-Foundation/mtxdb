@@ -112,11 +112,16 @@ impl PackfileStorage {
         // the index can be sized once for the true total.
         let mut room_entries: HashMap<[u8; 16], Vec<ShardRecord>> = HashMap::new();
         let mut room_order: Vec<[u8; 16]> = Vec::new();
-        for shard_id in 0..shard::MAX_SHARDS_U8 {
-            let path = ShardPool::shard_path(&base_dir, shard_id);
-            if !path.exists() {
-                continue;
-            }
+
+        // Collect open shard info (slot, path) before the scan loop so we
+        // don't hold the shards read-lock across the I/O-heavy scan.
+        let open_shards: Vec<(u8, PathBuf)> = shards
+            .all_shards()
+            .into_iter()
+            .map(|(id, shard)| (id, shard.path.clone()))
+            .collect();
+
+        for (shard_id, path) in open_shards {
             let entries = match packfile::scan_and_recover_packfile(&path) {
                 Ok(e) => e,
                 Err(recovery_err) => {
@@ -274,12 +279,8 @@ impl PackfileStorage {
 
     fn scan_room_records(&self, room_id: &[u8; 16]) -> Vec<ScannedShard> {
         let mut scanned: Vec<ScannedShard> = Vec::new();
-        for shard_id in 0..shard::MAX_SHARDS_U8 {
-            let path = ShardPool::shard_path(&self.base_dir, shard_id);
-            if !path.exists() {
-                continue;
-            }
-            match packfile::scan_packfile(&path) {
+        for (shard_id, shard) in self.shards.all_shards() {
+            match packfile::scan_packfile(&shard.path) {
                 Ok(entries) => {
                     let room_entries: Vec<([u8; 16], u64)> = entries
                         .into_iter()
@@ -671,8 +672,53 @@ impl PackfileStorage {
 
         let index = Self::build_index(&new_offsets);
         self.swap_generation(room_id, index);
+        self.retire_empty_shards(room_id);
 
         Ok((kept, dropped))
+    }
+
+    /// After a repack, scan all rooms' indexes and retire any shard that
+    /// no room references.
+    ///
+    /// Acquires every room's `put_mutex` (in sorted order, skipping the
+    /// caller's already-held lock) to prevent a concurrent `put()` from
+    /// landing a write in a shard whose index entry hasn't been inserted
+    /// yet — without that, the scan could see zero references to a shard
+    /// that a writer just committed bytes to but hasn't index-updated yet,
+    /// causing a live shard to be retired under it.
+    fn retire_empty_shards(&self, held_room: &[u8; 16]) {
+        let rooms = self.rooms.read();
+
+        // Collect room IDs in sorted order for deadlock-free lock acquisition.
+        // Skip the room whose put_mutex the caller already holds.
+        let mut rooms_to_lock: Vec<[u8; 16]> = rooms
+            .keys()
+            .filter(|id| *id != held_room)
+            .copied()
+            .collect();
+        rooms_to_lock.sort_unstable();
+
+        // Acquire all other rooms' put_mutexes. The sorted order prevents
+        // deadlocks; the held room is skipped (parking_lot is non-reentrant).
+        let mutexes: Vec<_> = rooms_to_lock.iter().map(|id| self.put_mutex(id)).collect();
+        let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+
+        // Build the union of shard IDs referenced across all rooms.
+        let mut referenced = [false; shard::MAX_SHARDS];
+        for gen_swap in rooms.values() {
+            let gen = gen_swap.load();
+            let ids = gen.index.referenced_shard_ids();
+            for (i, &has_refs) in ids.iter().enumerate() {
+                referenced[i] |= has_refs;
+            }
+        }
+
+        // Retire any shard not in the union.
+        for id in 0..shard::MAX_SHARDS_U8 {
+            if !referenced[id as usize] {
+                self.shards.retire_slot(id);
+            }
+        }
     }
 }
 
@@ -1522,6 +1568,76 @@ mod tests {
                 "rotation should reclaim a garbage-only shard slot after repack, \
                  not report the pool as permanently full",
             );
+    }
+
+    /// Repack must not retire a shard that another room's index still
+    /// references.  This test puts live records from two different rooms
+    /// into the same shard, then repacks only room A — the shared shard
+    /// must survive because room B's index still points into it.
+    #[test]
+    fn test_repack_does_not_retire_shard_referenced_by_other_room() {
+        let dir = test_dir("repack_cross_room_safety");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Put a record for room A — lands on shard 0.
+        let mut root_a = [0u8; 16];
+        root_a[0] = 0xAA;
+        store
+            .put(
+                &TEST_ROOM,
+                &root_a,
+                &NodeData::new(bytes::Bytes::from_static(b"room A root")),
+            )
+            .unwrap();
+
+        // Force a rotation so the next write goes to a different shard.
+        store.shards.active_shard().file_len.store(
+            shard::MAX_SHARD_BYTES - 10,
+            std::sync::atomic::Ordering::Release,
+        );
+
+        // Put a record for room B — lands on shard 1.
+        let mut root_b = [0u8; 16];
+        root_b[0] = 0xBB;
+        store
+            .put(
+                &OTHER_ROOM,
+                &root_b,
+                &NodeData::new(bytes::Bytes::from_static(b"room B root")),
+            )
+            .unwrap();
+
+        // Force another rotation and put more room A garbage on shard 2.
+        store.shards.active_shard().file_len.store(
+            shard::MAX_SHARD_BYTES - 10,
+            std::sync::atomic::Ordering::Release,
+        );
+        let mut garbage = [0u8; 16];
+        garbage[0] = 0xCC;
+        store
+            .put(
+                &TEST_ROOM,
+                &garbage,
+                &NodeData::new(bytes::Bytes::from_static(b"garbage")),
+            )
+            .unwrap();
+
+        // Repack room A with only root_a as live.  The garbage record
+        // should be dropped, but shard 1 (which holds room B's root)
+        // must NOT be retired.
+        store.set_live_roots(&TEST_ROOM, vec![root_a]);
+        let (kept, dropped) = store
+            .repack_room_reachable(&TEST_ROOM, |_hash, _data| Vec::new())
+            .unwrap();
+        assert_eq!(kept, 1);
+        assert!(dropped > 0);
+
+        // Room B's root must still be retrievable — shard 1 was not retired.
+        let got = store.get(&OTHER_ROOM, &root_b).unwrap();
+        assert!(
+            got.is_some(),
+            "room B root must survive repack of room A — shared shard must not be retired",
+        );
     }
 
     #[test]
