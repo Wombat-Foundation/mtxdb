@@ -128,6 +128,11 @@ impl ShardPool {
         let mut highest_active: u8 = 0;
         let mut max_generation: u64 = 0;
 
+        // Track the highest generation seen per slot so we can reject
+        // stale files left behind by a crash between rotate() creating a
+        // new generation and the old generation's Drop deleting it.
+        let mut best_generation: [Option<u64>; MAX_SHARDS] = [None; MAX_SHARDS];
+
         // Scan for existing shard files.  Supports two filename formats:
         //   shard_XX.pack          — legacy (generation 0)
         //   shard_XX_YYYYYYYY.pack — generation-tracked (YYYY = hex u64)
@@ -155,9 +160,25 @@ impl ShardPool {
 
             if let Ok(id) = u8::from_str_radix(slot_hex, 16) {
                 if id < MAX_SHARDS_U8 {
+                    // If we already have a generation for this slot and the
+                    // current file is not newer, it's stale — delete it.
+                    if let Some(prev) = best_generation[id as usize] {
+                        if prev >= generation {
+                            let _ = fs::remove_file(&path);
+                            continue;
+                        }
+                    }
+
+                    // We have a strictly newer generation — drop the old one
+                    // and its file before installing the new shard.
+                    if let Some(old) = shards[id as usize].take() {
+                        let _ = fs::remove_file(&old.path);
+                    }
+
                     let file = packfile::open_packfile(&path, false)?;
                     let file_len = file.metadata()?.len();
                     let shard = Arc::new(Shard::new(id, generation, file, path, file_len));
+                    best_generation[id as usize] = Some(generation);
                     shards[id as usize] = Some(shard);
                     if id > highest_active {
                         highest_active = id;
@@ -635,6 +656,62 @@ mod tests {
         assert!(
             !path.exists(),
             "retired shard's file should be deleted once its last reference drops"
+        );
+    }
+
+    /// Crash-recovery: if two generation files exist for the same slot
+    /// (e.g. a crash landed between `rotate()` creating a new generation
+    /// and the old generation's `Drop` deleting its file), the scan must
+    /// keep the higher generation and delete the stale one.
+    #[test]
+    fn test_scan_keeps_highest_generation_per_slot() {
+        let dir = test_dir("scan_generation_dedup");
+        let pool = ShardPool::open(dir.clone()).unwrap();
+
+        // Write a record so shard 0 exists (generation 0).
+        let record = test_record(0x01, 0xAA, b"live data");
+        pool.put_record(&record).unwrap();
+        drop(pool);
+
+        // Promote the live file to generation 99 (simulating that rotate()
+        // created a newer generation before a crash left a stale gen-0 file
+        // behind).
+        let live_path = ShardPool::shard_path(&dir, 0, 99);
+        let old_path = ShardPool::shard_path(&dir, 0, 0);
+        std::fs::rename(&old_path, &live_path).unwrap();
+
+        // Create a stale gen-0 file (the crash leftover).
+        let mut buf = Vec::new();
+        packfile::write_header(&mut buf).unwrap();
+        packfile::write_record(
+            &mut buf,
+            &packfile::Record {
+                room_id: [0xFF; 16],
+                hash: [0xBB; 16],
+                data: bytes::Bytes::from_static(b"stale leftover"),
+            },
+        )
+        .unwrap();
+        std::fs::write(&old_path, &buf).unwrap();
+
+        // Both files exist on disk.
+        assert!(live_path.exists(), "live gen-99 file missing");
+        assert!(old_path.exists(), "stale gen-0 file missing");
+
+        // Reopen the pool — the scan must keep gen 99, delete gen 0.
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        let shard = pool.get_shard(0).unwrap();
+        assert_eq!(
+            shard.generation, 99,
+            "scan should have kept the higher generation"
+        );
+        assert_eq!(shard.path, live_path);
+        drop(pool);
+
+        // The stale gen-0 file must have been cleaned up by the scan.
+        assert!(
+            !old_path.exists(),
+            "stale generation file should be deleted during scan"
         );
     }
 }
