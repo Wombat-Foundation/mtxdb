@@ -652,6 +652,14 @@ impl PackfileStorage {
         ShardPool::read_at(shard, offset)
     }
 
+    /// The record's actual on-disk byte length (see
+    /// [`ShardPool::record_disk_len_at`]) — the true disk-usage figure,
+    /// unlike `Record::serialized_len()` which is an uncompressed upper
+    /// bound.
+    fn record_disk_len_at(shard: &Shard, offset: u64) -> Result<u64, StorageError> {
+        ShardPool::record_disk_len_at(shard, offset)
+    }
+
     fn scan_room_records(&self, room_id: &[u8; 16]) -> Result<Vec<ScannedShard>, StorageError> {
         let mut scanned: Vec<ScannedShard> = Vec::new();
         for (shard_id, shard) in self.shards.all_shards() {
@@ -1513,8 +1521,11 @@ impl PackfileStorage {
         let mut shards_touched: HashSet<u16> = HashSet::new();
         for (hash, &(shard_id, offset)) in hash_to_shard_offset {
             if let Some(shard) = pinned.get(&shard_id) {
-                if let Ok(record) = Self::read_at(shard, offset) {
-                    let bytes = u64::try_from(record.serialized_len()).unwrap_or(u64::MAX);
+                // Actual on-disk bytes, not the uncompressed upper bound —
+                // a repack preflight should report what will really be
+                // reclaimed/kept, which is smaller than plaintext size for
+                // any frame that compressed.
+                if let Ok(bytes) = Self::record_disk_len_at(shard, offset) {
                     if live_set.contains(hash) {
                         shards_touched.insert(shard_id);
                         kept_bytes = kept_bytes.saturating_add(bytes);

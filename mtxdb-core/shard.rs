@@ -794,9 +794,15 @@ impl ShardPool {
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
         let mut shard = self.shard_for_room(&record.room_id);
         loop {
-            let record_len = record.serialized_len() as u64;
+            // Uncompressed upper bound, used only for the pre-write
+            // capacity check below — `write_record` may compress the
+            // payload and write fewer bytes than this, but never more,
+            // so checking against this bound never lets a shard overflow
+            // MAX_SHARD_BYTES; it may just rotate a little earlier than
+            // strictly necessary when compression would have made it fit.
+            let max_record_len = record.serialized_len() as u64;
 
-            let offset = {
+            let (offset, record_len) = {
                 let guard = shard.append_lock.lock();
                 let mut file = shard.file.try_clone()?;
                 let offset = file.seek(io::SeekFrom::End(0))?;
@@ -806,7 +812,7 @@ impl ShardPool {
                 // threads both pass the check then one exceeds the limit.
                 let current_len = shard.file_len.load(Ordering::Acquire);
                 let fits = current_len
-                    .checked_add(record_len)
+                    .checked_add(max_record_len)
                     .is_some_and(|sum| sum <= MAX_SHARD_BYTES);
                 if !fits && current_len > packfile::HEADER_LEN as u64 {
                     drop(guard);
@@ -815,12 +821,14 @@ impl ShardPool {
                     continue;
                 }
 
-                packfile::write_record(&mut file, record)?;
+                // The actual on-disk length — may be smaller than
+                // `max_record_len` when the payload compressed.
+                let record_len = packfile::write_record(&mut file, record)?;
                 let new_len = offset.checked_add(record_len).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "offset + record_len overflow")
                 })?;
                 shard.file_len.store(new_len, Ordering::Release);
-                offset
+                (offset, record_len)
             };
 
             shard.write_count.fetch_add(1, Ordering::Relaxed);
@@ -828,6 +836,71 @@ impl ShardPool {
             self.dirty.lock().insert(shard.shard_id);
             return Ok((shard.shard_id, offset));
         }
+    }
+
+    /// The actual on-disk byte length of the frame at `offset` — length
+    /// prefix (4) + frame body + CRC (4). Unlike [`serialized_len`]
+    /// (an uncompressed upper bound computed from a decoded `Record`),
+    /// this reflects compression: it's read straight off the length
+    /// prefix, without decompressing (or even reading) the node bytes.
+    /// Used for disk-usage accounting (e.g. repack preflight), where an
+    /// uncompressed estimate would overstate what a repack actually
+    /// reclaims.
+    ///
+    /// [`serialized_len`]: crate::packfile::Record::serialized_len
+    ///
+    /// # Errors
+    /// Returns `StorageError::Corrupt` on a truncated/invalid length
+    /// prefix, `StorageError::Io` on I/O failure.
+    ///
+    /// # Panics
+    /// Panics only on internal invariant violation (unreachable path).
+    pub fn record_disk_len_at(
+        shard: &Shard,
+        offset: u64,
+    ) -> Result<u64, crate::storage::StorageError> {
+        use crate::storage::StorageError;
+
+        // 1-byte flags + 4-byte uncompressed_len + 16-byte room_id + 16-byte hash.
+        const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
+
+        for attempt in 0..2 {
+            let guard = shard.mmap().map_err(StorageError::Io)?;
+            let Some(mem) = guard.as_deref() else {
+                return Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "shard could not be mapped",
+                )));
+            };
+
+            let offset_usize = usize::try_from(offset)
+                .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
+
+            if offset_usize
+                .checked_add(4)
+                .map_or(true, |end| end > mem.len())
+            {
+                if attempt == 0 {
+                    drop(guard);
+                    Self::remap_shard(shard)?;
+                    continue;
+                }
+                return Err(StorageError::Corrupt("truncated length prefix".into()));
+            }
+
+            let prefix_end = offset_usize.checked_add(4).expect("checked above");
+            let frame_len_bytes: [u8; 4] = mem[offset_usize..prefix_end].try_into().unwrap();
+            let frame_len = u32::from_le_bytes(frame_len_bytes);
+
+            if !(FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
+                return Err(StorageError::Corrupt(format!(
+                    "invalid record length: {frame_len}"
+                )));
+            }
+
+            return Ok(4_u64.wrapping_add(u64::from(frame_len)).wrapping_add(4));
+        }
+        unreachable!("record_disk_len_at remap-retry is bounded to two iterations")
     }
 
     /// Read a record from a specific shard at the given offset.
@@ -840,6 +913,9 @@ impl ShardPool {
     /// Panics only on internal invariant violation (unreachable path).
     pub fn read_at(shard: &Shard, offset: u64) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
+
+        // 1-byte flags + 4-byte uncompressed_len + 16-byte room_id + 16-byte hash.
+        const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
 
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
@@ -863,19 +939,19 @@ impl ShardPool {
             }
 
             let prefix_end = offset.checked_add(4).expect("checked above");
-            let payload_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
-            let payload_len = u32::from_le_bytes(payload_len_bytes);
+            let frame_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
+            let frame_len = u32::from_le_bytes(frame_len_bytes);
 
-            if !(32..=packfile::MAX_RECORD_LEN).contains(&payload_len) {
+            if !(FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
                 return Err(StorageError::Corrupt(format!(
-                    "invalid record length: {payload_len}"
+                    "invalid record length: {frame_len}"
                 )));
             }
 
-            let payload_len_usize = payload_len as usize;
+            let frame_len_usize = frame_len as usize;
             let crc_pos = prefix_end
-                .checked_add(payload_len_usize)
-                .ok_or_else(|| StorageError::Corrupt("prefix_end + payload_len overflow".into()))?;
+                .checked_add(frame_len_usize)
+                .ok_or_else(|| StorageError::Corrupt("prefix_end + frame_len overflow".into()))?;
             let frame_end = crc_pos
                 .checked_add(4)
                 .ok_or_else(|| StorageError::Corrupt("crc_pos + 4 overflow".into()))?;
@@ -892,8 +968,10 @@ impl ShardPool {
             let payload = &mem[prefix_end..crc_pos];
             let crc_buf: [u8; 4] = mem[crc_pos..frame_end].try_into().unwrap();
 
+            // Verify CRC over the bytes as written (compressed, if
+            // compressed) before attempting any decompression below.
             let mut crc = crc32fast::Hasher::new();
-            crc.update(&payload_len_bytes);
+            crc.update(&frame_len_bytes);
             crc.update(payload);
             let expected = crc.finalize();
             let actual = u32::from_le_bytes(crc_buf);
@@ -903,11 +981,41 @@ impl ShardPool {
                 )));
             }
 
+            let flags = payload[0];
+            if flags & !packfile::FLAG_COMPRESSED != 0 {
+                return Err(StorageError::Corrupt(format!(
+                    "unsupported record flags: {flags:#04x}"
+                )));
+            }
+            let uncompressed_len = u32::from_le_bytes(payload[1..5].try_into().unwrap());
             let mut room_id = [0u8; 16];
-            room_id.copy_from_slice(&payload[..16]);
+            room_id.copy_from_slice(&payload[5..21]);
             let mut hash = [0u8; 16];
-            hash.copy_from_slice(&payload[16..32]);
-            let data = bytes::Bytes::copy_from_slice(&payload[32..]);
+            hash.copy_from_slice(&payload[21..37]);
+            let node_bytes = &payload[37..];
+
+            let data = if flags & packfile::FLAG_COMPRESSED != 0 {
+                if uncompressed_len > packfile::MAX_RECORD_LEN {
+                    return Err(StorageError::Corrupt(format!(
+                        "framed uncompressed_len too large: {uncompressed_len} > {}",
+                        packfile::MAX_RECORD_LEN
+                    )));
+                }
+                let decompressed = zstd::bulk::decompress(
+                    node_bytes,
+                    usize::try_from(uncompressed_len).expect("checked above"),
+                )
+                .map_err(|e| StorageError::Corrupt(format!("zstd decompress failed: {e}")))?;
+                if decompressed.len() != usize::try_from(uncompressed_len).expect("checked above") {
+                    return Err(StorageError::Corrupt(format!(
+                        "decompressed length {} != framed uncompressed_len {uncompressed_len}",
+                        decompressed.len()
+                    )));
+                }
+                bytes::Bytes::from(decompressed)
+            } else {
+                bytes::Bytes::copy_from_slice(node_bytes)
+            };
 
             return Ok(Record {
                 room_id,

@@ -21,9 +21,14 @@ pub const MAGIC: [u8; 4] = *b"MDB1";
 /// process has no safe way to update bytes in place, so anything that
 /// changes over a shard's life (IO/sync counters, the room→count
 /// directory) stays in the existing sidecar files (`shard_stats.bin`,
-/// `shard_rooms.bin`), not here. This is a hard format cutover, not a
-/// migration: v1 files are not recognized by v2 readers.
-pub const VERSION: u8 = 0x02;
+/// `shard_rooms.bin`), not here.
+///
+/// Version 3: adds a per-frame `flags` byte and `uncompressed_len` field
+/// to the record layout (see [`Record`]/[`write_record`]/[`read_record`])
+/// so individual frames can carry zstd-compressed payloads. Each cutover
+/// is hard, not a migration: a v2 (or v1) file is not recognized by a v3
+/// reader — reset or migrate an old store rather than opening it here.
+pub const VERSION: u8 = 0x03;
 
 /// Total reserved header size in bytes: every shard file's first record
 /// starts at exactly this offset. One 4KiB page — ample room for the
@@ -60,26 +65,54 @@ pub struct ShardHeader {
     pub created_at: u64,
 }
 
-/// Maximum record size (64KB). Reject anything larger during recovery scan.
+/// Maximum record size (64KB). Bounds the *uncompressed* on-disk frame
+/// length ([`FRAME_FIXED_LEN`] + `data.len()`, i.e. what the frame would
+/// take up were it stored raw) — checked at write time against the
+/// caller's plaintext `data`, and at read time against the actual on-disk
+/// frame length, which never exceeds the uncompressed bound (compression
+/// is only ever used when it shrinks a frame; see [`write_record`]).
+/// Reject anything larger during recovery scan.
 pub const MAX_RECORD_LEN: u32 = 64 * 1024;
+
+/// Per-frame flag: `data` is zstd-compressed on disk; decompress to
+/// `uncompressed_len` bytes before returning it to the caller.
+///
+/// `pub(crate)` so `shard.rs`'s `mmap`-based inline frame parser (which
+/// duplicates this module's frame layout for zero-copy reads) can share
+/// the same flag bit instead of hardcoding it.
+pub(crate) const FLAG_COMPRESSED: u8 = 0x01;
+
+/// Byte length of the fixed part of a v3 frame's payload, i.e. everything
+/// between the length prefix and the node bytes: 1-byte flags + 4-byte
+/// `uncompressed_len` + 16-byte `room_id` + 16-byte `hash`.
+const FRAME_FIXED_LEN: usize = 1 + 4 + 16 + 16;
 
 /// A scanned `(room_id, hash, file_offset)` entry from a packfile.
 pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 
 /// A single record in the packfile.
 ///
-/// Frame layout on disk (v1 — global shard format with `room_id`):
+/// Frame layout on disk (v3):
 /// ```text
-/// [u32 len]            — byte length of (room_id ++ hash ++ node_bytes), little-endian
-/// [16-byte room_id]    — room this record belongs to (for shard scan recovery)
-/// [16-byte hash]       — structural hash (index-rebuild metadata only, NOT for verification)
-/// [node bytes]         — opaque node payload
-/// [u32 crc32]          — CRC32 covering len + room_id + hash + node_bytes
+/// [u32 len]              — byte length of everything below down to (not including) crc32, little-endian
+/// [u8 flags]             — bit 0: node bytes are zstd-compressed
+/// [u32 uncompressed_len] — plaintext length of `data`; equals the node bytes' own length when flags == 0
+/// [16-byte room_id]      — room this record belongs to (for shard scan recovery)
+/// [16-byte hash]         — structural hash (index-rebuild metadata only, NOT for verification)
+/// [node bytes]           — opaque node payload, zstd-compressed iff flags bit 0 is set
+/// [u32 crc32]            — CRC32 covering len + flags + uncompressed_len + room_id + hash + node_bytes
 /// ```
+///
+/// A frame is only ever written compressed when doing so makes it
+/// smaller — otherwise `data` is stored raw with `flags == 0` — so the
+/// on-disk frame length never exceeds the plaintext one.
 ///
 /// **Security invariant:** The framed hash is index-rebuild metadata only.
 /// Verification always compares against the *caller-requested* hash, never
-/// against the hash stored in the frame.
+/// against the hash stored in the frame. The CRC covers the bytes as
+/// written (compressed, when compressed) — it's verified *before*
+/// decompression is attempted, so a corrupt frame is never fed to the
+/// decompressor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     /// The room this record belongs to.
@@ -91,12 +124,16 @@ pub struct Record {
 }
 
 impl Record {
-    /// Total on-disk frame size for this record, including length prefix and CRC.
+    /// Upper bound on this record's on-disk frame size (length prefix,
+    /// fixed fields, plaintext node bytes, and CRC) — i.e. the size were
+    /// it written uncompressed. The actual on-disk size after
+    /// [`write_record`] may be smaller when the payload compresses;
+    /// callers that need the exact size use `write_record`'s return
+    /// value instead. Useful as a safe capacity estimate before writing.
     #[must_use]
     pub fn serialized_len(&self) -> usize {
         4_usize
-            .wrapping_add(16)
-            .wrapping_add(16)
+            .wrapping_add(FRAME_FIXED_LEN)
             .wrapping_add(self.data.len())
             .wrapping_add(4)
     }
@@ -128,44 +165,76 @@ pub fn map_pack(file: &File) -> io::Result<memmap2::Mmap> {
     unsafe { memmap2::Mmap::map(file) }
 }
 
-/// Write a single record into the packfile.
+/// zstd compression level used for record payloads. A low level: packfile
+/// frames are small (<= [`MAX_RECORD_LEN`]) and written on the hot append
+/// path, so this favors write throughput over squeezing out the last few
+/// percent of ratio.
+const ZSTD_LEVEL: i32 = 3;
+
+/// Write a single record into the packfile, compressing its payload with
+/// zstd when doing so makes the frame smaller (falls back to storing it
+/// raw otherwise — e.g. already-compressed or very small payloads often
+/// don't shrink).
 ///
 /// # Errors
-/// Returns `io::Error` on write failure.
+/// Returns `io::Error` on write failure, or if `record.data` would make
+/// even an uncompressed frame exceed [`MAX_RECORD_LEN`] (checked against
+/// the plaintext on-disk frame length — [`FRAME_FIXED_LEN`] plus
+/// `record.data.len()` — before compression, so this bound is never
+/// looser than what [`read_record`] will actually accept).
 ///
 /// # Panics
-/// Panics if the record payload exceeds `u32::MAX`.
-pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<()> {
-    let payload_len = u32::try_from(16_usize.wrapping_add(16).wrapping_add(record.data.len()))
+/// Panics if the record's fixed fields plus plaintext data exceed `u32::MAX`.
+pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64> {
+    let plaintext_frame_len = u32::try_from(FRAME_FIXED_LEN.wrapping_add(record.data.len()))
         .expect("record payload exceeds u32::MAX");
-    if payload_len > MAX_RECORD_LEN {
+    if plaintext_frame_len > MAX_RECORD_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("record payload too large: {payload_len} > {MAX_RECORD_LEN}"),
+            format!("record payload too large: {plaintext_frame_len} > {MAX_RECORD_LEN}"),
         ));
     }
-    writer.write_all(&payload_len.to_le_bytes())?;
+
+    let uncompressed_len = u32::try_from(record.data.len()).expect("checked above");
+    let compressed = zstd::bulk::compress(&record.data, ZSTD_LEVEL).ok();
+    let (flags, node_bytes): (u8, &[u8]) = match &compressed {
+        Some(c) if c.len() < record.data.len() => (FLAG_COMPRESSED, c.as_slice()),
+        _ => (0, &record.data),
+    };
+
+    let frame_len = u32::try_from(FRAME_FIXED_LEN.wrapping_add(node_bytes.len()))
+        .expect("bounded by MAX_RECORD_LEN, checked above");
+
+    writer.write_all(&frame_len.to_le_bytes())?;
+    writer.write_all(&[flags])?;
+    writer.write_all(&uncompressed_len.to_le_bytes())?;
     writer.write_all(&record.room_id)?;
     writer.write_all(&record.hash)?;
-    writer.write_all(&record.data)?;
+    writer.write_all(node_bytes)?;
 
-    // CRC covers len + room_id + hash + data
+    // CRC covers len + flags + uncompressed_len + room_id + hash + node_bytes,
+    // i.e. the bytes as written to disk (compressed, when compressed).
     let mut crc = crc32fast::Hasher::new();
-    crc.update(&payload_len.to_le_bytes());
+    crc.update(&frame_len.to_le_bytes());
+    crc.update(&[flags]);
+    crc.update(&uncompressed_len.to_le_bytes());
     crc.update(&record.room_id);
     crc.update(&record.hash);
-    crc.update(&record.data);
+    crc.update(node_bytes);
     let checksum = crc.finalize();
     writer.write_all(&checksum.to_le_bytes())?;
 
-    Ok(())
+    let total_len = 4_u64.wrapping_add(u64::from(frame_len)).wrapping_add(4);
+    Ok(total_len)
 }
 
 /// Read a single record from the packfile. Returns `None` on EOF.
 ///
 /// # Errors
 /// Returns `io::Error` on read failure or `io::ErrorKind::InvalidData`
-/// if the record length is invalid or the CRC check fails.
+/// if the record length is invalid, an unrecognized flag bit is set, the
+/// CRC check fails, or (for a compressed frame) decompression fails or
+/// yields a length other than the framed `uncompressed_len`.
 ///
 /// # Panics
 /// Panics if the payload length does not fit in `usize` (always true on
@@ -178,21 +247,24 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
         Err(e) => return Err(e),
     }
 
-    let payload_len = u32::from_le_bytes(len_buf);
-    if !(32..=MAX_RECORD_LEN).contains(&payload_len) {
+    let frame_len = u32::from_le_bytes(len_buf);
+    let min_len = u32::try_from(FRAME_FIXED_LEN).expect("FRAME_FIXED_LEN fits in u32");
+    if !(min_len..=MAX_RECORD_LEN).contains(&frame_len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid record length: {payload_len}"),
+            format!("invalid record length: {frame_len}"),
         ));
     }
 
-    let mut payload = vec![0u8; usize::try_from(payload_len).expect("u32 always fits in usize")];
+    let mut payload = vec![0u8; usize::try_from(frame_len).expect("u32 always fits in usize")];
     reader.read_exact(&mut payload)?;
 
     let mut crc_buf = [0u8; 4];
     reader.read_exact(&mut crc_buf)?;
 
-    // Verify CRC
+    // Verify CRC over the bytes as written (compressed, if compressed) —
+    // before any decompression is attempted, so a corrupt frame is never
+    // fed to the decompressor.
     let mut crc = crc32fast::Hasher::new();
     crc.update(&len_buf);
     crc.update(&payload);
@@ -205,11 +277,50 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
         ));
     }
 
+    let flags = payload[0];
+    if flags & !FLAG_COMPRESSED != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported record flags: {flags:#04x}"),
+        ));
+    }
+    let uncompressed_len = u32::from_le_bytes(payload[1..5].try_into().unwrap());
     let mut room_id = [0u8; 16];
-    room_id.copy_from_slice(&payload[..16]);
+    room_id.copy_from_slice(&payload[5..21]);
     let mut hash = [0u8; 16];
-    hash.copy_from_slice(&payload[16..32]);
-    let data = Bytes::copy_from_slice(&payload[32..]);
+    hash.copy_from_slice(&payload[21..37]);
+    let node_bytes = &payload[37..];
+
+    let data = if flags & FLAG_COMPRESSED != 0 {
+        if uncompressed_len > MAX_RECORD_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_RECORD_LEN}"),
+            ));
+        }
+        let decompressed = zstd::bulk::decompress(
+            node_bytes,
+            usize::try_from(uncompressed_len).expect("checked above"),
+        )
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("zstd decompress failed: {e}"),
+            )
+        })?;
+        if decompressed.len() != usize::try_from(uncompressed_len).expect("checked above") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "decompressed length {} != framed uncompressed_len {uncompressed_len}",
+                    decompressed.len()
+                ),
+            ));
+        }
+        Bytes::from(decompressed)
+    } else {
+        Bytes::copy_from_slice(node_bytes)
+    };
 
     Ok(Some(Record {
         room_id,
@@ -599,6 +710,42 @@ mod tests {
         assert_eq!(record, read);
     }
 
+    /// Highly-compressible, well-above-threshold data should be stored
+    /// with the compressed flag set and round-trip exactly.
+    #[test]
+    fn test_write_read_roundtrip_compressed() {
+        let data = vec![0x42u8; 8192];
+        let record = test_record_raw([0xaa; 16], &data);
+        let mut buf = Vec::new();
+        let written = write_record(&mut buf, &record).unwrap();
+        assert_eq!(written, buf.len() as u64);
+        assert!(
+            (buf.len() as u64) < record.serialized_len() as u64,
+            "highly compressible data should shrink on disk: {} vs uncompressed upper bound {}",
+            buf.len(),
+            record.serialized_len()
+        );
+
+        let mut cursor = Cursor::new(&buf);
+        let read = read_record(&mut cursor).unwrap().unwrap();
+        assert_eq!(record, read);
+    }
+
+    /// Data that doesn't shrink under zstd (tiny/incompressible) must fall
+    /// back to being stored raw, not expanded on disk.
+    #[test]
+    fn test_write_record_falls_back_to_raw_when_incompressible() {
+        let record = test_record_raw([0xaa; 16], b"hi");
+        let mut buf = Vec::new();
+        let written = write_record(&mut buf, &record).unwrap();
+        assert_eq!(written, buf.len() as u64);
+        assert_eq!(buf.len(), record.serialized_len());
+
+        let mut cursor = Cursor::new(&buf);
+        let read = read_record(&mut cursor).unwrap().unwrap();
+        assert_eq!(record, read);
+    }
+
     #[test]
     fn test_multiple_records() {
         let records = vec![
@@ -626,8 +773,9 @@ mod tests {
         let mut buf = Vec::new();
         write_record(&mut buf, &record).unwrap();
 
-        // Flip a byte in the data payload (after room_id + hash = 32 bytes of header)
-        buf[44] ^= 0xff;
+        // Flip a byte in the node payload (after the fixed frame header:
+        // len(4) + flags(1) + uncompressed_len(4) + room_id(16) + hash(16))
+        buf[41] ^= 0xff;
 
         let mut cursor = Cursor::new(&buf);
         let result = read_record(&mut cursor);
@@ -694,7 +842,7 @@ mod tests {
             hash: [0u8; 16],
             data: Bytes::from_static(b"hello"),
         };
-        assert_eq!(r.serialized_len(), 4 + 16 + 16 + 5 + 4);
+        assert_eq!(r.serialized_len(), 4 + FRAME_FIXED_LEN + 5 + 4);
     }
 
     #[test]
@@ -707,6 +855,31 @@ mod tests {
         let mut buf = Vec::new();
         let err = write_record(&mut buf, &r).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The largest *incompressible* payload that still fits at the write
+    /// boundary — `FRAME_FIXED_LEN + data.len() == MAX_RECORD_LEN` — must
+    /// round-trip. Regression test: an earlier version bounded the write
+    /// check by `32 + data.len()` (the pre-compression frame's fixed
+    /// size) while the read bound was `FRAME_FIXED_LEN + data.len()`, a
+    /// 5-byte mismatch that let a write succeed at exactly this size and
+    /// then fail on read.
+    #[test]
+    fn test_write_read_roundtrip_at_max_record_len_boundary() {
+        let data_len = MAX_RECORD_LEN as usize - FRAME_FIXED_LEN;
+        // Pseudorandom, not zeros/repeats, so zstd can't shrink it below
+        // the raw size — this must take the uncompressed-fallback path.
+        let data: Vec<u8> = (0..data_len)
+            .map(|i| (i as u64).wrapping_mul(2_654_435_761).to_le_bytes()[0])
+            .collect();
+        let record = test_record_raw([0xaa; 16], &data);
+        let mut buf = Vec::new();
+        let written = write_record(&mut buf, &record).unwrap();
+        assert_eq!(written, buf.len() as u64);
+
+        let mut cursor = Cursor::new(&buf);
+        let read = read_record(&mut cursor).unwrap().unwrap();
+        assert_eq!(record, read);
     }
 
     #[test]
@@ -873,13 +1046,16 @@ mod tests {
         write_header(&mut buf, 0, 0).unwrap();
         write_record(&mut buf, &test_record_raw([0xaa; 16], b"good")).unwrap();
         let valid_len = buf.len();
-        // Simulate a realistic torn tail: valid length prefix + partial
-        // payload (missing CRC). This mimics a crash mid-write.
-        let partial_payload_len: u32 = 16 + 16 + 4; // room_id + hash + 4 bytes of data
-        buf.extend_from_slice(&partial_payload_len.to_le_bytes());
+        // Simulate a realistic torn tail: valid length prefix declaring a
+        // full frame, but fewer payload bytes actually present (missing
+        // tail of the node bytes and the CRC). This mimics a crash mid-write.
+        let declared_frame_len: u32 = u32::try_from(FRAME_FIXED_LEN).unwrap() + 4; // fixed header + 4 bytes of data
+        buf.extend_from_slice(&declared_frame_len.to_le_bytes());
+        buf.push(0); // flags: uncompressed
+        buf.extend_from_slice(&4u32.to_le_bytes()); // uncompressed_len
         buf.extend_from_slice(&[0xdd; 16]); // room_id
         buf.extend_from_slice(&[0xbb; 16]); // hash
-        buf.extend_from_slice(&[0xcc; 4]); // partial data (CRC never written)
+        buf.extend_from_slice(&[0xcc; 2]); // partial data (short of declared len; CRC never written)
         std::fs::write(&path, &buf).unwrap();
         let entries = scan_and_recover_packfile(&path).unwrap();
         assert_eq!(entries.len(), 1);

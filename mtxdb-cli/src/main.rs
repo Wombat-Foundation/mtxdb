@@ -23,7 +23,7 @@ pub(crate) enum Commands {
         room: Option<String>,
         id: String,
     },
-    Rooms {
+    Namespaces {
         all: bool,
     },
     Shards {
@@ -114,14 +114,14 @@ fn build_cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("rooms")
-                .about("List rooms in the selected shard pool")
+            Command::new("namespaces")
+                .about("List logical namespaces in the selected shard pool")
                 .arg(
                     Arg::new("all")
                         .short('a')
                         .long("all")
                         .action(ArgAction::SetTrue)
-                        .help("List rooms in every independent pool"),
+                        .help("List namespaces in every independent pool"),
                 ),
         )
         .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
@@ -302,7 +302,7 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").cloned(),
             id: m.get_one::<String>("id").unwrap().clone(),
         },
-        Some(("rooms", m)) => Commands::Rooms {
+        Some(("namespaces", m)) => Commands::Namespaces {
             all: m.get_flag("all"),
         },
         Some(("shards", m)) => Commands::Shards {

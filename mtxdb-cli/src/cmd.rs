@@ -81,6 +81,11 @@ fn fmt_disk_megabytes(bytes: u64) -> String {
 /// payload, and CRC through one sequential buffered scan; a room listing
 /// never allocates payloads or checks CRCs.
 fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
+    // 1-byte flags + 4-byte uncompressed_len + 16-byte room_id + 16-byte
+    // hash — the fixed part of a v3 frame's payload, preceding the
+    // (possibly zstd-compressed) node bytes.
+    const FRAME_FIXED_LEN: u64 = 1 + 4 + 16 + 16;
+
     let mut by_room = HashMap::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -103,9 +108,20 @@ fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error.into()),
             }
-            let payload_len = u64::from(u32::from_le_bytes(len));
-            if !(32..=u64::from(mtxdb_core::packfile::MAX_RECORD_LEN)).contains(&payload_len) {
-                bail!("invalid record length {payload_len} while measuring room disk usage");
+            let frame_len = u64::from(u32::from_le_bytes(len));
+            if !(FRAME_FIXED_LEN..=u64::from(mtxdb_core::packfile::MAX_RECORD_LEN))
+                .contains(&frame_len)
+            {
+                bail!("invalid record length {frame_len} while measuring room disk usage");
+            }
+            // Skip the flags byte and uncompressed_len field to reach room_id
+            // — this scan only needs the room ID, not whether/how the node
+            // bytes that follow are compressed.
+            let mut flags_and_uncompressed_len = [0_u8; 5];
+            match reader.read_exact(&mut flags_and_uncompressed_len) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
             }
             let mut room_id = [0_u8; 16];
             match reader.read_exact(&mut room_id) {
@@ -113,7 +129,7 @@ fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error.into()),
             }
-            let mut remaining = payload_len.saturating_sub(16).saturating_add(4);
+            let mut remaining = frame_len.saturating_sub(21).saturating_add(4);
             let mut complete = true;
             while remaining != 0 {
                 let chunk_len = usize::try_from(remaining)
@@ -134,7 +150,7 @@ fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
                 break;
             }
             let total = by_room.entry(room_id).or_insert(0_u64);
-            *total = total.saturating_add(payload_len.saturating_add(8));
+            *total = total.saturating_add(frame_len.saturating_add(8));
         }
     }
     Ok(by_room)
@@ -166,7 +182,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
         Commands::Get { room, id } => cmd_get(cli, room.as_deref(), id),
-        Commands::Rooms { all } => cmd_rooms(cli, *all),
+        Commands::Namespaces { all } => cmd_namespaces(cli, *all),
         Commands::Shards { all } => cmd_shards(cli, *all),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { shard } => cmd_scan(cli, shard),
@@ -327,7 +343,7 @@ fn room_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
         .collect())
 }
 
-fn cmd_rooms(cli: &Cli, all: bool) -> anyhow::Result<()> {
+fn cmd_namespaces(cli: &Cli, all: bool) -> anyhow::Result<()> {
     if all {
         let layout = open_layout(cli)?;
         for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
@@ -335,25 +351,25 @@ fn cmd_rooms(cli: &Cli, all: bool) -> anyhow::Result<()> {
                 println!();
             }
             println!("{}:", shard_type.as_str());
-            cmd_rooms_in_dir(&pool_dir(&layout, shard_type)?)?;
+            cmd_namespaces_in_dir(&pool_dir(&layout, shard_type)?)?;
         }
         return Ok(());
     }
-    cmd_rooms_in_dir(&selected_pool_dir(cli)?)
+    cmd_namespaces_in_dir(&selected_pool_dir(cli)?)
 }
 
-/// List rooms from one pool. Cross-pool aggregation is deliberately avoided:
-/// each pool has its own room-ID namespace and lifecycle.
-fn cmd_rooms_in_dir(dir: &Path) -> anyhow::Result<()> {
+/// List logical namespaces from one pool. Cross-pool aggregation is deliberately
+/// avoided: each pool owns an independent 16-byte namespace and lifecycle.
+fn cmd_namespaces_in_dir(dir: &Path) -> anyhow::Result<()> {
     let rooms = match PackfileStorage::room_summaries_from_disk(dir) {
         Some(rooms) => rooms,
         // A named pool is created with the database layout, before it has
         // necessarily received a first write. `open_read_only` quite
         // properly rejects a directory with no shard files, but for a
-        // listing that simply means there are no rooms to show.
+        // listing that simply means there are no namespaces to show.
         None if glob_shard_files(dir)?.is_empty() => Vec::new(),
         // Old stores have no sidecar yet. Keep the complete, slower fallback
-        // so `rooms` remains useful until `mtxdb sync` writes one.
+        // so `namespaces` remains useful until `mtxdb sync` writes one.
         None => PackfileStorage::open_read_only(dir.into())
             .context("failed to open store")?
             .room_summaries(),
@@ -362,13 +378,13 @@ fn cmd_rooms_in_dir(dir: &Path) -> anyhow::Result<()> {
     let disk_bytes = room_disk_bytes(dir)?;
 
     if rooms.is_empty() {
-        println!("no rooms found");
+        println!("no namespaces found");
         return Ok(());
     }
 
     println!(
         "  {:>4}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
-        "slot", "room", "nodes", "shards", "index RAM", "disk (MB)"
+        "slot", "namespace", "nodes", "shards", "index RAM", "disk (MB)"
     );
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;

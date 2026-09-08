@@ -21,6 +21,7 @@ bytes = "1.5"
 crc32fast = "1.4"
 memmap2 = "0.9.11"
 parking_lot = "0.12"
+zstd = { version = "0.13", default-features = false, features = ["pkg-config"] }
 
 [[bench]]
 name = "storage"
