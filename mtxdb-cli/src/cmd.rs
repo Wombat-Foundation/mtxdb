@@ -523,17 +523,28 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
         if let Some((_, len, mem)) = summaries.into_iter().find(|(id, _, _)| *id == room_id) {
             println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
             let shards = room_shards.get(&room_id).cloned().unwrap_or_default();
-            if shards.len() > 1 {
-                println!(
-                    "  shards: {}",
-                    shards
-                        .iter()
-                        .map(u16::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+            match shards.as_slice() {
+                [shard] => println!("  shard: {shard}"),
+                [] => {}
+                _ => {
+                    println!(
+                        "  shards: {}",
+                        shards
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
-            let details = matrix_room_details_from_cache(dir, &room_id).unwrap_or_else(|| {
+            if let Some(details) = matrix_room_details_from_cache(dir, &room_id) {
+                print_matrix_room_details(details, None)
+            } else {
+                println!(
+                    "  Matrix metadata: scanning {} shard{}...",
+                    shards.len(),
+                    if shards.len() == 1 { "" } else { "s" }
+                );
                 let details = matrix_room_details_from_shards(dir, &room_id, &shards)
                     .unwrap_or_else(|error| {
                         eprintln!("warning: unable to inspect Matrix room metadata: {error}");
@@ -542,9 +553,8 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
                 if let Err(error) = persist_matrix_room_details(dir, &room_id, &details) {
                     eprintln!("warning: unable to cache Matrix room metadata: {error}");
                 }
-                details
-            });
-            print_matrix_room_details(details);
+                print_matrix_room_details(details, Some(shards.len()));
+            }
             return Ok(());
         }
         eprintln!("room {hex}: not found");
@@ -559,17 +569,21 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
         Some((len, mem)) => {
             println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
             let shards = store.room_referenced_shards(&room_id);
-            if shards.len() > 1 {
-                println!(
-                    "  shards: {}",
-                    shards
-                        .iter()
-                        .map(u16::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+            match shards.as_slice() {
+                [shard] => println!("  shard: {shard}"),
+                [] => {}
+                _ => {
+                    println!(
+                        "  shards: {}",
+                        shards
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
-            print_matrix_room_details(matrix_room_details(&store, dir, &room_id)?);
+            print_matrix_room_details(matrix_room_details(&store, dir, &room_id)?, None);
         }
         None => eprintln!("room {hex}: not found"),
     }
@@ -812,12 +826,19 @@ fn matrix_room_details_from_shards(
     Ok(details)
 }
 
-fn print_matrix_room_details(details: MatrixRoomDetails) {
+fn print_matrix_room_details(details: MatrixRoomDetails, scanned_shards: Option<usize>) {
     if let Some(matrix_room_id) = details.room_id {
         println!("  Matrix room: {matrix_room_id}");
     }
     if let Some(create) = details.create {
         println!("  create: {create}");
+    } else if let Some(shard_count) = scanned_shards {
+        println!(
+            "  create: not found (scanned all {shard_count} shard{})",
+            if shard_count == 1 { "" } else { "s" }
+        );
+    } else {
+        println!("  create: not found");
     }
 }
 
