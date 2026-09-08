@@ -1168,7 +1168,9 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let mut locations = HashMap::new();
     let mut ordered_ids = Vec::new();
     for (shard_index, (_, shard)) in shards.iter().enumerate() {
-        for (candidate_collection, node_id, offset) in mtxdb_core::packfile::scan_packfile(&shard.path)? {
+        for (candidate_collection, node_id, offset) in
+            mtxdb_core::packfile::scan_packfile(&shard.path)?
+        {
             if candidate_collection == collection_id {
                 if !locations.contains_key(&node_id) {
                     ordered_ids.push(node_id);
@@ -1416,7 +1418,9 @@ fn cmd_repack(
     topo: bool,
 ) -> anyhow::Result<()> {
     let target = match (collection, shards.is_empty(), all) {
-        (Some(collection), true, false) => RepackTarget::Collection(parse_collection_id(collection)?),
+        (Some(collection), true, false) => {
+            RepackTarget::Collection(parse_collection_id(collection)?)
+        }
         (None, false, false) => RepackTarget::Shards(parse_shard_selectors(shards)?),
         (None, true, true) => RepackTarget::All,
         // Clap rejects the both-targets case through `conflicts_with`; this

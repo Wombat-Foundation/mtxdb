@@ -370,26 +370,11 @@ impl PackfileStorage {
             // cleanly at a torn tail (indistinguishable from a writer's
             // in-flight append) instead of truncating it away.
             let entries = if writable {
-                match packfile::scan_and_recover_packfile(&path) {
-                    Ok(e) => e,
-                    Err(recovery_err) => {
-                        eprintln!(
-                            "warning: recovery scan failed for shard {shard_id:02x}: {recovery_err}"
-                        );
-                        match packfile::scan_packfile(&path) {
-                            Ok(partial) => {
-                                eprintln!("warning: partial scan recovered {} records from shard {shard_id:02x}", partial.len());
-                                partial
-                            }
-                            Err(scan_err) => {
-                                eprintln!(
-                                    "warning: shard {shard_id:02x} skipped entirely: {scan_err}"
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                }
+                // Recovery can safely truncate only a torn final frame. Any
+                // other failure (CRC mismatch, invalid framing, permissions)
+                // means this pack cannot be indexed faithfully; fail open
+                // rather than publish a store that silently omitted it.
+                packfile::scan_and_recover_packfile(&path)?
             } else {
                 match packfile::scan_packfile(&path) {
                     Ok(e) => e,
@@ -583,8 +568,10 @@ impl PackfileStorage {
         let collections = self.collections_referencing_shard(shard_id)?;
         let mut results = Vec::with_capacity(collections.len());
         for collection_id in collections {
-            let (kept, dropped) =
-                self.repack_collection_reachable(&collection_id, |hash, data| extract_edges(hash, data))?;
+            let (kept, dropped) = self
+                .repack_collection_reachable(&collection_id, |hash, data| {
+                    extract_edges(hash, data)
+                })?;
             results.push((collection_id, kept, dropped));
         }
         Ok(results)
@@ -797,7 +784,11 @@ impl PackfileStorage {
     /// wherever a collection's index is replaced wholesale rather than
     /// incrementally appended to, since only then can its distribution
     /// across shards actually change.
-    fn replace_collection_shard_counts(&self, collection_id: &[u8; 16], counts: &HashMap<u16, u64>) {
+    fn replace_collection_shard_counts(
+        &self,
+        collection_id: &[u8; 16],
+        counts: &HashMap<u16, u64>,
+    ) {
         let old_shards = self
             .collection_shards
             .write()
@@ -1032,7 +1023,9 @@ impl PackfileStorage {
     /// Returns `None` when the directory has not been persisted yet or is
     /// malformed.
     #[must_use]
-    pub fn shard_collection_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
+    pub fn shard_collection_counts_from_disk(
+        base_dir: &std::path::Path,
+    ) -> Option<HashMap<u16, u64>> {
         let (_, records) = read_persisted_shard_collections(base_dir)?;
         let mut totals = HashMap::new();
         for record in records {
@@ -2500,6 +2493,33 @@ mod tests {
         store.put(&TEST_COLLECTION, &id, &data).unwrap();
         let got = store.get(&TEST_COLLECTION, &id).unwrap().unwrap();
         assert_eq!(got.bytes, data.bytes);
+    }
+
+    /// A writable open must not silently skip a corrupt pack and publish a
+    /// partial index. The caller needs an error so it can repair or restore
+    /// the pack before accepting writes.
+    #[test]
+    fn test_writable_open_rejects_corrupt_pack_instead_of_skipping_it() {
+        let dir = test_dir("open_corrupt_pack");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let id = distinct_id(0x42);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"payload")),
+            )
+            .unwrap();
+        let path = store.shards.active_shard().path.clone();
+        drop(store);
+
+        let mut bytes = fs::read(&path).unwrap();
+        let payload_byte =
+            crate::packfile::HEADER_LEN + 4 + crate::packfile::FRAME_FIXED_LEN as usize;
+        bytes[payload_byte] ^= 0xff;
+        fs::write(path, bytes).unwrap();
+
+        assert!(PackfileStorage::open(dir).is_err());
     }
 
     #[test]
@@ -4104,7 +4124,8 @@ mod tests {
             let repacker = scope.spawn(|| {
                 for _ in 0..5 {
                     std::thread::sleep(std::time::Duration::from_micros(50));
-                    let _ = store.repack_collection_reachable(&collection, |_hash, _data| Vec::new());
+                    let _ =
+                        store.repack_collection_reachable(&collection, |_hash, _data| Vec::new());
                 }
             });
 

@@ -111,6 +111,21 @@ pub struct Record {
     pub data: Bytes,
 }
 
+/// Read a record length prefix, distinguishing clean EOF from a torn prefix.
+///
+/// A zero-byte read is the normal end of an append-only pack. Once even one
+/// byte of the four-byte prefix exists, however, the frame is incomplete and
+/// must surface as `UnexpectedEof` so recovery can truncate it before a later
+/// append would land after corrupt bytes.
+fn read_frame_len_prefix(reader: &mut impl Read) -> io::Result<Option<[u8; 4]>> {
+    let mut len_buf = [0u8; 4];
+    if reader.read(&mut len_buf[..1])? == 0 {
+        return Ok(None);
+    }
+    reader.read_exact(&mut len_buf[1..])?;
+    Ok(Some(len_buf))
+}
+
 impl Record {
     /// Upper bound on this record's on-disk frame size (length prefix,
     /// fixed fields, plaintext node bytes, and CRC) — i.e. the size were
@@ -231,12 +246,9 @@ pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64>
 /// Panics if the payload length does not fit in `usize` (always true on
 /// 64-bit targets where `usize >= 32 bits`).
 pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
+    let Some(len_buf) = read_frame_len_prefix(reader)? else {
+        return Ok(None);
+    };
 
     let frame_len = u32::from_le_bytes(len_buf);
     if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
@@ -373,12 +385,9 @@ const SCAN_DISCARD_BUF_LEN: usize = 8192;
 /// subtracts `FRAME_FIXED_LEN` from `frame_len`, which the preceding
 /// range check already guarantees is `>= FRAME_FIXED_LEN`.
 pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordMetadata>> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
+    let Some(len_buf) = read_frame_len_prefix(reader)? else {
+        return Ok(None);
+    };
 
     let frame_len = u32::from_le_bytes(len_buf);
     if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
@@ -1268,6 +1277,25 @@ mod tests {
         buf.extend_from_slice(&[0xbb; 16]); // hash
         buf.extend_from_slice(&[0xcc; 2]); // partial data (short of declared len; CRC never written)
         std::fs::write(&path, &buf).unwrap();
+        let entries = scan_and_recover_packfile(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len as u64);
+    }
+
+    /// A partial length prefix is a torn frame, not clean EOF. Recovery must
+    /// remove it so subsequent appends start at a valid record boundary.
+    #[test]
+    fn test_scan_and_recover_truncates_partial_length_prefix() {
+        let dir = test_dir("recover_partial_prefix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pack_0000000000000000.pack");
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        write_record(&mut buf, &test_record_raw([0xaa; 16], b"good")).unwrap();
+        let valid_len = buf.len();
+        buf.extend_from_slice(&[0x12, 0x34, 0x56]);
+        std::fs::write(&path, &buf).unwrap();
+
         let entries = scan_and_recover_packfile(&path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len as u64);

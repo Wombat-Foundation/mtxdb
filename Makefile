@@ -15,7 +15,7 @@ _help:
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .PHONY: all
-all: format lint doc test
+all: format lint doc fix test install
 
 .PHONY: format
 format: ##H Format code
