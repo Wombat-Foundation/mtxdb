@@ -18,7 +18,7 @@ pub(crate) enum Commands {
         data: String,
     },
     Get {
-        room: String,
+        room: Option<String>,
         id: String,
     },
     Rooms,
@@ -40,7 +40,7 @@ pub(crate) enum Commands {
         topo: bool,
     },
     Delete {
-        room: String,
+        rooms: Vec<String>,
         yes: bool,
     },
     Completions {
@@ -127,8 +127,8 @@ fn sub_import() -> Command {
         .long_about(
             "Import Matrix federation events from a JSON document or JSONL event stream. A JSON \
              document must contain a `pdus` array, an `auth_chain` array, or both; a `.jsonl` \
-             file contains one event per line. Each imported event needs a base64-no-pad \
-             `hashes.sha256` value. The room comes from `room_id` unless --room is supplied.",
+             file contains one event per line. Each imported event needs an `event_id`. The room \
+             comes from `room_id` unless --room is supplied.",
         )
         .arg(
             Arg::new("path")
@@ -173,8 +173,14 @@ fn sub_repack() -> Command {
 
 fn sub_delete() -> Command {
     Command::new("delete")
-        .about("Delete all data for a room")
-        .arg(Arg::new("room").short('r').long("room").required(true))
+        .about("Delete all data for one or more rooms")
+        .arg(
+            Arg::new("room")
+                .required(true)
+                .num_args(1..)
+                .value_name("ROOM")
+                .help("Room IDs to delete"),
+        )
         .arg(
             Arg::new("yes")
                 .long("yes")
@@ -194,7 +200,7 @@ fn sub_put() -> Command {
 fn sub_get() -> Command {
     Command::new("get")
         .about("Retrieve a record")
-        .arg(Arg::new("room").short('r').long("room").required(true))
+        .arg(Arg::new("room").short('r').long("room"))
         .arg(Arg::new("id").short('i').long("id").required(true))
 }
 
@@ -215,7 +221,7 @@ fn parse_cli() -> Cli {
             data: m.get_one::<String>("data").unwrap().clone(),
         },
         Some(("get", m)) => Commands::Get {
-            room: m.get_one::<String>("room").unwrap().clone(),
+            room: m.get_one::<String>("room").cloned(),
             id: m.get_one::<String>("id").unwrap().clone(),
         },
         Some(("rooms", _)) => Commands::Rooms,
@@ -246,7 +252,7 @@ fn parse_cli() -> Cli {
             topo: m.get_flag("topo"),
         },
         Some(("delete", m)) => Commands::Delete {
-            room: m.get_one::<String>("room").unwrap().clone(),
+            rooms: m.get_many::<String>("room").unwrap().cloned().collect(),
             yes: m.get_flag("yes"),
         },
         Some(("completions", m)) => Commands::Completions {

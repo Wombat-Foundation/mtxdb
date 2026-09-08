@@ -93,7 +93,7 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
-        Commands::Get { room, id } => cmd_get(cli, room, id),
+        Commands::Get { room, id } => cmd_get(cli, room.as_deref(), id),
         Commands::Rooms => cmd_rooms(cli),
         Commands::Shards => cmd_shards(cli),
         Commands::Info { room } => cmd_info(cli, room),
@@ -105,7 +105,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             root,
             topo,
         } => cmd_repack(cli, room.as_deref(), *shard, root, *topo),
-        Commands::Delete { room, yes } => cmd_delete(cli, room, *yes),
+        Commands::Delete { rooms, yes } => cmd_delete(cli, rooms, *yes),
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync => cmd_sync(cli),
     }
@@ -186,18 +186,40 @@ fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
-    let room_id = parse_room_id(room)?;
+fn cmd_get(cli: &Cli, room: Option<&str>, id: &str) -> anyhow::Result<()> {
     let node_id = parse_node_id(id)?;
     let store = open_store_read_only(cli)?;
-    match store.get(&room_id, &node_id)? {
-        Some(data) => {
+    let matches: Vec<([u8; 16], NodeData)> = match room {
+        Some(room) => {
+            let room_id = parse_room_id(room)?;
+            store
+                .get(&room_id, &node_id)?
+                .map(|data| vec![(room_id, data)])
+                .unwrap_or_default()
+        }
+        None => room_frame_counts(cli.dir.as_deref().unwrap_or_else(|| Path::new(".")))?
+            .into_iter()
+            .filter_map(|(room_id, _)| match store.get(&room_id, &node_id) {
+                Ok(Some(data)) => Some(Ok((room_id, data))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    match matches.as_slice() {
+        [] => bail!("not found"),
+        [(_, data)] => {
             io::stdout().write_all(&data.bytes)?;
             io::stdout().write_all(b"\n")?;
         }
-        None => {
-            bail!("not found");
-        }
+        _ => bail!(
+            "node ID {id} is present in multiple rooms ({}); specify --room",
+            matches
+                .iter()
+                .map(|(room_id, _)| hex_encode(room_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
     Ok(())
 }
@@ -538,16 +560,23 @@ fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyho
     let room_hex = hex_encode(&room_id);
 
     for ev in &events {
-        let Some(id_bytes) = event_node_id(ev) else {
+        let Some(incoming_event_id) = event_id(ev) else {
             skipped = skipped.saturating_add(1);
             continue;
         };
+        let event_hash = blake3::hash(incoming_event_id.as_bytes());
+        let mut id_bytes = [0u8; 16];
+        id_bytes.copy_from_slice(&event_hash.as_bytes()[..16]);
 
-        let event_bytes = ev.to_string().into_bytes();
+        let event_bytes = ev.encode().into_bytes();
         if let Some(existing) = store.get(&room_id, &id_bytes)? {
-            if existing.bytes.as_ref() != event_bytes.as_slice() {
+            let mut existing_bytes = existing.bytes.to_vec();
+            let existing_event_id = simd_json::to_owned_value(&mut existing_bytes)
+                .ok()
+                .and_then(|event| event_id(&event).map(str::to_owned));
+            if existing_event_id.as_deref() != Some(incoming_event_id) {
                 bail!(
-                    "node ID {} already exists with different payload; refusing to overwrite it",
+                    "node ID {} collides with a different event_id; refusing to overwrite it",
                     hex_encode(&id_bytes)
                 );
             }
@@ -561,7 +590,7 @@ fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyho
 
     eprintln!("imported {event_count} events to room {room_hex}");
     if skipped > 0 {
-        eprintln!("skipped {skipped} events (missing sha256 hash)");
+        eprintln!("skipped {skipped} events (missing event_id)");
     }
     if already_present > 0 {
         eprintln!("{already_present} events already present");
@@ -580,21 +609,14 @@ fn event_room_id(value: &OwnedValue) -> Option<&str> {
     }
 }
 
-fn event_node_id(value: &OwnedValue) -> Option<[u8; 16]> {
-    let OwnedValue::Object(event) = value else {
-        return None;
-    };
-    let Some(OwnedValue::Object(hashes)) = event.get("hashes") else {
-        return None;
-    };
-    let Some(OwnedValue::String(sha)) = hashes.get("sha256") else {
-        return None;
-    };
-    let decoded = base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(sha)
-        .ok()?;
-    let bytes: [u8; 16] = decoded.get(..16)?.try_into().ok()?;
-    Some(bytes)
+fn event_id(value: &OwnedValue) -> Option<&str> {
+    match value {
+        OwnedValue::Object(object) => match object.get("event_id") {
+            Some(OwnedValue::String(event_id)) => Some(event_id.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn cmd_repack(
@@ -865,22 +887,34 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId
     edges
 }
 
-fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
-    let room_id = parse_room_id(room)?;
-    let hex = hex_encode(&room_id);
+fn cmd_delete(cli: &Cli, rooms: &[String], yes: bool) -> anyhow::Result<()> {
+    let mut room_ids: Vec<[u8; 16]> = rooms
+        .iter()
+        .map(|room| parse_room_id(room))
+        .collect::<anyhow::Result<_>>()?;
+    room_ids.sort_unstable();
+    room_ids.dedup();
 
     if !yes {
-        eprintln!("This will permanently delete all data for room {hex}.");
-        if !confirm("Delete this room?")? {
-            eprintln!("aborted");
+        println!(
+            "This will permanently delete all data for {} room(s):",
+            room_ids.len()
+        );
+        for room_id in &room_ids {
+            println!("  {}", hex_encode(room_id));
+        }
+        if !confirm("Delete these rooms?")? {
+            println!("aborted");
             return Ok(());
         }
     }
 
     let store = open_store(cli)?;
-    let count = store.room_index_info(&room_id).map_or(0, |(len, _)| len);
-    store.delete_room(&room_id)?;
-    eprintln!("deleted {count} nodes for room {hex}");
+    for room_id in room_ids {
+        let count = store.room_index_info(&room_id).map_or(0, |(len, _)| len);
+        store.delete_room(&room_id)?;
+        println!("deleted {count} nodes for room {}", hex_encode(&room_id));
+    }
     Ok(())
 }
 
