@@ -938,30 +938,21 @@ fn repack_preview(
     let mut total_kept = 0usize;
     let mut total_dropped = 0usize;
     println!(
-        "preflight: scanning {} room{} across {} shard{}",
-        rooms.len(),
-        if rooms.len() == 1 { "" } else { "s" },
+        "preflight: scanning {} shard{} for {} room{}...",
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
+        rooms.len(),
+        if rooms.len() == 1 { "" } else { "s" },
     );
-    for (position, room_id) in rooms.iter().enumerate() {
-        let current = position
-            .checked_add(1)
-            .context("repack preflight room count overflow")?;
-        println!(
-            "  scanning {current}/{}: {}",
-            rooms.len(),
-            hex_encode(room_id)
-        );
-        let plan = if topo {
-            preview_store.plan_room_repack(room_id, extract_matrix_edges)?
-        } else {
-            preview_store.plan_room_repack(room_id, |_hash, _data| Vec::new())?
-        };
+    let plans = if topo {
+        preview_store.plan_rooms_repack(&rooms, extract_matrix_edges)?
+    } else {
+        preview_store.plan_rooms_repack(&rooms, |_hash, _data| Vec::new())?
+    };
+    for plan in plans {
         total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
         total_kept = total_kept.saturating_add(plan.kept);
         total_dropped = total_dropped.saturating_add(plan.dropped);
-        println!("  planned {current}/{}", rooms.len());
     }
 
     let max_shard_bytes = mtxdb_core::shard::MAX_SHARD_BYTES;

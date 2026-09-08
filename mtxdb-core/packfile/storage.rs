@@ -84,6 +84,9 @@ type AdjacencyResult = (Vec<[u8; 16]>, HashMap<[u8; 16], Vec<[u8; 16]>>);
 /// produced by a repack's initial shard scan.
 type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 
+/// Deduplicated live-location map for one room during a repack scan.
+type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
+
 /// One scanned record's `(shard_id, hash, offset)`, as accumulated per
 /// room during `PackfileStorage::open_with_options`'s initial scan.
 type ShardRecord = (u16, [u8; 16], u64);
@@ -584,6 +587,32 @@ impl PackfileStorage {
             }
         }
         Ok(scanned)
+    }
+
+    /// Scan every open shard once and build deduplicated record maps for the
+    /// requested rooms. This is the batch counterpart to `scan_room_records`:
+    /// a shard-compaction preflight must not reread the same packfile once per
+    /// room in its closure.
+    fn scan_room_record_maps(
+        &self,
+        room_ids: &[[u8; 16]],
+    ) -> Result<HashMap<[u8; 16], RepackRecordMap>, StorageError> {
+        let wanted: HashSet<[u8; 16]> = room_ids.iter().copied().collect();
+        let mut maps: HashMap<[u8; 16], RepackRecordMap> = wanted
+            .iter()
+            .copied()
+            .map(|room_id| (room_id, HashMap::new()))
+            .collect();
+        for (shard_id, shard) in self.shards.all_shards() {
+            for (room_id, hash, offset) in packfile::scan_packfile(&shard.path)? {
+                if wanted.contains(&room_id) {
+                    maps.entry(room_id)
+                        .or_default()
+                        .insert(hash, (shard_id, offset));
+                }
+            }
+        }
+        Ok(maps)
     }
 
     fn build_index(offsets: &[([u8; 16], u16, u64)]) -> LossyIndex {
@@ -1317,14 +1346,23 @@ impl PackfileStorage {
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<RepackPlan, StorageError> {
         let hash_to_shard_offset = self.repack_scan_incremental(room_id)?;
+        self.plan_room_repack_from_map(room_id, &hash_to_shard_offset, &extract_edges)
+    }
+
+    fn plan_room_repack_from_map(
+        &self,
+        room_id: &[u8; 16],
+        hash_to_shard_offset: &RepackRecordMap,
+        extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+    ) -> Result<RepackPlan, StorageError> {
         let pinned = self.pin_shards(hash_to_shard_offset.values().map(|&(id, _)| id));
 
         let roots = self.live_roots.read().get(room_id).cloned();
         let (live_hashes, _adjacency) = match roots {
             Some(roots) if !roots.is_empty() => {
-                Self::bfs_live_set(&roots, &hash_to_shard_offset, &pinned, &extract_edges)?
+                Self::bfs_live_set(&roots, hash_to_shard_offset, &pinned, &extract_edges)?
             }
-            _ => Self::scan_full_adjacency(&hash_to_shard_offset, &pinned, &extract_edges)?,
+            _ => Self::scan_full_adjacency(hash_to_shard_offset, &pinned, &extract_edges)?,
         };
         let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
 
@@ -1351,6 +1389,30 @@ impl PackfileStorage {
             kept_bytes,
             shards_touched,
         })
+    }
+
+    /// Plan several room repacks from one physical scan of their shard
+    /// closure. Unlike repeatedly calling [`Self::plan_room_repack`], this
+    /// is O(bytes scanned) rather than O(rooms × bytes scanned).
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O or corruption while scanning or
+    /// resolving a requested room's records.
+    pub fn plan_rooms_repack(
+        &self,
+        room_ids: &[[u8; 16]],
+        extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+    ) -> Result<Vec<RepackPlan>, StorageError> {
+        let maps = self.scan_room_record_maps(room_ids)?;
+        room_ids
+            .iter()
+            .map(|room_id| {
+                let map = maps.get(room_id).ok_or_else(|| {
+                    StorageError::Corrupt("repack batch scan lost requested room".to_owned())
+                })?;
+                self.plan_room_repack_from_map(room_id, map, &extract_edges)
+            })
+            .collect()
     }
 
     /// Finds every room and shard transitively reachable from
