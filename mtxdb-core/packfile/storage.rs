@@ -3676,7 +3676,8 @@ mod tests {
 
         // Force TEST_ROOM's home (shard 0) to look full, so its next write
         // rotates *its own* home to shard 1 — root stays physically on
-        // shard 0, but TEST_ROOM's home moves on.
+        // shard 0, but TEST_ROOM's home (and this next record, `garbage`)
+        // moves to shard 1.
         store.shards.active_shard().file_len.store(
             shard::MAX_SHARD_BYTES - 10,
             std::sync::atomic::Ordering::Release,
@@ -3691,9 +3692,13 @@ mod tests {
             )
             .unwrap();
 
-        // Repack with only root live: the kept copy is rewritten into
-        // TEST_ROOM's *current* home (shard 1), leaving shard 0 holding
-        // only now-superseded bytes no live index entry points at.
+        // Repack with only root live: TEST_ROOM's records now span *two*
+        // source shards (root on 0, garbage on 1), and a repack must never
+        // rewrite live data back into one of its own sources (see
+        // `ShardPool::prepare_room_repack`'s doc) — so the kept copy lands
+        // on a *third* shard (2), not shard 1. Shard 1, left holding only
+        // the now-dropped `garbage` record with nothing live pointing at
+        // it, gets retired and closed during this same repack.
         store.set_live_roots(&TEST_ROOM, vec![root]);
         store
             .repack_room_reachable(&TEST_ROOM, |_hash, _data| Vec::new())
@@ -3706,9 +3711,26 @@ mod tests {
             !store.rooms_referencing_shard(0).unwrap().contains(&TEST_ROOM),
             "a room whose live data has moved off a shard must not be reported as still referencing it"
         );
+
+        // The real invariant here isn't "the destination is shard 2" —
+        // that's just where a deterministic, empty-pool allocator happens
+        // to land today. What must hold is: exactly one destination, and
+        // it's neither of the two source shards (0 and 1) a repack must
+        // never write live data back into.
+        let destinations = store.room_referenced_shards(&TEST_ROOM);
+        assert_eq!(
+            destinations.len(),
+            1,
+            "TEST_ROOM's live data must land on exactly one shard after repack"
+        );
+        let destination = destinations[0];
+        assert!(
+            ![0, 1].contains(&destination),
+            "the repack destination must not be one of its own source shards (0: root, 1: garbage)"
+        );
         assert!(
             store
-                .rooms_referencing_shard(1)
+                .rooms_referencing_shard(destination)
                 .unwrap()
                 .contains(&TEST_ROOM),
             "the room's current shard must still be reported"
