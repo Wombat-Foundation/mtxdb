@@ -1,7 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["mtxdb-cli", "mtxdb-core"]
-# exclude = ["mtxdb-ffi", "mtxdb-wasm"]
+# mtxdb-ffi and mtxdb-wasm deliberately stay out: a workspace member's own
+# [profile.*] is ignored (only the workspace root's applies), and
+# mtxdb-wasm's release profile (opt-level "z", lto, panic="abort") is
+# load-bearing for wasm binary size — folding it in here silently
+# discards it. They stay standalone builds, each with their own
+# [workspace] table, depending on mtxdb-core via a path dependency.
 
 # LINTS
 
@@ -58,7 +63,6 @@ codegen-units = 1
 panic = "abort"
 
 [profile.dev]
-opt-level = 0
 debug = 0
 strip = "debuginfo"
 incremental = true

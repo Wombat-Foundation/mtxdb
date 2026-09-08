@@ -9,8 +9,9 @@ repository = "https://github.com/Wombat-Foundation/mtxdb"
 description = "mtxdb: CLI and core library components; fast Matrix binary DB."
 license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
-keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
-categories = ["database-implementations", "storage"]
+keywords = ["database", "matrix", "cli"]
+categories = ["database", "cli"]
+readme = "../README.md"
 
 [[bin]]
 name = "mtxdb"
