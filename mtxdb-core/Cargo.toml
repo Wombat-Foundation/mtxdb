@@ -23,20 +23,20 @@ memmap2 = "0.9.11"
 parking_lot = "0.12"
 zstd = { version = "0.13", default-features = false }
 
-# Native builds link the system libzstd via pkg-config (already installed
-# at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
-# `zstd`/`zstd-safe` don't forward a "pkg-config" feature of their own, so
-# this reaches it by depending on `zstd-sys` directly at the same version
-# zstd-safe resolves to — Cargo unifies the two into one build.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-zstd-sys = { version = "2.1", features = ["pkg-config"] }
-
-# wasm targets have no libzstd to pkg-config against. `zstd-sys` ships a
-# "vendored" feature that forces its bundled C sources to be compiled from
-# source instead (overriding "pkg-config" outright, whichever target
-# enabled it) using its own `wasm-shim` — minimal libc stubs — so `cc`
-# can target wasm32 directly without a full WASI sysroot.
-[target.'cfg(target_family = "wasm")'.dependencies]
+# Compile zstd's bundled C source ourselves on every target, pinned to the
+# exact version in Cargo.lock, instead of linking whatever libzstd happens
+# to be installed on the build machine (that was tried via `zstd-sys`'s
+# "pkg-config" feature — see git history). Compressed frame bytes must be
+# byte-for-byte identical across independently-built nodes for the same
+# input (see the `Record`/`write_record` docs), which only holds within a
+# single fixed libzstd build: different nodes' system libzstd packages can
+# legitimately differ in version and produce different compressed bytes
+# for identical plaintext, breaking that guarantee silently. Vendoring
+# means every target — including wasm, which has no system libzstd to
+# link against in the first place, via `zstd-sys`'s `wasm-shim` minimal
+# libc stubs so `cc` can target wasm32 without a full WASI sysroot —
+# compiles the identical C source, so encoder output only ever depends on
+# input bytes, not on what's installed on whichever machine built the binary.
 zstd-sys = { version = "2.1", features = ["vendored"] }
 
 [[bench]]
