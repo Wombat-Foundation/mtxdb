@@ -85,7 +85,11 @@ pub(crate) const FLAG_COMPRESSED: u8 = 0x01;
 /// Byte length of the fixed part of a v3 frame's payload, i.e. everything
 /// between the length prefix and the node bytes: 1-byte flags + 4-byte
 /// `uncompressed_len` + 16-byte `room_id` + 16-byte `hash`.
-const FRAME_FIXED_LEN: usize = 1 + 4 + 16 + 16;
+pub(crate) const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
+
+/// Maximum plaintext node payload in one frame. This is lower than
+/// [`MAX_RECORD_LEN`] because the fixed v3 frame fields consume space too.
+pub const MAX_DATA_LEN: u32 = MAX_RECORD_LEN - FRAME_FIXED_LEN;
 
 /// A scanned `(room_id, hash, file_offset)` entry from a packfile.
 pub type ScanEntry = ([u8; 16], [u8; 16], u64);
@@ -133,7 +137,7 @@ impl Record {
     #[must_use]
     pub fn serialized_len(&self) -> usize {
         4_usize
-            .wrapping_add(FRAME_FIXED_LEN)
+            .wrapping_add(FRAME_FIXED_LEN as usize)
             .wrapping_add(self.data.len())
             .wrapping_add(4)
     }
@@ -186,8 +190,11 @@ const ZSTD_LEVEL: i32 = 3;
 /// # Panics
 /// Panics if the record's fixed fields plus plaintext data exceed `u32::MAX`.
 pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64> {
-    let plaintext_frame_len = u32::try_from(FRAME_FIXED_LEN.wrapping_add(record.data.len()))
-        .expect("record payload exceeds u32::MAX");
+    let uncompressed_len =
+        u32::try_from(record.data.len()).expect("record payload exceeds u32::MAX");
+    let plaintext_frame_len = FRAME_FIXED_LEN
+        .checked_add(uncompressed_len)
+        .expect("record frame length exceeds u32::MAX");
     if plaintext_frame_len > MAX_RECORD_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -195,15 +202,15 @@ pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64>
         ));
     }
 
-    let uncompressed_len = u32::try_from(record.data.len()).expect("checked above");
     let compressed = zstd::bulk::compress(&record.data, ZSTD_LEVEL).ok();
     let (flags, node_bytes): (u8, &[u8]) = match &compressed {
         Some(c) if c.len() < record.data.len() => (FLAG_COMPRESSED, c.as_slice()),
         _ => (0, &record.data),
     };
 
-    let frame_len = u32::try_from(FRAME_FIXED_LEN.wrapping_add(node_bytes.len()))
-        .expect("bounded by MAX_RECORD_LEN, checked above");
+    let frame_len = FRAME_FIXED_LEN
+        .checked_add(u32::try_from(node_bytes.len()).expect("bounded by MAX_RECORD_LEN"))
+        .expect("bounded by MAX_RECORD_LEN");
 
     writer.write_all(&frame_len.to_le_bytes())?;
     writer.write_all(&[flags])?;
@@ -248,8 +255,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     }
 
     let frame_len = u32::from_le_bytes(len_buf);
-    let min_len = u32::try_from(FRAME_FIXED_LEN).expect("FRAME_FIXED_LEN fits in u32");
-    if !(min_len..=MAX_RECORD_LEN).contains(&frame_len) {
+    if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid record length: {frame_len}"),
@@ -292,10 +298,10 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     let node_bytes = &payload[37..];
 
     let data = if flags & FLAG_COMPRESSED != 0 {
-        if uncompressed_len > MAX_RECORD_LEN {
+        if uncompressed_len > MAX_DATA_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_RECORD_LEN}"),
+                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
             ));
         }
         let decompressed = zstd::bulk::decompress(
@@ -319,6 +325,16 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
         }
         Bytes::from(decompressed)
     } else {
+        if usize::try_from(uncompressed_len).expect("u32 always fits in usize") != node_bytes.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "raw node length {} != framed uncompressed_len {uncompressed_len}",
+                    node_bytes.len()
+                ),
+            ));
+        }
         Bytes::copy_from_slice(node_bytes)
     };
 
@@ -842,7 +858,7 @@ mod tests {
             hash: [0u8; 16],
             data: Bytes::from_static(b"hello"),
         };
-        assert_eq!(r.serialized_len(), 4 + FRAME_FIXED_LEN + 5 + 4);
+        assert_eq!(r.serialized_len(), 4 + FRAME_FIXED_LEN as usize + 5 + 4);
     }
 
     #[test]
@@ -866,7 +882,7 @@ mod tests {
     /// then fail on read.
     #[test]
     fn test_write_read_roundtrip_at_max_record_len_boundary() {
-        let data_len = MAX_RECORD_LEN as usize - FRAME_FIXED_LEN;
+        let data_len = MAX_RECORD_LEN as usize - FRAME_FIXED_LEN as usize;
         // Pseudorandom, not zeros/repeats, so zstd can't shrink it below
         // the raw size — this must take the uncompressed-fallback path.
         let data: Vec<u8> = (0..data_len)
@@ -1049,7 +1065,7 @@ mod tests {
         // Simulate a realistic torn tail: valid length prefix declaring a
         // full frame, but fewer payload bytes actually present (missing
         // tail of the node bytes and the CRC). This mimics a crash mid-write.
-        let declared_frame_len: u32 = u32::try_from(FRAME_FIXED_LEN).unwrap() + 4; // fixed header + 4 bytes of data
+        let declared_frame_len = FRAME_FIXED_LEN + 4; // fixed header + 4 bytes of data
         buf.extend_from_slice(&declared_frame_len.to_le_bytes());
         buf.push(0); // flags: uncompressed
         buf.extend_from_slice(&4u32.to_le_bytes()); // uncompressed_len

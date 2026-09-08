@@ -861,9 +861,6 @@ impl ShardPool {
     ) -> Result<u64, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
-        // 1-byte flags + 4-byte uncompressed_len + 16-byte room_id + 16-byte hash.
-        const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
-
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
             let Some(mem) = guard.as_deref() else {
@@ -892,7 +889,7 @@ impl ShardPool {
             let frame_len_bytes: [u8; 4] = mem[offset_usize..prefix_end].try_into().unwrap();
             let frame_len = u32::from_le_bytes(frame_len_bytes);
 
-            if !(FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
+            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
                 return Err(StorageError::Corrupt(format!(
                     "invalid record length: {frame_len}"
                 )));
@@ -913,9 +910,6 @@ impl ShardPool {
     /// Panics only on internal invariant violation (unreachable path).
     pub fn read_at(shard: &Shard, offset: u64) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
-
-        // 1-byte flags + 4-byte uncompressed_len + 16-byte room_id + 16-byte hash.
-        const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
 
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
@@ -942,7 +936,7 @@ impl ShardPool {
             let frame_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
             let frame_len = u32::from_le_bytes(frame_len_bytes);
 
-            if !(FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
+            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
                 return Err(StorageError::Corrupt(format!(
                     "invalid record length: {frame_len}"
                 )));
@@ -965,65 +959,87 @@ impl ShardPool {
                 return Err(StorageError::Corrupt("truncated frame".into()));
             }
 
-            let payload = &mem[prefix_end..crc_pos];
-            let crc_buf: [u8; 4] = mem[crc_pos..frame_end].try_into().unwrap();
-
-            // Verify CRC over the bytes as written (compressed, if
-            // compressed) before attempting any decompression below.
-            let mut crc = crc32fast::Hasher::new();
-            crc.update(&frame_len_bytes);
-            crc.update(payload);
-            let expected = crc.finalize();
-            let actual = u32::from_le_bytes(crc_buf);
-            if expected != actual {
-                return Err(StorageError::Corrupt(format!(
-                    "CRC mismatch: expected {expected:08x}, got {actual:08x}"
-                )));
-            }
-
-            let flags = payload[0];
-            if flags & !packfile::FLAG_COMPRESSED != 0 {
-                return Err(StorageError::Corrupt(format!(
-                    "unsupported record flags: {flags:#04x}"
-                )));
-            }
-            let uncompressed_len = u32::from_le_bytes(payload[1..5].try_into().unwrap());
-            let mut room_id = [0u8; 16];
-            room_id.copy_from_slice(&payload[5..21]);
-            let mut hash = [0u8; 16];
-            hash.copy_from_slice(&payload[21..37]);
-            let node_bytes = &payload[37..];
-
-            let data = if flags & packfile::FLAG_COMPRESSED != 0 {
-                if uncompressed_len > packfile::MAX_RECORD_LEN {
-                    return Err(StorageError::Corrupt(format!(
-                        "framed uncompressed_len too large: {uncompressed_len} > {}",
-                        packfile::MAX_RECORD_LEN
-                    )));
-                }
-                let decompressed = zstd::bulk::decompress(
-                    node_bytes,
-                    usize::try_from(uncompressed_len).expect("checked above"),
-                )
-                .map_err(|e| StorageError::Corrupt(format!("zstd decompress failed: {e}")))?;
-                if decompressed.len() != usize::try_from(uncompressed_len).expect("checked above") {
-                    return Err(StorageError::Corrupt(format!(
-                        "decompressed length {} != framed uncompressed_len {uncompressed_len}",
-                        decompressed.len()
-                    )));
-                }
-                bytes::Bytes::from(decompressed)
-            } else {
-                bytes::Bytes::copy_from_slice(node_bytes)
-            };
-
-            return Ok(Record {
-                room_id,
-                hash,
-                data,
-            });
+            return Self::decode_record_frame(
+                frame_len_bytes,
+                &mem[prefix_end..crc_pos],
+                mem[crc_pos..frame_end].try_into().unwrap(),
+            );
         }
         unreachable!("read_at remap-retry is bounded to two iterations")
+    }
+
+    /// Verify and decode one complete v3 frame already bounded within an mmap.
+    fn decode_record_frame(
+        frame_len: [u8; 4],
+        payload: &[u8],
+        checksum: [u8; 4],
+    ) -> Result<Record, crate::storage::StorageError> {
+        use crate::storage::StorageError;
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&frame_len);
+        crc.update(payload);
+        let expected = crc.finalize();
+        let actual = u32::from_le_bytes(checksum);
+        if expected != actual {
+            return Err(StorageError::Corrupt(format!(
+                "CRC mismatch: expected {expected:08x}, got {actual:08x}"
+            )));
+        }
+
+        let flags = payload[0];
+        if flags & !packfile::FLAG_COMPRESSED != 0 {
+            return Err(StorageError::Corrupt(format!(
+                "unsupported record flags: {flags:#04x}"
+            )));
+        }
+        let uncompressed_len = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+        let mut room_id = [0u8; 16];
+        room_id.copy_from_slice(&payload[5..21]);
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&payload[21..37]);
+        let data = Self::decode_node_bytes(flags, uncompressed_len, &payload[37..])?;
+
+        Ok(Record {
+            room_id,
+            hash,
+            data,
+        })
+    }
+
+    /// Decode the node portion after a frame's CRC and structural fields passed.
+    fn decode_node_bytes(
+        flags: u8,
+        uncompressed_len: u32,
+        node_bytes: &[u8],
+    ) -> Result<bytes::Bytes, crate::storage::StorageError> {
+        use crate::storage::StorageError;
+
+        let expected_len = usize::try_from(uncompressed_len).expect("u32 always fits in usize");
+        if flags & packfile::FLAG_COMPRESSED == 0 {
+            return (expected_len == node_bytes.len())
+                .then(|| bytes::Bytes::copy_from_slice(node_bytes))
+                .ok_or_else(|| {
+                    StorageError::Corrupt(
+                        "raw node length differs from framed uncompressed_len".into(),
+                    )
+                });
+        }
+        if uncompressed_len > packfile::MAX_DATA_LEN {
+            return Err(StorageError::Corrupt(format!(
+                "framed uncompressed_len too large: {uncompressed_len} > {}",
+                packfile::MAX_DATA_LEN
+            )));
+        }
+        let decompressed = zstd::bulk::decompress(node_bytes, expected_len)
+            .map_err(|e| StorageError::Corrupt(format!("zstd decompress failed: {e}")))?;
+        if decompressed.len() != expected_len {
+            return Err(StorageError::Corrupt(format!(
+                "decompressed length {} != framed uncompressed_len {uncompressed_len}",
+                decompressed.len()
+            )));
+        }
+        Ok(bytes::Bytes::from(decompressed))
     }
 
     /// Remap a shard to its current on-disk length.

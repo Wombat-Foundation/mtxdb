@@ -361,6 +361,12 @@ fn cmd_namespaces(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// List logical namespaces from one pool. Cross-pool aggregation is deliberately
 /// avoided: each pool owns an independent 16-byte namespace and lifecycle.
 fn cmd_namespaces_in_dir(dir: &Path) -> anyhow::Result<()> {
+    // The persisted room directory is a fast listing snapshot, not proof
+    // that the shard files are readable by this binary. Validate the small
+    // immutable header of every shard before trusting it, so a pre-cutover
+    // store does not misleadingly appear empty just because its sidecar is
+    // empty or stale.
+    validate_packfile_headers(dir)?;
     let rooms = match PackfileStorage::room_summaries_from_disk(dir) {
         Some(rooms) => rooms,
         // A named pool is created with the database layout, before it has
@@ -427,6 +433,25 @@ fn cmd_namespaces_in_dir(dir: &Path) -> anyhow::Result<()> {
         fmt_megabytes(total_memory),
         fmt_disk_megabytes(total_disk_bytes),
     );
+    Ok(())
+}
+
+/// Confirm that every packfile in `dir` uses the format this CLI can read.
+/// This reads only the fixed 4 KiB shard descriptors; it never scans frames.
+fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "pack")
+        {
+            continue;
+        }
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open shard `{}`", path.display()))?;
+        mtxdb_core::packfile::read_header(&mut BufReader::new(file))
+            .with_context(|| format!("unsupported or corrupt shard `{}`", path.display()))?;
+    }
     Ok(())
 }
 

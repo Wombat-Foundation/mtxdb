@@ -10,3 +10,4 @@ docs/*.md
 .tmp/
 *.pack
 *.idx
+db.meta

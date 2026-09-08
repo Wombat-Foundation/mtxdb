@@ -128,6 +128,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("completions")
                 .about("Print shell completion script")
+                .hide(true)
                 .display_order(usize::MAX)
                 .arg(Arg::new("shell").required(true).value_parser([
                     "bash",
