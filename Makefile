@@ -85,6 +85,7 @@ bench: ##H Run benchmarks
 .PHONY: build
 build: ##H Build all
 	$(CARGO) build --release --timings
+	$(CARGO) build --release --timings --manifest-path mtxdb-cli/Cargo.toml
 	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
 	RUSTFLAGS= $(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 
