@@ -1393,6 +1393,23 @@ impl PackfileStorage {
             .collect()
     }
 
+    /// Current indexed-node count for every shard.
+    ///
+    /// Unlike a physical packfile scan, these counts include only index
+    /// entries that are presently live and resolve through a room's current
+    /// generation. Rewritten or superseded append entries are excluded.
+    #[must_use]
+    pub fn shard_node_counts(&self) -> HashMap<u16, u64> {
+        self.shard_rooms
+            .read()
+            .iter()
+            .map(|(&shard_id, rooms)| {
+                let count = rooms.values().copied().fold(0u64, u64::saturating_add);
+                (shard_id, count)
+            })
+            .collect()
+    }
+
     /// # Errors
     /// Returns `StorageError` on I/O or corruption.
     ///
@@ -1456,6 +1473,16 @@ impl PackfileStorage {
                 live_hashes.len(),
             )));
         }
+
+        // Copy into a non-source destination shard, never back into the
+        // room's current generation. Once the new index is published below,
+        // this lets old source shards retire when no other room references
+        // them.
+        let source_shards: HashSet<u16> = hash_to_shard_offset
+            .values()
+            .map(|&(shard_id, _)| shard_id)
+            .collect();
+        self.shards.prepare_room_repack(room_id, &source_shards)?;
 
         let mut new_offsets: Vec<([u8; 16], u16, u64)> = Vec::with_capacity(topo.len());
         for &local in &topo {
@@ -2909,6 +2936,47 @@ mod tests {
                 "rotation should reclaim a garbage-only shard slot after repack, \
                  not report the pool as permanently full",
             );
+    }
+
+    #[test]
+    fn test_repack_moves_live_data_out_of_its_source_shard() {
+        let dir = test_dir("repack_moves_from_source");
+        let store = PackfileStorage::open(dir).unwrap();
+        let node = [0xA5; 16];
+        store
+            .put(
+                &TEST_ROOM,
+                &node,
+                &NodeData::new(bytes::Bytes::from_static(b"live")),
+            )
+            .unwrap();
+
+        let source = store
+            .room_referenced_shards(&TEST_ROOM)
+            .into_iter()
+            .next()
+            .unwrap();
+        let (kept, dropped) = store
+            .repack_room_reachable(&TEST_ROOM, |_hash, _data| Vec::new())
+            .unwrap();
+
+        assert_eq!((kept, dropped), (1, 0));
+        let destination = store
+            .room_referenced_shards(&TEST_ROOM)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_ne!(destination, source);
+        assert!(store.shards.get_shard(source).is_none());
+        assert_eq!(
+            store
+                .get(&TEST_ROOM, &node)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            b"live"
+        );
     }
 
     /// Repack must not retire a shard that another room's index still

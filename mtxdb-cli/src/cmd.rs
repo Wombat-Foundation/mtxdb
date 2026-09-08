@@ -55,6 +55,19 @@ fn fmt_megabytes(bytes: usize) -> String {
     format!("{whole}.{fraction:04} MB")
 }
 
+/// Percentage of `part` over `total`, rounded exactly to two decimals.
+fn fmt_percent(part: u64, total: u64) -> String {
+    if total == 0 {
+        return "0.00%".to_owned();
+    }
+    let hundredths = part
+        .saturating_mul(10_000)
+        .saturating_add(total / 2)
+        .checked_div(total)
+        .unwrap_or(u64::MAX);
+    format!("{}.{:02}%", hundredths / 100, hundredths % 100)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().fold(
         String::with_capacity(bytes.len().saturating_mul(2)),
@@ -63,6 +76,18 @@ fn hex_encode(bytes: &[u8]) -> String {
             s
         },
     )
+}
+
+/// Ask the user to explicitly approve a destructive operation.
+///
+/// Returns `false` for every response except `y`/`Y`, so an empty line or
+/// EOF is always safe by default.
+fn confirm(prompt: &str) -> anyhow::Result<bool> {
+    eprint!("{prompt} [y/N] ");
+    io::stderr().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
 pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
@@ -157,13 +182,12 @@ fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Scan every shard's packfile to count frames per room — the I/O
+/// Scan every shard's packfile to count append entries per room — the I/O
 /// (reading record headers) is unavoidable since room ownership only
 /// exists inside the packfile, but this skips building a `LossyIndex`
 /// and `NodeCache` per room, which `open_store_read_only` would do
 /// purely to hand back counts and then throw everything away.
-fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
-    let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+fn room_frame_counts(dir: &Path) -> anyhow::Result<Vec<([u8; 16], usize)>> {
     let mut counts: std::collections::HashMap<[u8; 16], usize> = std::collections::HashMap::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -173,22 +197,39 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         }
         let records = mtxdb_core::packfile::scan_packfile(&path)?;
         for (room_id, _hash, _offset) in &records {
-            #[allow(clippy::arithmetic_side_effects)]
-            {
-                counts.entry(*room_id).and_modify(|c| *c += 1).or_insert(1);
-            }
+            counts
+                .entry(*room_id)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
         }
     }
 
-    if counts.is_empty() {
+    let mut rooms: Vec<([u8; 16], usize)> = counts.into_iter().collect();
+    rooms.sort_unstable_by_key(|&(id, _)| id);
+    Ok(rooms)
+}
+
+fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
+    let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    let rooms = room_frame_counts(dir)?;
+
+    if rooms.is_empty() {
         eprintln!("no rooms found");
         return Ok(());
     }
-    let mut rooms: Vec<([u8; 16], usize)> = counts.into_iter().collect();
-    rooms.sort_unstable_by_key(|&(id, _)| id);
+
+    let store = open_store_read_only(cli)?;
+    println!(
+        "  {:>4}  {:<34}  {:>7}  {:>10}  {:>7}",
+        "slot", "room", "nodes", "index RAM", "writes"
+    );
     for (i, (room_id, count)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
-        println!("  {i}: 0x{hex} ({count} frames)");
+        let (nodes, memory) = store.room_index_info(room_id).unwrap_or((0, 0));
+        println!(
+            "  {i:>4}  0x{hex}  {nodes:>7}  {:>10}  {count:>7}",
+            fmt_megabytes(memory),
+        );
     }
     Ok(())
 }
@@ -210,7 +251,8 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
-    print_shard_table(&shard_entries, &stats_map);
+    let node_counts = open_store_read_only(cli)?.shard_node_counts();
+    print_shard_table(&shard_entries, &stats_map, &node_counts);
     eprintln!(
         "{} shard(s), {}",
         shard_entries.len(),
@@ -289,21 +331,26 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 }
 
 /// Print the shard table header and rows.
-fn print_shard_table(shard_entries: &[(u16, u64, u64)], stats_map: &ShardStatsMap) {
+fn print_shard_table(
+    shard_entries: &[(u16, u64, u64)],
+    stats_map: &ShardStatsMap,
+    node_counts: &std::collections::HashMap<u16, u64>,
+) {
     const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     println!(
-        "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
-        "slot", "epoch", "bytes", "writes", "written", "syncs"
+        "{:>6}  {:>18}  {:>10}  {:>8}  {:>8}  {:>10}  {:>6}",
+        "slot", "epoch", "bytes", "nodes", "writes", "written", "syncs"
     );
     for &(slot_id, epoch, file_bytes) in shard_entries {
         let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
         let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
         println!(
-            "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
+            "{:>6}  {:>18}  {:>10}  {:>8}  {:>8}  {:>10}  {:>6}",
             slot_id,
             format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
+            node_counts.get(&slot_id).copied().unwrap_or(0),
             wc,
             fmt_bytes(bw),
             sc,
@@ -336,7 +383,17 @@ fn fmt_duration(secs: u64) -> String {
 }
 
 fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
-    let room_id = parse_room_id(room)?;
+    let room_id = match room.parse::<usize>() {
+        Ok(slot) => {
+            let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+            let rooms = room_frame_counts(dir)?;
+            rooms
+                .get(slot)
+                .map(|(room_id, _)| *room_id)
+                .with_context(|| format!("room slot {slot} not found"))?
+        }
+        Err(_) => parse_room_id(room)?,
+    };
     let store = open_store_read_only(cli)?;
     let hex = hex_encode(&room_id);
     match store.room_index_info(&room_id) {
@@ -372,7 +429,7 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let path = &shard.path;
     let records = mtxdb_core::packfile::scan_packfile(path)?;
     println!(
-        "shard: {} bytes, {} frames",
+        "shard: {} bytes, {} writes",
         std::fs::metadata(path)?.len(),
         records.len()
     );
@@ -543,105 +600,93 @@ fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyho
 /// it's grown since the read-only preview (a write landed in the gap),
 /// that's reported rather than silently repacking a larger scope than
 /// what was shown.
-fn cmd_repack_shard(
-    cli: &Cli,
-    shard_id: u16,
-    live_roots: &[String],
-    topo: bool,
-) -> anyhow::Result<()> {
-    if !live_roots.is_empty() {
-        bail!("--root requires --room — live roots are per-room, not meaningful for --shard");
-    }
-    if topo {
-        eprintln!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-    } else {
-        eprintln!("warning: --topo without --root means no GC; all records preserved");
-    }
+struct RepackPreview {
+    rooms: Vec<[u8; 16]>,
+    shards: Vec<u16>,
+}
 
-    let (preview_rooms, preview_shards) = {
-        let preview_store = open_store_read_only(cli)?;
-        let (rooms, shards) = preview_store.repack_closure(shard_id)?;
-        if rooms.is_empty() {
-            eprintln!("no rooms reference shard {shard_id}");
-            return Ok(());
-        }
-
-        let mut total_kept_bytes: u64 = 0;
-        let mut total_kept = 0usize;
-        let mut total_dropped = 0usize;
-        for room_id in &rooms {
-            let plan = if topo {
-                preview_store.plan_room_repack(room_id, extract_matrix_edges)?
-            } else {
-                preview_store.plan_room_repack(room_id, |_hash, _data| Vec::new())?
-            };
-            total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
-            total_kept = total_kept.saturating_add(plan.kept);
-            total_dropped = total_dropped.saturating_add(plan.dropped);
-        }
-
-        let max_shard_bytes = mtxdb_core::shard::MAX_SHARD_BYTES;
-        let expected_shards = total_kept_bytes
-            .checked_add(max_shard_bytes.saturating_sub(1))
-            .map_or(1, |rounded| rounded / max_shard_bytes)
-            .max(1);
-        let slop = expected_shards
-            .saturating_mul(max_shard_bytes)
-            .saturating_sub(total_kept_bytes);
-        let shard_slots = shards
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        eprintln!(
-            "this will repack {} room{} across {} shard{} (slots: {shard_slots})",
-            rooms.len(),
-            if rooms.len() == 1 { "" } else { "s" },
-            shards.len(),
-            if shards.len() == 1 { "" } else { "s" },
-        );
-        eprintln!(
-            "expected result: ~{expected_shards} shard{} ({} kept, {} dropped, ~{} slack in the last shard)",
-            if expected_shards == 1 { "" } else { "s" },
-            total_kept,
-            total_dropped,
-            fmt_bytes(slop),
-        );
-        (rooms, shards)
-        // preview_store (and its non-exclusive read-only handle) drops
-        // here, before the confirmation prompt — nothing about a
-        // read-only open blocks a real writer anyway, but there's no
-        // reason to keep it open through an indefinite human pause.
-    };
-
-    eprint!("press Enter to continue, Ctrl+C to abort: ");
-    io::stderr().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-
-    // Only now do we take the exclusive writer lock — and the very first
-    // thing done under it is recomputing the closure fresh, since the
-    // read-only preview above is, by construction, a snapshot that could
-    // be arbitrarily stale by the time a human finishes reading it.
-    let store = open_store(cli)?;
-    let (rooms, touched_shards) = store.repack_closure(shard_id)?;
+fn repack_preview(cli: &Cli, shard_id: u16, topo: bool) -> anyhow::Result<Option<RepackPreview>> {
+    let preview_store = open_store_read_only(cli)?;
+    let (rooms, shards) = preview_store.repack_closure(shard_id)?;
     if rooms.is_empty() {
-        eprintln!("shard {shard_id} is no longer referenced by any room — nothing to do");
-        return Ok(());
-    }
-    let grew = rooms.iter().any(|r| !preview_rooms.contains(r))
-        || touched_shards.iter().any(|s| !preview_shards.contains(s));
-    if grew {
-        eprintln!(
-            "note: the closure grew since the preview (now {} rooms / {} shards) — repacking the current, authoritative closure",
-            rooms.len(),
-            touched_shards.len()
-        );
+        eprintln!("no rooms reference shard {shard_id}");
+        return Ok(None);
     }
 
-    let mut results = Vec::with_capacity(rooms.len());
+    let mut total_kept_bytes: u64 = 0;
+    let mut total_kept = 0usize;
+    let mut total_dropped = 0usize;
     for room_id in &rooms {
+        let plan = if topo {
+            preview_store.plan_room_repack(room_id, extract_matrix_edges)?
+        } else {
+            preview_store.plan_room_repack(room_id, |_hash, _data| Vec::new())?
+        };
+        total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
+        total_kept = total_kept.saturating_add(plan.kept);
+        total_dropped = total_dropped.saturating_add(plan.dropped);
+    }
+
+    let max_shard_bytes = mtxdb_core::shard::MAX_SHARD_BYTES;
+    let expected_shards = total_kept_bytes
+        .checked_add(max_shard_bytes.saturating_sub(1))
+        .map_or(1, |rounded| rounded / max_shard_bytes)
+        .max(1);
+    let slop = expected_shards
+        .saturating_mul(max_shard_bytes)
+        .saturating_sub(total_kept_bytes);
+    let shard_slots = shards
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shard_sizes: std::collections::HashMap<u16, u64> = preview_store
+        .shard_summaries()
+        .into_iter()
+        .map(|summary| (summary.shard_id, summary.file_bytes))
+        .collect();
+    let total_input_bytes = shards.iter().fold(0u64, |total, shard_id| {
+        total.saturating_add(shard_sizes.get(shard_id).copied().unwrap_or(0))
+    });
+
+    eprintln!(
+        "this will repack {} room{} across {} shard{} (slots: {shard_slots})",
+        rooms.len(),
+        if rooms.len() == 1 { "" } else { "s" },
+        shards.len(),
+        if shards.len() == 1 { "" } else { "s" },
+    );
+    for shard_id in &shards {
+        let bytes = shard_sizes.get(shard_id).copied().unwrap_or(0);
+        eprintln!("  slot {shard_id}: {}", fmt_bytes(bytes));
+    }
+    eprintln!("  total: {}", fmt_bytes(total_input_bytes));
+    eprintln!(
+        "expected result: ~{expected_shards} shard{} ({} nodes across {} room{} rewritten: ~{} / {} = {}; {} unreachable nodes removed; ~{} free in the last shard)",
+        if expected_shards == 1 { "" } else { "s" },
+        total_kept,
+        rooms.len(),
+        if rooms.len() == 1 { "" } else { "s" },
+        fmt_bytes(total_kept_bytes),
+        fmt_bytes(total_input_bytes),
+        fmt_percent(total_kept_bytes, total_input_bytes),
+        total_dropped,
+        fmt_bytes(slop),
+    );
+    // preview_store (and its non-exclusive read-only handle) drops
+    // here, before the confirmation prompt — nothing about a
+    // read-only open blocks a real writer anyway, but there's no
+    // reason to keep it open through an indefinite human pause.
+    Ok(Some(RepackPreview { rooms, shards }))
+}
+
+fn repack_rooms(
+    store: &PackfileStorage,
+    rooms: &[[u8; 16]],
+    topo: bool,
+) -> anyhow::Result<(usize, usize)> {
+    let mut results = Vec::with_capacity(rooms.len());
+    for room_id in rooms {
         let (kept, dropped) = if topo {
             store.repack_room_reachable(room_id, extract_matrix_edges)?
         } else {
@@ -662,6 +707,57 @@ fn cmd_repack_shard(
         "done: {} rooms repacked, {final_kept} kept, {final_dropped} dropped",
         results.len()
     );
+    Ok((final_kept, final_dropped))
+}
+
+fn cmd_repack_shard(
+    cli: &Cli,
+    shard_id: u16,
+    live_roots: &[String],
+    topo: bool,
+) -> anyhow::Result<()> {
+    if !live_roots.is_empty() {
+        bail!("--root requires --room — live roots are per-room, not meaningful for --shard");
+    }
+    if topo {
+        eprintln!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
+    } else {
+        eprintln!("warning: --topo without --root means no GC; all records preserved");
+    }
+
+    let Some(preview) = repack_preview(cli, shard_id, topo)? else {
+        return Ok(());
+    };
+
+    if !confirm("Apply this repack?")? {
+        eprintln!("aborted");
+        return Ok(());
+    }
+
+    // Only now do we take the exclusive writer lock — and the very first
+    // thing done under it is recomputing the closure fresh, since the
+    // read-only preview above is, by construction, a snapshot that could
+    // be arbitrarily stale by the time a human finishes reading it.
+    let store = open_store(cli)?;
+    let (rooms, touched_shards) = store.repack_closure(shard_id)?;
+    if rooms.is_empty() {
+        eprintln!("shard {shard_id} is no longer referenced by any room — nothing to do");
+        return Ok(());
+    }
+    let grew = rooms.iter().any(|r| !preview.rooms.contains(r))
+        || touched_shards.iter().any(|s| !preview.shards.contains(s));
+    if grew {
+        eprintln!(
+            "note: the closure grew since the preview (now {} rooms / {} shards) — repacking the current, authoritative closure",
+            rooms.len(),
+            touched_shards.len()
+        );
+    }
+
+    repack_rooms(&store, &rooms, topo)?;
+    drop(store);
+    eprintln!("post-repack shard state:");
+    cmd_shards(cli)?;
     Ok(())
 }
 
@@ -695,11 +791,7 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
 
     if !yes {
         eprintln!("This will permanently delete all data for room {hex}.");
-        eprint!("Are you sure? [y/N] ");
-        io::stderr().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
+        if !confirm("Delete this room?")? {
             eprintln!("aborted");
             return Ok(());
         }

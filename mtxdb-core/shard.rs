@@ -940,6 +940,11 @@ impl ShardPool {
     /// Returns `io::Error` on shard file creation failure.
     fn rotate(&self) -> io::Result<()> {
         let _guard = self.rotation_lock.lock();
+        self.rotate_locked()
+    }
+
+    /// Rotate while `rotation_lock` is held by the caller.
+    fn rotate_locked(&self) -> io::Result<()> {
         let current = *self.active_write.lock();
 
         let mut shards = self.shards.write();
@@ -967,6 +972,30 @@ impl ShardPool {
         Err(io::Error::other(
             "shard pool full: all slots occupied by active shards; repack to reclaim",
         ))
+    }
+
+    /// Assign a non-source shard as `room_id`'s write home before a repack.
+    /// Repack must never copy live entries back into one of its source
+    /// shards: doing so leaves the source still referenced after the
+    /// generation swap, preventing its retirement and turning compaction
+    /// into unbounded append growth. Rooms being rewritten from the same
+    /// sources share the current destination shard.
+    ///
+    /// # Errors
+    /// Returns an error if no free shard slot is available for the temporary
+    /// rewrite destination.
+    pub(crate) fn prepare_room_repack(
+        &self,
+        room_id: &[u8; 16],
+        source_shards: &HashSet<u16>,
+    ) -> io::Result<()> {
+        let _guard = self.rotation_lock.lock();
+        if source_shards.contains(&*self.active_write.lock()) {
+            self.rotate_locked()?;
+        }
+        let shard_id = *self.active_write.lock();
+        self.room_home.write().insert(*room_id, shard_id);
+        Ok(())
     }
 
     /// Best-effort stats snapshot write, same contract as the `Drop` impl:
