@@ -473,13 +473,16 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
             .with_context(|| format!("{} is not valid UTF-8 JSONL", path.display()))?;
         let mut events = Vec::new();
         for (line_number, line) in text.lines().enumerate() {
+            let line_number = line_number
+                .checked_add(1)
+                .context("JSONL line number overflow")?;
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
             let mut bytes = line.as_bytes().to_vec();
             let event = simd_json::to_owned_value(&mut bytes)
-                .with_context(|| format!("invalid JSONL event on line {}", line_number + 1))?;
+                .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
             events.push(event);
         }
         let detected_room = events.iter().find_map(event_room_id).map(str::to_owned);
@@ -507,6 +510,7 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
 
     let mut event_count = 0u64;
     let mut skipped = 0u64;
+    let mut already_present = 0u64;
 
     let store = open_store(cli)?;
 
@@ -523,34 +527,22 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
     let room_hex = hex_encode(&room_id);
 
     for ev in &events {
-        let sha = match ev {
-            OwnedValue::Object(obj) => match obj.get("hashes") {
-                Some(OwnedValue::Object(h)) => match h.get("sha256") {
-                    Some(OwnedValue::String(s)) => Some(s.as_str()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(sha) = sha else {
+        let Some(id_bytes) = event_node_id(ev) else {
             skipped = skipped.saturating_add(1);
             continue;
         };
 
-        let id_bytes = match base64::engine::general_purpose::STANDARD_NO_PAD.decode(sha) {
-            Ok(b) if b.len() >= 16 => {
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&b[..16]);
-                id
-            }
-            _ => {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-        };
-
         let event_bytes = ev.to_string().into_bytes();
+        if let Some(existing) = store.get(&room_id, &id_bytes)? {
+            if existing.bytes.as_ref() != event_bytes.as_slice() {
+                bail!(
+                    "node ID {} already exists with different payload; refusing to overwrite it",
+                    hex_encode(&id_bytes)
+                );
+            }
+            already_present = already_present.saturating_add(1);
+            continue;
+        }
         let data = NodeData::new(bytes::Bytes::from(event_bytes));
         store.put(&room_id, &id_bytes, &data)?;
         event_count = event_count.saturating_add(1);
@@ -559,6 +551,9 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
     eprintln!("imported {event_count} events to room {room_hex}");
     if skipped > 0 {
         eprintln!("skipped {skipped} events (missing sha256 hash)");
+    }
+    if already_present > 0 {
+        eprintln!("{already_present} events already present");
     }
 
     Ok(())
@@ -572,6 +567,23 @@ fn event_room_id(value: &OwnedValue) -> Option<&str> {
         },
         _ => None,
     }
+}
+
+fn event_node_id(value: &OwnedValue) -> Option<[u8; 16]> {
+    let OwnedValue::Object(event) = value else {
+        return None;
+    };
+    let Some(OwnedValue::Object(hashes)) = event.get("hashes") else {
+        return None;
+    };
+    let Some(OwnedValue::String(sha)) = hashes.get("sha256") else {
+        return None;
+    };
+    let decoded = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(sha)
+        .ok()?;
+    let bytes: [u8; 16] = decoded.get(..16)?.try_into().ok()?;
+    Some(bytes)
 }
 
 fn cmd_repack(
