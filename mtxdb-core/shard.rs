@@ -384,7 +384,17 @@ impl ShardPool {
     }
 
     fn open_internal(base_dir: PathBuf, writable: bool) -> io::Result<Self> {
-        fs::create_dir_all(&base_dir)?;
+        if writable {
+            fs::create_dir_all(&base_dir)?;
+        } else if !base_dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "shard pool directory does not exist: {}",
+                    base_dir.display()
+                ),
+            ));
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         let writer_lock = writable

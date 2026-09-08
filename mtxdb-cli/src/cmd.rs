@@ -182,7 +182,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
         Commands::Get { room, id } => cmd_get(cli, room.as_deref(), id),
-        Commands::Namespaces { all } => cmd_namespaces(cli, *all),
+        Commands::Collections { all } => cmd_collections(cli, *all),
         Commands::Shards { all } => cmd_shards(cli, *all),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { shard } => cmd_scan(cli, shard),
@@ -343,7 +343,7 @@ fn room_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
         .collect())
 }
 
-fn cmd_namespaces(cli: &Cli, all: bool) -> anyhow::Result<()> {
+fn cmd_collections(cli: &Cli, all: bool) -> anyhow::Result<()> {
     if all {
         let layout = open_layout(cli)?;
         for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
@@ -351,16 +351,16 @@ fn cmd_namespaces(cli: &Cli, all: bool) -> anyhow::Result<()> {
                 println!();
             }
             println!("{}:", shard_type.as_str());
-            cmd_namespaces_in_dir(&pool_dir(&layout, shard_type)?)?;
+            cmd_collections_in_dir(&pool_dir(&layout, shard_type)?)?;
         }
         return Ok(());
     }
-    cmd_namespaces_in_dir(&selected_pool_dir(cli)?)
+    cmd_collections_in_dir(&selected_pool_dir(cli)?)
 }
 
-/// List logical namespaces from one pool. Cross-pool aggregation is deliberately
+/// List logical collections from one pool. Cross-pool aggregation is deliberately
 /// avoided: each pool owns an independent 16-byte namespace and lifecycle.
-fn cmd_namespaces_in_dir(dir: &Path) -> anyhow::Result<()> {
+fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
     // The persisted room directory is a fast listing snapshot, not proof
     // that the shard files are readable by this binary. Validate the small
     // immutable header of every shard before trusting it, so a pre-cutover
@@ -372,10 +372,10 @@ fn cmd_namespaces_in_dir(dir: &Path) -> anyhow::Result<()> {
         // A named pool is created with the database layout, before it has
         // necessarily received a first write. `open_read_only` quite
         // properly rejects a directory with no shard files, but for a
-        // listing that simply means there are no namespaces to show.
+        // listing that simply means there are no collections to show.
         None if glob_shard_files(dir)?.is_empty() => Vec::new(),
         // Old stores have no sidecar yet. Keep the complete, slower fallback
-        // so `namespaces` remains useful until `mtxdb sync` writes one.
+        // so `collections` remains useful until `mtxdb sync` writes one.
         None => PackfileStorage::open_read_only(dir.into())
             .context("failed to open store")?
             .room_summaries(),
@@ -384,13 +384,13 @@ fn cmd_namespaces_in_dir(dir: &Path) -> anyhow::Result<()> {
     let disk_bytes = room_disk_bytes(dir)?;
 
     if rooms.is_empty() {
-        println!("no namespaces found");
+        println!("no collections found");
         return Ok(());
     }
 
     println!(
         "  {:>4}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
-        "slot", "namespace", "nodes", "shards", "index RAM", "disk (MB)"
+        "slot", "collection", "nodes", "shards", "index RAM", "disk"
     );
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;

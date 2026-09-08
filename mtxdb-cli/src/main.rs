@@ -23,7 +23,7 @@ pub(crate) enum Commands {
         room: Option<String>,
         id: String,
     },
-    Namespaces {
+    Collections {
         all: bool,
     },
     Shards {
@@ -115,17 +115,17 @@ fn build_cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("namespaces")
-                .about("List logical namespaces in the selected shard pool")
+            Command::new("collections")
+                .about("List logical collections in the selected shard pool")
                 .arg(
                     Arg::new("all")
                         .short('a')
                         .long("all")
                         .action(ArgAction::SetTrue)
-                        .help("List namespaces in every independent pool"),
+                        .help("List collections in every independent pool"),
                 ),
         )
-        .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
+        .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard stats"))
         .subcommand(
             Command::new("completions")
                 .about("Print shell completion script")
@@ -154,7 +154,7 @@ fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("info")
-                .about("Show storage info for a room")
+                .about("Show storage info for a collection")
                 .arg(Arg::new("room").required(true).value_name("ROOM")),
         )
         .subcommand(sub_delete())
@@ -168,8 +168,8 @@ fn sub_import() -> Command {
         .long_about(
             "Import Matrix federation events from a JSON document or JSONL event stream. A JSON \
              document must contain a `pdus` array, an `auth_chain` array, or both; a `.jsonl` \
-             file contains one event per line. Each imported event needs an `event_id`. The room \
-             comes from `room_id` unless --room is supplied.",
+             file contains one event per line. Each imported event needs an `event_id`. The \
+             namespace comes from `room_id` unless --room is supplied.",
         )
         .arg(
             Arg::new("path")
@@ -188,9 +188,9 @@ fn sub_import() -> Command {
 
 fn sub_export() -> Command {
     Command::new("export")
-        .about("Export a room's records as JSONL to stdout")
+        .about("Export a collection's records as JSONL to stdout")
         .long_about(
-            "Export a room's stored records as one JSON value per line on stdout. Redirect the \
+            "Export a collection's stored records as one JSON value per line on stdout. Redirect the \
              output to make an input accepted by `mtxdb import`.",
         )
         .arg(
@@ -203,7 +203,7 @@ fn sub_export() -> Command {
 
 fn sub_repack() -> Command {
     Command::new("repack")
-        .about("Trigger a manual repack for a room, or every room referencing a shard")
+        .about("Trigger manual repack over closure of collection or shard closure")
         .arg(
             Arg::new("room")
                 .short('r')
@@ -237,13 +237,13 @@ fn sub_repack() -> Command {
 
 fn sub_delete() -> Command {
     Command::new("delete")
-        .about("Delete all data for one or more rooms")
+        .about("Delete all data for one or more collections")
         .arg(
             Arg::new("room")
                 .required(true)
                 .num_args(1..)
                 .value_name("ROOM")
-                .help("Room IDs to delete"),
+                .help("Namespace IDs to delete"),
         )
         .arg(
             Arg::new("yes")
@@ -304,7 +304,7 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").cloned(),
             id: m.get_one::<String>("id").unwrap().clone(),
         },
-        Some(("namespaces", m)) => Commands::Namespaces {
+        Some(("collections", m)) => Commands::Collections {
             all: m.get_flag("all"),
         },
         Some(("shards", m)) => Commands::Shards {
