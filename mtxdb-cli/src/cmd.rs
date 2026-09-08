@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
-use std::path::Path;
+use std::io::{self, BufReader, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
@@ -272,7 +272,16 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         let shards = room_shards
             .as_ref()
             .and_then(|by_room| by_room.get(room_id))
-            .map_or_else(|| "?".to_owned(), |shards| shards.len().to_string());
+            .map_or_else(
+                || "?".to_owned(),
+                |shards| {
+                    if shards.len() == 1 {
+                        String::new()
+                    } else {
+                        shards.len().to_string()
+                    }
+                },
+            );
         total_nodes = total_nodes
             .checked_add(*nodes)
             .context("total room node count overflow")?;
@@ -501,40 +510,223 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
         }
         Err(_) => parse_room_id(room)?,
     };
-    let store = open_store_read_only(cli)?;
     let hex = hex_encode(&room_id);
+    let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+
+    // The persisted directory is enough for the numerical summary and the
+    // room's physical placement. Do not rebuild every room index merely to
+    // answer `info` for one room.
+    if let (Some(summaries), Some(room_shards)) = (
+        PackfileStorage::room_summaries_from_disk(dir),
+        PackfileStorage::room_shards_from_disk(dir),
+    ) {
+        if let Some((_, len, mem)) = summaries.into_iter().find(|(id, _, _)| *id == room_id) {
+            println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
+            let shards = room_shards.get(&room_id).cloned().unwrap_or_default();
+            if shards.len() > 1 {
+                println!(
+                    "  shards: {}",
+                    shards
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            let details = matrix_room_details_from_cache(dir, &room_id).unwrap_or_else(|| {
+                let details = matrix_room_details_from_shards(dir, &room_id, &shards)
+                    .unwrap_or_else(|error| {
+                        eprintln!("warning: unable to inspect Matrix room metadata: {error}");
+                        MatrixRoomDetails::default()
+                    });
+                if let Err(error) = persist_matrix_room_details(dir, &room_id, &details) {
+                    eprintln!("warning: unable to cache Matrix room metadata: {error}");
+                }
+                details
+            });
+            print_matrix_room_details(details);
+            return Ok(());
+        }
+        eprintln!("room {hex}: not found");
+        return Ok(());
+    }
+
+    // A store predating the inspection sidecar has no cheap authoritative
+    // summary. Preserve the old full-scan fallback until `mtxdb sync` can
+    // create the sidecar.
+    let store = open_store_read_only(cli)?;
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
             println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
             let shards = store.room_referenced_shards(&room_id);
             if shards.len() > 1 {
-                let shards = shards
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!("  shards: {shards}");
+                println!(
+                    "  shards: {}",
+                    shards
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
-            let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
-            let details = matrix_room_details(&store, dir, &room_id)?;
-            if let Some(matrix_room_id) = details.room_id {
-                println!("  Matrix room: {matrix_room_id}");
-            }
-            if let Some(create) = details.create {
-                println!("  create: {create}");
-            }
+            print_matrix_room_details(matrix_room_details(&store, dir, &room_id)?);
         }
-        None => {
-            eprintln!("room {hex}: not found");
-        }
+        None => eprintln!("room {hex}: not found"),
     }
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MatrixRoomDetails {
     room_id: Option<String>,
     create: Option<String>,
+}
+
+const MATRIX_ROOM_DETAILS_MAGIC: &[u8; 4] = b"MMRM";
+const MATRIX_ROOM_DETAILS_VERSION: u8 = 1;
+const MATRIX_ROOM_DETAILS_HEADER_LEN: usize = 4 + 1;
+const MATRIX_ROOM_DETAILS_RECORD_HEADER_LEN: usize = 16 + 2 + 2;
+
+fn matrix_room_details_path(dir: &Path) -> PathBuf {
+    dir.join("matrix_room_details.bin")
+}
+
+/// Load one cached Matrix description. This cache is only presentation
+/// metadata; packfiles and the shard→room directory remain authoritative.
+fn matrix_room_details_from_cache(dir: &Path, room_id: &[u8; 16]) -> Option<MatrixRoomDetails> {
+    let buf = fs::read(matrix_room_details_path(dir)).ok()?;
+    if buf.len() < MATRIX_ROOM_DETAILS_HEADER_LEN
+        || &buf[0..4] != MATRIX_ROOM_DETAILS_MAGIC
+        || buf[4] != MATRIX_ROOM_DETAILS_VERSION
+    {
+        return None;
+    }
+    let mut offset = MATRIX_ROOM_DETAILS_HEADER_LEN;
+    while offset < buf.len() {
+        let header_end = offset.checked_add(MATRIX_ROOM_DETAILS_RECORD_HEADER_LEN)?;
+        let header = buf.get(offset..header_end)?;
+        let matrix_len = usize::from(u16::from_le_bytes(header[16..18].try_into().ok()?));
+        let create_len = usize::from(u16::from_le_bytes(header[18..20].try_into().ok()?));
+        let data_len = matrix_len.checked_add(create_len)?;
+        let data_end = header_end.checked_add(data_len)?;
+        let data = buf.get(header_end..data_end)?;
+        if &header[0..16] == room_id {
+            let matrix_room_id = std::str::from_utf8(&data[..matrix_len])
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let create = std::str::from_utf8(&data[matrix_len..])
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            return Some(MatrixRoomDetails {
+                room_id: matrix_room_id,
+                create,
+            });
+        }
+        offset = data_end;
+    }
+    None
+}
+
+/// Atomically update the optional CLI metadata cache. It saves subsequent
+/// `info` calls from decoding arbitrary event payloads in large shards.
+fn persist_matrix_room_details(
+    dir: &Path,
+    room_id: &[u8; 16],
+    details: &MatrixRoomDetails,
+) -> io::Result<()> {
+    if details.room_id.is_none() && details.create.is_none() {
+        return Ok(());
+    }
+    let mut entries = read_all_matrix_room_details(dir);
+    entries.insert(*room_id, details.clone());
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(MATRIX_ROOM_DETAILS_MAGIC);
+    buf.push(MATRIX_ROOM_DETAILS_VERSION);
+    let mut entries: Vec<_> = entries.into_iter().collect();
+    entries.sort_unstable_by_key(|(room_id, _)| *room_id);
+    for (room_id, details) in entries {
+        let matrix_room_id = details.room_id.unwrap_or_default();
+        let create = details.create.unwrap_or_default();
+        let matrix_len = u16::try_from(matrix_room_id.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Matrix room ID exceeds cache limit",
+            )
+        })?;
+        let create_len = u16::try_from(create.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "create metadata exceeds cache limit",
+            )
+        })?;
+        buf.extend_from_slice(&room_id);
+        buf.extend_from_slice(&matrix_len.to_le_bytes());
+        buf.extend_from_slice(&create_len.to_le_bytes());
+        buf.extend_from_slice(matrix_room_id.as_bytes());
+        buf.extend_from_slice(create.as_bytes());
+    }
+    let path = matrix_room_details_path(dir);
+    let tmp_path = path.with_extension(format!("bin.tmp.{}", std::process::id()));
+    fs::write(&tmp_path, buf)?;
+    fs::rename(tmp_path, path)
+}
+
+fn read_all_matrix_room_details(
+    dir: &Path,
+) -> std::collections::HashMap<[u8; 16], MatrixRoomDetails> {
+    let mut entries = std::collections::HashMap::new();
+    let Ok(buf) = fs::read(matrix_room_details_path(dir)) else {
+        return entries;
+    };
+    if buf.len() < MATRIX_ROOM_DETAILS_HEADER_LEN
+        || &buf[0..4] != MATRIX_ROOM_DETAILS_MAGIC
+        || buf[4] != MATRIX_ROOM_DETAILS_VERSION
+    {
+        return entries;
+    }
+    let mut offset = MATRIX_ROOM_DETAILS_HEADER_LEN;
+    while let Some(header_end) = offset.checked_add(MATRIX_ROOM_DETAILS_RECORD_HEADER_LEN) {
+        let Some(header) = buf.get(offset..header_end) else {
+            break;
+        };
+        let Ok(matrix_len) = <[u8; 2]>::try_from(&header[16..18]) else {
+            break;
+        };
+        let Ok(create_len) = <[u8; 2]>::try_from(&header[18..20]) else {
+            break;
+        };
+        let data_len = usize::from(u16::from_le_bytes(matrix_len))
+            .checked_add(usize::from(u16::from_le_bytes(create_len)));
+        let Some(data_end) = data_len.and_then(|length| header_end.checked_add(length)) else {
+            break;
+        };
+        let Some(data) = buf.get(header_end..data_end) else {
+            break;
+        };
+        let Ok(matrix_room_id) =
+            std::str::from_utf8(&data[..usize::from(u16::from_le_bytes(matrix_len))])
+        else {
+            break;
+        };
+        let Ok(create) = std::str::from_utf8(&data[usize::from(u16::from_le_bytes(matrix_len))..])
+        else {
+            break;
+        };
+        let mut room_id = [0u8; 16];
+        room_id.copy_from_slice(&header[0..16]);
+        entries.insert(
+            room_id,
+            MatrixRoomDetails {
+                room_id: (!matrix_room_id.is_empty()).then(|| matrix_room_id.to_owned()),
+                create: (!create.is_empty()).then(|| create.to_owned()),
+            },
+        );
+        offset = data_end;
+    }
+    entries
 }
 
 /// Find the human-facing Matrix metadata carried by live JSON events. Pack
@@ -569,19 +761,8 @@ fn matrix_room_details(
             if details.room_id.is_none() {
                 details.room_id = event_room_id(&event).map(str::to_owned);
             }
-            if details.create.is_none() && event["type"].as_str() == Some("m.room.create") {
-                let event_id = event_id(&event).unwrap_or("<missing event_id>");
-                let sender = event["sender"].as_str().unwrap_or("<missing sender>");
-                let creator = event["content"]["creator"].as_str();
-                let version = event["content"]["room_version"].as_str();
-                let mut create = format!("{event_id} by {sender}");
-                if let Some(creator) = creator {
-                    let _ = write!(create, "; creator {creator}");
-                }
-                if let Some(version) = version {
-                    let _ = write!(create, "; room version {version}");
-                }
-                details.create = Some(create);
+            if details.create.is_none() {
+                details.create = matrix_create_details(&event);
             }
             if details.room_id.is_some() && details.create.is_some() {
                 return Ok(details);
@@ -589,6 +770,68 @@ fn matrix_room_details(
         }
     }
     Ok(details)
+}
+
+/// Read Matrix metadata from only the shards containing `room_id`. This is
+/// deliberately streaming: common Matrix room IDs and create events occur
+/// near the beginning of topology-ordered data, so `info` can stop as soon
+/// as both fields are found rather than scanning unrelated shards or loading
+/// a full store index.
+fn matrix_room_details_from_shards(
+    dir: &Path,
+    room_id: &[u8; 16],
+    shard_ids: &[u16],
+) -> anyhow::Result<MatrixRoomDetails> {
+    let pool = ShardPool::open_read_only(dir.into()).context("failed to open shard store")?;
+    let mut details = MatrixRoomDetails::default();
+    for shard_id in shard_ids {
+        let Some(shard) = pool.get_shard(*shard_id) else {
+            continue;
+        };
+        let file = fs::File::open(&shard.path)?;
+        let mut reader = BufReader::new(file);
+        if mtxdb_core::packfile::read_header(&mut reader)?.is_none() {
+            continue;
+        }
+        loop {
+            let record = match mtxdb_core::packfile::read_record(&mut reader) {
+                Ok(Some(record)) => record,
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            };
+            if &record.room_id != room_id {
+                continue;
+            }
+            update_matrix_room_details(&mut details, &record.data);
+            if details.room_id.is_some() && details.create.is_some() {
+                return Ok(details);
+            }
+        }
+    }
+    Ok(details)
+}
+
+fn print_matrix_room_details(details: MatrixRoomDetails) {
+    if let Some(matrix_room_id) = details.room_id {
+        println!("  Matrix room: {matrix_room_id}");
+    }
+    if let Some(create) = details.create {
+        println!("  create: {create}");
+    }
+}
+
+fn update_matrix_room_details(details: &mut MatrixRoomDetails, data: &[u8]) {
+    let mut bytes = data.to_vec();
+    let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
+        return;
+    };
+    if details.room_id.is_none() {
+        details.room_id = event_room_id(&event).map(str::to_owned);
+    }
+    if details.create.is_none() {
+        details.create = matrix_create_details(&event);
+    }
 }
 
 fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
@@ -778,6 +1021,51 @@ fn event_id(value: &OwnedValue) -> Option<&str> {
         },
         _ => None,
     }
+}
+
+fn event_string_field<'a>(value: &'a OwnedValue, field: &str) -> Option<&'a str> {
+    match value {
+        OwnedValue::Object(object) => match object.get(field) {
+            Some(OwnedValue::String(value)) => Some(value.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn nested_event_string_field<'a>(
+    value: &'a OwnedValue,
+    object: &str,
+    field: &str,
+) -> Option<&'a str> {
+    match value {
+        OwnedValue::Object(fields) => match fields.get(object) {
+            Some(OwnedValue::Object(nested)) => match nested.get(field) {
+                Some(OwnedValue::String(value)) => Some(value.as_str()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn matrix_create_details(event: &OwnedValue) -> Option<String> {
+    if event_string_field(event, "type") != Some("m.room.create") {
+        return None;
+    }
+    let event_id = event_id(event).unwrap_or("<missing event_id>");
+    let sender = event_string_field(event, "sender").unwrap_or("<missing sender>");
+    let creator = nested_event_string_field(event, "content", "creator");
+    let version = nested_event_string_field(event, "content", "room_version");
+    let mut create = format!("{event_id} by {sender}");
+    if let Some(creator) = creator {
+        let _ = write!(create, "; creator {creator}");
+    }
+    if let Some(version) = version {
+        let _ = write!(create, "; room version {version}");
+    }
+    Some(create)
 }
 
 fn cmd_repack(

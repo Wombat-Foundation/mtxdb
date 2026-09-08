@@ -108,11 +108,67 @@ struct RoomScanOutput {
 /// Magic bytes + version identifying the persisted shard→room directory
 /// format (see `PackfileStorage::persist_shard_rooms`).
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
-const SHARD_ROOMS_VERSION: u8 = 1;
+const SHARD_ROOMS_VERSION: u8 = 2;
+/// Version 1 did not preserve room insertion order. It remains readable so
+/// existing stores retain their fast inspection path until their next sync.
+const SHARD_ROOMS_LEGACY_VERSION: u8 = 1;
 /// Header size: magic(4) + version(1) + `persisted_at`(8).
 const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8;
-/// On-disk size of one entry: `shard_id`(2) + `room_id`(16) + count(8).
-const SHARD_ROOMS_RECORD_LEN: usize = 2 + 16 + 8;
+/// Version 1 entry: `shard_id`(2) + `room_id`(16) + count(8).
+const SHARD_ROOMS_RECORD_LEN_V1: usize = 2 + 16 + 8;
+/// Version 2 additionally stores the room's stable insertion ordinal.
+const SHARD_ROOMS_RECORD_LEN_V2: usize = SHARD_ROOMS_RECORD_LEN_V1 + 8;
+
+#[derive(Clone, Copy)]
+struct PersistedShardRoom {
+    shard_id: u16,
+    room_id: [u8; 16],
+    count: u64,
+    insertion_order: Option<u64>,
+}
+
+/// Decode the small inspection sidecar. This is deliberately shared by all
+/// read-only CLI summary helpers so they agree on validation and format
+/// compatibility.
+fn read_persisted_shard_rooms(
+    base_dir: &std::path::Path,
+) -> Option<(u64, Vec<PersistedShardRoom>)> {
+    let buf = fs::read(base_dir.join("shard_rooms.bin")).ok()?;
+    if buf.len() < SHARD_ROOMS_HEADER_LEN || &buf[0..4] != SHARD_ROOMS_MAGIC {
+        return None;
+    }
+    let record_len = match buf[4] {
+        SHARD_ROOMS_LEGACY_VERSION => SHARD_ROOMS_RECORD_LEN_V1,
+        SHARD_ROOMS_VERSION => SHARD_ROOMS_RECORD_LEN_V2,
+        _ => return None,
+    };
+    let body = &buf[SHARD_ROOMS_HEADER_LEN..];
+    if body.len().checked_rem(record_len) != Some(0) {
+        return None;
+    }
+    let persisted_at = u64::from_le_bytes(buf[5..13].try_into().ok()?);
+    let records = body
+        .chunks_exact(record_len)
+        .map(|chunk| {
+            let shard_id = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
+            let mut room_id = [0u8; 16];
+            room_id.copy_from_slice(&chunk[2..18]);
+            let count = u64::from_le_bytes(chunk[18..26].try_into().ok()?);
+            let insertion_order = if record_len == SHARD_ROOMS_RECORD_LEN_V2 {
+                Some(u64::from_le_bytes(chunk[26..34].try_into().ok()?))
+            } else {
+                None
+            };
+            Some(PersistedShardRoom {
+                shard_id,
+                room_id,
+                count,
+                insertion_order,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((persisted_at, records))
+}
 /// Disambiguates concurrent `persist_shard_rooms` tmp filenames within
 /// this process, paired with the process id for uniqueness across
 /// processes — same rationale as `shard::STATS_TMP_COUNTER`.
@@ -767,11 +823,24 @@ impl PackfileStorage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
+        let room_order: HashMap<[u8; 16], u64> = self
+            .room_order
+            .read()
+            .iter()
+            .enumerate()
+            .map(|(index, room_id)| {
+                u64::try_from(index)
+                    .map(|index| (*room_id, index))
+                    .map_err(|_| StorageError::Io(std::io::Error::other("room order exceeds u64")))
+            })
+            .collect::<Result<_, _>>()?;
         for (shard_id, rooms) in self.shard_rooms.read().iter() {
             for (room_id, count) in rooms {
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(room_id);
                 buf.extend_from_slice(&count.to_le_bytes());
+                let order = room_order.get(room_id).copied().unwrap_or(u64::MAX);
+                buf.extend_from_slice(&order.to_le_bytes());
             }
         }
 
@@ -806,7 +875,7 @@ impl PackfileStorage {
     /// Reads a persisted shard→room directory directly off disk, with no
     /// `ShardPool`/`PackfileStorage` construction at all — the fast path
     /// for a `rooms`-style CLI listing. Returns each room's total record
-    /// count summed across every shard it appears in, sorted by room id.
+    /// count summed across every shard it appears in, in insertion order.
     ///
     /// Best-effort: a missing, truncated, or corrupt file just yields an
     /// empty result rather than an error — the caller decides whether to
@@ -814,29 +883,30 @@ impl PackfileStorage {
     /// feature, or a writer hasn't flushed it yet).
     #[must_use]
     pub fn room_directory_from_disk(base_dir: &std::path::Path) -> Vec<([u8; 16], u64)> {
-        let Ok(buf) = fs::read(Self::shard_rooms_path(base_dir)) else {
+        let Some((_, records)) = read_persisted_shard_rooms(base_dir) else {
             return Vec::new();
         };
-        if buf.len() < SHARD_ROOMS_HEADER_LEN
-            || &buf[0..4] != SHARD_ROOMS_MAGIC
-            || buf[4] != SHARD_ROOMS_VERSION
-        {
-            return Vec::new();
-        }
-        let mut totals: HashMap<[u8; 16], u64> = HashMap::new();
-        for chunk in buf[SHARD_ROOMS_HEADER_LEN..].chunks_exact(SHARD_ROOMS_RECORD_LEN) {
-            let mut room_id = [0u8; 16];
-            room_id.copy_from_slice(&chunk[2..18]);
-            let Ok(count_bytes) = <[u8; 8]>::try_from(&chunk[18..26]) else {
-                continue;
+        let mut totals: HashMap<[u8; 16], (u64, Option<u64>)> = HashMap::new();
+        for record in records {
+            let entry = totals
+                .entry(record.room_id)
+                .or_insert((0, record.insertion_order));
+            entry.0 = entry.0.saturating_add(record.count);
+            entry.1 = match (entry.1, record.insertion_order) {
+                (Some(existing), Some(order)) => Some(existing.min(order)),
+                (None, order) | (order, None) => order,
             };
-            let count = u64::from_le_bytes(count_bytes);
-            let entry = totals.entry(room_id).or_insert(0);
-            *entry = entry.saturating_add(count);
         }
-        let mut result: Vec<([u8; 16], u64)> = totals.into_iter().collect();
-        result.sort_unstable_by_key(|(room_id, _)| *room_id);
+        let mut result: Vec<([u8; 16], u64, Option<u64>)> = totals
+            .into_iter()
+            .map(|(room_id, (count, order))| (room_id, count, order))
+            .collect();
+        result.sort_unstable_by_key(|(room_id, _, order)| (order.unwrap_or(u64::MAX), *room_id));
+
         result
+            .into_iter()
+            .map(|(room_id, count, _)| (room_id, count))
+            .collect()
     }
 
     /// Reads room summaries from the persisted shard→room directory without
@@ -868,23 +938,13 @@ impl PackfileStorage {
     pub fn room_shards_from_disk(
         base_dir: &std::path::Path,
     ) -> Option<HashMap<[u8; 16], Vec<u16>>> {
-        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
-        if buf.len() < SHARD_ROOMS_HEADER_LEN
-            || &buf[0..4] != SHARD_ROOMS_MAGIC
-            || buf[4] != SHARD_ROOMS_VERSION
-        {
-            return None;
-        }
-        let body = &buf[SHARD_ROOMS_HEADER_LEN..];
-        if body.len() % SHARD_ROOMS_RECORD_LEN != 0 {
-            return None;
-        }
+        let (_, records) = read_persisted_shard_rooms(base_dir)?;
         let mut shards: HashMap<[u8; 16], Vec<u16>> = HashMap::new();
-        for chunk in body.chunks_exact(SHARD_ROOMS_RECORD_LEN) {
-            let shard_id = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
-            let mut room_id = [0u8; 16];
-            room_id.copy_from_slice(&chunk[2..18]);
-            shards.entry(room_id).or_default().push(shard_id);
+        for record in records {
+            shards
+                .entry(record.room_id)
+                .or_default()
+                .push(record.shard_id);
         }
         for room_shards in shards.values_mut() {
             room_shards.sort_unstable();
@@ -901,23 +961,11 @@ impl PackfileStorage {
     /// explicitly open the store and rebuild its indexes instead.
     #[must_use]
     pub fn shard_node_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
-        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
-        if buf.len() < SHARD_ROOMS_HEADER_LEN
-            || &buf[0..4] != SHARD_ROOMS_MAGIC
-            || buf[4] != SHARD_ROOMS_VERSION
-        {
-            return None;
-        }
-        let body = &buf[SHARD_ROOMS_HEADER_LEN..];
-        if body.len() % SHARD_ROOMS_RECORD_LEN != 0 {
-            return None;
-        }
+        let (_, records) = read_persisted_shard_rooms(base_dir)?;
         let mut totals = HashMap::new();
-        for chunk in body.chunks_exact(SHARD_ROOMS_RECORD_LEN) {
-            let shard_id = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
-            let count = u64::from_le_bytes(chunk[18..26].try_into().ok()?);
-            let total = totals.entry(shard_id).or_insert(0_u64);
-            *total = total.saturating_add(count);
+        for record in records {
+            let total = totals.entry(record.shard_id).or_insert(0_u64);
+            *total = total.saturating_add(record.count);
         }
         Some(totals)
     }
@@ -930,21 +978,10 @@ impl PackfileStorage {
     /// malformed.
     #[must_use]
     pub fn shard_room_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
-        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
-        if buf.len() < SHARD_ROOMS_HEADER_LEN
-            || &buf[0..4] != SHARD_ROOMS_MAGIC
-            || buf[4] != SHARD_ROOMS_VERSION
-        {
-            return None;
-        }
-        let body = &buf[SHARD_ROOMS_HEADER_LEN..];
-        if body.len() % SHARD_ROOMS_RECORD_LEN != 0 {
-            return None;
-        }
+        let (_, records) = read_persisted_shard_rooms(base_dir)?;
         let mut totals = HashMap::new();
-        for chunk in body.chunks_exact(SHARD_ROOMS_RECORD_LEN) {
-            let shard_id = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
-            let count = totals.entry(shard_id).or_insert(0_u64);
+        for record in records {
+            let count = totals.entry(record.shard_id).or_insert(0_u64);
             *count = count.saturating_add(1);
         }
         Some(totals)
@@ -956,14 +993,7 @@ impl PackfileStorage {
     /// `ShardPool::stats_persisted_at` does for shard IO stats.
     #[must_use]
     pub fn room_directory_persisted_at(base_dir: &std::path::Path) -> Option<u64> {
-        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
-        if buf.len() < SHARD_ROOMS_HEADER_LEN
-            || &buf[0..4] != SHARD_ROOMS_MAGIC
-            || buf[4] != SHARD_ROOMS_VERSION
-        {
-            return None;
-        }
-        Some(u64::from_le_bytes(buf[5..13].try_into().ok()?))
+        read_persisted_shard_rooms(base_dir).map(|(persisted_at, _)| persisted_at)
     }
 
     /// Pin one `Arc<Shard>` per distinct shard id, keeping each shard's file
