@@ -60,7 +60,7 @@ pub(crate) enum Commands {
 }
 
 fn build_cli() -> Command {
-    Command::new("mtxdb")
+    global_args(Command::new("mtxdb"))
         .version(concat!(
             env!("CARGO_PKG_VERSION"),
             " (",
@@ -82,88 +82,106 @@ fn build_cli() -> Command {
                 .hide(true),
         )
         .about("CLI for the mtxdb content-addressed storage engine")
-        .arg(
-            Arg::new("dir")
-                .short('d')
-                .long("dir")
-                .env("MTXDB_DIR")
-                .value_name("DIR")
-                .global(true)
-                .help("Database root directory"),
-        )
-        .arg(
-            Arg::new("shard_type")
-                .short('t')
-                .long("shard-type")
-                .env("MTXDB_SHARD_TYPE")
-                .value_name("TYPE")
-                .default_value("event-dag")
-                .value_parser(["state", "event-dag", "auth-chain"])
-                .hide_possible_values(true)
-                .global(true)
-                .help("Independent shard pool to operate on"),
-        )
-        .subcommand(
-            Command::new("shards")
-                .about("List open shard slots with size, rotation, and IO/sync stats")
-                .arg(
-                    Arg::new("all")
-                        .short('a')
-                        .long("all")
-                        .action(ArgAction::SetTrue)
-                        .help("List shards in every independent pool"),
-                ),
-        )
-        .subcommand(
-            Command::new("collections")
-                .about("List logical collections in the selected shard pool")
-                .arg(
-                    Arg::new("all")
-                        .short('a')
-                        .long("all")
-                        .action(ArgAction::SetTrue)
-                        .help("List collections in every independent pool"),
-                ),
-        )
-        .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard stats"))
-        .subcommand(
-            Command::new("completions")
-                .about("Print shell completion script")
-                .hide(true)
-                .display_order(usize::MAX)
-                .arg(Arg::new("shell").required(true).value_parser([
-                    "bash",
-                    "elvish",
-                    "fish",
-                    "powershell",
-                    "zsh",
-                ])),
-        )
+        .subcommand(sub_shards())
+        .subcommand(sub_collections())
+        .subcommand(sub_sync())
+        .subcommand(sub_completions())
         .subcommand(sub_import())
         .subcommand(sub_export())
         .subcommand(sub_repack())
-        .subcommand(
-            Command::new("scan")
-                .about("Scan a packfile and print records")
-                .arg(
-                    Arg::new("shard")
-                        .required(true)
-                        .value_name("SLOT | EPOCH")
-                        .help("Decimal shard slot or 0x-prefixed shard rotation from `shards`"),
-                ),
-        )
-        .subcommand(
-            Command::new("info")
-                .about("Show storage info for a collection")
-                .arg(
-                    Arg::new("collection")
-                        .required(true)
-                        .value_name("COLLECTION"),
-                ),
-        )
+        .subcommand(sub_scan())
+        .subcommand(sub_info())
         .subcommand(sub_delete())
         .subcommand(sub_put())
         .subcommand(sub_get())
+}
+
+/// The two flags shared by every subcommand (`--dir`, `--shard-type`).
+fn global_args(cmd: Command) -> Command {
+    cmd.arg(
+        Arg::new("dir")
+            .short('d')
+            .long("dir")
+            .env("MTXDB_DIR")
+            .value_name("DIR")
+            .global(true)
+            .help("Database root directory"),
+    )
+    .arg(
+        Arg::new("shard_type")
+            .short('t')
+            .long("shard-type")
+            .env("MTXDB_SHARD_TYPE")
+            .value_name("TYPE")
+            .default_value("event-dag")
+            .value_parser(["state", "event-dag", "auth-chain"])
+            .hide_possible_values(true)
+            .global(true)
+            .help("Independent shard pool to operate on"),
+    )
+}
+
+fn sub_shards() -> Command {
+    Command::new("shards")
+        .about("List open shard slots with size, rotation, and IO/sync stats")
+        .arg(
+            Arg::new("all")
+                .short('a')
+                .long("all")
+                .action(ArgAction::SetTrue)
+                .help("List shards in every independent pool"),
+        )
+}
+
+fn sub_collections() -> Command {
+    Command::new("collections")
+        .about("List logical collections in the selected shard pool")
+        .arg(
+            Arg::new("all")
+                .short('a')
+                .long("all")
+                .action(ArgAction::SetTrue)
+                .help("List collections in every independent pool"),
+        )
+}
+
+fn sub_sync() -> Command {
+    Command::new("sync").about("Bootstrap or refresh persisted shard stats")
+}
+
+fn sub_completions() -> Command {
+    Command::new("completions")
+        .about("Print shell completion script")
+        .hide(true)
+        .display_order(usize::MAX)
+        .arg(Arg::new("shell").required(true).value_parser([
+            "bash",
+            "elvish",
+            "fish",
+            "powershell",
+            "zsh",
+        ]))
+}
+
+fn sub_scan() -> Command {
+    Command::new("scan")
+        .about("Scan a packfile and print records")
+        .arg(
+            Arg::new("shard")
+                .required(true)
+                .value_name("SLOT | EPOCH")
+                .help("Decimal shard slot or 0x-prefixed shard rotation from `shards`"),
+        )
+}
+
+fn sub_info() -> Command {
+    Command::new("info")
+        .about("Show storage info for a collection")
+        .arg(
+            Arg::new("collection")
+                .required(true)
+                .value_name("COLLECTION"),
+        )
 }
 
 fn sub_import() -> Command {
