@@ -57,7 +57,7 @@ LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 cov: ##H Run code coverage and generate HTML report
 	# TODO: include `src/bin/` in coverage
 	# Run coverage
-	$(CARGO) llvm-cov --lib --tests \
+	$(CARGO) llvm-cov -p mtxdb-core --lib --tests \
 		--html --output-dir .coverage \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Print per-file summary to the terminal (functions/lines only)
