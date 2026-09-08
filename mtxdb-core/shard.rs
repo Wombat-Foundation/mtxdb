@@ -26,12 +26,12 @@ pub type ShardEntry = ([u8; 16], [u8; 16], u64);
 
 /// A single global shard file shared across all rooms.
 pub struct Shard {
-    /// Identifier for this shard within the pool.
+    /// Reusable slot identifier for this shard within the pool.
     pub shard_id: u16,
-    /// Monotonically increasing generation counter, distinct from the
-    /// slot index. Ensures a reused slot never collides on-disk with a
-    /// still-referenced old shard at the same slot.
-    pub generation: u64,
+    /// Globally monotonic file epoch, distinct from the slot index.
+    /// Ensures a reused slot never collides on-disk with a still-referenced
+    /// older file at that slot.
+    pub epoch: u64,
     /// The open file handle backing this shard.
     pub file: File,
     /// Filesystem path to this shard's file.
@@ -77,13 +77,13 @@ pub struct ShardStats {
     pub sync_count: u64,
 }
 
-/// Basic size, generation, and IO/sync info for one open shard.
+/// Basic size, epoch, and IO/sync info for one open shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardSummary {
-    /// Shard ID within the pool.
+    /// Reusable shard slot within the pool.
     pub shard_id: u16,
-    /// Monotonically increasing generation counter for this shard's slot.
-    pub generation: u64,
+    /// Globally monotonic file epoch for this shard incarnation.
+    pub epoch: u64,
     /// Current on-disk file length in bytes.
     pub file_bytes: u64,
     /// IO/sync counters for this shard.
@@ -102,7 +102,7 @@ const STATS_MAGIC: &[u8; 4] = b"MSTA";
 /// other unreadable snapshot — rather than migrated in place.
 const STATS_VERSION: u8 = 3;
 
-/// On-disk size of one stats record: `shard_id`(2) + generation(8) + 3×counter(8) = 34 bytes.
+/// On-disk size of one stats record: `slot_id`(2) + epoch(8) + 3×counter(8) = 34 bytes.
 const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
 
 /// Header size: magic(4) + version(1) + `persisted_at`(8).
@@ -114,9 +114,9 @@ const STATS_HEADER_LEN: usize = 4 + 1 + 8;
 static STATS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl ShardStats {
-    fn encode(self, shard_id: u16, generation: u64, buf: &mut Vec<u8>) {
+    fn encode(self, shard_id: u16, epoch: u64, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&shard_id.to_le_bytes());
-        buf.extend_from_slice(&generation.to_le_bytes());
+        buf.extend_from_slice(&epoch.to_le_bytes());
         buf.extend_from_slice(&self.write_count.to_le_bytes());
         buf.extend_from_slice(&self.bytes_written.to_le_bytes());
         buf.extend_from_slice(&self.sync_count.to_le_bytes());
@@ -124,13 +124,13 @@ impl ShardStats {
 
     fn decode(rec: &[u8; STATS_RECORD_LEN]) -> (u16, u64, Self) {
         let shard_id = u16::from_le_bytes(rec[0..2].try_into().unwrap());
-        let generation = u64::from_le_bytes(rec[2..10].try_into().unwrap());
+        let epoch = u64::from_le_bytes(rec[2..10].try_into().unwrap());
         let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
         let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
         let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
         (
             shard_id,
-            generation,
+            epoch,
             Self {
                 write_count,
                 bytes_written,
@@ -141,10 +141,10 @@ impl ShardStats {
 }
 
 impl Shard {
-    fn new(shard_id: u16, generation: u64, file: File, path: PathBuf, file_len: u64) -> Self {
+    fn new(shard_id: u16, epoch: u64, file: File, path: PathBuf, file_len: u64) -> Self {
         Self {
             shard_id,
-            generation,
+            epoch,
             file,
             path,
             mmap: RwLock::new(None),
@@ -245,11 +245,11 @@ pub struct ShardPool {
     base_dir: PathBuf,
     /// Shard IDs written to since the last sync, for scoped fsync.
     dirty: parking_lot::Mutex<HashSet<u16>>,
-    /// Monotonically increasing generation counter for shard filenames.
-    /// Each newly created shard file gets a unique generation, so a
+    /// Globally monotonic epoch counter for shard filenames.
+    /// Each newly created shard file gets a unique epoch, so a
     /// reused slot never collides on-disk with a still-referenced old
     /// shard at the same slot.
-    next_generation: AtomicU64,
+    next_epoch: AtomicU64,
     /// Total number of shards retired (garbage-collected after a repack)
     /// over the pool's lifetime.
     retired_count: AtomicU64,
@@ -335,11 +335,11 @@ impl ShardPool {
     }
 
     /// Discovers existing `shard_*.pack` files in `base_dir` and parses
-    /// each one's `(shard_id, generation, path)` from its filename.
+    /// each one's `(slot_id, epoch, path)` from its filename.
     /// Supports three filename formats:
-    ///   `shard_XX.pack`                      — ancient (no generation, implied gen 0)
-    ///   `shard_XX_YYYYYYYYYYYYYYYY.pack`      — 2-digit slot, generation-tracked
-    ///   `shard_XXXX_YYYYYYYYYYYYYYYY.pack`    — 4-digit slot, generation-tracked
+    ///   `shard_XX.pack`                      — legacy (no epoch, implied epoch 0)
+    ///   `shard_XX_YYYYYYYYYYYYYYYY.pack`      — 2-digit slot, epoch-suffixed
+    ///   `shard_XXXX_YYYYYYYYYYYYYYYY.pack`    — 4-digit slot, epoch-suffixed
     fn discover_shard_files(base_dir: &Path) -> io::Result<Vec<(u16, u64, PathBuf)>> {
         let mut shard_files = Vec::new();
         for entry in fs::read_dir(base_dir)? {
@@ -359,7 +359,7 @@ impl ShardPool {
             // - No underscore → ancient format "XX" (gen 0)
             // - Underscore after 2 chars → 2-digit slot "XX_YYYY..."
             // - Underscore after 4 chars → 4-digit slot "XXXX_YYYY..."
-            let (slot_hex, generation) = match id_hex.split_once('_') {
+            let (slot_hex, epoch) = match id_hex.split_once('_') {
                 Some((slot, gen_hex)) => {
                     let gen = u64::from_str_radix(gen_hex, 16).unwrap_or(0);
                     (slot, gen)
@@ -369,7 +369,7 @@ impl ShardPool {
 
             if let Ok(id) = u16::from_str_radix(slot_hex, 16) {
                 if id < MAX_SHARDS_U16 {
-                    shard_files.push((id, generation, path));
+                    shard_files.push((id, epoch, path));
                 }
             }
         }
@@ -386,36 +386,36 @@ impl ShardPool {
 
         let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
         let mut highest_active: u16 = 0;
-        let mut max_generation: u64 = 0;
+        let mut max_epoch: u64 = 0;
 
-        // Track the highest generation seen per slot so we can reject
+        // Track the highest epoch seen per slot so we can reject
         // stale files left behind by a crash between rotate() creating a
-        // new generation and the old generation's Drop deleting it.
-        let mut best_generation: Vec<Option<u64>> = vec![None; MAX_SHARDS];
+        // new epoch and the old epoch's Drop deleting it.
+        let mut best_epoch: Vec<Option<u64>> = vec![None; MAX_SHARDS];
 
         let mut shard_files = Self::discover_shard_files(&base_dir)?;
 
-        // Process older generations first. Besides making recovery
+        // Process older epochs first. Besides making recovery
         // deterministic, this means a malformed newer candidate can fall
         // back to the already-validated predecessor.
-        shard_files.sort_unstable_by_key(|(id, generation, _)| (*id, *generation));
+        shard_files.sort_unstable_by_key(|(id, epoch, _)| (*id, *epoch));
 
-        for (id, generation, path) in shard_files {
+        for (id, epoch, path) in shard_files {
             let id_usize = id as usize;
 
-            // If we already have a generation for this slot and the current
+            // If we already have an epoch for this slot and the current
             // file is not newer, it's stale — delete it.
-            if let Some(prev) = best_generation[id_usize] {
-                if prev >= generation {
+            if let Some(prev) = best_epoch[id_usize] {
+                if prev >= epoch {
                     let _ = fs::remove_file(&path);
                     continue;
                 }
             }
 
             // Validate a newer candidate before retiring the older
-            // generation. A torn header in a just-created file must
+            // epoch. A torn header in a just-created file must
             // not destroy the last known-good recovery fallback.
-            let file = match packfile::open_packfile(&path, false, id, generation) {
+            let file = match packfile::open_packfile(&path, false, id, epoch) {
                 Ok(file) => file,
                 Err(error) if shards[id_usize].is_some() => {
                     eprintln!(
@@ -428,19 +428,19 @@ impl ShardPool {
             };
 
             // The candidate is valid, so it is now safe to retire
-            // the older generation for this slot.
+            // the older epoch for this slot.
             if let Some(old) = shards[id_usize].take() {
                 let _ = fs::remove_file(&old.path);
             }
             let file_len = file.metadata()?.len();
-            let shard = Arc::new(Shard::new(id, generation, file, path, file_len));
-            best_generation[id_usize] = Some(generation);
+            let shard = Arc::new(Shard::new(id, epoch, file, path, file_len));
+            best_epoch[id_usize] = Some(epoch);
             shards[id_usize] = Some(shard);
             if id > highest_active {
                 highest_active = id;
             }
-            if generation >= max_generation {
-                max_generation = generation.saturating_add(1);
+            if epoch >= max_epoch {
+                max_epoch = epoch.saturating_add(1);
             }
         }
 
@@ -461,7 +461,7 @@ impl ShardPool {
             let file = packfile::open_packfile(&path, true, 0, 0)?;
             let file_len = file.metadata()?.len();
             shards[0] = Some(Arc::new(Shard::new(0, 0, file, path, file_len)));
-            max_generation = 1;
+            max_epoch = 1;
         }
 
         // Restoring is a pure read of shard_stats.bin applied to our own
@@ -479,7 +479,7 @@ impl ShardPool {
             rotation_lock: parking_lot::Mutex::new(()),
             base_dir,
             dirty: parking_lot::Mutex::new(HashSet::new()),
-            next_generation: AtomicU64::new(max_generation),
+            next_epoch: AtomicU64::new(max_epoch),
             retired_count: AtomicU64::new(0),
             room_home: RwLock::new(HashMap::new()),
             stats_persisted_at: RwLock::new(stats_persisted_at),
@@ -624,7 +624,7 @@ impl ShardPool {
     }
 
     /// Load a persisted stats snapshot, if one exists, and restore each
-    /// shard's counters when its generation still matches — a stale
+    /// shard's counters when its epoch still matches — a stale
     /// snapshot entry (from a slot since retired and reused) is silently
     /// skipped rather than misapplied. Returns the snapshot's persisted-at
     /// unix timestamp, if the file was readable and current-format.
@@ -643,9 +643,9 @@ impl ShardPool {
             let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) else {
                 break;
             };
-            let (shard_id, generation, stats) = ShardStats::decode(rec);
+            let (shard_id, epoch, stats) = ShardStats::decode(rec);
             if let Some(Some(shard)) = shards.get(shard_id as usize) {
-                if shard.generation == generation {
+                if shard.epoch == epoch {
                     shard.restore_stats(stats);
                 }
             }
@@ -654,7 +654,7 @@ impl ShardPool {
     }
 
     /// Persist every currently-open shard's IO/sync counters to disk,
-    /// keyed by `(shard_id, generation)` so a retired/reused slot's stale
+    /// keyed by `(slot_id, epoch)` so a retired/reused slot's stale
     /// numbers are never mistakenly restored onto a new shard.
     ///
     /// Writes to a temp file and renames into place, so a crash mid-write
@@ -671,7 +671,7 @@ impl ShardPool {
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
         for (shard_id, shard) in self.all_shards() {
-            shard.stats().encode(shard_id, shard.generation, &mut buf);
+            shard.stats().encode(shard_id, shard.epoch, &mut buf);
         }
 
         // Unique per (process, call) — the same base_dir can be opened by
@@ -703,8 +703,8 @@ impl ShardPool {
 
     /// On-disk path for a shard file.
     #[must_use]
-    pub fn shard_path(base_dir: &Path, shard_id: u16, generation: u64) -> PathBuf {
-        base_dir.join(format!("shard_{shard_id:04x}_{generation:016x}.pack"))
+    pub fn shard_path(base_dir: &Path, shard_id: u16, epoch: u64) -> PathBuf {
+        base_dir.join(format!("shard_{shard_id:04x}_{epoch:016x}.pack"))
     }
 
     /// Get a reference to a shard by ID.
@@ -738,7 +738,7 @@ impl ShardPool {
             .collect()
     }
 
-    /// List every currently-open shard with basic size, generation, and
+    /// List every currently-open shard with basic size, epoch, and
     /// IO/sync stats. Needs no room data at all — the shard-only path a
     /// `mtxdb shards`-style inspection tool should use directly (via
     /// `open_read_only`) rather than opening a full `PackfileStorage`,
@@ -749,7 +749,7 @@ impl ShardPool {
             .into_iter()
             .map(|(shard_id, shard)| ShardSummary {
                 shard_id,
-                generation: shard.generation,
+                epoch: shard.epoch,
                 file_bytes: shard.file_len(),
                 stats: shard.stats(),
             })
@@ -948,12 +948,12 @@ impl ShardPool {
         for offset in 1..=MAX_SHARDS_U16 {
             let candidate = current.wrapping_add(offset).wrapping_rem(MAX_SHARDS_U16);
             if shards[candidate as usize].is_none() {
-                let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                let path = Self::shard_path(&self.base_dir, candidate, gen);
-                let file = packfile::open_packfile(&path, true, candidate, gen)?;
+                let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
+                let path = Self::shard_path(&self.base_dir, candidate, epoch);
+                let file = packfile::open_packfile(&path, true, candidate, epoch)?;
                 let file_len = file.metadata()?.len();
                 shards[candidate as usize] =
-                    Some(Arc::new(Shard::new(candidate, gen, file, path, file_len)));
+                    Some(Arc::new(Shard::new(candidate, epoch, file, path, file_len)));
                 drop(shards);
                 *self.active_write.lock() = candidate;
                 return Ok(());
@@ -1574,8 +1574,8 @@ mod tests {
     fn test_shard_pool_open_rejects_identity_mismatch() {
         let dir = test_dir("pool_open_identity_mismatch");
         std::fs::create_dir_all(&dir).unwrap();
-        // A valid v2 header claiming shard 0, generation 0, filed under a
-        // filename that claims shard 0, generation 7.
+        // A valid v2 header claiming slot 0, epoch 0, filed under a
+        // filename that claims slot 0, epoch 7.
         let path = ShardPool::shard_path(&dir, 0, 7);
         let mut buf = Vec::new();
         packfile::write_header(&mut buf, 0, 0).unwrap();
@@ -1585,7 +1585,7 @@ mod tests {
             panic!("expected ShardPool::open to reject the identity mismatch");
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("generation 7"));
+        assert!(err.to_string().contains("epoch 7"));
     }
 
     /// End-to-end: `ShardPool::open` refuses a shard file with a CRC-
@@ -1677,16 +1677,14 @@ mod tests {
         );
     }
 
-    /// Crash-recovery: if two generation files exist for the same slot
-    /// (e.g. a crash landed between `rotate()` creating a new generation
-    /// and the old generation's `Drop` deleting its file), the scan must
-    /// keep the higher generation and delete the stale one.
+    /// Crash-recovery: if two epoch files exist for the same slot, the scan
+    /// keeps the higher epoch and deletes the stale one.
     #[test]
-    fn test_scan_keeps_highest_generation_per_slot() {
-        let dir = test_dir("scan_generation_dedup");
+    fn test_scan_keeps_highest_epoch_per_slot() {
+        let dir = test_dir("scan_epoch_dedup");
         let pool = ShardPool::open(dir.clone()).unwrap();
 
-        // Write a record so shard 0 exists (generation 0), then discard it —
+        // Write a record so slot 0 exists (epoch 0), then discard it —
         // this test hand-constructs both on-disk files below instead, since
         // each one's embedded header must genuinely match its own filename
         // (renaming a real gen-0 file to a gen-99 path wouldn't update the
@@ -1699,8 +1697,8 @@ mod tests {
         let old_path = ShardPool::shard_path(&dir, 0, 0);
         std::fs::remove_file(&old_path).unwrap();
 
-        // Simulate that rotate() created a newer generation before a crash
-        // left a stale gen-0 file behind: a genuine gen-99 file whose header
+        // Simulate that rotate() created a newer epoch before a crash
+        // left a stale epoch-0 file behind: a genuine epoch-99 file whose header
         // matches its filename.
         let live_path = ShardPool::shard_path(&dir, 0, 99);
         let mut live_buf = Vec::new();
@@ -1716,7 +1714,7 @@ mod tests {
         .unwrap();
         std::fs::write(&live_path, &live_buf).unwrap();
 
-        // Create a stale gen-0 file (the crash leftover).
+        // Create a stale epoch-0 file (the crash leftover).
         let mut buf = Vec::new();
         packfile::write_header(&mut buf, 0, 0).unwrap();
         packfile::write_record(
@@ -1731,41 +1729,38 @@ mod tests {
         std::fs::write(&old_path, &buf).unwrap();
 
         // Both files exist on disk.
-        assert!(live_path.exists(), "live gen-99 file missing");
-        assert!(old_path.exists(), "stale gen-0 file missing");
+        assert!(live_path.exists(), "live epoch-99 file missing");
+        assert!(old_path.exists(), "stale epoch-0 file missing");
 
-        // Reopen the pool — the scan must keep gen 99, delete gen 0.
+        // Reopen the pool — the scan must keep epoch 99, delete epoch 0.
         let pool = ShardPool::open(dir.clone()).unwrap();
         let shard = pool.get_shard(0).unwrap();
-        assert_eq!(
-            shard.generation, 99,
-            "scan should have kept the higher generation"
-        );
+        assert_eq!(shard.epoch, 99, "scan should have kept the higher epoch");
         assert_eq!(shard.path, live_path);
         drop(pool);
 
         // The stale gen-0 file must have been cleaned up by the scan.
         assert!(
             !old_path.exists(),
-            "stale generation file should be deleted during scan"
+            "stale epoch file should be deleted during scan"
         );
     }
 
     #[test]
-    fn test_scan_retains_valid_generation_when_newer_header_is_torn() {
-        let dir = test_dir("scan_torn_newer_generation");
+    fn test_scan_retains_valid_epoch_when_newer_header_is_torn() {
+        let dir = test_dir("scan_torn_newer_epoch");
         let old_path = ShardPool::shard_path(&dir, 0, 1);
         let mut old = Vec::new();
         packfile::write_header(&mut old, 0, 1).unwrap();
         std::fs::write(&old_path, old).unwrap();
 
-        // A higher-generation filename alone is not enough to supersede a
+        // A higher-epoch filename alone is not enough to supersede a
         // valid shard: its header must validate first.
         let torn_path = ShardPool::shard_path(&dir, 0, 2);
         std::fs::write(&torn_path, b"MTX").unwrap();
 
         let pool = ShardPool::open(dir).unwrap();
-        assert_eq!(pool.get_shard(0).unwrap().generation, 1);
+        assert_eq!(pool.get_shard(0).unwrap().epoch, 1);
         assert!(old_path.exists());
     }
 
@@ -1810,20 +1805,20 @@ mod tests {
 
     /// Backward compatibility: the startup scan must correctly parse all
     /// three filename formats that can exist on disk:
-    ///   - `shard_XX.pack` — ancient (2-digit, no generation, implied gen 0)
-    ///   - `shard_XX_YYYYYYYYYYYYYYYY.pack` — current (2-digit + generation)
-    ///   - `shard_XXXX_YYYYYYYYYYYYYYYY.pack` — new (4-digit + generation)
+    ///   - `shard_XX.pack` — legacy (2-digit, no epoch, implied epoch 0)
+    ///   - `shard_XX_YYYYYYYYYYYYYYYY.pack` — current (2-digit + epoch)
+    ///   - `shard_XXXX_YYYYYYYYYYYYYYYY.pack` — new (4-digit + epoch)
     #[test]
     fn test_scan_parses_three_filename_formats() {
         let dir = test_dir("scan_three_formats");
 
         // Manually create one file in each format. Each file's header must
-        // genuinely match the (shard_id, generation) implied by its own
+        // genuinely match the (slot_id, epoch) implied by its own
         // filename — that's exactly what open_packfile's identity check
         // verifies now, so this fixture has to be honest about it too.
-        let make_pack = |room_byte: u8, shard_id: u16, generation: u64| -> Vec<u8> {
+        let make_pack = |room_byte: u8, shard_id: u16, epoch: u64| -> Vec<u8> {
             let mut buf = Vec::new();
-            packfile::write_header(&mut buf, shard_id, generation).unwrap();
+            packfile::write_header(&mut buf, shard_id, epoch).unwrap();
             packfile::write_record(
                 &mut buf,
                 &packfile::Record {
@@ -1840,17 +1835,17 @@ mod tests {
             buf
         };
 
-        // Slot 0: legacy format "shard_00.pack" → gen 0
+        // Slot 0: legacy format "shard_00.pack" → epoch 0
         std::fs::write(dir.join("shard_00.pack"), make_pack(0x01, 0, 0)).unwrap();
 
-        // Slot 1: 2-digit with generation "shard_01_0000000000000005.pack" → gen 5
+        // Slot 1: 2-digit with epoch "shard_01_0000000000000005.pack" → epoch 5
         std::fs::write(
             dir.join("shard_01_0000000000000005.pack"),
             make_pack(0x02, 1, 5),
         )
         .unwrap();
 
-        // Slot 2: 4-digit with generation "shard_0002_0000000000000003.pack" → gen 3
+        // Slot 2: 4-digit with epoch "shard_0002_0000000000000003.pack" → epoch 3
         std::fs::write(
             dir.join("shard_0002_0000000000000003.pack"),
             make_pack(0x03, 2, 3),
@@ -1860,15 +1855,15 @@ mod tests {
         let pool = ShardPool::open(dir).unwrap();
 
         let s0 = pool.get_shard(0).unwrap();
-        assert_eq!(s0.generation, 0, "legacy shard_00.pack → gen 0");
+        assert_eq!(s0.epoch, 0, "legacy shard_00.pack → epoch 0");
         assert_eq!(s0.shard_id, 0);
 
         let s1 = pool.get_shard(1).unwrap();
-        assert_eq!(s1.generation, 5, "shard_01_...0005.pack → gen 5");
+        assert_eq!(s1.epoch, 5, "shard_01_...0005.pack → epoch 5");
         assert_eq!(s1.shard_id, 1);
 
         let s2 = pool.get_shard(2).unwrap();
-        assert_eq!(s2.generation, 3, "shard_0002_...0003.pack → gen 3");
+        assert_eq!(s2.epoch, 3, "shard_0002_...0003.pack → epoch 3");
         assert_eq!(s2.shard_id, 2);
 
         // Slot 3 was never created; pool should have no shard there.

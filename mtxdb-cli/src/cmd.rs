@@ -165,7 +165,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
 
 /// Deliberately bypasses both `PackfileStorage` and `ShardPool` — it
 /// needs no room data and no open file handles. Instead it globs shard
-/// filenames for size/generation, then decodes `shard_stats.bin` directly
+/// filenames for size/epoch, then decodes `shard_stats.bin` directly
 /// for the IO/sync counters. Zero `File::open` calls; the only I/O is
 /// `stat()` per shard file and one read of the small stats snapshot.
 /// Safe to run against a directory a live writer process owns.
@@ -185,7 +185,7 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Glob `shard_*.pack` files in `dir`, parsing `slot_id`, generation,
+/// Glob `shard_*.pack` files in `dir`, parsing `slot_id`, epoch,
 /// and file size from each filename and its metadata.
 fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
     let mut entries = Vec::new();
@@ -195,7 +195,7 @@ fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
         if path.extension().is_some_and(|e| e == "pack") {
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 if let Some(id_hex) = stem.strip_prefix("shard_") {
-                    let (slot_hex, generation) = match id_hex.split_once('_') {
+                    let (slot_hex, epoch) = match id_hex.split_once('_') {
                         Some((slot, gen_hex)) => {
                             let gen = u64::from_str_radix(gen_hex, 16).unwrap_or(0);
                             (slot, gen)
@@ -204,7 +204,7 @@ fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
                     };
                     if let Ok(slot_id) = u16::from_str_radix(slot_hex, 16) {
                         let file_bytes = entry.metadata()?.len();
-                        entries.push((slot_id, generation, file_bytes));
+                        entries.push((slot_id, epoch, file_bytes));
                     }
                 }
             }
@@ -213,19 +213,19 @@ fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
     Ok(entries)
 }
 
-/// Composite `(shard_id, generation)` key to `(write_count,
+/// Composite `(slot_id, epoch)` key to `(write_count,
 /// bytes_written, sync_count)`, as decoded from `shard_stats.bin`.
 type ShardStatsMap = std::collections::HashMap<u64, (u64, u64, u64)>;
 
 /// Decode `shard_stats.bin` — same binary format as
 /// `ShardPool::restore_persisted_stats`, but standalone. Returns a map
-/// from a composite `(shard_id, generation)` key to `(write_count,
+/// from a composite `(slot_id, epoch)` key to `(write_count,
 /// bytes_written, sync_count)` and the snapshot's persisted-at timestamp.
 fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
     const STATS_HEADER_LEN: usize = 4 + 1 + 8; // magic + version + persisted_at
     const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
-    const GEN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     let mut stats_map = std::collections::HashMap::new();
     let mut persisted_at = None;
@@ -243,11 +243,11 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     for chunk in body.chunks(STATS_RECORD_LEN) {
         if let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) {
             let shard_id = u16::from_le_bytes(rec[0..2].try_into().unwrap());
-            let generation = u64::from_le_bytes(rec[2..10].try_into().unwrap());
+            let epoch = u64::from_le_bytes(rec[2..10].try_into().unwrap());
             let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
             let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
             let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
-            let key = u64::from(shard_id) << 48 | (generation & GEN_MASK);
+            let key = u64::from(shard_id) << 48 | (epoch & EPOCH_MASK);
             stats_map.insert(key, (write_count, bytes_written, sync_count));
         }
     }
@@ -256,19 +256,19 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 
 /// Print the shard table header and rows.
 fn print_shard_table(shard_entries: &[(u16, u64, u64)], stats_map: &ShardStatsMap) {
-    const GEN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     println!(
         "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
-        "shard", "generation", "bytes", "writes", "written", "syncs"
+        "slot", "epoch", "bytes", "writes", "written", "syncs"
     );
-    for &(slot_id, generation, file_bytes) in shard_entries {
-        let key = u64::from(slot_id) << 48 | (generation & GEN_MASK);
+    for &(slot_id, epoch, file_bytes) in shard_entries {
+        let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
         let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
         println!(
             "{:>6}  {:>18}  {:>10}  {:>8}  {:>10}  {:>6}",
             slot_id,
-            format!("{generation:#018x}"),
+            format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
             wc,
             fmt_bytes(bw),

@@ -78,7 +78,7 @@ fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("shards")
-                .about("List open shards with size, generation, and IO/sync stats"),
+                .about("List open shard slots with size, epoch, and IO/sync stats"),
         )
         .subcommand(Command::new("rooms").about("List rooms in the store"))
         .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))

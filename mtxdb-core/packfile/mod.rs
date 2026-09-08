@@ -13,7 +13,7 @@ pub const MAGIC: [u8; 4] = *b"MDB1";
 /// [`write_header`]/[`read_header`]).
 ///
 /// Version 2: a fixed [`HEADER_LEN`]-byte reserved shard descriptor
-/// (magic, version, header length, shard slot, generation, creation
+/// (magic, version, header length, shard slot, epoch, creation
 /// time, feature flags, CRC — zero-padded to `HEADER_LEN`) precedes the
 /// first record, instead of v1's bare 5-byte magic+version. Written once
 /// at shard creation and never mutated afterward — an append-only file
@@ -38,13 +38,13 @@ const CRC_COVERED_LEN: usize = 4 // magic
     + 1 // version
     + 4 // header_len (u32)
     + 2 // shard_id (u16)
-    + 8 // generation (u64)
+    + 8 // epoch (u64)
     + 8 // created_at (u64, unix seconds)
     + 4; // feature_flags (u32, reserved)
 
 /// A shard's immutable descriptor, parsed from its reserved header.
 ///
-/// Recording `shard_id`/`generation` in the file itself (not just its
+/// Recording `shard_id`/`epoch` in the file itself (not just its
 /// filename) lets a reader detect a shard file that's been copied or
 /// renamed inconsistently with its own history — the two should always
 /// agree, and a mismatch means something outside mtxdb moved this file.
@@ -52,8 +52,10 @@ const CRC_COVERED_LEN: usize = 4 // magic
 pub struct ShardHeader {
     /// The shard slot id this file was created for.
     pub shard_id: u16,
-    /// The generation counter this file was created with.
-    pub generation: u64,
+    /// Global epoch assigned when this shard file was created.
+    ///
+    /// An epoch distinguishes different incarnations of a reusable slot.
+    pub epoch: u64,
     /// Unix-seconds creation timestamp.
     pub created_at: u64,
 }
@@ -217,7 +219,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
 }
 
 /// Write a new shard file's [`HEADER_LEN`]-byte reserved header: magic,
-/// version, header length, `shard_id`, `generation`, creation time, and
+/// version, header length, `shard_id`, `epoch`, creation time, and
 /// a CRC over all of the above — zero-padded to fill `HEADER_LEN`.
 /// Written once, at creation, and never mutated again (see [`VERSION`]'s
 /// doc for why).
@@ -230,7 +232,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
 /// # Panics
 /// Never in practice: the only internal conversion (`HEADER_LEN` as
 /// `u32`) is a compile-time constant well within range.
-pub fn write_header(writer: &mut impl Write, shard_id: u16, generation: u64) -> io::Result<()> {
+pub fn write_header(writer: &mut impl Write, shard_id: u16, epoch: u64) -> io::Result<()> {
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -242,7 +244,7 @@ pub fn write_header(writer: &mut impl Write, shard_id: u16, generation: u64) -> 
     let header_len = u32::try_from(HEADER_LEN).expect("HEADER_LEN fits in u32");
     buf[5..9].copy_from_slice(&header_len.to_le_bytes());
     buf[9..11].copy_from_slice(&shard_id.to_le_bytes());
-    buf[11..19].copy_from_slice(&generation.to_le_bytes());
+    buf[11..19].copy_from_slice(&epoch.to_le_bytes());
     buf[19..27].copy_from_slice(&created_at.to_le_bytes());
     // buf[27..31] (feature_flags) stays zero — reserved for future use.
 
@@ -344,19 +346,19 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     }
 
     let shard_id = u16::from_le_bytes(buf[9..11].try_into().unwrap());
-    let generation = u64::from_le_bytes(buf[11..19].try_into().unwrap());
+    let epoch = u64::from_le_bytes(buf[11..19].try_into().unwrap());
     let created_at = u64::from_le_bytes(buf[19..27].try_into().unwrap());
 
     Ok(Some(ShardHeader {
         shard_id,
-        generation,
+        epoch,
         created_at,
     }))
 }
 
 /// Open or create a packfile, writing the header if it's new.
 ///
-/// `shard_id`/`generation` are the caller's expectation for this file —
+/// `shard_id`/`epoch` are the caller's expectation for this file —
 /// derived from its filename, which already encodes both (see
 /// `ShardPool::shard_path`). On creation they're written into the new
 /// header; on opening an existing file they're cross-checked against
@@ -368,13 +370,8 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 /// Returns `io::Error` on open/write failure, `io::ErrorKind::InvalidData`
 /// if the existing header is invalid or its CRC fails, or
 /// `io::ErrorKind::InvalidData` if the header's recorded `shard_id`/
-/// `generation` don't match what the filename says they should be.
-pub fn open_packfile(
-    path: &Path,
-    create: bool,
-    shard_id: u16,
-    generation: u64,
-) -> io::Result<File> {
+/// `epoch` don't match what the filename says they should be.
+pub fn open_packfile(path: &Path, create: bool, shard_id: u16, epoch: u64) -> io::Result<File> {
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
@@ -382,7 +379,7 @@ pub fn open_packfile(
         .open(path)?;
 
     if file.metadata()?.len() == 0 {
-        write_header(&mut file, shard_id, generation)?;
+        write_header(&mut file, shard_id, epoch)?;
         file.sync_all()?;
     } else {
         let mut reader = BufReader::new(&file);
@@ -392,16 +389,16 @@ pub fn open_packfile(
                 "invalid packfile header",
             ));
         };
-        if header.shard_id != shard_id || header.generation != generation {
+        if header.shard_id != shard_id || header.epoch != epoch {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "shard file {} identifies itself as shard {} generation {} in its header, \
-                     but its filename says shard {shard_id} generation {generation} — \
+                    "shard file {} identifies itself as slot {} epoch {} in its header, \
+                     but its filename says slot {shard_id} epoch {epoch} — \
                      copied or renamed inconsistently with its own history",
                     path.display(),
                     header.shard_id,
-                    header.generation,
+                    header.epoch,
                 ),
             ));
         }
@@ -657,7 +654,7 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let header = read_header(&mut cursor).unwrap().expect("valid header");
         assert_eq!(header.shard_id, 7);
-        assert_eq!(header.generation, 42);
+        assert_eq!(header.epoch, 42);
         assert!(header.created_at > 0);
     }
 
@@ -680,7 +677,7 @@ mod tests {
     fn test_header_crc_mismatch_is_an_error_not_none() {
         let mut buf = Vec::new();
         write_header(&mut buf, 1, 1).unwrap();
-        // Corrupt a byte inside the CRC-covered region (the generation
+        // Corrupt a byte inside the CRC-covered region (the epoch
         // field) without touching magic/version/header_len — this must
         // surface as corruption, not as "not a packfile".
         buf[12] ^= 0xFF;
@@ -751,7 +748,7 @@ mod tests {
 
     /// Direct test of the identity cross-check: a file whose *header* is
     /// perfectly valid (right magic, version, CRC) but whose embedded
-    /// (`shard_id`, generation) don't match what the caller expects (i.e.
+    /// (`shard_id`, epoch) don't match what the caller expects (i.e.
     /// what the filename says) must be rejected — this is the actual
     /// detection claim, independent of any test fixture happening to
     /// already agree with its own filename.
@@ -761,7 +758,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_0002_0000000000000005.pack");
 
-        // Header genuinely says shard 0, generation 0 — a valid v2
+        // Header genuinely says slot 0, epoch 0 — a valid v2
         // header on its own terms, just not what this filename claims.
         let mut buf = Vec::new();
         write_header(&mut buf, 0, 0).unwrap();
@@ -771,8 +768,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let msg = err.to_string();
         assert!(
-            msg.contains("shard 0") && msg.contains("generation 0") && msg.contains("shard 2")
-                && msg.contains("generation 5"),
+            msg.contains("slot 0") && msg.contains("epoch 0") && msg.contains("slot 2")
+                && msg.contains("epoch 5"),
             "error must name both the header's actual identity and the filename's expected one, got: {msg}"
         );
 
