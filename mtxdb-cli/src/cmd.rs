@@ -157,7 +157,7 @@ fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Scan every shard's packfile to count records per room — the I/O
+/// Scan every shard's packfile to count frames per room — the I/O
 /// (reading record headers) is unavoidable since room ownership only
 /// exists inside the packfile, but this skips building a `LossyIndex`
 /// and `NodeCache` per room, which `open_store_read_only` would do
@@ -188,7 +188,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     rooms.sort_unstable_by_key(|&(id, _)| id);
     for (i, (room_id, count)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
-        println!("  {i}: 0x{hex} ({count} records)");
+        println!("  {i}: 0x{hex} ({count} frames)");
     }
     Ok(())
 }
@@ -341,10 +341,7 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let hex = hex_encode(&room_id);
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
-            println!(
-                "room {hex}: {len} records, {} index RAM",
-                fmt_megabytes(mem)
-            );
+            println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
         }
         None => {
             eprintln!("room {hex}: not found");
@@ -375,7 +372,7 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let path = &shard.path;
     let records = mtxdb_core::packfile::scan_packfile(path)?;
     println!(
-        "shard: {} bytes, {} records",
+        "shard: {} bytes, {} frames",
         std::fs::metadata(path)?.len(),
         records.len()
     );
@@ -706,7 +703,7 @@ fn cmd_delete(cli: &Cli, room: &str, yes: bool) -> anyhow::Result<()> {
     let store = open_store(cli)?;
     let count = store.room_index_info(&room_id).map_or(0, |(len, _)| len);
     store.delete_room(&room_id)?;
-    eprintln!("deleted {count} records for room {hex}");
+    eprintln!("deleted {count} nodes for room {hex}");
     Ok(())
 }
 
