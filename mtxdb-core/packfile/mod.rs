@@ -343,6 +343,113 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     }))
 }
 
+/// A frame's `room_id`/`hash` metadata, without its node payload — what
+/// [`scan_packfile`]/[`scan_packfile_from`]/[`scan_and_recover_packfile`]
+/// actually need. See [`read_record_metadata`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordMetadata {
+    /// The room this record belongs to.
+    pub room_id: [u8; 16],
+    /// The structural hash framed alongside the record.
+    pub hash: [u8; 16],
+}
+
+/// Buffer size for streaming node bytes through [`read_record_metadata`]
+/// without allocating a buffer proportional to the frame's payload size.
+/// Large enough to keep syscall/CRC-update overhead low, small enough to
+/// stay a stack buffer.
+const SCAN_DISCARD_BUF_LEN: usize = 8192;
+
+/// Read one frame's metadata (`room_id`, `hash`) without allocating,
+/// decompressing, or otherwise materializing its node payload — the scan
+/// path's counterpart to [`read_record`], which fully decodes a frame for
+/// callers that actually need its data.
+///
+/// Node bytes are streamed through a small fixed buffer and fed into the
+/// running CRC as they're read, then discarded — this still detects
+/// corruption in the payload region (the CRC covers the same bytes
+/// [`read_record`] verifies), it just never buffers or decompresses them.
+/// Deliberately a streaming *read*, not a `Seek` past the payload: seeking
+/// would skip CRC verification of the region entirely (silently defeating
+/// [`scan_and_recover_packfile`]'s whole purpose) and, on non-SSD media,
+/// replace one sequential scan with many small seeks.
+///
+/// # Errors
+/// Same conditions as [`read_record`] (invalid length, unsupported flags,
+/// CRC mismatch), except a compressed frame's `uncompressed_len` is not
+/// bounds-checked against [`MAX_DATA_LEN`] here — this function never
+/// allocates a decompression buffer sized from it, so that check (which
+/// exists in `read_record` specifically to bound that allocation) doesn't
+/// apply.
+///
+/// # Panics
+/// Never in practice: the only internal `checked_sub`/`expect` pair
+/// subtracts `FRAME_FIXED_LEN` from `frame_len`, which the preceding
+/// range check already guarantees is `>= FRAME_FIXED_LEN`.
+pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordMetadata>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    let frame_len = u32::from_le_bytes(len_buf);
+    if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid record length: {frame_len}"),
+        ));
+    }
+
+    let mut fixed = [0u8; FRAME_FIXED_LEN as usize];
+    reader.read_exact(&mut fixed)?;
+
+    let flags = fixed[0];
+    if flags & !FLAG_COMPRESSED != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported record flags: {flags:#04x}"),
+        ));
+    }
+    let mut room_id = [0u8; 16];
+    room_id.copy_from_slice(&fixed[5..21]);
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&fixed[21..37]);
+
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&len_buf);
+    crc.update(&fixed);
+
+    // frame_len >= FRAME_FIXED_LEN is guaranteed by the range check above.
+    let mut remaining: usize = frame_len
+        .checked_sub(FRAME_FIXED_LEN)
+        .expect("frame_len >= FRAME_FIXED_LEN, checked above")
+        as usize;
+    let mut discard = [0u8; SCAN_DISCARD_BUF_LEN];
+    while remaining > 0 {
+        let chunk_len = remaining.min(discard.len());
+        reader.read_exact(&mut discard[..chunk_len])?;
+        crc.update(&discard[..chunk_len]);
+        remaining = remaining
+            .checked_sub(chunk_len)
+            .expect("chunk_len <= remaining by construction (min above)");
+    }
+
+    let mut crc_buf = [0u8; 4];
+    reader.read_exact(&mut crc_buf)?;
+    let expected = crc.finalize();
+    let actual = u32::from_le_bytes(crc_buf);
+    if expected != actual {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CRC mismatch: expected {expected:08x}, got {actual:08x}"),
+        ));
+    }
+
+    Ok(Some(RecordMetadata { room_id, hash }))
+}
+
 /// Write a new shard file's [`HEADER_LEN`]-byte reserved header: magic,
 /// version, header length, `shard_id`, `epoch`, creation time, and
 /// a CRC over all of the above — zero-padded to fill `HEADER_LEN`.
@@ -602,9 +709,9 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
 
     loop {
         let offset = reader.stream_position()?;
-        match read_record(&mut reader) {
-            Ok(Some(record)) => {
-                entries.push((record.room_id, record.hash, offset));
+        match read_record_metadata(&mut reader) {
+            Ok(Some(meta)) => {
+                entries.push((meta.room_id, meta.hash, offset));
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -655,9 +762,9 @@ pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<Scan
     let mut entries = Vec::new();
     loop {
         let offset = reader.stream_position()?;
-        match read_record(&mut reader) {
-            Ok(Some(record)) => {
-                entries.push((record.room_id, record.hash, offset));
+        match read_record_metadata(&mut reader) {
+            Ok(Some(meta)) => {
+                entries.push((meta.room_id, meta.hash, offset));
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -692,9 +799,9 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let mut truncated = false;
     loop {
         let offset = reader.stream_position()?;
-        match read_record(&mut reader) {
-            Ok(Some(record)) => {
-                entries.push((record.room_id, record.hash, offset));
+        match read_record_metadata(&mut reader) {
+            Ok(Some(meta)) => {
+                entries.push((meta.room_id, meta.hash, offset));
                 last_valid_offset = reader.stream_position()?;
             }
             Ok(None) => break,
@@ -789,6 +896,70 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let read = read_record(&mut cursor).unwrap().unwrap();
         assert_eq!(record, read);
+    }
+
+    /// `read_record_metadata` must agree with `read_record` on `room_id`/`hash`
+    /// for both a compressed and a raw-fallback frame, without touching
+    /// (or needing to decompress) the payload.
+    #[test]
+    fn test_read_record_metadata_matches_read_record() {
+        for data in [vec![0x42u8; 8192], b"hi".to_vec()] {
+            let record = test_record_raw([0x77; 16], &data);
+            let mut buf = Vec::new();
+            write_record(&mut buf, &record).unwrap();
+
+            let mut cursor = Cursor::new(&buf);
+            let full = read_record(&mut cursor).unwrap().unwrap();
+
+            let mut cursor = Cursor::new(&buf);
+            let meta = read_record_metadata(&mut cursor).unwrap().unwrap();
+
+            assert_eq!(meta.room_id, full.room_id);
+            assert_eq!(meta.hash, full.hash);
+        }
+    }
+
+    /// A frame spanning multiple `SCAN_DISCARD_BUF_LEN`-sized chunks must
+    /// still stream correctly (payload larger than one discard buffer).
+    #[test]
+    fn test_read_record_metadata_spans_multiple_discard_chunks() {
+        // Incompressible so it stays large on disk and forces several
+        // discard-buffer iterations through the streaming loop.
+        let data: Vec<u8> = (0..(SCAN_DISCARD_BUF_LEN * 3 + 500))
+            .map(|i| (i as u64).wrapping_mul(2_654_435_761).to_le_bytes()[0])
+            .collect();
+        let record = test_record_raw([0x99; 16], &data);
+        let mut buf = Vec::new();
+        write_record(&mut buf, &record).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let meta = read_record_metadata(&mut cursor).unwrap().unwrap();
+        assert_eq!(meta.room_id, record.room_id);
+        assert_eq!(meta.hash, record.hash);
+    }
+
+    /// Corruption inside the node-payload region must still be caught by
+    /// `read_record_metadata` — it streams payload bytes through the CRC
+    /// as it discards them rather than skipping them outright, so this
+    /// must fail exactly like `read_record` does on the same corrupted
+    /// buffer, not silently succeed because the payload was never
+    /// "read" for its own sake.
+    #[test]
+    fn test_read_record_metadata_detects_payload_corruption() {
+        let record = test_record_raw([0xbb; 16], b"payload region corruption test");
+        let mut buf = Vec::new();
+        write_record(&mut buf, &record).unwrap();
+
+        // Flip a byte inside the node-bytes region (right after the fixed
+        // 37-byte header: len(4) + flags(1) + uncompressed_len(4) +
+        // room_id(16) + hash(16)).
+        let corrupt_at = 4 + FRAME_FIXED_LEN as usize + 3;
+        buf[corrupt_at] ^= 0xff;
+
+        let mut cursor = Cursor::new(&buf);
+        let err = read_record_metadata(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("CRC mismatch"));
     }
 
     /// Data that doesn't shrink under zstd (tiny/incompressible) must fall
