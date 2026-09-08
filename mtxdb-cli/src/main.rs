@@ -46,7 +46,7 @@ pub enum Commands {
 
 fn build_cli() -> Command {
     Command::new("mtxdb")
-        .version(concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_DESCRIBE"), ")"))
+        .version(env!("GIT_DESCRIBE"))
         .about("CLI for the mtxdb content-addressed storage engine")
         .arg(
             Arg::new("dir")
