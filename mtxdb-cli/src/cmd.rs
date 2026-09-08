@@ -55,19 +55,6 @@ fn fmt_megabytes(bytes: usize) -> String {
     format!("{whole}.{fraction:04} MB")
 }
 
-/// Percentage of `part` over `total`, rounded exactly to two decimals.
-fn fmt_percent(part: u64, total: u64) -> String {
-    if total == 0 {
-        return "0.00%".to_owned();
-    }
-    let hundredths = part
-        .saturating_mul(10_000)
-        .saturating_add(total / 2)
-        .checked_div(total)
-        .unwrap_or(u64::MAX);
-    format!("{}.{:02}%", hundredths / 100, hundredths % 100)
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().fold(
         String::with_capacity(bytes.len().saturating_mul(2)),
@@ -428,6 +415,11 @@ fn print_shard_table(
         "{:>6}  {:>18}  {:>10}  {:>8}  {:>14}  {:>15}  {:>6}",
         "slot", "rotation", "bytes", "nodes", "mileage (MB)", "mileage (IOPs)", "syncs",
     );
+    let mut total_bytes = 0u64;
+    let mut total_nodes = node_counts.map(|_| 0u64);
+    let mut total_mileage_bytes = 0u64;
+    let mut total_mileage_iops = 0u64;
+    let mut total_syncs = 0u64;
     for &(slot_id, epoch, file_bytes) in shard_entries {
         let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
         let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
@@ -451,7 +443,25 @@ fn print_shard_table(
             wc,
             sc,
         );
+        total_bytes = total_bytes.saturating_add(file_bytes);
+        total_mileage_bytes = total_mileage_bytes.saturating_add(bw);
+        total_mileage_iops = total_mileage_iops.saturating_add(wc);
+        total_syncs = total_syncs.saturating_add(sc);
+        if let (Some(total), Some(counts)) = (&mut total_nodes, node_counts) {
+            *total = total.saturating_add(counts.get(&slot_id).copied().unwrap_or(0));
+        }
     }
+    println!();
+    println!(
+        "{:>6}  {:>18}  {:>10}  {:>8}  {:>14}  {:>15}  {:>6}",
+        "",
+        "total",
+        fmt_bytes(total_bytes),
+        total_nodes.map_or_else(|| "?".to_owned(), |count| count.to_string()),
+        fmt_bytes(total_mileage_bytes),
+        total_mileage_iops,
+        total_syncs,
+    );
 }
 
 /// Short summary of the persisted shard-statistics snapshot age.
@@ -934,9 +944,9 @@ fn repack_preview(
         return Ok(None);
     }
 
-    let mut total_kept_bytes: u64 = 0;
     let mut total_kept = 0usize;
     let mut total_dropped = 0usize;
+    let mut total_dropped_bytes = 0u64;
     println!(
         "preflight: scanning {} shard{} for {} room{}...",
         shards.len(),
@@ -950,19 +960,11 @@ fn repack_preview(
         preview_store.plan_rooms_repack(&rooms, |_hash, _data| Vec::new())?
     };
     for plan in plans {
-        total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
         total_kept = total_kept.saturating_add(plan.kept);
         total_dropped = total_dropped.saturating_add(plan.dropped);
+        total_dropped_bytes = total_dropped_bytes.saturating_add(plan.dropped_bytes);
     }
 
-    let max_shard_bytes = mtxdb_core::shard::MAX_SHARD_BYTES;
-    let expected_shards = total_kept_bytes
-        .checked_add(max_shard_bytes.saturating_sub(1))
-        .map_or(1, |rounded| rounded / max_shard_bytes)
-        .max(1);
-    let slop = expected_shards
-        .saturating_mul(max_shard_bytes)
-        .saturating_sub(total_kept_bytes);
     let shard_slots = shards
         .iter()
         .map(u16::to_string)
@@ -1001,17 +1003,13 @@ fn repack_preview(
         fmt_bytes(total_input_bytes)
     );
     println!(
-        "expected result: ~{expected_shards} shard{} ({total_kept} nodes across {} room{} rewritten)",
-        if expected_shards == 1 { "" } else { "s" },
+        "expected result: {total_kept} nodes across {} room{} rewritten",
         rooms.len(),
-        if rooms.len() == 1 { "" } else { "s" },
+        if rooms.len() == 1 { "" } else { "s" }
     );
     println!(
-        "                 ~{} / {} = {}; {total_dropped} nodes pruned; ~{} headroom",
-        fmt_bytes(total_kept_bytes),
-        fmt_bytes(total_input_bytes),
-        fmt_percent(total_kept_bytes, total_input_bytes),
-        fmt_bytes(slop),
+        "                 {total_dropped} nodes / {} pruned",
+        fmt_bytes(total_dropped_bytes),
     );
     // preview_store (and its non-exclusive read-only handle) drops
     // here, before the confirmation prompt — nothing about a
@@ -1030,32 +1028,13 @@ fn repack_rooms(
     } else {
         store.repack_rooms_reachable(rooms, |_hash, _data| Vec::new())?
     };
-    let mut total_kept = 0_usize;
-    for (position, (room_id, kept, dropped)) in results.iter().enumerate() {
-        println!(
-            "repacked {}: {kept} kept, {dropped} dropped",
-            hex_encode(room_id)
-        );
-        total_kept = total_kept
-            .checked_add(*kept)
-            .context("repack progress node count overflow")?;
-        if rooms.len() > 1 {
-            let completed = position
-                .checked_add(1)
-                .context("repack progress room count overflow")?;
-            println!(
-                "finished {completed} rooms [{total_kept} nodes] {completed}/{} done",
-                rooms.len()
-            );
-        }
-    }
     let (final_kept, final_dropped) = results
         .iter()
         .fold((0usize, 0usize), |(k, d), &(_, kept, dropped)| {
             (k.saturating_add(kept), d.saturating_add(dropped))
         });
     println!(
-        "done: {} rooms repacked, {final_kept} kept, {final_dropped} dropped",
+        "done: {} rooms repacked in one shard batch, {final_kept} kept, {final_dropped} dropped",
         results.len()
     );
     Ok((final_kept, final_dropped))

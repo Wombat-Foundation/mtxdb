@@ -31,6 +31,8 @@ pub struct RepackPlan {
     pub dropped: usize,
     /// Total on-disk frame bytes of the records that would be kept.
     pub kept_bytes: u64,
+    /// Total on-disk frame bytes of records that would be pruned.
+    pub dropped_bytes: u64,
     /// Every shard id at least one kept record currently lives in.
     pub shards_touched: Vec<u16>,
 }
@@ -1366,17 +1368,20 @@ impl PackfileStorage {
         };
         let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
 
+        let live_set: HashSet<[u8; 16]> = live_hashes.iter().copied().collect();
         let mut kept_bytes: u64 = 0;
+        let mut dropped_bytes: u64 = 0;
         let mut shards_touched: HashSet<u16> = HashSet::new();
-        for hash in &live_hashes {
-            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(hash) else {
-                continue;
-            };
-            shards_touched.insert(shard_id);
+        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
             if let Some(shard) = pinned.get(&shard_id) {
                 if let Ok(record) = Self::read_at(shard, offset) {
-                    kept_bytes = kept_bytes
-                        .saturating_add(u64::try_from(record.serialized_len()).unwrap_or(u64::MAX));
+                    let bytes = u64::try_from(record.serialized_len()).unwrap_or(u64::MAX);
+                    if live_set.contains(hash) {
+                        shards_touched.insert(shard_id);
+                        kept_bytes = kept_bytes.saturating_add(bytes);
+                    } else {
+                        dropped_bytes = dropped_bytes.saturating_add(bytes);
+                    }
                 }
             }
         }
@@ -1387,6 +1392,7 @@ impl PackfileStorage {
             kept: live_hashes.len(),
             dropped,
             kept_bytes,
+            dropped_bytes,
             shards_touched,
         })
     }
