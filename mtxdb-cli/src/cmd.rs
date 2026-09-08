@@ -98,7 +98,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Shards => cmd_shards(cli),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { shard } => cmd_scan(cli, shard),
-        Commands::Import { paths, room } => cmd_import(cli, paths, room.as_deref()),
+        Commands::Import { paths, room } => {
+            cmd_import(cli, paths, room.as_deref());
+            Ok(())
+        }
         Commands::Repack {
             room,
             shard,
@@ -266,14 +269,32 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         "  {:>4}  {:<34}  {:>7}  {:>10}  {:>7}",
         "slot", "room", "nodes", "index RAM", "writes"
     );
+    let mut total_nodes = 0_usize;
+    let mut total_memory = 0_usize;
+    let mut total_writes = 0_usize;
     for (i, (room_id, count)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
         let (nodes, memory) = store.room_index_info(room_id).unwrap_or((0, 0));
+        total_nodes = total_nodes
+            .checked_add(nodes)
+            .context("total room node count overflow")?;
+        total_memory = total_memory
+            .checked_add(memory)
+            .context("total room index memory overflow")?;
+        total_writes = total_writes
+            .checked_add(*count)
+            .context("total room write count overflow")?;
         println!(
             "  {i:>4}  0x{hex}  {nodes:>7}  {:>10}  {count:>7}",
             fmt_megabytes(memory),
         );
     }
+    println!(
+        "  {:>4}  {:<34}  {total_nodes:>7}  {:>10}  {total_writes:>7}",
+        "",
+        "total",
+        fmt_megabytes(total_memory),
+    );
     Ok(())
 }
 
@@ -485,15 +506,12 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_import(
-    cli: &Cli,
-    paths: &[std::path::PathBuf],
-    room_override: Option<&str>,
-) -> anyhow::Result<()> {
+fn cmd_import(cli: &Cli, paths: &[std::path::PathBuf], room_override: Option<&str>) {
     for path in paths {
-        cmd_import_file(cli, path, room_override)?;
+        if let Err(error) = cmd_import_file(cli, path, room_override) {
+            eprintln!("{}: {error:#}", path.display());
+        }
     }
-    Ok(())
 }
 
 fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Result<()> {
@@ -550,7 +568,15 @@ fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyho
     let room_id = if let Some(r) = room_override {
         parse_room_id(r)?
     } else {
-        let rid = detected_room.context("could not detect room_id; pass --room for this input")?;
+        let rid = detected_room.with_context(|| {
+            let first_event = events
+                .first()
+                .and_then(event_id)
+                .unwrap_or("<missing event_id>");
+            format!(
+                "could not detect room_id (first event: {first_event}); pass --room for this input"
+            )
+        })?;
         let hash = blake3::hash(rid.as_bytes());
         let mut id = [0u8; 16];
         id.copy_from_slice(&hash.as_bytes()[..16]);
