@@ -15,15 +15,7 @@ publish = false
 [workspace]
 # exclude = ["mtxdb-ffi", "mtxdb-wasm"]
 
-[lib]
-path = "mtxdb-core/lib.rs"
-
 [dependencies]
-arc-swap = "1"
-bytes = "1.5"
-crc32fast = "1.4"
-memmap2 = "0.8"
-parking_lot = "0.12"
 
 [dev-dependencies]
 
@@ -34,7 +26,7 @@ harness = false
 
 # LINTS
 
-[lints.rust]
+[workspace.lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = [
@@ -48,7 +40,7 @@ trivial_numeric_casts = "warn"
 unreachable_pub = "warn"
 unused_lifetimes = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
@@ -70,25 +62,25 @@ verbose_file_reads = "warn"
 
 # BUILD PROFILES
 
-[profile.release]
+[workspace.profile.release]
 strip = "symbols"
 lto = "thin"
 
-[profile.release-max-perf]
+[workspace.profile.release-max-perf]
 inherits = "release"
 strip = "symbols"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-[profile.dev]
+[workspace.profile.dev]
 opt-level = 0
 debug = 0
 strip = "debuginfo"
 incremental = true
 codegen-units = 256
 
-[profile.test]
+[workspace.profile.test]
 debug = 0
 strip = "debuginfo"
 incremental = true
