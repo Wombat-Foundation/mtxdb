@@ -33,7 +33,7 @@ pub type ShardEntry = ([u8; 16], [u8; 16], u64);
 /// A single global shard file shared across all rooms.
 pub struct Shard {
     /// Reusable slot identifier for this shard within the pool.
-    pub shard_id: u16,
+    pub slot: u16,
     /// Globally monotonic file epoch, distinct from the slot index.
     /// Ensures a reused slot never collides on-disk with a still-referenced
     /// older file at that slot.
@@ -87,7 +87,7 @@ pub struct ShardStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardSummary {
     /// Reusable shard slot within the pool.
-    pub shard_id: u16,
+    pub slot: u16,
     /// Globally monotonic file epoch for this shard incarnation.
     pub epoch: u64,
     /// Current on-disk file length in bytes.
@@ -147,9 +147,9 @@ impl ShardStats {
 }
 
 impl Shard {
-    fn new(shard_id: u16, epoch: u64, file: File, path: PathBuf, file_len: u64) -> Self {
+    fn new(slot: u16, epoch: u64, file: File, path: PathBuf, file_len: u64) -> Self {
         Self {
-            shard_id,
+            slot,
             epoch,
             file,
             path,
@@ -585,8 +585,8 @@ impl ShardPool {
     /// since `ShardPool::open` itself only discovers shard *files*, not
     /// their room contents). Normal routing updates the home automatically
     /// from then on via `put_record`.
-    pub(crate) fn set_room_home(&self, room_id: &[u8; 16], shard_id: u16) {
-        self.room_home.write().insert(*room_id, shard_id);
+    pub(crate) fn set_room_home(&self, room_id: &[u8; 16], slot: u16) {
+        self.room_home.write().insert(*room_id, slot);
     }
 
     /// The shard a room's writes should go to: its remembered home if one
@@ -600,27 +600,23 @@ impl ShardPool {
             }
         }
         let shard = self.active_shard();
-        self.room_home.write().insert(*room_id, shard.shard_id);
+        self.room_home.write().insert(*room_id, shard.slot);
         shard
     }
 
     /// A room's home shard just filled up: rotate the pool forward (unless
     /// another room already did, in which case just adopt whatever's now
     /// active) and point the room at the result.
-    fn rotate_room_full_home(
-        &self,
-        room_id: &[u8; 16],
-        full_shard_id: u16,
-    ) -> io::Result<Arc<Shard>> {
+    fn rotate_room_full_home(&self, room_id: &[u8; 16], full_slot: u16) -> io::Result<Arc<Shard>> {
         {
             let active = self.active_write.lock();
-            if *active == full_shard_id {
+            if *active == full_slot {
                 drop(active);
                 self.rotate()?;
             }
         }
         let shard = self.active_shard();
-        self.room_home.write().insert(*room_id, shard.shard_id);
+        self.room_home.write().insert(*room_id, shard.slot);
         Ok(shard)
     }
 
@@ -676,8 +672,8 @@ impl ShardPool {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
-        for (shard_id, shard) in self.all_shards() {
-            shard.stats().encode(shard_id, shard.epoch, &mut buf);
+        for (slot, shard) in self.all_shards() {
+            shard.stats().encode(slot, shard.epoch, &mut buf);
         }
 
         // Unique per (process, call) — the same base_dir can be opened by
@@ -715,22 +711,22 @@ impl ShardPool {
 
     /// Get a reference to a shard by ID.
     #[must_use]
-    pub fn get_shard(&self, shard_id: u16) -> Option<Arc<Shard>> {
-        self.shards.read().get(shard_id as usize)?.clone()
+    pub fn get_shard(&self, slot: u16) -> Option<Arc<Shard>> {
+        self.shards.read().get(slot as usize)?.clone()
     }
 
     /// Get IO/sync stats for a single shard by ID.
     #[must_use]
-    pub fn stats(&self, shard_id: u16) -> Option<ShardStats> {
+    pub fn stats(&self, slot: u16) -> Option<ShardStats> {
         self.shards
             .read()
-            .get(shard_id as usize)?
+            .get(slot as usize)?
             .as_ref()
             .map(|shard| shard.stats())
     }
 
     /// Snapshot IO/sync stats for every currently-open shard, as
-    /// `(shard_id, ShardStats)` pairs.
+    /// `(slot, ShardStats)` pairs.
     #[must_use]
     pub fn all_stats(&self) -> Vec<(u16, ShardStats)> {
         self.shards
@@ -753,8 +749,8 @@ impl ShardPool {
     pub fn summaries(&self) -> Vec<ShardSummary> {
         self.all_shards()
             .into_iter()
-            .map(|(shard_id, shard)| ShardSummary {
-                shard_id,
+            .map(|(slot, shard)| ShardSummary {
+                slot,
                 epoch: shard.epoch,
                 file_bytes: shard.file_len(),
                 stats: shard.stats(),
@@ -762,7 +758,7 @@ impl ShardPool {
             .collect()
     }
 
-    /// Return all currently-open shards as `(slot_id, Arc<Shard>)` pairs.
+    /// Return all currently-open shards as `(slot, Arc<Shard>)` pairs.
     #[must_use]
     pub fn all_shards(&self) -> Vec<(u16, Arc<Shard>)> {
         self.shards
@@ -792,7 +788,7 @@ impl ShardPool {
     }
 
     /// Append a record to its room's home shard (see `room_home`).
-    /// Returns `(shard_id, offset)`. Rotates the room to a new home shard
+    /// Returns `(slot, offset)`. Rotates the room to a new home shard
     /// if its current one is full.
     ///
     /// # Errors
@@ -823,7 +819,7 @@ impl ShardPool {
                 if !fits && current_len > packfile::HEADER_LEN as u64 {
                     drop(guard);
                     drop(file);
-                    shard = self.rotate_room_full_home(&record.room_id, shard.shard_id)?;
+                    shard = self.rotate_room_full_home(&record.room_id, shard.slot)?;
                     continue;
                 }
 
@@ -839,8 +835,8 @@ impl ShardPool {
 
             shard.write_count.fetch_add(1, Ordering::Relaxed);
             shard.bytes_written.fetch_add(record_len, Ordering::Relaxed);
-            self.dirty.lock().insert(shard.shard_id);
-            return Ok((shard.shard_id, offset));
+            self.dirty.lock().insert(shard.slot);
+            return Ok((shard.slot, offset));
         }
     }
 
@@ -1123,8 +1119,8 @@ impl ShardPool {
         if source_shards.contains(&*self.active_write.lock()) {
             self.rotate_locked()?;
         }
-        let shard_id = *self.active_write.lock();
-        self.room_home.write().insert(*room_id, shard_id);
+        let slot = *self.active_write.lock();
+        self.room_home.write().insert(*room_id, slot);
         Ok(())
     }
 
@@ -1141,10 +1137,10 @@ impl ShardPool {
         if source_shards.contains(&*self.active_write.lock()) {
             self.rotate_locked()?;
         }
-        let shard_id = *self.active_write.lock();
+        let slot = *self.active_write.lock();
         let mut homes = self.room_home.write();
         for room_id in room_ids {
-            homes.insert(*room_id, shard_id);
+            homes.insert(*room_id, slot);
         }
         Ok(())
     }
@@ -1260,22 +1256,18 @@ impl ShardPool {
     /// `None` allows `rotate()` to reuse it.
     ///
     /// Does nothing if the slot is already empty or is the active write shard.
-    pub fn retire_slot(&self, shard_id: u16) {
+    pub fn retire_slot(&self, slot: u16) {
         let mut shards = self.shards.write();
-        if *self.active_write.lock() == shard_id {
+        if *self.active_write.lock() == slot {
             return;
         }
-        if let Some(slot) = shards.get_mut(shard_id as usize) {
-            if let Some(shard) = slot.take() {
+        if let Some(slot_entry) = shards.get_mut(slot as usize) {
+            if let Some(shard) = slot_entry.take() {
                 shard.is_current.store(false, Ordering::Release);
-                self.dirty.lock().remove(&shard_id);
+                self.dirty.lock().remove(&slot);
                 self.retired_count.fetch_add(1, Ordering::Relaxed);
                 drop(shards);
-                // Any room whose home was this slot must re-home on its
-                // next write — otherwise, once the slot is reused, that
-                // room's writes would silently land in an unrelated
-                // shard that happens to have been assigned the same slot.
-                self.room_home.write().retain(|_, home| *home != shard_id);
+                self.room_home.write().retain(|_, home| *home != slot);
             }
         }
     }
@@ -1358,11 +1350,11 @@ mod tests {
         let pool = ShardPool::open(dir).unwrap();
 
         let record = test_record(0x01, 0xAA, b"hello shard");
-        let (shard_id, offset) = pool.put_record(&record).unwrap();
-        assert_eq!(shard_id, 0);
+        let (slot, offset) = pool.put_record(&record).unwrap();
+        assert_eq!(slot, 0);
         assert!(offset > 0);
 
-        let shard = pool.get_shard(shard_id).unwrap();
+        let shard = pool.get_shard(slot).unwrap();
         let read = ShardPool::read_at(&shard, offset).unwrap();
         assert_eq!(read.room_id[0], 0x01);
         assert_eq!(read.hash[0], 0xAA);
@@ -1463,8 +1455,8 @@ mod tests {
         let pool = ShardPool::open(dir).unwrap();
 
         let record = test_record(0x01, 0xCC, b"needs sync");
-        let (shard_id, _offset) = pool.put_record(&record).unwrap();
-        assert!(pool.dirty.lock().contains(&shard_id));
+        let (slot, _offset) = pool.put_record(&record).unwrap();
+        assert!(pool.dirty.lock().contains(&slot));
 
         pool.sync_dirty().unwrap();
         assert!(
@@ -1512,8 +1504,8 @@ mod tests {
             .store(MAX_SHARD_BYTES - 10, Ordering::Release);
 
         let record = test_record(0x01, 0xBB, b"trigger rotation");
-        let (shard_id, _offset) = pool.put_record(&record).unwrap();
-        assert_eq!(shard_id, 1);
+        let (slot, _offset) = pool.put_record(&record).unwrap();
+        assert_eq!(slot, 1);
     }
 
     /// Core fix: a room's writes must stay on its own home shard even
@@ -1738,11 +1730,11 @@ mod tests {
         let dir = test_dir("pool_reopen_v2");
         let pool = ShardPool::open(dir.clone()).unwrap();
         let record = test_record(0x01, 0xAA, b"survives reopen");
-        let (shard_id, offset) = pool.put_record(&record).unwrap();
+        let (slot, offset) = pool.put_record(&record).unwrap();
         drop(pool);
 
         let pool = ShardPool::open(dir).unwrap();
-        let shard = pool.get_shard(shard_id).unwrap();
+        let shard = pool.get_shard(slot).unwrap();
         let read = ShardPool::read_at(&shard, offset).unwrap();
         assert_eq!(read.data.as_ref(), b"survives reopen");
     }
@@ -1830,9 +1822,9 @@ mod tests {
         let pool = ShardPool::open(dir).unwrap();
 
         let record = test_record(0x01, 0xAA, b"payload");
-        let (shard_id, _offset) = pool.put_record(&record).unwrap();
+        let (slot, _offset) = pool.put_record(&record).unwrap();
 
-        let pinned = pool.get_shard(shard_id).unwrap();
+        let pinned = pool.get_shard(slot).unwrap();
         let path = pinned.path.clone();
         assert!(path.exists());
 
@@ -1956,9 +1948,9 @@ mod tests {
         let pool = ShardPool::open(dir).unwrap();
 
         let record = test_record(0x01, 0xAA, b"payload for stats");
-        let (shard_id, offset) = pool.put_record(&record).unwrap();
+        let (slot, offset) = pool.put_record(&record).unwrap();
 
-        let shard = pool.get_shard(shard_id).unwrap();
+        let shard = pool.get_shard(slot).unwrap();
         let stats = shard.stats();
         assert_eq!(stats.write_count, 1);
         assert_eq!(stats.bytes_written, record.serialized_len() as u64);
@@ -1976,11 +1968,11 @@ mod tests {
 
         let all = pool.all_stats();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].0, shard_id);
+        assert_eq!(all[0].0, slot);
         assert_eq!(all[0].1, shard.stats());
 
-        assert_eq!(pool.stats(shard_id), Some(shard.stats()));
-        assert_eq!(pool.stats(shard_id.wrapping_add(1)), None);
+        assert_eq!(pool.stats(slot), Some(shard.stats()));
+        assert_eq!(pool.stats(slot.wrapping_add(1)), None);
     }
 
     /// Backward compatibility: the startup scan must correctly parse all
@@ -2036,15 +2028,15 @@ mod tests {
 
         let s0 = pool.get_shard(0).unwrap();
         assert_eq!(s0.epoch, 0, "legacy shard_00.pack → epoch 0");
-        assert_eq!(s0.shard_id, 0);
+        assert_eq!(s0.slot, 0);
 
         let s1 = pool.get_shard(1).unwrap();
         assert_eq!(s1.epoch, 5, "shard_01_...0005.pack → epoch 5");
-        assert_eq!(s1.shard_id, 1);
+        assert_eq!(s1.slot, 1);
 
         let s2 = pool.get_shard(2).unwrap();
         assert_eq!(s2.epoch, 3, "shard_0002_...0003.pack → epoch 3");
-        assert_eq!(s2.shard_id, 2);
+        assert_eq!(s2.slot, 2);
 
         // Slot 3 was never created; pool should have no shard there.
         assert!(pool.get_shard(3).is_none());

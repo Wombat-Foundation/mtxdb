@@ -1892,7 +1892,7 @@ impl PackfileStorage {
                 self.copy_record_to_shard(room_id, pinned, old_shard_id, old_offset)?
             {
                 output_state.1 = output_state.1.saturating_add(1);
-                let current_active_shard = self.shards.active_shard().shard_id;
+                let current_active_shard = self.shards.active_shard().slot;
                 Self::report_repack_output_rotation(
                     output_progress,
                     &mut output_state.0,
@@ -1955,7 +1955,7 @@ impl PackfileStorage {
             .prepare_rooms_repack(&room_ids, &source_shards)?;
 
         let mut results = Vec::with_capacity(room_ids.len());
-        let mut output_state = (self.shards.active_shard().shard_id, 0usize);
+        let mut output_state = (self.shards.active_shard().slot, 0usize);
         for room_id in &room_ids {
             let hash_to_shard_offset = maps.get(room_id).ok_or_else(|| {
                 StorageError::Corrupt("repack batch scan lost requested room".to_owned())

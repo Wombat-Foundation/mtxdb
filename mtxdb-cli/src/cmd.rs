@@ -1474,7 +1474,7 @@ fn resolve_repack_target(
             let shard_ids = store
                 .shard_summaries()
                 .into_iter()
-                .map(|summary| summary.shard_id)
+                .map(|summary| summary.slot)
                 .collect::<Vec<_>>();
             resolve_repack_shards(store, &shard_ids)
         }
@@ -1549,7 +1549,7 @@ fn repack_preview(
     let shard_sizes: std::collections::HashMap<u16, u64> = preview_store
         .shard_summaries()
         .into_iter()
-        .map(|summary| (summary.shard_id, summary.file_bytes))
+        .map(|summary| (summary.slot, summary.file_bytes))
         .collect();
     let total_input_bytes = shards.iter().fold(0u64, |total, shard_id| {
         total.saturating_add(shard_sizes.get(shard_id).copied().unwrap_or(0))
