@@ -374,7 +374,12 @@ impl PackfileStorage {
                 // other failure (CRC mismatch, invalid framing, permissions)
                 // means this pack cannot be indexed faithfully; fail open
                 // rather than publish a store that silently omitted it.
-                packfile::scan_and_recover_packfile(&path)?
+                packfile::scan_and_recover_packfile(&path).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("recovery scan failed for pack {}: {error}", path.display()),
+                    )
+                })?
             } else {
                 match packfile::scan_packfile(&path) {
                     Ok(e) => e,
