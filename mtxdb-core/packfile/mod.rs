@@ -436,11 +436,10 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
     Ok(Some(RecordMetadata { room_id, hash }))
 }
 
-/// Write a new shard file's [`HEADER_LEN`]-byte reserved header: magic,
-/// version, header length, `shard_id`, `epoch`, creation time, and
-/// a CRC over all of the above — zero-padded to fill `HEADER_LEN`.
-/// Written once, at creation, and never mutated again (see [`VERSION`]'s
-/// doc for why).
+/// Write a new pack file's [`HEADER_LEN`]-byte reserved header: magic,
+/// version, header length, `pack_id`, creation time, and a CRC over all
+/// of the above — zero-padded to fill `HEADER_LEN`. Written once, at
+/// creation, and never mutated again (see [`VERSION`]'s doc for why).
 ///
 /// # Errors
 /// Returns `io::Error` on write failure, or if the system clock is
@@ -1139,7 +1138,7 @@ mod tests {
     fn test_open_packfile_rejects_identity_mismatch() {
         let dir = test_dir("packfile_identity_mismatch");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("shard_0000000000000002.pack");
+        let path = dir.join("pack_0000000000000002.pack");
 
         // Header genuinely says pack_id 0 — a valid v4 header on its
         // own terms, just not what this filename claims.
@@ -1157,7 +1156,7 @@ mod tests {
 
         // The identical header opened under a matching expectation must
         // succeed — the check is about the mismatch, not the file itself.
-        let ok_path = dir.join("shard_0000000000000000.pack");
+        let ok_path = dir.join("pack_0000000000000000.pack");
         std::fs::write(&ok_path, &buf).unwrap();
         open_packfile(&ok_path, false, 0).unwrap();
     }

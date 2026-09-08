@@ -3117,7 +3117,7 @@ mod tests {
             std::fs::write(path, b"").unwrap();
         }
 
-        let valid_path = dir.join("shard_0000000000000000.pack");
+        let valid_path = dir.join("pack_0000000000000000.pack");
         let mut buf = Vec::new();
         packfile::write_header(&mut buf, 0).unwrap();
         packfile::write_record(
