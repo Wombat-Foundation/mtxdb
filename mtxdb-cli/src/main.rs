@@ -5,9 +5,11 @@ mod cmd;
 use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Command};
+use mtxdb_core::ShardType;
 
 pub(crate) struct Cli {
     pub(crate) dir: Option<PathBuf>,
+    pub(crate) shard_type: ShardType,
     pub(crate) command: Commands,
 }
 
@@ -22,7 +24,9 @@ pub(crate) enum Commands {
         id: String,
     },
     Rooms,
-    Shards,
+    Shards {
+        all: bool,
+    },
     Info {
         room: String,
     },
@@ -32,6 +36,9 @@ pub(crate) enum Commands {
     Import {
         paths: Vec<PathBuf>,
         room: Option<String>,
+    },
+    Export {
+        room: String,
     },
     Repack {
         room: Option<String>,
@@ -80,11 +87,29 @@ fn build_cli() -> Command {
                 .env("MTXDB_DIR")
                 .value_name("DIR")
                 .global(true)
-                .help("Base directory for packfiles"),
+                .help("Database root directory"),
+        )
+        .arg(
+            Arg::new("shard_type")
+                .short('t')
+                .long("shard-type")
+                .env("MTXDB_SHARD_TYPE")
+                .value_name("TYPE")
+                .default_value("event-dag")
+                .value_parser(["state", "event-dag", "auth-chain"])
+                .global(true)
+                .help("Independent shard pool to operate on"),
         )
         .subcommand(
             Command::new("shards")
-                .about("List open shard slots with size, rotation, and IO/sync stats"),
+                .about("List open shard slots with size, rotation, and IO/sync stats")
+                .arg(
+                    Arg::new("all")
+                        .short('a')
+                        .long("all")
+                        .action(ArgAction::SetTrue)
+                        .help("List shards in every independent pool"),
+                ),
         )
         .subcommand(Command::new("rooms").about("List rooms in the store"))
         .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
@@ -101,6 +126,7 @@ fn build_cli() -> Command {
                 ])),
         )
         .subcommand(sub_import())
+        .subcommand(sub_export())
         .subcommand(sub_repack())
         .subcommand(
             Command::new("scan")
@@ -143,6 +169,21 @@ fn sub_import() -> Command {
                 .short('r')
                 .long("room")
                 .help("Room ID (hex, 32 chars). Auto-detected if omitted"),
+        )
+}
+
+fn sub_export() -> Command {
+    Command::new("export")
+        .about("Export a room's records as JSONL to stdout")
+        .long_about(
+            "Export a room's stored records as one JSON value per line on stdout. Redirect the \
+             output to make an input accepted by `mtxdb import`.",
+        )
+        .arg(
+            Arg::new("room")
+                .required(true)
+                .value_name("ROOM")
+                .help("Room ID (hex, 32 chars)"),
         )
 }
 
@@ -228,6 +269,16 @@ fn parse_cli() -> Cli {
     }
 
     let dir = matches.get_one::<String>("dir").map(PathBuf::from);
+    let shard_type = match matches
+        .get_one::<String>("shard_type")
+        .map(String::as_str)
+        .expect("clap supplies the default shard type")
+    {
+        "state" => ShardType::State,
+        "event-dag" => ShardType::EventDag,
+        "auth-chain" => ShardType::AuthChain,
+        _ => unreachable!("clap validates shard type"),
+    };
 
     let command = match matches.subcommand() {
         Some(("put", m)) => Commands::Put {
@@ -240,7 +291,9 @@ fn parse_cli() -> Cli {
             id: m.get_one::<String>("id").unwrap().clone(),
         },
         Some(("rooms", _)) => Commands::Rooms,
-        Some(("shards", _)) => Commands::Shards,
+        Some(("shards", m)) => Commands::Shards {
+            all: m.get_flag("all"),
+        },
         Some(("info", m)) => Commands::Info {
             room: m.get_one::<String>("room").unwrap().clone(),
         },
@@ -254,6 +307,9 @@ fn parse_cli() -> Cli {
                 .map(PathBuf::from)
                 .collect(),
             room: m.get_one::<String>("room").cloned(),
+        },
+        Some(("export", m)) => Commands::Export {
+            room: m.get_one::<String>("room").unwrap().clone(),
         },
         Some(("repack", m)) => Commands::Repack {
             room: m.get_one::<String>("room").cloned(),
@@ -286,7 +342,11 @@ fn parse_cli() -> Cli {
         }
     };
 
-    Cli { dir, command }
+    Cli {
+        dir,
+        shard_type,
+        command,
+    }
 }
 
 fn main() -> anyhow::Result<()> {

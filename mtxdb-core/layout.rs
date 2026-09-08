@@ -26,6 +26,9 @@ pub enum ShardType {
 }
 
 impl ShardType {
+    /// Every shard type defined by the current database layout.
+    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::AuthChain];
+
     /// Stable on-disk directory name for this pool.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -72,7 +75,9 @@ impl DatabaseLayout {
             Self::reject_legacy_flat_store(&root)?;
             Self::write_descriptor(&meta_path)?;
         }
-        fs::create_dir_all(root.join("pools"))?;
+        for shard_type in ShardType::ALL {
+            fs::create_dir_all(root.join("pools").join(shard_type.as_str()))?;
+        }
         Ok(Self { root })
     }
 
@@ -146,6 +151,9 @@ mod tests {
         let root = test_dir("initialize");
         let layout = DatabaseLayout::open(root.clone()).unwrap();
         assert!(root.join(DB_META_FILENAME).is_file());
+        for shard_type in ShardType::ALL {
+            assert!(root.join("pools").join(shard_type.as_str()).is_dir());
+        }
         assert_eq!(
             layout.pool_dir(ShardType::State).unwrap(),
             root.join("pools/state")

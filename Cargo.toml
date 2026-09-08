@@ -55,8 +55,10 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [dependencies]
-bytes = "1.5"
 mtxdb-core = { path = "mtxdb-core" }
+
+[dev-dependencies]
+bytes = "1.5"
 
 # BENCHES — `benches/storage.rs` is discovered by this root package as well
 # as explicitly registered by `mtxdb-core`. Keep its direct shared dependencies
