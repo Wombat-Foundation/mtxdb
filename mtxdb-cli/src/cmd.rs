@@ -523,25 +523,13 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
         if let Some((_, len, mem)) = summaries.into_iter().find(|(id, _, _)| *id == room_id) {
             println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
             let shards = room_shards.get(&room_id).cloned().unwrap_or_default();
-            match shards.as_slice() {
-                [shard] => println!("  shard: {shard}"),
-                [] => {}
-                _ => {
-                    println!(
-                        "  shards: {}",
-                        shards
-                            .iter()
-                            .map(u16::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
-            }
+            print_room_shards(&shards);
             if let Some(details) = matrix_room_details_from_cache(dir, &room_id) {
-                print_matrix_room_details(details, None)
+                print_matrix_room_details(details, None);
             } else {
                 println!(
-                    "  Matrix metadata: scanning {} shard{}...",
+                    "  {:<12} scanning {} shard{}...",
+                    "metadata:",
                     shards.len(),
                     if shards.len() == 1 { "" } else { "s" }
                 );
@@ -569,20 +557,7 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
         Some((len, mem)) => {
             println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
             let shards = store.room_referenced_shards(&room_id);
-            match shards.as_slice() {
-                [shard] => println!("  shard: {shard}"),
-                [] => {}
-                _ => {
-                    println!(
-                        "  shards: {}",
-                        shards
-                            .iter()
-                            .map(u16::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
-            }
+            print_room_shards(&shards);
             print_matrix_room_details(matrix_room_details(&store, dir, &room_id)?, None);
         }
         None => eprintln!("room {hex}: not found"),
@@ -828,17 +803,34 @@ fn matrix_room_details_from_shards(
 
 fn print_matrix_room_details(details: MatrixRoomDetails, scanned_shards: Option<usize>) {
     if let Some(matrix_room_id) = details.room_id {
-        println!("  Matrix room: {matrix_room_id}");
+        println!("  {:<12} {matrix_room_id}", "Matrix room:");
     }
     if let Some(create) = details.create {
-        println!("  create: {create}");
+        println!("  {:<12} {create}", "create:");
     } else if let Some(shard_count) = scanned_shards {
         println!(
-            "  create: not found (scanned all {shard_count} shard{})",
+            "  {:<12} not found (scanned all {shard_count} shard{})",
+            "create:",
             if shard_count == 1 { "" } else { "s" }
         );
     } else {
-        println!("  create: not found");
+        println!("  {:<12} not found", "create:");
+    }
+}
+
+fn print_room_shards(shards: &[u16]) {
+    match shards {
+        [shard] => println!("  {:<12} {shard}", "shard:"),
+        [] => {}
+        _ => println!(
+            "  {:<12} {}",
+            "shards:",
+            shards
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -891,7 +883,10 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_import(cli: &Cli, paths: &[std::path::PathBuf], room_override: Option<&str>) {
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
+        if index != 0 {
+            eprintln!();
+        }
         if let Err(error) = cmd_import_file(cli, path, room_override) {
             eprintln!("{}: {error:#}", path.display());
         }
@@ -920,6 +915,7 @@ fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyho
     if events.is_empty() {
         bail!("no events found in {}", path.display());
     }
+    let first_event_ids: Vec<&str> = events.iter().filter_map(event_id).take(3).collect();
 
     let mut event_count = 0u64;
     let mut skipped = 0u64;
@@ -977,6 +973,14 @@ fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyho
     }
 
     eprintln!("imported {event_count} events to room {room_hex}");
+    if !first_event_ids.is_empty() {
+        eprintln!(
+            "first {} event{}: {}",
+            first_event_ids.len(),
+            if first_event_ids.len() == 1 { "" } else { "s" },
+            first_event_ids.join(", ")
+        );
+    }
     if skipped > 0 {
         eprintln!("skipped {skipped} events (missing event_id)");
     }
@@ -1105,7 +1109,7 @@ fn cmd_repack(
         // branch gives the missing-target case a readable diagnostic.
         _ => {
             return Err(anyhow!(
-                "exactly one of --room <room> | --shard <shard> is required"
+                "exactly one of --room <room> | --shard <shard> | --all is required"
             ))
         }
     };

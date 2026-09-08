@@ -169,6 +169,25 @@ fn read_persisted_shard_rooms(
         .collect::<Option<Vec<_>>>()?;
     Some((persisted_at, records))
 }
+
+/// The durable order supplied by a v2 inspection directory. Legacy v1
+/// directories have no order information at all, so callers must retain
+/// their physical first-seen order until the next sync upgrades them.
+fn persisted_room_order(base_dir: &std::path::Path) -> Option<Vec<[u8; 16]>> {
+    let (_, records) = read_persisted_shard_rooms(base_dir)?;
+    let mut orders: HashMap<[u8; 16], u64> = HashMap::new();
+    for record in records {
+        let order = record.insertion_order?;
+        orders
+            .entry(record.room_id)
+            .and_modify(|current| *current = (*current).min(order))
+            .or_insert(order);
+    }
+    let mut rooms: Vec<([u8; 16], u64)> = orders.into_iter().collect();
+    rooms.sort_unstable_by_key(|(room_id, order)| (*order, *room_id));
+    Some(rooms.into_iter().map(|(room_id, _)| room_id).collect())
+}
+
 /// Disambiguates concurrent `persist_shard_rooms` tmp filenames within
 /// this process, paired with the process id for uniqueness across
 /// processes — same rationale as `shard::STATS_TMP_COUNTER`.
@@ -321,7 +340,12 @@ impl PackfileStorage {
         // Phase 1: accumulate all records per room across every shard so
         // the index can be sized once for the true total.
         let mut room_entries: HashMap<[u8; 16], Vec<ShardRecord>> = HashMap::new();
-        let mut room_order: Vec<[u8; 16]> = Vec::new();
+        // Seed logical insertion order before scanning. A newly written room
+        // cannot appear in the sidecar until the next flush, so append it at
+        // first physical sight below. Legacy v1 sidecars yield no order and
+        // therefore use the same first-seen fallback for every room.
+        let mut room_order = persisted_room_order(&base_dir).unwrap_or_default();
+        let mut known_rooms: HashSet<[u8; 16]> = room_order.iter().copied().collect();
 
         // Collect open shard info (slot, path) before the scan loop so we
         // don't hold the shards read-lock across the I/O-heavy scan.
@@ -373,15 +397,16 @@ impl PackfileStorage {
                 }
             };
             for (room_id, hash, offset) in entries {
+                if known_rooms.insert(room_id) {
+                    room_order.push(room_id);
+                }
                 room_entries
                     .entry(room_id)
-                    .or_insert_with(|| {
-                        room_order.push(room_id);
-                        Vec::new()
-                    })
+                    .or_default()
                     .push((shard_id, hash, offset));
             }
         }
+        room_order.retain(|room_id| room_entries.contains_key(room_id));
 
         // P1: load deleted rooms set (persisted to disk)
         let deleted_rooms = Self::load_deleted_rooms(&base_dir);
