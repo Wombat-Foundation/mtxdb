@@ -254,6 +254,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         // so `rooms` remains useful until `mtxdb sync` writes one.
         None => open_store_read_only(cli)?.room_summaries(),
     };
+    let room_shards = PackfileStorage::room_shards_from_disk(dir);
 
     if rooms.is_empty() {
         eprintln!("no rooms found");
@@ -261,13 +262,17 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     }
 
     println!(
-        "  {:>4}  {:<34}  {:>7}  {:>10}",
-        "slot", "room", "nodes", "index RAM"
+        "  {:>4}  {:<34}  {:>7}  {:>6}  {:>10}",
+        "slot", "room", "nodes", "shards", "index RAM"
     );
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     for (i, (room_id, nodes, memory)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
+        let shards = room_shards
+            .as_ref()
+            .and_then(|by_room| by_room.get(room_id))
+            .map_or_else(|| "?".to_owned(), |shards| shards.len().to_string());
         total_nodes = total_nodes
             .checked_add(*nodes)
             .context("total room node count overflow")?;
@@ -275,15 +280,16 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
             .checked_add(*memory)
             .context("total room index memory overflow")?;
         println!(
-            "  {i:>4}  0x{hex}  {nodes:>7}  {:>10}",
+            "  {i:>4}  0x{hex}  {nodes:>7}  {shards:>6}  {:>10}",
             fmt_megabytes(*memory),
         );
     }
     println!();
     println!(
-        "  {:>4}  {:<34}  {total_nodes:>7}  {:>10}",
+        "  {:>4}  {:<34}  {total_nodes:>7}  {:>6}  {:>10}",
         "",
         "total",
+        "",
         fmt_megabytes(total_memory),
     );
     Ok(())
@@ -500,6 +506,15 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
             println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
+            let shards = store.room_referenced_shards(&room_id);
+            if shards.len() > 1 {
+                let shards = shards
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  shards: {shards}");
+            }
             let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
             let details = matrix_room_details(&store, dir, &room_id)?;
             if let Some(matrix_room_id) = details.room_id {
@@ -1022,18 +1037,32 @@ fn repack_rooms(
         store.repack_rooms_reachable_with_progress(
             rooms,
             extract_matrix_edges,
-            |shard_id, nodes, active| {
-                let state = if active { "active" } else { "full" };
-                println!("  output slot {shard_id} {state}: {nodes} nodes copied");
+            |room_id, from, to, nodes, complete| {
+                if complete {
+                    println!("  copy complete: {nodes} nodes; output slot {to} active");
+                } else {
+                    let room_id = room_id.expect("rotation progress has a room");
+                    println!(
+                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying room {}",
+                        hex_encode(&room_id),
+                    );
+                }
             },
         )?
     } else {
         store.repack_rooms_reachable_with_progress(
             rooms,
             |_hash, _data| Vec::new(),
-            |shard_id, nodes, active| {
-                let state = if active { "active" } else { "full" };
-                println!("  output slot {shard_id} {state}: {nodes} nodes copied");
+            |room_id, from, to, nodes, complete| {
+                if complete {
+                    println!("  copy complete: {nodes} nodes; output slot {to} active");
+                } else {
+                    let room_id = room_id.expect("rotation progress has a room");
+                    println!(
+                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying room {}",
+                        hex_encode(&room_id),
+                    );
+                }
             },
         )?
     };

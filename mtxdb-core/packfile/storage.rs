@@ -88,6 +88,8 @@ type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 
 /// Deduplicated live-location map for one room during a repack scan.
 type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
+/// Replacement index entries produced while copying one repack room.
+type RepackOffsets = Vec<([u8; 16], u16, u64)>;
 
 /// One scanned record's `(shard_id, hash, offset)`, as accumulated per
 /// room during `PackfileStorage::open_with_options`'s initial scan.
@@ -855,6 +857,40 @@ impl PackfileStorage {
                 Some((room_id, nodes, LossyIndex::memory_usage_for_entries(nodes)))
             })
             .collect()
+    }
+
+    /// Current live shard slots per room from the persisted shard→room
+    /// directory, without opening packfiles or rebuilding room indexes.
+    ///
+    /// Returns `None` when the directory has not been persisted yet or is
+    /// malformed.
+    #[must_use]
+    pub fn room_shards_from_disk(
+        base_dir: &std::path::Path,
+    ) -> Option<HashMap<[u8; 16], Vec<u16>>> {
+        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
+        if buf.len() < SHARD_ROOMS_HEADER_LEN
+            || &buf[0..4] != SHARD_ROOMS_MAGIC
+            || buf[4] != SHARD_ROOMS_VERSION
+        {
+            return None;
+        }
+        let body = &buf[SHARD_ROOMS_HEADER_LEN..];
+        if body.len() % SHARD_ROOMS_RECORD_LEN != 0 {
+            return None;
+        }
+        let mut shards: HashMap<[u8; 16], Vec<u16>> = HashMap::new();
+        for chunk in body.chunks_exact(SHARD_ROOMS_RECORD_LEN) {
+            let shard_id = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
+            let mut room_id = [0u8; 16];
+            room_id.copy_from_slice(&chunk[2..18]);
+            shards.entry(room_id).or_default().push(shard_id);
+        }
+        for room_shards in shards.values_mut() {
+            room_shards.sort_unstable();
+            room_shards.dedup();
+        }
+        Some(shards)
     }
 
     /// Current live-node count per shard from the persisted shard→room
@@ -1697,14 +1733,15 @@ impl PackfileStorage {
         self.repack_rooms_reachable_with_progress(
             room_ids,
             extract_edges,
-            |_shard_id, _nodes, _active| {},
+            |_room, _from, _to, _nodes, _complete| {},
         )
     }
 
-    /// As [`Self::repack_rooms_reachable`], with a callback whenever a
-    /// destination shard is finished. The callback receives the shard slot
-    /// and the number of replacement records written to it. The third
-    /// argument is true only for the final, still-active destination shard.
+    /// As [`Self::repack_rooms_reachable`], with a callback whenever the
+    /// shared output stream rotates. The callback receives the room whose
+    /// copy crossed the boundary (or `None` at completion), the slot it
+    /// rotated from, the replacement slot, the cumulative number of copied
+    /// nodes, and whether the copy is complete.
     ///
     /// This lets an interactive caller show meaningful physical-compaction
     /// progress without turning the shared shard batch back into a
@@ -1719,11 +1756,111 @@ impl PackfileStorage {
     ///
     /// Panics if the CSR implementation returns a local ID not present in its
     /// own hash table, which would violate its internal ordering invariant.
+    fn report_repack_output_rotation(
+        output_progress: &mut impl FnMut(Option<[u8; 16]>, u16, u16, usize, bool),
+        active_output_shard: &mut u16,
+        current_active_shard: u16,
+        room_id: &[u8; 16],
+        copied_nodes: usize,
+    ) {
+        if current_active_shard != *active_output_shard {
+            output_progress(
+                Some(*room_id),
+                *active_output_shard,
+                current_active_shard,
+                copied_nodes,
+                false,
+            );
+            *active_output_shard = current_active_shard;
+        }
+    }
+
+    fn copy_repack_batch_room(
+        &self,
+        room_id: &[u8; 16],
+        hash_to_shard_offset: &RepackRecordMap,
+        pinned: &HashMap<u16, Arc<Shard>>,
+        extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+        output_progress: &mut impl FnMut(Option<[u8; 16]>, u16, u16, usize, bool),
+        output_state: &mut (u16, usize),
+    ) -> Result<(RepackOffsets, usize), StorageError> {
+        let roots = self.live_roots.read().get(room_id).cloned();
+        let (live_hashes, adjacency) = match roots {
+            Some(roots) if !roots.is_empty() => {
+                Self::bfs_live_set(&roots, hash_to_shard_offset, pinned, extract_edges)?
+            }
+            _ => Self::scan_full_adjacency(hash_to_shard_offset, pinned, extract_edges)?,
+        };
+        let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
+
+        if dropped > 0 {
+            let live_set: HashSet<[u8; 16]> = live_hashes.iter().copied().collect();
+            if let Some(gen) = self.generation(room_id) {
+                for hash in hash_to_shard_offset.keys() {
+                    if !live_set.contains(hash) {
+                        gen.cache.remove(hash);
+                    }
+                }
+            }
+        }
+
+        let csr = Csr::build_from_edges(&live_hashes, &adjacency);
+        let topo = csr.topo_order();
+        if topo.len() != live_hashes.len() {
+            return Err(StorageError::Corrupt(format!(
+                "repack: cyclic graph detected — topo_order produced {} nodes from {} live hashes",
+                topo.len(),
+                live_hashes.len(),
+            )));
+        }
+
+        let mut new_offsets = Vec::with_capacity(topo.len());
+        for &local in &topo {
+            let hash = csr
+                .hash_of(local)
+                .expect("topo order contains valid local IDs");
+            let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
+                continue;
+            };
+            if let Some(entry) =
+                self.copy_record_to_shard(room_id, pinned, old_shard_id, old_offset)?
+            {
+                output_state.1 = output_state.1.saturating_add(1);
+                let current_active_shard = self.shards.active_shard().shard_id;
+                Self::report_repack_output_rotation(
+                    output_progress,
+                    &mut output_state.0,
+                    current_active_shard,
+                    room_id,
+                    output_state.1,
+                );
+                new_offsets.push(entry);
+            }
+        }
+
+        Ok((new_offsets, dropped))
+    }
+
+    /// As [`Self::repack_rooms_reachable`], with a callback whenever the
+    /// shared output stream rotates. The callback receives the room whose
+    /// copy crossed the boundary (or `None` at completion), the slot it
+    /// rotated from, the replacement slot, the cumulative number of copied
+    /// nodes, and whether the copy is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on I/O, corruption, or an unavailable staging
+    /// shard slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the CSR implementation returns a local ID not present in its
+    /// own hash table, which would violate its internal ordering invariant.
     pub fn repack_rooms_reachable_with_progress(
         &self,
         room_ids: &[[u8; 16]],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
-        mut shard_finished: impl FnMut(u16, usize, bool),
+        mut output_progress: impl FnMut(Option<[u8; 16]>, u16, u16, usize, bool),
     ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
         let mut room_ids = room_ids.to_vec();
         room_ids.sort_unstable();
@@ -1752,65 +1889,19 @@ impl PackfileStorage {
             .prepare_rooms_repack(&room_ids, &source_shards)?;
 
         let mut results = Vec::with_capacity(room_ids.len());
-        let mut output_shard = None;
-        let mut output_nodes = 0usize;
+        let mut output_state = (self.shards.active_shard().shard_id, 0usize);
         for room_id in &room_ids {
             let hash_to_shard_offset = maps.get(room_id).ok_or_else(|| {
                 StorageError::Corrupt("repack batch scan lost requested room".to_owned())
             })?;
-            let roots = self.live_roots.read().get(room_id).cloned();
-            let (live_hashes, adjacency) = match roots {
-                Some(roots) if !roots.is_empty() => {
-                    Self::bfs_live_set(&roots, hash_to_shard_offset, &pinned, &extract_edges)?
-                }
-                _ => Self::scan_full_adjacency(hash_to_shard_offset, &pinned, &extract_edges)?,
-            };
-            let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
-
-            if dropped > 0 {
-                let live_set: HashSet<[u8; 16]> = live_hashes.iter().copied().collect();
-                if let Some(gen) = self.generation(room_id) {
-                    for hash in hash_to_shard_offset.keys() {
-                        if !live_set.contains(hash) {
-                            gen.cache.remove(hash);
-                        }
-                    }
-                }
-            }
-
-            let csr = Csr::build_from_edges(&live_hashes, &adjacency);
-            let topo = csr.topo_order();
-            if topo.len() != live_hashes.len() {
-                return Err(StorageError::Corrupt(format!(
-                    "repack: cyclic graph detected — topo_order produced {} nodes from {} live hashes",
-                    topo.len(),
-                    live_hashes.len(),
-                )));
-            }
-
-            let mut new_offsets = Vec::with_capacity(topo.len());
-            for &local in &topo {
-                let hash = csr
-                    .hash_of(local)
-                    .expect("topo order contains valid local IDs");
-                let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
-                    continue;
-                };
-                if let Some(entry) =
-                    self.copy_record_to_shard(room_id, &pinned, old_shard_id, old_offset)?
-                {
-                    if let Some(previous_shard) = output_shard {
-                        if previous_shard != entry.1 {
-                            shard_finished(previous_shard, output_nodes, false);
-                            output_nodes = 0;
-                        }
-                    }
-                    output_shard = Some(entry.1);
-                    output_nodes = output_nodes.saturating_add(1);
-                    new_offsets.push(entry);
-                }
-            }
-
+            let (new_offsets, dropped) = self.copy_repack_batch_room(
+                room_id,
+                hash_to_shard_offset,
+                &pinned,
+                &extract_edges,
+                &mut output_progress,
+                &mut output_state,
+            )?;
             let kept = new_offsets.len();
             let index = Self::build_index(&new_offsets);
             self.replace_room_shard_counts(room_id, &index.shard_counts());
@@ -1829,9 +1920,7 @@ impl PackfileStorage {
             results.push((*room_id, kept, dropped));
         }
 
-        if let Some(shard_id) = output_shard {
-            shard_finished(shard_id, output_nodes, true);
-        }
+        output_progress(None, output_state.0, output_state.0, output_state.1, true);
 
         // All target room locks remain held while source references are
         // replaced. Drop them before the general retirement protocol, which
