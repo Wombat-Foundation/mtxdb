@@ -58,33 +58,10 @@ fn build_cli() -> Command {
                 .help("Base directory for packfiles"),
         )
         .subcommand(
-            Command::new("put")
-                .about("Insert a record")
-                .arg(Arg::new("room").short('r').long("room").required(true))
-                .arg(Arg::new("id").short('i').long("id").required(true))
-                .arg(Arg::new("data").short('a').long("data").required(true)),
-        )
-        .subcommand(
-            Command::new("get")
-                .about("Retrieve a record")
-                .arg(Arg::new("room").short('r').long("room").required(true))
-                .arg(Arg::new("id").short('i').long("id").required(true)),
-        )
-        .subcommand(Command::new("rooms").about("List rooms in the store"))
-        .subcommand(
             Command::new("shards")
                 .about("List open shards with size, generation, and IO/sync stats"),
         )
-        .subcommand(
-            Command::new("info")
-                .about("Show storage info for a room")
-                .arg(Arg::new("room").short('r').long("room").required(true)),
-        )
-        .subcommand(
-            Command::new("scan")
-                .about("Scan a packfile and print records")
-                .arg(Arg::new("path").required(true)),
-        )
+        .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
         .subcommand(
             Command::new("import")
                 .about("Import a JSON DAG file (rezzy-compatible format)")
@@ -95,6 +72,11 @@ fn build_cli() -> Command {
                         .long("room")
                         .help("Room ID (hex, 32 chars). Auto-detected if omitted"),
                 ),
+        )
+        .subcommand(
+            Command::new("scan")
+                .about("Scan a packfile and print records")
+                .arg(Arg::new("path").required(true)),
         )
         .subcommand(
             Command::new("repack")
@@ -126,6 +108,12 @@ fn build_cli() -> Command {
                         .help("Repack in topological order (requires edge-capable data format)"),
                 ),
         )
+        .subcommand(Command::new("rooms").about("List rooms in the store"))
+        .subcommand(
+            Command::new("info")
+                .about("Show storage info for a room")
+                .arg(Arg::new("room").short('r').long("room").required(true)),
+        )
         .subcommand(
             Command::new("delete")
                 .about("Delete all data for a room")
@@ -137,7 +125,19 @@ fn build_cli() -> Command {
                         .help("Skip confirmation prompt"),
                 ),
         )
-        .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
+        .subcommand(
+            Command::new("put")
+                .about("Insert a record")
+                .arg(Arg::new("room").short('r').long("room").required(true))
+                .arg(Arg::new("id").short('i').long("id").required(true))
+                .arg(Arg::new("data").short('a').long("data").required(true)),
+        )
+        .subcommand(
+            Command::new("get")
+                .about("Retrieve a record")
+                .arg(Arg::new("room").short('r').long("room").required(true))
+                .arg(Arg::new("id").short('i').long("id").required(true)),
+        )
 }
 
 fn parse_cli() -> Cli {
