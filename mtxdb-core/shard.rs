@@ -411,10 +411,13 @@ impl ShardPool {
             let id_usize = id as usize;
 
             // If we already have an epoch for this slot and the current
-            // file is not newer, it's stale — delete it.
+            // file is not newer, it's stale — skip it (delete only when
+            // writable; a read-only open must never mutate files).
             if let Some(prev) = best_epoch[id_usize] {
                 if prev >= epoch {
-                    let _ = fs::remove_file(&path);
+                    if writable {
+                        let _ = fs::remove_file(&path);
+                    }
                     continue;
                 }
             }
@@ -435,9 +438,11 @@ impl ShardPool {
             };
 
             // The candidate is valid, so it is now safe to retire
-            // the older epoch for this slot.
+            // the older epoch for this slot (only when writable).
             if let Some(old) = shards[id_usize].take() {
-                let _ = fs::remove_file(&old.path);
+                if writable {
+                    let _ = fs::remove_file(&old.path);
+                }
             }
             let file_len = file.metadata()?.len();
             let shard = Arc::new(Shard::new(id, epoch, file, path, file_len));
@@ -1258,14 +1263,19 @@ impl ShardPool {
     ///
     /// Does nothing if the slot is already empty or is the active write shard.
     pub fn retire_slot(&self, slot: u16) {
+        // Acquire dirty then shards to maintain lock order: dirty → shards
+        // (matching sync_dirty). Hold both through the retirement so the
+        // dirty bit is only cleared when the shard actually leaves the pool.
+        let mut dirty = self.dirty.lock();
         let mut shards = self.shards.write();
+
         if *self.active_write.lock() == slot {
-            return;
+            return; // leave dirty unchanged — sync_dirty must fsync later
         }
         if let Some(slot_entry) = shards.get_mut(slot as usize) {
             if let Some(shard) = slot_entry.take() {
+                dirty.remove(&slot);
                 shard.is_current.store(false, Ordering::Release);
-                self.dirty.lock().remove(&slot);
                 self.retired_count.fetch_add(1, Ordering::Relaxed);
                 drop(shards);
                 self.room_home.write().retain(|_, home| *home != slot);
@@ -2054,5 +2064,37 @@ mod tests {
         let max_offset = MAX_SHARD_BYTES - 1;
         let slot = crate::index::IndexSlot::new(0, 0, max_offset);
         assert_eq!(slot.offset(), max_offset);
+    }
+
+    /// Regression: `retire_slot` must not clear the active write shard's
+    /// dirty bit. If it does, `sync_dirty()` sees no dirty shards and
+    /// skips the fsync — a repack can report success without persisting
+    /// its copied data.
+    #[test]
+    fn retire_slot_preserves_active_dirty_bit() {
+        let dir = test_dir("retire_preserves_dirty");
+        let pool = ShardPool::open(dir).unwrap();
+
+        // Put a record so the active shard is dirty.
+        let record = test_record(1, 1, b"payload");
+        let (slot, _offset) = pool.put_record(&record).unwrap();
+        assert!(
+            pool.dirty.lock().contains(&slot),
+            "active shard should be dirty after put"
+        );
+
+        // Attempting to retire the active shard should be a no-op.
+        pool.retire_slot(slot);
+        assert!(
+            pool.dirty.lock().contains(&slot),
+            "active shard dirty bit must survive retire_slot"
+        );
+
+        // sync_dirty must still find and fsync the shard.
+        pool.sync_dirty().unwrap();
+        assert!(
+            pool.dirty.lock().is_empty(),
+            "sync_dirty should clear dirty after fsync"
+        );
     }
 }

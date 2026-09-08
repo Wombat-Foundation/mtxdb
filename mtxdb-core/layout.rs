@@ -59,6 +59,10 @@ impl DatabaseLayout {
     /// unknown, or it contains a legacy flat packfile layout.
     pub fn open(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&root)?;
+        // Always check for root-level legacy .pack files, not just on
+        // first open. A stray .pack at root after db.meta exists means
+        // data was silently dropped into the wrong location.
+        Self::reject_legacy_flat_store(&root)?;
         let meta_path = root.join(DB_META_FILENAME);
         if meta_path.exists() {
             let contents = fs::read(&meta_path)?;
@@ -72,7 +76,6 @@ impl DatabaseLayout {
                 ));
             }
         } else {
-            Self::reject_legacy_flat_store(&root)?;
             Self::write_descriptor(&meta_path)?;
         }
         for shard_type in ShardType::ALL {

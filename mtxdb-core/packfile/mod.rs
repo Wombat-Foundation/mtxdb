@@ -517,16 +517,43 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 /// `io::ErrorKind::InvalidData` if the header's recorded `shard_id`/
 /// `epoch` don't match what the filename says they should be.
 pub fn open_packfile(path: &Path, create: bool, shard_id: u16, epoch: u64) -> io::Result<File> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(create)
-        .open(path)?;
+    if create {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)?;
 
-    if file.metadata()?.len() == 0 {
-        write_header(&mut file, shard_id, epoch)?;
-        file.sync_all()?;
+        if file.metadata()?.len() == 0 {
+            write_header(&mut file, shard_id, epoch)?;
+            file.sync_all()?;
+        } else {
+            let mut reader = BufReader::new(&file);
+            let Some(header) = read_header(&mut reader)? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid packfile header",
+                ));
+            };
+            if header.slot != shard_id || header.epoch != epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "shard file {} identifies itself as slot {} epoch {} in its header, \
+                         but its filename says slot {shard_id} epoch {epoch} — \
+                         copied or renamed inconsistently with its own history",
+                        path.display(),
+                        header.slot,
+                        header.epoch,
+                    ),
+                ));
+            }
+        }
+        Ok(file)
     } else {
+        // Read-only path: open with read-only permissions, validate
+        // the header, never write or create.
+        let file = File::open(path)?;
         let mut reader = BufReader::new(&file);
         let Some(header) = read_header(&mut reader)? else {
             return Err(io::Error::new(
@@ -547,9 +574,8 @@ pub fn open_packfile(path: &Path, create: bool, shard_id: u16, epoch: u64) -> io
                 ),
             ));
         }
+        Ok(file)
     }
-
-    Ok(file)
 }
 
 /// Scan an existing packfile and return `(room_id, hash, offset)` entries.
