@@ -641,7 +641,7 @@ fn print_shard_table(
     let active_slot = shard_entries.iter().map(|(slot, _, _, _)| *slot).max();
 
     println!(
-        "{:>8}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
+        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
         "pack id", "ver", "bytes", "nodes", "collections", "syncs",
     );
     let mut total_bytes = 0u64;
@@ -656,9 +656,9 @@ fn print_shard_table(
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
-            "{:>8}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
+            "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
             format!(
-                "{pack_id:#x}{}",
+                "0x{pack_id:016x}{}",
                 if active_slot == Some(slot_id) {
                     "*"
                 } else {
@@ -679,7 +679,7 @@ fn print_shard_table(
     }
     println!();
     println!(
-        "{:>8}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
+        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
         "total",
         "",
         fmt_bytes(total_bytes),
