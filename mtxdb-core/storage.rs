@@ -6,66 +6,6 @@ use parking_lot::RwLock;
 /// A node ID is a 16-byte structural hash.
 pub type NodeId = [u8; 16];
 
-// -----------------------------------------------------------------------------
-// Entry Type Tags
-// -----------------------------------------------------------------------------
-
-/// Tag byte prepended to values to identify their record type.
-/// Legacy/untagged data (written before this scheme) is detected by the
-/// absence of a recognized tag (first byte not in the set of defined tag
-/// constants) or by zero-length values (tombstones).
-///
-/// Tag byte for generic key-value records.
-pub const ENTRY_TYPE_GENERIC_KV: u8 = 0x00;
-///
-/// Tag byte for event JSON records.
-pub const ENTRY_TYPE_EVENT_JSON: u8 = 0x01;
-/// Tag byte for auth chain link manifests.
-pub const ENTRY_TYPE_AUTH_CHAIN_LINKS: u8 = 0x0A;
-/// Tag byte for prev event edges.
-pub const ENTRY_TYPE_PREV_EVENT_EDGES: u8 = 0x0B;
-///
-/// Tag byte for HAMT internal nodes.
-pub const ENTRY_TYPE_HAMT_NODE: u8 = 0x10;
-/// Tag byte for HAMT root.
-pub const ENTRY_TYPE_HAMT_ROOT: u8 = 0x11;
-/// Tag byte for event-to-state-group mappings.
-pub const ENTRY_TYPE_EVENT_STATE_GROUP: u8 = 0x1A;
-/// Tag byte for state group reference counts.
-pub const ENTRY_TYPE_STATE_GROUP_REFCOUNT: u8 = 0x1B;
-
-/// Returns true if the first byte is a recognized entry type tag.
-#[must_use]
-pub fn is_known_tag(byte: u8) -> bool {
-    matches!(
-        byte,
-        ENTRY_TYPE_HAMT_ROOT
-            | ENTRY_TYPE_HAMT_NODE
-            | ENTRY_TYPE_PREV_EVENT_EDGES
-            | ENTRY_TYPE_EVENT_JSON
-            | ENTRY_TYPE_EVENT_STATE_GROUP
-            | ENTRY_TYPE_STATE_GROUP_REFCOUNT
-            | ENTRY_TYPE_AUTH_CHAIN_LINKS
-            | ENTRY_TYPE_GENERIC_KV
-    )
-}
-
-/// Returns a human-readable name for a tag byte, or `None` for unknown/legacy.
-#[must_use]
-pub fn tag_name(byte: u8) -> Option<&'static str> {
-    match byte {
-        ENTRY_TYPE_HAMT_ROOT => Some("hamt_root"),
-        ENTRY_TYPE_HAMT_NODE => Some("hamt_node"),
-        ENTRY_TYPE_PREV_EVENT_EDGES => Some("prev_event_edges"),
-        ENTRY_TYPE_EVENT_JSON => Some("event_json"),
-        ENTRY_TYPE_EVENT_STATE_GROUP => Some("event_state_group"),
-        ENTRY_TYPE_STATE_GROUP_REFCOUNT => Some("state_group_refcount"),
-        ENTRY_TYPE_AUTH_CHAIN_LINKS => Some("auth_chain_links"),
-        ENTRY_TYPE_GENERIC_KV => Some("generic_kv"),
-        _ => None,
-    }
-}
-
 /// Opaque node data as raw bytes (the encoded HAMT node or PDU).
 #[derive(Debug, Clone)]
 pub struct NodeData {
@@ -82,30 +22,6 @@ impl NodeData {
             bytes,
             children: Vec::new(),
         }
-    }
-
-    /// Strip a leading entry-type tag from the bytes, returning
-    /// `(tag_byte, payload)`. If the first byte is not a known tag,
-    /// returns `(0x00, original_bytes)` — legacy/untagged data.
-    #[must_use]
-    pub fn strip_tag(&self) -> (u8, &[u8]) {
-        if !self.bytes.is_empty() && is_known_tag(self.bytes[0]) {
-            (self.bytes[0], &self.bytes[1..])
-        } else {
-            (0x00, &self.bytes)
-        }
-    }
-
-    /// Returns the human-readable tag name from the leading byte,
-    /// or `"legacy"` if untagged.
-    #[must_use]
-    pub fn tag_name_or_legacy(&self) -> &'static str {
-        if !self.bytes.is_empty() {
-            if let Some(name) = tag_name(self.bytes[0]) {
-                return name;
-            }
-        }
-        "legacy"
     }
 }
 

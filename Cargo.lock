@@ -290,6 +290,14 @@ dependencies = [
 name = "mtxdb"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "mtxdb-core",
+]
+
+[[package]]
+name = "mtxdb-cli"
+version = "0.1.0"
+dependencies = [
  "anyhow",
  "base64",
  "blake3",

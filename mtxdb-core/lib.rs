@@ -22,6 +22,8 @@ pub mod dag;
 pub mod frontier;
 /// Lossy, append-only index mapping content hashes to packfile locations.
 pub mod index;
+/// Database-root layout and named independent packfile pools.
+pub mod layout;
 /// On-disk packfile format and the storage engine built on top of it.
 pub mod packfile;
 /// Fixed-size shard file pool that packfiles are written into.
@@ -31,11 +33,7 @@ pub mod storage;
 
 pub use cache::NodeCache;
 pub use index::LossyIndex;
+pub use layout::{DatabaseLayout, ShardType};
 pub use packfile::{storage::PackfileStorage, Record};
 pub use shard::ShardPool;
-pub use storage::{
-    is_known_tag, tag_name, NodeData, NodeId, StorageEngine, ENTRY_TYPE_AUTH_CHAIN_LINKS,
-    ENTRY_TYPE_EVENT_JSON, ENTRY_TYPE_EVENT_STATE_GROUP, ENTRY_TYPE_GENERIC_KV,
-    ENTRY_TYPE_HAMT_NODE, ENTRY_TYPE_HAMT_ROOT, ENTRY_TYPE_PREV_EVENT_EDGES,
-    ENTRY_TYPE_STATE_GROUP_REFCOUNT,
-};
+pub use storage::{NodeData, NodeId, StorageEngine};

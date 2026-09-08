@@ -1,12 +1,19 @@
-[workspace]
-resolver = "2"
-members = ["mtxdb-cli", "mtxdb-core"]
 # mtxdb-ffi and mtxdb-wasm deliberately stay out: a workspace member's own
 # [profile.*] is ignored (only the workspace root's applies), and
 # mtxdb-wasm's release profile (opt-level "z", lto, panic="abort") is
 # load-bearing for wasm binary size — folding it in here silently
 # discards it. They stay standalone builds, each with their own
 # [workspace] table, depending on mtxdb-core via a path dependency.
+
+[package]
+name = "mtxdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+publish = false
+[workspace]
+resolver = "2"
+members = ["mtxdb-cli", "mtxdb-core"]
 
 # LINTS
 
@@ -44,8 +51,16 @@ str_to_string = "warn"
 tests_outside_test_module = "warn"
 verbose_file_reads = "warn"
 
-# BENCHES — lives in mtxdb-core/Cargo.toml, not here: a virtual manifest
-# (this file has no [package]) can't own a [[bench]] target at all.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bytes = "1.5"
+mtxdb-core = { path = "mtxdb-core" }
+
+# BENCHES — `benches/storage.rs` is discovered by this root package as well
+# as explicitly registered by `mtxdb-core`. Keep its direct shared dependencies
+# here so `cargo bench` from the database root works.
 
 # BUILD PROFILES — must be plain [profile.*], never nested under
 # [workspace.*]; Cargo only recognizes profiles at this exact table name
