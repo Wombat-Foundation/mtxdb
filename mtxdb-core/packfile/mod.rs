@@ -255,36 +255,79 @@ pub fn write_header(writer: &mut impl Write, shard_id: u16, generation: u64) -> 
 
 /// Read and validate a shard file's reserved header.
 ///
-/// Returns `Ok(None)` for anything that isn't a recognized mdb v2
-/// packfile — empty file (EOF before a full header), wrong magic, or a
-/// different version. Returns `Err` for a header that *is* recognized
-/// (right magic, version, and length) but fails its own CRC — that's a
-/// distinct, worse condition than "not a packfile at all" and is
-/// reported as corruption rather than silently treated as absent.
+/// Returns `Ok(None)` only for something that genuinely isn't an mdb
+/// packfile at all — an empty file, or one whose first bytes don't match
+/// [`MAGIC`]. Everything else that's wrong is a real `Err`, not a quiet
+/// `None`, specifically so a caller (or one of the `scan_*` functions,
+/// which all propagate this via `?`) can't mistake "this store is a
+/// format I don't understand" for "this store has no data":
+///
+/// - Right magic, wrong version (most notably a pre-v2 store): a
+///   distinct, identifiable error naming the version found, not folded
+///   into "not a packfile".
+/// - Right magic and version, but truncated before a full `HEADER_LEN`
+///   header, or a CRC mismatch: corruption, reported as such.
 ///
 /// # Errors
-/// Returns `io::Error` on I/O failure or a CRC mismatch.
+/// Returns `io::Error` (`Unsupported`) if the version doesn't match
+/// [`VERSION`], or (`InvalidData`) if the header is truncated or its CRC
+/// doesn't match, or on I/O failure.
 ///
 /// # Panics
 /// Never in practice: every internal `try_into`/`from_le_bytes` slices a
-/// fixed, in-range region of the just-read `HEADER_LEN`-byte buffer.
+/// fixed, in-range region of the just-read header buffer.
 pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
-    let mut buf = [0u8; HEADER_LEN];
-    match reader.read_exact(&mut buf) {
+    // Phase 1: just enough to identify the format (magic + version),
+    // before committing to reading a full HEADER_LEN buffer — a small
+    // pre-cutover v1 file (bare 5-byte header) can easily be shorter
+    // than HEADER_LEN in total, and version mismatch has to be detected
+    // regardless of how much data follows it.
+    let mut prefix = [0u8; 5];
+    match reader.read_exact(&mut prefix) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    if buf[..4] != MAGIC || buf[4] != VERSION {
+    if prefix[..4] != MAGIC {
         return Ok(None);
     }
+    if prefix[4] != VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "packfile format version {:#04x} is not supported by this build \
+                 (only {VERSION:#04x}) — this looks like a pre-cutover store; \
+                 reset or migrate it rather than opening it with this version",
+                prefix[4]
+            ),
+        ));
+    }
+
+    // Phase 2: magic and version confirmed — read the rest of the
+    // reserved header. Running out of bytes here means a genuinely
+    // truncated v2 header, which is corruption, not "not a packfile".
+    let mut buf = [0u8; HEADER_LEN];
+    buf[..5].copy_from_slice(&prefix);
+    reader.read_exact(&mut buf[5..]).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated v2 shard header: shorter than {HEADER_LEN} bytes"),
+            )
+        } else {
+            e
+        }
+    })?;
+
     let header_len = u32::from_le_bytes(buf[5..9].try_into().unwrap());
     if header_len as usize != HEADER_LEN {
         // A version byte we recognize but a header length we don't is
-        // still "not this format" rather than corruption — but since
-        // VERSION and HEADER_LEN have only ever shipped together, this
-        // is defensive, not a case that's expected to occur.
-        return Ok(None);
+        // corruption too, for the same reason as above — VERSION and
+        // HEADER_LEN have only ever shipped together.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("shard header declares length {header_len}, expected {HEADER_LEN}"),
+        ));
     }
 
     let expected_crc = u32::from_le_bytes(
@@ -704,6 +747,97 @@ mod tests {
         let result = open_packfile(&path, false, 0, 0);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Direct test of the identity cross-check: a file whose *header* is
+    /// perfectly valid (right magic, version, CRC) but whose embedded
+    /// (`shard_id`, generation) don't match what the caller expects (i.e.
+    /// what the filename says) must be rejected — this is the actual
+    /// detection claim, independent of any test fixture happening to
+    /// already agree with its own filename.
+    #[test]
+    fn test_open_packfile_rejects_identity_mismatch() {
+        let dir = test_dir("packfile_identity_mismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard_0002_0000000000000005.pack");
+
+        // Header genuinely says shard 0, generation 0 — a valid v2
+        // header on its own terms, just not what this filename claims.
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0, 0).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = open_packfile(&path, false, 2, 5).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shard 0") && msg.contains("generation 0") && msg.contains("shard 2")
+                && msg.contains("generation 5"),
+            "error must name both the header's actual identity and the filename's expected one, got: {msg}"
+        );
+
+        // The identical header opened under a matching expectation must
+        // succeed — the check is about the mismatch, not the file itself.
+        let ok_path = dir.join("shard_0000_0000000000000000.pack");
+        std::fs::write(&ok_path, &buf).unwrap();
+        open_packfile(&ok_path, false, 0, 0).unwrap();
+    }
+
+    /// A recognizable pre-cutover v1 file (right magic, version 0x01,
+    /// otherwise well-formed) must be refused with a specific,
+    /// identifiable error — not silently treated as absent/empty data.
+    #[test]
+    fn test_open_packfile_refuses_v1_with_specific_error() {
+        let dir = test_dir("packfile_v1_refused");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard_00.pack");
+
+        // A valid v1 file: 5-byte header (magic + version 0x01) followed
+        // by a real, well-formed record — this is what an actual
+        // pre-cutover store's shard file looks like, not a corrupt one.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.push(0x01);
+        write_record(&mut buf, &test_record_raw([0x11; 16], b"old data")).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = open_packfile(&path, false, 0, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0x01") && msg.to_lowercase().contains("reset or migrate"),
+            "error must identify the offending version and advise resetting/migrating, got: {msg}"
+        );
+
+        // The same file must not be silently readable as "0 entries" via
+        // the standalone scan helpers either — this is the actual "too
+        // quiet" failure mode: a v1 store must error, not look empty.
+        assert_eq!(
+            scan_packfile(&path).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            scan_and_recover_packfile(&path).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            scan_packfile_from(&path, 0).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    /// The same v1-rejection must also hold for a v1 file too short to
+    /// fill a v2 `HEADER_LEN` buffer — version mismatch must be caught by
+    /// the 5-byte prefix check before ever attempting to read a full
+    /// `HEADER_LEN`, not collapsed into "empty" by an early EOF.
+    #[test]
+    fn test_read_header_refuses_short_v1_file_not_silently_empty() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.push(0x01); // v1, and nothing else — far shorter than HEADER_LEN
+        let mut cursor = Cursor::new(&buf);
+        let err = read_header(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]

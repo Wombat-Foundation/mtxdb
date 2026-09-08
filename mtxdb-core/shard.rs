@@ -778,7 +778,7 @@ impl ShardPool {
                 let fits = current_len
                     .checked_add(record_len)
                     .is_some_and(|sum| sum <= MAX_SHARD_BYTES);
-                if !fits && current_len > 5 {
+                if !fits && current_len > packfile::HEADER_LEN as u64 {
                     drop(guard);
                     drop(file);
                     shard = self.rotate_room_full_home(&record.room_id, shard.shard_id)?;
@@ -1512,6 +1512,93 @@ mod tests {
         assert_eq!(entries[0].1[0], 0x10);
         assert_eq!(entries[2].0[0], 0x01);
         assert_eq!(entries[2].1[0], 0x11);
+    }
+
+    /// End-to-end: real data survives a real close-and-reopen through the
+    /// actual `ShardPool::open` bootstrap, not just a raw byte-level
+    /// `read_header` call — proves the v2 header roundtrips through the
+    /// path a real process restart actually takes.
+    #[test]
+    fn test_shard_pool_reopen_survives_v2_header_roundtrip() {
+        let dir = test_dir("pool_reopen_v2");
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        let record = test_record(0x01, 0xAA, b"survives reopen");
+        let (shard_id, offset) = pool.put_record(&record).unwrap();
+        drop(pool);
+
+        let pool = ShardPool::open(dir).unwrap();
+        let shard = pool.get_shard(shard_id).unwrap();
+        let read = ShardPool::read_at(&shard, offset).unwrap();
+        assert_eq!(read.data.as_ref(), b"survives reopen");
+    }
+
+    /// End-to-end: `ShardPool::open` itself refuses a shard file whose
+    /// embedded identity doesn't match its filename — not just
+    /// `open_packfile` called directly in isolation.
+    #[test]
+    fn test_shard_pool_open_rejects_identity_mismatch() {
+        let dir = test_dir("pool_open_identity_mismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A valid v2 header claiming shard 0, generation 0, filed under a
+        // filename that claims shard 0, generation 7.
+        let path = ShardPool::shard_path(&dir, 0, 7);
+        let mut buf = Vec::new();
+        packfile::write_header(&mut buf, 0, 0).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let Err(err) = ShardPool::open(dir) else {
+            panic!("expected ShardPool::open to reject the identity mismatch");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("generation 7"));
+    }
+
+    /// End-to-end: `ShardPool::open` refuses a shard file with a CRC-
+    /// corrupted header, not just `read_header` called directly.
+    #[test]
+    fn test_shard_pool_open_rejects_corrupt_header_crc() {
+        let dir = test_dir("pool_open_bad_crc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = ShardPool::shard_path(&dir, 0, 0);
+        let mut buf = Vec::new();
+        packfile::write_header(&mut buf, 0, 0).unwrap();
+        buf[12] ^= 0xFF; // corrupt a byte inside the CRC-covered region
+        std::fs::write(&path, &buf).unwrap();
+
+        let Err(err) = ShardPool::open(dir) else {
+            panic!("expected ShardPool::open to reject the corrupt header");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// End-to-end: `ShardPool::open` refuses a real pre-cutover v1 store
+    /// with the specific version-mismatch error, rather than treating it
+    /// as an empty/fresh directory and silently starting a new v2 store
+    /// alongside old data it can no longer read.
+    #[test]
+    fn test_shard_pool_open_refuses_v1_store() {
+        let dir = test_dir("pool_open_v1_store");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = ShardPool::shard_path(&dir, 0, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&packfile::MAGIC);
+        buf.push(0x01);
+        packfile::write_record(
+            &mut buf,
+            &packfile::Record {
+                room_id: [0x22; 16],
+                hash: [0x33; 16],
+                data: bytes::Bytes::from_static(b"pre-cutover data"),
+            },
+        )
+        .unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let Err(err) = ShardPool::open(dir) else {
+            panic!("expected ShardPool::open to refuse the v1 store");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("0x01"));
     }
 
     /// A retired shard's file must survive as long as any `Arc<Shard>`
