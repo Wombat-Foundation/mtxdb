@@ -18,8 +18,14 @@ pub const MAX_SHARDS: usize = 4096;
 /// and modular arithmetic.
 pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 
-/// Maximum shard size before rotation (256 MB).
-pub const MAX_SHARD_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum shard size before rotation: `2^28 - 1` bytes (~256 MB), the
+/// largest value for which every offset a shard can ever produce still
+/// fits `IndexSlot`'s 28-bit offset field (which reserves its all-zero
+/// encoding as the empty-slot sentinel, capping the max representable
+/// offset at `2^28 - 2` — see `index::IndexSlot`). Do not round this up
+/// to a clean `256 * 1024 * 1024`: that's one byte over the ceiling and
+/// lets a shard produce an offset `IndexSlot::new` panics on.
+pub const MAX_SHARD_BYTES: u64 = (1u64 << 28) - 1;
 
 /// Scanned `(room_id, hash, offset)` entry from a shard file.
 pub type ShardEntry = ([u8; 16], [u8; 16], u64);
@@ -2042,5 +2048,18 @@ mod tests {
 
         // Slot 3 was never created; pool should have no shard there.
         assert!(pool.get_shard(3).is_none());
+    }
+
+    /// Regression: `MAX_SHARD_BYTES` was 2^28 exactly, but `IndexSlot` stores
+    /// `offset + 1` in 28 bits, so offset 2^28 - 1 would overflow. The
+    /// shard cap must be ≤ (1u64 << 28) - 1 to guarantee no offset
+    /// reaches the sentinel boundary.
+    #[test]
+    fn max_shard_bytes_fits_index_slot() {
+        // The largest offset a shard can ever present must survive
+        // IndexSlot::new without panicking.
+        let max_offset = MAX_SHARD_BYTES - 1;
+        let slot = crate::index::IndexSlot::new(0, 0, max_offset);
+        assert_eq!(slot.offset(), max_offset);
     }
 }
