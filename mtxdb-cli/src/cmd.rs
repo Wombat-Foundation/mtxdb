@@ -914,7 +914,9 @@ fn repack_preview(
     target: &RepackTarget,
     topo: bool,
 ) -> anyhow::Result<Option<RepackPreview>> {
+    println!("preflight: scanning shards and rebuilding live indexes...");
     let preview_store = open_store_read_only(cli)?;
+    println!("preflight: resolving shard closure...");
     let (rooms, shards) = resolve_repack_target(&preview_store, target)?;
     if rooms.is_empty() {
         match target {
@@ -935,7 +937,22 @@ fn repack_preview(
     let mut total_kept_bytes: u64 = 0;
     let mut total_kept = 0usize;
     let mut total_dropped = 0usize;
-    for room_id in &rooms {
+    println!(
+        "preflight: scanning {} room{} across {} shard{}",
+        rooms.len(),
+        if rooms.len() == 1 { "" } else { "s" },
+        shards.len(),
+        if shards.len() == 1 { "" } else { "s" },
+    );
+    for (position, room_id) in rooms.iter().enumerate() {
+        let current = position
+            .checked_add(1)
+            .context("repack preflight room count overflow")?;
+        println!(
+            "  scanning {current}/{}: {}",
+            rooms.len(),
+            hex_encode(room_id)
+        );
         let plan = if topo {
             preview_store.plan_room_repack(room_id, extract_matrix_edges)?
         } else {
@@ -944,6 +961,7 @@ fn repack_preview(
         total_kept_bytes = total_kept_bytes.saturating_add(plan.kept_bytes);
         total_kept = total_kept.saturating_add(plan.kept);
         total_dropped = total_dropped.saturating_add(plan.dropped);
+        println!("  planned {current}/{}", rooms.len());
     }
 
     let max_shard_bytes = mtxdb_core::shard::MAX_SHARD_BYTES;
@@ -987,7 +1005,7 @@ fn repack_preview(
         if rooms.len() == 1 { "" } else { "s" },
     );
     println!(
-        "                 ~{} / {} = {}; {total_dropped} nodes pruned; ~{} free shard",
+        "                 ~{} / {} = {}; {total_dropped} nodes pruned; ~{} headroom",
         fmt_bytes(total_kept_bytes),
         fmt_bytes(total_input_bytes),
         fmt_percent(total_kept_bytes, total_input_bytes),
@@ -1074,6 +1092,11 @@ fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Re
     }
 
     repack_rooms(&store, &rooms, topo)?;
+    // `cmd_shards` deliberately reads the persisted shard→room directory
+    // instead of reopening and scanning every packfile. Refresh it before
+    // the immediate post-repack table so freshly-created rotations have
+    // real node counts rather than `?`.
+    store.persist_shard_rooms()?;
     drop(store);
     println!("post-repack shard state:");
     cmd_shards(cli)?;
