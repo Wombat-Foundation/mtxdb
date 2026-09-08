@@ -102,15 +102,14 @@ const STATS_FILENAME: &str = "shard_stats.bin";
 
 /// Magic bytes + version identifying the stats file format.
 const STATS_MAGIC: &[u8; 4] = b"MSTA";
-/// v3 adds an 8-byte persisted-at unix-seconds timestamp right after the
-/// version byte, so a reader (e.g. `mtxdb shards`) can tell how stale a
-/// snapshot is instead of just trusting whatever numbers happen to be on
-/// disk. A v2 file is simply not restored — best-effort, same as any
-/// other unreadable snapshot — rather than migrated in place.
-const STATS_VERSION: u8 = 3;
+/// v4 replaces the v3 `slot_id`(2) + epoch(8) key with a single `pack_id`(8)
+/// key, cutting the per-record overhead by 2 bytes and eliminating the
+/// ephemeral slot-vs-epoch disambiguation. A v3 file is read as a
+/// legacy fallback; a v2 file is simply not restored.
+const STATS_VERSION: u8 = 4;
 
-/// On-disk size of one stats record: `slot_id`(2) + epoch(8) + 3×counter(8) = 34 bytes.
-const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
+/// On-disk size of one v4 stats record: `pack_id`(8) + 3×counter(8) = 32 bytes.
+const STATS_RECORD_LEN: usize = 8 + 8 * 3;
 
 /// Header size: magic(4) + version(1) + `persisted_at`(8).
 const STATS_HEADER_LEN: usize = 4 + 1 + 8;
@@ -130,23 +129,20 @@ const POOL_META_VERSION: u8 = 1;
 static STATS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl ShardStats {
-    fn encode(self, shard_id: u16, epoch: u64, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&shard_id.to_le_bytes());
-        buf.extend_from_slice(&epoch.to_le_bytes());
+    fn encode(self, pack_id: u64, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&pack_id.to_le_bytes());
         buf.extend_from_slice(&self.write_count.to_le_bytes());
         buf.extend_from_slice(&self.bytes_written.to_le_bytes());
         buf.extend_from_slice(&self.sync_count.to_le_bytes());
     }
 
-    fn decode(rec: &[u8; STATS_RECORD_LEN]) -> (u16, u64, Self) {
-        let shard_id = u16::from_le_bytes(rec[0..2].try_into().unwrap());
-        let epoch = u64::from_le_bytes(rec[2..10].try_into().unwrap());
-        let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
-        let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
-        let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
+    fn decode(rec: &[u8; STATS_RECORD_LEN]) -> (u64, Self) {
+        let pack_id = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+        let write_count = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+        let bytes_written = u64::from_le_bytes(rec[16..24].try_into().unwrap());
+        let sync_count = u64::from_le_bytes(rec[24..32].try_into().unwrap());
         (
-            shard_id,
-            epoch,
+            pack_id,
             Self {
                 write_count,
                 bytes_written,
@@ -779,9 +775,9 @@ impl ShardPool {
     }
 
     /// Load a persisted stats snapshot, if one exists, and restore each
-    /// shard's counters when its epoch still matches — a stale
-    /// snapshot entry (from a slot since retired and reused) is silently
-    /// skipped rather than misapplied. Returns the snapshot's persisted-at
+    /// shard's counters when its `pack_id` matches — a stale snapshot entry
+    /// (from a shard since retired and deleted) is silently skipped
+    /// rather than misapplied. Returns the snapshot's persisted-at
     /// unix timestamp, if the file was readable and current-format.
     ///
     /// Best-effort: a missing, truncated, or corrupt file just means no
@@ -798,10 +794,11 @@ impl ShardPool {
             let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) else {
                 break;
             };
-            let (shard_id, pack_id, stats) = ShardStats::decode(rec);
-            if let Some(Some(shard)) = shards.get(shard_id as usize) {
+            let (pack_id, stats) = ShardStats::decode(rec);
+            for shard in shards.iter().flatten() {
                 if shard.pack_id == pack_id {
                     shard.restore_stats(stats);
+                    break;
                 }
             }
         }
@@ -809,7 +806,7 @@ impl ShardPool {
     }
 
     /// Persist every currently-open shard's IO/sync counters to disk,
-    /// keyed by `(slot_id, epoch)` so a retired/reused slot's stale
+    /// keyed by `pack_id` so a retired/reused slot's stale
     /// numbers are never mistakenly restored onto a new shard.
     ///
     /// Writes to a temp file and renames into place, so a crash mid-write
@@ -825,8 +822,8 @@ impl ShardPool {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
-        for (slot, shard) in self.all_shards() {
-            shard.stats().encode(slot, shard.pack_id, &mut buf);
+        for (_slot, shard) in self.all_shards() {
+            shard.stats().encode(shard.pack_id, &mut buf);
         }
 
         // Unique per (process, call) — the same base_dir can be opened by

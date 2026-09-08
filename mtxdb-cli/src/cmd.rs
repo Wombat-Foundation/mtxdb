@@ -599,8 +599,9 @@ type ShardStatsMap = std::collections::HashMap<u64, (u64, u64, u64)>;
 /// bytes_written, sync_count)` and the snapshot's persisted-at timestamp.
 fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
-    const STATS_HEADER_LEN: usize = 4 + 1 + 8; // magic + version + persisted_at
-    const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
+    const STATS_VERSION: u8 = 4;
+    const STATS_HEADER_LEN: usize = 4 + 1 + 8;
+    const STATS_RECORD_LEN: usize = 8 + 8 * 3;
 
     let mut stats_map = std::collections::HashMap::new();
     let mut persisted_at = None;
@@ -609,7 +610,7 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     let Ok(buf) = fs::read(stats_path) else {
         return (stats_map, persisted_at);
     };
-    if buf.len() < STATS_HEADER_LEN || &buf[0..4] != STATS_MAGIC || buf[4] != 3 {
+    if buf.len() < STATS_HEADER_LEN || &buf[0..4] != STATS_MAGIC || buf[4] != STATS_VERSION {
         return (stats_map, persisted_at);
     }
 
@@ -617,10 +618,10 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     let body = &buf[STATS_HEADER_LEN..];
     for chunk in body.chunks(STATS_RECORD_LEN) {
         if let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) {
-            let pack_id = u64::from_le_bytes(rec[2..10].try_into().unwrap());
-            let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
-            let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
-            let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
+            let pack_id = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+            let write_count = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+            let bytes_written = u64::from_le_bytes(rec[16..24].try_into().unwrap());
+            let sync_count = u64::from_le_bytes(rec[24..32].try_into().unwrap());
             stats_map.insert(pack_id, (write_count, bytes_written, sync_count));
         }
     }
@@ -631,8 +632,8 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 fn print_shard_table(
     shard_entries: &[(u16, u64, u64, u8)],
     stats_map: &ShardStatsMap,
-    node_counts: Option<&std::collections::HashMap<u16, u64>>,
-    collection_counts: Option<&std::collections::HashMap<u16, u64>>,
+    node_counts: Option<&std::collections::HashMap<u64, u64>>,
+    collection_counts: Option<&std::collections::HashMap<u64, u64>>,
     total_collections: Option<usize>,
 ) {
     // `ShardPool::open_internal` restores the highest occupied slot as its
@@ -650,10 +651,10 @@ fn print_shard_table(
     for &(slot_id, pack_id, file_bytes, version) in shard_entries {
         let (_, _, sc) = stats_map.get(&pack_id).copied().unwrap_or_default();
         let nodes = node_counts
-            .and_then(|counts| counts.get(&slot_id))
+            .and_then(|counts| counts.get(&pack_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         let collections = collection_counts
-            .and_then(|counts| counts.get(&slot_id))
+            .and_then(|counts| counts.get(&pack_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
             "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
@@ -674,7 +675,7 @@ fn print_shard_table(
         total_bytes = total_bytes.saturating_add(file_bytes);
         total_syncs = total_syncs.saturating_add(sc);
         if let (Some(total), Some(counts)) = (&mut total_nodes, node_counts) {
-            *total = total.saturating_add(counts.get(&slot_id).copied().unwrap_or(0));
+            *total = total.saturating_add(counts.get(&pack_id).copied().unwrap_or(0));
         }
     }
     println!();
@@ -782,7 +783,7 @@ fn cmd_info(cli: &Cli, collection: &str) -> anyhow::Result<()> {
                 "collection {hex}: {len} nodes, {} index RAM",
                 fmt_megabytes(mem)
             );
-            let shards = store.collection_referenced_shards(&collection_id);
+            let shards = store.collection_referenced_pack_ids(&collection_id);
             print_collection_shards(&shards);
             print_matrix_room_details(matrix_room_details(&store, &dir, &collection_id)?, None);
         }
@@ -998,12 +999,17 @@ fn matrix_room_details(
 fn matrix_room_details_from_shards(
     dir: &Path,
     collection_id: &[u8; 16],
-    shard_ids: &[u16],
+    pack_ids: &[u64],
 ) -> anyhow::Result<MatrixRoomDetails> {
     let pool = ShardPool::open_read_only(dir.into()).context("failed to open shard store")?;
     let mut details = MatrixRoomDetails::default();
-    for shard_id in shard_ids {
-        let Some(shard) = pool.get_shard(*shard_id) else {
+    for &pack_id in pack_ids {
+        let Some(shard) = pool
+            .all_shards()
+            .into_iter()
+            .find(|(_, s)| s.pack_id == pack_id)
+            .map(|(_, s)| s)
+        else {
             continue;
         };
         let file = fs::File::open(&shard.path)?;
@@ -1047,16 +1053,16 @@ fn print_matrix_room_details(details: MatrixRoomDetails, scanned_shards: Option<
     }
 }
 
-fn print_collection_shards(shards: &[u16]) {
+fn print_collection_shards(shards: &[u64]) {
     match shards {
-        [shard] => println!("  {:<12} {shard}", "shard:"),
+        [shard] => println!("  {:<12} {shard:#x}", "pack:"),
         [] => {}
         _ => println!(
             "  {:<12} {}",
-            "shards:",
+            "packs:",
             shards
                 .iter()
-                .map(u16::to_string)
+                .map(|id| format!("{id:#x}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1155,13 +1161,13 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let collection_shards = PackfileStorage::collection_shards_from_disk(&pool_dir)
         .and_then(|by_collection| by_collection.get(&collection_id).cloned())
         .context("collection shard directory is unavailable; run `mtxdb sync` before exporting")?;
-    let collection_shards: HashSet<u16> = collection_shards.into_iter().collect();
+    let collection_shards: HashSet<u64> = collection_shards.into_iter().collect();
 
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
     let mut shards: Vec<_> = pool
         .all_shards()
         .into_iter()
-        .filter(|(shard_id, _)| collection_shards.contains(shard_id))
+        .filter(|(_, shard)| collection_shards.contains(&shard.pack_id))
         .collect();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
 
