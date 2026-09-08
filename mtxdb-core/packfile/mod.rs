@@ -50,7 +50,7 @@ pub struct ShardHeader {
 }
 
 /// Maximum record size (64KB). Bounds the *uncompressed* on-disk frame
-/// length ([`FRAME_FIXED_LEN`] + `data.len()`, i.e. what the frame would
+/// length (`FRAME_FIXED_LEN + data.len()`, i.e. what the frame would
 /// take up were it stored raw) — checked at write time against the
 /// caller's plaintext `data`, and at read time against the actual on-disk
 /// frame length, which never exceeds the uncompressed bound (compression
@@ -167,7 +167,7 @@ const ZSTD_LEVEL: i32 = 3;
 /// # Errors
 /// Returns `io::Error` on write failure, or if `record.data` would make
 /// even an uncompressed frame exceed [`MAX_RECORD_LEN`] (checked against
-/// the plaintext on-disk frame length — [`FRAME_FIXED_LEN`] plus
+/// the plaintext on-disk frame length — `FRAME_FIXED_LEN` plus
 /// `record.data.len()` — before compression, so this bound is never
 /// looser than what [`read_record`] will actually accept).
 ///

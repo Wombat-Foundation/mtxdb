@@ -1170,11 +1170,13 @@ fn cmd_import_file(
     if events.is_empty() {
         bail!("no events found in {}", path.display());
     }
-    let first_event_ids: Vec<&str> = events.iter().filter_map(event_id).take(3).collect();
-
     let mut event_count = 0u64;
     let mut skipped = 0u64;
     let mut already_present = 0u64;
+    // Successful imports are the nominal case and need no event-ID noise.
+    // Keep a small sample only for the duplicate case, where it helps an
+    // operator identify which input/store overlap caused the no-op.
+    let mut already_present_ids = Vec::with_capacity(3);
 
     let room_id = if let Some(r) = room_override {
         parse_room_id(r)?
@@ -1218,6 +1220,9 @@ fn cmd_import_file(
                 );
             }
             already_present = already_present.saturating_add(1);
+            if already_present_ids.len() < 3 {
+                already_present_ids.push(incoming_event_id);
+            }
             continue;
         }
         let data = NodeData::new(bytes::Bytes::from(event_bytes));
@@ -1226,19 +1231,19 @@ fn cmd_import_file(
     }
 
     eprintln!("imported {event_count} events to room {room_hex}");
-    if !first_event_ids.is_empty() {
-        eprintln!(
-            "first {} event{}: {}",
-            first_event_ids.len(),
-            if first_event_ids.len() == 1 { "" } else { "s" },
-            first_event_ids.join(", ")
-        );
-    }
     if skipped > 0 {
         eprintln!("skipped {skipped} events (missing event_id)");
     }
     if already_present > 0 {
-        eprintln!("{already_present} events already present");
+        let suffix = if already_present > already_present_ids.len() as u64 {
+            ", ..."
+        } else {
+            ""
+        };
+        eprintln!(
+            "{already_present} events already present [{}{suffix}]",
+            already_present_ids.join(", "),
+        );
     }
 
     Ok(())

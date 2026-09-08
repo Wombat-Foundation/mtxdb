@@ -2020,8 +2020,8 @@ impl PackfileStorage {
     /// drained) — every record was matched by content hash, not just
     /// index tag, so an index-tag collision can't surface the wrong one.
     ///
-    /// Read-only: resolves against one frozen generation snapshot (see
-    /// [`Self::bfs_ancestors`]) and takes no `put_mutex`. Cost is
+    /// Read-only: resolves against one frozen generation snapshot via its
+    /// internal breadth-first traversal and takes no `put_mutex`. Cost is
     /// proportional to the number of ancestors actually walked — one
     /// index lookup per node — not room size, since it doesn't pre-scan
     /// every shard the way `repack_room_reachable` does.
