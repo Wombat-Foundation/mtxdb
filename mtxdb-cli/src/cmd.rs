@@ -104,10 +104,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         }
         Commands::Repack {
             room,
-            shard,
+            shards,
+            all,
             root,
             topo,
-        } => cmd_repack(cli, room.as_deref(), *shard, root, *topo),
+        } => cmd_repack(cli, room.as_deref(), shards, *all, root, *topo),
         Commands::Delete { rooms, yes } => cmd_delete(cli, rooms, *yes),
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync => cmd_sync(cli),
@@ -270,14 +271,16 @@ fn room_frame_counts(dir: &Path) -> anyhow::Result<Vec<([u8; 16], usize)>> {
 
 fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
-    let rooms = room_frame_counts(dir)?;
+    let writes: std::collections::HashMap<[u8; 16], usize> =
+        room_frame_counts(dir)?.into_iter().collect();
+    let store = open_store_read_only(cli)?;
+    let rooms = store.room_summaries();
 
     if rooms.is_empty() {
         eprintln!("no rooms found");
         return Ok(());
     }
 
-    let store = open_store_read_only(cli)?;
     println!(
         "  {:>4}  {:<34}  {:>7}  {:>10}  {:>7}",
         "slot", "room", "nodes", "index RAM", "writes"
@@ -285,23 +288,24 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_writes = 0_usize;
-    for (i, (room_id, count)) in rooms.iter().enumerate() {
+    for (i, (room_id, nodes, memory)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
-        let (nodes, memory) = store.room_index_info(room_id).unwrap_or((0, 0));
+        let count = writes.get(room_id).copied().unwrap_or(0);
         total_nodes = total_nodes
-            .checked_add(nodes)
+            .checked_add(*nodes)
             .context("total room node count overflow")?;
         total_memory = total_memory
-            .checked_add(memory)
+            .checked_add(*memory)
             .context("total room index memory overflow")?;
         total_writes = total_writes
-            .checked_add(*count)
+            .checked_add(count)
             .context("total room write count overflow")?;
         println!(
             "  {i:>4}  0x{hex}  {nodes:>7}  {:>10}  {count:>7}",
-            fmt_megabytes(memory),
+            fmt_megabytes(*memory),
         );
     }
+    println!();
     println!(
         "  {:>4}  {:<34}  {total_nodes:>7}  {:>10}  {total_writes:>7}",
         "",
@@ -313,7 +317,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
 
 /// Deliberately bypasses both `PackfileStorage` and `ShardPool` — it
 /// needs no room data and no packfile reads. Instead it globs shard
-/// filenames for size/epoch, then decodes the small `shard_stats.bin` and
+/// filenames for size/rotation, then decodes the small `shard_stats.bin` and
 /// `shard_rooms.bin` sidecars for counters and live-node counts.
 /// Safe to run against a directory a live writer process owns.
 fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
@@ -329,6 +333,7 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
     let node_counts = PackfileStorage::shard_node_counts_from_disk(dir);
     print_shard_table(&shard_entries, &stats_map, node_counts.as_ref());
+    println!("* active shard");
     println!(
         "{} shard(s), {}",
         shard_entries.len(),
@@ -414,10 +419,14 @@ fn print_shard_table(
     node_counts: Option<&std::collections::HashMap<u16, u64>>,
 ) {
     const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    // `ShardPool::open_internal` restores the highest occupied slot as its
+    // append destination. Mirror that recovery rule here without opening a
+    // writer just to render an inspection table.
+    let active_slot = shard_entries.iter().map(|(slot, _, _)| *slot).max();
 
     println!(
-        "{:>6}  {:>18}  {:>10}  {:>8}  {:>8}  {:>10}  {:>6}",
-        "slot", "epoch", "bytes", "nodes", "writes", "written", "syncs"
+        "{:>6}  {:>18}  {:>10}  {:>8}  {:>14}  {:>15}  {:>6}",
+        "slot", "rotation", "bytes", "nodes", "mileage (MB)", "mileage (IOPs)", "syncs",
     );
     for &(slot_id, epoch, file_bytes) in shard_entries {
         let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
@@ -426,13 +435,20 @@ fn print_shard_table(
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
-            "{:>6}  {:>18}  {:>10}  {:>8}  {:>8}  {:>10}  {:>6}",
-            slot_id,
+            "{:>6}  {:>18}  {:>10}  {:>8}  {:>14}  {:>15}  {:>6}",
+            format!(
+                "{slot_id}{}",
+                if active_slot == Some(slot_id) {
+                    "*"
+                } else {
+                    " "
+                }
+            ),
             format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
             nodes,
-            wc,
             fmt_bytes(bw),
+            wc,
             sc,
         );
     }
@@ -558,19 +574,20 @@ fn matrix_room_details(
 fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let base_dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
     let pool = ShardPool::open_read_only(base_dir.into()).context("failed to open shard store")?;
-    let shard = if let Some(epoch) = selector
+    let shard = if let Some(rotation) = selector
         .strip_prefix("0x")
         .or_else(|| selector.strip_prefix("0X"))
     {
-        let epoch = u64::from_str_radix(epoch, 16).context("invalid hexadecimal shard epoch")?;
+        let rotation =
+            u64::from_str_radix(rotation, 16).context("invalid hexadecimal shard rotation")?;
         pool.all_shards()
             .into_iter()
-            .find_map(|(_, shard)| (shard.epoch == epoch).then_some(shard))
-            .with_context(|| format!("shard epoch {selector} not found"))?
+            .find_map(|(_, shard)| (shard.epoch == rotation).then_some(shard))
+            .with_context(|| format!("shard rotation {selector} not found"))?
     } else {
         let slot = selector
             .parse::<u16>()
-            .context("shard slot must be a decimal u16 or a 0x-prefixed epoch")?;
+            .context("shard slot must be a decimal u16 or a 0x-prefixed rotation")?;
         pool.get_shard(slot)
             .with_context(|| format!("shard slot {slot} not found"))?
     };
@@ -746,13 +763,15 @@ fn event_id(value: &OwnedValue) -> Option<&str> {
 fn cmd_repack(
     cli: &Cli,
     room: Option<&str>,
-    shard: Option<u16>,
+    shards: &[String],
+    all: bool,
     roots: &[String],
     topo: bool,
 ) -> anyhow::Result<()> {
-    let target = match (room, shard) {
-        (Some(room), None) => RepackTarget::Room(parse_room_id(room)?),
-        (None, Some(shard_id)) => RepackTarget::Shard(shard_id),
+    let target = match (room, shards.is_empty(), all) {
+        (Some(room), true, false) => RepackTarget::Room(parse_room_id(room)?),
+        (None, false, false) => RepackTarget::Shards(parse_shard_selectors(shards)?),
+        (None, true, true) => RepackTarget::All,
         // Clap rejects the both-targets case through `conflicts_with`; this
         // branch gives the missing-target case a readable diagnostic.
         _ => {
@@ -763,8 +782,8 @@ fn cmd_repack(
     };
 
     if !roots.is_empty() {
-        match target {
-            RepackTarget::Shard(_) => {
+        match &target {
+            RepackTarget::Shards(_) | RepackTarget::All => {
                 bail!(
                     "--root requires --room — live roots are per-room, not meaningful for --shard"
                 );
@@ -784,7 +803,7 @@ fn cmd_repack(
     } else {
         println!("warning: --topo without --root means no GC; all records preserved");
     }
-    cmd_repack_target(cli, target, topo)
+    cmd_repack_target(cli, &target, topo)
 }
 
 /// Compacts every shard transitively touched by rooms referencing
@@ -817,37 +836,98 @@ struct RepackPreview {
     shards: Vec<u16>,
 }
 
-#[derive(Clone, Copy)]
 enum RepackTarget {
     Room([u8; 16]),
-    Shard(u16),
+    Shards(Vec<u16>),
+    All,
+}
+
+/// Parse decimal shard slots and inclusive `START-END` ranges, returning an
+/// ordered deduplicated set so overlapping selections are repacked once.
+fn parse_shard_selectors(selectors: &[String]) -> anyhow::Result<Vec<u16>> {
+    let mut slots = std::collections::BTreeSet::new();
+    for selector in selectors {
+        let (start, end) = if let Some((start, end)) = selector.split_once('-') {
+            if start.is_empty() || end.is_empty() || end.contains('-') {
+                bail!("invalid shard range `{selector}`; use decimal START-END");
+            }
+            let start = start
+                .parse::<u16>()
+                .with_context(|| format!("invalid shard range start `{start}`"))?;
+            let end = end
+                .parse::<u16>()
+                .with_context(|| format!("invalid shard range end `{end}`"))?;
+            if start > end {
+                bail!("invalid shard range `{selector}`; start exceeds end");
+            }
+            (start, end)
+        } else {
+            let slot = selector.parse::<u16>().with_context(|| {
+                format!("invalid shard slot `{selector}`; use decimal slots or START-END ranges")
+            })?;
+            (slot, slot)
+        };
+        slots.extend(start..=end);
+    }
+    Ok(slots.into_iter().collect())
 }
 
 fn resolve_repack_target(
     store: &PackfileStorage,
-    target: RepackTarget,
+    target: &RepackTarget,
 ) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
     match target {
         RepackTarget::Room(room_id) => {
-            if store.room_index_info(&room_id).is_none() {
-                bail!("room {} not found", hex_encode(&room_id));
+            if store.room_index_info(room_id).is_none() {
+                bail!("room {} not found", hex_encode(room_id));
             }
-            Ok((vec![room_id], store.room_referenced_shards(&room_id)))
+            Ok((vec![*room_id], store.room_referenced_shards(room_id)))
         }
-        RepackTarget::Shard(shard_id) => Ok(store.repack_closure(shard_id)?),
+        RepackTarget::Shards(shard_ids) => resolve_repack_shards(store, shard_ids),
+        RepackTarget::All => {
+            let shard_ids = store
+                .shard_summaries()
+                .into_iter()
+                .map(|summary| summary.shard_id)
+                .collect::<Vec<_>>();
+            resolve_repack_shards(store, &shard_ids)
+        }
     }
+}
+
+fn resolve_repack_shards(
+    store: &PackfileStorage,
+    shard_ids: &[u16],
+) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
+    let mut rooms = std::collections::BTreeSet::new();
+    let mut shards = std::collections::BTreeSet::new();
+    for shard_id in shard_ids {
+        let (closure_rooms, closure_shards) = store.repack_closure(*shard_id)?;
+        rooms.extend(closure_rooms);
+        shards.extend(closure_shards);
+    }
+    Ok((rooms.into_iter().collect(), shards.into_iter().collect()))
 }
 
 fn repack_preview(
     cli: &Cli,
-    target: RepackTarget,
+    target: &RepackTarget,
     topo: bool,
 ) -> anyhow::Result<Option<RepackPreview>> {
     let preview_store = open_store_read_only(cli)?;
     let (rooms, shards) = resolve_repack_target(&preview_store, target)?;
     if rooms.is_empty() {
-        if let RepackTarget::Shard(shard_id) = target {
-            println!("no rooms reference shard {shard_id}");
+        match target {
+            RepackTarget::Shards(shard_ids) => {
+                let slots = shard_ids
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("no rooms reference selected shards: {slots}");
+            }
+            RepackTarget::All => println!("no rooms found in active shards"),
+            RepackTarget::Room(_) => {}
         }
         return Ok(None);
     }
@@ -926,7 +1006,8 @@ fn repack_rooms(
     topo: bool,
 ) -> anyhow::Result<(usize, usize)> {
     let mut results = Vec::with_capacity(rooms.len());
-    for room_id in rooms {
+    let mut total_kept = 0_usize;
+    for (position, room_id) in rooms.iter().enumerate() {
         let (kept, dropped) = if topo {
             store.repack_room_reachable(room_id, extract_matrix_edges)?
         } else {
@@ -937,6 +1018,18 @@ fn repack_rooms(
             hex_encode(room_id)
         );
         results.push((kept, dropped));
+        total_kept = total_kept
+            .checked_add(kept)
+            .context("repack progress node count overflow")?;
+        if rooms.len() > 1 {
+            let completed = position
+                .checked_add(1)
+                .context("repack progress room count overflow")?;
+            println!(
+                "finished {completed} rooms [{total_kept} nodes] {completed}/{} done",
+                rooms.len()
+            );
+        }
     }
     let (final_kept, final_dropped) = results
         .iter()
@@ -950,7 +1043,7 @@ fn repack_rooms(
     Ok((final_kept, final_dropped))
 }
 
-fn cmd_repack_target(cli: &Cli, target: RepackTarget, topo: bool) -> anyhow::Result<()> {
+fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Result<()> {
     let Some(preview) = repack_preview(cli, target, topo)? else {
         return Ok(());
     };

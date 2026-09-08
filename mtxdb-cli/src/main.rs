@@ -35,7 +35,8 @@ pub(crate) enum Commands {
     },
     Repack {
         room: Option<String>,
-        shard: Option<u16>,
+        shards: Vec<String>,
+        all: bool,
         root: Vec<String>,
         topo: bool,
     },
@@ -83,7 +84,7 @@ fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("shards")
-                .about("List open shard slots with size, epoch, and IO/sync stats"),
+                .about("List open shard slots with size, rotation, and IO/sync stats"),
         )
         .subcommand(Command::new("rooms").about("List rooms in the store"))
         .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
@@ -108,7 +109,7 @@ fn build_cli() -> Command {
                     Arg::new("shard")
                         .required(true)
                         .value_name("SLOT | EPOCH")
-                        .help("Decimal shard slot or 0x-prefixed shard epoch from `shards`"),
+                        .help("Decimal shard slot or 0x-prefixed shard rotation from `shards`"),
                 ),
         )
         .subcommand(
@@ -159,8 +160,16 @@ fn sub_repack() -> Command {
                 .short('s')
                 .long("shard")
                 .conflicts_with("room")
-                .value_parser(clap::value_parser!(u16))
-                .help("Repack every room still referencing this shard id"),
+                .num_args(1..)
+                .value_name("SLOT | START-END")
+                .help("Repack rooms referencing shard slots (for example: -s 0 1 2 or -s 0-3)"),
+        )
+        .arg(
+            Arg::new("all")
+                .long("all")
+                .conflicts_with_all(["room", "shard"])
+                .action(ArgAction::SetTrue)
+                .help("Repack every room in every active shard"),
         )
         .arg(Arg::new("root").short('o').long("root").num_args(1..))
         .arg(
@@ -248,7 +257,13 @@ fn parse_cli() -> Cli {
         },
         Some(("repack", m)) => Commands::Repack {
             room: m.get_one::<String>("room").cloned(),
-            shard: m.get_one::<u16>("shard").copied(),
+            shards: m
+                .get_many::<String>("shard")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            all: m.get_flag("all"),
             root: m
                 .get_many::<String>("root")
                 .into_iter()
