@@ -30,7 +30,7 @@ pub(crate) enum Commands {
         shard: String,
     },
     Import {
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         room: Option<String>,
     },
     Repack {
@@ -133,8 +133,9 @@ fn sub_import() -> Command {
         .arg(
             Arg::new("path")
                 .required(true)
+                .num_args(1..)
                 .value_name("FILE")
-                .help("Matrix federation JSON document or JSONL event stream"),
+                .help("Matrix federation JSON documents or JSONL event streams"),
         )
         .arg(
             Arg::new("room")
@@ -226,7 +227,11 @@ fn parse_cli() -> Cli {
             shard: m.get_one::<String>("shard").unwrap().clone(),
         },
         Some(("import", m)) => Commands::Import {
-            path: PathBuf::from(m.get_one::<String>("path").unwrap()),
+            paths: m
+                .get_many::<String>("path")
+                .unwrap()
+                .map(PathBuf::from)
+                .collect(),
             room: m.get_one::<String>("room").cloned(),
         },
         Some(("repack", m)) => Commands::Repack {

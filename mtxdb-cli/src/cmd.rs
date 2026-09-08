@@ -98,7 +98,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Shards => cmd_shards(cli),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { shard } => cmd_scan(cli, shard),
-        Commands::Import { path, room } => cmd_import(cli, path, room.as_deref()),
+        Commands::Import { paths, room } => cmd_import(cli, paths, room.as_deref()),
         Commands::Repack {
             room,
             shard,
@@ -463,7 +463,18 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Result<()> {
+fn cmd_import(
+    cli: &Cli,
+    paths: &[std::path::PathBuf],
+    room_override: Option<&str>,
+) -> anyhow::Result<()> {
+    for path in paths {
+        cmd_import_file(cli, path, room_override)?;
+    }
+    Ok(())
+}
+
+fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Result<()> {
     let content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let is_jsonl = path
         .extension()
