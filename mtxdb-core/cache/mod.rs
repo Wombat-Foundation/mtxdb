@@ -297,11 +297,11 @@ impl NodeCache {
 
 /// A pinned set of nodes that are never evicted.
 ///
-/// Represents the top two levels of a room's HAMT trie:
+/// Represents the top two levels of a collection's HAMT trie:
 /// - Level 0: 1 node (the root)
 /// - Level 1: up to 32 nodes
 ///
-/// Total: ~33 nodes, ~17KB per room.
+/// Total: ~33 nodes, ~17KB per collection.
 pub struct PinnedNodes {
     nodes: RwLock<HashMap<NodeId, Arc<NodeData>>>,
 }

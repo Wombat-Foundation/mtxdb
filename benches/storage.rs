@@ -53,7 +53,7 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-// ── Synthetic Matrix room DAG generator ─────────────────────────────
+// ── Synthetic Matrix room DAG generator ───────────────────────────────────
 
 struct DagGenerator {
     prev_events: Vec<Vec<usize>>,
@@ -92,7 +92,7 @@ impl DagGenerator {
             prev.extend(extra_prevs);
             prev_events.push(prev);
 
-            // Reference the room's create event plus one other, more
+            // Reference the collection's create event plus one other, more
             // recently-rotated pool member (e.g. current power levels).
             let recent = auth_pool[rng.next_u64() as usize % auth_pool.len()];
             auth_events.push(vec![auth_pool[0], recent]);
@@ -318,7 +318,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     let pack_size = pack_dir_size(&dir);
 
     // ── Clear cache to force packfile re-reads ──
-    store.room_cache(&ROOM).clear();
+    store.collection_cache(&ROOM).clear();
 
     // ── Cold read phase: backward traversal simulating /sync, cache empty ──
     let io_before = IoStats::read_now();
@@ -338,8 +338,8 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
         }
     }
 
-    let cold_hits = store.room_cache(&ROOM).hits();
-    let cold_misses = store.room_cache(&ROOM).misses();
+    let cold_hits = store.collection_cache(&ROOM).hits();
+    let cold_misses = store.collection_cache(&ROOM).misses();
 
     let read_elapsed = t_read.elapsed();
     let io_after = IoStats::read_now();
@@ -377,8 +377,8 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     // this size buys nothing on a single full scan; only cross-request
     // temporal locality — e.g. repeated /sync of the same recent range —
     // would benefit, which this harness does not model). ──
-    let hits_before_warm = store.room_cache(&ROOM).hits();
-    let misses_before_warm = store.room_cache(&ROOM).misses();
+    let hits_before_warm = store.collection_cache(&ROOM).hits();
+    let misses_before_warm = store.collection_cache(&ROOM).misses();
     let t_warm = Instant::now();
 
     let mut warm_found = 0u64;
@@ -389,8 +389,8 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     }
 
     let warm_elapsed = t_warm.elapsed();
-    let warm_hits = store.room_cache(&ROOM).hits() - hits_before_warm;
-    let warm_misses = store.room_cache(&ROOM).misses() - misses_before_warm;
+    let warm_hits = store.collection_cache(&ROOM).hits() - hits_before_warm;
+    let warm_misses = store.collection_cache(&ROOM).misses() - misses_before_warm;
     let warm_total = warm_hits + warm_misses;
     let warm_hit_rate = if warm_total > 0 {
         (warm_hits as f64 / warm_total as f64) * 100.0
@@ -488,7 +488,7 @@ fn l1_owner(as_of: u64, bucket: u64) -> u64 {
 enum Intent {
     /// Fetching an event purely to extract its prev/auth routing.
     GraphWalk,
-    /// Fetching a HAMT node to navigate the room state trie.
+    /// Fetching a HAMT node to navigate the collection state trie.
     StateTrie,
     /// Fetching an event because its JSON body is actually needed.
     Timeline,
@@ -626,7 +626,7 @@ fn run_intent_benchmark(total_events: usize) {
         )
         .unwrap();
 
-    store.room_cache(&ROOM).clear();
+    store.collection_cache(&ROOM).clear();
     let inst = InstrumentedStorage::new(store);
 
     // Reconcile 2+ divergent tips, the way state-res v2 actually shapes
@@ -729,11 +729,11 @@ fn run_intent_benchmark(total_events: usize) {
 //
 // PackfileStorage::put() never triggers automatic repacks — repack is
 // purely caller-invoked (repack_room_reachable). This benchmark never
-// calls it, so the room's packfile grows monotonically in arrival order.
+// calls it, so the collection's packfile grows monotonically in arrival order.
 // That makes the real threat model here
 // "random-offset reads into a large, cold, ever-growing file", not "did
 // this survive a repack". This scenario measures whether an attacker
-// choosing reaction targets from the OLDEST part of a room's history
+// choosing reaction targets from the OLDEST part of a collection's history
 // (the furthest possible physical offset from the write head) costs more
 // than organic reactions to RECENT messages, and whether the sort-then-read
 // fix in get_many (Part 3) narrows that gap.
@@ -753,7 +753,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
-    // A long, mostly-linear room history — the base messages that will be
+    // A long, mostly-linear collection history — the base messages that will be
     // reacted to. Low fork probability: this is about history depth, not
     // fork/join shape (that's what run_intent_benchmark covers).
     let dag = DagGenerator::generate(history_len, 0.02, 50);
@@ -810,7 +810,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
                       targets: &[NodeId],
                       f: &dyn Fn(&[NodeId]) -> usize|
      -> Row {
-        store.room_cache(&ROOM).clear();
+        store.collection_cache(&ROOM).clear();
         drop_caches_for_dir(&dir);
         let io_before = IoStats::read_now();
         let t = Instant::now();
@@ -903,7 +903,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
 // repack_room_reachable's live-set/adjacency construction is inherently
 // deduplicated (derived from a hash-keyed map, not a raw per-occurrence
 // Vec), so this exponential blowup does not apply to it. Calling it here
-// with no live roots configured still repacks the *entire* room on every
+// with no live roots configured still repacks the *entire* collection on every
 // cycle (nothing is known to be garbage), which is the legitimate O(n^2)
 // case the original comment intended:
 //
@@ -921,7 +921,7 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
     fs::create_dir_all(&dir).unwrap();
 
     let store = PackfileStorage::open_with_cache(dir.clone(), 2000).unwrap();
-    let room_id = [0x99; 16];
+    let collection_id = [0x99; 16];
 
     let mut total_repack_time = std::time::Duration::ZERO;
     let mut repack_count = 0;
@@ -937,13 +937,13 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
         x = x ^ (x >> 31);
         id[..8].copy_from_slice(&x.to_le_bytes());
         let data = NodeData::new(bytes::Bytes::from(format!("repack payload {i}")));
-        store.put(&room_id, &id, &data).unwrap();
+        store.put(&collection_id, &id, &data).unwrap();
 
         // Simulate an external GC worker polling and triggering repack.
         if (i + 1) % repack_interval == 0 {
             let t_repack = Instant::now();
             store
-                .repack_room_reachable(&room_id, |_hash, _data| Vec::new())
+                .repack_room_reachable(&collection_id, |_hash, _data| Vec::new())
                 .unwrap();
             total_repack_time += t_repack.elapsed();
             repack_count += 1;
@@ -962,7 +962,7 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
     eprintln!("  that's the O(n^2) full-rewrite cost, empirically, not just argued.");
     eprintln!();
 
-    store.delete_room(&room_id).unwrap();
+    store.delete_room(&collection_id).unwrap();
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }

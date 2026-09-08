@@ -19,7 +19,7 @@ const DB_META_FILENAME: &str = "db.meta";
 pub enum ShardType {
     /// HAMT nodes, roots, and state-group sidecars.
     State,
-    /// Event JSON plus room-DAG-oriented event data.
+    /// Event JSON plus collection-DAG-oriented event data.
     EventDag,
     /// Auth-chain manifests and their closure traversal data.
     AuthChain,

@@ -46,7 +46,7 @@ impl FrontierBatch {
 ///
 /// # Arguments
 /// * `engine` - The storage engine to read from.
-/// * `room_id` - The room whose index and packfiles to search.
+/// * `collection_id` - The collection whose index and packfiles to search.
 /// * `batch` - The frontier batch with hashes to fetch.
 ///
 /// # Returns
@@ -56,10 +56,10 @@ impl FrontierBatch {
 /// Returns `StorageError::Io` on I/O failure from the storage engine.
 pub fn fetch_frontier_batch<S: StorageEngine>(
     engine: &S,
-    room_id: &[u8; 16],
+    collection_id: &[u8; 16],
     batch: &FrontierBatch,
 ) -> Result<Vec<(NodeId, Option<NodeData>)>, crate::storage::StorageError> {
-    let results = engine.get_many(room_id, &batch.hashes)?;
+    let results = engine.get_many(collection_id, &batch.hashes)?;
 
     Ok(batch
         .hashes
@@ -80,10 +80,10 @@ pub fn fetch_frontier_batch<S: StorageEngine>(
 /// Returns `StorageError::Io` on I/O failure from the storage engine.
 pub fn fetch_frontier_concurrent<S: StorageEngine>(
     engine: &S,
-    room_id: &[u8; 16],
+    collection_id: &[u8; 16],
     batch: &FrontierBatch,
 ) -> Result<Vec<(NodeId, Option<NodeData>)>, crate::storage::StorageError> {
-    fetch_frontier_batch(engine, room_id, batch)
+    fetch_frontier_batch(engine, collection_id, batch)
 }
 
 /// A BFS layer of the HAMT trie traversal.
@@ -213,27 +213,27 @@ mod tests {
         use crate::storage::InMemoryStorage;
 
         let engine = InMemoryStorage::new();
-        let room = [0x01; 16];
+        let collection = [0x01; 16];
         let id1 = [1u8; 16];
         let id2 = [2u8; 16];
 
         engine
             .put(
-                &room,
+                &collection,
                 &id1,
                 &NodeData::new(bytes::Bytes::from_static(b"node1")),
             )
             .unwrap();
         engine
             .put(
-                &room,
+                &collection,
                 &id2,
                 &NodeData::new(bytes::Bytes::from_static(b"node2")),
             )
             .unwrap();
 
         let batch = FrontierBatch::new(vec![id1, id2, [3u8; 16]]); // id3 not in store
-        let results = fetch_frontier_concurrent(&engine, &room, &batch).unwrap();
+        let results = fetch_frontier_concurrent(&engine, &collection, &batch).unwrap();
 
         assert_eq!(results.len(), 3);
         assert!(results[0].1.is_some());

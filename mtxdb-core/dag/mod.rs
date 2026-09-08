@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-/// Dense local ID for a room. No single room exceeds 2^31 events.
+/// Dense local ID for a collection. No single collection exceeds 2^31 events.
 pub type LocalId = u32;
 
 /// A compressed sparse row (CSR) arena for the active event DAG.
@@ -9,7 +9,7 @@ pub type LocalId = u32;
 /// Events and their edges arrive sequentially, building contiguously.
 ///
 /// Design from docs:
-/// - Two heap allocations per room: `nodes` Vec and `edges` Vec.
+/// - Two heap allocations per collection: `nodes` Vec and `edges` Vec.
 /// - Edges of a node are contiguous in the `edges` array (cache line).
 /// - O(1) drop: `nodes.clear()` + `edges.clear()`.
 /// - No self-referential structs (compiles in safe Rust).
@@ -95,7 +95,7 @@ impl GraphEdge {
 pub struct EventNode {
     /// Global short event ID.
     pub short_id: u64,
-    /// Dense local ID within this room.
+    /// Dense local ID within this collection.
     pub local_id: LocalId,
     /// Range into the edges array for `prev_events`: (start, len).
     pub prev: (u32, u32),
@@ -103,20 +103,20 @@ pub struct EventNode {
     pub auth: (u32, u32),
 }
 
-/// CSR arena for an active room's event DAG.
+/// CSR arena for an active collection's event DAG.
 ///
-/// Contains all events loaded for an active room, with edges stored
+/// Contains all events loaded for an active collection, with edges stored
 /// contiguously in a single Vec. Graph algorithms like topological
 /// sort are linear scans over this array.
 #[derive(Debug)]
 pub struct ActiveRoomFrontier {
-    /// All event nodes in the room.
+    /// All event nodes in the collection.
     pub nodes: Vec<EventNode>,
     /// Contiguous edge storage. Edges for a node are at `edges[start..start+len]`.
     pub edges: Vec<GraphEdge>,
     /// Maps global `short_id` → index into nodes Vec.
     pub resident: HashMap<u64, u32>,
-    /// Maps global `short_id` → dense `local_id` for this room.
+    /// Maps global `short_id` → dense `local_id` for this collection.
     pub id_remap: HashMap<u64, LocalId>,
     /// Next `local_id` to assign.
     next_local_id: LocalId,
@@ -234,7 +234,7 @@ impl ActiveRoomFrontier {
         &self.edges[start..end]
     }
 
-    /// Drop all data for this room. O(1) — replaces backing stores
+    /// Drop all data for this collection. O(1) — replaces backing stores
     /// with empty containers; the old data is dropped when the returned
     /// values go out of scope.
     pub fn clear(&mut self) {
@@ -245,13 +245,13 @@ impl ActiveRoomFrontier {
         self.next_local_id = 0;
     }
 
-    /// Number of events in this room's frontier.
+    /// Number of events in this collection's frontier.
     #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    /// Returns `true` if this room's frontier has no events.
+    /// Returns `true` if this collection's frontier has no events.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()

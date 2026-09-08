@@ -72,55 +72,60 @@ impl NodeRef {
 /// The storage engine trait. Abstracts the backend so the packfile,
 /// index, cache, and frontier code don't depend on a specific engine.
 ///
-/// Every operation is scoped to a single room. The caller always knows
-/// which room a node belongs to; the engine uses this to select the
-/// correct per-room index and packfile, keeping each room's active index
-/// at ~8KB (100 active rooms < 1MB total).
+/// Every operation is scoped to a single collection. The caller always knows
+/// which collection a node belongs to; the engine uses this to select the
+/// correct per-collection index and packfile, keeping each collection's active index
+/// at ~8KB (100 active collections < 1MB total).
 ///
 /// Implementations:
 /// - `PackfileStorage`: the custom append-only packfile with lossy index.
 /// - `InMemoryStorage`: for tests.
 pub trait StorageEngine: Send + Sync {
-    /// Fetch a single node by its structural hash within a room.
+    /// Fetch a single node by its structural hash within a collection.
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError>;
+    fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError>;
 
-    /// Fetch multiple nodes by their structural hashes within a room.
+    /// Fetch multiple nodes by their structural hashes within a collection.
     /// Returns results in the same order as the input keys.
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
     fn get_many(
         &self,
-        room_id: &[u8; 16],
+        collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError>;
 
-    /// Store a new node within a room. The caller must ensure the node
+    /// Store a new node within a collection. The caller must ensure the node
     /// is not already present (content-addressed: identical data produces
     /// identical hash).
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn put(&self, room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError>;
+    fn put(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+    ) -> Result<(), StorageError>;
 
-    /// Store multiple new nodes in a single batch within a room.
+    /// Store multiple new nodes in a single batch within a collection.
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
     fn put_many(
         &self,
-        room_id: &[u8; 16],
+        collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<(), StorageError>;
 
-    /// Delete all nodes for a given room (range delete).
+    /// Delete all nodes for a given collection (range delete).
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn delete_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError>;
+    fn delete_room(&self, collection_id: &[u8; 16]) -> Result<(), StorageError>;
 
     /// Sync to disk (fsync).
     ///
@@ -173,10 +178,10 @@ impl From<std::io::Error> for StorageError {
 
 /// In-memory storage engine for tests.
 ///
-/// Partitions nodes by room. Each room's nodes are tracked in a
-/// per-room `HashMap`, enabling correct `delete_room` behavior.
+/// Partitions nodes by collection. Each collection's nodes are tracked in a
+/// per-collection `HashMap`, enabling correct `delete_room` behavior.
 pub struct InMemoryStorage {
-    rooms: RwLock<HashMap<[u8; 16], HashMap<NodeId, NodeData>>>,
+    collections: RwLock<HashMap<[u8; 16], HashMap<NodeId, NodeData>>>,
 }
 
 impl InMemoryStorage {
@@ -184,7 +189,7 @@ impl InMemoryStorage {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            rooms: RwLock::new(HashMap::new()),
+            collections: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -196,28 +201,35 @@ impl Default for InMemoryStorage {
 }
 
 impl StorageEngine for InMemoryStorage {
-    fn get(&self, room_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        let rooms = self.rooms.read();
-        Ok(rooms.get(room_id).and_then(|r| r.get(id).cloned()))
+    fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        let collections = self.collections.read();
+        Ok(collections
+            .get(collection_id)
+            .and_then(|r| r.get(id).cloned()))
     }
 
     fn get_many(
         &self,
-        room_id: &[u8; 16],
+        collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        let rooms = self.rooms.read();
-        let room = rooms.get(room_id);
+        let collections = self.collections.read();
+        let collection = collections.get(collection_id);
         Ok(ids
             .iter()
-            .map(|id| room.and_then(|r| r.get(id).cloned()))
+            .map(|id| collection.and_then(|r| r.get(id).cloned()))
             .collect())
     }
 
-    fn put(&self, room_id: &[u8; 16], id: &NodeId, data: &NodeData) -> Result<(), StorageError> {
-        self.rooms
+    fn put(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+    ) -> Result<(), StorageError> {
+        self.collections
             .write()
-            .entry(*room_id)
+            .entry(*collection_id)
             .or_default()
             .insert(*id, data.clone());
         Ok(())
@@ -225,19 +237,19 @@ impl StorageEngine for InMemoryStorage {
 
     fn put_many(
         &self,
-        room_id: &[u8; 16],
+        collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<(), StorageError> {
-        let mut rooms = self.rooms.write();
-        let room = rooms.entry(*room_id).or_default();
+        let mut collections = self.collections.write();
+        let collection = collections.entry(*collection_id).or_default();
         for (id, data) in entries {
-            room.insert(*id, data.clone());
+            collection.insert(*id, data.clone());
         }
         Ok(())
     }
 
-    fn delete_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
-        self.rooms.write().remove(room_id);
+    fn delete_room(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        self.collections.write().remove(collection_id);
         Ok(())
     }
 
@@ -252,7 +264,7 @@ mod tests {
     use super::*;
     use std::error::Error;
 
-    const TEST_ROOM: [u8; 16] = [0x01; 16];
+    const TEST_COLLECTION: [u8; 16] = [0x01; 16];
 
     #[test]
     fn test_in_memory_roundtrip() {
@@ -260,15 +272,15 @@ mod tests {
         let id = [0x42u8; 16];
         let data = NodeData::new(bytes::Bytes::from_static(b"test node data"));
 
-        store.put(&TEST_ROOM, &id, &data).unwrap();
-        let fetched = store.get(&TEST_ROOM, &id).unwrap().unwrap();
+        store.put(&TEST_COLLECTION, &id, &data).unwrap();
+        let fetched = store.get(&TEST_COLLECTION, &id).unwrap().unwrap();
         assert_eq!(fetched.bytes, data.bytes);
     }
 
     #[test]
     fn test_in_memory_not_found() {
         let store = InMemoryStorage::new();
-        assert!(store.get(&TEST_ROOM, &[0x00; 16]).unwrap().is_none());
+        assert!(store.get(&TEST_COLLECTION, &[0x00; 16]).unwrap().is_none());
     }
 
     #[test]
@@ -282,10 +294,10 @@ mod tests {
             })
             .collect();
 
-        store.put_many(&TEST_ROOM, &entries).unwrap();
+        store.put_many(&TEST_COLLECTION, &entries).unwrap();
 
         let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
-        let results = store.get_many(&TEST_ROOM, &ids).unwrap();
+        let results = store.get_many(&TEST_COLLECTION, &ids).unwrap();
         assert_eq!(results.len(), 10);
         for (i, result) in results.iter().enumerate() {
             assert!(result.is_some());
@@ -356,7 +368,7 @@ mod tests {
     #[test]
     fn test_in_memory_default() {
         let store = InMemoryStorage::default();
-        assert!(store.get(&TEST_ROOM, &[0; 16]).unwrap().is_none());
+        assert!(store.get(&TEST_COLLECTION, &[0; 16]).unwrap().is_none());
     }
 
     #[test]
@@ -365,14 +377,14 @@ mod tests {
         let id = [0x42u8; 16];
         store
             .put(
-                &TEST_ROOM,
+                &TEST_COLLECTION,
                 &id,
                 &NodeData::new(bytes::Bytes::from_static(b"d")),
             )
             .unwrap();
-        assert!(store.get(&TEST_ROOM, &id).unwrap().is_some());
-        store.delete_room(&TEST_ROOM).unwrap();
-        assert!(store.get(&TEST_ROOM, &id).unwrap().is_none());
+        assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
+        store.delete_room(&TEST_COLLECTION).unwrap();
+        assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_none());
         store.sync().unwrap();
     }
 }

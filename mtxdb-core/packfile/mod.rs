@@ -20,7 +20,7 @@ pub const MAGIC: [u8; 4] = *b"MTDB";
 pub const VERSION: u8 = 0x04;
 
 /// Total reserved header size in bytes: every shard file's first record
-/// starts at exactly this offset. One 4KiB page — ample room for the
+/// starts at exactly this offset. One 4KiB page — ample collection for the
 /// descriptor fields plus future growth, with no benefit to a larger
 /// reservation (see [`write_header`] for the field layout).
 pub const HEADER_LEN: usize = 4096;
@@ -68,14 +68,14 @@ pub(crate) const FLAG_COMPRESSED: u8 = 0x01;
 
 /// Byte length of the fixed part of a v3 frame's payload, i.e. everything
 /// between the length prefix and the node bytes: 1-byte flags + 4-byte
-/// `uncompressed_len` + 16-byte `room_id` + 16-byte `hash`.
+/// `uncompressed_len` + 16-byte `collection_id` + 16-byte `hash`.
 pub(crate) const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
 
 /// Maximum plaintext node payload in one frame. This is lower than
 /// [`MAX_RECORD_LEN`] because the fixed v3 frame fields consume space too.
 pub const MAX_DATA_LEN: u32 = MAX_RECORD_LEN - FRAME_FIXED_LEN;
 
-/// A scanned `(room_id, hash, file_offset)` entry from a packfile.
+/// A scanned `(collection_id, hash, file_offset)` entry from a packfile.
 pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 
 /// A single record in the packfile.
@@ -85,10 +85,10 @@ pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 /// [u32 len]              — byte length of everything below down to (not including) crc32, little-endian
 /// [u8 flags]             — bit 0: node bytes are zstd-compressed
 /// [u32 uncompressed_len] — plaintext length of `data`; equals the node bytes' own length when flags == 0
-/// [16-byte room_id]      — room this record belongs to (for shard scan recovery)
+/// [16-byte collection_id]      — collection this record belongs to (for shard scan recovery)
 /// [16-byte hash]         — structural hash (index-rebuild metadata only, NOT for verification)
 /// [node bytes]           — opaque node payload, zstd-compressed iff flags bit 0 is set
-/// [u32 crc32]            — CRC32 covering len + flags + uncompressed_len + room_id + hash + node_bytes
+/// [u32 crc32]            — CRC32 covering len + flags + uncompressed_len + collection_id + hash + node_bytes
 /// ```
 ///
 /// A frame is only ever written compressed when doing so makes it
@@ -103,8 +103,8 @@ pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 /// decompressor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    /// The room this record belongs to.
-    pub room_id: [u8; 16],
+    /// The collection this record belongs to.
+    pub collection_id: [u8; 16],
     /// The structural hash framed alongside the record (index-rebuild metadata only).
     pub hash: [u8; 16],
     /// The opaque node payload.
@@ -199,17 +199,17 @@ pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64>
     writer.write_all(&frame_len.to_le_bytes())?;
     writer.write_all(&[flags])?;
     writer.write_all(&uncompressed_len.to_le_bytes())?;
-    writer.write_all(&record.room_id)?;
+    writer.write_all(&record.collection_id)?;
     writer.write_all(&record.hash)?;
     writer.write_all(node_bytes)?;
 
-    // CRC covers len + flags + uncompressed_len + room_id + hash + node_bytes,
+    // CRC covers len + flags + uncompressed_len + collection_id + hash + node_bytes,
     // i.e. the bytes as written to disk (compressed, when compressed).
     let mut crc = crc32fast::Hasher::new();
     crc.update(&frame_len.to_le_bytes());
     crc.update(&[flags]);
     crc.update(&uncompressed_len.to_le_bytes());
-    crc.update(&record.room_id);
+    crc.update(&record.collection_id);
     crc.update(&record.hash);
     crc.update(node_bytes);
     let checksum = crc.finalize();
@@ -275,8 +275,8 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
         ));
     }
     let uncompressed_len = u32::from_le_bytes(payload[1..5].try_into().unwrap());
-    let mut room_id = [0u8; 16];
-    room_id.copy_from_slice(&payload[5..21]);
+    let mut collection_id = [0u8; 16];
+    collection_id.copy_from_slice(&payload[5..21]);
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&payload[21..37]);
     let node_bytes = &payload[37..];
@@ -323,19 +323,19 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     };
 
     Ok(Some(Record {
-        room_id,
+        collection_id,
         hash,
         data,
     }))
 }
 
-/// A frame's `room_id`/`hash` metadata, without its node payload — what
+/// A frame's `collection_id`/`hash` metadata, without its node payload — what
 /// [`scan_packfile`]/[`scan_packfile_from`]/[`scan_and_recover_packfile`]
 /// actually need. See [`read_record_metadata`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordMetadata {
-    /// The room this record belongs to.
-    pub room_id: [u8; 16],
+    /// The collection this record belongs to.
+    pub collection_id: [u8; 16],
     /// The structural hash framed alongside the record.
     pub hash: [u8; 16],
 }
@@ -346,7 +346,7 @@ pub struct RecordMetadata {
 /// stay a stack buffer.
 const SCAN_DISCARD_BUF_LEN: usize = 8192;
 
-/// Read one frame's metadata (`room_id`, `hash`) without allocating,
+/// Read one frame's metadata (`collection_id`, `hash`) without allocating,
 /// decompressing, or otherwise materializing its node payload — the scan
 /// path's counterpart to [`read_record`], which fully decodes a frame for
 /// callers that actually need its data.
@@ -398,8 +398,8 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
             format!("unsupported record flags: {flags:#04x}"),
         ));
     }
-    let mut room_id = [0u8; 16];
-    room_id.copy_from_slice(&fixed[5..21]);
+    let mut collection_id = [0u8; 16];
+    collection_id.copy_from_slice(&fixed[5..21]);
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&fixed[21..37]);
 
@@ -433,7 +433,10 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
         ));
     }
 
-    Ok(Some(RecordMetadata { room_id, hash }))
+    Ok(Some(RecordMetadata {
+        collection_id,
+        hash,
+    }))
 }
 
 /// Write a new pack file's [`HEADER_LEN`]-byte reserved header: magic,
@@ -664,8 +667,8 @@ pub fn open_packfile(path: &Path, create: bool, pack_id: u64) -> io::Result<File
     }
 }
 
-/// Scan an existing packfile and return `(room_id, hash, offset)` entries.
-/// Used during startup to rebuild per-room indexes from shard files.
+/// Scan an existing packfile and return `(collection_id, hash, offset)` entries.
+/// Used during startup to rebuild per-collection indexes from shard files.
 ///
 /// Does **not** truncate the file — safe to call on an active shard while
 /// concurrent appends are landing. A torn tail (a crashed write that leaves
@@ -690,7 +693,7 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
         let offset = reader.stream_position()?;
         match read_record_metadata(&mut reader) {
             Ok(Some(meta)) => {
-                entries.push((meta.room_id, meta.hash, offset));
+                entries.push((meta.collection_id, meta.hash, offset));
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -743,7 +746,7 @@ pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<Scan
         let offset = reader.stream_position()?;
         match read_record_metadata(&mut reader) {
             Ok(Some(meta)) => {
-                entries.push((meta.room_id, meta.hash, offset));
+                entries.push((meta.collection_id, meta.hash, offset));
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -780,7 +783,7 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
         let offset = reader.stream_position()?;
         match read_record_metadata(&mut reader) {
             Ok(Some(meta)) => {
-                entries.push((meta.room_id, meta.hash, offset));
+                entries.push((meta.collection_id, meta.hash, offset));
                 last_valid_offset = reader.stream_position()?;
             }
             Ok(None) => break,
@@ -820,9 +823,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_record(room_id: [u8; 16], hash: [u8; 16], data: &[u8]) -> Record {
+    fn test_record(collection_id: [u8; 16], hash: [u8; 16], data: &[u8]) -> Record {
         Record {
-            room_id,
+            collection_id,
             hash,
             data: Bytes::copy_from_slice(data),
         }
@@ -839,7 +842,7 @@ mod tests {
 
     fn test_record_raw(hash: [u8; 16], data: &[u8]) -> Record {
         Record {
-            room_id: [0xAA; 16],
+            collection_id: [0xAA; 16],
             hash,
             data: Bytes::copy_from_slice(data),
         }
@@ -877,7 +880,7 @@ mod tests {
         assert_eq!(record, read);
     }
 
-    /// `read_record_metadata` must agree with `read_record` on `room_id`/`hash`
+    /// `read_record_metadata` must agree with `read_record` on `collection_id`/`hash`
     /// for both a compressed and a raw-fallback frame, without touching
     /// (or needing to decompress) the payload.
     #[test]
@@ -893,7 +896,7 @@ mod tests {
             let mut cursor = Cursor::new(&buf);
             let meta = read_record_metadata(&mut cursor).unwrap().unwrap();
 
-            assert_eq!(meta.room_id, full.room_id);
+            assert_eq!(meta.collection_id, full.collection_id);
             assert_eq!(meta.hash, full.hash);
         }
     }
@@ -913,7 +916,7 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         let meta = read_record_metadata(&mut cursor).unwrap().unwrap();
-        assert_eq!(meta.room_id, record.room_id);
+        assert_eq!(meta.collection_id, record.collection_id);
         assert_eq!(meta.hash, record.hash);
     }
 
@@ -931,7 +934,7 @@ mod tests {
 
         // Flip a byte inside the node-bytes region (right after the fixed
         // 37-byte header: len(4) + flags(1) + uncompressed_len(4) +
-        // room_id(16) + hash(16)).
+        // collection_id(16) + hash(16)).
         let corrupt_at = 4 + FRAME_FIXED_LEN as usize + 3;
         buf[corrupt_at] ^= 0xff;
 
@@ -984,7 +987,7 @@ mod tests {
         write_record(&mut buf, &record).unwrap();
 
         // Flip a byte in the node payload (after the fixed frame header:
-        // len(4) + flags(1) + uncompressed_len(4) + room_id(16) + hash(16))
+        // len(4) + flags(1) + uncompressed_len(4) + collection_id(16) + hash(16))
         buf[41] ^= 0xff;
 
         let mut cursor = Cursor::new(&buf);
@@ -1047,7 +1050,7 @@ mod tests {
     #[test]
     fn test_record_serialized_len() {
         let r = Record {
-            room_id: [0u8; 16],
+            collection_id: [0u8; 16],
             hash: [0u8; 16],
             data: Bytes::from_static(b"hello"),
         };
@@ -1057,7 +1060,7 @@ mod tests {
     #[test]
     fn test_write_record_payload_too_large() {
         let r = Record {
-            room_id: [0u8; 16],
+            collection_id: [0u8; 16],
             hash: [0u8; 16],
             data: Bytes::from(vec![0u8; MAX_RECORD_LEN as usize + 1]),
         };
@@ -1261,7 +1264,7 @@ mod tests {
         buf.extend_from_slice(&declared_frame_len.to_le_bytes());
         buf.push(0); // flags: uncompressed
         buf.extend_from_slice(&4u32.to_le_bytes()); // uncompressed_len
-        buf.extend_from_slice(&[0xdd; 16]); // room_id
+        buf.extend_from_slice(&[0xdd; 16]); // collection_id
         buf.extend_from_slice(&[0xbb; 16]); // hash
         buf.extend_from_slice(&[0xcc; 2]); // partial data (short of declared len; CRC never written)
         std::fs::write(&path, &buf).unwrap();
@@ -1301,18 +1304,26 @@ mod tests {
         let dir = test_dir("scan_room_id");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
-        let room1 = [0x01; 16];
-        let room2 = [0x02; 16];
+        let collection1 = [0x01; 16];
+        let collection2 = [0x02; 16];
         let mut buf = Vec::new();
         write_header(&mut buf, 0).unwrap();
-        write_record(&mut buf, &test_record(room1, [0xAA; 16], b"room1 msg")).unwrap();
-        write_record(&mut buf, &test_record(room2, [0xBB; 16], b"room2 msg")).unwrap();
+        write_record(
+            &mut buf,
+            &test_record(collection1, [0xAA; 16], b"collection1 msg"),
+        )
+        .unwrap();
+        write_record(
+            &mut buf,
+            &test_record(collection2, [0xBB; 16], b"collection2 msg"),
+        )
+        .unwrap();
         std::fs::write(&path, &buf).unwrap();
         let entries = scan_packfile(&path).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, room1);
+        assert_eq!(entries[0].0, collection1);
         assert_eq!(entries[0].1, [0xAA; 16]);
-        assert_eq!(entries[1].0, room2);
+        assert_eq!(entries[1].0, collection2);
         assert_eq!(entries[1].1, [0xBB; 16]);
     }
 }

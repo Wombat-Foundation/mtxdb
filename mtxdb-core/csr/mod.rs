@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 const CSR_VERSION: u8 = 1;
 
-/// Compressed sparse row graph for a room's event DAG.
+/// Compressed sparse row graph for a collection's event DAG.
 ///
 /// Stores adjacency information in two flat arrays (`offsets` and `targets`)
 /// for cache-friendly traversal. O(1) neighbor lookup, O(V+E) topological sort.

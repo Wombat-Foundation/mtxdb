@@ -34,23 +34,23 @@ impl MdbStorage {
         Ok(Self { inner: storage })
     }
 
-    /// Store a node. Both `room_id` and `node_id` must be 16-byte arrays.
-    pub fn put(&self, room_id: &[u8], node_id: &[u8], data: &[u8]) -> Result<(), JsValue> {
-        let room = as_id(room_id, "room_id")?;
+    /// Store a node. Both `collection_id` and `node_id` must be 16-byte arrays.
+    pub fn put(&self, collection_id: &[u8], node_id: &[u8], data: &[u8]) -> Result<(), JsValue> {
+        let collection = as_id(collection_id, "collection_id")?;
         let id = as_id(node_id, "node_id")?;
         let node_data = NodeData::new(bytes::Bytes::copy_from_slice(data));
         self.inner
-            .put(&room, &id, &node_data)
+            .put(&collection, &id, &node_data)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Fetch a node. Returns `null` if not found.
-    pub fn get(&self, room_id: &[u8], node_id: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
-        let room = as_id(room_id, "room_id")?;
+    pub fn get(&self, collection_id: &[u8], node_id: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
+        let collection = as_id(collection_id, "collection_id")?;
         let id = as_id(node_id, "node_id")?;
         match self
             .inner
-            .get(&room, &id)
+            .get(&collection, &id)
             .map_err(|e| JsValue::from_str(&e.to_string()))?
         {
             Some(data) => Ok(Some(data.bytes.to_vec())),
@@ -58,11 +58,11 @@ impl MdbStorage {
         }
     }
 
-    /// Delete all data for a room.
-    pub fn delete_room(&self, room_id: &[u8]) -> Result<(), JsValue> {
-        let room = as_id(room_id, "room_id")?;
+    /// Delete all data for a collection.
+    pub fn delete_room(&self, collection_id: &[u8]) -> Result<(), JsValue> {
+        let collection = as_id(collection_id, "collection_id")?;
         self.inner
-            .delete_room(&room)
+            .delete_room(&collection)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

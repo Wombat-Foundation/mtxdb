@@ -77,14 +77,14 @@ impl IndexSlot {
     }
 }
 
-/// A per-room lossy fanout index for content-addressed records.
+/// A per-collection lossy fanout index for content-addressed records.
 ///
 /// Uses open addressing with linear probing on a power-of-two sized table.
 /// The index is mmap-able (flat `u64` array) and small enough to stay
-/// resident in RAM for active rooms.
+/// resident in RAM for active collections.
 ///
 /// Design decisions (from docs):
-/// - Partition by room: ~8KB per 1000-node room, 100 active rooms < 1MB.
+/// - Partition by collection: ~8KB per 1000-node collection, 100 active collections < 1MB.
 /// - Empty slot terminates probe (write-once, no tombstones needed).
 /// - Tag collisions surface as verification failures (`decode_v1_verified`).
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
@@ -249,7 +249,7 @@ impl LossyIndex {
     /// Returns which shard IDs are referenced by at least one occupied slot.
     ///
     /// Used by shard retirement to determine which shards are still live
-    /// across all rooms before freeing a pool slot.
+    /// across all collections before freeing a pool slot.
     #[must_use]
     pub fn referenced_shard_ids(&self) -> [bool; crate::shard::MAX_SHARDS] {
         let mut seen = [false; crate::shard::MAX_SHARDS];
@@ -266,10 +266,10 @@ impl LossyIndex {
 
     /// Tally of how many occupied slots point into each shard.
     ///
-    /// Used to maintain the persisted per-shard room directory (see
-    /// `PackfileStorage`'s `shard_rooms` tracking): whenever a room's
+    /// Used to maintain the persisted per-shard collection directory (see
+    /// `PackfileStorage`'s `shard_rooms` tracking): whenever a collection's
     /// index is rebuilt or swapped in, this gives the exact per-shard
-    /// contribution to record against that room, without a second scan
+    /// contribution to record against that collection, without a second scan
     /// of the packfile itself.
     #[must_use]
     pub fn shard_counts(&self) -> std::collections::HashMap<u16, u64> {
@@ -283,12 +283,12 @@ impl LossyIndex {
         counts
     }
 
-    /// Whether this room's index currently has any live entry pointing
+    /// Whether this collection's index currently has any live entry pointing
     /// into `shard_id`. Short-circuits on the first match — unlike
     /// `referenced_shard_ids`, which always builds a full `MAX_SHARDS`
-    /// membership map, this is the cheap check for "does this one room
+    /// membership map, this is the cheap check for "does this one collection
     /// still reference this one shard," used to filter a shard-scan's
-    /// candidate room list down to rooms that haven't already repacked
+    /// candidate collection list down to collections that haven't already repacked
     /// past it.
     #[must_use]
     pub fn references_shard(&self, shard_id: u16) -> bool {

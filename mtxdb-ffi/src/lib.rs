@@ -80,13 +80,13 @@ pub unsafe extern "C" fn mdb_storage_destroy(handle: *mut MdbStorage) {
 ///
 /// # Safety
 /// - `handle` must be a valid pointer from `mdb_storage_open`.
-/// - `room_id` must point to at least 16 bytes.
+/// - `collection_id` must point to at least 16 bytes.
 /// - `node_id` must point to at least 16 bytes.
 /// - `data` / `data_len` must reference a valid byte buffer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdb_put(
     handle: *mut MdbStorage,
-    room_id: *const u8,
+    collection_id: *const u8,
     node_id: *const u8,
     data: *const u8,
     data_len: usize,
@@ -94,11 +94,11 @@ pub unsafe extern "C" fn mdb_put(
     let Some(storage) = (unsafe { handle.as_ref() }) else {
         return MdbError::InvalidInput;
     };
-    let room = unsafe { read_id(room_id) };
+    let collection = unsafe { read_id(collection_id) };
     let id = unsafe { read_id(node_id) };
     let bytes = unsafe { slice::from_raw_parts(data, data_len) };
     let node_data = NodeData::new(bytes::Bytes::copy_from_slice(bytes));
-    match storage.inner.put(&room, &id, &node_data) {
+    match storage.inner.put(&collection, &id, &node_data) {
         Ok(()) => MdbError::Ok,
         Err(_) => MdbError::Io,
     }
@@ -113,20 +113,20 @@ pub unsafe extern "C" fn mdb_put(
 ///
 /// # Safety
 /// - `handle` must be a valid pointer from `mdb_storage_open`.
-/// - `room_id` must point to at least 16 bytes.
+/// - `collection_id` must point to at least 16 bytes.
 /// - `node_id` must point to at least 16 bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdb_get(
     handle: *mut MdbStorage,
-    room_id: *const u8,
+    collection_id: *const u8,
     node_id: *const u8,
 ) -> *mut MdbNodeData {
     let Some(storage) = (unsafe { handle.as_ref() }) else {
         return ptr::null_mut();
     };
-    let room = unsafe { read_id(room_id) };
+    let collection = unsafe { read_id(collection_id) };
     let id = unsafe { read_id(node_id) };
-    match storage.inner.get(&room, &id) {
+    match storage.inner.get(&collection, &id) {
         Ok(Some(data)) => Box::into_raw(Box::new(MdbNodeData { inner: data })),
         _ => ptr::null_mut(),
     }
@@ -143,13 +143,13 @@ pub unsafe extern "C" fn mdb_get(
 ///
 /// # Safety
 /// - `handle` must be a valid pointer from `mdb_storage_open`.
-/// - `room_id` must point to at least 16 bytes.
+/// - `collection_id` must point to at least 16 bytes.
 /// - `node_id` must point to at least 16 bytes.
 /// - `out_err` must be a valid mutable pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdb_get_ex(
     handle: *mut MdbStorage,
-    room_id: *const u8,
+    collection_id: *const u8,
     node_id: *const u8,
     out_err: *mut MdbError,
 ) -> *mut MdbNodeData {
@@ -157,9 +157,9 @@ pub unsafe extern "C" fn mdb_get_ex(
         unsafe { *out_err = MdbError::InvalidInput };
         return ptr::null_mut();
     };
-    let room = unsafe { read_id(room_id) };
+    let collection = unsafe { read_id(collection_id) };
     let id = unsafe { read_id(node_id) };
-    match storage.inner.get(&room, &id) {
+    match storage.inner.get(&collection, &id) {
         Ok(Some(data)) => {
             unsafe { *out_err = MdbError::Ok };
             Box::into_raw(Box::new(MdbNodeData { inner: data }))
@@ -228,18 +228,18 @@ pub unsafe extern "C" fn mdb_sync(handle: *mut MdbStorage) -> MdbError {
     }
 }
 
-/// Delete all data for a room.
+/// Delete all data for a collection.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer from `mdb_storage_open`.
-/// - `room_id` must point to at least 16 bytes.
+/// - `collection_id` must point to at least 16 bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mdb_delete_room(handle: *mut MdbStorage, room_id: *const u8) -> MdbError {
+pub unsafe extern "C" fn mdb_delete_room(handle: *mut MdbStorage, collection_id: *const u8) -> MdbError {
     let Some(storage) = (unsafe { handle.as_ref() }) else {
         return MdbError::InvalidInput;
     };
-    let room = unsafe { read_id(room_id) };
-    match storage.inner.delete_room(&room) {
+    let collection = unsafe { read_id(collection_id) };
+    match storage.inner.delete_room(&collection) {
         Ok(()) => MdbError::Ok,
         Err(_) => MdbError::Io,
     }
@@ -260,14 +260,14 @@ mod tests {
         let handle = unsafe { mdb_storage_open(path.as_ptr()) };
         assert!(!handle.is_null());
 
-        let room = [0x01u8; 16];
+        let collection = [0x01u8; 16];
         let id = [0x42u8; 16];
         let data = b"hello from ffi";
 
         let result = unsafe {
             mdb_put(
                 handle,
-                room.as_ptr(),
+                collection.as_ptr(),
                 id.as_ptr(),
                 data.as_ptr(),
                 data.len(),
@@ -275,7 +275,7 @@ mod tests {
         };
         assert!(matches!(result, MdbError::Ok));
 
-        let node = unsafe { mdb_get(handle, room.as_ptr(), id.as_ptr()) };
+        let node = unsafe { mdb_get(handle, collection.as_ptr(), id.as_ptr()) };
         assert!(!node.is_null());
 
         let mut out_len = 0usize;

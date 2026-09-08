@@ -37,7 +37,7 @@ fn fmt_bytes(n: u64) -> String {
 }
 
 /// Decimal megabytes, rounded exactly to five fractional digits, for index
-/// memory shown in human-facing room output.
+/// memory shown in human-facing collection output.
 fn fmt_megabytes(bytes: usize) -> String {
     const BYTES_PER_MB: u64 = 1_000_000;
     const FRACTION_SCALE: u64 = 100_000;
@@ -57,7 +57,7 @@ fn fmt_megabytes(bytes: usize) -> String {
 }
 
 /// Physical disk use, where millibyte precision is enough to distinguish
-/// small records without making large-room listings visually noisy.
+/// small records without making large-collection listings visually noisy.
 fn fmt_disk_megabytes(bytes: u64) -> String {
     const BYTES_PER_MB: u64 = 1_000_000;
     const FRACTION_SCALE: u64 = 1_000;
@@ -74,14 +74,14 @@ fn fmt_disk_megabytes(bytes: u64) -> String {
     format!("{whole}.{fraction:03} MB")
 }
 
-/// Sum the physical frames belonging to each room. This is deliberately a
-/// disk-footprint figure: superseded frames remain charged to the room until
+/// Sum the physical frames belonging to each collection. This is deliberately a
+/// disk-footprint figure: superseded frames remain charged to the collection until
 /// a repack reclaims them, while the shard header is shared and unallocated.
-/// Reads only each frame's length and room ID, then discards its hash,
-/// payload, and CRC through one sequential buffered scan; a room listing
+/// Reads only each frame's length and collection ID, then discards its hash,
+/// payload, and CRC through one sequential buffered scan; a collection listing
 /// never allocates payloads or checks CRCs.
-fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
-    // 1-byte flags + 4-byte uncompressed_len + 16-byte room_id + 16-byte
+fn collection_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
+    // 1-byte flags + 4-byte uncompressed_len + 16-byte collection_id + 16-byte
     // hash — the fixed part of a v3 frame's payload, preceding the
     // (possibly zstd-compressed) node bytes.
     const FRAME_FIXED_LEN: u64 = 1 + 4 + 16 + 16;
@@ -112,10 +112,10 @@ fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
             if !(FRAME_FIXED_LEN..=u64::from(mtxdb_core::packfile::MAX_RECORD_LEN))
                 .contains(&frame_len)
             {
-                bail!("invalid record length {frame_len} while measuring room disk usage");
+                bail!("invalid record length {frame_len} while measuring collection disk usage");
             }
-            // Skip the flags byte and uncompressed_len field to reach room_id
-            // — this scan only needs the room ID, not whether/how the node
+            // Skip the flags byte and uncompressed_len field to reach collection_id
+            // — this scan only needs the collection ID, not whether/how the node
             // bytes that follow are compressed.
             let mut flags_and_uncompressed_len = [0_u8; 5];
             match reader.read_exact(&mut flags_and_uncompressed_len) {
@@ -123,8 +123,8 @@ fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error.into()),
             }
-            let mut room_id = [0_u8; 16];
-            match reader.read_exact(&mut room_id) {
+            let mut collection_id = [0_u8; 16];
+            match reader.read_exact(&mut collection_id) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error.into()),
@@ -149,7 +149,7 @@ fn room_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
             if !complete {
                 break;
             }
-            let total = by_room.entry(room_id).or_insert(0_u64);
+            let total = by_room.entry(collection_id).or_insert(0_u64);
             *total = total.saturating_add(frame_len.saturating_add(8));
         }
     }
@@ -180,22 +180,26 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 
 pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
-        Commands::Get { room, id } => cmd_get(cli, room.as_deref(), id),
+        Commands::Put {
+            collection,
+            id,
+            data,
+        } => cmd_put(cli, collection, id, data),
+        Commands::Get { collection, id } => cmd_get(cli, collection.as_deref(), id),
         Commands::Collections { all } => cmd_collections(cli, *all),
         Commands::Shards { all } => cmd_shards(cli, *all),
-        Commands::Info { room } => cmd_info(cli, room),
+        Commands::Info { collection } => cmd_info(cli, collection),
         Commands::Scan { shard } => cmd_scan(cli, shard),
-        Commands::Import { paths, room } => cmd_import(cli, paths, room.as_deref()),
-        Commands::Export { room } => cmd_export(cli, room),
+        Commands::Import { paths, collection } => cmd_import(cli, paths, collection.as_deref()),
+        Commands::Export { collection } => cmd_export(cli, collection),
         Commands::Repack {
-            room,
+            collection,
             shards,
             all,
             root,
             topo,
-        } => cmd_repack(cli, room.as_deref(), shards, *all, root, *topo),
-        Commands::Delete { rooms, yes } => cmd_delete(cli, rooms, *yes),
+        } => cmd_repack(cli, collection.as_deref(), shards, *all, root, *topo),
+        Commands::Delete { collections, yes } => cmd_delete(cli, collections, *yes),
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync => cmd_sync(cli),
     }
@@ -207,9 +211,9 @@ fn parse_room_id(hex: &str) -> anyhow::Result<[u8; 16]> {
         .or_else(|| hex.strip_prefix("0X"))
         .unwrap_or(hex);
     if hex.len() != 32 {
-        bail!("room ID must be 32 hex characters, got {}", hex.len());
+        bail!("collection ID must be 32 hex characters, got {}", hex.len());
     }
-    let bytes = hex::decode(hex).context("invalid hex in room ID")?;
+    let bytes = hex::decode(hex).context("invalid hex in collection ID")?;
     let mut id = [0u8; 16];
     id.copy_from_slice(&bytes);
     Ok(id)
@@ -250,7 +254,7 @@ fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
 }
 
 /// Open the store read-only — coexists with a live writer process rather
-/// than contending with it. For commands that only ever read room data.
+/// than contending with it. For commands that only ever read collection data.
 fn open_store_read_only(cli: &Cli) -> anyhow::Result<PackfileStorage> {
     PackfileStorage::open_read_only(selected_pool_dir(cli)?).context("failed to open store")
 }
@@ -275,33 +279,36 @@ fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
     pool_dir(&open_layout(cli)?, cli.shard_type)
 }
 
-fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
-    let room_id = parse_room_id(room)?;
+fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<()> {
+    let collection_id = parse_room_id(collection)?;
     let node_id = parse_node_id(id)?;
     let store = open_store(cli)?;
     let node_data = NodeData::new(bytes::Bytes::from(data.as_bytes().to_vec()));
-    store.put(&room_id, &node_id, &node_data)?;
-    let room_hex = hex_encode(&room_id);
+    store.put(&collection_id, &node_id, &node_data)?;
+    let collection_hex = hex_encode(&collection_id);
     let id_hex = hex_encode(&node_id);
-    eprintln!("put {id_hex} into room {room_hex} ({} bytes)", data.len());
+    eprintln!(
+        "put {id_hex} into collection {collection_hex} ({} bytes)",
+        data.len()
+    );
     Ok(())
 }
 
-fn cmd_get(cli: &Cli, room: Option<&str>, id: &str) -> anyhow::Result<()> {
+fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str) -> anyhow::Result<()> {
     let node_id = parse_get_id(id)?;
     let store = open_store_read_only(cli)?;
-    let matches: Vec<([u8; 16], NodeData)> = match room {
-        Some(room) => {
-            let room_id = parse_room_id(room)?;
+    let matches: Vec<([u8; 16], NodeData)> = match collection {
+        Some(collection) => {
+            let collection_id = parse_room_id(collection)?;
             store
-                .get(&room_id, &node_id)?
-                .map(|data| vec![(room_id, data)])
+                .get(&collection_id, &node_id)?
+                .map(|data| vec![(collection_id, data)])
                 .unwrap_or_default()
         }
-        None => room_ids(cli)?
+        None => collection_ids(cli)?
             .into_iter()
-            .filter_map(|room_id| match store.get(&room_id, &node_id) {
-                Ok(Some(data)) => Some(Ok((room_id, data))),
+            .filter_map(|collection_id| match store.get(&collection_id, &node_id) {
+                Ok(Some(data)) => Some(Ok((collection_id, data))),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             })
@@ -314,10 +321,10 @@ fn cmd_get(cli: &Cli, room: Option<&str>, id: &str) -> anyhow::Result<()> {
             io::stdout().write_all(b"\n")?;
         }
         _ => bail!(
-            "node ID {id} is present in multiple rooms ({}); specify --room",
+            "node ID {id} is present in multiple collections ({}); specify --collection",
             matches
                 .iter()
-                .map(|(room_id, _)| hex_encode(room_id))
+                .map(|(collection_id, _)| hex_encode(collection_id))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -325,21 +332,21 @@ fn cmd_get(cli: &Cli, room: Option<&str>, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Enumerate live rooms from the persisted directory. Stores created before
+/// Enumerate live collections from the persisted directory. Stores created before
 /// that sidecar existed fall back to a one-time index rebuild; `mtxdb sync`
 /// makes future calls fast.
-fn room_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
+fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
     let dir = selected_pool_dir(cli)?;
-    if PackfileStorage::room_directory_persisted_at(&dir).is_some() {
-        return Ok(PackfileStorage::room_directory_from_disk(&dir)
+    if PackfileStorage::collection_directory_persisted_at(&dir).is_some() {
+        return Ok(PackfileStorage::collection_directory_from_disk(&dir)
             .into_iter()
-            .map(|(room_id, _)| room_id)
+            .map(|(collection_id, _)| collection_id)
             .collect());
     }
     Ok(open_store_read_only(cli)?
-        .room_summaries()
+        .collection_summaries()
         .into_iter()
-        .map(|(room_id, _, _)| room_id)
+        .map(|(collection_id, _, _)| collection_id)
         .collect())
 }
 
@@ -361,14 +368,14 @@ fn cmd_collections(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
 /// avoided: each pool owns an independent 16-byte namespace and lifecycle.
 fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
-    // The persisted room directory is a fast listing snapshot, not proof
+    // The persisted collection directory is a fast listing snapshot, not proof
     // that the shard files are readable by this binary. Validate the small
     // immutable header of every shard before trusting it, so a pre-cutover
     // store does not misleadingly appear empty just because its sidecar is
     // empty or stale.
     validate_packfile_headers(dir)?;
-    let rooms = match PackfileStorage::room_summaries_from_disk(dir) {
-        Some(rooms) => rooms,
+    let collections = match PackfileStorage::collection_summaries_from_disk(dir) {
+        Some(collections) => collections,
         // A named pool is created with the database layout, before it has
         // necessarily received a first write. `open_read_only` quite
         // properly rejects a directory with no shard files, but for a
@@ -378,12 +385,12 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
         // so `collections` remains useful until `mtxdb sync` writes one.
         None => PackfileStorage::open_read_only(dir.into())
             .context("failed to open store")?
-            .room_summaries(),
+            .collection_summaries(),
     };
-    let room_shards = PackfileStorage::room_shards_from_disk(dir);
-    let disk_bytes = room_disk_bytes(dir)?;
+    let collection_shards = PackfileStorage::collection_shards_from_disk(dir);
+    let disk_bytes = collection_disk_bytes(dir)?;
 
-    if rooms.is_empty() {
+    if collections.is_empty() {
         println!("no collections found");
         return Ok(());
     }
@@ -395,11 +402,11 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
-    for (i, (room_id, nodes, memory)) in rooms.iter().enumerate() {
-        let hex = hex_encode(room_id);
-        let shards = room_shards
+    for (i, (collection_id, nodes, memory)) in collections.iter().enumerate() {
+        let hex = hex_encode(collection_id);
+        let shards = collection_shards
             .as_ref()
-            .and_then(|by_room| by_room.get(room_id))
+            .and_then(|by_room| by_room.get(collection_id))
             .map_or_else(
                 || "?".to_owned(),
                 |shards| {
@@ -412,11 +419,11 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
             );
         total_nodes = total_nodes
             .checked_add(*nodes)
-            .context("total room node count overflow")?;
+            .context("total collection node count overflow")?;
         total_memory = total_memory
             .checked_add(*memory)
-            .context("total room index memory overflow")?;
-        let disk = disk_bytes.get(room_id).copied().unwrap_or(0);
+            .context("total collection index memory overflow")?;
+        let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
         total_disk_bytes = total_disk_bytes.saturating_add(disk);
         println!(
             "  {i:>4}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
@@ -456,7 +463,7 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Deliberately bypasses both `PackfileStorage` and `ShardPool` — it
-/// needs no room data and no packfile reads. Instead it globs shard
+/// needs no collection data and no packfile reads. Instead it globs shard
 /// filenames for size/rotation, then decodes the small `shard_stats.bin` and
 /// `shard_rooms.bin` sidecars for counters and live-node counts.
 /// Safe to run against a directory a live writer process owns.
@@ -476,7 +483,7 @@ fn cmd_shards(cli: &Cli, all: bool) -> anyhow::Result<()> {
 }
 
 /// List shard metadata from one pool only. This reads directory entries and
-/// sidecars; it never scans packfile contents or opens room indexes.
+/// sidecars; it never scans packfile contents or opens collection indexes.
 fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
     let mut shard_entries = glob_shard_files(dir)?;
     shard_entries.sort_unstable_by_key(|&(id, _, _, _)| id);
@@ -488,15 +495,15 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
 
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
     let node_counts = PackfileStorage::shard_node_counts_from_disk(dir);
-    let room_counts = PackfileStorage::shard_room_counts_from_disk(dir);
-    let total_rooms = room_counts
+    let collection_counts = PackfileStorage::shard_room_counts_from_disk(dir);
+    let total_rooms = collection_counts
         .as_ref()
-        .map(|_| PackfileStorage::room_directory_from_disk(dir).len());
+        .map(|_| PackfileStorage::collection_directory_from_disk(dir).len());
     print_shard_table(
         &shard_entries,
         &stats_map,
         node_counts.as_ref(),
-        room_counts.as_ref(),
+        collection_counts.as_ref(),
         total_rooms,
     );
     println!("* active shard");
@@ -587,7 +594,7 @@ fn print_shard_table(
     shard_entries: &[(u16, u64, u64, u8)],
     stats_map: &ShardStatsMap,
     node_counts: Option<&std::collections::HashMap<u16, u64>>,
-    room_counts: Option<&std::collections::HashMap<u16, u64>>,
+    collection_counts: Option<&std::collections::HashMap<u16, u64>>,
     total_rooms: Option<usize>,
 ) {
     const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -598,7 +605,7 @@ fn print_shard_table(
 
     println!(
         "{:>6}  {:>3}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
-        "slot", "ver", "rotation", "bytes", "nodes", "rooms", "syncs",
+        "slot", "ver", "rotation", "bytes", "nodes", "collections", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
@@ -609,7 +616,7 @@ fn print_shard_table(
         let nodes = node_counts
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
-        let rooms = room_counts
+        let collections = collection_counts
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
@@ -626,7 +633,7 @@ fn print_shard_table(
             format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
             nodes,
-            rooms,
+            collections,
             sc,
         );
         total_bytes = total_bytes.saturating_add(file_bytes);
@@ -672,32 +679,41 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
-    let room_id = match room.parse::<usize>() {
+fn cmd_info(cli: &Cli, collection: &str) -> anyhow::Result<()> {
+    let collection_id = match collection.parse::<usize>() {
         Ok(slot) => {
-            let rooms = room_ids(cli)?;
-            rooms
+            let collections = collection_ids(cli)?;
+            collections
                 .get(slot)
                 .copied()
-                .with_context(|| format!("room slot {slot} not found"))?
+                .with_context(|| format!("collection slot {slot} not found"))?
         }
-        Err(_) => parse_room_id(room)?,
+        Err(_) => parse_room_id(collection)?,
     };
-    let hex = hex_encode(&room_id);
+    let hex = hex_encode(&collection_id);
     let dir = selected_pool_dir(cli)?;
 
     // The persisted directory is enough for the numerical summary and the
-    // room's physical placement. Do not rebuild every room index merely to
-    // answer `info` for one room.
-    if let (Some(summaries), Some(room_shards)) = (
-        PackfileStorage::room_summaries_from_disk(&dir),
-        PackfileStorage::room_shards_from_disk(&dir),
+    // collection's physical placement. Do not rebuild every collection index merely to
+    // answer `info` for one collection.
+    if let (Some(summaries), Some(collection_shards)) = (
+        PackfileStorage::collection_summaries_from_disk(&dir),
+        PackfileStorage::collection_shards_from_disk(&dir),
     ) {
-        if let Some((_, len, mem)) = summaries.into_iter().find(|(id, _, _)| *id == room_id) {
-            println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
-            let shards = room_shards.get(&room_id).cloned().unwrap_or_default();
-            print_room_shards(&shards);
-            if let Some(details) = matrix_room_details_from_cache(&dir, &room_id) {
+        if let Some((_, len, mem)) = summaries
+            .into_iter()
+            .find(|(id, _, _)| *id == collection_id)
+        {
+            println!(
+                "collection {hex}: {len} nodes, {} index RAM",
+                fmt_megabytes(mem)
+            );
+            let shards = collection_shards
+                .get(&collection_id)
+                .cloned()
+                .unwrap_or_default();
+            print_collection_shards(&shards);
+            if let Some(details) = matrix_room_details_from_cache(&dir, &collection_id) {
                 print_matrix_room_details(details, None);
             } else {
                 println!(
@@ -706,19 +722,19 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
                     shards.len(),
                     if shards.len() == 1 { "" } else { "s" }
                 );
-                let details = matrix_room_details_from_shards(&dir, &room_id, &shards)
+                let details = matrix_room_details_from_shards(&dir, &collection_id, &shards)
                     .unwrap_or_else(|error| {
                         eprintln!("warning: unable to inspect Matrix room metadata: {error}");
                         MatrixRoomDetails::default()
                     });
-                if let Err(error) = persist_matrix_room_details(&dir, &room_id, &details) {
+                if let Err(error) = persist_matrix_room_details(&dir, &collection_id, &details) {
                     eprintln!("warning: unable to cache Matrix room metadata: {error}");
                 }
                 print_matrix_room_details(details, Some(shards.len()));
             }
             return Ok(());
         }
-        eprintln!("room {hex}: not found");
+        eprintln!("collection {hex}: not found");
         return Ok(());
     }
 
@@ -726,21 +742,24 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     // summary. Preserve the old full-scan fallback until `mtxdb sync` can
     // create the sidecar.
     let store = open_store_read_only(cli)?;
-    match store.room_index_info(&room_id) {
+    match store.collection_index_info(&collection_id) {
         Some((len, mem)) => {
-            println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
-            let shards = store.room_referenced_shards(&room_id);
-            print_room_shards(&shards);
-            print_matrix_room_details(matrix_room_details(&store, &dir, &room_id)?, None);
+            println!(
+                "collection {hex}: {len} nodes, {} index RAM",
+                fmt_megabytes(mem)
+            );
+            let shards = store.collection_referenced_shards(&collection_id);
+            print_collection_shards(&shards);
+            print_matrix_room_details(matrix_room_details(&store, &dir, &collection_id)?, None);
         }
-        None => eprintln!("room {hex}: not found"),
+        None => eprintln!("collection {hex}: not found"),
     }
     Ok(())
 }
 
 #[derive(Clone, Default)]
 struct MatrixRoomDetails {
-    room_id: Option<String>,
+    matrix_room_id: Option<String>,
     create: Option<String>,
 }
 
@@ -754,8 +773,11 @@ fn matrix_room_details_path(dir: &Path) -> PathBuf {
 }
 
 /// Load one cached Matrix description. This cache is only presentation
-/// metadata; packfiles and the shard→room directory remain authoritative.
-fn matrix_room_details_from_cache(dir: &Path, room_id: &[u8; 16]) -> Option<MatrixRoomDetails> {
+/// metadata; packfiles and the shard→collection directory remain authoritative.
+fn matrix_room_details_from_cache(
+    dir: &Path,
+    collection_id: &[u8; 16],
+) -> Option<MatrixRoomDetails> {
     let buf = fs::read(matrix_room_details_path(dir)).ok()?;
     if buf.len() < MATRIX_ROOM_DETAILS_HEADER_LEN
         || &buf[0..4] != MATRIX_ROOM_DETAILS_MAGIC
@@ -772,7 +794,7 @@ fn matrix_room_details_from_cache(dir: &Path, room_id: &[u8; 16]) -> Option<Matr
         let data_len = matrix_len.checked_add(create_len)?;
         let data_end = header_end.checked_add(data_len)?;
         let data = buf.get(header_end..data_end)?;
-        if &header[0..16] == room_id {
+        if &header[0..16] == collection_id {
             let matrix_room_id = std::str::from_utf8(&data[..matrix_len])
                 .ok()
                 .filter(|value| !value.is_empty())
@@ -782,7 +804,7 @@ fn matrix_room_details_from_cache(dir: &Path, room_id: &[u8; 16]) -> Option<Matr
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
             return Some(MatrixRoomDetails {
-                room_id: matrix_room_id,
+                matrix_room_id,
                 create,
             });
         }
@@ -795,22 +817,22 @@ fn matrix_room_details_from_cache(dir: &Path, room_id: &[u8; 16]) -> Option<Matr
 /// `info` calls from decoding arbitrary event payloads in large shards.
 fn persist_matrix_room_details(
     dir: &Path,
-    room_id: &[u8; 16],
+    collection_id: &[u8; 16],
     details: &MatrixRoomDetails,
 ) -> io::Result<()> {
-    if details.room_id.is_none() && details.create.is_none() {
+    if details.matrix_room_id.is_none() && details.create.is_none() {
         return Ok(());
     }
     let mut entries = read_all_matrix_room_details(dir);
-    entries.insert(*room_id, details.clone());
+    entries.insert(*collection_id, details.clone());
 
     let mut buf = Vec::new();
     buf.extend_from_slice(MATRIX_ROOM_DETAILS_MAGIC);
     buf.push(MATRIX_ROOM_DETAILS_VERSION);
     let mut entries: Vec<_> = entries.into_iter().collect();
-    entries.sort_unstable_by_key(|(room_id, _)| *room_id);
-    for (room_id, details) in entries {
-        let matrix_room_id = details.room_id.unwrap_or_default();
+    entries.sort_unstable_by_key(|(collection_id, _)| *collection_id);
+    for (collection_id, details) in entries {
+        let matrix_room_id = details.matrix_room_id.clone().unwrap_or_default();
         let create = details.create.unwrap_or_default();
         let matrix_len = u16::try_from(matrix_room_id.len()).map_err(|_| {
             io::Error::new(
@@ -824,7 +846,7 @@ fn persist_matrix_room_details(
                 "create metadata exceeds cache limit",
             )
         })?;
-        buf.extend_from_slice(&room_id);
+        buf.extend_from_slice(&collection_id);
         buf.extend_from_slice(&matrix_len.to_le_bytes());
         buf.extend_from_slice(&create_len.to_le_bytes());
         buf.extend_from_slice(matrix_room_id.as_bytes());
@@ -877,12 +899,12 @@ fn read_all_matrix_room_details(
         else {
             break;
         };
-        let mut room_id = [0u8; 16];
-        room_id.copy_from_slice(&header[0..16]);
+        let mut collection_id = [0u8; 16];
+        collection_id.copy_from_slice(&header[0..16]);
         entries.insert(
-            room_id,
+            collection_id,
             MatrixRoomDetails {
-                room_id: (!matrix_room_id.is_empty()).then(|| matrix_room_id.to_owned()),
+                matrix_room_id: (!matrix_room_id.is_empty()).then(|| matrix_room_id.to_owned()),
                 create: (!create.is_empty()).then(|| create.to_owned()),
             },
         );
@@ -893,11 +915,11 @@ fn read_all_matrix_room_details(
 
 /// Find the human-facing Matrix metadata carried by live JSON events. Pack
 /// scans can contain superseded frames, so every candidate is resolved through
-/// the room's live index before being inspected.
+/// the collection's live index before being inspected.
 fn matrix_room_details(
     store: &PackfileStorage,
     dir: &Path,
-    room_id: &[u8; 16],
+    collection_id: &[u8; 16],
 ) -> anyhow::Result<MatrixRoomDetails> {
     let mut details = MatrixRoomDetails::default();
     let mut seen = std::collections::HashSet::new();
@@ -910,23 +932,23 @@ fn matrix_room_details(
             continue;
         }
         for (record_room_id, node_id, _) in mtxdb_core::packfile::scan_packfile(&path)? {
-            if &record_room_id != room_id || !seen.insert(node_id) {
+            if &record_room_id != collection_id || !seen.insert(node_id) {
                 continue;
             }
-            let Some(data) = store.get(room_id, &node_id)? else {
+            let Some(data) = store.get(collection_id, &node_id)? else {
                 continue;
             };
             let mut bytes = data.bytes.to_vec();
             let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
                 continue;
             };
-            if details.room_id.is_none() {
-                details.room_id = event_room_id(&event).map(str::to_owned);
+            if details.matrix_room_id.is_none() {
+                details.matrix_room_id = event_room_id(&event).map(str::to_owned);
             }
             if details.create.is_none() {
                 details.create = matrix_create_details(&event);
             }
-            if details.room_id.is_some() && details.create.is_some() {
+            if details.matrix_room_id.is_some() && details.create.is_some() {
                 return Ok(details);
             }
         }
@@ -934,14 +956,14 @@ fn matrix_room_details(
     Ok(details)
 }
 
-/// Read Matrix metadata from only the shards containing `room_id`. This is
+/// Read Matrix metadata from only the shards containing `collection_id`. This is
 /// deliberately streaming: common Matrix room IDs and create events occur
 /// near the beginning of topology-ordered data, so `info` can stop as soon
 /// as both fields are found rather than scanning unrelated shards or loading
 /// a full store index.
 fn matrix_room_details_from_shards(
     dir: &Path,
-    room_id: &[u8; 16],
+    collection_id: &[u8; 16],
     shard_ids: &[u16],
 ) -> anyhow::Result<MatrixRoomDetails> {
     let pool = ShardPool::open_read_only(dir.into()).context("failed to open shard store")?;
@@ -962,11 +984,11 @@ fn matrix_room_details_from_shards(
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error.into()),
             };
-            if &record.room_id != room_id {
+            if &record.collection_id != collection_id {
                 continue;
             }
             update_matrix_room_details(&mut details, &record.data);
-            if details.room_id.is_some() && details.create.is_some() {
+            if details.matrix_room_id.is_some() && details.create.is_some() {
                 return Ok(details);
             }
         }
@@ -975,7 +997,7 @@ fn matrix_room_details_from_shards(
 }
 
 fn print_matrix_room_details(details: MatrixRoomDetails, scanned_shards: Option<usize>) {
-    if let Some(matrix_room_id) = details.room_id {
+    if let Some(matrix_room_id) = details.matrix_room_id {
         println!("  {:<12} {matrix_room_id}", "Matrix room:");
     }
     if let Some(create) = details.create {
@@ -991,7 +1013,7 @@ fn print_matrix_room_details(details: MatrixRoomDetails, scanned_shards: Option<
     }
 }
 
-fn print_room_shards(shards: &[u16]) {
+fn print_collection_shards(shards: &[u16]) {
     match shards {
         [shard] => println!("  {:<12} {shard}", "shard:"),
         [] => {}
@@ -1012,8 +1034,8 @@ fn update_matrix_room_details(details: &mut MatrixRoomDetails, data: &[u8]) {
     let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
         return;
     };
-    if details.room_id.is_none() {
-        details.room_id = event_room_id(&event).map(str::to_owned);
+    if details.matrix_room_id.is_none() {
+        details.matrix_room_id = event_room_id(&event).map(str::to_owned);
     }
     if details.create.is_none() {
         details.create = matrix_create_details(&event);
@@ -1047,10 +1069,10 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         std::fs::metadata(path)?.len(),
         records.len()
     );
-    for (room_id, node_id, offset) in &records {
-        let room_hex = hex_encode(room_id);
+    for (collection_id, node_id, offset) in &records {
+        let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
-        println!("  room={room_hex} id={id_hex} @ {offset}");
+        println!("  collection={collection_hex} id={id_hex} @ {offset}");
     }
     Ok(())
 }
@@ -1058,18 +1080,18 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
 fn cmd_import(
     cli: &Cli,
     paths: &[std::path::PathBuf],
-    room_override: Option<&str>,
+    collection_override: Option<&str>,
 ) -> anyhow::Result<()> {
     // One writer owns the entire batch: it prevents another writer from
     // interleaving halfway through a shell glob, and lets us publish one
-    // complete shard/room snapshot once the final input has been handled.
+    // complete shard/collection snapshot once the final input has been handled.
     let store = open_store(cli)?;
     let mut failures = 0_usize;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
-        if let Err(error) = cmd_import_file(&store, path, room_override) {
+        if let Err(error) = cmd_import_file(&store, path, collection_override) {
             eprintln!("{}: {error:#}", path.display());
             failures = failures.saturating_add(1);
         }
@@ -1083,29 +1105,29 @@ fn cmd_import(
     Ok(())
 }
 
-/// Export every live record in one room as a JSONL stream. A read-only frame
-/// scan avoids rebuilding every room's in-memory index just to enumerate one
-/// room. Scanning shards in rotation order lets a later physical copy replace
+/// Export every live record in one collection as a JSONL stream. A read-only frame
+/// scan avoids rebuilding every collection's in-memory index just to enumerate one
+/// collection. Scanning shards in rotation order lets a later physical copy replace
 /// an older one with the same node ID.
-fn cmd_export(cli: &Cli, room: &str) -> anyhow::Result<()> {
-    let room_id = parse_room_id(room)?;
+fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
+    let collection_id = parse_room_id(collection)?;
     let pool_dir = selected_pool_dir(cli)?;
-    let Some(summaries) = PackfileStorage::room_summaries_from_disk(&pool_dir) else {
-        bail!("room directory is unavailable; run `mtxdb sync` before exporting");
+    let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&pool_dir) else {
+        bail!("collection directory is unavailable; run `mtxdb sync` before exporting");
     };
-    if !summaries.iter().any(|(id, _, _)| *id == room_id) {
-        bail!("room {room} not found");
+    if !summaries.iter().any(|(id, _, _)| *id == collection_id) {
+        bail!("collection {collection} not found");
     }
-    let room_shards = PackfileStorage::room_shards_from_disk(&pool_dir)
-        .and_then(|by_room| by_room.get(&room_id).cloned())
-        .context("room shard directory is unavailable; run `mtxdb sync` before exporting")?;
-    let room_shards: HashSet<u16> = room_shards.into_iter().collect();
+    let collection_shards = PackfileStorage::collection_shards_from_disk(&pool_dir)
+        .and_then(|by_room| by_room.get(&collection_id).cloned())
+        .context("collection shard directory is unavailable; run `mtxdb sync` before exporting")?;
+    let collection_shards: HashSet<u16> = collection_shards.into_iter().collect();
 
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
     let mut shards: Vec<_> = pool
         .all_shards()
         .into_iter()
-        .filter(|(shard_id, _)| room_shards.contains(shard_id))
+        .filter(|(shard_id, _)| collection_shards.contains(shard_id))
         .collect();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
 
@@ -1113,7 +1135,7 @@ fn cmd_export(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let mut ordered_ids = Vec::new();
     for (shard_index, (_, shard)) in shards.iter().enumerate() {
         for (candidate_room, node_id, offset) in mtxdb_core::packfile::scan_packfile(&shard.path)? {
-            if candidate_room == room_id {
+            if candidate_room == collection_id {
                 if !locations.contains_key(&node_id) {
                     ordered_ids.push(node_id);
                 }
@@ -1138,8 +1160,8 @@ fn cmd_export(cli: &Cli, room: &str) -> anyhow::Result<()> {
     }
     output.flush()?;
     eprintln!(
-        "exported {exported} records from room {}",
-        hex_encode(&room_id)
+        "exported {exported} records from collection {}",
+        hex_encode(&collection_id)
     );
     Ok(())
 }
@@ -1147,7 +1169,7 @@ fn cmd_export(cli: &Cli, room: &str) -> anyhow::Result<()> {
 fn cmd_import_file(
     store: &PackfileStorage,
     path: &Path,
-    room_override: Option<&str>,
+    collection_override: Option<&str>,
 ) -> anyhow::Result<()> {
     let content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let is_jsonl = path
@@ -1178,7 +1200,7 @@ fn cmd_import_file(
     // operator identify which input/store overlap caused the no-op.
     let mut already_present_ids = Vec::with_capacity(3);
 
-    let room_id = if let Some(r) = room_override {
+    let collection_id = if let Some(r) = collection_override {
         parse_room_id(r)?
     } else {
         let rid = detected_room.with_context(|| {
@@ -1187,7 +1209,7 @@ fn cmd_import_file(
                 .and_then(event_id)
                 .unwrap_or("<missing event_id>");
             format!(
-                "could not detect room_id (first event: {first_event}); pass --room for this input"
+                "could not detect collection_id (first event: {first_event}); pass --collection for this input"
             )
         })?;
         let hash = blake3::hash(rid.as_bytes());
@@ -1196,7 +1218,7 @@ fn cmd_import_file(
         id
     };
 
-    let room_hex = hex_encode(&room_id);
+    let collection_hex = hex_encode(&collection_id);
 
     for ev in &events {
         let Some(incoming_event_id) = event_id(ev) else {
@@ -1208,7 +1230,7 @@ fn cmd_import_file(
         id_bytes.copy_from_slice(&event_hash.as_bytes()[..16]);
 
         let event_bytes = ev.encode().into_bytes();
-        if let Some(existing) = store.get(&room_id, &id_bytes)? {
+        if let Some(existing) = store.get(&collection_id, &id_bytes)? {
             let mut existing_bytes = existing.bytes.to_vec();
             let existing_event_id = simd_json::to_owned_value(&mut existing_bytes)
                 .ok()
@@ -1226,11 +1248,11 @@ fn cmd_import_file(
             continue;
         }
         let data = NodeData::new(bytes::Bytes::from(event_bytes));
-        store.put(&room_id, &id_bytes, &data)?;
+        store.put(&collection_id, &id_bytes, &data)?;
         event_count = event_count.saturating_add(1);
     }
 
-    eprintln!("imported {event_count} events to room {room_hex}");
+    eprintln!("imported {event_count} events to collection {collection_hex}");
     if skipped > 0 {
         eprintln!("skipped {skipped} events (missing event_id)");
     }
@@ -1353,21 +1375,21 @@ fn matrix_create_details(event: &OwnedValue) -> Option<String> {
 
 fn cmd_repack(
     cli: &Cli,
-    room: Option<&str>,
+    collection: Option<&str>,
     shards: &[String],
     all: bool,
     roots: &[String],
     topo: bool,
 ) -> anyhow::Result<()> {
-    let target = match (room, shards.is_empty(), all) {
-        (Some(room), true, false) => RepackTarget::Room(parse_room_id(room)?),
+    let target = match (collection, shards.is_empty(), all) {
+        (Some(collection), true, false) => RepackTarget::Collection(parse_room_id(collection)?),
         (None, false, false) => RepackTarget::Shards(parse_shard_selectors(shards)?),
         (None, true, true) => RepackTarget::All,
         // Clap rejects the both-targets case through `conflicts_with`; this
         // branch gives the missing-target case a readable diagnostic.
         _ => {
             return Err(anyhow!(
-                "exactly one of --room <room> | --shard <shard> | --all is required"
+                "exactly one of --collection <collection> | --shard <shard> | --all is required"
             ))
         }
     };
@@ -1376,13 +1398,13 @@ fn cmd_repack(
         match &target {
             RepackTarget::Shards(_) | RepackTarget::All => {
                 bail!(
-                    "--root requires --room — live roots are per-room, not meaningful for --shard"
+                    "--root requires --collection — live roots are per-collection, not meaningful for --shard"
                 );
             }
-            RepackTarget::Room(_) if !topo => {
+            RepackTarget::Collection(_) if !topo => {
                 bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
             }
-            RepackTarget::Room(_) => {
+            RepackTarget::Collection(_) => {
                 bail!(
                     "--root cannot be used with Matrix topology yet: imported event IDs cannot be resolved to stored node IDs; refusing a rooted repack that could discard ancestors"
                 );
@@ -1397,21 +1419,21 @@ fn cmd_repack(
     cmd_repack_target(cli, &target, topo)
 }
 
-/// Compacts every shard transitively touched by rooms referencing
-/// `shard_id` — not just `shard_id` itself. A room's live data can span
+/// Compacts every shard transitively touched by collections referencing
+/// `shard_id` — not just `shard_id` itself. A collection's live data can span
 /// more than one shard (`PackfileStorage::repack_closure` finds the full
-/// closure), and repacking a room always rewrites its *entire* live set
+/// closure), and repacking a collection always rewrites its *entire* live set
 /// regardless of which shard triggered the repack, so a shard-scoped
 /// compaction has to account for everything that repack will actually
 /// touch, not just the one shard named on the command line.
 ///
 /// Runs a non-mutating preflight first (`PackfileStorage::plan_room_repack`
-/// per room in the closure): prints how many rooms and shards are
+/// per collection in the closure): prints how many collections and shards are
 /// involved and the expected shard count/slack after compaction, then
 /// prompts for confirmation before performing any real repack. `--root`
-/// doesn't apply here since live roots are inherently per-room — the
+/// doesn't apply here since live roots are inherently per-collection — the
 /// same `--topo`/no-`--topo` edge-extraction choice applies uniformly
-/// across every room the closure touches.
+/// across every collection the closure touches.
 ///
 /// The preflight runs against a **read-only** open, not the exclusive
 /// writer — an interactive confirmation pause can take arbitrarily long,
@@ -1423,12 +1445,12 @@ fn cmd_repack(
 /// that's reported rather than silently repacking a larger scope than
 /// what was shown.
 struct RepackPreview {
-    rooms: Vec<[u8; 16]>,
+    collections: Vec<[u8; 16]>,
     shards: Vec<u16>,
 }
 
 enum RepackTarget {
-    Room([u8; 16]),
+    Collection([u8; 16]),
     Shards(Vec<u16>),
     All,
 }
@@ -1468,11 +1490,14 @@ fn resolve_repack_target(
     target: &RepackTarget,
 ) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
     match target {
-        RepackTarget::Room(room_id) => {
-            if store.room_index_info(room_id).is_none() {
-                bail!("room {} not found", hex_encode(room_id));
+        RepackTarget::Collection(collection_id) => {
+            if store.collection_index_info(collection_id).is_none() {
+                bail!("collection {} not found", hex_encode(collection_id));
             }
-            Ok((vec![*room_id], store.room_referenced_shards(room_id)))
+            Ok((
+                vec![*collection_id],
+                store.collection_referenced_shards(collection_id),
+            ))
         }
         RepackTarget::Shards(shard_ids) => resolve_repack_shards(store, shard_ids),
         RepackTarget::All => {
@@ -1490,14 +1515,17 @@ fn resolve_repack_shards(
     store: &PackfileStorage,
     shard_ids: &[u16],
 ) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
-    let mut rooms = std::collections::BTreeSet::new();
+    let mut collections = std::collections::BTreeSet::new();
     let mut shards = std::collections::BTreeSet::new();
     for shard_id in shard_ids {
         let (closure_rooms, closure_shards) = store.repack_closure(*shard_id)?;
-        rooms.extend(closure_rooms);
+        collections.extend(closure_rooms);
         shards.extend(closure_shards);
     }
-    Ok((rooms.into_iter().collect(), shards.into_iter().collect()))
+    Ok((
+        collections.into_iter().collect(),
+        shards.into_iter().collect(),
+    ))
 }
 
 fn repack_preview(
@@ -1508,8 +1536,8 @@ fn repack_preview(
     println!("preflight: scanning shards and rebuilding live indexes...");
     let preview_store = open_store_read_only(cli)?;
     println!("preflight: resolving shard closure...");
-    let (rooms, shards) = resolve_repack_target(&preview_store, target)?;
-    if rooms.is_empty() {
+    let (collections, shards) = resolve_repack_target(&preview_store, target)?;
+    if collections.is_empty() {
         match target {
             RepackTarget::Shards(shard_ids) => {
                 let slots = shard_ids
@@ -1517,10 +1545,10 @@ fn repack_preview(
                     .map(u16::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!("no rooms reference selected shards: {slots}");
+                println!("no collections reference selected shards: {slots}");
             }
-            RepackTarget::All => println!("no rooms found in active shards"),
-            RepackTarget::Room(_) => {}
+            RepackTarget::All => println!("no collections found in active shards"),
+            RepackTarget::Collection(_) => {}
         }
         return Ok(None);
     }
@@ -1529,16 +1557,16 @@ fn repack_preview(
     let mut total_dropped = 0usize;
     let mut total_dropped_bytes = 0u64;
     println!(
-        "preflight: scanning {} shard{} for {} room{}...",
+        "preflight: scanning {} shard{} for {} collection{}...",
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
-        rooms.len(),
-        if rooms.len() == 1 { "" } else { "s" },
+        collections.len(),
+        if collections.len() == 1 { "" } else { "s" },
     );
     let plans = if topo {
-        preview_store.plan_rooms_repack(&rooms, extract_matrix_edges)?
+        preview_store.plan_rooms_repack(&collections, extract_matrix_edges)?
     } else {
-        preview_store.plan_rooms_repack(&rooms, |_hash, _data| Vec::new())?
+        preview_store.plan_rooms_repack(&collections, |_hash, _data| Vec::new())?
     };
     for plan in plans {
         total_kept = total_kept.saturating_add(plan.kept);
@@ -1561,9 +1589,9 @@ fn repack_preview(
     });
 
     println!(
-        "this will repack {} room{} across {} shard{} (slots: {shard_slots})",
-        rooms.len(),
-        if rooms.len() == 1 { "" } else { "s" },
+        "this will repack {} collection{} across {} shard{} (slots: {shard_slots})",
+        collections.len(),
+        if collections.len() == 1 { "" } else { "s" },
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
     );
@@ -1584,9 +1612,9 @@ fn repack_preview(
         fmt_bytes(total_input_bytes)
     );
     println!(
-        "expected result: {total_kept} nodes across {} room{} rewritten",
-        rooms.len(),
-        if rooms.len() == 1 { "" } else { "s" }
+        "expected result: {total_kept} nodes across {} collection{} rewritten",
+        collections.len(),
+        if collections.len() == 1 { "" } else { "s" }
     );
     println!(
         "                 {total_dropped} nodes / {} pruned",
@@ -1596,42 +1624,45 @@ fn repack_preview(
     // here, before the confirmation prompt — nothing about a
     // read-only open blocks a real writer anyway, but there's no
     // reason to keep it open through an indefinite human pause.
-    Ok(Some(RepackPreview { rooms, shards }))
+    Ok(Some(RepackPreview {
+        collections,
+        shards,
+    }))
 }
 
 fn repack_rooms(
     store: &PackfileStorage,
-    rooms: &[[u8; 16]],
+    collections: &[[u8; 16]],
     topo: bool,
 ) -> anyhow::Result<(usize, usize)> {
     let results = if topo {
         store.repack_rooms_reachable_with_progress(
-            rooms,
+            collections,
             extract_matrix_edges,
-            |room_id, from, to, nodes, complete| {
+            |collection_id, from, to, nodes, complete| {
                 if complete {
                     println!("  copy complete: {nodes} nodes; output slot {to} active");
                 } else {
-                    let room_id = room_id.expect("rotation progress has a room");
+                    let collection_id = collection_id.expect("rotation progress has a collection");
                     println!(
-                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying room {}",
-                        hex_encode(&room_id),
+                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying collection {}",
+                        hex_encode(&collection_id),
                     );
                 }
             },
         )?
     } else {
         store.repack_rooms_reachable_with_progress(
-            rooms,
+            collections,
             |_hash, _data| Vec::new(),
-            |room_id, from, to, nodes, complete| {
+            |collection_id, from, to, nodes, complete| {
                 if complete {
                     println!("  copy complete: {nodes} nodes; output slot {to} active");
                 } else {
-                    let room_id = room_id.expect("rotation progress has a room");
+                    let collection_id = collection_id.expect("rotation progress has a collection");
                     println!(
-                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying room {}",
-                        hex_encode(&room_id),
+                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying collection {}",
+                        hex_encode(&collection_id),
                     );
                 }
             },
@@ -1643,7 +1674,7 @@ fn repack_rooms(
             (k.saturating_add(kept), d.saturating_add(dropped))
         });
     println!(
-        "done: {} rooms repacked in one shard batch, {final_kept} kept, {final_dropped} dropped",
+        "done: {} collections repacked in one shard batch, {final_kept} kept, {final_dropped} dropped",
         results.len()
     );
     Ok((final_kept, final_dropped))
@@ -1664,23 +1695,23 @@ fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Re
     // read-only preview above is, by construction, a snapshot that could
     // be arbitrarily stale by the time a human finishes reading it.
     let store = open_store(cli)?;
-    let (rooms, touched_shards) = resolve_repack_target(&store, target)?;
-    if rooms.is_empty() {
-        println!("repack target is no longer referenced by any room — nothing to do");
+    let (collections, touched_shards) = resolve_repack_target(&store, target)?;
+    if collections.is_empty() {
+        println!("repack target is no longer referenced by any collection — nothing to do");
         return Ok(());
     }
-    let grew = rooms.iter().any(|r| !preview.rooms.contains(r))
+    let grew = collections.iter().any(|r| !preview.collections.contains(r))
         || touched_shards.iter().any(|s| !preview.shards.contains(s));
     if grew {
         println!(
-            "note: the closure grew since the preview (now {} rooms / {} shards) — repacking the current, authoritative closure",
-            rooms.len(),
+            "note: the closure grew since the preview (now {} collections / {} shards) — repacking the current, authoritative closure",
+            collections.len(),
             touched_shards.len()
         );
     }
 
-    repack_rooms(&store, &rooms, topo)?;
-    // `cmd_shards` deliberately reads the persisted shard→room directory
+    repack_rooms(&store, &collections, topo)?;
+    // `cmd_shards` deliberately reads the persisted shard→collection directory
     // instead of reopening and scanning every packfile. Refresh it before
     // the immediate post-repack table so freshly-created rotations have
     // real node counts rather than `?`.
@@ -1715,39 +1746,44 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId
     edges
 }
 
-fn cmd_delete(cli: &Cli, rooms: &[String], yes: bool) -> anyhow::Result<()> {
-    let mut room_ids: Vec<[u8; 16]> = rooms
+fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
+    let mut collection_ids: Vec<[u8; 16]> = collections
         .iter()
-        .map(|room| parse_room_id(room))
+        .map(|collection| parse_room_id(collection))
         .collect::<anyhow::Result<_>>()?;
-    room_ids.sort_unstable();
-    room_ids.dedup();
+    collection_ids.sort_unstable();
+    collection_ids.dedup();
 
     if !yes {
         println!(
-            "This will permanently delete all data for {} room(s):",
-            room_ids.len()
+            "This will permanently delete all data for {} collection(s):",
+            collection_ids.len()
         );
-        for room_id in &room_ids {
-            println!("  {}", hex_encode(room_id));
+        for collection_id in &collection_ids {
+            println!("  {}", hex_encode(collection_id));
         }
-        if !confirm("Delete these rooms?")? {
+        if !confirm("Delete these collections?")? {
             println!("aborted");
             return Ok(());
         }
     }
 
     let store = open_store(cli)?;
-    for room_id in room_ids {
-        let count = store.room_index_info(&room_id).map_or(0, |(len, _)| len);
-        store.delete_room(&room_id)?;
-        println!("deleted {count} nodes for room {}", hex_encode(&room_id));
+    for collection_id in collection_ids {
+        let count = store
+            .collection_index_info(&collection_id)
+            .map_or(0, |(len, _)| len);
+        store.delete_room(&collection_id)?;
+        println!(
+            "deleted {count} nodes for collection {}",
+            hex_encode(&collection_id)
+        );
     }
     Ok(())
 }
 
 /// Opens the store as writer (which always does a full scan and builds
-/// the shard→room directory and shard stats in memory regardless of
+/// the shard→collection directory and shard stats in memory regardless of
 /// whether either has ever been persisted), then persists both —
 /// bootstrapping `shard_stats.bin`/`shard_rooms.bin` for a store whose
 /// writer process has never called `sync_all`, or just refreshing them
@@ -1755,7 +1791,7 @@ fn cmd_delete(cli: &Cli, rooms: &[String], yes: bool) -> anyhow::Result<()> {
 fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
     let store = open_store(cli)?;
     store.sync_all()?;
-    eprintln!("synced: persisted shard IO stats and shard\u{2192}room directory");
+    eprintln!("synced: persisted shard IO stats and shard\u{2192}collection directory");
     Ok(())
 }
 

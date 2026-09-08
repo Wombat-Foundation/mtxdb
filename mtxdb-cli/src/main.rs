@@ -15,12 +15,12 @@ pub(crate) struct Cli {
 
 pub(crate) enum Commands {
     Put {
-        room: String,
+        collection: String,
         id: String,
         data: String,
     },
     Get {
-        room: Option<String>,
+        collection: Option<String>,
         id: String,
     },
     Collections {
@@ -30,27 +30,27 @@ pub(crate) enum Commands {
         all: bool,
     },
     Info {
-        room: String,
+        collection: String,
     },
     Scan {
         shard: String,
     },
     Import {
         paths: Vec<PathBuf>,
-        room: Option<String>,
+        collection: Option<String>,
     },
     Export {
-        room: String,
+        collection: String,
     },
     Repack {
-        room: Option<String>,
+        collection: Option<String>,
         shards: Vec<String>,
         all: bool,
         root: Vec<String>,
         topo: bool,
     },
     Delete {
-        rooms: Vec<String>,
+        collections: Vec<String>,
         yes: bool,
     },
     Completions {
@@ -155,7 +155,11 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("info")
                 .about("Show storage info for a collection")
-                .arg(Arg::new("room").required(true).value_name("ROOM")),
+                .arg(
+                    Arg::new("collection")
+                        .required(true)
+                        .value_name("COLLECTION"),
+                ),
         )
         .subcommand(sub_delete())
         .subcommand(sub_put())
@@ -169,7 +173,7 @@ fn sub_import() -> Command {
             "Import Matrix federation events from a JSON document or JSONL event stream. A JSON \
              document must contain a `pdus` array, an `auth_chain` array, or both; a `.jsonl` \
              file contains one event per line. Each imported event needs an `event_id`. The \
-             namespace comes from `room_id` unless --room is supplied.",
+             namespace comes from `collection_id` unless --collection is supplied.",
         )
         .arg(
             Arg::new("path")
@@ -179,10 +183,10 @@ fn sub_import() -> Command {
                 .help("Matrix federation JSON documents or JSONL event streams"),
         )
         .arg(
-            Arg::new("room")
+            Arg::new("collection")
                 .short('r')
-                .long("room")
-                .help("Room ID (hex, 32 chars). Auto-detected if omitted"),
+                .long("collection")
+                .help("Collection ID (hex, 32 chars). Auto-detected if omitted"),
         )
 }
 
@@ -194,10 +198,10 @@ fn sub_export() -> Command {
              output to make an input accepted by `mtxdb import`.",
         )
         .arg(
-            Arg::new("room")
+            Arg::new("collection")
                 .required(true)
-                .value_name("ROOM")
-                .help("Room ID (hex, 32 chars)"),
+                .value_name("COLLECTION")
+                .help("Collection ID (hex, 32 chars)"),
         )
 }
 
@@ -205,26 +209,28 @@ fn sub_repack() -> Command {
     Command::new("repack")
         .about("Trigger manual repack over closure of collection or shard closure")
         .arg(
-            Arg::new("room")
+            Arg::new("collection")
                 .short('r')
-                .long("room")
+                .long("collection")
                 .conflicts_with("shard"),
         )
         .arg(
             Arg::new("shard")
                 .short('s')
                 .long("shard")
-                .conflicts_with("room")
+                .conflicts_with("collection")
                 .num_args(1..)
                 .value_name("SLOT | START-END")
-                .help("Repack rooms referencing shard slots (for example: -s 0 1 2 or -s 0-3)"),
+                .help(
+                    "Repack collections referencing shard slots (for example: -s 0 1 2 or -s 0-3)",
+                ),
         )
         .arg(
             Arg::new("all")
                 .long("all")
-                .conflicts_with_all(["room", "shard"])
+                .conflicts_with_all(["collection", "shard"])
                 .action(ArgAction::SetTrue)
-                .help("Repack every room in every active shard"),
+                .help("Repack every collection in every active shard"),
         )
         .arg(Arg::new("root").short('o').long("root").num_args(1..))
         .arg(
@@ -239,10 +245,10 @@ fn sub_delete() -> Command {
     Command::new("delete")
         .about("Delete all data for one or more collections")
         .arg(
-            Arg::new("room")
+            Arg::new("collection")
                 .required(true)
                 .num_args(1..)
-                .value_name("ROOM")
+                .value_name("COLLECTION")
                 .help("Namespace IDs to delete"),
         )
         .arg(
@@ -256,7 +262,12 @@ fn sub_delete() -> Command {
 fn sub_put() -> Command {
     Command::new("put")
         .about("Insert a record")
-        .arg(Arg::new("room").short('r').long("room").required(true))
+        .arg(
+            Arg::new("collection")
+                .short('r')
+                .long("collection")
+                .required(true),
+        )
         .arg(Arg::new("id").short('i').long("id").required(true))
         .arg(Arg::new("data").short('a').long("data").required(true))
 }
@@ -264,7 +275,7 @@ fn sub_put() -> Command {
 fn sub_get() -> Command {
     Command::new("get")
         .about("Retrieve a record")
-        .arg(Arg::new("room").short('r').long("room"))
+        .arg(Arg::new("collection").short('r').long("collection"))
         .arg(
             Arg::new("id")
                 .short('i')
@@ -296,12 +307,12 @@ fn parse_cli() -> Cli {
 
     let command = match matches.subcommand() {
         Some(("put", m)) => Commands::Put {
-            room: m.get_one::<String>("room").unwrap().clone(),
+            collection: m.get_one::<String>("collection").unwrap().clone(),
             id: m.get_one::<String>("id").unwrap().clone(),
             data: m.get_one::<String>("data").unwrap().clone(),
         },
         Some(("get", m)) => Commands::Get {
-            room: m.get_one::<String>("room").cloned(),
+            collection: m.get_one::<String>("collection").cloned(),
             id: m.get_one::<String>("id").unwrap().clone(),
         },
         Some(("collections", m)) => Commands::Collections {
@@ -311,7 +322,7 @@ fn parse_cli() -> Cli {
             all: m.get_flag("all"),
         },
         Some(("info", m)) => Commands::Info {
-            room: m.get_one::<String>("room").unwrap().clone(),
+            collection: m.get_one::<String>("collection").unwrap().clone(),
         },
         Some(("scan", m)) => Commands::Scan {
             shard: m.get_one::<String>("shard").unwrap().clone(),
@@ -322,13 +333,13 @@ fn parse_cli() -> Cli {
                 .unwrap()
                 .map(PathBuf::from)
                 .collect(),
-            room: m.get_one::<String>("room").cloned(),
+            collection: m.get_one::<String>("collection").cloned(),
         },
         Some(("export", m)) => Commands::Export {
-            room: m.get_one::<String>("room").unwrap().clone(),
+            collection: m.get_one::<String>("collection").unwrap().clone(),
         },
         Some(("repack", m)) => Commands::Repack {
-            room: m.get_one::<String>("room").cloned(),
+            collection: m.get_one::<String>("collection").cloned(),
             shards: m
                 .get_many::<String>("shard")
                 .into_iter()
@@ -345,7 +356,11 @@ fn parse_cli() -> Cli {
             topo: m.get_flag("topo"),
         },
         Some(("delete", m)) => Commands::Delete {
-            rooms: m.get_many::<String>("room").unwrap().cloned().collect(),
+            collections: m
+                .get_many::<String>("collection")
+                .unwrap()
+                .cloned()
+                .collect(),
             yes: m.get_flag("yes"),
         },
         Some(("completions", m)) => Commands::Completions {
