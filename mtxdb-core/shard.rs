@@ -115,6 +115,15 @@ const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
 /// Header size: magic(4) + version(1) + `persisted_at`(8).
 const STATS_HEADER_LEN: usize = 4 + 1 + 8;
 
+/// Pool metadata filename — persists the `next_pack_id` high-water mark
+/// so a restarted process never reuses a `pack_id` that was already
+/// assigned, even if all shards from that range have been retired and
+/// deleted.
+const POOL_META_FILENAME: &str = "pool.meta";
+
+/// Pool metadata format version.
+const POOL_META_VERSION: u8 = 1;
+
 /// Disambiguates concurrent `persist_stats` tmp filenames within this
 /// process (paired with the process id, which disambiguates across
 /// processes sharing the same `base_dir`).
@@ -437,7 +446,14 @@ impl ShardPool {
 
         let highest_active = next_slot.saturating_sub(1);
 
-        // If no shards exist, create the initial shard 0 — but a read-only
+        // Restore next_pack_id from pool.meta if available, falling back
+        // to max_pack_id computed from discovered files. The meta file
+        // survives retired-and-deleted shards, so it's strictly more
+        // conservative than the file scan.
+        let mut next_pack_id = Self::restore_pool_meta(&base_dir)
+            .map_or(max_pack_id, |persisted| persisted.max(max_pack_id));
+
+        // If no shards exist, create the initial shard — but a read-only
         // open of a store that doesn't exist yet makes no sense; error
         // instead of a read-only pool silently creating on-disk state.
         if shards.iter().all(std::option::Option::is_none) {
@@ -450,11 +466,12 @@ impl ShardPool {
                     ),
                 ));
             }
-            let path = Self::shard_path(&base_dir, 0);
-            let file = packfile::open_packfile(&path, true, 0)?;
+            let pack_id = next_pack_id;
+            let path = Self::shard_path(&base_dir, pack_id);
+            let file = packfile::open_packfile(&path, true, pack_id)?;
             let file_len = file.metadata()?.len();
-            shards[0] = Some(Arc::new(Shard::new(0, 0, file, path, file_len)));
-            max_pack_id = 1;
+            shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
+            next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
         }
 
         // Restoring is a pure read of shard_stats.bin applied to our own
@@ -472,7 +489,7 @@ impl ShardPool {
             rotation_lock: parking_lot::Mutex::new(()),
             base_dir,
             dirty: parking_lot::Mutex::new(HashSet::new()),
-            next_pack_id: AtomicU64::new(max_pack_id),
+            next_pack_id: AtomicU64::new(next_pack_id),
             retired_count: AtomicU64::new(0),
             room_home: RwLock::new(HashMap::new()),
             stats_persisted_at: RwLock::new(stats_persisted_at),
@@ -610,6 +627,55 @@ impl ShardPool {
     /// Path to the persisted stats snapshot for a base directory.
     fn stats_path(base_dir: &Path) -> PathBuf {
         base_dir.join(STATS_FILENAME)
+    }
+
+    /// On-disk path for the pool metadata file.
+    fn pool_meta_path(base_dir: &Path) -> PathBuf {
+        base_dir.join(POOL_META_FILENAME)
+    }
+
+    /// Persist `next_pack_id` to `pool.meta` using an atomic
+    /// tmp+rename pattern. Must be called after every successful
+    /// `rotate_locked` (which increments `next_pack_id`).
+    fn persist_pool_meta(&self) -> io::Result<()> {
+        let next = self.next_pack_id.load(Ordering::Relaxed);
+        let mut buf = Vec::with_capacity(13);
+        buf.extend_from_slice(b"PMeta");
+        buf.push(POOL_META_VERSION);
+        buf.extend_from_slice(&next.to_le_bytes());
+
+        let final_path = Self::pool_meta_path(&self.base_dir);
+        let tmp_path = final_path.with_extension(format!("meta.tmp.{}", std::process::id()));
+        let write_result = (|| -> io::Result<()> {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(&buf)?;
+            tmp.sync_all()
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Restore `next_pack_id` from `pool.meta` if it exists. Returns
+    /// the persisted `next_pack_id`, or `None` if no meta file is
+    /// present or it is unreadable/corrupt.
+    fn restore_pool_meta(base_dir: &Path) -> Option<u64> {
+        let path = Self::pool_meta_path(base_dir);
+        let data = fs::read(&path).ok()?;
+        if data.len() < 13 {
+            return None;
+        }
+        if &data[0..5] != b"PMeta" {
+            return None;
+        }
+        if data[5] != POOL_META_VERSION {
+            return None;
+        }
+        let bytes: [u8; 8] = data[6..14].try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
     }
 
     /// Load a persisted stats snapshot, if one exists, and restore each
@@ -1075,6 +1141,14 @@ impl ShardPool {
                 )));
                 drop(shards);
                 *self.active_write.lock() = candidate;
+                // Persist the new next_pack_id so a restart never reuses
+                // this pack_id, even if the shard file is later retired
+                // and deleted before the next stats flush.
+                if self.writable {
+                    if let Err(e) = self.persist_pool_meta() {
+                        eprintln!("mtxdb: failed to persist pool metadata: {e}");
+                    }
+                }
                 return Ok(());
             }
         }
@@ -1828,6 +1902,70 @@ mod tests {
             }
             Ok(_) => panic!("expected Unsupported error for v3 filename"),
         }
+    }
+
+    /// `pool.meta` persists `next_pack_id` across restarts so a
+    /// reopened pool never reuses a `pack_id` that was already assigned,
+    /// even if all shards from that range have been retired and deleted.
+    #[test]
+    fn test_pool_meta_persists_next_pack_id_across_restarts() {
+        let dir = test_dir("pool_meta_persist");
+        let pool = ShardPool::open(dir.clone()).unwrap();
+
+        // Initial state: pool.meta does not exist yet, next_pack_id = 0.
+        assert!(
+            !ShardPool::pool_meta_path(&dir).exists(),
+            "pool.meta should not exist on a fresh pool"
+        );
+
+        // Create shard 0 (pack_id 0) so rotation has something to work with.
+        let record = test_record(0x01, 0xAA, b"first");
+        pool.put_record(&record).unwrap();
+
+        // Force a rotation — this creates pack_id 1 and persists pool.meta.
+        pool.rotate().unwrap();
+        pool.put_record(&test_record(0x02, 0xBB, b"second"))
+            .unwrap();
+
+        // pool.meta should now exist with next_pack_id = 2.
+        assert!(ShardPool::pool_meta_path(&dir).exists());
+        let restored = ShardPool::restore_pool_meta(&dir);
+        assert_eq!(
+            restored,
+            Some(2),
+            "pool.meta should contain next_pack_id = 2"
+        );
+
+        // Delete all shard files to simulate full retirement.
+        drop(pool);
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "pack") {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+
+        // Reopen: pool.meta survives, so next_pack_id must be >= 2
+        // even though no shard files remain.
+        let pool2 = ShardPool::open(dir.clone()).unwrap();
+        assert!(
+            pool2.next_pack_id.load(Ordering::Relaxed) >= 2,
+            "pool.meta must prevent pack_id reuse after all shards are deleted"
+        );
+
+        // Creating a new shard should get pack_id 2 (not 0).
+        let record = test_record(0x03, 0xCC, b"after restart");
+        let (_, offset) = pool2.put_record(&record).unwrap();
+        assert!(offset > 0, "record should have been written");
+
+        // Verify pack_id 2 was assigned to the new shard.
+        let summaries = pool2.summaries();
+        assert!(
+            summaries.iter().any(|s| s.pack_id == 2),
+            "new shard should have pack_id 2, got: {:?}",
+            summaries.iter().map(|s| s.pack_id).collect::<Vec<_>>()
+        );
     }
 
     /// A retired shard's file must survive as long as any `Arc<Shard>`
