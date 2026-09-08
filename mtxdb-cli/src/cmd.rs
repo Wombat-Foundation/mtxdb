@@ -142,6 +142,19 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
+/// Resolve either the fixed-width storage key or a Matrix event ID. Imported
+/// Matrix events use the first 128 bits of `BLAKE3(event_id)` as their key.
+fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
+    if id.starts_with('$') {
+        let hash = blake3::hash(id.as_bytes());
+        let mut node_id = [0_u8; 16];
+        node_id.copy_from_slice(&hash.as_bytes()[..16]);
+        Ok(node_id)
+    } else {
+        parse_node_id(id)
+    }
+}
+
 /// Open the store as its exclusive writer. Fails fast if another process
 /// (e.g. a live embedder) already holds the writer lock — required for
 /// any command that mutates data.
@@ -190,7 +203,7 @@ fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_get(cli: &Cli, room: Option<&str>, id: &str) -> anyhow::Result<()> {
-    let node_id = parse_node_id(id)?;
+    let node_id = parse_get_id(id)?;
     let store = open_store_read_only(cli)?;
     let matches: Vec<([u8; 16], NodeData)> = match room {
         Some(room) => {
@@ -299,10 +312,9 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
 }
 
 /// Deliberately bypasses both `PackfileStorage` and `ShardPool` — it
-/// needs no room data and no open file handles. Instead it globs shard
-/// filenames for size/epoch, then decodes `shard_stats.bin` directly
-/// for the IO/sync counters. Zero `File::open` calls; the only I/O is
-/// `stat()` per shard file and one read of the small stats snapshot.
+/// needs no room data and no packfile reads. Instead it globs shard
+/// filenames for size/epoch, then decodes the small `shard_stats.bin` and
+/// `shard_rooms.bin` sidecars for counters and live-node counts.
 /// Safe to run against a directory a live writer process owns.
 fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
@@ -315,8 +327,8 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
-    let node_counts = open_store_read_only(cli)?.shard_node_counts();
-    print_shard_table(&shard_entries, &stats_map, &node_counts);
+    let node_counts = PackfileStorage::shard_node_counts_from_disk(dir);
+    print_shard_table(&shard_entries, &stats_map, node_counts.as_ref());
     println!(
         "{} shard(s), {}",
         shard_entries.len(),
@@ -399,7 +411,7 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 fn print_shard_table(
     shard_entries: &[(u16, u64, u64)],
     stats_map: &ShardStatsMap,
-    node_counts: &std::collections::HashMap<u16, u64>,
+    node_counts: Option<&std::collections::HashMap<u16, u64>>,
 ) {
     const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
@@ -410,12 +422,15 @@ fn print_shard_table(
     for &(slot_id, epoch, file_bytes) in shard_entries {
         let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
         let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
+        let nodes = node_counts
+            .and_then(|counts| counts.get(&slot_id))
+            .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
             "{:>6}  {:>18}  {:>10}  {:>8}  {:>8}  {:>10}  {:>6}",
             slot_id,
             format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
-            node_counts.get(&slot_id).copied().unwrap_or(0),
+            nodes,
             wc,
             fmt_bytes(bw),
             sc,
@@ -464,12 +479,80 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
             println!("room {hex}: {len} nodes, {} index RAM", fmt_megabytes(mem));
+            let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+            let details = matrix_room_details(&store, dir, &room_id)?;
+            if let Some(matrix_room_id) = details.room_id {
+                println!("  Matrix room: {matrix_room_id}");
+            }
+            if let Some(create) = details.create {
+                println!("  create: {create}");
+            }
         }
         None => {
             eprintln!("room {hex}: not found");
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct MatrixRoomDetails {
+    room_id: Option<String>,
+    create: Option<String>,
+}
+
+/// Find the human-facing Matrix metadata carried by live JSON events. Pack
+/// scans can contain superseded frames, so every candidate is resolved through
+/// the room's live index before being inspected.
+fn matrix_room_details(
+    store: &PackfileStorage,
+    dir: &Path,
+    room_id: &[u8; 16],
+) -> anyhow::Result<MatrixRoomDetails> {
+    let mut details = MatrixRoomDetails::default();
+    let mut seen = std::collections::HashSet::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "pack")
+        {
+            continue;
+        }
+        for (record_room_id, node_id, _) in mtxdb_core::packfile::scan_packfile(&path)? {
+            if &record_room_id != room_id || !seen.insert(node_id) {
+                continue;
+            }
+            let Some(data) = store.get(room_id, &node_id)? else {
+                continue;
+            };
+            let mut bytes = data.bytes.to_vec();
+            let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
+                continue;
+            };
+            if details.room_id.is_none() {
+                details.room_id = event_room_id(&event).map(str::to_owned);
+            }
+            if details.create.is_none() && event["type"].as_str() == Some("m.room.create") {
+                let event_id = event_id(&event).unwrap_or("<missing event_id>");
+                let sender = event["sender"].as_str().unwrap_or("<missing sender>");
+                let creator = event["content"]["creator"].as_str();
+                let version = event["content"]["room_version"].as_str();
+                let mut create = format!("{event_id} by {sender}");
+                if let Some(creator) = creator {
+                    let _ = write!(create, "; creator {creator}");
+                }
+                if let Some(version) = version {
+                    let _ = write!(create, "; room version {version}");
+                }
+                details.create = Some(create);
+            }
+            if details.room_id.is_some() && details.create.is_some() {
+                return Ok(details);
+            }
+        }
+    }
+    Ok(details)
 }
 
 fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
@@ -520,39 +603,17 @@ fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyho
         .extension()
         .is_some_and(|extension| extension == "jsonl");
     let (events, detected_room) = if is_jsonl {
-        let text = std::str::from_utf8(&content)
-            .with_context(|| format!("{} is not valid UTF-8 JSONL", path.display()))?;
-        let mut events = Vec::new();
-        for (line_number, line) in text.lines().enumerate() {
-            let line_number = line_number
-                .checked_add(1)
-                .context("JSONL line number overflow")?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut bytes = line.as_bytes().to_vec();
-            let event = simd_json::to_owned_value(&mut bytes)
-                .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
-            events.push(event);
+        match parse_jsonl_events(&content) {
+            Ok(events) => events,
+            Err(jsonl_error) => match parse_federation_events(&content) {
+                // Some existing DAG exports carry a `.jsonl` suffix despite
+                // being a pretty-printed federation JSON document.
+                Ok(events) => events,
+                Err(_) => return Err(jsonl_error),
+            },
         }
-        let detected_room = events.iter().find_map(event_room_id).map(str::to_owned);
-        (events, detected_room)
     } else {
-        let mut content = content;
-        let val: OwnedValue = simd_json::to_owned_value(&mut content).context("invalid JSON")?;
-        let detected_room = event_room_id(&val).map(str::to_owned);
-        let pdus = val["pdus"].as_array();
-        let auth_chain = val["auth_chain"].as_array();
-        if pdus.is_none() && auth_chain.is_none() {
-            bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array, or a .jsonl file containing one event per line");
-        }
-        let events = [pdus, auth_chain]
-            .into_iter()
-            .flatten()
-            .flat_map(|events| events.iter().cloned())
-            .collect();
-        (events, detected_room)
+        parse_federation_events(&content)?
     };
 
     if events.is_empty() {
@@ -623,6 +684,43 @@ fn cmd_import_file(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyho
     }
 
     Ok(())
+}
+
+fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
+    let text = std::str::from_utf8(content).context("input is not valid UTF-8 JSONL")?;
+    let mut events = Vec::new();
+    for (line_number, line) in text.lines().enumerate() {
+        let line_number = line_number
+            .checked_add(1)
+            .context("JSONL line number overflow")?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut bytes = line.as_bytes().to_vec();
+        let event = simd_json::to_owned_value(&mut bytes)
+            .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
+        events.push(event);
+    }
+    let detected_room = events.iter().find_map(event_room_id).map(str::to_owned);
+    Ok((events, detected_room))
+}
+
+fn parse_federation_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
+    let mut bytes = content.to_vec();
+    let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
+    let detected_room = event_room_id(&val).map(str::to_owned);
+    let pdus = val["pdus"].as_array();
+    let auth_chain = val["auth_chain"].as_array();
+    if pdus.is_none() && auth_chain.is_none() {
+        bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array, or a .jsonl file containing one event per line");
+    }
+    let events = [pdus, auth_chain]
+        .into_iter()
+        .flatten()
+        .flat_map(|events| events.iter().cloned())
+        .collect();
+    Ok((events, detected_room))
 }
 
 fn event_room_id(value: &OwnedValue) -> Option<&str> {

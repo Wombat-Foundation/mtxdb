@@ -806,6 +806,35 @@ impl PackfileStorage {
         result
     }
 
+    /// Current live-node count per shard from the persisted shard→room
+    /// directory, without opening packfiles or rebuilding room indexes.
+    ///
+    /// Returns `None` when the directory has not been persisted yet or is
+    /// malformed. Callers that need an authoritative fresh count can then
+    /// explicitly open the store and rebuild its indexes instead.
+    #[must_use]
+    pub fn shard_node_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
+        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
+        if buf.len() < SHARD_ROOMS_HEADER_LEN
+            || &buf[0..4] != SHARD_ROOMS_MAGIC
+            || buf[4] != SHARD_ROOMS_VERSION
+        {
+            return None;
+        }
+        let body = &buf[SHARD_ROOMS_HEADER_LEN..];
+        if body.len() % SHARD_ROOMS_RECORD_LEN != 0 {
+            return None;
+        }
+        let mut totals = HashMap::new();
+        for chunk in body.chunks_exact(SHARD_ROOMS_RECORD_LEN) {
+            let shard_id = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
+            let count = u64::from_le_bytes(chunk[18..26].try_into().ok()?);
+            let total = totals.entry(shard_id).or_insert(0_u64);
+            *total = total.saturating_add(count);
+        }
+        Some(totals)
+    }
+
     /// Unix-seconds timestamp of the persisted shard→room directory, if
     /// one exists — lets a reader (e.g. a `rooms` CLI listing) label how
     /// stale the counts it's showing are, the same way

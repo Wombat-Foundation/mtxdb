@@ -201,7 +201,13 @@ fn sub_get() -> Command {
     Command::new("get")
         .about("Retrieve a record")
         .arg(Arg::new("room").short('r').long("room"))
-        .arg(Arg::new("id").short('i').long("id").required(true))
+        .arg(
+            Arg::new("id")
+                .short('i')
+                .long("id")
+                .required(true)
+                .help("Node ID (32 hex characters) or Matrix event ID"),
+        )
 }
 
 fn parse_cli() -> Cli {
