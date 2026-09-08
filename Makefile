@@ -14,6 +14,9 @@ _help:
 # Format, lint, and make docs
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+.PHONY: all
+	all: format lint fix doc test install
+
 .PHONY: format
 format: ##H Format code
 	-prettier -w $$(git ls-files '*.md' '*.y*ml' '*.json')
