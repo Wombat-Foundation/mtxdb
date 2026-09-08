@@ -55,11 +55,9 @@ const CRC_COVERED_LEN: usize = 4 // magic
 /// agree, and a mismatch means something outside mtxdb moved this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardHeader {
-    /// The shard slot id this file was created for.
-    pub shard_id: u16,
+    /// Pool-local slot this file was created for.
+    pub slot: u16,
     /// Global epoch assigned when this shard file was created.
-    ///
-    /// An epoch distinguishes different incarnations of a reusable slot.
     pub epoch: u64,
     /// Unix-seconds creation timestamp.
     pub created_at: u64,
@@ -497,7 +495,7 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     let created_at = u64::from_le_bytes(buf[19..27].try_into().unwrap());
 
     Ok(Some(ShardHeader {
-        shard_id,
+        slot: shard_id,
         epoch,
         created_at,
     }))
@@ -536,7 +534,7 @@ pub fn open_packfile(path: &Path, create: bool, shard_id: u16, epoch: u64) -> io
                 "invalid packfile header",
             ));
         };
-        if header.shard_id != shard_id || header.epoch != epoch {
+        if header.slot != shard_id || header.epoch != epoch {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -544,7 +542,7 @@ pub fn open_packfile(path: &Path, create: bool, shard_id: u16, epoch: u64) -> io
                      but its filename says slot {shard_id} epoch {epoch} — \
                      copied or renamed inconsistently with its own history",
                     path.display(),
-                    header.shard_id,
+                    header.slot,
                     header.epoch,
                 ),
             ));
@@ -837,7 +835,7 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         let header = read_header(&mut cursor).unwrap().expect("valid header");
-        assert_eq!(header.shard_id, 7);
+        assert_eq!(header.slot, 7);
         assert_eq!(header.epoch, 42);
         assert!(header.created_at > 0);
     }

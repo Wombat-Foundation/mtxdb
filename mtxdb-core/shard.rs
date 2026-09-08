@@ -32,7 +32,8 @@ pub type ShardEntry = ([u8; 16], [u8; 16], u64);
 
 /// A single global shard file shared across all rooms.
 pub struct Shard {
-    /// Reusable slot identifier for this shard within the pool.
+    /// Pool-local allocator slot (index into the open-shard table).
+    /// Ephemeral, recycled on retire. Never shown to operators.
     pub slot: u16,
     /// Globally monotonic file epoch, distinct from the slot index.
     /// Ensures a reused slot never collides on-disk with a still-referenced
@@ -86,7 +87,7 @@ pub struct ShardStats {
 /// Basic size, epoch, and IO/sync info for one open shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardSummary {
-    /// Reusable shard slot within the pool.
+    /// Pool-local allocator slot (ephemeral).
     pub slot: u16,
     /// Globally monotonic file epoch for this shard incarnation.
     pub epoch: u64,
