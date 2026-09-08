@@ -56,6 +56,24 @@ fn fmt_megabytes(bytes: usize) -> String {
     format!("{whole}.{fraction:05} MB")
 }
 
+/// Physical disk use, where millibyte precision is enough to distinguish
+/// small records without making large-room listings visually noisy.
+fn fmt_disk_megabytes(bytes: u64) -> String {
+    const BYTES_PER_MB: u64 = 1_000_000;
+    const FRACTION_SCALE: u64 = 1_000;
+
+    let mut whole = bytes / BYTES_PER_MB;
+    let mut fraction = (bytes % BYTES_PER_MB)
+        .saturating_mul(FRACTION_SCALE)
+        .saturating_add(BYTES_PER_MB / 2)
+        / BYTES_PER_MB;
+    if fraction == FRACTION_SCALE {
+        whole = whole.saturating_add(1);
+        fraction = 0;
+    }
+    format!("{whole}.{fraction:03} MB")
+}
+
 /// Sum the physical frames belonging to each room. This is deliberately a
 /// disk-footprint figure: superseded frames remain charged to the room until
 /// a repack reclaims them, while the shard header is shared and unallocated.
@@ -358,7 +376,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         println!(
             "  {i:>4}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
             fmt_megabytes(*memory),
-            fmt_megabytes(usize::try_from(disk).unwrap_or(usize::MAX)),
+            fmt_disk_megabytes(disk),
         );
     }
     println!();
@@ -368,7 +386,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         "total",
         "",
         fmt_megabytes(total_memory),
-        fmt_megabytes(usize::try_from(total_disk_bytes).unwrap_or(usize::MAX)),
+        fmt_disk_megabytes(total_disk_bytes),
     );
     Ok(())
 }
@@ -1667,11 +1685,17 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_megabytes;
+    use super::{fmt_disk_megabytes, fmt_megabytes};
 
     #[test]
     fn index_memory_megabytes_uses_fixed_point_rounding() {
         assert_eq!(fmt_megabytes(524_328), "0.52433 MB");
         assert_eq!(fmt_megabytes(999_999), "1.00000 MB");
+    }
+
+    #[test]
+    fn disk_megabytes_uses_three_fractional_digits() {
+        assert_eq!(fmt_disk_megabytes(42_280), "0.042 MB");
+        assert_eq!(fmt_disk_megabytes(999_999), "1.000 MB");
     }
 }
