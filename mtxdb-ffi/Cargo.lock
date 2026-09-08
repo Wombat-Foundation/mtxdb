@@ -111,6 +111,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "zstd",
+ "zstd-sys",
 ]
 
 [[package]]
