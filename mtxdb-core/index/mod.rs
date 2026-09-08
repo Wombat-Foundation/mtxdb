@@ -235,6 +235,17 @@ impl LossyIndex {
             .wrapping_add(std::mem::size_of::<Self>())
     }
 
+    /// Memory that an index holding `entries` records would use after the
+    /// standard two-times-capacity allocation policy is applied.
+    #[must_use]
+    pub fn memory_usage_for_entries(entries: usize) -> usize {
+        let minimum = entries.saturating_mul(2).max(16);
+        let capacity = minimum.next_power_of_two();
+        capacity
+            .wrapping_mul(std::mem::size_of::<IndexSlot>())
+            .wrapping_add(std::mem::size_of::<Self>())
+    }
+
     /// Returns which shard IDs are referenced by at least one occupied slot.
     ///
     /// Used by shard retirement to determine which shards are still live

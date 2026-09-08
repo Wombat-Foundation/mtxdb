@@ -201,9 +201,9 @@ fn cmd_get(cli: &Cli, room: Option<&str>, id: &str) -> anyhow::Result<()> {
                 .map(|data| vec![(room_id, data)])
                 .unwrap_or_default()
         }
-        None => room_frame_counts(cli.dir.as_deref().unwrap_or_else(|| Path::new(".")))?
+        None => room_ids(cli)?
             .into_iter()
-            .filter_map(|(room_id, _)| match store.get(&room_id, &node_id) {
+            .filter_map(|room_id| match store.get(&room_id, &node_id) {
                 Ok(Some(data)) => Some(Ok((room_id, data))),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
@@ -228,40 +228,32 @@ fn cmd_get(cli: &Cli, room: Option<&str>, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Scan every shard's packfile to count append entries per room — the I/O
-/// (reading record headers) is unavoidable since room ownership only
-/// exists inside the packfile, but this skips building a `LossyIndex`
-/// and `NodeCache` per room, which `open_store_read_only` would do
-/// purely to hand back counts and then throw everything away.
-fn room_frame_counts(dir: &Path) -> anyhow::Result<Vec<([u8; 16], usize)>> {
-    require_store_dir(dir)?;
-    let mut counts: std::collections::HashMap<[u8; 16], usize> = std::collections::HashMap::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "pack") {
-            continue;
-        }
-        let records = mtxdb_core::packfile::scan_packfile(&path)?;
-        for (room_id, _hash, _offset) in &records {
-            counts
-                .entry(*room_id)
-                .and_modify(|count| *count = count.saturating_add(1))
-                .or_insert(1);
-        }
+/// Enumerate live rooms from the persisted directory. Stores created before
+/// that sidecar existed fall back to a one-time index rebuild; `mtxdb sync`
+/// makes future calls fast.
+fn room_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
+    let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    if PackfileStorage::room_directory_persisted_at(dir).is_some() {
+        return Ok(PackfileStorage::room_directory_from_disk(dir)
+            .into_iter()
+            .map(|(room_id, _)| room_id)
+            .collect());
     }
-
-    let mut rooms: Vec<([u8; 16], usize)> = counts.into_iter().collect();
-    rooms.sort_unstable_by_key(|&(id, _)| id);
-    Ok(rooms)
+    Ok(open_store_read_only(cli)?
+        .room_summaries()
+        .into_iter()
+        .map(|(room_id, _, _)| room_id)
+        .collect())
 }
 
 fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
-    let writes: std::collections::HashMap<[u8; 16], usize> =
-        room_frame_counts(dir)?.into_iter().collect();
-    let store = open_store_read_only(cli)?;
-    let rooms = store.room_summaries();
+    let rooms = match PackfileStorage::room_summaries_from_disk(dir) {
+        Some(rooms) => rooms,
+        // Old stores have no sidecar yet. Keep the complete, slower fallback
+        // so `rooms` remains useful until `mtxdb sync` writes one.
+        None => open_store_read_only(cli)?.room_summaries(),
+    };
 
     if rooms.is_empty() {
         eprintln!("no rooms found");
@@ -269,32 +261,27 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
     }
 
     println!(
-        "  {:>4}  {:<34}  {:>7}  {:>10}  {:>7}",
-        "slot", "room", "nodes", "index RAM", "writes"
+        "  {:>4}  {:<34}  {:>7}  {:>10}",
+        "slot", "room", "nodes", "index RAM"
     );
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
-    let mut total_writes = 0_usize;
     for (i, (room_id, nodes, memory)) in rooms.iter().enumerate() {
         let hex = hex_encode(room_id);
-        let count = writes.get(room_id).copied().unwrap_or(0);
         total_nodes = total_nodes
             .checked_add(*nodes)
             .context("total room node count overflow")?;
         total_memory = total_memory
             .checked_add(*memory)
             .context("total room index memory overflow")?;
-        total_writes = total_writes
-            .checked_add(count)
-            .context("total room write count overflow")?;
         println!(
-            "  {i:>4}  0x{hex}  {nodes:>7}  {:>10}  {count:>7}",
+            "  {i:>4}  0x{hex}  {nodes:>7}  {:>10}",
             fmt_megabytes(*memory),
         );
     }
     println!();
     println!(
-        "  {:>4}  {:<34}  {total_nodes:>7}  {:>10}  {total_writes:>7}",
+        "  {:>4}  {:<34}  {total_nodes:>7}  {:>10}",
         "",
         "total",
         fmt_megabytes(total_memory),
@@ -319,7 +306,17 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
 
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
     let node_counts = PackfileStorage::shard_node_counts_from_disk(dir);
-    print_shard_table(&shard_entries, &stats_map, node_counts.as_ref());
+    let room_counts = PackfileStorage::shard_room_counts_from_disk(dir);
+    let total_rooms = room_counts
+        .as_ref()
+        .map(|_| PackfileStorage::room_directory_from_disk(dir).len());
+    print_shard_table(
+        &shard_entries,
+        &stats_map,
+        node_counts.as_ref(),
+        room_counts.as_ref(),
+        total_rooms,
+    );
     println!("* active shard");
     println!(
         "{} shard(s), {}",
@@ -404,6 +401,8 @@ fn print_shard_table(
     shard_entries: &[(u16, u64, u64)],
     stats_map: &ShardStatsMap,
     node_counts: Option<&std::collections::HashMap<u16, u64>>,
+    room_counts: Option<&std::collections::HashMap<u16, u64>>,
+    total_rooms: Option<usize>,
 ) {
     const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
     // `ShardPool::open_internal` restores the highest occupied slot as its
@@ -412,22 +411,23 @@ fn print_shard_table(
     let active_slot = shard_entries.iter().map(|(slot, _, _)| *slot).max();
 
     println!(
-        "{:>6}  {:>18}  {:>10}  {:>8}  {:>14}  {:>15}  {:>6}",
-        "slot", "rotation", "bytes", "nodes", "mileage (MB)", "mileage (IOPs)", "syncs",
+        "{:>6}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
+        "slot", "rotation", "bytes", "nodes", "rooms", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
-    let mut total_mileage_bytes = 0u64;
-    let mut total_mileage_iops = 0u64;
     let mut total_syncs = 0u64;
     for &(slot_id, epoch, file_bytes) in shard_entries {
         let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
-        let (wc, bw, sc) = stats_map.get(&key).copied().unwrap_or_default();
+        let (_, _, sc) = stats_map.get(&key).copied().unwrap_or_default();
         let nodes = node_counts
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
+        let rooms = room_counts
+            .and_then(|counts| counts.get(&slot_id))
+            .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
-            "{:>6}  {:>18}  {:>10}  {:>8}  {:>14}  {:>15}  {:>6}",
+            "{:>6}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
             format!(
                 "{slot_id}{}",
                 if active_slot == Some(slot_id) {
@@ -439,13 +439,10 @@ fn print_shard_table(
             format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
             nodes,
-            fmt_bytes(bw),
-            wc,
+            rooms,
             sc,
         );
         total_bytes = total_bytes.saturating_add(file_bytes);
-        total_mileage_bytes = total_mileage_bytes.saturating_add(bw);
-        total_mileage_iops = total_mileage_iops.saturating_add(wc);
         total_syncs = total_syncs.saturating_add(sc);
         if let (Some(total), Some(counts)) = (&mut total_nodes, node_counts) {
             *total = total.saturating_add(counts.get(&slot_id).copied().unwrap_or(0));
@@ -453,13 +450,12 @@ fn print_shard_table(
     }
     println!();
     println!(
-        "{:>6}  {:>18}  {:>10}  {:>8}  {:>14}  {:>15}  {:>6}",
+        "{:>6}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
         "",
         "total",
         fmt_bytes(total_bytes),
         total_nodes.map_or_else(|| "?".to_owned(), |count| count.to_string()),
-        fmt_bytes(total_mileage_bytes),
-        total_mileage_iops,
+        total_rooms.map_or_else(|| "?".to_owned(), |count| count.to_string()),
         total_syncs,
     );
 }
@@ -491,11 +487,10 @@ fn fmt_duration(secs: u64) -> String {
 fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let room_id = match room.parse::<usize>() {
         Ok(slot) => {
-            let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
-            let rooms = room_frame_counts(dir)?;
+            let rooms = room_ids(cli)?;
             rooms
                 .get(slot)
-                .map(|(room_id, _)| *room_id)
+                .copied()
                 .with_context(|| format!("room slot {slot} not found"))?
         }
         Err(_) => parse_room_id(room)?,

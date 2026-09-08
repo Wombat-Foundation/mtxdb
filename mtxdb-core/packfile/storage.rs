@@ -837,6 +837,26 @@ impl PackfileStorage {
         result
     }
 
+    /// Reads room summaries from the persisted shard→room directory without
+    /// opening packfiles. The node count and index-RAM figure match the
+    /// index rebuilt by [`Self::open`], provided the sidecar is current.
+    ///
+    /// Returns `None` when the directory has not been persisted yet or is
+    /// malformed.
+    #[must_use]
+    pub fn room_summaries_from_disk(
+        base_dir: &std::path::Path,
+    ) -> Option<Vec<([u8; 16], usize, usize)>> {
+        Self::room_directory_persisted_at(base_dir)?;
+        Self::room_directory_from_disk(base_dir)
+            .into_iter()
+            .map(|(room_id, nodes)| {
+                let nodes = usize::try_from(nodes).ok()?;
+                Some((room_id, nodes, LossyIndex::memory_usage_for_entries(nodes)))
+            })
+            .collect()
+    }
+
     /// Current live-node count per shard from the persisted shard→room
     /// directory, without opening packfiles or rebuilding room indexes.
     ///
@@ -862,6 +882,34 @@ impl PackfileStorage {
             let count = u64::from_le_bytes(chunk[18..26].try_into().ok()?);
             let total = totals.entry(shard_id).or_insert(0_u64);
             *total = total.saturating_add(count);
+        }
+        Some(totals)
+    }
+
+    /// Current number of rooms with live nodes per shard from the persisted
+    /// shard→room directory, without opening packfiles or rebuilding room
+    /// indexes.
+    ///
+    /// Returns `None` when the directory has not been persisted yet or is
+    /// malformed.
+    #[must_use]
+    pub fn shard_room_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
+        let buf = fs::read(Self::shard_rooms_path(base_dir)).ok()?;
+        if buf.len() < SHARD_ROOMS_HEADER_LEN
+            || &buf[0..4] != SHARD_ROOMS_MAGIC
+            || buf[4] != SHARD_ROOMS_VERSION
+        {
+            return None;
+        }
+        let body = &buf[SHARD_ROOMS_HEADER_LEN..];
+        if body.len() % SHARD_ROOMS_RECORD_LEN != 0 {
+            return None;
+        }
+        let mut totals = HashMap::new();
+        for chunk in body.chunks_exact(SHARD_ROOMS_RECORD_LEN) {
+            let shard_id = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
+            let count = totals.entry(shard_id).or_insert(0_u64);
+            *count = count.saturating_add(1);
         }
         Some(totals)
     }
