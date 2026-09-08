@@ -166,7 +166,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
         Commands::Get { room, id } => cmd_get(cli, room.as_deref(), id),
-        Commands::Rooms => cmd_rooms(cli),
+        Commands::Rooms { all } => cmd_rooms(cli, *all),
         Commands::Shards { all } => cmd_shards(cli, *all),
         Commands::Info { room } => cmd_info(cli, room),
         Commands::Scan { shard } => cmd_scan(cli, shard),
@@ -327,19 +327,42 @@ fn room_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
         .collect())
 }
 
-fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
-    let dir = selected_pool_dir(cli)?;
-    let rooms = match PackfileStorage::room_summaries_from_disk(&dir) {
+fn cmd_rooms(cli: &Cli, all: bool) -> anyhow::Result<()> {
+    if all {
+        let layout = open_layout(cli)?;
+        for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
+            if index != 0 {
+                println!();
+            }
+            println!("{}:", shard_type.as_str());
+            cmd_rooms_in_dir(&pool_dir(&layout, shard_type)?)?;
+        }
+        return Ok(());
+    }
+    cmd_rooms_in_dir(&selected_pool_dir(cli)?)
+}
+
+/// List rooms from one pool. Cross-pool aggregation is deliberately avoided:
+/// each pool has its own room-ID namespace and lifecycle.
+fn cmd_rooms_in_dir(dir: &Path) -> anyhow::Result<()> {
+    let rooms = match PackfileStorage::room_summaries_from_disk(dir) {
         Some(rooms) => rooms,
+        // A named pool is created with the database layout, before it has
+        // necessarily received a first write. `open_read_only` quite
+        // properly rejects a directory with no shard files, but for a
+        // listing that simply means there are no rooms to show.
+        None if glob_shard_files(dir)?.is_empty() => Vec::new(),
         // Old stores have no sidecar yet. Keep the complete, slower fallback
         // so `rooms` remains useful until `mtxdb sync` writes one.
-        None => open_store_read_only(cli)?.room_summaries(),
+        None => PackfileStorage::open_read_only(dir.into())
+            .context("failed to open store")?
+            .room_summaries(),
     };
-    let room_shards = PackfileStorage::room_shards_from_disk(&dir);
-    let disk_bytes = room_disk_bytes(&dir)?;
+    let room_shards = PackfileStorage::room_shards_from_disk(dir);
+    let disk_bytes = room_disk_bytes(dir)?;
 
     if rooms.is_empty() {
-        eprintln!("no rooms found");
+        println!("no rooms found");
         return Ok(());
     }
 

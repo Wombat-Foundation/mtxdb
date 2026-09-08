@@ -23,7 +23,9 @@ pub(crate) enum Commands {
         room: Option<String>,
         id: String,
     },
-    Rooms,
+    Rooms {
+        all: bool,
+    },
     Shards {
         all: bool,
     },
@@ -111,7 +113,17 @@ fn build_cli() -> Command {
                         .help("List shards in every independent pool"),
                 ),
         )
-        .subcommand(Command::new("rooms").about("List rooms in the store"))
+        .subcommand(
+            Command::new("rooms")
+                .about("List rooms in the selected shard pool")
+                .arg(
+                    Arg::new("all")
+                        .short('a')
+                        .long("all")
+                        .action(ArgAction::SetTrue)
+                        .help("List rooms in every independent pool"),
+                ),
+        )
         .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
         .subcommand(
             Command::new("completions")
@@ -290,7 +302,9 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").cloned(),
             id: m.get_one::<String>("id").unwrap().clone(),
         },
-        Some(("rooms", _)) => Commands::Rooms,
+        Some(("rooms", m)) => Commands::Rooms {
+            all: m.get_flag("all"),
+        },
         Some(("shards", m)) => Commands::Shards {
             all: m.get_flag("all"),
         },
