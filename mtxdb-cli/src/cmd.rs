@@ -1031,8 +1031,8 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
             u64::from_str_radix(rotation, 16).context("invalid hexadecimal shard rotation")?;
         pool.all_shards()
             .into_iter()
-            .find_map(|(_, shard)| (shard.epoch == rotation).then_some(shard))
-            .with_context(|| format!("shard rotation {selector} not found"))?
+            .find_map(|(_, shard)| (shard.pack_id == rotation).then_some(shard))
+            .with_context(|| format!("shard pack_id {selector} not found"))?
     } else {
         let slot = selector
             .parse::<u16>()
@@ -1107,7 +1107,7 @@ fn cmd_export(cli: &Cli, room: &str) -> anyhow::Result<()> {
         .into_iter()
         .filter(|(shard_id, _)| room_shards.contains(shard_id))
         .collect();
-    shards.sort_unstable_by_key(|(_, shard)| shard.epoch);
+    shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
 
     let mut locations = HashMap::new();
     let mut ordered_ids = Vec::new();
