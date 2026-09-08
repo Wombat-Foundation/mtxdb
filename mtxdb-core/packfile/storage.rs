@@ -140,6 +140,10 @@ pub struct PackfileStorage {
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
     put_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
+    /// Serializes the read-modify-write `deleted.rooms` file. Room locks
+    /// protect a room's lifecycle, but distinct rooms may be recreated or
+    /// deleted concurrently.
+    deleted_rooms_lock: parking_lot::Mutex<()>,
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
@@ -343,6 +347,7 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
+            deleted_rooms_lock: parking_lot::Mutex::new(()),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
@@ -609,6 +614,7 @@ impl PackfileStorage {
     }
 
     fn persist_deleted_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
+        let _guard = self.deleted_rooms_lock.lock();
         let path = Self::deleted_rooms_path(&self.base_dir);
         let mut set = Self::load_deleted_rooms(&self.base_dir);
         set.insert(*room_id);
@@ -618,6 +624,7 @@ impl PackfileStorage {
     }
 
     fn clear_deleted_room(&self, room_id: &[u8; 16]) -> Result<(), StorageError> {
+        let _guard = self.deleted_rooms_lock.lock();
         let path = Self::deleted_rooms_path(&self.base_dir);
         let mut set = Self::load_deleted_rooms(&self.base_dir);
         if set.remove(room_id) {
@@ -856,9 +863,9 @@ impl PackfileStorage {
         })?;
         Ok(Some((record.hash, new_shard_id, new_offset)))
     }
-    fn swap_generation(&self, room_id: &[u8; 16], index: LossyIndex) {
+    fn swap_generation(&self, room_id: &[u8; 16], index: LossyIndex) -> Result<(), StorageError> {
         let cache = self.generation(room_id).map(|g| g.cache.clone());
-        self.store_generation(room_id, index, cache);
+        self.store_generation(room_id, index, cache)
     }
 
     /// Store a new generation for a room, reusing the existing cache if present.
@@ -872,11 +879,18 @@ impl PackfileStorage {
         room_id: &[u8; 16],
         index: LossyIndex,
         cache: Option<Arc<NodeCache>>,
-    ) {
+    ) -> Result<(), StorageError> {
         let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
         let new_gen = Arc::new(RoomGeneration { index, cache });
 
         let is_new = self.rooms.read().get(room_id).is_none();
+
+        // Clear a prior deletion marker before publishing the recreated
+        // generation. A failure must fail the write: otherwise it appears to
+        // succeed but disappears on the next startup scan.
+        if is_new {
+            self.clear_deleted_room(room_id)?;
+        }
 
         self.rooms
             .write()
@@ -889,10 +903,10 @@ impl PackfileStorage {
             })
             .store(new_gen);
 
-        if is_new {
+        if is_new && !self.room_order.read().contains(room_id) {
             self.room_order.write().push(*room_id);
-            let _ = self.clear_deleted_room(room_id);
         }
+        Ok(())
     }
 
     fn rebuild_index(&self, room_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
@@ -1462,7 +1476,7 @@ impl PackfileStorage {
 
         let index = Self::build_index(&new_offsets);
         self.replace_room_shard_counts(room_id, &index.shard_counts());
-        self.swap_generation(room_id, index);
+        self.swap_generation(room_id, index)?;
         self.retire_empty_shards(room_id);
 
         self.repack_count.fetch_add(1, Ordering::Relaxed);
@@ -1585,11 +1599,11 @@ impl PackfileStorage {
     /// that a writer just committed bytes to but hasn't index-updated yet,
     /// causing a live shard to be retired under it.
     fn retire_empty_shards(&self, held_room: &[u8; 16]) {
-        let rooms = self.rooms.read();
-
         // Collect room IDs in sorted order for deadlock-free lock acquisition.
         // Skip the room whose put_mutex the caller already holds.
-        let mut rooms_to_lock: Vec<[u8; 16]> = rooms
+        let mut rooms_to_lock: Vec<[u8; 16]> = self
+            .rooms
+            .read()
             .keys()
             .filter(|id| *id != held_room)
             .copied()
@@ -1600,6 +1614,10 @@ impl PackfileStorage {
         // deadlocks; the held room is skipped (parking_lot is non-reentrant).
         let mutexes: Vec<_> = rooms_to_lock.iter().map(|id| self.put_mutex(id)).collect();
         let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+
+        // Do not retain the map guard while acquiring room locks: another
+        // operation may need the map lock while it holds a room lock.
+        let rooms = self.rooms.read();
 
         // Build the union of shard IDs referenced across all rooms.
         let mut referenced = [false; shard::MAX_SHARDS];
@@ -1723,7 +1741,7 @@ impl StorageEngine for PackfileStorage {
             (index, cache)
         };
 
-        self.store_generation(room_id, index, Some(cache));
+        self.store_generation(room_id, index, Some(cache))?;
 
         Ok(())
     }
@@ -1748,7 +1766,9 @@ impl StorageEngine for PackfileStorage {
 
         self.rooms.write().remove(room_id);
         self.live_roots.write().remove(room_id);
-        self.put_locks.lock().remove(room_id);
+        // Keep lock entries for the storage lifetime. Removing an entry while
+        // a caller still owns its Arc permits a later put to obtain a second
+        // mutex and bypass this deletion's serialization.
         self.remove_room_shard_counts(room_id);
         self.persist_deleted_room(room_id)?;
         Ok(())

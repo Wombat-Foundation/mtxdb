@@ -334,28 +334,15 @@ impl ShardPool {
         Self::open_internal(base_dir, false)
     }
 
-    fn open_internal(base_dir: PathBuf, writable: bool) -> io::Result<Self> {
-        fs::create_dir_all(&base_dir)?;
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let writer_lock = writable
-            .then(|| Self::acquire_writer_lock(&base_dir))
-            .transpose()?;
-
-        let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
-        let mut highest_active: u16 = 0;
-        let mut max_generation: u64 = 0;
-
-        // Track the highest generation seen per slot so we can reject
-        // stale files left behind by a crash between rotate() creating a
-        // new generation and the old generation's Drop deleting it.
-        let mut best_generation: Vec<Option<u64>> = vec![None; MAX_SHARDS];
-
-        // Scan for existing shard files.  Supports three filename formats:
-        //   shard_XX.pack                      — ancient (no generation, implied gen 0)
-        //   shard_XX_YYYYYYYYYYYYYYYY.pack      — 2-digit slot, generation-tracked
-        //   shard_XXXX_YYYYYYYYYYYYYYYY.pack    — 4-digit slot, generation-tracked
-        for entry in fs::read_dir(&base_dir)? {
+    /// Discovers existing `shard_*.pack` files in `base_dir` and parses
+    /// each one's `(shard_id, generation, path)` from its filename.
+    /// Supports three filename formats:
+    ///   `shard_XX.pack`                      — ancient (no generation, implied gen 0)
+    ///   `shard_XX_YYYYYYYYYYYYYYYY.pack`      — 2-digit slot, generation-tracked
+    ///   `shard_XXXX_YYYYYYYYYYYYYYYY.pack`    — 4-digit slot, generation-tracked
+    fn discover_shard_files(base_dir: &Path) -> io::Result<Vec<(u16, u64, PathBuf)>> {
+        let mut shard_files = Vec::new();
+        for entry in fs::read_dir(base_dir)? {
             let entry = entry?;
             let path = entry.path();
             if !path.extension().is_some_and(|e| e == "pack") {
@@ -382,35 +369,78 @@ impl ShardPool {
 
             if let Ok(id) = u16::from_str_radix(slot_hex, 16) {
                 if id < MAX_SHARDS_U16 {
-                    let id_usize = id as usize;
-
-                    // If we already have a generation for this slot and the
-                    // current file is not newer, it's stale — delete it.
-                    if let Some(prev) = best_generation[id_usize] {
-                        if prev >= generation {
-                            let _ = fs::remove_file(&path);
-                            continue;
-                        }
-                    }
-
-                    // We have a strictly newer generation — drop the old one
-                    // and its file before installing the new shard.
-                    if let Some(old) = shards[id_usize].take() {
-                        let _ = fs::remove_file(&old.path);
-                    }
-
-                    let file = packfile::open_packfile(&path, false, id, generation)?;
-                    let file_len = file.metadata()?.len();
-                    let shard = Arc::new(Shard::new(id, generation, file, path, file_len));
-                    best_generation[id_usize] = Some(generation);
-                    shards[id_usize] = Some(shard);
-                    if id > highest_active {
-                        highest_active = id;
-                    }
-                    if generation >= max_generation {
-                        max_generation = generation.saturating_add(1);
-                    }
+                    shard_files.push((id, generation, path));
                 }
+            }
+        }
+        Ok(shard_files)
+    }
+
+    fn open_internal(base_dir: PathBuf, writable: bool) -> io::Result<Self> {
+        fs::create_dir_all(&base_dir)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let writer_lock = writable
+            .then(|| Self::acquire_writer_lock(&base_dir))
+            .transpose()?;
+
+        let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
+        let mut highest_active: u16 = 0;
+        let mut max_generation: u64 = 0;
+
+        // Track the highest generation seen per slot so we can reject
+        // stale files left behind by a crash between rotate() creating a
+        // new generation and the old generation's Drop deleting it.
+        let mut best_generation: Vec<Option<u64>> = vec![None; MAX_SHARDS];
+
+        let mut shard_files = Self::discover_shard_files(&base_dir)?;
+
+        // Process older generations first. Besides making recovery
+        // deterministic, this means a malformed newer candidate can fall
+        // back to the already-validated predecessor.
+        shard_files.sort_unstable_by_key(|(id, generation, _)| (*id, *generation));
+
+        for (id, generation, path) in shard_files {
+            let id_usize = id as usize;
+
+            // If we already have a generation for this slot and the current
+            // file is not newer, it's stale — delete it.
+            if let Some(prev) = best_generation[id_usize] {
+                if prev >= generation {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+            }
+
+            // Validate a newer candidate before retiring the older
+            // generation. A torn header in a just-created file must
+            // not destroy the last known-good recovery fallback.
+            let file = match packfile::open_packfile(&path, false, id, generation) {
+                Ok(file) => file,
+                Err(error) if shards[id_usize].is_some() => {
+                    eprintln!(
+                        "warning: ignoring invalid newer shard {} while retaining its valid predecessor: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            // The candidate is valid, so it is now safe to retire
+            // the older generation for this slot.
+            if let Some(old) = shards[id_usize].take() {
+                let _ = fs::remove_file(&old.path);
+            }
+            let file_len = file.metadata()?.len();
+            let shard = Arc::new(Shard::new(id, generation, file, path, file_len));
+            best_generation[id_usize] = Some(generation);
+            shards[id_usize] = Some(shard);
+            if id > highest_active {
+                highest_active = id;
+            }
+            if generation >= max_generation {
+                max_generation = generation.saturating_add(1);
             }
         }
 
@@ -1020,7 +1050,11 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_dirty(&self) -> io::Result<()> {
-        let dirty: Vec<u16> = { self.dirty.lock().iter().copied().collect() };
+        // Keep this lock through the fsync and removal. An append that
+        // completes during the fsync blocks before marking itself dirty, so
+        // it cannot be accidentally cleared by this generation of the sync.
+        let mut dirty_set = self.dirty.lock();
+        let dirty: Vec<u16> = dirty_set.iter().copied().collect();
         if dirty.is_empty() {
             return Ok(());
         }
@@ -1030,10 +1064,11 @@ impl ShardPool {
                 if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
                     shard.file.sync_all()?;
                     shard.sync_count.fetch_add(1, Ordering::Relaxed);
-                    self.dirty.lock().remove(&id);
+                    dirty_set.remove(&id);
                 }
             }
         }
+        drop(dirty_set);
         self.persist_stats_best_effort();
         Ok(())
     }
@@ -1714,6 +1749,24 @@ mod tests {
             !old_path.exists(),
             "stale generation file should be deleted during scan"
         );
+    }
+
+    #[test]
+    fn test_scan_retains_valid_generation_when_newer_header_is_torn() {
+        let dir = test_dir("scan_torn_newer_generation");
+        let old_path = ShardPool::shard_path(&dir, 0, 1);
+        let mut old = Vec::new();
+        packfile::write_header(&mut old, 0, 1).unwrap();
+        std::fs::write(&old_path, old).unwrap();
+
+        // A higher-generation filename alone is not enough to supersede a
+        // valid shard: its header must validate first.
+        let torn_path = ShardPool::shard_path(&dir, 0, 2);
+        std::fs::write(&torn_path, b"MTX").unwrap();
+
+        let pool = ShardPool::open(dir).unwrap();
+        assert_eq!(pool.get_shard(0).unwrap().generation, 1);
+        assert!(old_path.exists());
     }
 
     /// `stats()` must reflect actual write/read/sync activity, so callers

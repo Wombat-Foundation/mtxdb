@@ -437,12 +437,17 @@ fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyho
         if !topo {
             bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
         }
-        let root_ids: Vec<mtxdb::NodeId> = roots
-            .iter()
-            .map(|r| parse_node_id(r))
-            .collect::<anyhow::Result<_>>()?;
-        store.set_live_roots(&room_id, root_ids);
-    } else if topo {
+        // Imported Matrix `prev_events` entries are event IDs, whereas this
+        // store is indexed by the truncated content hashes in `hashes.sha256`.
+        // We do not persist an event-ID → NodeId map, so treating those IDs as
+        // hashes would make a rooted repack retain only the supplied roots and
+        // silently collect their ancestors. Refuse the destructive operation
+        // until that mapping is available.
+        bail!(
+            "--root cannot be used with Matrix topology yet: imported event IDs cannot be resolved to stored node IDs; refusing a rooted repack that could discard ancestors"
+        );
+    }
+    if topo {
         eprintln!("warning: --topo without --root means no GC; all records preserved");
     }
 

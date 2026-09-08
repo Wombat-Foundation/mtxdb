@@ -191,10 +191,13 @@ impl Csr {
         let n = n_u32 as usize;
         let e = e_u32 as usize;
 
-        let offsets_len = n.wrapping_add(1);
+        let offsets_len = n.checked_add(1).ok_or(CsrError::Malformed)?;
+        let offsets_bytes = offsets_len.checked_mul(4).ok_or(CsrError::Malformed)?;
+        let targets_bytes = e.checked_mul(4).ok_or(CsrError::Malformed)?;
         let expected = 9usize
-            .wrapping_add(offsets_len.wrapping_mul(4))
-            .wrapping_add(e.wrapping_mul(4));
+            .checked_add(offsets_bytes)
+            .and_then(|size| size.checked_add(targets_bytes))
+            .ok_or(CsrError::Malformed)?;
         if data.len() < expected {
             return Err(CsrError::TooShort);
         }
@@ -207,7 +210,7 @@ impl Csr {
             ));
         }
 
-        let targets_start = 9usize.wrapping_add(offsets_len.wrapping_mul(4));
+        let targets_start = 9usize.wrapping_add(offsets_bytes);
         let mut targets = Vec::with_capacity(e);
         for i in 0..e {
             let off = targets_start.wrapping_add(i.wrapping_mul(4));
@@ -216,13 +219,13 @@ impl Csr {
             ));
         }
 
-        if offsets[0] != 0 {
+        if offsets.first() != Some(&0) {
             return Err(CsrError::Malformed);
         }
         if offsets.windows(2).any(|w| w[1] < w[0]) {
             return Err(CsrError::Malformed);
         }
-        if n > 0 && *offsets.last().unwrap() != e_u32 {
+        if offsets.last().copied() != Some(e_u32) {
             return Err(CsrError::Malformed);
         }
         if targets.iter().any(|&t| t >= n_u32) {
