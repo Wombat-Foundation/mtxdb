@@ -66,6 +66,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn parse_room_id(hex: &str) -> anyhow::Result<[u8; 16]> {
+    let hex = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     if hex.len() != 32 {
         bail!("room ID must be 32 hex characters, got {}", hex.len());
     }
@@ -76,6 +80,10 @@ fn parse_room_id(hex: &str) -> anyhow::Result<[u8; 16]> {
 }
 
 fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
+    let hex = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     if hex.len() != 32 {
         bail!("node ID must be 32 hex characters, got {}", hex.len());
     }
@@ -422,11 +430,9 @@ fn cmd_repack(
     match (room, shard) {
         (Some(room), None) => cmd_repack_room(cli, room, roots, topo),
         (None, Some(shard_id)) => cmd_repack_shard(cli, shard_id, roots, topo),
-        // clap's ArgGroup(required, conflicting) already rules both of
-        // these out before we get here; kept as a hard error rather than
-        // silently picking one, since reaching it means that guarantee
-        // broke.
-        _ => bail!("exactly one of --room or --shard is required"),
+        // Clap rejects the both-targets case through `conflicts_with`; this
+        // branch gives the missing-target case a readable diagnostic.
+        _ => bail!("exactly one of --room <room> | --shard <shard> is required"),
     }
 }
 

@@ -144,11 +144,6 @@ fn sub_repack() -> Command {
                 .value_parser(clap::value_parser!(u16))
                 .help("Repack every room still referencing this shard id"),
         )
-        .group(
-            clap::ArgGroup::new("repack_target")
-                .args(["room", "shard"])
-                .required(true),
-        )
         .arg(Arg::new("root").short('o').long("root").num_args(1..))
         .arg(
             Arg::new("topo")
