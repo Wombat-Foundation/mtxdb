@@ -43,6 +43,9 @@ pub(crate) enum Commands {
         room: String,
         yes: bool,
     },
+    Completions {
+        shell: String,
+    },
     Sync,
 }
 
@@ -84,6 +87,17 @@ fn build_cli() -> Command {
         )
         .subcommand(Command::new("rooms").about("List rooms in the store"))
         .subcommand(Command::new("sync").about("Bootstrap or refresh persisted shard/room stats"))
+        .subcommand(
+            Command::new("completions")
+                .about("Print shell completion script")
+                .arg(Arg::new("shell").required(true).value_parser([
+                    "bash",
+                    "elvish",
+                    "fish",
+                    "powershell",
+                    "zsh",
+                ])),
+        )
         .subcommand(sub_import())
         .subcommand(sub_repack())
         .subcommand(
@@ -218,6 +232,9 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").unwrap().clone(),
             yes: m.get_flag("yes"),
         },
+        Some(("completions", m)) => Commands::Completions {
+            shell: m.get_one::<String>("shell").unwrap().clone(),
+        },
         Some(("sync", _)) => Commands::Sync,
         _ => {
             build_cli().print_help().unwrap();
@@ -230,5 +247,18 @@ fn parse_cli() -> Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = parse_cli();
+    if let Commands::Completions { shell } = &cli.command {
+        let shell = match shell.as_str() {
+            "bash" => clap_complete::Shell::Bash,
+            "elvish" => clap_complete::Shell::Elvish,
+            "fish" => clap_complete::Shell::Fish,
+            "powershell" => clap_complete::Shell::PowerShell,
+            "zsh" => clap_complete::Shell::Zsh,
+            _ => unreachable!("Clap validates the shell name"),
+        };
+        let mut command = build_cli();
+        clap_complete::generate(shell, &mut command, "mtxdb", &mut std::io::stdout());
+        return Ok(());
+    }
     cmd::run(&cli)
 }

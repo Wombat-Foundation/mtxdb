@@ -60,6 +60,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             topo,
         } => cmd_repack(cli, room.as_deref(), *shard, root, *topo),
         Commands::Delete { room, yes } => cmd_delete(cli, room, *yes),
+        Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync => cmd_sync(cli),
     }
 }
@@ -286,7 +287,7 @@ fn print_stats_age(persisted_at: Option<u64>) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |now| now.as_secs().saturating_sub(ts));
             eprintln!(
-                "stats snapshot: {} old (counters above may lag a live writer between its flushes)",
+                "stats snapshot: {} old",
                 fmt_duration(age_secs)
             );
         }
