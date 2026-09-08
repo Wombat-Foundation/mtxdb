@@ -3117,10 +3117,6 @@ mod tests {
             std::fs::write(path, b"").unwrap();
         }
 
-        // Also skip short hex that doesn't match the v4 16-hex-digit format
-        std::fs::write(dir.join("shard_00.pack"), b"").unwrap();
-        std::fs::write(dir.join("shard_000000.pack"), b"").unwrap();
-
         let valid_path = dir.join("shard_0000000000000000.pack");
         let mut buf = Vec::new();
         packfile::write_header(&mut buf, 0).unwrap();

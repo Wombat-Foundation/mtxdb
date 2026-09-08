@@ -343,8 +343,14 @@ impl ShardPool {
 
     /// Discovers existing `shard_*.pack` files in `base_dir` and parses
     /// each one's `(pack_id, path)` from its filename.
-    /// Only parses v4 filenames: `shard_XXXXXXXXXXXXXXXX.pack` where the
-    /// 16 hex digits encode the `pack_id`.
+    /// Discovers shard packfiles in the pool directory.
+    ///
+    /// Only v4 filenames are accepted: `shard_XXXXXXXXXXXXXXXX.pack`
+    /// where the 16 hex digits encode the `pack_id`.
+    ///
+    /// Any `shard_*.pack` file that doesn't match the v4 format is
+    /// rejected with `Unsupported` — this is a hard cutover, not a
+    /// silent skip.
     fn discover_shard_files(base_dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
         let mut shard_files = Vec::new();
         for entry in fs::read_dir(base_dir)? {
@@ -357,16 +363,25 @@ impl ShardPool {
                 continue;
             };
             let Some(id_hex) = stem.strip_prefix("shard_") else {
+                // Not a shard file — skip silently.
                 continue;
             };
 
-            // v4 format: exactly 16 hex digits for pack_id
-            if id_hex.len() != 16 {
-                continue;
+            // v4 format: exactly 16 hex digits for pack_id.
+            if id_hex.len() != 16 || id_hex.chars().any(|c| !c.is_ascii_hexdigit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "found pre-v4 shard file {}; \
+                         use a fresh pool or explicitly migrate/reset it",
+                        path.display()
+                    ),
+                ));
             }
-            if let Ok(pack_id) = u64::from_str_radix(id_hex, 16) {
-                shard_files.push((pack_id, path));
-            }
+            let pack_id = u64::from_str_radix(id_hex, 16).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("{id_hex}: {e}"))
+            })?;
+            shard_files.push((pack_id, path));
         }
         Ok(shard_files)
     }
@@ -399,20 +414,16 @@ impl ShardPool {
         shard_files.sort_unstable_by_key(|(pack_id, _)| *pack_id);
 
         for (pack_id, path) in shard_files {
-            // Validate the file before accepting it.
-            let file = match packfile::open_packfile(&path, false, pack_id) {
-                Ok(file) => file,
-                Err(error) => {
-                    if writable {
-                        let _ = fs::remove_file(&path);
-                    }
-                    eprintln!(
-                        "warning: ignoring invalid shard {}: {error}",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
+            // Validate the file before accepting it. A valid v4 file
+            // must have the right magic, version, and CRC. If it
+            // doesn't, the pool is corrupt — fail open rather than
+            // silently deleting data.
+            let file = packfile::open_packfile(&path, false, pack_id).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupt shard {}; failed to open: {error}", path.display()),
+                )
+            })?;
 
             let file_len = file.metadata()?.len();
             let slot = next_slot;
@@ -1725,7 +1736,7 @@ mod tests {
     /// embedded identity doesn't match its filename and creates a
     /// fresh shard 0 when no valid files remain.
     #[test]
-    fn test_shard_pool_open_skips_identity_mismatch() {
+    fn test_shard_pool_open_fails_on_identity_mismatch() {
         let dir = test_dir("pool_open_identity_mismatch");
         std::fs::create_dir_all(&dir).unwrap();
         // A valid header claiming pack_id 0, filed under a
@@ -1734,22 +1745,17 @@ mod tests {
         let mut buf = Vec::new();
         packfile::write_header(&mut buf, 0).unwrap();
         std::fs::write(&path, &buf).unwrap();
-
-        // The pool opens successfully — the mismatched file is skipped
-        // and a fresh shard 0 (pack_id 0) is created.
-        let pool = ShardPool::open(dir).unwrap();
-        assert_eq!(pool.get_shard(0).unwrap().pack_id, 0);
-        assert!(
-            !path.exists(),
-            "mismatched file should be deleted when writable"
-        );
+        // The pool fails to open — identity mismatch is corruption.
+        match ShardPool::open(dir) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected InvalidData for identity mismatch"),
+        }
     }
 
-    /// End-to-end: `ShardPool::open` skips a shard file with a CRC-
-    /// corrupted header and creates a fresh shard 0 when no valid files
-    /// remain.
+    /// End-to-end: `ShardPool::open` fails when a shard file has a
+    /// corrupted CRC — this is pool corruption, not a skip.
     #[test]
-    fn test_shard_pool_open_skips_corrupt_header_crc() {
+    fn test_shard_pool_open_fails_on_corrupt_header_crc() {
         let dir = test_dir("pool_open_bad_crc");
         std::fs::create_dir_all(&dir).unwrap();
         let path = ShardPool::shard_path(&dir, 0);
@@ -1758,16 +1764,18 @@ mod tests {
         buf[12] ^= 0xFF; // corrupt a byte inside the CRC-covered region
         std::fs::write(&path, &buf).unwrap();
 
-        // The pool opens successfully — the corrupt file is skipped and
-        // a fresh shard 0 (pack_id 0) is created.
-        let pool = ShardPool::open(dir).unwrap();
-        assert_eq!(pool.get_shard(0).unwrap().pack_id, 0);
+        // The pool fails to open — corrupt header is corruption.
+        match ShardPool::open(dir) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected InvalidData for corrupt CRC"),
+        }
     }
 
-    /// End-to-end: `ShardPool::open` skips a real pre-cutover v1 store
-    /// and creates a fresh shard 0 when no valid files remain.
+    /// End-to-end: `ShardPool::open` fails when a shard file has a
+    /// v4 filename but contains v1 content — this is a pre-v4
+    /// remnant, not a valid v4 pack.
     #[test]
-    fn test_shard_pool_open_skips_v1_store() {
+    fn test_shard_pool_open_fails_on_v1_with_v4_filename() {
         let dir = test_dir("pool_open_v1_store");
         std::fs::create_dir_all(&dir).unwrap();
         let path = ShardPool::shard_path(&dir, 0);
@@ -1785,10 +1793,41 @@ mod tests {
         .unwrap();
         std::fs::write(&path, &buf).unwrap();
 
-        // The pool opens successfully — the v1 file is skipped and
-        // a fresh shard 0 (pack_id 0) is created.
-        let pool = ShardPool::open(dir).unwrap();
-        assert_eq!(pool.get_shard(0).unwrap().pack_id, 0);
+        // The pool fails to open — v1 content in a v4 filename slot
+        // is corruption.
+        match ShardPool::open(dir) {
+            Err(e) => {
+                assert!(
+                    e.kind() == io::ErrorKind::Unsupported
+                        || e.kind() == io::ErrorKind::InvalidData,
+                    "expected Unsupported or InvalidData, got: {:?}",
+                    e.kind()
+                );
+            }
+            Ok(_) => panic!("expected error for v1 content in v4 filename"),
+        }
+    }
+
+    /// `discover_shard_files` rejects v3 filenames (e.g.
+    /// `shard_0004_0000000000000004.pack`) with `Unsupported` rather
+    /// than silently skipping them.
+    #[test]
+    fn test_discover_rejects_v3_filenames() {
+        let dir = test_dir("discover_v3_reject");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create a v3-format filename — 4-digit slot + underscore + 16-digit epoch.
+        let path = dir.join("shard_0004_0000000000000004.pack");
+        std::fs::write(&path, b"fake").unwrap();
+        match ShardPool::discover_shard_files(&dir) {
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+                assert!(
+                    e.to_string().contains("pre-v4"),
+                    "error should mention pre-v4, got: {e}"
+                );
+            }
+            Ok(_) => panic!("expected Unsupported error for v3 filename"),
+        }
     }
 
     /// A retired shard's file must survive as long as any `Arc<Shard>`
@@ -1901,6 +1940,7 @@ mod tests {
         assert!(live_path.exists(), "pack_id 99 file should still exist");
     }
 
+    /// A torn header in a v4-named shard file causes pool open to fail.
     #[test]
     fn test_scan_retains_valid_shard_when_newer_header_is_torn() {
         let dir = test_dir("scan_torn_newer_pack");
@@ -1909,14 +1949,23 @@ mod tests {
         packfile::write_header(&mut old, 1).unwrap();
         std::fs::write(&old_path, old).unwrap();
 
-        // A higher pack_id filename alone is not enough to supersede a
-        // valid shard: its header must validate first.
+        // A higher pack_id filename with a torn header — pool open
+        // must fail because this corrupt shard is a valid v4 filename
+        // that can't be read.
         let torn_path = ShardPool::shard_path(&dir, 2);
         std::fs::write(&torn_path, b"MTX").unwrap();
 
-        let pool = ShardPool::open(dir).unwrap();
-        assert_eq!(pool.get_shard(0).unwrap().pack_id, 1);
-        assert!(old_path.exists());
+        match ShardPool::open(dir) {
+            Err(e) => {
+                assert!(
+                    e.kind() == io::ErrorKind::InvalidData
+                        || e.kind() == io::ErrorKind::UnexpectedEof,
+                    "expected InvalidData or UnexpectedEof for torn header, got: {:?}",
+                    e.kind()
+                );
+            }
+            Ok(_) => panic!("expected error for torn shard header"),
+        }
     }
 
     /// `stats()` must reflect actual write/read/sync activity, so callers
