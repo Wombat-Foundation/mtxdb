@@ -1,10 +1,11 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context};
 use base64::Engine as _;
+use mtxdb_core::shard::ShardPool;
 use mtxdb_core::storage::{NodeData, StorageEngine};
 use mtxdb_core::PackfileStorage;
 use simd_json::prelude::*;
@@ -34,6 +35,26 @@ fn fmt_bytes(n: u64) -> String {
     }
 }
 
+/// Decimal megabytes, rounded exactly to four fractional digits, for the
+/// human-facing `info` output.
+fn fmt_megabytes(bytes: usize) -> String {
+    const BYTES_PER_MB: u64 = 1_000_000;
+    const FRACTION_SCALE: u64 = 10_000;
+
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    let mut whole = bytes / BYTES_PER_MB;
+    let fractional_bytes = bytes % BYTES_PER_MB;
+    let mut fraction = fractional_bytes
+        .saturating_mul(FRACTION_SCALE)
+        .saturating_add(BYTES_PER_MB / 2)
+        / BYTES_PER_MB;
+    if fraction == FRACTION_SCALE {
+        whole = whole.saturating_add(1);
+        fraction = 0;
+    }
+    format!("{whole}.{fraction:04} MB")
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().fold(
         String::with_capacity(bytes.len().saturating_mul(2)),
@@ -51,7 +72,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Rooms => cmd_rooms(cli),
         Commands::Shards => cmd_shards(cli),
         Commands::Info { room } => cmd_info(cli, room),
-        Commands::Scan { path } => cmd_scan(path),
+        Commands::Scan { shard } => cmd_scan(cli, shard),
         Commands::Import { path, room } => cmd_import(cli, path, room.as_deref()),
         Commands::Repack {
             room,
@@ -190,7 +211,11 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
 
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
     print_shard_table(&shard_entries, &stats_map);
-    print_stats_age(persisted_at);
+    eprintln!(
+        "{} shard(s), {}",
+        shard_entries.len(),
+        stats_snapshot_summary(persisted_at)
+    );
     Ok(())
 }
 
@@ -284,24 +309,18 @@ fn print_shard_table(shard_entries: &[(u16, u64, u64)], stats_map: &ShardStatsMa
             sc,
         );
     }
-    println!("{} shards", shard_entries.len());
 }
 
-/// Print how old the stats snapshot is (or that none exists).
-fn print_stats_age(persisted_at: Option<u64>) {
+/// Short summary of the persisted shard-statistics snapshot age.
+fn stats_snapshot_summary(persisted_at: Option<u64>) -> String {
     match persisted_at {
         Some(ts) => {
             let age_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |now| now.as_secs().saturating_sub(ts));
-            eprintln!(
-                "stats snapshot: {} old",
-                fmt_duration(age_secs)
-            );
+            format!("snapshot: {} old", fmt_duration(age_secs))
         }
-        None => eprintln!(
-            "stats snapshot: none persisted yet — counters above are all zero by default, not necessarily real"
-        ),
+        None => "snapshot: none persisted".to_owned(),
     }
 }
 
@@ -322,7 +341,10 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     let hex = hex_encode(&room_id);
     match store.room_index_info(&room_id) {
         Some((len, mem)) => {
-            println!("room {hex}: {len} records, {mem} bytes index memory");
+            println!(
+                "room {hex}: {len} records, {} index RAM",
+                fmt_megabytes(mem)
+            );
         }
         None => {
             eprintln!("room {hex}: not found");
@@ -331,7 +353,26 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_scan(path: &PathBuf) -> anyhow::Result<()> {
+fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    let base_dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    let pool = ShardPool::open_read_only(base_dir.into()).context("failed to open shard store")?;
+    let shard = if let Some(epoch) = selector
+        .strip_prefix("0x")
+        .or_else(|| selector.strip_prefix("0X"))
+    {
+        let epoch = u64::from_str_radix(epoch, 16).context("invalid hexadecimal shard epoch")?;
+        pool.all_shards()
+            .into_iter()
+            .find_map(|(_, shard)| (shard.epoch == epoch).then_some(shard))
+            .with_context(|| format!("shard epoch {selector} not found"))?
+    } else {
+        let slot = selector
+            .parse::<u16>()
+            .context("shard slot must be a decimal u16 or a 0x-prefixed epoch")?;
+        pool.get_shard(slot)
+            .with_context(|| format!("shard slot {slot} not found"))?
+    };
+    let path = &shard.path;
     let records = mtxdb_core::packfile::scan_packfile(path)?;
     println!(
         "shard: {} bytes, {} records",
@@ -376,6 +417,9 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
 
     let arr_pdus = val["pdus"].as_array();
     let arr_auth = val["auth_chain"].as_array();
+    if arr_pdus.is_none() && arr_auth.is_none() {
+        bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array");
+    }
     for arr in [arr_pdus, arr_auth].into_iter().flatten() {
         for ev in arr {
             let sha = match ev {
@@ -439,6 +483,10 @@ fn cmd_repack(
 fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Result<()> {
     let room_id = parse_room_id(room)?;
     let store = open_store(cli)?;
+    let hex = hex_encode(&room_id);
+    if store.room_index_info(&room_id).is_none() {
+        bail!("room {hex} not found");
+    }
 
     if !roots.is_empty() {
         if !topo {
@@ -462,7 +510,6 @@ fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyho
     // mtxdb-core). --topo controls whether real prev_events-derived edges
     // are used for ordering; without it, every record is treated as its
     // own root (dedup only, no dependency ordering).
-    let hex = hex_encode(&room_id);
     let (kept, dropped) = if topo {
         eprintln!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
         store.repack_room_reachable(&room_id, extract_matrix_edges)?
@@ -674,4 +721,15 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
     store.sync_all()?;
     eprintln!("synced: persisted shard IO stats and shard\u{2192}room directory");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_megabytes;
+
+    #[test]
+    fn index_memory_megabytes_uses_fixed_point_rounding() {
+        assert_eq!(fmt_megabytes(524_328), "0.5243 MB");
+        assert_eq!(fmt_megabytes(999_999), "1.0000 MB");
+    }
 }

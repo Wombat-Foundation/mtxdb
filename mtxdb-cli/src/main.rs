@@ -27,7 +27,7 @@ pub(crate) enum Commands {
         room: String,
     },
     Scan {
-        path: PathBuf,
+        shard: String,
     },
     Import {
         path: PathBuf,
@@ -90,6 +90,7 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("completions")
                 .about("Print shell completion script")
+                .display_order(usize::MAX)
                 .arg(Arg::new("shell").required(true).value_parser([
                     "bash",
                     "elvish",
@@ -103,12 +104,17 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("scan")
                 .about("Scan a packfile and print records")
-                .arg(Arg::new("path").required(true)),
+                .arg(
+                    Arg::new("shard")
+                        .required(true)
+                        .value_name("SLOT | EPOCH")
+                        .help("Decimal shard slot or 0x-prefixed shard epoch from `shards`"),
+                ),
         )
         .subcommand(
             Command::new("info")
                 .about("Show storage info for a room")
-                .arg(Arg::new("room").short('r').long("room").required(true)),
+                .arg(Arg::new("room").required(true).value_name("ROOM")),
         )
         .subcommand(sub_delete())
         .subcommand(sub_put())
@@ -117,8 +123,19 @@ fn build_cli() -> Command {
 
 fn sub_import() -> Command {
     Command::new("import")
-        .about("Import a JSON DAG file (rezzy-compatible format)")
-        .arg(Arg::new("path").required(true))
+        .about("Import Matrix federation events from JSON")
+        .long_about(
+            "Import Matrix federation events from JSON. The document must contain a `pdus` \
+             array, an `auth_chain` array, or both; each imported event needs a base64-no-pad \
+             `hashes.sha256` value. The room comes from the document's `room_id` unless --room \
+             is supplied.",
+        )
+        .arg(
+            Arg::new("path")
+                .required(true)
+                .value_name("FILE")
+                .help("Matrix federation JSON document"),
+        )
         .arg(
             Arg::new("room")
                 .short('r')
@@ -206,7 +223,7 @@ fn parse_cli() -> Cli {
             room: m.get_one::<String>("room").unwrap().clone(),
         },
         Some(("scan", m)) => Commands::Scan {
-            path: PathBuf::from(m.get_one::<String>("path").unwrap()),
+            shard: m.get_one::<String>("shard").unwrap().clone(),
         },
         Some(("import", m)) => Commands::Import {
             path: PathBuf::from(m.get_one::<String>("path").unwrap()),
