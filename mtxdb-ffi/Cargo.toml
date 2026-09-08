@@ -19,4 +19,4 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 bytes = "1.5"
-mtxdb = { path = ".." }
+mtxdb-core = { path = "../mtxdb-core" }

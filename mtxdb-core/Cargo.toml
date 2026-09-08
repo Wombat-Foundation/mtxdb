@@ -12,12 +12,6 @@ authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
 
-[workspace]
-
-[[bench]]
-name = "storage"
-path = "../benches/storage.rs"
-
 [lib]
 path = "lib.rs"
 
@@ -27,3 +21,11 @@ bytes = "1.5"
 crc32fast = "1.4"
 memmap2 = "0.8"
 parking_lot = "0.12"
+
+[[bench]]
+name = "storage"
+path = "../benches/storage.rs"
+harness = false
+
+[lints]
+workspace = true

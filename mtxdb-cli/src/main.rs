@@ -1,15 +1,17 @@
+//! CLI for the mtxdb content-addressed storage engine.
+
 mod cmd;
 
 use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Command};
 
-pub struct Cli {
-    pub dir: Option<PathBuf>,
-    pub command: Commands,
+pub(crate) struct Cli {
+    pub(crate) dir: Option<PathBuf>,
+    pub(crate) command: Commands,
 }
 
-pub enum Commands {
+pub(crate) enum Commands {
     Put {
         room: String,
         id: String,

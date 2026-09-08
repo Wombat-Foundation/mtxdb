@@ -12,8 +12,6 @@ authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
 
-[workspace]
-
 [[bin]]
 name = "mtxdb"
 path = "src/main.rs"
@@ -22,14 +20,11 @@ path = "src/main.rs"
 anyhow = "1.0"
 base64 = "0.23.1"
 blake3 = "1"
-# bytes = "1.5"
+bytes = "1.5"
 clap = { version = "=4.5.48", default-features = false, features = ["std", "env", "help", "usage", "error-context"] }
 hex = "0.4"
 mtxdb-core = { path = "../mtxdb-core" }
 simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
-[lints.rust]
-workspace = true
-
-[lints.clippy]
+[lints]
 workspace = true

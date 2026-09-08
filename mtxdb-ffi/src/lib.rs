@@ -9,8 +9,8 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 
-use mtxdb::storage::{NodeData, StorageEngine};
-use mtxdb::PackfileStorage;
+use mtxdb_core::storage::{NodeData, StorageEngine};
+use mtxdb_core::PackfileStorage;
 
 /// Opaque handle to a PackfileStorage instance.
 pub struct MdbStorage {
@@ -170,8 +170,8 @@ pub unsafe extern "C" fn mdb_get_ex(
         }
         Err(e) => {
             let code = match e {
-                mtxdb::storage::StorageError::Io(_) => MdbError::Io,
-                mtxdb::storage::StorageError::Corrupt(_) => MdbError::Io,
+                mtxdb_core::storage::StorageError::Io(_) => MdbError::Io,
+                mtxdb_core::storage::StorageError::Corrupt(_) => MdbError::Io,
                 _ => MdbError::Internal,
             };
             unsafe { *out_err = code };

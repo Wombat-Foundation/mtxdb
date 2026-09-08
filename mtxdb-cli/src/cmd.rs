@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use base64::Engine as _;
-use mtxdb::storage::{NodeData, StorageEngine};
-use mtxdb::PackfileStorage;
+use mtxdb_core::storage::{NodeData, StorageEngine};
+use mtxdb_core::PackfileStorage;
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
 
@@ -44,7 +44,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     )
 }
 
-pub fn run(cli: &Cli) -> anyhow::Result<()> {
+pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Put { room, id, data } => cmd_put(cli, room, id, data),
         Commands::Get { room, id } => cmd_get(cli, room, id),
@@ -141,7 +141,7 @@ fn cmd_rooms(cli: &Cli) -> anyhow::Result<()> {
         if !path.extension().is_some_and(|e| e == "pack") {
             continue;
         }
-        let records = mtxdb::packfile::scan_packfile(&path)?;
+        let records = mtxdb_core::packfile::scan_packfile(&path)?;
         for (room_id, _hash, _offset) in &records {
             #[allow(clippy::arithmetic_side_effects)]
             {
@@ -323,7 +323,7 @@ fn cmd_info(cli: &Cli, room: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_scan(path: &PathBuf) -> anyhow::Result<()> {
-    let records = mtxdb::packfile::scan_packfile(path)?;
+    let records = mtxdb_core::packfile::scan_packfile(path)?;
     println!(
         "shard: {} bytes, {} records",
         std::fs::metadata(path)?.len(),
@@ -529,7 +529,7 @@ fn cmd_repack_shard(
             total_dropped = total_dropped.saturating_add(plan.dropped);
         }
 
-        let max_shard_bytes = mtxdb::shard::MAX_SHARD_BYTES;
+        let max_shard_bytes = mtxdb_core::shard::MAX_SHARD_BYTES;
         let expected_shards = total_kept_bytes
             .checked_add(max_shard_bytes.saturating_sub(1))
             .map_or(1, |rounded| rounded / max_shard_bytes)
@@ -609,7 +609,7 @@ fn cmd_repack_shard(
     Ok(())
 }
 
-fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
+fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId> {
     let mut input = data.to_vec();
     let val: simd_json::OwnedValue = match simd_json::to_owned_value(&mut input) {
         Ok(v) => v,

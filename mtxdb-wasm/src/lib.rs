@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 use wasm_bindgen::prelude::*;
 
-use mtxdb::storage::{NodeData, StorageEngine};
-use mtxdb::PackfileStorage;
+use mtxdb_core::storage::{NodeData, StorageEngine};
+use mtxdb_core::PackfileStorage;
 
 /// JavaScript-accessible handle to a mtxdb storage instance.
 #[wasm_bindgen]

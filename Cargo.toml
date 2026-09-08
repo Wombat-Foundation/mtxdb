@@ -1,28 +1,7 @@
-[package]
-name = "mtxdb"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.81"
-repository = "https://github.com/Wombat-Foundation/mtxdb"
-description = "mtxdb: highly efficient, novel embedded database."
-license = "MIT OR Apache-2.0"
-authors = ["Shane Jaroch <chown_tee@proton.me>"]
-readme = "README.md"
-keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
-categories = ["database-implementations", "storage"]
-publish = false
-
 [workspace]
+resolver = "2"
+members = ["mtxdb-cli", "mtxdb-core"]
 # exclude = ["mtxdb-ffi", "mtxdb-wasm"]
-
-[dependencies]
-
-[dev-dependencies]
-
-[[bench]]
-name = "storage"
-path = "benches/storage.rs"
-harness = false
 
 # LINTS
 
@@ -60,27 +39,32 @@ str_to_string = "warn"
 tests_outside_test_module = "warn"
 verbose_file_reads = "warn"
 
-# BUILD PROFILES
+# BENCHES — lives in mtxdb-core/Cargo.toml, not here: a virtual manifest
+# (this file has no [package]) can't own a [[bench]] target at all.
 
-[workspace.profile.release]
+# BUILD PROFILES — must be plain [profile.*], never nested under
+# [workspace.*]; Cargo only recognizes profiles at this exact table name
+# regardless of whether the manifest is virtual or a real package.
+
+[profile.release]
 strip = "symbols"
 lto = "thin"
 
-[workspace.profile.release-max-perf]
+[profile.release-max-perf]
 inherits = "release"
 strip = "symbols"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-[workspace.profile.dev]
+[profile.dev]
 opt-level = 0
 debug = 0
 strip = "debuginfo"
 incremental = true
 codegen-units = 256
 
-[workspace.profile.test]
+[profile.test]
 debug = 0
 strip = "debuginfo"
 incremental = true
