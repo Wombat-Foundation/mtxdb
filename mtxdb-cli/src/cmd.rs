@@ -86,7 +86,7 @@ fn collection_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
     // (possibly zstd-compressed) node bytes.
     const FRAME_FIXED_LEN: u64 = 1 + 4 + 16 + 16;
 
-    let mut by_room = HashMap::new();
+    let mut by_collection = HashMap::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if !path
@@ -149,11 +149,11 @@ fn collection_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
             if !complete {
                 break;
             }
-            let total = by_room.entry(collection_id).or_insert(0_u64);
+            let total = by_collection.entry(collection_id).or_insert(0_u64);
             *total = total.saturating_add(frame_len.saturating_add(8));
         }
     }
-    Ok(by_room)
+    Ok(by_collection)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -205,7 +205,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
-fn parse_room_id(hex: &str) -> anyhow::Result<[u8; 16]> {
+fn parse_collection_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     let hex = hex
         .strip_prefix("0x")
         .or_else(|| hex.strip_prefix("0X"))
@@ -280,7 +280,7 @@ fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
 }
 
 fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<()> {
-    let collection_id = parse_room_id(collection)?;
+    let collection_id = parse_collection_id(collection)?;
     let node_id = parse_node_id(id)?;
     let store = open_store(cli)?;
     let node_data = NodeData::new(bytes::Bytes::from(data.as_bytes().to_vec()));
@@ -299,7 +299,7 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str) -> anyhow::Result<()> 
     let store = open_store_read_only(cli)?;
     let matches: Vec<([u8; 16], NodeData)> = match collection {
         Some(collection) => {
-            let collection_id = parse_room_id(collection)?;
+            let collection_id = parse_collection_id(collection)?;
             store
                 .get(&collection_id, &node_id)?
                 .map(|data| vec![(collection_id, data)])
@@ -406,7 +406,7 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
         let hex = hex_encode(collection_id);
         let shards = collection_shards
             .as_ref()
-            .and_then(|by_room| by_room.get(collection_id))
+            .and_then(|by_collection| by_collection.get(collection_id))
             .map_or_else(
                 || "?".to_owned(),
                 |shards| {
@@ -465,7 +465,7 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
 /// Deliberately bypasses both `PackfileStorage` and `ShardPool` — it
 /// needs no collection data and no frame reads. Instead it validates pack
 /// headers, then decodes the small `shard_stats.bin` and
-/// `shard_rooms.bin` sidecars for counters and live-node counts.
+/// `shard_collections.bin` sidecars for counters and live-node counts.
 /// Safe to run against a directory a live writer process owns.
 fn cmd_shards(cli: &Cli, all: bool) -> anyhow::Result<()> {
     if all {
@@ -495,8 +495,8 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
 
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
     let node_counts = PackfileStorage::shard_node_counts_from_disk(dir);
-    let collection_counts = PackfileStorage::shard_room_counts_from_disk(dir);
-    let total_rooms = collection_counts
+    let collection_counts = PackfileStorage::shard_collection_counts_from_disk(dir);
+    let total_collections = collection_counts
         .as_ref()
         .map(|_| PackfileStorage::collection_directory_from_disk(dir).len());
     print_shard_table(
@@ -504,7 +504,7 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
         &stats_map,
         node_counts.as_ref(),
         collection_counts.as_ref(),
-        total_rooms,
+        total_collections,
     );
     println!("* active shard");
     println!(
@@ -633,7 +633,7 @@ fn print_shard_table(
     stats_map: &ShardStatsMap,
     node_counts: Option<&std::collections::HashMap<u16, u64>>,
     collection_counts: Option<&std::collections::HashMap<u16, u64>>,
-    total_rooms: Option<usize>,
+    total_collections: Option<usize>,
 ) {
     // `ShardPool::open_internal` restores the highest occupied slot as its
     // append destination. Mirror that recovery rule here without opening a
@@ -684,7 +684,7 @@ fn print_shard_table(
         "",
         fmt_bytes(total_bytes),
         total_nodes.map_or_else(|| "?".to_owned(), |count| count.to_string()),
-        total_rooms.map_or_else(|| "?".to_owned(), |count| count.to_string()),
+        total_collections.map_or_else(|| "?".to_owned(), |count| count.to_string()),
         total_syncs,
     );
 }
@@ -722,7 +722,7 @@ fn cmd_info(cli: &Cli, collection: &str) -> anyhow::Result<()> {
                 .copied()
                 .with_context(|| format!("collection slot {slot} not found"))?
         }
-        Err(_) => parse_room_id(collection)?,
+        Err(_) => parse_collection_id(collection)?,
     };
     let hex = hex_encode(&collection_id);
     let dir = selected_pool_dir(cli)?;
@@ -965,8 +965,8 @@ fn matrix_room_details(
         {
             continue;
         }
-        for (record_room_id, node_id, _) in mtxdb_core::packfile::scan_packfile(&path)? {
-            if &record_room_id != collection_id || !seen.insert(node_id) {
+        for (record_collection_id, node_id, _) in mtxdb_core::packfile::scan_packfile(&path)? {
+            if &record_collection_id != collection_id || !seen.insert(node_id) {
                 continue;
             }
             let Some(data) = store.get(collection_id, &node_id)? else {
@@ -1144,7 +1144,7 @@ fn cmd_import(
 /// collection. Scanning shards in rotation order lets a later physical copy replace
 /// an older one with the same node ID.
 fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
-    let collection_id = parse_room_id(collection)?;
+    let collection_id = parse_collection_id(collection)?;
     let pool_dir = selected_pool_dir(cli)?;
     let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&pool_dir) else {
         bail!("collection directory is unavailable; run `mtxdb sync` before exporting");
@@ -1153,7 +1153,7 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
         bail!("collection {collection} not found");
     }
     let collection_shards = PackfileStorage::collection_shards_from_disk(&pool_dir)
-        .and_then(|by_room| by_room.get(&collection_id).cloned())
+        .and_then(|by_collection| by_collection.get(&collection_id).cloned())
         .context("collection shard directory is unavailable; run `mtxdb sync` before exporting")?;
     let collection_shards: HashSet<u16> = collection_shards.into_iter().collect();
 
@@ -1168,8 +1168,8 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let mut locations = HashMap::new();
     let mut ordered_ids = Vec::new();
     for (shard_index, (_, shard)) in shards.iter().enumerate() {
-        for (candidate_room, node_id, offset) in mtxdb_core::packfile::scan_packfile(&shard.path)? {
-            if candidate_room == collection_id {
+        for (candidate_collection, node_id, offset) in mtxdb_core::packfile::scan_packfile(&shard.path)? {
+            if candidate_collection == collection_id {
                 if !locations.contains_key(&node_id) {
                     ordered_ids.push(node_id);
                 }
@@ -1209,7 +1209,7 @@ fn cmd_import_file(
     let is_jsonl = path
         .extension()
         .is_some_and(|extension| extension == "jsonl");
-    let (events, detected_room) = if is_jsonl {
+    let (events, detected_collection) = if is_jsonl {
         match parse_jsonl_events(&content) {
             Ok(events) => events,
             Err(jsonl_error) => match parse_federation_events(&content) {
@@ -1235,9 +1235,9 @@ fn cmd_import_file(
     let mut already_present_ids = Vec::with_capacity(3);
 
     let collection_id = if let Some(r) = collection_override {
-        parse_room_id(r)?
+        parse_collection_id(r)?
     } else {
-        let rid = detected_room.with_context(|| {
+        let rid = detected_collection.with_context(|| {
             let first_event = events
                 .first()
                 .and_then(event_id)
@@ -1321,14 +1321,14 @@ fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option
             .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
         events.push(event);
     }
-    let detected_room = events.iter().find_map(event_room_id).map(str::to_owned);
-    Ok((events, detected_room))
+    let detected_collection = events.iter().find_map(event_room_id).map(str::to_owned);
+    Ok((events, detected_collection))
 }
 
 fn parse_federation_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
     let mut bytes = content.to_vec();
     let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
-    let detected_room = event_room_id(&val).map(str::to_owned);
+    let detected_collection = event_room_id(&val).map(str::to_owned);
     let pdus = val["pdus"].as_array();
     let auth_chain = val["auth_chain"].as_array();
     if pdus.is_none() && auth_chain.is_none() {
@@ -1339,7 +1339,7 @@ fn parse_federation_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, O
         .flatten()
         .flat_map(|events| events.iter().cloned())
         .collect();
-    Ok((events, detected_room))
+    Ok((events, detected_collection))
 }
 
 fn event_room_id(value: &OwnedValue) -> Option<&str> {
@@ -1416,7 +1416,7 @@ fn cmd_repack(
     topo: bool,
 ) -> anyhow::Result<()> {
     let target = match (collection, shards.is_empty(), all) {
-        (Some(collection), true, false) => RepackTarget::Collection(parse_room_id(collection)?),
+        (Some(collection), true, false) => RepackTarget::Collection(parse_collection_id(collection)?),
         (None, false, false) => RepackTarget::Shards(parse_shard_selectors(shards)?),
         (None, true, true) => RepackTarget::All,
         // Clap rejects the both-targets case through `conflicts_with`; this
@@ -1461,7 +1461,7 @@ fn cmd_repack(
 /// compaction has to account for everything that repack will actually
 /// touch, not just the one shard named on the command line.
 ///
-/// Runs a non-mutating preflight first (`PackfileStorage::plan_room_repack`
+/// Runs a non-mutating preflight first (`PackfileStorage::plan_collection_repack`
 /// per collection in the closure): prints how many collections and shards are
 /// involved and the expected shard count/slack after compaction, then
 /// prompts for confirmation before performing any real repack. `--root`
@@ -1552,8 +1552,8 @@ fn resolve_repack_shards(
     let mut collections = std::collections::BTreeSet::new();
     let mut shards = std::collections::BTreeSet::new();
     for shard_id in shard_ids {
-        let (closure_rooms, closure_shards) = store.repack_closure(*shard_id)?;
-        collections.extend(closure_rooms);
+        let (closure_collections, closure_shards) = store.repack_closure(*shard_id)?;
+        collections.extend(closure_collections);
         shards.extend(closure_shards);
     }
     Ok((
@@ -1598,9 +1598,9 @@ fn repack_preview(
         if collections.len() == 1 { "" } else { "s" },
     );
     let plans = if topo {
-        preview_store.plan_rooms_repack(&collections, extract_matrix_edges)?
+        preview_store.plan_collections_repack(&collections, extract_matrix_edges)?
     } else {
-        preview_store.plan_rooms_repack(&collections, |_hash, _data| Vec::new())?
+        preview_store.plan_collections_repack(&collections, |_hash, _data| Vec::new())?
     };
     for plan in plans {
         total_kept = total_kept.saturating_add(plan.kept);
@@ -1664,13 +1664,13 @@ fn repack_preview(
     }))
 }
 
-fn repack_rooms(
+fn repack_collections(
     store: &PackfileStorage,
     collections: &[[u8; 16]],
     topo: bool,
 ) -> anyhow::Result<(usize, usize)> {
     let results = if topo {
-        store.repack_rooms_reachable_with_progress(
+        store.repack_collections_reachable_with_progress(
             collections,
             extract_matrix_edges,
             |collection_id, from, to, nodes, complete| {
@@ -1686,7 +1686,7 @@ fn repack_rooms(
             },
         )?
     } else {
-        store.repack_rooms_reachable_with_progress(
+        store.repack_collections_reachable_with_progress(
             collections,
             |_hash, _data| Vec::new(),
             |collection_id, from, to, nodes, complete| {
@@ -1744,12 +1744,12 @@ fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Re
         );
     }
 
-    repack_rooms(&store, &collections, topo)?;
+    repack_collections(&store, &collections, topo)?;
     // `cmd_shards` deliberately reads the persisted shard→collection directory
     // instead of reopening and scanning every packfile. Refresh it before
     // the immediate post-repack table so freshly-created rotations have
     // real node counts rather than `?`.
-    store.persist_shard_rooms()?;
+    store.persist_shard_collections()?;
     drop(store);
     println!("post-repack shard state:");
     cmd_shards(cli, false)?;
@@ -1783,7 +1783,7 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId
 fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
     let mut collection_ids: Vec<[u8; 16]> = collections
         .iter()
-        .map(|collection| parse_room_id(collection))
+        .map(|collection| parse_collection_id(collection))
         .collect::<anyhow::Result<_>>()?;
     collection_ids.sort_unstable();
     collection_ids.dedup();
@@ -1807,7 +1807,7 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
         let count = store
             .collection_index_info(&collection_id)
             .map_or(0, |(len, _)| len);
-        store.delete_room(&collection_id)?;
+        store.delete_collection(&collection_id)?;
         println!(
             "deleted {count} nodes for collection {}",
             hex_encode(&collection_id)
@@ -1819,7 +1819,7 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
 /// Opens the store as writer (which always does a full scan and builds
 /// the shard→collection directory and shard stats in memory regardless of
 /// whether either has ever been persisted), then persists both —
-/// bootstrapping `shard_stats.bin`/`shard_rooms.bin` for a store whose
+/// bootstrapping `shard_stats.bin`/`shard_collections.bin` for a store whose
 /// writer process has never called `sync_all`, or just refreshing them
 /// on demand.
 fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {

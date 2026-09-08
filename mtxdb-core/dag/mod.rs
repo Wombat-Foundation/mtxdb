@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_active_room_frontier_default() {
+    fn test_active_collection_frontier_default() {
         let frontier = ActiveRoomFrontier::default();
         assert!(frontier.is_empty());
         assert_eq!(frontier.len(), 0);

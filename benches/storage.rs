@@ -728,7 +728,7 @@ fn run_intent_benchmark(total_events: usize) {
 // ── Reaction-swarm adversarial scenario ──────────────────────────────
 //
 // PackfileStorage::put() never triggers automatic repacks — repack is
-// purely caller-invoked (repack_room_reachable). This benchmark never
+// purely caller-invoked (repack_collection_reachable). This benchmark never
 // calls it, so the collection's packfile grows monotonically in arrival order.
 // That makes the real threat model here
 // "random-offset reads into a large, cold, ever-growing file", not "did
@@ -890,7 +890,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
 
 // ── Repack amplification scenario ────────────────────────────────────
 //
-// This benchmark previously called the now-retired repack_room_rewrite,
+// This benchmark previously called the now-retired repack_collection_rewrite,
 // which had a real bug worth recording: its scan step never deduplicated
 // physical record occurrences, so every repack re-copied every prior
 // repack's redundant copies on top of the current live set. That's
@@ -898,9 +898,9 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
 // cycle), not the O(n^2) originally assumed here — confirmed empirically
 // when a 20,000-event run failed to complete (unbounded memory growth,
 // then a Corrupt read once shard rotation collided with the same call's
-// stale offsets — see repack_room_reachable's docs on pin_shards).
+// stale offsets — see repack_collection_reachable's docs on pin_shards).
 //
-// repack_room_reachable's live-set/adjacency construction is inherently
+// repack_collection_reachable's live-set/adjacency construction is inherently
 // deduplicated (derived from a hash-keyed map, not a raw per-occurrence
 // Vec), so this exponential blowup does not apply to it. Calling it here
 // with no live roots configured still repacks the *entire* collection on every
@@ -943,7 +943,7 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
         if (i + 1) % repack_interval == 0 {
             let t_repack = Instant::now();
             store
-                .repack_room_reachable(&collection_id, |_hash, _data| Vec::new())
+                .repack_collection_reachable(&collection_id, |_hash, _data| Vec::new())
                 .unwrap();
             total_repack_time += t_repack.elapsed();
             repack_count += 1;
@@ -962,7 +962,7 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
     eprintln!("  that's the O(n^2) full-rewrite cost, empirically, not just argued.");
     eprintln!();
 
-    store.delete_room(&collection_id).unwrap();
+    store.delete_collection(&collection_id).unwrap();
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }

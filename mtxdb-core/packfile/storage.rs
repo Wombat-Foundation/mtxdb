@@ -20,7 +20,7 @@ use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
 /// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
 
-/// Result of [`PackfileStorage::plan_room_repack`] — what a real repack
+/// Result of [`PackfileStorage::plan_collection_repack`] — what a real repack
 /// of this collection would do, computed exactly (same scan + reachability
 /// pass) but without performing any writes.
 #[derive(Debug, Clone, Default)]
@@ -96,17 +96,17 @@ type RepackOffsets = Vec<([u8; 16], u16, u64)>;
 type ShardRecord = (u16, [u8; 16], u64);
 
 /// Accumulator for `PackfileStorage::open_with_options`'s phase 2 —
-/// bundles the three maps `init_room_from_scan` fills in per collection, so
+/// bundles the three maps `init_collection_from_scan` fills in per collection, so
 /// that function takes one out-parameter instead of three.
 #[derive(Default)]
 struct RoomScanOutput {
     collections: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
-    shard_rooms: HashMap<u16, HashMap<[u8; 16], u64>>,
+    shard_collections: HashMap<u16, HashMap<[u8; 16], u64>>,
     collection_shards: HashMap<[u8; 16], HashSet<u16>>,
 }
 
 /// Magic bytes + version identifying the persisted shard→collection directory
-/// format (see `PackfileStorage::persist_shard_rooms`).
+/// format (see `PackfileStorage::persist_shard_collections`).
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
 const SHARD_ROOMS_VERSION: u8 = 2;
 /// Version 1 did not preserve collection insertion order. It remains readable so
@@ -130,10 +130,10 @@ struct PersistedShardRoom {
 /// Decode the small inspection sidecar. This is deliberately shared by all
 /// read-only CLI summary helpers so they agree on validation and format
 /// compatibility.
-fn read_persisted_shard_rooms(
+fn read_persisted_shard_collections(
     base_dir: &std::path::Path,
 ) -> Option<(u64, Vec<PersistedShardRoom>)> {
-    let buf = fs::read(base_dir.join("shard_rooms.bin")).ok()?;
+    let buf = fs::read(base_dir.join("shard_collections.bin")).ok()?;
     if buf.len() < SHARD_ROOMS_HEADER_LEN || &buf[0..4] != SHARD_ROOMS_MAGIC {
         return None;
     }
@@ -173,8 +173,8 @@ fn read_persisted_shard_rooms(
 /// The durable order supplied by a v2 inspection directory. Legacy v1
 /// directories have no order information at all, so callers must retain
 /// their physical first-seen order until the next sync upgrades them.
-fn persisted_room_order(base_dir: &std::path::Path) -> Option<Vec<[u8; 16]>> {
-    let (_, records) = read_persisted_shard_rooms(base_dir)?;
+fn persisted_collection_order(base_dir: &std::path::Path) -> Option<Vec<[u8; 16]>> {
+    let (_, records) = read_persisted_shard_collections(base_dir)?;
     let mut orders: HashMap<[u8; 16], u64> = HashMap::new();
     for record in records {
         let order = record.insertion_order?;
@@ -193,7 +193,7 @@ fn persisted_room_order(base_dir: &std::path::Path) -> Option<Vec<[u8; 16]>> {
     )
 }
 
-/// Disambiguates concurrent `persist_shard_rooms` tmp filenames within
+/// Disambiguates concurrent `persist_shard_collections` tmp filenames within
 /// this process, paired with the process id for uniqueness across
 /// processes — same rationale as `shard::STATS_TMP_COUNTER`.
 static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -230,18 +230,18 @@ pub struct PackfileStorage {
     /// Serializes the read-modify-write `deleted.collections` file. Collection locks
     /// protect a collection's lifecycle, but distinct collections may be recreated or
     /// deleted concurrently.
-    deleted_rooms_lock: parking_lot::Mutex<()>,
+    deleted_collections_lock: parking_lot::Mutex<()>,
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
-    /// Total number of `repack_room_reachable` calls across all collections.
+    /// Total number of `repack_collection_reachable` calls across all collections.
     repack_count: AtomicU64,
     /// Total records kept (rewritten into the new generation) across all repacks.
     repack_kept_total: AtomicU64,
     /// Total records dropped (found unreachable) across all repacks.
     repack_dropped_total: AtomicU64,
     /// Per-collection repack counts, so a hot collection's churn is visible individually.
-    repack_counts_by_room: RwLock<HashMap<[u8; 16], u64>>,
+    repack_counts_by_collection: RwLock<HashMap<[u8; 16], u64>>,
     /// Per-collection incremental repack state. Each entry tracks the byte
     /// offset up to which each shard has been scanned for this collection and
     /// the deduplicated hash → (`shard_id`, offset) map from the last repack.
@@ -256,15 +256,15 @@ pub struct PackfileStorage {
     /// `LossyIndex::shard_counts`) rather than ever re-derived by
     /// scanning a shard file, which is what made `collections_referencing_shard`
     /// and a `collections`-style listing expensive before this existed.
-    shard_rooms: RwLock<HashMap<u16, HashMap<[u8; 16], u64>>>,
-    /// Reverse index of `shard_rooms`: which shards a given collection currently
+    shard_collections: RwLock<HashMap<u16, HashMap<[u8; 16], u64>>>,
+    /// Reverse index of `shard_collections`: which shards a given collection currently
     /// contributes a nonzero count to. Lets a collection's full-index-rebuild
-    /// path (`replace_room_shard_counts`) clear exactly the shard entries
-    /// it used to occupy without scanning every shard in `shard_rooms`.
+    /// path (`replace_collection_shard_counts`) clear exactly the shard entries
+    /// it used to occupy without scanning every shard in `shard_collections`.
     collection_shards: RwLock<HashMap<[u8; 16], HashSet<u16>>>,
-    /// Wall-clock instant of the last `maybe_persist_shard_rooms` flush,
+    /// Wall-clock instant of the last `maybe_persist_shard_collections` flush,
     /// used to rate-limit that timer-driven path.
-    last_shard_rooms_flush: RwLock<Option<std::time::Instant>>,
+    last_shard_collections_flush: RwLock<Option<std::time::Instant>>,
 }
 
 /// Per-collection state for incremental repack.
@@ -349,8 +349,8 @@ impl PackfileStorage {
         // cannot appear in the sidecar until the next flush, so append it at
         // first physical sight below. Legacy v1 sidecars yield no order and
         // therefore use the same first-seen fallback for every collection.
-        let mut collection_order = persisted_room_order(&base_dir).unwrap_or_default();
-        let mut known_rooms: HashSet<[u8; 16]> = collection_order.iter().copied().collect();
+        let mut collection_order = persisted_collection_order(&base_dir).unwrap_or_default();
+        let mut known_collections: HashSet<[u8; 16]> = collection_order.iter().copied().collect();
 
         // Collect open shard info (slot, path) before the scan loop so we
         // don't hold the shards read-lock across the I/O-heavy scan.
@@ -402,7 +402,7 @@ impl PackfileStorage {
                 }
             };
             for (collection_id, hash, offset) in entries {
-                if known_rooms.insert(collection_id) {
+                if known_collections.insert(collection_id) {
                     collection_order.push(collection_id);
                 }
                 collection_entries
@@ -414,16 +414,16 @@ impl PackfileStorage {
         collection_order.retain(|collection_id| collection_entries.contains_key(collection_id));
 
         // P1: load deleted collections set (persisted to disk)
-        let deleted_rooms = Self::load_deleted_rooms(&base_dir);
+        let deleted_collections = Self::load_deleted_collections(&base_dir);
 
         let mut scan_out = RoomScanOutput::default();
 
         // Phase 2: build per-collection indexes sized to the true total.
         for collection_id in &collection_order {
-            if deleted_rooms.contains(collection_id) {
+            if deleted_collections.contains(collection_id) {
                 continue;
             }
-            Self::init_room_from_scan(
+            Self::init_collection_from_scan(
                 collection_id,
                 &collection_entries[collection_id],
                 &shards,
@@ -440,18 +440,18 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
-            deleted_rooms_lock: parking_lot::Mutex::new(()),
+            deleted_collections_lock: parking_lot::Mutex::new(()),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
             repack_count: AtomicU64::new(0),
             repack_kept_total: AtomicU64::new(0),
             repack_dropped_total: AtomicU64::new(0),
-            repack_counts_by_room: RwLock::new(HashMap::new()),
+            repack_counts_by_collection: RwLock::new(HashMap::new()),
             repack_incremental: RwLock::new(HashMap::new()),
-            shard_rooms: RwLock::new(scan_out.shard_rooms),
+            shard_collections: RwLock::new(scan_out.shard_collections),
             collection_shards: RwLock::new(scan_out.collection_shards),
-            last_shard_rooms_flush: RwLock::new(None),
+            last_shard_collections_flush: RwLock::new(None),
         })
     }
 
@@ -460,7 +460,7 @@ impl PackfileStorage {
     /// per-collection body of `open_with_options`'s phase 2, factored out to
     /// keep that function under the line-count lint rather than
     /// suppressing it.
-    fn init_room_from_scan(
+    fn init_collection_from_scan(
         collection_id: &[u8; 16],
         records: &[ShardRecord],
         shards: &ShardPool,
@@ -475,7 +475,7 @@ impl PackfileStorage {
         // its existing data instead of restarting at whatever the pool's
         // active shard happens to be.
         if let Some(&(last_shard_id, _, _)) = records.last() {
-            shards.set_room_home(collection_id, last_shard_id);
+            shards.set_collection_home(collection_id, last_shard_id);
         }
         let mut index = LossyIndex::new(records.len().saturating_mul(2).max(16));
         for (shard_id, hash, offset) in records {
@@ -483,7 +483,7 @@ impl PackfileStorage {
         }
         let counts = index.shard_counts();
         for (&shard_id, &count) in &counts {
-            out.shard_rooms
+            out.shard_collections
                 .entry(shard_id)
                 .or_default()
                 .insert(*collection_id, count);
@@ -546,7 +546,7 @@ impl PackfileStorage {
         // dominant cost of shard retirement/evacuation-style operations
         // on a large shard.
         Ok(self
-            .shard_rooms
+            .shard_collections
             .read()
             .get(&shard_id)
             .map(|collections| collections.keys().copied().collect())
@@ -584,7 +584,7 @@ impl PackfileStorage {
         let mut results = Vec::with_capacity(collections.len());
         for collection_id in collections {
             let (kept, dropped) =
-                self.repack_room_reachable(&collection_id, |hash, data| extract_edges(hash, data))?;
+                self.repack_collection_reachable(&collection_id, |hash, data| extract_edges(hash, data))?;
             results.push((collection_id, kept, dropped));
         }
         Ok(results)
@@ -630,7 +630,7 @@ impl PackfileStorage {
     ///
     /// Repacking is entirely caller-driven — nothing in this engine polls
     /// this on its own. A background GC worker is expected to call this
-    /// periodically and issue `repack_room_reachable` itself; nothing in
+    /// periodically and issue `repack_collection_reachable` itself; nothing in
     /// `mtxdb-core` currently does so.
     #[must_use]
     pub fn needs_repack(&self, collection_id: &[u8; 16]) -> bool {
@@ -668,7 +668,7 @@ impl PackfileStorage {
         ShardPool::record_disk_len_at(shard, offset)
     }
 
-    fn scan_room_records(
+    fn scan_collection_records(
         &self,
         collection_id: &[u8; 16],
     ) -> Result<Vec<ScannedShard>, StorageError> {
@@ -694,10 +694,10 @@ impl PackfileStorage {
     }
 
     /// Scan every open shard once and build deduplicated record maps for the
-    /// requested collections. This is the batch counterpart to `scan_room_records`:
+    /// requested collections. This is the batch counterpart to `scan_collection_records`:
     /// a shard-compaction preflight must not reread the same packfile once per
     /// collection in its closure.
-    fn scan_room_record_maps(
+    fn scan_collection_record_maps(
         &self,
         collection_ids: &[[u8; 16]],
     ) -> Result<HashMap<[u8; 16], RepackRecordMap>, StorageError> {
@@ -727,12 +727,12 @@ impl PackfileStorage {
         index
     }
 
-    fn deleted_rooms_path(base_dir: &std::path::Path) -> PathBuf {
+    fn deleted_collections_path(base_dir: &std::path::Path) -> PathBuf {
         base_dir.join("deleted.collections")
     }
 
-    fn load_deleted_rooms(base_dir: &std::path::Path) -> HashSet<[u8; 16]> {
-        let path = Self::deleted_rooms_path(base_dir);
+    fn load_deleted_collections(base_dir: &std::path::Path) -> HashSet<[u8; 16]> {
+        let path = Self::deleted_collections_path(base_dir);
         let Ok(bytes) = fs::read(&path) else {
             return HashSet::new();
         };
@@ -746,20 +746,20 @@ impl PackfileStorage {
             .collect()
     }
 
-    fn persist_deleted_room(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
-        let _guard = self.deleted_rooms_lock.lock();
-        let path = Self::deleted_rooms_path(&self.base_dir);
-        let mut set = Self::load_deleted_rooms(&self.base_dir);
+    fn persist_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        let _guard = self.deleted_collections_lock.lock();
+        let path = Self::deleted_collections_path(&self.base_dir);
+        let mut set = Self::load_deleted_collections(&self.base_dir);
         set.insert(*collection_id);
         let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
         fs::write(&path, &bytes).map_err(StorageError::Io)?;
         Ok(())
     }
 
-    fn clear_deleted_room(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
-        let _guard = self.deleted_rooms_lock.lock();
-        let path = Self::deleted_rooms_path(&self.base_dir);
-        let mut set = Self::load_deleted_rooms(&self.base_dir);
+    fn clear_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        let _guard = self.deleted_collections_lock.lock();
+        let path = Self::deleted_collections_path(&self.base_dir);
+        let mut set = Self::load_deleted_collections(&self.base_dir);
         if set.remove(collection_id) {
             let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
             fs::write(&path, &bytes).map_err(StorageError::Io)?;
@@ -770,19 +770,19 @@ impl PackfileStorage {
     /// Records one new record landing in `shard_id` for `collection_id` — the
     /// cheap, O(1) path for a plain `put` that only appends, never moves
     /// or drops anything. Kept separate from
-    /// [`Self::replace_room_shard_counts`], which pays for a full
+    /// [`Self::replace_collection_shard_counts`], which pays for a full
     /// per-shard recount and is reserved for the cases that actually
     /// change a collection's existing distribution (an index rebuild or a
     /// repack), so a normal write never regresses to O(collection size).
-    fn record_new_shard_room(&self, shard_id: u16, collection_id: &[u8; 16]) {
-        let mut shard_rooms = self.shard_rooms.write();
-        let count = shard_rooms
+    fn record_new_shard_collection(&self, shard_id: u16, collection_id: &[u8; 16]) {
+        let mut shard_collections = self.shard_collections.write();
+        let count = shard_collections
             .entry(shard_id)
             .or_default()
             .entry(*collection_id)
             .or_insert(0);
         *count = count.saturating_add(1);
-        drop(shard_rooms);
+        drop(shard_collections);
         self.collection_shards
             .write()
             .entry(*collection_id)
@@ -790,63 +790,63 @@ impl PackfileStorage {
             .insert(shard_id);
     }
 
-    /// Replaces `collection_id`'s entire contribution to `shard_rooms` with
+    /// Replaces `collection_id`'s entire contribution to `shard_collections` with
     /// `counts` (typically `LossyIndex::shard_counts()` on a freshly
     /// rebuilt or repacked index) — clears it out of any shard it no
     /// longer occupies and installs the fresh per-shard counts. Used
     /// wherever a collection's index is replaced wholesale rather than
     /// incrementally appended to, since only then can its distribution
     /// across shards actually change.
-    fn replace_room_shard_counts(&self, collection_id: &[u8; 16], counts: &HashMap<u16, u64>) {
+    fn replace_collection_shard_counts(&self, collection_id: &[u8; 16], counts: &HashMap<u16, u64>) {
         let old_shards = self
             .collection_shards
             .write()
             .insert(*collection_id, counts.keys().copied().collect());
-        let mut shard_rooms = self.shard_rooms.write();
+        let mut shard_collections = self.shard_collections.write();
         if let Some(old_shards) = old_shards {
             for shard_id in &old_shards {
                 if !counts.contains_key(shard_id) {
-                    if let Some(m) = shard_rooms.get_mut(shard_id) {
+                    if let Some(m) = shard_collections.get_mut(shard_id) {
                         m.remove(collection_id);
                         if m.is_empty() {
-                            shard_rooms.remove(shard_id);
+                            shard_collections.remove(shard_id);
                         }
                     }
                 }
             }
         }
         for (&shard_id, &count) in counts {
-            shard_rooms
+            shard_collections
                 .entry(shard_id)
                 .or_default()
                 .insert(*collection_id, count);
         }
     }
 
-    /// Removes `collection_id` from `shard_rooms`/`collection_shards` entirely —
+    /// Removes `collection_id` from `shard_collections`/`collection_shards` entirely —
     /// used on collection deletion, where nothing of the collection survives in any
     /// shard.
-    fn remove_room_shard_counts(&self, collection_id: &[u8; 16]) {
+    fn remove_collection_shard_counts(&self, collection_id: &[u8; 16]) {
         let Some(old_shards) = self.collection_shards.write().remove(collection_id) else {
             return;
         };
-        let mut shard_rooms = self.shard_rooms.write();
+        let mut shard_collections = self.shard_collections.write();
         for shard_id in old_shards {
-            if let Some(m) = shard_rooms.get_mut(&shard_id) {
+            if let Some(m) = shard_collections.get_mut(&shard_id) {
                 m.remove(collection_id);
                 if m.is_empty() {
-                    shard_rooms.remove(&shard_id);
+                    shard_collections.remove(&shard_id);
                 }
             }
         }
     }
 
     /// Path to the persisted shard→collection directory for a base directory.
-    fn shard_rooms_path(base_dir: &std::path::Path) -> PathBuf {
-        base_dir.join("shard_rooms.bin")
+    fn shard_collections_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join("shard_collections.bin")
     }
 
-    /// Persist the current `shard_rooms` directory to disk: which collections
+    /// Persist the current `shard_collections` directory to disk: which collections
     /// have live records in each shard, and how many. Read by
     /// [`Self::collection_directory_from_disk`] — a free function a separate,
     /// short-lived process (a `collections`-style CLI listing) can call without
@@ -859,7 +859,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on write or rename failure.
-    pub fn persist_shard_rooms(&self) -> Result<(), StorageError> {
+    pub fn persist_shard_collections(&self) -> Result<(), StorageError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(SHARD_ROOMS_MAGIC);
         buf.push(SHARD_ROOMS_VERSION);
@@ -880,7 +880,7 @@ impl PackfileStorage {
                     })
             })
             .collect::<Result<_, _>>()?;
-        for (shard_id, collections) in self.shard_rooms.read().iter() {
+        for (shard_id, collections) in self.shard_collections.read().iter() {
             for (collection_id, count) in collections {
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(collection_id);
@@ -894,9 +894,9 @@ impl PackfileStorage {
         }
 
         let unique = SHARD_ROOMS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = Self::shard_rooms_path(&self.base_dir)
+        let tmp_path = Self::shard_collections_path(&self.base_dir)
             .with_extension(format!("bin.tmp.{}.{unique}", std::process::id()));
-        let final_path = Self::shard_rooms_path(&self.base_dir);
+        let final_path = Self::shard_collections_path(&self.base_dir);
         let write_result = (|| -> std::io::Result<()> {
             let mut tmp = fs::File::create(&tmp_path)?;
             std::io::Write::write_all(&mut tmp, &buf)?;
@@ -910,13 +910,13 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Best-effort wrapper around [`Self::persist_shard_rooms`] — logs and
+    /// Best-effort wrapper around [`Self::persist_shard_collections`] — logs and
     /// swallows a failure rather than turning it into a hard error, same
     /// contract as `ShardPool`'s stats persistence: this is observability
     /// data, not something worth failing an otherwise-successful sync
     /// over.
-    fn persist_shard_rooms_best_effort(&self) {
-        if let Err(e) = self.persist_shard_rooms() {
+    fn persist_shard_collections_best_effort(&self) {
+        if let Err(e) = self.persist_shard_collections() {
             eprintln!("mtxdb: failed to persist shard→collection directory: {e}");
         }
     }
@@ -932,7 +932,7 @@ impl PackfileStorage {
     /// feature, or a writer hasn't flushed it yet).
     #[must_use]
     pub fn collection_directory_from_disk(base_dir: &std::path::Path) -> Vec<([u8; 16], u64)> {
-        let Some((_, records)) = read_persisted_shard_rooms(base_dir) else {
+        let Some((_, records)) = read_persisted_shard_collections(base_dir) else {
             return Vec::new();
         };
         let mut totals: HashMap<[u8; 16], (u64, Option<u64>)> = HashMap::new();
@@ -993,7 +993,7 @@ impl PackfileStorage {
     pub fn collection_shards_from_disk(
         base_dir: &std::path::Path,
     ) -> Option<HashMap<[u8; 16], Vec<u16>>> {
-        let (_, records) = read_persisted_shard_rooms(base_dir)?;
+        let (_, records) = read_persisted_shard_collections(base_dir)?;
         let mut shards: HashMap<[u8; 16], Vec<u16>> = HashMap::new();
         for record in records {
             shards
@@ -1016,7 +1016,7 @@ impl PackfileStorage {
     /// explicitly open the store and rebuild its indexes instead.
     #[must_use]
     pub fn shard_node_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
-        let (_, records) = read_persisted_shard_rooms(base_dir)?;
+        let (_, records) = read_persisted_shard_collections(base_dir)?;
         let mut totals = HashMap::new();
         for record in records {
             let total = totals.entry(record.shard_id).or_insert(0_u64);
@@ -1032,8 +1032,8 @@ impl PackfileStorage {
     /// Returns `None` when the directory has not been persisted yet or is
     /// malformed.
     #[must_use]
-    pub fn shard_room_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
-        let (_, records) = read_persisted_shard_rooms(base_dir)?;
+    pub fn shard_collection_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u16, u64>> {
+        let (_, records) = read_persisted_shard_collections(base_dir)?;
         let mut totals = HashMap::new();
         for record in records {
             let count = totals.entry(record.shard_id).or_insert(0_u64);
@@ -1048,7 +1048,7 @@ impl PackfileStorage {
     /// `ShardPool::stats_persisted_at` does for shard IO stats.
     #[must_use]
     pub fn collection_directory_persisted_at(base_dir: &std::path::Path) -> Option<u64> {
-        read_persisted_shard_rooms(base_dir).map(|(persisted_at, _)| persisted_at)
+        read_persisted_shard_collections(base_dir).map(|(persisted_at, _)| persisted_at)
     }
 
     /// Pin one `Arc<Shard>` per distinct shard id, keeping each shard's file
@@ -1122,7 +1122,7 @@ impl PackfileStorage {
         // generation. A failure must fail the write: otherwise it appears to
         // succeed but disappears on the next startup scan.
         if is_new {
-            self.clear_deleted_room(collection_id)?;
+            self.clear_deleted_collection(collection_id)?;
         }
 
         self.collections
@@ -1143,7 +1143,7 @@ impl PackfileStorage {
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
-        let scanned = self.scan_room_records(collection_id)?;
+        let scanned = self.scan_collection_records(collection_id)?;
         let total: usize = scanned.iter().map(|(_, e)| e.len()).sum();
         let mut index = LossyIndex::new(total.saturating_mul(2).max(16));
         for (shard_id, entries) in scanned {
@@ -1226,13 +1226,13 @@ impl PackfileStorage {
         Ok(None)
     }
 
-    // repack_room_rewrite and repack_room_topo were retired: both scanned
+    // repack_collection_rewrite and repack_collection_topo were retired: both scanned
     // for records without deduplicating physical duplicates (each prior
     // repack's rewritten copies included), giving an exponential blowup on
     // repeated calls against a growing collection, and both re-fetched
     // Arc<Shard> per loop iteration rather than pinning shards for the
     // call's duration — vulnerable to the rotation race documented on
-    // `pin_shards`. `repack_room_reachable`'s no-live-roots fallback
+    // `pin_shards`. `repack_collection_reachable`'s no-live-roots fallback
     // subsumes both: same topological ordering, correct dedup via
     // `hash_to_shard_offset`, and pinned shards throughout.
 
@@ -1466,7 +1466,7 @@ impl PackfileStorage {
         } else {
             // First repack: full scan of every shard.
             drop(cursors);
-            let scanned = self.scan_room_records(collection_id)?;
+            let scanned = self.scan_collection_records(collection_id)?;
             let mut map = HashMap::new();
             for (shard_id, entries) in &scanned {
                 for (hash, offset) in entries {
@@ -1504,7 +1504,7 @@ impl PackfileStorage {
         );
     }
 
-    /// Non-mutating preview of what [`Self::repack_room_reachable`] would
+    /// Non-mutating preview of what [`Self::repack_collection_reachable`] would
     /// do for `collection_id`: runs the exact same scan + reachability
     /// computation (so kept/dropped counts are exact, not estimates), but
     /// performs no writes, no index swap, and no incremental-repack
@@ -1515,16 +1515,16 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption.
-    pub fn plan_room_repack(
+    pub fn plan_collection_repack(
         &self,
         collection_id: &[u8; 16],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<RepackPlan, StorageError> {
         let hash_to_shard_offset = self.repack_scan_incremental(collection_id)?;
-        self.plan_room_repack_from_map(collection_id, &hash_to_shard_offset, &extract_edges)
+        self.plan_collection_repack_from_map(collection_id, &hash_to_shard_offset, &extract_edges)
     }
 
-    fn plan_room_repack_from_map(
+    fn plan_collection_repack_from_map(
         &self,
         collection_id: &[u8; 16],
         hash_to_shard_offset: &RepackRecordMap,
@@ -1574,25 +1574,25 @@ impl PackfileStorage {
     }
 
     /// Plan several collection repacks from one physical scan of their shard
-    /// closure. Unlike repeatedly calling [`Self::plan_room_repack`], this
+    /// closure. Unlike repeatedly calling [`Self::plan_collection_repack`], this
     /// is O(bytes scanned) rather than O(collections × bytes scanned).
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption while scanning or
     /// resolving a requested collection's records.
-    pub fn plan_rooms_repack(
+    pub fn plan_collections_repack(
         &self,
         collection_ids: &[[u8; 16]],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<RepackPlan>, StorageError> {
-        let maps = self.scan_room_record_maps(collection_ids)?;
+        let maps = self.scan_collection_record_maps(collection_ids)?;
         collection_ids
             .iter()
             .map(|collection_id| {
                 let map = maps.get(collection_id).ok_or_else(|| {
                     StorageError::Corrupt("repack batch scan lost requested collection".to_owned())
                 })?;
-                self.plan_room_repack_from_map(collection_id, map, &extract_edges)
+                self.plan_collection_repack_from_map(collection_id, map, &extract_edges)
             })
             .collect()
     }
@@ -1673,7 +1673,7 @@ impl PackfileStorage {
     /// generation. Rewritten or superseded append entries are excluded.
     #[must_use]
     pub fn shard_node_counts(&self) -> HashMap<u16, u64> {
-        self.shard_rooms
+        self.shard_collections
             .read()
             .iter()
             .map(|(&shard_id, collections)| {
@@ -1691,13 +1691,13 @@ impl PackfileStorage {
     ///
     /// # Panics
     /// Panics if any hash in the CSR exceeds `u32::MAX` local ID space.
-    pub fn repack_room_reachable(
+    pub fn repack_collection_reachable(
         &self,
         collection_id: &[u8; 16],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<(usize, usize), StorageError> {
         let collection_arc = self.put_mutex(collection_id);
-        let _room_guard = collection_arc.lock();
+        let _collection_guard = collection_arc.lock();
 
         let hash_to_shard_offset = self.repack_scan_incremental(collection_id)?;
 
@@ -1759,7 +1759,7 @@ impl PackfileStorage {
             .map(|&(shard_id, _)| shard_id)
             .collect();
         self.shards
-            .prepare_room_repack(collection_id, &source_shards)?;
+            .prepare_collection_repack(collection_id, &source_shards)?;
 
         let mut new_offsets: Vec<([u8; 16], u16, u64)> = Vec::with_capacity(topo.len());
         for &local in &topo {
@@ -1779,7 +1779,7 @@ impl PackfileStorage {
         let kept = new_offsets.len();
 
         let index = Self::build_index(&new_offsets);
-        self.replace_room_shard_counts(collection_id, &index.shard_counts());
+        self.replace_collection_shard_counts(collection_id, &index.shard_counts());
         self.swap_generation(collection_id, index)?;
         self.retire_empty_shards(collection_id);
 
@@ -1788,7 +1788,7 @@ impl PackfileStorage {
             .fetch_add(kept as u64, Ordering::Relaxed);
         self.repack_dropped_total
             .fetch_add(dropped as u64, Ordering::Relaxed);
-        self.repack_counts_by_room
+        self.repack_counts_by_collection
             .write()
             .entry(*collection_id)
             .and_modify(|c| *c = c.saturating_add(1))
@@ -1821,19 +1821,19 @@ impl PackfileStorage {
     /// # Panics
     /// Panics if the CSR implementation returns a local ID not present in its
     /// own hash table, which would violate its internal ordering invariant.
-    pub fn repack_rooms_reachable(
+    pub fn repack_collections_reachable(
         &self,
         collection_ids: &[[u8; 16]],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
-        self.repack_rooms_reachable_with_progress(
+        self.repack_collections_reachable_with_progress(
             collection_ids,
             extract_edges,
-            |_room, _from, _to, _nodes, _complete| {},
+            |_collection, _from, _to, _nodes, _complete| {},
         )
     }
 
-    /// As [`Self::repack_rooms_reachable`], with a callback whenever the
+    /// As [`Self::repack_collections_reachable`], with a callback whenever the
     /// shared output stream rotates. The callback receives the collection whose
     /// copy crossed the boundary (or `None` at completion), the slot it
     /// rotated from, the replacement slot, the cumulative number of copied
@@ -1871,7 +1871,7 @@ impl PackfileStorage {
         }
     }
 
-    fn copy_repack_batch_room(
+    fn copy_repack_batch_collection(
         &self,
         collection_id: &[u8; 16],
         hash_to_shard_offset: &RepackRecordMap,
@@ -1937,7 +1937,7 @@ impl PackfileStorage {
         Ok((new_offsets, dropped))
     }
 
-    /// As [`Self::repack_rooms_reachable`], with a callback whenever the
+    /// As [`Self::repack_collections_reachable`], with a callback whenever the
     /// shared output stream rotates. The callback receives the collection whose
     /// copy crossed the boundary (or `None` at completion), the slot it
     /// rotated from, the replacement slot, the cumulative number of copied
@@ -1952,7 +1952,7 @@ impl PackfileStorage {
     ///
     /// Panics if the CSR implementation returns a local ID not present in its
     /// own hash table, which would violate its internal ordering invariant.
-    pub fn repack_rooms_reachable_with_progress(
+    pub fn repack_collections_reachable_with_progress(
         &self,
         collection_ids: &[[u8; 16]],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
@@ -1971,7 +1971,7 @@ impl PackfileStorage {
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let collection_guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
 
-        let maps = self.scan_room_record_maps(&collection_ids)?;
+        let maps = self.scan_collection_record_maps(&collection_ids)?;
         let source_shards: HashSet<u16> = maps
             .values()
             .flat_map(|map| map.values().map(|&(shard_id, _)| shard_id))
@@ -1982,7 +1982,7 @@ impl PackfileStorage {
         // `put_record` moves every collection to the same active successor when a
         // destination fills, so output remains densely packed across collections.
         self.shards
-            .prepare_rooms_repack(&collection_ids, &source_shards)?;
+            .prepare_collections_repack(&collection_ids, &source_shards)?;
 
         let mut results = Vec::with_capacity(collection_ids.len());
         let mut output_state = (self.shards.active_shard().slot, 0usize);
@@ -1990,7 +1990,7 @@ impl PackfileStorage {
             let hash_to_shard_offset = maps.get(collection_id).ok_or_else(|| {
                 StorageError::Corrupt("repack batch scan lost requested collection".to_owned())
             })?;
-            let (new_offsets, dropped) = self.copy_repack_batch_room(
+            let (new_offsets, dropped) = self.copy_repack_batch_collection(
                 collection_id,
                 hash_to_shard_offset,
                 &pinned,
@@ -2000,7 +2000,7 @@ impl PackfileStorage {
             )?;
             let kept = new_offsets.len();
             let index = Self::build_index(&new_offsets);
-            self.replace_room_shard_counts(collection_id, &index.shard_counts());
+            self.replace_collection_shard_counts(collection_id, &index.shard_counts());
             self.swap_generation(collection_id, index)?;
             self.repack_save_incremental_state(collection_id, &new_offsets);
             self.repack_count.fetch_add(1, Ordering::Relaxed);
@@ -2008,7 +2008,7 @@ impl PackfileStorage {
                 .fetch_add(kept as u64, Ordering::Relaxed);
             self.repack_dropped_total
                 .fetch_add(dropped as u64, Ordering::Relaxed);
-            self.repack_counts_by_room
+            self.repack_counts_by_collection
                 .write()
                 .entry(*collection_id)
                 .and_modify(|count| *count = count.saturating_add(1))
@@ -2054,7 +2054,7 @@ impl PackfileStorage {
     /// internal breadth-first traversal and takes no `put_mutex`. Cost is
     /// proportional to the number of ancestors actually walked — one
     /// index lookup per node — not collection size, since it doesn't pre-scan
-    /// every shard the way `repack_room_reachable` does.
+    /// every shard the way `repack_collection_reachable` does.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption, or if the walk finds a
@@ -2122,14 +2122,14 @@ impl PackfileStorage {
     /// yet — without that, the scan could see zero references to a shard
     /// that a writer just committed bytes to but hasn't index-updated yet,
     /// causing a live shard to be retired under it.
-    fn retire_empty_shards(&self, held_room: &[u8; 16]) {
+    fn retire_empty_shards(&self, held_collection: &[u8; 16]) {
         // Collect collection IDs in sorted order for deadlock-free lock acquisition.
         // Skip the collection whose put_mutex the caller already holds.
         let mut collections_to_lock: Vec<[u8; 16]> = self
             .collections
             .read()
             .keys()
-            .filter(|id| *id != held_room)
+            .filter(|id| *id != held_collection)
             .copied()
             .collect();
         collections_to_lock.sort_unstable();
@@ -2244,7 +2244,7 @@ impl StorageEngine for PackfileStorage {
         data: &NodeData,
     ) -> Result<(), StorageError> {
         let collection_arc = self.put_mutex(collection_id);
-        let _room_guard = collection_arc.lock();
+        let _collection_guard = collection_arc.lock();
 
         let record = Record {
             collection_id: *collection_id,
@@ -2267,9 +2267,9 @@ impl StorageEngine for PackfileStorage {
                 // The rebuild re-derived the collection's entire live set from
                 // scratch, so its shard distribution needs a full
                 // recompute too, not just crediting this one record.
-                self.replace_room_shard_counts(collection_id, &index.shard_counts());
+                self.replace_collection_shard_counts(collection_id, &index.shard_counts());
             } else {
-                self.record_new_shard_room(shard_id, collection_id);
+                self.record_new_shard_collection(shard_id, collection_id);
             }
             let cache = match &old_gen {
                 Some(g) => g.cache.clone(),
@@ -2305,20 +2305,20 @@ impl StorageEngine for PackfileStorage {
         Ok(())
     }
 
-    fn delete_room(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+    fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
         // Acquire the collection's put mutex to serialize with any in-flight put,
         // preventing a concurrent put from resurrecting the collection after we
         // remove it from the generation map.
         let collection_arc = self.put_mutex(collection_id);
-        let _room_guard = collection_arc.lock();
+        let _collection_guard = collection_arc.lock();
 
         self.collections.write().remove(collection_id);
         self.live_roots.write().remove(collection_id);
         // Keep lock entries for the storage lifetime. Removing an entry while
         // a caller still owns its Arc permits a later put to obtain a second
         // mutex and bypass this deletion's serialization.
-        self.remove_room_shard_counts(collection_id);
-        self.persist_deleted_room(collection_id)?;
+        self.remove_collection_shard_counts(collection_id);
+        self.persist_deleted_collection(collection_id)?;
         Ok(())
     }
 
@@ -2338,7 +2338,7 @@ impl PackfileStorage {
     /// Returns `StorageError` on I/O failure.
     pub fn sync_all(&self) -> Result<(), StorageError> {
         self.shards.sync_all()?;
-        self.persist_shard_rooms_best_effort();
+        self.persist_shard_collections_best_effort();
         Ok(())
     }
 
@@ -2346,16 +2346,16 @@ impl PackfileStorage {
     /// writer's own periodic tick — same contract as
     /// `ShardPool::maybe_persist_stats`: a no-op if called again before
     /// `min_interval` has passed since the last flush from here.
-    pub fn maybe_persist_shard_rooms(&self, min_interval: std::time::Duration) {
+    pub fn maybe_persist_shard_collections(&self, min_interval: std::time::Duration) {
         let now = std::time::Instant::now();
         {
-            let mut last = self.last_shard_rooms_flush.write();
+            let mut last = self.last_shard_collections_flush.write();
             if last.is_some_and(|prev| now.duration_since(prev) < min_interval) {
                 return;
             }
             *last = Some(now);
         }
-        self.persist_shard_rooms_best_effort();
+        self.persist_shard_collections_best_effort();
     }
 
     /// Snapshot IO/sync stats for every currently-open shard.
@@ -2404,8 +2404,8 @@ impl PackfileStorage {
     /// Number of times a specific collection has been repacked. 0 if it has
     /// never been repacked (or doesn't exist).
     #[must_use]
-    pub fn repack_count_for_room(&self, collection_id: &[u8; 16]) -> u64 {
-        self.repack_counts_by_room
+    pub fn repack_count_for_collection(&self, collection_id: &[u8; 16]) -> u64 {
+        self.repack_counts_by_collection
             .read()
             .get(collection_id)
             .copied()
@@ -2428,7 +2428,7 @@ impl PackfileStorage {
 /// Snapshot of global repack activity across all collections.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RepackStats {
-    /// Total number of `repack_room_reachable` calls across all collections.
+    /// Total number of `repack_collection_reachable` calls across all collections.
     pub repack_count: u64,
     /// Total records kept (rewritten into a new generation) across all repacks.
     pub kept_total: u64,
@@ -2555,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_room() {
+    fn test_delete_collection() {
         let dir = test_dir("delete");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -2564,13 +2564,13 @@ mod tests {
 
         store.put(&OTHER_COLLECTION, &id, &data).unwrap();
 
-        store.delete_room(&OTHER_COLLECTION).unwrap();
+        store.delete_collection(&OTHER_COLLECTION).unwrap();
         assert!(store.get(&OTHER_COLLECTION, &id).unwrap().is_none());
         assert!(store.generation(&OTHER_COLLECTION).is_none());
     }
 
     #[test]
-    fn test_delete_room_does_not_resurrect_on_reopen() {
+    fn test_delete_collection_does_not_resurrect_on_reopen() {
         let dir = test_dir("delete_no_resurrect");
 
         let id = [0x01u8; 16];
@@ -2579,7 +2579,7 @@ mod tests {
         {
             let store = PackfileStorage::open(dir.clone()).unwrap();
             store.put(&OTHER_COLLECTION, &id, &data).unwrap();
-            store.delete_room(&OTHER_COLLECTION).unwrap();
+            store.delete_collection(&OTHER_COLLECTION).unwrap();
             store.sync_all().unwrap();
         }
 
@@ -2592,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_room_clears_live_roots() {
+    fn test_delete_collection_clears_live_roots() {
         let dir = test_dir("delete_live_roots");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -2607,7 +2607,7 @@ mod tests {
         store.set_live_roots(&OTHER_COLLECTION, vec![id]);
         assert!(store.live_roots.read().contains_key(&OTHER_COLLECTION));
 
-        store.delete_room(&OTHER_COLLECTION).unwrap();
+        store.delete_collection(&OTHER_COLLECTION).unwrap();
         assert!(!store.live_roots.read().contains_key(&OTHER_COLLECTION));
     }
 
@@ -2899,7 +2899,7 @@ mod tests {
         // collection's index/cache entirely.
         store.set_live_roots(&TEST_COLLECTION, vec![b]);
         let (kept, dropped) = store
-            .repack_room_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
         assert_eq!((kept, dropped), (1, 1), "repack must have GC'd A");
 
@@ -2917,7 +2917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_records_same_room() {
+    fn test_multiple_records_same_collection() {
         let dir = test_dir("multi");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -2937,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_room_isolation() {
+    fn test_collection_isolation() {
         let dir = test_dir("isolation");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -2957,7 +2957,7 @@ mod tests {
         assert!(store.get(&OTHER_COLLECTION, &id_a).unwrap().is_none());
         assert!(store.get(&TEST_COLLECTION, &id_b).unwrap().is_none());
 
-        store.delete_room(&TEST_COLLECTION).unwrap();
+        store.delete_collection(&TEST_COLLECTION).unwrap();
         assert!(store.get(&TEST_COLLECTION, &id_a).unwrap().is_none());
         let got_b = store.get(&OTHER_COLLECTION, &id_b).unwrap().unwrap();
         assert_eq!(got_b.bytes, data_b.bytes);
@@ -3191,8 +3191,8 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_room_preserves_other_room_cache() {
-        let dir = test_dir("delete_room_cache");
+    fn test_delete_collection_preserves_other_collection_cache() {
+        let dir = test_dir("delete_collection_cache");
         let store = PackfileStorage::open(dir.clone()).unwrap();
 
         let collection_a = TEST_COLLECTION;
@@ -3211,7 +3211,7 @@ mod tests {
         let gen_b_before = store.generation(&collection_b).unwrap();
         let hits_b_before = gen_b_before.cache.hits();
 
-        store.delete_room(&collection_a).unwrap();
+        store.delete_collection(&collection_a).unwrap();
 
         assert!(store.get(&collection_a, &id_a).unwrap().is_none());
         assert!(store.generation(&collection_a).is_none());
@@ -3223,7 +3223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repack_room_reachable_no_roots_preserves_diamond_dag_in_topo_order() {
+    fn test_repack_collection_reachable_no_roots_preserves_diamond_dag_in_topo_order() {
         let dir = test_dir("repack_topo");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -3273,7 +3273,7 @@ mod tests {
 
         // No live roots configured for TEST_COLLECTION: preserves everything,
         // still deduplicated and topologically ordered.
-        let result = store.repack_room_reachable(&TEST_COLLECTION, |hash, _data| {
+        let result = store.repack_collection_reachable(&TEST_COLLECTION, |hash, _data| {
             edges.get(hash).cloned().unwrap_or_default()
         });
         let (kept, dropped) = result.unwrap();
@@ -3295,7 +3295,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repack_room_reachable_drops_unreachable_records() {
+    fn test_repack_collection_reachable_drops_unreachable_records() {
         let dir = test_dir("repack_reachable_gc");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -3333,7 +3333,7 @@ mod tests {
         store.set_live_roots(&TEST_COLLECTION, vec![root]);
 
         let (kept, dropped) = store
-            .repack_room_reachable(&TEST_COLLECTION, |hash, _data| {
+            .repack_collection_reachable(&TEST_COLLECTION, |hash, _data| {
                 edges.get(hash).cloned().unwrap_or_default()
             })
             .unwrap();
@@ -3358,7 +3358,7 @@ mod tests {
         assert_eq!(stats.repack_count, 1);
         assert_eq!(stats.kept_total, 3);
         assert_eq!(stats.dropped_total, 2);
-        assert_eq!(store.repack_count_for_room(&TEST_COLLECTION), 1);
+        assert_eq!(store.repack_count_for_collection(&TEST_COLLECTION), 1);
 
         // A second repack uses the incremental path: it clones the
         // previous live_map (3 entries from the first repack's output)
@@ -3368,7 +3368,7 @@ mod tests {
         // behavior: each repack does bounded work proportional to new
         // bytes, not proportional to total shard size.
         let (kept2, dropped2) = store
-            .repack_room_reachable(&TEST_COLLECTION, |hash, _data| {
+            .repack_collection_reachable(&TEST_COLLECTION, |hash, _data| {
                 edges.get(hash).cloned().unwrap_or_default()
             })
             .unwrap();
@@ -3378,7 +3378,7 @@ mod tests {
         assert_eq!(stats2.repack_count, 2);
         assert_eq!(stats2.kept_total, stats.kept_total + kept2 as u64);
         assert_eq!(stats2.dropped_total, stats.dropped_total + dropped2 as u64);
-        assert_eq!(store.repack_count_for_room(&TEST_COLLECTION), 2);
+        assert_eq!(store.repack_count_for_collection(&TEST_COLLECTION), 2);
     }
 
     /// Repack drops unreachable *records* from the index (`dropped` count),
@@ -3444,7 +3444,7 @@ mod tests {
 
         store.set_live_roots(&TEST_COLLECTION, vec![root]);
         let (kept, dropped) = store
-            .repack_room_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
         assert_eq!(kept, 1, "only root should survive");
         assert!(dropped > 0, "the garbage records should have been dropped");
@@ -3494,7 +3494,7 @@ mod tests {
             .next()
             .unwrap();
         let (kept, dropped) = store
-            .repack_room_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
 
         assert_eq!((kept, dropped), (1, 0));
@@ -3521,8 +3521,8 @@ mod tests {
     /// into the same shard, then repacks only collection A — the shared shard
     /// must survive because collection B's index still points into it.
     #[test]
-    fn test_repack_does_not_retire_shard_referenced_by_other_room() {
-        let dir = test_dir("repack_cross_room_safety");
+    fn test_repack_does_not_retire_shard_referenced_by_other_collection() {
+        let dir = test_dir("repack_cross_collection_safety");
         let store = PackfileStorage::open(dir).unwrap();
 
         // Put a record for collection A — lands on shard 0.
@@ -3573,7 +3573,7 @@ mod tests {
         // must NOT be retired.
         store.set_live_roots(&TEST_COLLECTION, vec![root_a]);
         let (kept, dropped) = store
-            .repack_room_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
         assert_eq!(kept, 1);
         assert!(dropped > 0);
@@ -3636,7 +3636,7 @@ mod tests {
     /// the targeted way to reclaim one shard without waiting for each
     /// collection to independently cross its own repack threshold.
     #[test]
-    fn test_repack_shard_repacks_every_referencing_room() {
+    fn test_repack_shard_repacks_every_referencing_collection() {
         let dir = test_dir("repack_shard");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -3703,7 +3703,7 @@ mod tests {
     /// rewritten in place) — that collection must NOT show up as still
     /// referencing the shard its data moved away from.
     #[test]
-    fn test_rooms_referencing_shard_excludes_rooms_already_repacked_away() {
+    fn test_collections_referencing_shard_excludes_collections_already_repacked_away() {
         let dir = test_dir("collections_referencing_shard_stale");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -3752,13 +3752,13 @@ mod tests {
         // Repack with only root live: TEST_COLLECTION's records now span *two*
         // source shards (root on 0, garbage on 1), and a repack must never
         // rewrite live data back into one of its own sources (see
-        // `ShardPool::prepare_room_repack`'s doc) — so the kept copy lands
+        // `ShardPool::prepare_collection_repack`'s doc) — so the kept copy lands
         // on a *third* shard (2), not shard 1. Shard 1, left holding only
         // the now-dropped `garbage` record with nothing live pointing at
         // it, gets retired and closed during this same repack.
         store.set_live_roots(&TEST_COLLECTION, vec![root]);
         store
-            .repack_room_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
 
         // Shard 0's raw bytes still physically contain TEST_COLLECTION's
@@ -3795,7 +3795,7 @@ mod tests {
     }
 
     #[test]
-    fn test_room_directory_from_disk_matches_room_summaries_after_sync() {
+    fn test_collection_directory_from_disk_matches_collection_summaries_after_sync() {
         let dir = test_dir("collection_directory_roundtrip");
         let store = PackfileStorage::open(dir.clone()).unwrap();
 
@@ -3837,7 +3837,7 @@ mod tests {
     }
 
     #[test]
-    fn test_room_directory_from_disk_empty_when_never_persisted() {
+    fn test_collection_directory_from_disk_empty_when_never_persisted() {
         let dir = test_dir("collection_directory_never_persisted");
         let _store = PackfileStorage::open(dir.clone()).unwrap();
         // No sync_all call: nothing has been persisted yet.
@@ -3852,7 +3852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_room_directory_reflects_delete_and_repack() {
+    fn test_collection_directory_reflects_delete_and_repack() {
         let dir = test_dir("collection_directory_delete_repack");
         let store = PackfileStorage::open(dir.clone()).unwrap();
 
@@ -3881,7 +3881,7 @@ mod tests {
             "both collections must appear before deletion"
         );
 
-        store.delete_room(&TEST_COLLECTION).unwrap();
+        store.delete_collection(&TEST_COLLECTION).unwrap();
         store.sync_all().unwrap();
 
         let directory = PackfileStorage::collection_directory_from_disk(&dir);
@@ -3893,7 +3893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_room_repack_matches_real_repack_without_mutating() {
+    fn test_plan_collection_repack_matches_real_repack_without_mutating() {
         let dir = test_dir("plan_matches_real");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -3911,7 +3911,7 @@ mod tests {
         // on insert, so instead exercise the "no live roots: keep
         // everything" path, which is what --root-less usage always hits.
         let plan = store
-            .plan_room_repack(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .plan_collection_repack(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
         assert_eq!(plan.kept, 5);
         assert_eq!(plan.dropped, 0);
@@ -3922,14 +3922,14 @@ mod tests {
         // right after must see the exact same collection state and produce the
         // exact same result.
         let (kept, dropped) = store
-            .repack_room_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
         assert_eq!(kept, plan.kept);
         assert_eq!(dropped, plan.dropped);
     }
 
     #[test]
-    fn test_repack_closure_single_room_single_shard() {
+    fn test_repack_closure_single_collection_single_shard() {
         let dir = test_dir("closure_trivial");
         let store = PackfileStorage::open(dir).unwrap();
         store
@@ -3946,7 +3946,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repack_closure_pulls_in_rooms_second_shard_transitively() {
+    fn test_repack_closure_pulls_in_collections_second_shard_transitively() {
         // Collection A lives on shards {0, 1} (spans a rotation). Collection B lives
         // only on shard 1. Starting the closure from shard 0 must still
         // discover shard 1 (because collection A references it) and, through
@@ -3987,14 +3987,14 @@ mod tests {
         let (mut collections, mut shards) = store.repack_closure(0).unwrap();
         collections.sort_unstable();
         shards.sort_unstable();
-        let mut expected_rooms = vec![TEST_COLLECTION, OTHER_COLLECTION];
-        expected_rooms.sort_unstable();
-        assert_eq!(collections, expected_rooms);
+        let mut expected_collections = vec![TEST_COLLECTION, OTHER_COLLECTION];
+        expected_collections.sort_unstable();
+        assert_eq!(collections, expected_collections);
         assert_eq!(shards, vec![0, 1]);
     }
 
     #[test]
-    fn test_room_referenced_shards_empty_for_unknown_room() {
+    fn test_collection_referenced_shards_empty_for_unknown_collection() {
         let dir = test_dir("referenced_shards_unknown");
         let store = PackfileStorage::open(dir).unwrap();
         assert_eq!(
@@ -4004,7 +4004,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repack_room_reachable_without_live_roots_preserves_everything() {
+    fn test_repack_collection_reachable_without_live_roots_preserves_everything() {
         let dir = test_dir("repack_reachable_no_roots");
         let store = PackfileStorage::open(dir).unwrap();
 
@@ -4031,7 +4031,7 @@ mod tests {
         // No set_live_roots call for this collection: nothing is known to be
         // garbage, so everything must survive.
         let (kept, dropped) = store
-            .repack_room_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
             .unwrap();
 
         assert_eq!(kept, 2);
@@ -4104,7 +4104,7 @@ mod tests {
             let repacker = scope.spawn(|| {
                 for _ in 0..5 {
                     std::thread::sleep(std::time::Duration::from_micros(50));
-                    let _ = store.repack_room_reachable(&collection, |_hash, _data| Vec::new());
+                    let _ = store.repack_collection_reachable(&collection, |_hash, _data| Vec::new());
                 }
             });
 

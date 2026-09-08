@@ -1300,8 +1300,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_packfile_returns_room_id() {
-        let dir = test_dir("scan_room_id");
+    fn test_scan_packfile_returns_collection_id() {
+        let dir = test_dir("scan_collection_id");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         let collection1 = [0x01; 16];

@@ -267,7 +267,7 @@ impl LossyIndex {
     /// Tally of how many occupied slots point into each shard.
     ///
     /// Used to maintain the persisted per-shard collection directory (see
-    /// `PackfileStorage`'s `shard_rooms` tracking): whenever a collection's
+    /// `PackfileStorage`'s `shard_collections` tracking): whenever a collection's
     /// index is rebuilt or swapped in, this gives the exact per-shard
     /// contribution to record against that collection, without a second scan
     /// of the packfile itself.

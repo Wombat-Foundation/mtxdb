@@ -649,7 +649,7 @@ impl ShardPool {
     /// since `ShardPool::open` itself only discovers shard *files*, not
     /// their collection contents). Normal routing updates the home automatically
     /// from then on via `put_record`.
-    pub(crate) fn set_room_home(&self, collection_id: &[u8; 16], slot: u16) {
+    pub(crate) fn set_collection_home(&self, collection_id: &[u8; 16], slot: u16) {
         self.collection_home.write().insert(*collection_id, slot);
     }
 
@@ -657,7 +657,7 @@ impl ShardPool {
     /// exists and the slot is still occupied, otherwise a freshly assigned
     /// home (the pool's current active shard, the same fallback every collection
     /// used before per-collection routing existed).
-    fn shard_for_room(&self, collection_id: &[u8; 16]) -> Arc<Shard> {
+    fn shard_for_collection(&self, collection_id: &[u8; 16]) -> Arc<Shard> {
         if let Some(id) = self.collection_home.read().get(collection_id).copied() {
             if let Some(shard) = self.get_shard(id) {
                 return shard;
@@ -673,7 +673,7 @@ impl ShardPool {
     /// A collection's home shard just filled up: rotate the pool forward (unless
     /// another collection already did, in which case just adopt whatever's now
     /// active) and point the collection at the result.
-    fn rotate_room_full_home(
+    fn rotate_collection_full_home(
         &self,
         collection_id: &[u8; 16],
         full_slot: u16,
@@ -947,7 +947,7 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on write or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
-        let mut shard = self.shard_for_room(&record.collection_id);
+        let mut shard = self.shard_for_collection(&record.collection_id);
         loop {
             // Uncompressed upper bound, used only for the pre-write
             // capacity check below — `write_record` may compress the
@@ -972,7 +972,7 @@ impl ShardPool {
                 if !fits && current_len > packfile::HEADER_LEN as u64 {
                     drop(guard);
                     drop(file);
-                    shard = self.rotate_room_full_home(&record.collection_id, shard.slot)?;
+                    shard = self.rotate_collection_full_home(&record.collection_id, shard.slot)?;
                     continue;
                 }
 
@@ -1273,7 +1273,7 @@ impl ShardPool {
     /// # Errors
     /// Returns an error if no free shard slot is available for the temporary
     /// rewrite destination.
-    pub(crate) fn prepare_room_repack(
+    pub(crate) fn prepare_collection_repack(
         &self,
         collection_id: &[u8; 16],
         source_shards: &HashSet<u16>,
@@ -1291,7 +1291,7 @@ impl ShardPool {
     /// stream.  Individual collections still retain their own indexes, but their
     /// replacement frames fill the same succession of destination shards
     /// instead of stranding one partially-filled shard per collection.
-    pub(crate) fn prepare_rooms_repack(
+    pub(crate) fn prepare_collections_repack(
         &self,
         collection_ids: &[[u8; 16]],
         source_shards: &HashSet<u16>,
@@ -1684,7 +1684,7 @@ mod tests {
     /// A specifically to move) would silently redirect collection A's next
     /// write too — destroying locality collection A never had a reason to lose.
     #[test]
-    fn test_room_stays_on_home_shard_despite_unrelated_pool_rotation() {
+    fn test_collection_stays_on_home_shard_despite_unrelated_pool_rotation() {
         let dir = test_dir("collection_locality");
         let pool = ShardPool::open(dir).unwrap();
 
@@ -1714,7 +1714,7 @@ mod tests {
     /// only that collection) rotates to a new home — independent of whatever
     /// the pool-wide cursor is doing for other collections.
     #[test]
-    fn test_room_rotates_its_own_home_when_full() {
+    fn test_collection_rotates_its_own_home_when_full() {
         let dir = test_dir("collection_locality_own_rotation");
         let pool = ShardPool::open(dir).unwrap();
 

@@ -234,12 +234,12 @@ pub unsafe extern "C" fn mdb_sync(handle: *mut MdbStorage) -> MdbError {
 /// - `handle` must be a valid pointer from `mdb_storage_open`.
 /// - `collection_id` must point to at least 16 bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mdb_delete_room(handle: *mut MdbStorage, collection_id: *const u8) -> MdbError {
+pub unsafe extern "C" fn mdb_delete_collection(handle: *mut MdbStorage, collection_id: *const u8) -> MdbError {
     let Some(storage) = (unsafe { handle.as_ref() }) else {
         return MdbError::InvalidInput;
     };
     let collection = unsafe { read_id(collection_id) };
-    match storage.inner.delete_room(&collection) {
+    match storage.inner.delete_collection(&collection) {
         Ok(()) => MdbError::Ok,
         Err(_) => MdbError::Io,
     }

@@ -59,10 +59,10 @@ impl MdbStorage {
     }
 
     /// Delete all data for a collection.
-    pub fn delete_room(&self, collection_id: &[u8]) -> Result<(), JsValue> {
+    pub fn delete_collection(&self, collection_id: &[u8]) -> Result<(), JsValue> {
         let collection = as_id(collection_id, "collection_id")?;
         self.inner
-            .delete_room(&collection)
+            .delete_collection(&collection)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

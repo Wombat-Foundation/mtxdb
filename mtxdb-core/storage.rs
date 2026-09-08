@@ -125,7 +125,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
-    fn delete_room(&self, collection_id: &[u8; 16]) -> Result<(), StorageError>;
+    fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError>;
 
     /// Sync to disk (fsync).
     ///
@@ -179,7 +179,7 @@ impl From<std::io::Error> for StorageError {
 /// In-memory storage engine for tests.
 ///
 /// Partitions nodes by collection. Each collection's nodes are tracked in a
-/// per-collection `HashMap`, enabling correct `delete_room` behavior.
+/// per-collection `HashMap`, enabling correct `delete_collection` behavior.
 pub struct InMemoryStorage {
     collections: RwLock<HashMap<[u8; 16], HashMap<NodeId, NodeData>>>,
 }
@@ -248,7 +248,7 @@ impl StorageEngine for InMemoryStorage {
         Ok(())
     }
 
-    fn delete_room(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+    fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
         self.collections.write().remove(collection_id);
         Ok(())
     }
@@ -383,7 +383,7 @@ mod tests {
             )
             .unwrap();
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
-        store.delete_room(&TEST_COLLECTION).unwrap();
+        store.delete_collection(&TEST_COLLECTION).unwrap();
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_none());
         store.sync().unwrap();
     }
