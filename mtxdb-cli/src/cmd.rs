@@ -479,7 +479,7 @@ fn cmd_shards(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// sidecars; it never scans packfile contents or opens room indexes.
 fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
     let mut shard_entries = glob_shard_files(dir)?;
-    shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
+    shard_entries.sort_unstable_by_key(|&(id, _, _, _)| id);
 
     if shard_entries.is_empty() {
         println!("no shards found in `{}` (store is empty)", dir.display());
@@ -509,8 +509,8 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Glob `shard_*.pack` files in `dir`, parsing `slot_id`, epoch,
-/// and file size from each filename and its metadata.
-fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
+/// file size, and format version from each file.
+fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64, u8)>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -527,7 +527,12 @@ fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
                     };
                     if let Ok(slot_id) = u16::from_str_radix(slot_hex, 16) {
                         let file_bytes = entry.metadata()?.len();
-                        entries.push((slot_id, epoch, file_bytes));
+                        let version = std::fs::File::open(&path)
+                            .ok()
+                            .and_then(|mut f| mtxdb_core::packfile::read_version(&mut f).ok())
+                            .flatten()
+                            .unwrap_or(0);
+                        entries.push((slot_id, epoch, file_bytes, version));
                     }
                 }
             }
@@ -579,7 +584,7 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 
 /// Print the shard table header and rows.
 fn print_shard_table(
-    shard_entries: &[(u16, u64, u64)],
+    shard_entries: &[(u16, u64, u64, u8)],
     stats_map: &ShardStatsMap,
     node_counts: Option<&std::collections::HashMap<u16, u64>>,
     room_counts: Option<&std::collections::HashMap<u16, u64>>,
@@ -589,16 +594,16 @@ fn print_shard_table(
     // `ShardPool::open_internal` restores the highest occupied slot as its
     // append destination. Mirror that recovery rule here without opening a
     // writer just to render an inspection table.
-    let active_slot = shard_entries.iter().map(|(slot, _, _)| *slot).max();
+    let active_slot = shard_entries.iter().map(|(slot, _, _, _)| *slot).max();
 
     println!(
-        "{:>6}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
-        "slot", "rotation", "bytes", "nodes", "rooms", "syncs",
+        "{:>6}  {:>3}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
+        "slot", "ver", "rotation", "bytes", "nodes", "rooms", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
     let mut total_syncs = 0u64;
-    for &(slot_id, epoch, file_bytes) in shard_entries {
+    for &(slot_id, epoch, file_bytes, version) in shard_entries {
         let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
         let (_, _, sc) = stats_map.get(&key).copied().unwrap_or_default();
         let nodes = node_counts
@@ -608,7 +613,7 @@ fn print_shard_table(
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
-            "{:>6}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
+            "{:>6}  {:>3}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
             format!(
                 "{slot_id}{}",
                 if active_slot == Some(slot_id) {
@@ -617,6 +622,7 @@ fn print_shard_table(
                     " "
                 }
             ),
+            version,
             format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
             nodes,
@@ -631,7 +637,8 @@ fn print_shard_table(
     }
     println!();
     println!(
-        "{:>6}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
+        "{:>6}  {:>3}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
+        "",
         "",
         "total",
         fmt_bytes(total_bytes),

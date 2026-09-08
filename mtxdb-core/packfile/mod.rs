@@ -382,6 +382,26 @@ pub fn write_header(writer: &mut impl Write, shard_id: u16, epoch: u64) -> io::R
     writer.write_all(&buf)
 }
 
+/// Read just the version byte from a packfile header (bytes 4..5, right
+/// after the 4-byte [`MAGIC`]). Returns `Ok(None)` if the file is too
+/// short or doesn't start with [`MAGIC`].
+///
+/// # Errors
+///
+/// Returns `io::Error` for a non-EOF read failure.
+pub fn read_version(reader: &mut impl Read) -> io::Result<Option<u8>> {
+    let mut prefix = [0u8; 5];
+    match reader.read_exact(&mut prefix) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    if prefix[..4] != MAGIC {
+        return Ok(None);
+    }
+    Ok(Some(prefix[4]))
+}
+
 /// Read and validate a shard file's reserved header.
 ///
 /// Returns `Ok(None)` only for something that genuinely isn't an mdb
