@@ -99,6 +99,7 @@ fn build_cli() -> Command {
                 .value_name("TYPE")
                 .default_value("event-dag")
                 .value_parser(["state", "event-dag", "auth-chain"])
+                .hide_possible_values(true)
                 .global(true)
                 .help("Independent shard pool to operate on"),
         )
