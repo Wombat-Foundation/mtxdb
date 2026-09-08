@@ -376,7 +376,18 @@ fn main() -> anyhow::Result<()> {
             "zsh" => clap_complete::Shell::Zsh,
             _ => unreachable!("Clap validates the shell name"),
         };
-        let mut command = build_cli();
+        // Rebuild without the hidden `completions` subcommand —
+        // `.hide(true)` only suppresses --help, not shell completions.
+        let base = build_cli();
+        let mut command = clap::Command::new("mtxdb");
+        for arg in base.get_arguments() {
+            command = command.arg(arg.clone());
+        }
+        for sub in base.get_subcommands() {
+            if sub.get_name() != "completions" {
+                command = command.subcommand(sub.clone());
+            }
+        }
         clap_complete::generate(shell, &mut command, "mtxdb", &mut std::io::stdout());
         return Ok(());
     }
