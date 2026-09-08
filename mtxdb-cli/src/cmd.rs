@@ -588,9 +588,14 @@ fn cmd_repack_shard(
         let slop = expected_shards
             .saturating_mul(max_shard_bytes)
             .saturating_sub(total_kept_bytes);
+        let shard_slots = shards
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
 
         eprintln!(
-            "this will repack {} room{} across {} shard{} ({shards:?})",
+            "this will repack {} room{} across {} shard{} (slots: {shard_slots})",
             rooms.len(),
             if rooms.len() == 1 { "" } else { "s" },
             shards.len(),
