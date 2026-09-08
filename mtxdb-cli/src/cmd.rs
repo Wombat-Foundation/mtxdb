@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
 use mtxdb_core::shard::ShardPool;
 use mtxdb_core::storage::{NodeData, StorageEngine};
@@ -83,8 +83,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Returns `false` for every response except `y`/`Y`, so an empty line or
 /// EOF is always safe by default.
 fn confirm(prompt: &str) -> anyhow::Result<bool> {
-    eprint!("{prompt} [y/N] ");
-    io::stderr().flush()?;
+    print!("{prompt} [y/N] ");
+    io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(input.trim().eq_ignore_ascii_case("y"))
@@ -253,7 +253,7 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
     let node_counts = open_store_read_only(cli)?.shard_node_counts();
     print_shard_table(&shard_entries, &stats_map, &node_counts);
-    eprintln!(
+    println!(
         "{} shard(s), {}",
         shard_entries.len(),
         stats_snapshot_summary(persisted_at)
@@ -525,54 +525,41 @@ fn cmd_repack(
     roots: &[String],
     topo: bool,
 ) -> anyhow::Result<()> {
-    match (room, shard) {
-        (Some(room), None) => cmd_repack_room(cli, room, roots, topo),
-        (None, Some(shard_id)) => cmd_repack_shard(cli, shard_id, roots, topo),
+    let target = match (room, shard) {
+        (Some(room), None) => RepackTarget::Room(parse_room_id(room)?),
+        (None, Some(shard_id)) => RepackTarget::Shard(shard_id),
         // Clap rejects the both-targets case through `conflicts_with`; this
         // branch gives the missing-target case a readable diagnostic.
-        _ => bail!("exactly one of --room <room> | --shard <shard> is required"),
-    }
-}
-
-fn cmd_repack_room(cli: &Cli, room: &str, roots: &[String], topo: bool) -> anyhow::Result<()> {
-    let room_id = parse_room_id(room)?;
-    let store = open_store(cli)?;
-    let hex = hex_encode(&room_id);
-    if store.room_index_info(&room_id).is_none() {
-        bail!("room {hex} not found");
-    }
+        _ => {
+            return Err(anyhow!(
+                "exactly one of --room <room> | --shard <shard> is required"
+            ))
+        }
+    };
 
     if !roots.is_empty() {
-        if !topo {
-            bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+        match target {
+            RepackTarget::Shard(_) => {
+                bail!(
+                    "--root requires --room — live roots are per-room, not meaningful for --shard"
+                );
+            }
+            RepackTarget::Room(_) if !topo => {
+                bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+            }
+            RepackTarget::Room(_) => {
+                bail!(
+                    "--root cannot be used with Matrix topology yet: imported event IDs cannot be resolved to stored node IDs; refusing a rooted repack that could discard ancestors"
+                );
+            }
         }
-        // Imported Matrix `prev_events` entries are event IDs, whereas this
-        // store is indexed by the truncated content hashes in `hashes.sha256`.
-        // We do not persist an event-ID → NodeId map, so treating those IDs as
-        // hashes would make a rooted repack retain only the supplied roots and
-        // silently collect their ancestors. Refuse the destructive operation
-        // until that mapping is available.
-        bail!(
-            "--root cannot be used with Matrix topology yet: imported event IDs cannot be resolved to stored node IDs; refusing a rooted repack that could discard ancestors"
-        );
     }
     if topo {
-        eprintln!("warning: --topo without --root means no GC; all records preserved");
-    }
-
-    // repack_room_reachable is the engine's one repack entry point (see
-    // mtxdb-core). --topo controls whether real prev_events-derived edges
-    // are used for ordering; without it, every record is treated as its
-    // own root (dedup only, no dependency ordering).
-    let (kept, dropped) = if topo {
-        eprintln!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-        store.repack_room_reachable(&room_id, extract_matrix_edges)?
+        println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
     } else {
-        store.repack_room_reachable(&room_id, |_hash, _data| Vec::new())?
-    };
-    eprintln!("repacked {hex}: {kept} kept, {dropped} dropped");
-
-    Ok(())
+        println!("warning: --topo without --root means no GC; all records preserved");
+    }
+    cmd_repack_target(cli, target, topo)
 }
 
 /// Compacts every shard transitively touched by rooms referencing
@@ -605,11 +592,38 @@ struct RepackPreview {
     shards: Vec<u16>,
 }
 
-fn repack_preview(cli: &Cli, shard_id: u16, topo: bool) -> anyhow::Result<Option<RepackPreview>> {
+#[derive(Clone, Copy)]
+enum RepackTarget {
+    Room([u8; 16]),
+    Shard(u16),
+}
+
+fn resolve_repack_target(
+    store: &PackfileStorage,
+    target: RepackTarget,
+) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
+    match target {
+        RepackTarget::Room(room_id) => {
+            if store.room_index_info(&room_id).is_none() {
+                bail!("room {} not found", hex_encode(&room_id));
+            }
+            Ok((vec![room_id], store.room_referenced_shards(&room_id)))
+        }
+        RepackTarget::Shard(shard_id) => Ok(store.repack_closure(shard_id)?),
+    }
+}
+
+fn repack_preview(
+    cli: &Cli,
+    target: RepackTarget,
+    topo: bool,
+) -> anyhow::Result<Option<RepackPreview>> {
     let preview_store = open_store_read_only(cli)?;
-    let (rooms, shards) = preview_store.repack_closure(shard_id)?;
+    let (rooms, shards) = resolve_repack_target(&preview_store, target)?;
     if rooms.is_empty() {
-        eprintln!("no rooms reference shard {shard_id}");
+        if let RepackTarget::Shard(shard_id) = target {
+            println!("no rooms reference shard {shard_id}");
+        }
         return Ok(None);
     }
 
@@ -649,7 +663,7 @@ fn repack_preview(cli: &Cli, shard_id: u16, topo: bool) -> anyhow::Result<Option
         total.saturating_add(shard_sizes.get(shard_id).copied().unwrap_or(0))
     });
 
-    eprintln!(
+    println!(
         "this will repack {} room{} across {} shard{} (slots: {shard_slots})",
         rooms.len(),
         if rooms.len() == 1 { "" } else { "s" },
@@ -658,19 +672,20 @@ fn repack_preview(cli: &Cli, shard_id: u16, topo: bool) -> anyhow::Result<Option
     );
     for shard_id in &shards {
         let bytes = shard_sizes.get(shard_id).copied().unwrap_or(0);
-        eprintln!("  slot {shard_id}: {}", fmt_bytes(bytes));
+        println!("  slot {shard_id}: {:>9}", fmt_bytes(bytes));
     }
-    eprintln!("  total: {}", fmt_bytes(total_input_bytes));
-    eprintln!(
-        "expected result: ~{expected_shards} shard{} ({} nodes across {} room{} rewritten: ~{} / {} = {}; {} unreachable nodes removed; ~{} free in the last shard)",
+    println!("  total:    {:>9}", fmt_bytes(total_input_bytes));
+    println!(
+        "expected result: ~{expected_shards} shard{} ({total_kept} nodes across {} room{} rewritten)",
         if expected_shards == 1 { "" } else { "s" },
-        total_kept,
         rooms.len(),
         if rooms.len() == 1 { "" } else { "s" },
+    );
+    println!(
+        "                 ~{} / {} = {}; {total_dropped} nodes pruned; ~{} free shard",
         fmt_bytes(total_kept_bytes),
         fmt_bytes(total_input_bytes),
         fmt_percent(total_kept_bytes, total_input_bytes),
-        total_dropped,
         fmt_bytes(slop),
     );
     // preview_store (and its non-exclusive read-only handle) drops
@@ -692,7 +707,7 @@ fn repack_rooms(
         } else {
             store.repack_room_reachable(room_id, |_hash, _data| Vec::new())?
         };
-        eprintln!(
+        println!(
             "repacked {}: {kept} kept, {dropped} dropped",
             hex_encode(room_id)
         );
@@ -703,34 +718,20 @@ fn repack_rooms(
         .fold((0usize, 0usize), |(k, d), &(kept, dropped)| {
             (k.saturating_add(kept), d.saturating_add(dropped))
         });
-    eprintln!(
+    println!(
         "done: {} rooms repacked, {final_kept} kept, {final_dropped} dropped",
         results.len()
     );
     Ok((final_kept, final_dropped))
 }
 
-fn cmd_repack_shard(
-    cli: &Cli,
-    shard_id: u16,
-    live_roots: &[String],
-    topo: bool,
-) -> anyhow::Result<()> {
-    if !live_roots.is_empty() {
-        bail!("--root requires --room — live roots are per-room, not meaningful for --shard");
-    }
-    if topo {
-        eprintln!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-    } else {
-        eprintln!("warning: --topo without --root means no GC; all records preserved");
-    }
-
-    let Some(preview) = repack_preview(cli, shard_id, topo)? else {
+fn cmd_repack_target(cli: &Cli, target: RepackTarget, topo: bool) -> anyhow::Result<()> {
+    let Some(preview) = repack_preview(cli, target, topo)? else {
         return Ok(());
     };
 
     if !confirm("Apply this repack?")? {
-        eprintln!("aborted");
+        println!("aborted");
         return Ok(());
     }
 
@@ -739,15 +740,15 @@ fn cmd_repack_shard(
     // read-only preview above is, by construction, a snapshot that could
     // be arbitrarily stale by the time a human finishes reading it.
     let store = open_store(cli)?;
-    let (rooms, touched_shards) = store.repack_closure(shard_id)?;
+    let (rooms, touched_shards) = resolve_repack_target(&store, target)?;
     if rooms.is_empty() {
-        eprintln!("shard {shard_id} is no longer referenced by any room — nothing to do");
+        println!("repack target is no longer referenced by any room — nothing to do");
         return Ok(());
     }
     let grew = rooms.iter().any(|r| !preview.rooms.contains(r))
         || touched_shards.iter().any(|s| !preview.shards.contains(s));
     if grew {
-        eprintln!(
+        println!(
             "note: the closure grew since the preview (now {} rooms / {} shards) — repacking the current, authoritative closure",
             rooms.len(),
             touched_shards.len()
@@ -756,7 +757,7 @@ fn cmd_repack_shard(
 
     repack_rooms(&store, &rooms, topo)?;
     drop(store);
-    eprintln!("post-repack shard state:");
+    println!("post-repack shard state:");
     cmd_shards(cli)?;
     Ok(())
 }
