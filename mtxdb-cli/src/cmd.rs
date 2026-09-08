@@ -144,6 +144,7 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
 /// any command that mutates data.
 fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    require_store_dir(dir)?;
     PackfileStorage::open(dir.into()).context("failed to open store")
 }
 
@@ -151,7 +152,26 @@ fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
 /// than contending with it. For commands that only ever read room data.
 fn open_store_read_only(cli: &Cli) -> anyhow::Result<PackfileStorage> {
     let dir = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    require_store_dir(dir)?;
     PackfileStorage::open_read_only(dir.into()).context("failed to open store")
+}
+
+/// Ensure the selected store location exists before issuing an operation.
+/// This turns the otherwise opaque `read_dir`/`open` ENOENT into an action
+/// the person running the CLI can take.
+fn require_store_dir(dir: &Path) -> anyhow::Result<()> {
+    match fs::metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => bail!("storage path `{}` is not a directory", dir.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
+            "storage directory `{}` does not exist; create it with `mkdir -p {}` or choose one with --dir DIR",
+            dir.display(),
+            dir.display(),
+        ),
+        Err(error) => Err(error).with_context(|| {
+            format!("cannot access storage directory `{}`", dir.display())
+        }),
+    }
 }
 
 fn cmd_put(cli: &Cli, room: &str, id: &str, data: &str) -> anyhow::Result<()> {
@@ -188,6 +208,7 @@ fn cmd_get(cli: &Cli, room: &str, id: &str) -> anyhow::Result<()> {
 /// and `NodeCache` per room, which `open_store_read_only` would do
 /// purely to hand back counts and then throw everything away.
 fn room_frame_counts(dir: &Path) -> anyhow::Result<Vec<([u8; 16], usize)>> {
+    require_store_dir(dir)?;
     let mut counts: std::collections::HashMap<[u8; 16], usize> = std::collections::HashMap::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -246,7 +267,7 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
     shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
 
     if shard_entries.is_empty() {
-        eprintln!("no shards found");
+        println!("no shards found in `{}` (store is empty)", dir.display());
         return Ok(());
     }
 
@@ -264,6 +285,7 @@ fn cmd_shards(cli: &Cli) -> anyhow::Result<()> {
 /// Glob `shard_*.pack` files in `dir`, parsing `slot_id`, epoch,
 /// and file size from each filename and its metadata.
 fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64)>> {
+    require_store_dir(dir)?;
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -442,8 +464,46 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Result<()> {
-    let mut content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let val: OwnedValue = simd_json::to_owned_value(&mut content).context("invalid JSON")?;
+    let content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let is_jsonl = path
+        .extension()
+        .is_some_and(|extension| extension == "jsonl");
+    let (events, detected_room) = if is_jsonl {
+        let text = std::str::from_utf8(&content)
+            .with_context(|| format!("{} is not valid UTF-8 JSONL", path.display()))?;
+        let mut events = Vec::new();
+        for (line_number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut bytes = line.as_bytes().to_vec();
+            let event = simd_json::to_owned_value(&mut bytes)
+                .with_context(|| format!("invalid JSONL event on line {}", line_number + 1))?;
+            events.push(event);
+        }
+        let detected_room = events.iter().find_map(event_room_id).map(str::to_owned);
+        (events, detected_room)
+    } else {
+        let mut content = content;
+        let val: OwnedValue = simd_json::to_owned_value(&mut content).context("invalid JSON")?;
+        let detected_room = event_room_id(&val).map(str::to_owned);
+        let pdus = val["pdus"].as_array();
+        let auth_chain = val["auth_chain"].as_array();
+        if pdus.is_none() && auth_chain.is_none() {
+            bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array, or a .jsonl file containing one event per line");
+        }
+        let events = [pdus, auth_chain]
+            .into_iter()
+            .flatten()
+            .flat_map(|events| events.iter().cloned())
+            .collect();
+        (events, detected_room)
+    };
+
+    if events.is_empty() {
+        bail!("no events found in {}", path.display());
+    }
 
     let mut event_count = 0u64;
     let mut skipped = 0u64;
@@ -453,14 +513,7 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
     let room_id = if let Some(r) = room_override {
         parse_room_id(r)?
     } else {
-        let rid = match &val {
-            OwnedValue::Object(obj) => match obj.get("room_id") {
-                Some(OwnedValue::String(s)) => Some(s.as_str()),
-                _ => None,
-            },
-            _ => None,
-        }
-        .context("could not detect room_id")?;
+        let rid = detected_room.context("could not detect room_id; pass --room for this input")?;
         let hash = blake3::hash(rid.as_bytes());
         let mut id = [0u8; 16];
         id.copy_from_slice(&hash.as_bytes()[..16]);
@@ -469,45 +522,38 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
 
     let room_hex = hex_encode(&room_id);
 
-    let arr_pdus = val["pdus"].as_array();
-    let arr_auth = val["auth_chain"].as_array();
-    if arr_pdus.is_none() && arr_auth.is_none() {
-        bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array");
-    }
-    for arr in [arr_pdus, arr_auth].into_iter().flatten() {
-        for ev in arr {
-            let sha = match ev {
-                OwnedValue::Object(obj) => match obj.get("hashes") {
-                    Some(OwnedValue::Object(h)) => match h.get("sha256") {
-                        Some(OwnedValue::String(s)) => Some(s.as_str()),
-                        _ => None,
-                    },
+    for ev in &events {
+        let sha = match ev {
+            OwnedValue::Object(obj) => match obj.get("hashes") {
+                Some(OwnedValue::Object(h)) => match h.get("sha256") {
+                    Some(OwnedValue::String(s)) => Some(s.as_str()),
                     _ => None,
                 },
                 _ => None,
-            };
-            let Some(sha) = sha else {
+            },
+            _ => None,
+        };
+        let Some(sha) = sha else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+
+        let id_bytes = match base64::engine::general_purpose::STANDARD_NO_PAD.decode(sha) {
+            Ok(b) if b.len() >= 16 => {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&b[..16]);
+                id
+            }
+            _ => {
                 skipped = skipped.saturating_add(1);
                 continue;
-            };
+            }
+        };
 
-            let id_bytes = match base64::engine::general_purpose::STANDARD_NO_PAD.decode(sha) {
-                Ok(b) if b.len() >= 16 => {
-                    let mut id = [0u8; 16];
-                    id.copy_from_slice(&b[..16]);
-                    id
-                }
-                _ => {
-                    skipped = skipped.saturating_add(1);
-                    continue;
-                }
-            };
-
-            let event_bytes = ev.to_string().into_bytes();
-            let data = NodeData::new(bytes::Bytes::from(event_bytes));
-            store.put(&room_id, &id_bytes, &data)?;
-            event_count = event_count.saturating_add(1);
-        }
+        let event_bytes = ev.to_string().into_bytes();
+        let data = NodeData::new(bytes::Bytes::from(event_bytes));
+        store.put(&room_id, &id_bytes, &data)?;
+        event_count = event_count.saturating_add(1);
     }
 
     eprintln!("imported {event_count} events to room {room_hex}");
@@ -516,6 +562,16 @@ fn cmd_import(cli: &Cli, path: &Path, room_override: Option<&str>) -> anyhow::Re
     }
 
     Ok(())
+}
+
+fn event_room_id(value: &OwnedValue) -> Option<&str> {
+    match value {
+        OwnedValue::Object(object) => match object.get("room_id") {
+            Some(OwnedValue::String(room_id)) => Some(room_id.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn cmd_repack(

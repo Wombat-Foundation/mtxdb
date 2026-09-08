@@ -123,18 +123,18 @@ fn build_cli() -> Command {
 
 fn sub_import() -> Command {
     Command::new("import")
-        .about("Import Matrix federation events from JSON")
+        .about("Import Matrix federation events from JSON or JSONL")
         .long_about(
-            "Import Matrix federation events from JSON. The document must contain a `pdus` \
-             array, an `auth_chain` array, or both; each imported event needs a base64-no-pad \
-             `hashes.sha256` value. The room comes from the document's `room_id` unless --room \
-             is supplied.",
+            "Import Matrix federation events from a JSON document or JSONL event stream. A JSON \
+             document must contain a `pdus` array, an `auth_chain` array, or both; a `.jsonl` \
+             file contains one event per line. Each imported event needs a base64-no-pad \
+             `hashes.sha256` value. The room comes from `room_id` unless --room is supplied.",
         )
         .arg(
             Arg::new("path")
                 .required(true)
                 .value_name("FILE")
-                .help("Matrix federation JSON document"),
+                .help("Matrix federation JSON document or JSONL event stream"),
         )
         .arg(
             Arg::new("room")
