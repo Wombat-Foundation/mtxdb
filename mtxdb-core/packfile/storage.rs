@@ -1646,6 +1646,37 @@ impl PackfileStorage {
         room_ids: &[[u8; 16]],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
+        self.repack_rooms_reachable_with_progress(
+            room_ids,
+            extract_edges,
+            |_shard_id, _nodes, _active| {},
+        )
+    }
+
+    /// As [`Self::repack_rooms_reachable`], with a callback whenever a
+    /// destination shard is finished. The callback receives the shard slot
+    /// and the number of replacement records written to it. The third
+    /// argument is true only for the final, still-active destination shard.
+    ///
+    /// This lets an interactive caller show meaningful physical-compaction
+    /// progress without turning the shared shard batch back into a
+    /// room-at-a-time operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on I/O, corruption, or an unavailable staging
+    /// shard slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the CSR implementation returns a local ID not present in its
+    /// own hash table, which would violate its internal ordering invariant.
+    pub fn repack_rooms_reachable_with_progress(
+        &self,
+        room_ids: &[[u8; 16]],
+        extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+        mut shard_finished: impl FnMut(u16, usize, bool),
+    ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
         let mut room_ids = room_ids.to_vec();
         room_ids.sort_unstable();
         room_ids.dedup();
@@ -1673,6 +1704,8 @@ impl PackfileStorage {
             .prepare_rooms_repack(&room_ids, &source_shards)?;
 
         let mut results = Vec::with_capacity(room_ids.len());
+        let mut output_shard = None;
+        let mut output_nodes = 0usize;
         for room_id in &room_ids {
             let hash_to_shard_offset = maps.get(room_id).ok_or_else(|| {
                 StorageError::Corrupt("repack batch scan lost requested room".to_owned())
@@ -1718,6 +1751,14 @@ impl PackfileStorage {
                 if let Some(entry) =
                     self.copy_record_to_shard(room_id, &pinned, old_shard_id, old_offset)?
                 {
+                    if let Some(previous_shard) = output_shard {
+                        if previous_shard != entry.1 {
+                            shard_finished(previous_shard, output_nodes, false);
+                            output_nodes = 0;
+                        }
+                    }
+                    output_shard = Some(entry.1);
+                    output_nodes = output_nodes.saturating_add(1);
                     new_offsets.push(entry);
                 }
             }
@@ -1738,6 +1779,10 @@ impl PackfileStorage {
                 .and_modify(|count| *count = count.saturating_add(1))
                 .or_insert(1);
             results.push((*room_id, kept, dropped));
+        }
+
+        if let Some(shard_id) = output_shard {
+            shard_finished(shard_id, output_nodes, true);
         }
 
         // All target room locks remain held while source references are

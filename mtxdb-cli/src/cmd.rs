@@ -1024,9 +1024,23 @@ fn repack_rooms(
     topo: bool,
 ) -> anyhow::Result<(usize, usize)> {
     let results = if topo {
-        store.repack_rooms_reachable(rooms, extract_matrix_edges)?
+        store.repack_rooms_reachable_with_progress(
+            rooms,
+            extract_matrix_edges,
+            |shard_id, nodes, active| {
+                let state = if active { "active" } else { "full" };
+                println!("  output slot {shard_id} {state}: {nodes} nodes copied");
+            },
+        )?
     } else {
-        store.repack_rooms_reachable(rooms, |_hash, _data| Vec::new())?
+        store.repack_rooms_reachable_with_progress(
+            rooms,
+            |_hash, _data| Vec::new(),
+            |shard_id, nodes, active| {
+                let state = if active { "active" } else { "full" };
+                println!("  output slot {shard_id} {state}: {nodes} nodes copied");
+            },
+        )?
     };
     let (final_kept, final_dropped) = results
         .iter()
