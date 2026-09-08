@@ -380,7 +380,7 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
         // necessarily received a first write. `open_read_only` quite
         // properly rejects a directory with no shard files, but for a
         // listing that simply means there are no collections to show.
-        None if glob_shard_files(dir)?.is_empty() => Vec::new(),
+        None if glob_pack_files(dir)?.is_empty() => Vec::new(),
         // Old stores have no sidecar yet. Keep the complete, slower fallback
         // so `collections` remains useful until `mtxdb sync` writes one.
         None => PackfileStorage::open_read_only(dir.into())
@@ -463,8 +463,8 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Deliberately bypasses both `PackfileStorage` and `ShardPool` — it
-/// needs no collection data and no packfile reads. Instead it globs shard
-/// filenames for size/rotation, then decodes the small `shard_stats.bin` and
+/// needs no collection data and no frame reads. Instead it validates pack
+/// headers, then decodes the small `shard_stats.bin` and
 /// `shard_rooms.bin` sidecars for counters and live-node counts.
 /// Safe to run against a directory a live writer process owns.
 fn cmd_shards(cli: &Cli, all: bool) -> anyhow::Result<()> {
@@ -485,7 +485,7 @@ fn cmd_shards(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// List shard metadata from one pool only. This reads directory entries and
 /// sidecars; it never scans packfile contents or opens collection indexes.
 fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
-    let mut shard_entries = glob_shard_files(dir)?;
+    let mut shard_entries = glob_pack_files(dir)?;
     shard_entries.sort_unstable_by_key(|&(id, _, _, _)| id);
 
     if shard_entries.is_empty() {
@@ -515,52 +515,92 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Glob `shard_*.pack` files in `dir`, parsing `slot_id`, epoch,
-/// file size, and format version from each file.
-fn glob_shard_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64, u8)>> {
-    let mut entries = Vec::new();
+/// Discover only canonical v4 `pack_{pack_id:016x}.pack` files.
+///
+/// The returned slot is CLI-internal: it mirrors the pool's deterministic
+/// pack-ID ordering solely to join the currently slot-keyed directory
+/// sidecar. It is never an operator-facing identity.
+fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64, u8)>> {
+    let mut packs = Vec::new();
+    let mut seen = HashSet::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "pack") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Some(id_hex) = stem.strip_prefix("shard_") {
-                    let (slot_hex, epoch) = match id_hex.split_once('_') {
-                        Some((slot, gen_hex)) => {
-                            let gen = u64::from_str_radix(gen_hex, 16).unwrap_or(0);
-                            (slot, gen)
-                        }
-                        None => (id_hex, 0),
-                    };
-                    if let Ok(slot_id) = u16::from_str_radix(slot_hex, 16) {
-                        let file_bytes = entry.metadata()?.len();
-                        let version = std::fs::File::open(&path)
-                            .ok()
-                            .and_then(|mut f| mtxdb_core::packfile::read_version(&mut f).ok())
-                            .flatten()
-                            .unwrap_or(0);
-                        entries.push((slot_id, epoch, file_bytes, version));
-                    }
-                }
-            }
+        if !path.extension().is_some_and(|e| e == "pack") {
+            continue;
         }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let id_hex = match stem.strip_prefix("pack_") {
+            Some(id_hex) => id_hex,
+            None if stem.starts_with("shard_") => {
+                bail!(
+                    "found pre-v4 shard file {}; reset it rather than opening it as v4",
+                    path.display()
+                );
+            }
+            None => continue,
+        };
+        if id_hex.len() != 16
+            || !id_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            bail!(
+                "invalid v4 pack filename {}; expected pack_{{16 lowercase hex digits}}.pack",
+                path.display()
+            );
+        }
+        let pack_id = u64::from_str_radix(id_hex, 16)?;
+        if !seen.insert(pack_id) {
+            bail!("duplicate pack_id {pack_id:#x} in {}", dir.display());
+        }
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open pack `{}`", path.display()))?;
+        let header = mtxdb_core::packfile::read_header(&mut BufReader::new(file))
+            .with_context(|| format!("unsupported or corrupt pack `{}`", path.display()))?
+            .with_context(|| format!("invalid pack header `{}`", path.display()))?;
+        if header.pack_id != pack_id {
+            bail!(
+                "pack {} identifies itself as {:#x}",
+                path.display(),
+                header.pack_id
+            );
+        }
+        packs.push((
+            pack_id,
+            entry.metadata()?.len(),
+            mtxdb_core::packfile::VERSION,
+        ));
     }
-    Ok(entries)
+    packs.sort_unstable_by_key(|(pack_id, _, _)| *pack_id);
+    packs
+        .into_iter()
+        .enumerate()
+        .map(|(slot, (pack_id, bytes, version))| {
+            Ok((
+                u16::try_from(slot).context("too many packs for the slot index")?,
+                pack_id,
+                bytes,
+                version,
+            ))
+        })
+        .collect()
 }
 
-/// Composite `(slot_id, epoch)` key to `(write_count,
-/// bytes_written, sync_count)`, as decoded from `shard_stats.bin`.
+/// Pack ID to `(write_count, bytes_written, sync_count)`, as decoded from
+/// `shard_stats.bin`.
 type ShardStatsMap = std::collections::HashMap<u64, (u64, u64, u64)>;
 
 /// Decode `shard_stats.bin` — same binary format as
 /// `ShardPool::restore_persisted_stats`, but standalone. Returns a map
-/// from a composite `(slot_id, epoch)` key to `(write_count,
+/// from a `pack_id` key to `(write_count,
 /// bytes_written, sync_count)` and the snapshot's persisted-at timestamp.
 fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
     const STATS_HEADER_LEN: usize = 4 + 1 + 8; // magic + version + persisted_at
     const STATS_RECORD_LEN: usize = 2 + 8 + 8 * 3;
-    const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     let mut stats_map = std::collections::HashMap::new();
     let mut persisted_at = None;
@@ -577,13 +617,11 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     let body = &buf[STATS_HEADER_LEN..];
     for chunk in body.chunks(STATS_RECORD_LEN) {
         if let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) {
-            let shard_id = u16::from_le_bytes(rec[0..2].try_into().unwrap());
-            let epoch = u64::from_le_bytes(rec[2..10].try_into().unwrap());
+            let pack_id = u64::from_le_bytes(rec[2..10].try_into().unwrap());
             let write_count = u64::from_le_bytes(rec[10..18].try_into().unwrap());
             let bytes_written = u64::from_le_bytes(rec[18..26].try_into().unwrap());
             let sync_count = u64::from_le_bytes(rec[26..34].try_into().unwrap());
-            let key = u64::from(shard_id) << 48 | (epoch & EPOCH_MASK);
-            stats_map.insert(key, (write_count, bytes_written, sync_count));
+            stats_map.insert(pack_id, (write_count, bytes_written, sync_count));
         }
     }
     (stats_map, persisted_at)
@@ -597,22 +635,20 @@ fn print_shard_table(
     collection_counts: Option<&std::collections::HashMap<u16, u64>>,
     total_rooms: Option<usize>,
 ) {
-    const EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
     // `ShardPool::open_internal` restores the highest occupied slot as its
     // append destination. Mirror that recovery rule here without opening a
     // writer just to render an inspection table.
     let active_slot = shard_entries.iter().map(|(slot, _, _, _)| *slot).max();
 
     println!(
-        "{:>6}  {:>3}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
-        "slot", "ver", "rotation", "bytes", "nodes", "collections", "syncs",
+        "{:>8}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
+        "pack id", "ver", "bytes", "nodes", "collections", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
     let mut total_syncs = 0u64;
-    for &(slot_id, epoch, file_bytes, version) in shard_entries {
-        let key = u64::from(slot_id) << 48 | (epoch & EPOCH_MASK);
-        let (_, _, sc) = stats_map.get(&key).copied().unwrap_or_default();
+    for &(slot_id, pack_id, file_bytes, version) in shard_entries {
+        let (_, _, sc) = stats_map.get(&pack_id).copied().unwrap_or_default();
         let nodes = node_counts
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
@@ -620,9 +656,9 @@ fn print_shard_table(
             .and_then(|counts| counts.get(&slot_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
-            "{:>6}  {:>3}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
+            "{:>8}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
             format!(
-                "{slot_id}{}",
+                "{pack_id:#x}{}",
                 if active_slot == Some(slot_id) {
                     "*"
                 } else {
@@ -630,7 +666,6 @@ fn print_shard_table(
                 }
             ),
             version,
-            format!("{epoch:#018x}"),
             fmt_bytes(file_bytes),
             nodes,
             collections,
@@ -644,10 +679,9 @@ fn print_shard_table(
     }
     println!();
     println!(
-        "{:>6}  {:>3}  {:>18}  {:>10}  {:>8}  {:>6}  {:>6}",
-        "",
-        "",
+        "{:>8}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
         "total",
+        "",
         fmt_bytes(total_bytes),
         total_nodes.map_or_else(|| "?".to_owned(), |count| count.to_string()),
         total_rooms.map_or_else(|| "?".to_owned(), |count| count.to_string()),
