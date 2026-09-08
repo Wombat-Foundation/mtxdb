@@ -998,6 +998,27 @@ impl ShardPool {
         Ok(())
     }
 
+    /// Route a whole repack batch through one shared, non-source write
+    /// stream.  Individual rooms still retain their own indexes, but their
+    /// replacement frames fill the same succession of destination shards
+    /// instead of stranding one partially-filled shard per room.
+    pub(crate) fn prepare_rooms_repack(
+        &self,
+        room_ids: &[[u8; 16]],
+        source_shards: &HashSet<u16>,
+    ) -> io::Result<()> {
+        let _guard = self.rotation_lock.lock();
+        if source_shards.contains(&*self.active_write.lock()) {
+            self.rotate_locked()?;
+        }
+        let shard_id = *self.active_write.lock();
+        let mut homes = self.room_home.write();
+        for room_id in room_ids {
+            homes.insert(*room_id, shard_id);
+        }
+        Ok(())
+    }
+
     /// Best-effort stats snapshot write, same contract as the `Drop` impl:
     /// the persisted stats file is pure observability, not correctness, so
     /// a failure here (e.g. the base directory momentarily gone during test

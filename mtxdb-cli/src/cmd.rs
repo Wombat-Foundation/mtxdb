@@ -984,11 +984,22 @@ fn repack_preview(
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
     );
+    let widest_slot = shards
+        .iter()
+        .map(u16::to_string)
+        .map(|slot| slot.len())
+        .max()
+        .unwrap_or(1);
+    let label_width = "slot ".len().saturating_add(widest_slot);
     for shard_id in &shards {
         let bytes = shard_sizes.get(shard_id).copied().unwrap_or(0);
-        println!("  slot {shard_id}: {:>9}", fmt_bytes(bytes));
+        println!("  slot {shard_id:>widest_slot$}: {:>9}", fmt_bytes(bytes));
     }
-    println!("  total:    {:>9}", fmt_bytes(total_input_bytes));
+    println!(
+        "  {:>label_width$}: {:>9}",
+        "total",
+        fmt_bytes(total_input_bytes)
+    );
     println!(
         "expected result: ~{expected_shards} shard{} ({total_kept} nodes across {} room{} rewritten)",
         if expected_shards == 1 { "" } else { "s" },
@@ -1014,21 +1025,19 @@ fn repack_rooms(
     rooms: &[[u8; 16]],
     topo: bool,
 ) -> anyhow::Result<(usize, usize)> {
-    let mut results = Vec::with_capacity(rooms.len());
+    let results = if topo {
+        store.repack_rooms_reachable(rooms, extract_matrix_edges)?
+    } else {
+        store.repack_rooms_reachable(rooms, |_hash, _data| Vec::new())?
+    };
     let mut total_kept = 0_usize;
-    for (position, room_id) in rooms.iter().enumerate() {
-        let (kept, dropped) = if topo {
-            store.repack_room_reachable(room_id, extract_matrix_edges)?
-        } else {
-            store.repack_room_reachable(room_id, |_hash, _data| Vec::new())?
-        };
+    for (position, (room_id, kept, dropped)) in results.iter().enumerate() {
         println!(
             "repacked {}: {kept} kept, {dropped} dropped",
             hex_encode(room_id)
         );
-        results.push((kept, dropped));
         total_kept = total_kept
-            .checked_add(kept)
+            .checked_add(*kept)
             .context("repack progress node count overflow")?;
         if rooms.len() > 1 {
             let completed = position
@@ -1042,7 +1051,7 @@ fn repack_rooms(
     }
     let (final_kept, final_dropped) = results
         .iter()
-        .fold((0usize, 0usize), |(k, d), &(kept, dropped)| {
+        .fold((0usize, 0usize), |(k, d), &(_, kept, dropped)| {
             (k.saturating_add(kept), d.saturating_add(dropped))
         });
     println!(

@@ -1621,6 +1621,128 @@ impl PackfileStorage {
         Ok((kept, dropped))
     }
 
+    /// Repack several rooms as one physical shard-compaction batch.
+    ///
+    /// The input is scanned once, then all replacement records are written
+    /// through one shared destination stream. This is O(bytes + nodes), not
+    /// O(rooms × bytes), and avoids leaving one partially-filled destination
+    /// shard behind for each room.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] on I/O, corruption, or an unavailable staging
+    /// shard slot.
+    ///
+    /// # Panics
+    /// Panics if the CSR implementation returns a local ID not present in its
+    /// own hash table, which would violate its internal ordering invariant.
+    pub fn repack_rooms_reachable(
+        &self,
+        room_ids: &[[u8; 16]],
+        extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+    ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
+        let mut room_ids = room_ids.to_vec();
+        room_ids.sort_unstable();
+        room_ids.dedup();
+        if room_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // A batch is one coherent generation change. Hold every selected
+        // room's writer mutex in a stable order so a concurrent put cannot
+        // be missed by the scan or revive an old source after the swap.
+        let mutexes: Vec<_> = room_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let room_guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
+
+        let maps = self.scan_room_record_maps(&room_ids)?;
+        let source_shards: HashSet<u16> = maps
+            .values()
+            .flat_map(|map| map.values().map(|&(shard_id, _)| shard_id))
+            .collect();
+        let pinned = self.pin_shards(source_shards.iter().copied());
+
+        // Establish one common destination before copying the first frame.
+        // `put_record` moves every room to the same active successor when a
+        // destination fills, so output remains densely packed across rooms.
+        self.shards
+            .prepare_rooms_repack(&room_ids, &source_shards)?;
+
+        let mut results = Vec::with_capacity(room_ids.len());
+        for room_id in &room_ids {
+            let hash_to_shard_offset = maps.get(room_id).ok_or_else(|| {
+                StorageError::Corrupt("repack batch scan lost requested room".to_owned())
+            })?;
+            let roots = self.live_roots.read().get(room_id).cloned();
+            let (live_hashes, adjacency) = match roots {
+                Some(roots) if !roots.is_empty() => {
+                    Self::bfs_live_set(&roots, hash_to_shard_offset, &pinned, &extract_edges)?
+                }
+                _ => Self::scan_full_adjacency(hash_to_shard_offset, &pinned, &extract_edges)?,
+            };
+            let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
+
+            if dropped > 0 {
+                let live_set: HashSet<[u8; 16]> = live_hashes.iter().copied().collect();
+                if let Some(gen) = self.generation(room_id) {
+                    for hash in hash_to_shard_offset.keys() {
+                        if !live_set.contains(hash) {
+                            gen.cache.remove(hash);
+                        }
+                    }
+                }
+            }
+
+            let csr = Csr::build_from_edges(&live_hashes, &adjacency);
+            let topo = csr.topo_order();
+            if topo.len() != live_hashes.len() {
+                return Err(StorageError::Corrupt(format!(
+                    "repack: cyclic graph detected — topo_order produced {} nodes from {} live hashes",
+                    topo.len(),
+                    live_hashes.len(),
+                )));
+            }
+
+            let mut new_offsets = Vec::with_capacity(topo.len());
+            for &local in &topo {
+                let hash = csr
+                    .hash_of(local)
+                    .expect("topo order contains valid local IDs");
+                let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
+                    continue;
+                };
+                if let Some(entry) =
+                    self.copy_record_to_shard(room_id, &pinned, old_shard_id, old_offset)?
+                {
+                    new_offsets.push(entry);
+                }
+            }
+
+            let kept = new_offsets.len();
+            let index = Self::build_index(&new_offsets);
+            self.replace_room_shard_counts(room_id, &index.shard_counts());
+            self.swap_generation(room_id, index)?;
+            self.repack_save_incremental_state(room_id, &new_offsets);
+            self.repack_count.fetch_add(1, Ordering::Relaxed);
+            self.repack_kept_total
+                .fetch_add(kept as u64, Ordering::Relaxed);
+            self.repack_dropped_total
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+            self.repack_counts_by_room
+                .write()
+                .entry(*room_id)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+            results.push((*room_id, kept, dropped));
+        }
+
+        // All target room locks remain held while source references are
+        // replaced. Drop them before the general retirement protocol, which
+        // obtains every room lock itself.
+        drop(room_guards);
+        self.retire_empty_shards_after_batch();
+        self.shards.sync_dirty()?;
+        Ok(results)
+    }
+
     /// Fetches the ancestors of `frontier`, walking `extract_edges`
     /// backward and stopping expansion at (and excluding) anything in
     /// `stop_at` — a bounded ancestor walk, e.g. for auth-chain or
@@ -1733,6 +1855,22 @@ impl PackfileStorage {
         let mutexes: Vec<_> = rooms_to_lock.iter().map(|id| self.put_mutex(id)).collect();
         let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
 
+        self.retire_empty_shards_locked();
+    }
+
+    /// Retire unreferenced shards after a batch has released all room locks.
+    /// This takes every room lock itself, unlike [`Self::retire_empty_shards`]
+    /// which is called while one particular room lock is already held.
+    fn retire_empty_shards_after_batch(&self) {
+        let mut room_ids: Vec<[u8; 16]> = self.rooms.read().keys().copied().collect();
+        room_ids.sort_unstable();
+        let mutexes: Vec<_> = room_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let _guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
+        self.retire_empty_shards_locked();
+    }
+
+    /// Every room writer lock is held by the caller.
+    fn retire_empty_shards_locked(&self) {
         // Do not retain the map guard while acquiring room locks: another
         // operation may need the map lock while it holds a room lock.
         let rooms = self.rooms.read();
