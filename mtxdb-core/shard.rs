@@ -255,6 +255,12 @@ pub struct ShardPool {
     /// Serializes shard rotation (finding/creating the next shard).
     rotation_lock: parking_lot::Mutex<()>,
     base_dir: PathBuf,
+    /// Per-pool rotation threshold, in bytes. Defaults to `MAX_SHARD_BYTES`
+    /// but may be set lower (e.g. by a benchmark that wants many small
+    /// packs to exercise repack/locality behavior) — never higher, since
+    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexSlot`'s 28-bit
+    /// offset field.
+    max_shard_bytes: u64,
     /// Shard IDs written to since the last sync, for scoped fsync.
     dirty: parking_lot::Mutex<HashSet<u16>>,
     /// Monotonically increasing `pack_id` counter for pack filenames.
@@ -326,7 +332,25 @@ impl ShardPool {
     /// Returns `io::Error` on directory read failure, packfile open
     /// failure, or if another process already holds the writer lock.
     pub fn open(base_dir: PathBuf) -> io::Result<Self> {
-        Self::open_internal(base_dir, true)
+        Self::open_internal(base_dir, true, MAX_SHARD_BYTES)
+    }
+
+    /// Open or create a shard pool as its exclusive writer, rotating
+    /// shards at `max_shard_bytes` instead of the default
+    /// [`MAX_SHARD_BYTES`]. Intended for benchmarks and tests that want
+    /// many small packs without writing gigabytes of data to trigger it.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`], plus `InvalidInput` if `max_shard_bytes`
+    /// is zero or exceeds [`MAX_SHARD_BYTES`].
+    pub fn open_with_max_shard_bytes(base_dir: PathBuf, max_shard_bytes: u64) -> io::Result<Self> {
+        if max_shard_bytes == 0 || max_shard_bytes > MAX_SHARD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("max_shard_bytes must be in 1..={MAX_SHARD_BYTES}, got {max_shard_bytes}"),
+            ));
+        }
+        Self::open_internal(base_dir, true, max_shard_bytes)
     }
 
     /// Open a shard pool as a read-only observer, coexisting with a
@@ -343,7 +367,9 @@ impl ShardPool {
     /// Returns `io::Error` on directory read failure, or if the directory
     /// has no shards yet.
     pub fn open_read_only(base_dir: PathBuf) -> io::Result<Self> {
-        Self::open_internal(base_dir, false)
+        // A read-only pool never writes, so the rotation threshold is
+        // never consulted — pass the default for consistency.
+        Self::open_internal(base_dir, false, MAX_SHARD_BYTES)
     }
 
     /// Discovers packfiles in the pool directory.
@@ -428,7 +454,7 @@ impl ShardPool {
         Ok(pack_files)
     }
 
-    fn open_internal(base_dir: PathBuf, writable: bool) -> io::Result<Self> {
+    fn open_internal(base_dir: PathBuf, writable: bool, max_shard_bytes: u64) -> io::Result<Self> {
         if writable {
             fs::create_dir_all(&base_dir)?;
         } else if !base_dir.is_dir() {
@@ -544,6 +570,7 @@ impl ShardPool {
             active_write: parking_lot::Mutex::new(highest_active),
             rotation_lock: parking_lot::Mutex::new(()),
             base_dir,
+            max_shard_bytes,
             dirty: parking_lot::Mutex::new(HashSet::new()),
             next_pack_id: AtomicU64::new(next_pack_id),
             retired_count: AtomicU64::new(0),
@@ -965,7 +992,7 @@ impl ShardPool {
                 let current_len = shard.file_len.load(Ordering::Acquire);
                 let fits = current_len
                     .checked_add(max_record_len)
-                    .is_some_and(|sum| sum <= MAX_SHARD_BYTES);
+                    .is_some_and(|sum| sum <= self.max_shard_bytes);
                 if !fits && current_len > packfile::HEADER_LEN as u64 {
                     drop(guard);
                     drop(file);

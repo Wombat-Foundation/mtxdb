@@ -284,7 +284,30 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `io::Error` if the base directory cannot be created or read.
     pub fn open(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true)
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true, None)
+    }
+
+    /// Open a packfile storage that rotates shards at `max_shard_bytes`
+    /// instead of the default `~256 MB` ceiling. Intended for benchmarks
+    /// and tests that want many small packs without writing gigabytes of
+    /// data to trigger rotation — see
+    /// [`crate::shard::ShardPool::open_with_max_shard_bytes`].
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the base directory cannot be created or
+    /// read, or if `max_shard_bytes` is zero or exceeds
+    /// [`crate::shard::MAX_SHARD_BYTES`].
+    pub fn open_with_max_shard_bytes(
+        base_dir: PathBuf,
+        max_shard_bytes: u64,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            true,
+            Some(max_shard_bytes),
+        )
     }
 
     /// Open a packfile storage as a read-only observer, coexisting with a
@@ -300,7 +323,7 @@ impl PackfileStorage {
     /// Returns `io::Error` if the directory can't be read, has no shards
     /// yet, or a writer already holds the exclusive lock.
     pub fn open_read_only(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, false)
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, false, None)
     }
 
     /// Open a packfile storage with a custom per-collection cache capacity.
@@ -311,7 +334,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         cache_capacity: usize,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, None, true)
+        Self::open_with_options(base_dir, cache_capacity, None, true, None)
     }
 
     /// Open a packfile storage with a swizzle callback for in-cache pointer resolution.
@@ -323,7 +346,7 @@ impl PackfileStorage {
         cache_capacity: usize,
         swizzle: SwizzleFn,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, Some(swizzle), true)
+        Self::open_with_options(base_dir, cache_capacity, Some(swizzle), true, None)
     }
 
     fn open_with_options(
@@ -331,11 +354,17 @@ impl PackfileStorage {
         cache_capacity: usize,
         swizzle: Option<SwizzleFn>,
         writable: bool,
+        max_shard_bytes: Option<u64>,
     ) -> Result<Self, std::io::Error> {
         fs::create_dir_all(&base_dir)?;
 
         let shards = if writable {
-            ShardPool::open(base_dir.clone())?
+            match max_shard_bytes {
+                Some(max_shard_bytes) => {
+                    ShardPool::open_with_max_shard_bytes(base_dir.clone(), max_shard_bytes)?
+                }
+                None => ShardPool::open(base_dir.clone())?,
+            }
         } else {
             ShardPool::open_read_only(base_dir.clone())?
         };

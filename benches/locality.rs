@@ -25,27 +25,6 @@ use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
 
 const MAX_DATA_LEN: usize = 65535 - 100;
 
-// ── Minimal PRNG ───────────────────────────────────────────────────
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
-    }
-}
-
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -107,13 +86,7 @@ impl ZipfianCollectionSampler {
         // Zipfian weights: collection 0 is the "elephant" with weight ~1.0,
         // each subsequent collection gets weight 1/k^s (s=1.0 for mild skew).
         let weights: Vec<f64> = (0..count as u64)
-            .map(|k| {
-                if k == 0 {
-                    1.0
-                } else {
-                    1.0 / (k as f64)
-                }
-            })
+            .map(|k| if k == 0 { 1.0 } else { 1.0 / (k as f64) })
             .collect();
         let total: f64 = weights.iter().sum();
 
@@ -125,8 +98,14 @@ impl ZipfianCollectionSampler {
     }
 
     fn sample(&self, idx: usize) -> [u8; 16] {
-        let mut rng = Rng::new(idx as u64 ^ 0xCAFE_BABE);
-        let r = rng.f64();
+        // A single xorshift step from a seed that only differs in its low
+        // bits barely perturbs the high bits `f64()` extracts (>>11), so a
+        // plain `Rng::new(idx ^ const).f64()` here returned ~0.1986 for
+        // almost every idx — the elephant collection's ~12.8% share of the
+        // Zipfian mass never won a draw, so the whole locality signal this
+        // benchmark exists to measure never fired. `splitmix64` mixes bits
+        // properly in one pass, so use it directly instead.
+        let r = (splitmix64(idx as u64 ^ 0xCAFE_BABE) >> 11) as f64 / (1u64 << 53) as f64;
         let mut cumulative = 0.0;
         for (i, w) in self.weights.iter().enumerate() {
             cumulative += w;
@@ -156,7 +135,11 @@ fn drop_caches_for_dir(dir: &Path) -> bool {
 
 // ── Benchmark ──────────────────────────────────────────────────────
 
-pub fn run_stage1_locality_benchmark(total_records: usize, collection_count: usize) {
+pub fn run_stage1_locality_benchmark(
+    total_records: usize,
+    collection_count: usize,
+    max_shard_bytes: Option<u64>,
+) {
     let temp_dir =
         std::env::temp_dir().join(format!("mtxdb_stage1_locality_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
@@ -166,8 +149,16 @@ pub fn run_stage1_locality_benchmark(total_records: usize, collection_count: usi
     let mut payload_gen = PseudoRandomPayload::new(0xDEAD_BEEF);
     let mut elephant_nodes = Vec::new();
 
-    println!("\n[1/4] Ingesting opaque Zipfian workload...");
-    let store = PackfileStorage::open(temp_dir.clone()).unwrap();
+    println!(
+        "\n[1/4] Ingesting opaque Zipfian workload (max_shard_bytes={})...",
+        max_shard_bytes.map_or_else(|| "default (~256 MB)".to_string(), |n| n.to_string())
+    );
+    let store = match max_shard_bytes {
+        Some(max_shard_bytes) => {
+            PackfileStorage::open_with_max_shard_bytes(temp_dir.clone(), max_shard_bytes).unwrap()
+        }
+        None => PackfileStorage::open(temp_dir.clone()).unwrap(),
+    };
 
     let all_collections: Vec<[u8; 16]> = sampler.collections.clone();
 
@@ -175,7 +166,16 @@ pub fn run_stage1_locality_benchmark(total_records: usize, collection_count: usi
         let collection = sampler.sample(i);
         let nid = node_id(i);
 
-        let payload_size = (1024 + (i % 30) * 1024).min(MAX_DATA_LEN);
+        // Scale payload size to the shard cap itself when one is given, so a
+        // tiny `max_shard_bytes` (e.g. a 10 KB test run) still fits several
+        // records per shard instead of overflowing MAX_SHARDS on oversized
+        // single-record payloads.
+        let payload_ceiling = max_shard_bytes.map_or(MAX_DATA_LEN, |cap| {
+            usize::try_from(cap / 8).unwrap_or(MAX_DATA_LEN).max(64)
+        });
+        let payload_size = (1024 + (i % 30) * 1024)
+            .min(MAX_DATA_LEN)
+            .min(payload_ceiling);
         let payload = payload_gen.generate_bytes(payload_size);
 
         if collection == sampler.elephant_id() {
@@ -236,7 +236,12 @@ pub fn run_stage1_locality_benchmark(total_records: usize, collection_count: usi
     // --- Phase C: Batch Repack ---
     println!("\n[3/4] Executing Batch Repack...");
     drop(store_pre);
-    let store_repack = PackfileStorage::open(temp_dir.clone()).unwrap();
+    let store_repack = match max_shard_bytes {
+        Some(max_shard_bytes) => {
+            PackfileStorage::open_with_max_shard_bytes(temp_dir.clone(), max_shard_bytes).unwrap()
+        }
+        None => PackfileStorage::open(temp_dir.clone()).unwrap(),
+    };
     let repack_start = Instant::now();
 
     store_repack
@@ -287,14 +292,16 @@ pub fn run_stage1_locality_benchmark(total_records: usize, collection_count: usi
     println!("\n═══════════════════════════════════════════════════════════════");
     println!("  STAGE 1 LOCALITY SUMMARY");
     println!("═══════════════════════════════════════════════════════════════");
+    println!(
+        "  Max shard bytes:      {}",
+        max_shard_bytes.map_or_else(|| "default (~256 MB)".to_string(), |n| n.to_string())
+    );
     println!("  Total records:        {total_records}");
     println!("  Collections:          {collection_count}");
     println!("  Elephant nodes:       {}", elephant_nodes.len());
     println!("  Sample size:          {}", sample_keys.len());
     println!("  ───────────────────────────────────────────────────────────");
-    println!(
-        "  Pack IDs:             {initial_pack_count} -> {post_pack_count}"
-    );
+    println!("  Pack IDs:             {initial_pack_count} -> {post_pack_count}");
     println!("  Latency:              {pre_latency:.2?} -> {post_latency:.2?}");
     println!(
         "  Speedup:              {:.2}x",
@@ -313,7 +320,16 @@ pub fn run_stage1_locality_benchmark(total_records: usize, collection_count: usi
 fn main() {
     println!("mtxdb stage 1 locality benchmark");
     println!("Requires `vmtouch` on PATH for cold-cache eviction.");
-    println!();
 
-    run_stage1_locality_benchmark(50_000, 500);
+    // A writable ShardPool keeps every discovered pack file open for its
+    // whole lifetime (see `ShardPool::open_internal`), so shard count here
+    // is bounded by the process's fd ulimit, not just MAX_SHARDS (4096) —
+    // a too-small max_shard_bytes with too many records blew past a
+    // default 1024-fd ulimit and failed with "Too many open files" before
+    // this was tuned down. 32 KB / 800 records keeps it around ~60 packs.
+    println!("\n\n### Phase A: tiny shards (max_shard_bytes = 32 KB) ###");
+    run_stage1_locality_benchmark(800, 20, Some(32 * 1024));
+
+    println!("\n\n### Phase B: default shards (max_shard_bytes = ~256 MB) ###");
+    run_stage1_locality_benchmark(50_000, 500, None);
 }

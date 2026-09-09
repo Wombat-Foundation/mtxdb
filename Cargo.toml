@@ -63,6 +63,17 @@ bytes = "1.5"
 # BENCHES — `benches/storage.rs` is discovered by this root package as well
 # as explicitly registered by `mtxdb-core`. Keep its direct shared dependencies
 # here so `cargo bench` from the database root works.
+#
+# `storage.rs` is already registered with `harness = false` under
+# `mtxdb-core`'s own [[bench]] (see mtxdb-core/Cargo.toml) — that's what
+# makes `cargo bench --bench storage` run its `fn main()` instead of being
+# wrapped in the default libtest harness (which would report "0 tests").
+# `locality.rs` needs the same treatment for this (root) package, since
+# nothing else registers it.
+
+[[bench]]
+name = "locality"
+harness = false
 
 # BUILD PROFILES — must be plain [profile.*], never nested under
 # [workspace.*]; Cargo only recognizes profiles at this exact table name
