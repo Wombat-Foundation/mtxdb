@@ -1844,7 +1844,16 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_disk_megabytes, fmt_megabytes, parse_pack_id_selector, parse_pack_selectors};
+    use super::{
+        event_room_id, fmt_disk_megabytes, fmt_megabytes, matrix_create_details,
+        parse_pack_id_selector, parse_pack_selectors,
+    };
+    use simd_json::OwnedValue;
+
+    fn owned_value(json: &str) -> OwnedValue {
+        let mut bytes = json.as_bytes().to_vec();
+        simd_json::to_owned_value(&mut bytes).expect("valid JSON fixture")
+    }
 
     #[test]
     fn index_memory_megabytes_uses_fixed_point_rounding() {
@@ -1873,6 +1882,66 @@ mod tests {
             parse_pack_selectors(&["0x3".to_owned(), "0x0002".to_owned(), "0x3".to_owned()])
                 .unwrap(),
             vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn event_room_id_reads_the_real_matrix_wire_key() {
+        let event = owned_value(r#"{"room_id": "!abc:example.org", "type": "m.room.message"}"#);
+        assert_eq!(event_room_id(&event), Some("!abc:example.org"));
+    }
+
+    #[test]
+    fn event_room_id_ignores_collection_id_and_missing_field() {
+        // `collection_id` is mtxdb's own storage key, not a Matrix wire field —
+        // event_room_id must not be fooled by it (regression for the room->collection rename).
+        let event = owned_value(r#"{"collection_id": "deadbeef", "type": "m.room.message"}"#);
+        assert_eq!(event_room_id(&event), None);
+
+        assert_eq!(event_room_id(&owned_value("{}")), None);
+        assert_eq!(event_room_id(&owned_value("42")), None);
+        assert_eq!(
+            event_room_id(&owned_value(r#"{"room_id": 42}"#)),
+            None,
+            "non-string room_id must not be coerced"
+        );
+    }
+
+    #[test]
+    fn matrix_create_details_matches_the_real_event_type() {
+        let event = owned_value(
+            r#"{
+                "type": "m.room.create",
+                "event_id": "$create:example.org",
+                "sender": "@alice:example.org",
+                "content": {"creator": "@alice:example.org", "room_version": "10"}
+            }"#,
+        );
+        assert_eq!(
+            matrix_create_details(&event).as_deref(),
+            Some(
+                "$create:example.org by @alice:example.org; creator @alice:example.org; room version 10"
+            )
+        );
+    }
+
+    #[test]
+    fn matrix_create_details_ignores_non_create_events() {
+        // A stray "m.collection.create" (a leftover from a bad room->collection rename)
+        // must never match — only the real Matrix wire event type does.
+        let wrong_type = owned_value(r#"{"type": "m.collection.create"}"#);
+        assert_eq!(matrix_create_details(&wrong_type), None);
+
+        let message = owned_value(r#"{"type": "m.room.message"}"#);
+        assert_eq!(matrix_create_details(&message), None);
+    }
+
+    #[test]
+    fn matrix_create_details_tolerates_missing_optional_fields() {
+        let event = owned_value(r#"{"type": "m.room.create"}"#);
+        assert_eq!(
+            matrix_create_details(&event).as_deref(),
+            Some("<missing event_id> by <missing sender>")
         );
     }
 }
