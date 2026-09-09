@@ -267,17 +267,18 @@ fn pack_dir_size(dir: &std::path::Path) -> u64 {
 /// pages — anything not yet fsynced won't be dropped, so callers should
 /// only rely on this after a write phase that has synced (or, as here,
 /// after reopening the store fresh so nothing is dirty in this process).
-fn drop_caches_for_dir(dir: &std::path::Path) {
+fn drop_caches_for_dir(dir: &std::path::Path) -> bool {
     // Shells out to `vmtouch -e`, which wraps the same posix_fadvise(2)
     // eviction this needs, rather than adding a dependency (or an unsafe
     // FFI call of our own) just for one syscall. Silently does nothing if
     // vmtouch isn't installed — callers should treat this as best-effort.
-    let _ = std::process::Command::new("vmtouch")
+    std::process::Command::new("vmtouch")
         .arg("-e")
         .arg(dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .is_ok_and(|status| status.success())
 }
 // jscpd:ignore-end
 
@@ -446,6 +447,94 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
         cold_gets_per_sec,
         warm_gets_per_sec,
     }
+}
+
+/// Measure the cost hidden by a short-lived `mtxdb get` invocation.
+///
+/// The normal read benchmarks above deliberately keep one store open, which is
+/// the right model for Synapse but not for the CLI. A CLI process must rebuild
+/// every collection index before its first point lookup because those indexes
+/// are currently in-memory only. Keep this separate from the point-read
+/// benchmark so a future persisted lookup-index can make the open time fall
+/// without obscuring the cost of the final `get` itself.
+fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
+    assert!(collection_count > 0, "benchmark needs at least one collection");
+
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!(
+        "mtxdb_bench_oneshot_open_{total_nodes}_{collection_count}_{pid}"
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let payload = bytes::Bytes::from(vec![b'x'; 1024]);
+    let target_id = DagGenerator::node_id(0);
+    let mut target_collection = [0u8; 16];
+    target_collection[..8].copy_from_slice(&0_u64.to_le_bytes());
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for node in 0..total_nodes {
+        let mut collection = [0u8; 16];
+        collection[..8].copy_from_slice(
+            &u64::try_from(node % collection_count)
+                .expect("usize always fits in u64")
+                .to_le_bytes(),
+        );
+        store
+            .put(
+                &collection,
+                &DagGenerator::node_id(node),
+                &NodeData::new(payload.clone()),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let pack_bytes = pack_dir_size(&dir);
+    let measure = || {
+        let started = Instant::now();
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        let open_elapsed = started.elapsed();
+
+        let lookup_started = Instant::now();
+        let found = store
+            .get(&target_collection, &target_id)
+            .unwrap()
+            .is_some();
+        let lookup_elapsed = lookup_started.elapsed();
+        assert!(found, "target must survive reopening");
+        (open_elapsed, lookup_elapsed)
+    };
+
+    // The write phase leaves pages resident, providing the honest warm
+    // baseline. Eviction is explicitly reported below rather than calling the
+    // following measurement "cold" when vmtouch is unavailable.
+    let (warm_open, warm_lookup) = measure();
+    let evicted = drop_caches_for_dir(&dir);
+    let (after_evict_open, after_evict_lookup) = measure();
+
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  ONE-SHOT CLI OPEN + GET");
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  Nodes / collections:    {total_nodes} / {collection_count}");
+    eprintln!("  Pack bytes:              {:.2} MB", pack_bytes as f64 / 1e6);
+    eprintln!("  Warm open/index rebuild: {warm_open:.2?}");
+    eprintln!("  Warm point lookup:       {warm_lookup:.2?}");
+    eprintln!(
+        "  {} open/index rebuild: {after_evict_open:.2?}",
+        if evicted { "Evicted-page" } else { "No-eviction" }
+    );
+    eprintln!(
+        "  {} point lookup:       {after_evict_lookup:.2?}",
+        if evicted { "Evicted-page" } else { "No-eviction" }
+    );
+    if !evicted {
+        eprintln!("  Note: vmtouch unavailable or failed; no disk-cold claim is made.");
+    }
+    eprintln!();
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 // ── Synthetic HAMT state trie (root + L1, structural sharing) ───────
@@ -811,7 +900,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
                       f: &dyn Fn(&[NodeId]) -> usize|
      -> Row {
         store.collection_cache(&ROOM).clear();
-        drop_caches_for_dir(&dir);
+        let _ = drop_caches_for_dir(&dir);
         let io_before = IoStats::read_now();
         let t = Instant::now();
         let found = f(targets);
@@ -977,6 +1066,8 @@ fn main() {
     run_benchmark("medium", 10_000, 500);
     let large = run_benchmark("large", 100_000, 2_000);
     let pressure = run_benchmark("pressure", 100_000, 100);
+
+    run_oneshot_open_benchmark(100_000, 39);
 
     run_intent_benchmark(20_000);
 
