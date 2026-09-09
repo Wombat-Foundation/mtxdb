@@ -486,7 +486,7 @@ fn cmd_shards(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// sidecars; it never scans packfile contents or opens collection indexes.
 fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
     let mut shard_entries = glob_pack_files(dir)?;
-    shard_entries.sort_unstable_by_key(|&(id, _, _, _)| id);
+    shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
 
     if shard_entries.is_empty() {
         println!("no shards found in `{}` (store is empty)", dir.display());
@@ -506,9 +506,9 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
         collection_counts.as_ref(),
         total_collections,
     );
-    println!("* active shard");
+    println!("* active pack");
     println!(
-        "{} shard(s), {}",
+        "{} pack(s), {}",
         shard_entries.len(),
         stats_snapshot_summary(persisted_at)
     );
@@ -517,10 +517,7 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
 
 /// Discover only canonical v4 `pack_{pack_id:016x}.pack` files.
 ///
-/// The returned slot is CLI-internal: it mirrors the pool's deterministic
-/// pack-ID ordering solely to join the currently slot-keyed directory
-/// sidecar. It is never an operator-facing identity.
-fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64, u8)>> {
+fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
     let mut packs = Vec::new();
     let mut seen = HashSet::new();
     for entry in fs::read_dir(dir)? {
@@ -575,18 +572,7 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u16, u64, u64, u8)>> {
         ));
     }
     packs.sort_unstable_by_key(|(pack_id, _, _)| *pack_id);
-    packs
-        .into_iter()
-        .enumerate()
-        .map(|(slot, (pack_id, bytes, version))| {
-            Ok((
-                u16::try_from(slot).context("too many packs for the slot index")?,
-                pack_id,
-                bytes,
-                version,
-            ))
-        })
-        .collect()
+    Ok(packs)
 }
 
 /// Pack ID to `(write_count, bytes_written, sync_count)`, as decoded from
@@ -630,16 +616,15 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 
 /// Print the shard table header and rows.
 fn print_shard_table(
-    shard_entries: &[(u16, u64, u64, u8)],
+    shard_entries: &[(u64, u64, u8)],
     stats_map: &ShardStatsMap,
     node_counts: Option<&std::collections::HashMap<u64, u64>>,
     collection_counts: Option<&std::collections::HashMap<u64, u64>>,
     total_collections: Option<usize>,
 ) {
-    // `ShardPool::open_internal` restores the highest occupied slot as its
-    // append destination. Mirror that recovery rule here without opening a
-    // writer just to render an inspection table.
-    let active_slot = shard_entries.iter().map(|(slot, _, _, _)| *slot).max();
+    // `ShardPool::open_internal` restores the newest pack as its append
+    // destination. Mirror that recovery rule here without opening a writer.
+    let active_pack_id = shard_entries.iter().map(|(pack_id, _, _)| *pack_id).max();
 
     println!(
         "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
@@ -648,7 +633,7 @@ fn print_shard_table(
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
     let mut total_syncs = 0u64;
-    for &(slot_id, pack_id, file_bytes, version) in shard_entries {
+    for &(pack_id, file_bytes, version) in shard_entries {
         let (_, _, sc) = stats_map.get(&pack_id).copied().unwrap_or_default();
         let nodes = node_counts
             .and_then(|counts| counts.get(&pack_id))
@@ -660,7 +645,7 @@ fn print_shard_table(
             "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
             format!(
                 "0x{pack_id:016x}{}",
-                if active_slot == Some(slot_id) {
+                if active_pack_id == Some(pack_id) {
                     "*"
                 } else {
                     " "
@@ -1055,14 +1040,14 @@ fn print_matrix_room_details(details: MatrixRoomDetails, scanned_shards: Option<
 
 fn print_collection_shards(shards: &[u64]) {
     match shards {
-        [shard] => println!("  {:<12} {shard:#x}", "pack:"),
+        [shard] => println!("  {:<12} 0x{shard:016x}", "pack:"),
         [] => {}
         _ => println!(
             "  {:<12} {}",
             "packs:",
             shards
                 .iter()
-                .map(|id| format!("{id:#x}"))
+                .map(|id| format!("0x{id:016x}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1082,30 +1067,32 @@ fn update_matrix_room_details(details: &mut MatrixRoomDetails, data: &[u8]) {
     }
 }
 
+/// Parse an operator-facing pack identifier. Slots are deliberately not
+/// accepted here: they are recycled implementation details, while a pack ID
+/// is the permanent identity printed by `mtxdb shards`.
+fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
+    let Some(hex) = selector.strip_prefix("0x") else {
+        bail!("invalid pack ID `{selector}`; use the 0x-prefixed ID shown by `mtxdb shards`");
+    };
+    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid pack ID `{selector}`; expected 1–16 hexadecimal digits after 0x");
+    }
+    u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
+}
+
 fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
-    let shard = if let Some(rotation) = selector
-        .strip_prefix("0x")
-        .or_else(|| selector.strip_prefix("0X"))
-    {
-        let rotation =
-            u64::from_str_radix(rotation, 16).context("invalid hexadecimal shard rotation")?;
-        pool.all_shards()
-            .into_iter()
-            .find_map(|(_, shard)| (shard.pack_id == rotation).then_some(shard))
-            .with_context(|| format!("shard pack_id {selector} not found"))?
-    } else {
-        let slot = selector
-            .parse::<u16>()
-            .context("shard slot must be a decimal u16 or a 0x-prefixed rotation")?;
-        pool.get_shard(slot)
-            .with_context(|| format!("shard slot {slot} not found"))?
-    };
+    let shard = pool
+        .all_shards()
+        .into_iter()
+        .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
+        .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
     let path = &shard.path;
     let records = mtxdb_core::packfile::scan_packfile(path)?;
     println!(
-        "shard: {} bytes, {} writes",
+        "pack 0x{pack_id:016x}: {} bytes, {} records",
         std::fs::metadata(path)?.len(),
         records.len()
     );
@@ -1147,7 +1134,7 @@ fn cmd_import(
 
 /// Export every live record in one collection as a JSONL stream. A read-only frame
 /// scan avoids rebuilding every collection's in-memory index just to enumerate one
-/// collection. Scanning shards in rotation order lets a later physical copy replace
+/// collection. Scanning packs in pack-ID order lets a later physical copy replace
 /// an older one with the same node ID.
 fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(collection)?;
@@ -1427,7 +1414,7 @@ fn cmd_repack(
         (Some(collection), true, false) => {
             RepackTarget::Collection(parse_collection_id(collection)?)
         }
-        (None, false, false) => RepackTarget::Shards(parse_shard_selectors(shards)?),
+        (None, false, false) => RepackTarget::Packs(parse_pack_selectors(shards)?),
         (None, true, true) => RepackTarget::All,
         // Clap rejects the both-targets case through `conflicts_with`; this
         // branch gives the missing-target case a readable diagnostic.
@@ -1440,7 +1427,7 @@ fn cmd_repack(
 
     if !roots.is_empty() {
         match &target {
-            RepackTarget::Shards(_) | RepackTarget::All => {
+            RepackTarget::Packs(_) | RepackTarget::All => {
                 bail!(
                     "--root requires --collection — live roots are per-collection, not meaningful for --shard"
                 );
@@ -1463,17 +1450,17 @@ fn cmd_repack(
     cmd_repack_target(cli, &target, topo)
 }
 
-/// Compacts every shard transitively touched by collections referencing
-/// `shard_id` — not just `shard_id` itself. A collection's live data can span
-/// more than one shard (`PackfileStorage::repack_closure` finds the full
+/// Compacts every pack transitively touched by collections referencing a
+/// selected pack — not just that pack itself. A collection's live data can span
+/// more than one pack (`PackfileStorage::repack_closure` finds the full
 /// closure), and repacking a collection always rewrites its *entire* live set
-/// regardless of which shard triggered the repack, so a shard-scoped
+/// regardless of which pack triggered the repack, so a pack-scoped
 /// compaction has to account for everything that repack will actually
 /// touch, not just the one shard named on the command line.
 ///
 /// Runs a non-mutating preflight first (`PackfileStorage::plan_collection_repack`
-/// per collection in the closure): prints how many collections and shards are
-/// involved and the expected shard count/slack after compaction, then
+/// per collection in the closure): prints how many collections and packs are
+/// involved and the expected pack count/slack after compaction, then
 /// prompts for confirmation before performing any real repack. `--root`
 /// doesn't apply here since live roots are inherently per-collection — the
 /// same `--topo`/no-`--topo` edge-extraction choice applies uniformly
@@ -1490,43 +1477,23 @@ fn cmd_repack(
 /// what was shown.
 struct RepackPreview {
     collections: Vec<[u8; 16]>,
-    shards: Vec<u16>,
+    pack_ids: Vec<u64>,
 }
 
 enum RepackTarget {
     Collection([u8; 16]),
-    Shards(Vec<u16>),
+    Packs(Vec<u64>),
     All,
 }
 
-/// Parse decimal shard slots and inclusive `START-END` ranges, returning an
-/// ordered deduplicated set so overlapping selections are repacked once.
-fn parse_shard_selectors(selectors: &[String]) -> anyhow::Result<Vec<u16>> {
-    let mut slots = std::collections::BTreeSet::new();
+/// Parse one or more permanent pack IDs. Numeric slots and ranges are not
+/// accepted because slots are recycled implementation details.
+fn parse_pack_selectors(selectors: &[String]) -> anyhow::Result<Vec<u64>> {
+    let mut pack_ids = std::collections::BTreeSet::new();
     for selector in selectors {
-        let (start, end) = if let Some((start, end)) = selector.split_once('-') {
-            if start.is_empty() || end.is_empty() || end.contains('-') {
-                bail!("invalid shard range `{selector}`; use decimal START-END");
-            }
-            let start = start
-                .parse::<u16>()
-                .with_context(|| format!("invalid shard range start `{start}`"))?;
-            let end = end
-                .parse::<u16>()
-                .with_context(|| format!("invalid shard range end `{end}`"))?;
-            if start > end {
-                bail!("invalid shard range `{selector}`; start exceeds end");
-            }
-            (start, end)
-        } else {
-            let slot = selector.parse::<u16>().with_context(|| {
-                format!("invalid shard slot `{selector}`; use decimal slots or START-END ranges")
-            })?;
-            (slot, slot)
-        };
-        slots.extend(start..=end);
+        pack_ids.insert(parse_pack_id_selector(selector)?);
     }
-    Ok(slots.into_iter().collect())
+    Ok(pack_ids.into_iter().collect())
 }
 
 fn resolve_repack_target(
@@ -1543,26 +1510,44 @@ fn resolve_repack_target(
                 store.collection_referenced_shards(collection_id),
             ))
         }
-        RepackTarget::Shards(shard_ids) => resolve_repack_shards(store, shard_ids),
+        RepackTarget::Packs(pack_ids) => resolve_repack_packs(store, pack_ids),
         RepackTarget::All => {
-            let shard_ids = store
+            let slots = store
                 .shard_summaries()
                 .into_iter()
                 .map(|summary| summary.slot)
                 .collect::<Vec<_>>();
-            resolve_repack_shards(store, &shard_ids)
+            resolve_repack_slots(store, &slots)
         }
     }
 }
 
-fn resolve_repack_shards(
+fn resolve_repack_packs(
     store: &PackfileStorage,
-    shard_ids: &[u16],
+    pack_ids: &[u64],
+) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
+    let slots = pack_ids
+        .iter()
+        .map(|&pack_id| {
+            store
+                .shard_summaries()
+                .into_iter()
+                .find(|summary| summary.pack_id == pack_id)
+                .map(|summary| summary.slot)
+                .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    resolve_repack_slots(store, &slots)
+}
+
+fn resolve_repack_slots(
+    store: &PackfileStorage,
+    slots: &[u16],
 ) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
     let mut collections = std::collections::BTreeSet::new();
     let mut shards = std::collections::BTreeSet::new();
-    for shard_id in shard_ids {
-        let (closure_collections, closure_shards) = store.repack_closure(*shard_id)?;
+    for slot in slots {
+        let (closure_collections, closure_shards) = store.repack_closure(*slot)?;
         collections.extend(closure_collections);
         shards.extend(closure_shards);
     }
@@ -1577,21 +1562,21 @@ fn repack_preview(
     target: &RepackTarget,
     topo: bool,
 ) -> anyhow::Result<Option<RepackPreview>> {
-    println!("preflight: scanning shards and rebuilding live indexes...");
+    println!("preflight: scanning packs and rebuilding live indexes...");
     let preview_store = open_store_read_only(cli)?;
-    println!("preflight: resolving shard closure...");
+    println!("preflight: resolving pack closure...");
     let (collections, shards) = resolve_repack_target(&preview_store, target)?;
     if collections.is_empty() {
         match target {
-            RepackTarget::Shards(shard_ids) => {
-                let slots = shard_ids
+            RepackTarget::Packs(pack_ids) => {
+                let pack_ids = pack_ids
                     .iter()
-                    .map(u16::to_string)
+                    .map(|id| format!("0x{id:016x}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!("no collections reference selected shards: {slots}");
+                println!("no collections reference selected packs: {pack_ids}");
             }
-            RepackTarget::All => println!("no collections found in active shards"),
+            RepackTarget::All => println!("no collections found in active packs"),
             RepackTarget::Collection(_) => {}
         }
         return Ok(None);
@@ -1601,7 +1586,7 @@ fn repack_preview(
     let mut total_dropped = 0usize;
     let mut total_dropped_bytes = 0u64;
     println!(
-        "preflight: scanning {} shard{} for {} collection{}...",
+        "preflight: scanning {} pack{} for {} collection{}...",
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
         collections.len(),
@@ -1618,37 +1603,35 @@ fn repack_preview(
         total_dropped_bytes = total_dropped_bytes.saturating_add(plan.dropped_bytes);
     }
 
-    let shard_slots = shards
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let shard_sizes: std::collections::HashMap<u16, u64> = preview_store
+    let pack_summaries: std::collections::HashMap<u16, (u64, u64)> = preview_store
         .shard_summaries()
         .into_iter()
-        .map(|summary| (summary.slot, summary.file_bytes))
+        .map(|summary| (summary.slot, (summary.pack_id, summary.file_bytes)))
         .collect();
-    let total_input_bytes = shards.iter().fold(0u64, |total, shard_id| {
-        total.saturating_add(shard_sizes.get(shard_id).copied().unwrap_or(0))
+    let pack_ids = shards
+        .iter()
+        .filter_map(|slot| pack_summaries.get(slot).map(|(pack_id, _)| *pack_id))
+        .collect::<Vec<_>>();
+    let total_input_bytes = shards.iter().fold(0u64, |total, slot| {
+        total.saturating_add(pack_summaries.get(slot).map_or(0, |(_, bytes)| *bytes))
     });
+    let pack_labels = pack_ids
+        .iter()
+        .map(|id| format!("0x{id:016x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     println!(
-        "this will repack {} collection{} across {} shard{} (slots: {shard_slots})",
+        "this will repack {} collection{} across {} pack{} ({pack_labels})",
         collections.len(),
         if collections.len() == 1 { "" } else { "s" },
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
     );
-    let widest_slot = shards
-        .iter()
-        .map(u16::to_string)
-        .map(|slot| slot.len())
-        .max()
-        .unwrap_or(1);
-    let label_width = "slot ".len().saturating_add(widest_slot);
-    for shard_id in &shards {
-        let bytes = shard_sizes.get(shard_id).copied().unwrap_or(0);
-        println!("  slot {shard_id:>widest_slot$}: {:>9}", fmt_bytes(bytes));
+    let label_width = "0x0000000000000000".len();
+    for slot in &shards {
+        let (pack_id, bytes) = pack_summaries.get(slot).copied().unwrap_or((0, 0));
+        println!("  0x{pack_id:016x}: {:>9}", fmt_bytes(bytes));
     }
     println!(
         "  {:>label_width$}: {:>9}",
@@ -1670,7 +1653,7 @@ fn repack_preview(
     // reason to keep it open through an indefinite human pause.
     Ok(Some(RepackPreview {
         collections,
-        shards,
+        pack_ids,
     }))
 }
 
@@ -1679,17 +1662,29 @@ fn repack_collections(
     collections: &[[u8; 16]],
     topo: bool,
 ) -> anyhow::Result<(usize, usize)> {
+    let pack_label = |slot| {
+        store
+            .shard_summaries()
+            .into_iter()
+            .find(|summary| summary.slot == slot)
+            .map_or_else(
+                || "retired pack".to_owned(),
+                |summary| format!("0x{:016x}", summary.pack_id),
+            )
+    };
     let results = if topo {
         store.repack_collections_reachable_with_progress(
             collections,
             extract_matrix_edges,
             |collection_id, from, to, nodes, complete| {
                 if complete {
-                    println!("  copy complete: {nodes} nodes; output slot {to} active");
+                    println!("  copy complete: {nodes} nodes; output {} active", pack_label(to));
                 } else {
-                    let collection_id = collection_id.expect("rotation progress has a collection");
+                    let collection_id = collection_id.expect("pack rotation progress has a collection");
                     println!(
-                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying collection {}",
+                        "  copy progress: {nodes} nodes; output rotated {} → {} while copying collection {}",
+                        pack_label(from),
+                        pack_label(to),
                         hex_encode(&collection_id),
                     );
                 }
@@ -1701,11 +1696,13 @@ fn repack_collections(
             |_hash, _data| Vec::new(),
             |collection_id, from, to, nodes, complete| {
                 if complete {
-                    println!("  copy complete: {nodes} nodes; output slot {to} active");
+                    println!("  copy complete: {nodes} nodes; output {} active", pack_label(to));
                 } else {
-                    let collection_id = collection_id.expect("rotation progress has a collection");
+                    let collection_id = collection_id.expect("pack rotation progress has a collection");
                     println!(
-                        "  copy progress: {nodes} nodes; output rotated {from} → {to} while copying collection {}",
+                        "  copy progress: {nodes} nodes; output rotated {} → {} while copying collection {}",
+                        pack_label(from),
+                        pack_label(to),
                         hex_encode(&collection_id),
                     );
                 }
@@ -1745,10 +1742,16 @@ fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Re
         return Ok(());
     }
     let grew = collections.iter().any(|r| !preview.collections.contains(r))
-        || touched_shards.iter().any(|s| !preview.shards.contains(s));
+        || touched_shards.iter().any(|slot| {
+            store
+                .shard_summaries()
+                .into_iter()
+                .find(|summary| summary.slot == *slot)
+                .map_or(true, |summary| !preview.pack_ids.contains(&summary.pack_id))
+        });
     if grew {
         println!(
-            "note: the closure grew since the preview (now {} collections / {} shards) — repacking the current, authoritative closure",
+            "note: the closure grew since the preview (now {} collections / {} packs) — repacking the current, authoritative closure",
             collections.len(),
             touched_shards.len()
         );
@@ -1757,7 +1760,7 @@ fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Re
     repack_collections(&store, &collections, topo)?;
     // `cmd_shards` deliberately reads the persisted shard→collection directory
     // instead of reopening and scanning every packfile. Refresh it before
-    // the immediate post-repack table so freshly-created rotations have
+    // the immediate post-repack table so freshly-created packs have
     // real node counts rather than `?`.
     store.persist_shard_collections()?;
     drop(store);
@@ -1841,7 +1844,7 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_disk_megabytes, fmt_megabytes};
+    use super::{fmt_disk_megabytes, fmt_megabytes, parse_pack_id_selector, parse_pack_selectors};
 
     #[test]
     fn index_memory_megabytes_uses_fixed_point_rounding() {
@@ -1853,5 +1856,23 @@ mod tests {
     fn disk_megabytes_uses_three_fractional_digits() {
         assert_eq!(fmt_disk_megabytes(42_280), "0.042 MB");
         assert_eq!(fmt_disk_megabytes(999_999), "1.000 MB");
+    }
+
+    #[test]
+    fn pack_selectors_accept_only_pack_ids_and_deduplicate() {
+        assert_eq!(parse_pack_id_selector("0x3").unwrap(), 3);
+        assert!(
+            parse_pack_id_selector("3").is_err(),
+            "decimal slots are not pack IDs"
+        );
+        assert!(
+            parse_pack_id_selector("0x3-5").is_err(),
+            "ranges are not pack IDs"
+        );
+        assert_eq!(
+            parse_pack_selectors(&["0x3".to_owned(), "0x0002".to_owned(), "0x3".to_owned()])
+                .unwrap(),
+            vec![2, 3]
+        );
     }
 }

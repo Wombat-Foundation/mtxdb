@@ -458,7 +458,10 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
 /// benchmark so a future persisted lookup-index can make the open time fall
 /// without obscuring the cost of the final `get` itself.
 fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
-    assert!(collection_count > 0, "benchmark needs at least one collection");
+    assert!(
+        collection_count > 0,
+        "benchmark needs at least one collection"
+    );
 
     let pid = std::process::id();
     let dir = std::env::temp_dir().join(format!(
@@ -498,10 +501,7 @@ fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
         let open_elapsed = started.elapsed();
 
         let lookup_started = Instant::now();
-        let found = store
-            .get(&target_collection, &target_id)
-            .unwrap()
-            .is_some();
+        let found = store.get(&target_collection, &target_id).unwrap().is_some();
         let lookup_elapsed = lookup_started.elapsed();
         assert!(found, "target must survive reopening");
         (open_elapsed, lookup_elapsed)
@@ -518,16 +518,27 @@ fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
     eprintln!("  ONE-SHOT CLI OPEN + GET");
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  Nodes / collections:    {total_nodes} / {collection_count}");
-    eprintln!("  Pack bytes:              {:.2} MB", pack_bytes as f64 / 1e6);
+    eprintln!(
+        "  Pack bytes:              {:.2} MB",
+        pack_bytes as f64 / 1e6
+    );
     eprintln!("  Warm open/index rebuild: {warm_open:.2?}");
     eprintln!("  Warm point lookup:       {warm_lookup:.2?}");
     eprintln!(
         "  {} open/index rebuild: {after_evict_open:.2?}",
-        if evicted { "Evicted-page" } else { "No-eviction" }
+        if evicted {
+            "Evicted-page"
+        } else {
+            "No-eviction"
+        }
     );
     eprintln!(
         "  {} point lookup:       {after_evict_lookup:.2?}",
-        if evicted { "Evicted-page" } else { "No-eviction" }
+        if evicted {
+            "Evicted-page"
+        } else {
+            "No-eviction"
+        }
     );
     if !evicted {
         eprintln!("  Note: vmtouch unavailable or failed; no disk-cold claim is made.");

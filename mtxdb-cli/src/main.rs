@@ -123,13 +123,13 @@ fn global_args(cmd: Command) -> Command {
 
 fn sub_shards() -> Command {
     Command::new("shards")
-        .about("List open shard slots with size, rotation, and IO/sync stats")
+        .about("List open packs with size and IO/sync stats")
         .arg(
             Arg::new("all")
                 .short('a')
                 .long("all")
                 .action(ArgAction::SetTrue)
-                .help("List shards in every independent pool"),
+                .help("List packs in every independent pool"),
         )
 }
 
@@ -169,8 +169,8 @@ fn sub_scan() -> Command {
         .arg(
             Arg::new("shard")
                 .required(true)
-                .value_name("SLOT | EPOCH")
-                .help("Decimal shard slot or 0x-prefixed shard rotation from `shards`"),
+                .value_name("PACK_ID")
+                .help("Pack ID from `shards`, for example 0x0000000000000003"),
         )
 }
 
@@ -225,7 +225,7 @@ fn sub_export() -> Command {
 
 fn sub_repack() -> Command {
     Command::new("repack")
-        .about("Trigger manual repack over closure of collection or shard closure")
+        .about("Trigger manual repack over a collection or pack closure")
         .arg(
             Arg::new("collection")
                 .short('r')
@@ -238,17 +238,15 @@ fn sub_repack() -> Command {
                 .long("shard")
                 .conflicts_with("collection")
                 .num_args(1..)
-                .value_name("SLOT | START-END")
-                .help(
-                    "Repack collections referencing shard slots (for example: -s 0 1 2 or -s 0-3)",
-                ),
+                .value_name("PACK_ID")
+                .help("Repack collections referencing packs (repeat -s for multiple pack IDs)"),
         )
         .arg(
             Arg::new("all")
                 .long("all")
                 .conflicts_with_all(["collection", "shard"])
                 .action(ArgAction::SetTrue)
-                .help("Repack every collection in every active shard"),
+                .help("Repack every collection in every active pack"),
         )
         .arg(Arg::new("root").short('o').long("root").num_args(1..))
         .arg(
