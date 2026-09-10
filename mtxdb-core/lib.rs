@@ -30,6 +30,8 @@ pub mod packfile;
 pub mod shard;
 /// Core node/storage types and the top-level `StorageEngine`.
 pub mod storage;
+/// Executable policy primitives for application collection templates.
+pub mod template;
 
 pub use cache::NodeCache;
 pub use index::LossyIndex;
@@ -37,3 +39,7 @@ pub use layout::{DatabaseLayout, ShardType};
 pub use packfile::{storage::PackfileStorage, Record};
 pub use shard::ShardPool;
 pub use storage::{NodeData, NodeId, StorageEngine};
+pub use template::{
+    EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding, RoomIdPolicy,
+    RoomMetadata, StateResolutionPolicy, ValidationProfile,
+};
