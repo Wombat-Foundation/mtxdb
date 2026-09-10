@@ -500,7 +500,7 @@ impl ShardPool {
             // must have the right magic, version, and CRC. If it
             // doesn't, the pool is corrupt — fail open rather than
             // silently deleting data.
-            let file = packfile::open_packfile(&path, false, pack_id).map_err(|error| {
+            let file = packfile::open_packfile(&path, writable, pack_id).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("corrupt pack {}; failed to open: {error}", path.display()),
@@ -1960,6 +1960,13 @@ mod tests {
         let shard = pool.get_shard(slot).unwrap();
         let read = ShardPool::read_at(&shard, offset).unwrap();
         assert_eq!(read.data.as_ref(), b"survives reopen");
+
+        // Recovered shards must retain append access. Opening an existing
+        // pack read-only here makes the next real import fail with EBADF.
+        let appended = test_record(0x01, 0xBB, b"appends after reopen");
+        let (_, appended_offset) = pool.put_record(&appended).unwrap();
+        let read = ShardPool::read_at(&shard, appended_offset).unwrap();
+        assert_eq!(read.data.as_ref(), b"appends after reopen");
     }
 
     /// End-to-end: `ShardPool::open` skips a shard file whose

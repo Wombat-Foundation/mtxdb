@@ -3,6 +3,9 @@ target/
 .coverage/
 lcov.info
 
+# test / in-repo db
+/pools
+
 # other stuff
 .env
 docs/*.md
