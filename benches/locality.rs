@@ -123,14 +123,27 @@ impl ZipfianCollectionSampler {
 
 // ── OS-level I/O counters ───────────────────────────────────────────
 
-/// Point-in-time snapshot of this process's page-fault and read-syscall
-/// counters, used to approximate "random seeks" against the mmap-backed
-/// packfiles. Reads here go through `mmap`, not `pread`/`read`, so a
-/// major page fault — the kernel pulling a page in from the backing file
-/// because it wasn't already resident — is the closest analog this
-/// engine has to a physical random seek; `read_syscalls` is reported
-/// alongside it mostly to show it stays flat (proving the mmap path
-/// really is the one doing the work).
+/// Point-in-time snapshot of this process's page-fault, read-syscall, and
+/// block-layer I/O counters, used to approximate "random seeks" against
+/// the mmap-backed packfiles. Reads here go through `mmap`, not
+/// `pread`/`read`, so a major page fault — the kernel pulling a page in
+/// from the backing file because it wasn't already resident — is one
+/// analog this engine has to a physical random seek; `read_syscalls` is
+/// reported alongside it mostly to show it stays flat (proving the mmap
+/// path really is the one doing the work).
+///
+/// `major_faults` alone is noisier than it looks: once a sequential
+/// access pattern triggers one major fault, the kernel's readahead often
+/// prefetches the next several pages in the background, so *those*
+/// pages get classified as minor faults on touch even though the bytes
+/// still came off disk within the same access — readahead reclassifies
+/// real disk I/O from major to minor, it doesn't eliminate it. That
+/// makes `major_faults` swing between runs depending on exact readahead
+/// timing. `disk_read_bytes` (`/proc/self/io`'s `read_bytes`) doesn't
+/// have that ambiguity: the block layer only increments it when bytes
+/// are actually fetched from the storage device, regardless of which
+/// fault (or none, for a readahead-only page) pulled them in — so it's
+/// the more trustworthy "did we really hit disk" number of the two.
 ///
 /// Linux-only (`/proc/self/stat`, `/proc/self/io`); `capture` returns
 /// `None` everywhere else.
@@ -139,15 +152,35 @@ struct IoSnapshot {
     major_faults: u64,
     minor_faults: u64,
     read_syscalls: u64,
+    disk_read_bytes: u64,
 }
 
 impl IoSnapshot {
     #[cfg(target_os = "linux")]
     fn capture() -> Option<Self> {
+        // `fs::read_to_string` grows its buffer in doubling steps (32,
+        // 32, 64, 128, 256...) plus a final zero-byte EOF read — that's
+        // ~6 `read()` syscalls to slurp a ~200-byte procfs file, which
+        // swamps the very syscall count this function exists to measure
+        // (confirmed with `strace`: a single `capture()` call was
+        // responsible for essentially the entire "10-11 read syscalls"
+        // reported around a query loop that itself makes none — all
+        // record reads go through `mmap`, not `read`/`pread`). A single
+        // fixed 1 KiB buffer comfortably fits both files' content in one
+        // `read()` call each, so `capture()`'s own footprint no longer
+        // dominates whatever it's trying to observe.
+        fn read_proc_file(path: &str) -> Option<String> {
+            use std::io::Read as _;
+            let mut file = fs::File::open(path).ok()?;
+            let mut buf = [0u8; 1024];
+            let n = file.read(&mut buf).ok()?;
+            Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+        }
+
         // /proc/self/stat's `comm` field (2nd, parenthesized) can itself
         // contain spaces or parens, so locate fields by splitting after
         // the *last* ')' rather than by raw whitespace index.
-        let stat = fs::read_to_string("/proc/self/stat").ok()?;
+        let stat = read_proc_file("/proc/self/stat")?;
         let after_comm = stat.rsplit_once(')')?.1;
         let fields: Vec<&str> = after_comm.split_whitespace().collect();
         // After the comm field, `state` is field 3 (index 0), so
@@ -155,22 +188,28 @@ impl IoSnapshot {
         let minor_faults = fields.get(7)?.parse().ok()?;
         let major_faults = fields.get(9)?.parse().ok()?;
 
-        // Best-effort: some kernels/containers lack task I/O accounting,
-        // in which case just report 0 read syscalls rather than losing
-        // the fault counts above too.
-        let read_syscalls = fs::read_to_string("/proc/self/io")
-            .ok()
-            .and_then(|io| {
-                io.lines()
-                    .find_map(|line| line.strip_prefix("syscr:"))
-                    .and_then(|v| v.trim().parse().ok())
-            })
-            .unwrap_or(0);
+        // Best-effort: some kernels/containers lack task I/O accounting
+        // (`/proc/self/io` absent or fields missing), in which case just
+        // report 0 for both rather than losing the fault counts above too.
+        let io_text = read_proc_file("/proc/self/io");
+        let find_field = |prefix: &str| -> u64 {
+            io_text
+                .as_deref()
+                .and_then(|io| {
+                    io.lines()
+                        .find_map(|line| line.strip_prefix(prefix))
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or(0)
+        };
+        let read_syscalls = find_field("syscr:");
+        let disk_read_bytes = find_field("read_bytes:");
 
         Some(Self {
             major_faults,
             minor_faults,
             read_syscalls,
+            disk_read_bytes,
         })
     }
 
@@ -185,39 +224,145 @@ impl IoSnapshot {
             major_faults: self.major_faults.saturating_sub(earlier.major_faults),
             minor_faults: self.minor_faults.saturating_sub(earlier.minor_faults),
             read_syscalls: self.read_syscalls.saturating_sub(earlier.read_syscalls),
+            disk_read_bytes: self.disk_read_bytes.saturating_sub(earlier.disk_read_bytes),
         }
     }
 }
 
+/// Column width for `row` labels. Chosen so a `row`'s value column
+/// lines up with a `subrow`'s: 2-space indent + `ROW_WIDTH` equals
+/// 4-space indent + `SUBROW_WIDTH`. Still comfortably fits the longest
+/// row label in use, "Post-repack packs:" at 18 chars.
+const ROW_WIDTH: usize = 19;
+/// Column width for `subrow` labels, sized to the longest one in use
+/// ("packs referenced:", 17 chars).
+const SUBROW_WIDTH: usize = 17;
+
+/// Prints a top-level `label: value` row, label left-padded to a fixed
+/// column so every row's value lines up regardless of label length.
+fn row(label: &str, value: impl std::fmt::Display) {
+    println!("  {label:<ROW_WIDTH$} {value}");
+}
+
+/// Prints an indented `label: value` row nested under the most recent
+/// `row(...)` — used for the handful of sub-measurements (disk bytes,
+/// faults, syscalls) that belong to one timed window (Open or Query)
+/// without repeating that window's name on every line.
+fn subrow(label: &str, value: impl std::fmt::Display) {
+    println!("    {label:<SUBROW_WIDTH$} {value}");
+}
+
+/// Prints one I/O snapshot delta as indented sub-rows under whichever
+/// timed window (Open or Query) the caller just printed a `row` for.
 fn print_io_delta(delta: Option<IoSnapshot>) {
     match delta {
         Some(d) => {
-            println!("  Major page faults:    {} (~random seeks)", d.major_faults);
-            println!("  Minor page faults:    {}", d.minor_faults);
-            println!("  Read syscalls:        {}", d.read_syscalls);
+            subrow("disk read:", format_bytes(d.disk_read_bytes));
+            subrow("major faults:", d.major_faults);
+            subrow("minor faults:", d.minor_faults);
+            subrow("read syscalls:", d.read_syscalls);
         }
-        None => println!("  Page fault/syscall counters unavailable (Linux only)"),
+        None => subrow("I/O counters:", "unavailable (Linux only)"),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
 // ── Cache eviction ─────────────────────────────────────────────────
 
-fn drop_caches_for_dir(dir: &Path) -> bool {
-    std::process::Command::new("vmtouch")
+/// Outcome of attempting to evict `dir`'s page-cache contents via
+/// `vmtouch -e`, distinguished so a caller can tell "vmtouch isn't
+/// installed" apart from "vmtouch ran but failed" — both leave a "cold"
+/// phase silently measuring a warm cache instead, which is worth a loud
+/// warning rather than a quiet fallback.
+enum Eviction {
+    Evicted,
+    NotFound,
+    Failed(String),
+}
+
+impl Eviction {
+    fn cache_state_label(&self) -> String {
+        match self {
+            Self::Evicted => "Cold (Evicted)".to_string(),
+            Self::NotFound => "Warm (vmtouch NOT FOUND on PATH)".to_string(),
+            Self::Failed(msg) => format!("Warm (vmtouch eviction FAILED: {msg})"),
+        }
+    }
+
+    fn warn_if_not_evicted(&self) {
+        match self {
+            Self::Evicted => {}
+            Self::NotFound => eprintln!(
+                "  WARNING: `vmtouch` not found on PATH — this phase is measuring a WARM \
+                 cache, not a cold one. Install vmtouch (e.g. `sudo apt-get install vmtouch`) \
+                 for real cold-cache numbers."
+            ),
+            Self::Failed(msg) => eprintln!(
+                "  WARNING: `vmtouch -e` failed ({msg}) — this phase is measuring a WARM \
+                 cache, not a cold one."
+            ),
+        }
+    }
+}
+
+fn drop_caches_for_dir(dir: &Path) -> Eviction {
+    match std::process::Command::new("vmtouch")
         .arg("-e")
         .arg(dir)
+        .output()
+    {
+        Ok(output) if output.status.success() => Eviction::Evicted,
+        Ok(output) => Eviction::Failed(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Eviction::NotFound,
+        Err(e) => Eviction::Failed(e.to_string()),
+    }
+}
+
+/// Whether `vmtouch` is callable on `$PATH` at all. Checked once up front
+/// so a missing install is a loud banner at startup, not something a
+/// reader has to notice buried in a "Cache state: Warm" line four phases in.
+fn vmtouch_on_path() -> bool {
+    std::process::Command::new("vmtouch")
+        .arg("-h")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok()
 }
 
 // ── Benchmark ──────────────────────────────────────────────────────
 
+fn shard_bytes_label(n: Option<u64>) -> String {
+    n.map_or_else(|| "default (~256 MB)".to_string(), |n| n.to_string())
+}
+
+/// Runs the ingest → pre-repack query → repack → post-repack query cycle.
+///
+/// `repack_max_shard_bytes` is the shard cap the *repack* step reopens the
+/// store with — normally the same as `max_shard_bytes` (the cap data was
+/// ingested under), but a caller can pass a larger cap (e.g. `None` for
+/// the default ~256 MB) to make the repack actually consolidate a pile of
+/// tiny shards into a handful of big ones, instead of just rewriting each
+/// collection into equally-tiny replacement shards.
 pub fn run_stage1_locality_benchmark(
     total_records: usize,
     collection_count: usize,
     max_shard_bytes: Option<u64>,
+    repack_max_shard_bytes: Option<u64>,
 ) {
     let temp_dir =
         std::env::temp_dir().join(format!("mtxdb_stage1_locality_{}", std::process::id()));
@@ -230,7 +375,7 @@ pub fn run_stage1_locality_benchmark(
 
     println!(
         "\n[1/4] Ingesting opaque Zipfian workload (max_shard_bytes={})...",
-        max_shard_bytes.map_or_else(|| "default (~256 MB)".to_string(), |n| n.to_string())
+        shard_bytes_label(max_shard_bytes)
     );
     let store = match max_shard_bytes {
         Some(max_shard_bytes) => {
@@ -269,7 +414,7 @@ pub fn run_stage1_locality_benchmark(
     store.sync_all().unwrap();
 
     let initial_pack_count = store.shard_summaries().len();
-    println!("  Rotated Packs:        {initial_pack_count}");
+    row("Rotated packs:", initial_pack_count);
 
     // --- Phase B: Pre-Repack Query Benchmark (Unclustered / Cold) ---
     println!("\n[2/4] Measuring PRE-REPACK query latency...");
@@ -282,11 +427,26 @@ pub fn run_stage1_locality_benchmark(
     drop(store);
     let evicted_pre = drop_caches_for_dir(&temp_dir);
 
-    let store_pre = PackfileStorage::open_read_only(temp_dir.clone()).unwrap();
-    let pre_io_before = IoSnapshot::capture();
-    let pre_start = Instant::now();
-    let mut pre_found = 0;
+    // Two separate windows, not one combined one: `open_read_only` does a
+    // full, eager scan of *every* pack file to rebuild *every*
+    // collection's index (see `PackfileStorage::open_with_options`) — a
+    // whole-store cost that scales with total store size, not with the
+    // elephant collection's own layout, so repacking one collection
+    // should never be expected to move it much. Bundling that cost
+    // together with the elephant-only point-lookup cost below would
+    // dilute the actual locality signal this benchmark exists to show
+    // inside a number dominated by something repack doesn't touch.
+    let t0_io = IoSnapshot::capture();
+    let t0 = Instant::now();
 
+    let store_pre = PackfileStorage::open_read_only(temp_dir.clone()).unwrap();
+
+    let t1_io = IoSnapshot::capture();
+    let t1 = Instant::now();
+    let pre_open_time = t1.duration_since(t0);
+    let pre_open_io_delta = t0_io.zip(t1_io).map(|(b, a)| a.delta(b));
+
+    let mut pre_found = 0;
     for nid in &sample_keys {
         if store_pre
             .get(&sampler.elephant_id(), nid)
@@ -296,33 +456,44 @@ pub fn run_stage1_locality_benchmark(
             pre_found += 1;
         }
     }
-    let pre_latency = pre_start.elapsed();
-    let pre_io_delta = pre_io_before
-        .zip(IoSnapshot::capture())
-        .map(|(b, a)| a.delta(b));
+
+    let t2_io = IoSnapshot::capture();
+    let t2 = Instant::now();
+    let pre_latency = t2.duration_since(t1);
+    let pre_io_delta = t1_io.zip(t2_io).map(|(b, a)| a.delta(b));
 
     let pre_packs_touched = store_pre
         .collection_referenced_pack_ids(&sampler.elephant_id())
         .len();
 
-    println!(
-        "  Cache state:          {}",
-        if evicted_pre {
-            "Cold (Evicted)"
-        } else {
-            "Warm (No vmtouch)"
-        }
+    row("Cache state:", evicted_pre.cache_state_label());
+    evicted_pre.warn_if_not_evicted();
+    row(
+        "Open time:",
+        format!("{pre_open_time:.2?} (whole store, expect ~flat)"),
     );
-    println!("  Pre-Repack Latency:   {pre_latency:.2?}");
-    println!("  Pack IDs Referenced:  {pre_packs_touched}");
+    print_io_delta(pre_open_io_delta);
+    row(
+        "Query latency:",
+        format!("{pre_latency:.2?} (elephant only)"),
+    );
+    subrow("packs referenced:", pre_packs_touched);
     print_io_delta(pre_io_delta);
 
     // --- Phase C: Batch Repack ---
-    println!("\n[3/4] Executing Batch Repack...");
+    if repack_max_shard_bytes == max_shard_bytes {
+        println!("\n[3/4] Executing Batch Repack...");
+    } else {
+        println!(
+            "\n[3/4] Executing Batch Repack (compacting to max_shard_bytes={})...",
+            shard_bytes_label(repack_max_shard_bytes)
+        );
+    }
     drop(store_pre);
-    let store_repack = match max_shard_bytes {
-        Some(max_shard_bytes) => {
-            PackfileStorage::open_with_max_shard_bytes(temp_dir.clone(), max_shard_bytes).unwrap()
+    let store_repack = match repack_max_shard_bytes {
+        Some(repack_max_shard_bytes) => {
+            PackfileStorage::open_with_max_shard_bytes(temp_dir.clone(), repack_max_shard_bytes)
+                .unwrap()
         }
         None => PackfileStorage::open(temp_dir.clone()).unwrap(),
     };
@@ -335,19 +506,29 @@ pub fn run_stage1_locality_benchmark(
     let repack_time = repack_start.elapsed();
 
     let post_pack_count = store_repack.shard_summaries().len();
-    println!("  Repack Duration:      {repack_time:.2?}");
-    println!("  Post-Repack Packs:    {post_pack_count} (was {initial_pack_count})");
+    row("Repack duration:", format!("{repack_time:.2?}"));
+    row(
+        "Post-repack packs:",
+        format!("{post_pack_count} (was {initial_pack_count})"),
+    );
 
     // --- Phase D: Post-Repack Query Benchmark (Clustered / Cold) ---
     println!("\n[4/4] Measuring POST-REPACK query latency...");
     drop(store_repack);
     let evicted_post = drop_caches_for_dir(&temp_dir);
 
-    let store_post = PackfileStorage::open_read_only(temp_dir.clone()).unwrap();
-    let post_io_before = IoSnapshot::capture();
-    let post_start = Instant::now();
-    let mut post_found = 0;
+    // Same open/query split and reasoning as the pre-repack window above.
+    let t0_io = IoSnapshot::capture();
+    let t0 = Instant::now();
 
+    let store_post = PackfileStorage::open_read_only(temp_dir.clone()).unwrap();
+
+    let t1_io = IoSnapshot::capture();
+    let t1 = Instant::now();
+    let post_open_time = t1.duration_since(t0);
+    let post_open_io_delta = t0_io.zip(t1_io).map(|(b, a)| a.delta(b));
+
+    let mut post_found = 0;
     for nid in &sample_keys {
         if store_post
             .get(&sampler.elephant_id(), nid)
@@ -357,59 +538,112 @@ pub fn run_stage1_locality_benchmark(
             post_found += 1;
         }
     }
-    let post_latency = post_start.elapsed();
-    let post_io_delta = post_io_before
-        .zip(IoSnapshot::capture())
-        .map(|(b, a)| a.delta(b));
+
+    let t2_io = IoSnapshot::capture();
+    let t2 = Instant::now();
+    let post_latency = t2.duration_since(t1);
+    let post_io_delta = t1_io.zip(t2_io).map(|(b, a)| a.delta(b));
     let post_packs_touched = store_post
         .collection_referenced_pack_ids(&sampler.elephant_id())
         .len();
 
-    println!(
-        "  Cache state:          {}",
-        if evicted_post {
-            "Cold (Evicted)"
-        } else {
-            "Warm (No vmtouch)"
-        }
+    row("Cache state:", evicted_post.cache_state_label());
+    evicted_post.warn_if_not_evicted();
+    row(
+        "Open time:",
+        format!("{post_open_time:.2?} (whole store, expect ~flat)"),
     );
-    println!("  Post-Repack Latency:  {post_latency:.2?}");
-    println!("  Pack IDs Referenced:  {post_packs_touched}");
+    print_io_delta(post_open_io_delta);
+    row(
+        "Query latency:",
+        format!("{post_latency:.2?} (elephant only)"),
+    );
+    subrow("packs referenced:", post_packs_touched);
     print_io_delta(post_io_delta);
 
     // --- Summary ---
     println!("\n═══════════════════════════════════════════════════════════════");
     println!("  STAGE 1 LOCALITY SUMMARY");
     println!("═══════════════════════════════════════════════════════════════");
-    println!(
-        "  Max shard bytes:      {}",
-        max_shard_bytes.map_or_else(|| "default (~256 MB)".to_string(), |n| n.to_string())
-    );
-    println!("  Total records:        {total_records}");
-    println!("  Collections:          {collection_count}");
-    println!("  Elephant nodes:       {}", elephant_nodes.len());
-    println!("  Sample size:          {}", sample_keys.len());
-    println!("  ───────────────────────────────────────────────────────────");
-    println!("  Pack IDs:             {initial_pack_count} -> {post_pack_count}");
-    println!("  Latency:              {pre_latency:.2?} -> {post_latency:.2?}");
-    if let (Some(pre_io), Some(post_io)) = (pre_io_delta, post_io_delta) {
-        println!(
-            "  Major page faults:    {} -> {} (~random seeks)",
-            pre_io.major_faults, post_io.major_faults
-        );
-        println!(
-            "  Read syscalls:        {} -> {}",
-            pre_io.read_syscalls, post_io.read_syscalls
+    if repack_max_shard_bytes == max_shard_bytes {
+        row("Max shard bytes:", shard_bytes_label(max_shard_bytes));
+    } else {
+        row(
+            "Max shard bytes:",
+            format!(
+                "{} -> {} (compacted)",
+                shard_bytes_label(max_shard_bytes),
+                shard_bytes_label(repack_max_shard_bytes)
+            ),
         );
     }
-    println!(
-        "  Speedup:              {:.2}x",
-        pre_latency.as_secs_f64() / post_latency.as_secs_f64()
+    row("Total records:", total_records);
+    row("Collections:", collection_count);
+    row("Elephant nodes:", elephant_nodes.len());
+    row("Sample size:", sample_keys.len());
+    println!("  ───────────────────────────────────────────────────────────");
+    row(
+        "Pack IDs:",
+        format!("{initial_pack_count} -> {post_pack_count}"),
     );
-    println!(
-        "  Found:                pre={pre_found}/{} post={post_found}/{}",
-        sample_keys.len(),
-        sample_keys.len()
+    row(
+        "Open time:",
+        format!("{pre_open_time:.2?} -> {post_open_time:.2?} (whole store)"),
+    );
+    if let (Some(pre_open_io), Some(post_open_io)) = (pre_open_io_delta, post_open_io_delta) {
+        subrow(
+            "disk read:",
+            format!(
+                "{} -> {}",
+                format_bytes(pre_open_io.disk_read_bytes),
+                format_bytes(post_open_io.disk_read_bytes)
+            ),
+        );
+    }
+    row(
+        "Query latency:",
+        format!("{pre_latency:.2?} -> {post_latency:.2?} (elephant only)"),
+    );
+    subrow(
+        "packs referenced:",
+        format!("{pre_packs_touched} -> {post_packs_touched}"),
+    );
+    if let (Some(pre_io), Some(post_io)) = (pre_io_delta, post_io_delta) {
+        subrow(
+            "disk read:",
+            format!(
+                "{} -> {}",
+                format_bytes(pre_io.disk_read_bytes),
+                format_bytes(post_io.disk_read_bytes)
+            ),
+        );
+        subrow(
+            "minor faults:",
+            format!("{} -> {}", pre_io.minor_faults, post_io.minor_faults),
+        );
+        subrow(
+            "major faults:",
+            format!("{} -> {}", pre_io.major_faults, post_io.major_faults),
+        );
+        subrow(
+            "read syscalls:",
+            format!("{} -> {}", pre_io.read_syscalls, post_io.read_syscalls),
+        );
+    }
+    row(
+        "Speedup:",
+        format!(
+            "{:.2}x",
+            pre_latency.as_secs_f64() / post_latency.as_secs_f64()
+        ),
+    );
+    row(
+        "Found:",
+        format!(
+            "pre={pre_found}/{} post={post_found}/{}",
+            sample_keys.len(),
+            sample_keys.len()
+        ),
     );
     println!("═══════════════════════════════════════════════════════════════");
 
@@ -418,7 +652,15 @@ pub fn run_stage1_locality_benchmark(
 
 fn main() {
     println!("mtxdb stage 1 locality benchmark");
-    println!("Requires `vmtouch` on PATH for cold-cache eviction.");
+    if vmtouch_on_path() {
+        println!("`vmtouch` found on PATH — cold-cache eviction enabled.");
+    } else {
+        eprintln!("⚠ WARNING: `vmtouch` not found on PATH.");
+        eprintln!(
+            "  Every \"cold\" phase below will silently run against a WARM cache instead \
+             — install it (e.g. `sudo apt-get install vmtouch`) for real cold-cache numbers."
+        );
+    }
 
     // A writable ShardPool keeps every discovered pack file open for its
     // whole lifetime (see `ShardPool::open_internal`), so shard count here
@@ -427,8 +669,18 @@ fn main() {
     // default 1024-fd ulimit and failed with "Too many open files" before
     // this was tuned down. 32 KB / 800 records keeps it around ~60 packs.
     println!("\n\n### Phase A: tiny shards (max_shard_bytes = 32 KB) ###");
-    run_stage1_locality_benchmark(800, 20, Some(32 * 1024));
+    run_stage1_locality_benchmark(800, 20, Some(32 * 1024), Some(32 * 1024));
 
     println!("\n\n### Phase B: default shards (max_shard_bytes = ~256 MB) ###");
-    run_stage1_locality_benchmark(50_000, 500, None);
+    run_stage1_locality_benchmark(50_000, 500, None, None);
+
+    // Phase A's repack reopened the store at the *same* 32 KB cap it
+    // ingested under, so it just rewrote each collection into equally
+    // tiny replacement shards (122 -> 122) — it never actually
+    // consolidated anything. This phase repeats Phase A's exact ingest,
+    // but repacks into the default ~256 MB cap instead, so the same 122
+    // tiny packs should collapse into a handful of large ones — and
+    // latency/page-faults/syscalls should drop accordingly.
+    println!("\n\n### Phase C: compact tiny packs into ~256 MB packs ###");
+    run_stage1_locality_benchmark(800, 20, Some(32 * 1024), None);
 }
