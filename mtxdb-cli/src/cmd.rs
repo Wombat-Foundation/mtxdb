@@ -74,19 +74,39 @@ fn fmt_disk_megabytes(bytes: u64) -> String {
     format!("{whole}.{fraction:03} MB")
 }
 
-/// Sum the physical frames belonging to each collection. This is deliberately a
-/// disk-footprint figure: superseded frames remain charged to the collection until
-/// a repack reclaims them, while the shard header is shared and unallocated.
-/// Reads only each frame's length and collection ID, then discards its hash,
-/// payload, and CRC through one sequential buffered scan; a collection listing
-/// never allocates payloads or checks CRCs.
-fn collection_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
+/// Raw, on-disk layout. It intentionally includes superseded frames: this is
+/// the physical interleaving a sequential scan sees, not a claim about a
+/// collection's live index footprint.
+#[derive(Default)]
+struct PhysicalLayout {
+    collections: HashMap<[u8; 16], CollectionPhysicalLayout>,
+    packs: HashMap<u64, PackPhysicalLayout>,
+}
+
+#[derive(Default)]
+struct CollectionPhysicalLayout {
+    disk_bytes: u64,
+    pack_bytes: HashMap<u64, u64>,
+    segments: u64,
+    largest_segment_bytes: u64,
+}
+
+#[derive(Default)]
+struct PackPhysicalLayout {
+    collections: HashSet<[u8; 16]>,
+    segments: u64,
+    largest_segment_bytes: u64,
+}
+
+/// Scan physical frame placement without allocating payloads. A torn active
+/// tail is ignored, just as the ordinary disk accounting scan does.
+fn physical_layout(dir: &Path) -> anyhow::Result<PhysicalLayout> {
     // 1-byte flags + 4-byte uncompressed_len + 16-byte collection_id + 16-byte
     // hash — the fixed part of a v3 frame's payload, preceding the
     // (possibly zstd-compressed) node bytes.
     const FRAME_FIXED_LEN: u64 = 1 + 4 + 16 + 16;
 
-    let mut by_collection = HashMap::new();
+    let mut layout = PhysicalLayout::default();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if !path
@@ -97,9 +117,11 @@ fn collection_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
         }
         let file = fs::File::open(path)?;
         let mut reader = BufReader::new(file);
-        if mtxdb_core::packfile::read_header(&mut reader)?.is_none() {
+        let Some(header) = mtxdb_core::packfile::read_header(&mut reader)? else {
             continue;
-        }
+        };
+        let pack_id = header.pack_id;
+        let mut current_run: Option<([u8; 16], u64)> = None;
         let mut discard = [0_u8; 8192];
         loop {
             let mut len = [0_u8; 4];
@@ -149,11 +171,44 @@ fn collection_disk_bytes(dir: &Path) -> anyhow::Result<HashMap<[u8; 16], u64>> {
             if !complete {
                 break;
             }
-            let total = by_collection.entry(collection_id).or_insert(0_u64);
-            *total = total.saturating_add(frame_len.saturating_add(8));
+            let record_bytes = frame_len.saturating_add(8);
+            let collection = layout.collections.entry(collection_id).or_default();
+            collection.disk_bytes = collection.disk_bytes.saturating_add(record_bytes);
+            let pack_bytes = collection.pack_bytes.entry(pack_id).or_default();
+            *pack_bytes = pack_bytes.saturating_add(record_bytes);
+            layout
+                .packs
+                .entry(pack_id)
+                .or_default()
+                .collections
+                .insert(collection_id);
+
+            match &mut current_run {
+                Some((run_collection, run_bytes)) if *run_collection == collection_id => {
+                    *run_bytes = run_bytes.saturating_add(record_bytes);
+                }
+                Some(_) => {
+                    finish_physical_run(&mut layout, pack_id, current_run.take());
+                    current_run = Some((collection_id, record_bytes));
+                }
+                None => current_run = Some((collection_id, record_bytes)),
+            }
         }
+        finish_physical_run(&mut layout, pack_id, current_run);
     }
-    Ok(by_collection)
+    Ok(layout)
+}
+
+fn finish_physical_run(layout: &mut PhysicalLayout, pack_id: u64, run: Option<([u8; 16], u64)>) {
+    let Some((collection_id, bytes)) = run else {
+        return;
+    };
+    let collection = layout.collections.entry(collection_id).or_default();
+    collection.segments = collection.segments.saturating_add(1);
+    collection.largest_segment_bytes = collection.largest_segment_bytes.max(bytes);
+    let pack = layout.packs.entry(pack_id).or_default();
+    pack.segments = pack.segments.saturating_add(1);
+    pack.largest_segment_bytes = pack.largest_segment_bytes.max(bytes);
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -186,8 +241,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             data,
         } => cmd_put(cli, collection, id, data),
         Commands::Get { collection, id } => cmd_get(cli, collection.as_deref(), id),
-        Commands::Collections { all } => cmd_collections(cli, *all),
-        Commands::Shards { all } => cmd_shards(cli, *all),
+        Commands::Collections { all, layout, sort } => {
+            cmd_collections(cli, *all, *layout, sort.as_deref())
+        }
+        Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Info { collection } => cmd_info(cli, collection),
         Commands::Scan { shard } => cmd_scan(cli, shard),
         Commands::Import { paths, collection } => cmd_import(cli, paths, collection.as_deref()),
@@ -350,24 +407,28 @@ fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
         .collect())
 }
 
-fn cmd_collections(cli: &Cli, all: bool) -> anyhow::Result<()> {
+fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     if all {
-        let layout = open_layout(cli)?;
+        let db_layout = open_layout(cli)?;
         for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
             if index != 0 {
                 println!();
             }
             println!("{}:", shard_type.as_str());
-            cmd_collections_in_dir(&pool_dir(&layout, shard_type)?)?;
+            cmd_collections_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort)?;
         }
         return Ok(());
     }
-    cmd_collections_in_dir(&selected_pool_dir(cli)?)
+    cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, sort)
 }
 
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
 /// avoided: each pool owns an independent 16-byte namespace and lifecycle.
-fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the command intentionally keeps its table construction and summary together"
+)]
+fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     // The persisted collection directory is a fast listing snapshot, not proof
     // that the shard files are readable by this binary. Validate the small
     // immutable header of every shard before trusting it, so a pre-cutover
@@ -388,21 +449,81 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
             .collection_summaries(),
     };
     let collection_shards = PackfileStorage::collection_shards_from_disk(dir);
-    let disk_bytes = collection_disk_bytes(dir)?;
+    let physical = physical_layout(dir)?;
+    let disk_bytes: HashMap<_, _> = physical
+        .collections
+        .iter()
+        .map(|(id, stats)| (*id, stats.disk_bytes))
+        .collect();
 
     if collections.is_empty() {
         println!("no collections found");
         return Ok(());
     }
 
-    println!(
-        "  {:>4}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
-        "slot", "collection", "nodes", "shards", "index RAM", "disk"
-    );
+    if let Some(column) = sort {
+        if !matches!(
+            column,
+            "slot"
+                | "collection"
+                | "nodes"
+                | "shards"
+                | "index-ram"
+                | "disk"
+                | "packs"
+                | "tail"
+                | "segments"
+                | "fragmentation"
+        ) {
+            bail!("unknown collections sort column `{column}`");
+        }
+    }
+    let mut ordered: Vec<_> = collections.iter().enumerate().collect();
+    ordered.sort_by(|(left_slot, left), (right_slot, right)| {
+        let left_layout = physical.collections.get(&left.0);
+        let right_layout = physical.collections.get(&right.0);
+        let score = |stats: Option<&CollectionPhysicalLayout>| {
+            stats.map_or(0, |s| s.segments.saturating_sub(s.pack_bytes.len() as u64))
+        };
+        let ordering = match sort.unwrap_or("slot") {
+            "collection" => left.0.cmp(&right.0),
+            "nodes" => right.1.cmp(&left.1),
+            "shards" | "packs" => right_layout
+                .map_or(0, |s| s.pack_bytes.len())
+                .cmp(&left_layout.map_or(0, |s| s.pack_bytes.len())),
+            "index-ram" => right.2.cmp(&left.2),
+            "disk" => right_layout
+                .map_or(0, |s| s.disk_bytes)
+                .cmp(&left_layout.map_or(0, |s| s.disk_bytes)),
+            "tail" => right_layout
+                .map_or(0, |s| {
+                    s.disk_bytes
+                        .saturating_sub(s.pack_bytes.values().copied().max().unwrap_or(0))
+                })
+                .cmp(&left_layout.map_or(0, |s| {
+                    s.disk_bytes
+                        .saturating_sub(s.pack_bytes.values().copied().max().unwrap_or(0))
+                })),
+            "segments" | "fragmentation" => score(right_layout).cmp(&score(left_layout)),
+            _ => left_slot.cmp(right_slot),
+        };
+        ordering.then_with(|| left.0.cmp(&right.0))
+    });
+    if layout {
+        println!(
+            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>8}  {:>13}",
+            "slot", "collection", "nodes", "packs", "disk", "runs", "largest", "tail"
+        );
+    } else {
+        println!(
+            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
+            "slot", "collection", "nodes", "shards", "index RAM", "disk"
+        );
+    }
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
-    for (i, (collection_id, nodes, memory)) in collections.iter().enumerate() {
+    for (i, (collection_id, nodes, memory)) in ordered {
         let hex = hex_encode(collection_id);
         let shards = collection_shards
             .as_ref()
@@ -425,11 +546,28 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
             .context("total collection index memory overflow")?;
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
         total_disk_bytes = total_disk_bytes.saturating_add(disk);
-        println!(
-            "  {i:>4}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
-            fmt_megabytes(*memory),
-            fmt_disk_megabytes(disk),
-        );
+        if layout {
+            let stats = physical.collections.get(collection_id);
+            let packs = stats.map_or(0, |s| s.pack_bytes.len());
+            let runs = stats.map_or(0, |s| s.segments);
+            let largest = stats.map_or(0, |s| s.largest_segment_bytes);
+            let tail = stats.map_or(0, |s| {
+                s.disk_bytes
+                    .saturating_sub(s.pack_bytes.values().copied().max().unwrap_or(0))
+            });
+            println!(
+                "  {i:>4}  0x{hex}  {nodes:>7}  {packs:>6}  {:>13}  {runs:>5}  {:>8}  {:>13}",
+                fmt_disk_megabytes(disk),
+                fmt_bytes(largest),
+                fmt_bytes(tail)
+            );
+        } else {
+            println!(
+                "  {i:>4}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
+                fmt_megabytes(*memory),
+                fmt_disk_megabytes(disk),
+            );
+        }
     }
     println!();
     println!(
@@ -440,6 +578,15 @@ fn cmd_collections_in_dir(dir: &Path) -> anyhow::Result<()> {
         fmt_megabytes(total_memory),
         fmt_disk_megabytes(total_disk_bytes),
     );
+    if layout {
+        let total_segments: u64 = physical.collections.values().map(|s| s.segments).sum();
+        let spread = physical
+            .collections
+            .values()
+            .filter(|s| s.pack_bytes.len() > 1)
+            .count();
+        println!("physical layout: {spread} collection(s) span multiple packs; {total_segments} contiguous runs (includes superseded frames)");
+    }
     Ok(())
 }
 
@@ -467,24 +614,24 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
 /// headers, then decodes the small `shard_stats.bin` and
 /// `shard_collections.bin` sidecars for counters and live-node counts.
 /// Safe to run against a directory a live writer process owns.
-fn cmd_shards(cli: &Cli, all: bool) -> anyhow::Result<()> {
+fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     if all {
-        let layout = open_layout(cli)?;
+        let db_layout = open_layout(cli)?;
         for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
             if index != 0 {
                 println!();
             }
             println!("{}:", shard_type.as_str());
-            cmd_shards_in_dir(&pool_dir(&layout, shard_type)?)?;
+            cmd_shards_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort)?;
         }
         return Ok(());
     }
-    cmd_shards_in_dir(&selected_pool_dir(cli)?)
+    cmd_shards_in_dir(&selected_pool_dir(cli)?, layout, sort)
 }
 
 /// List shard metadata from one pool only. This reads directory entries and
 /// sidecars; it never scans packfile contents or opens collection indexes.
-fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
+fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     let mut shard_entries = glob_pack_files(dir)?;
     shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
 
@@ -496,6 +643,52 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
     let (stats_map, persisted_at) = decode_stats_snapshot(dir);
     let node_counts = PackfileStorage::shard_node_counts_from_disk(dir);
     let collection_counts = PackfileStorage::shard_collection_counts_from_disk(dir);
+    let needs_layout = layout || matches!(sort, Some("segments" | "interleaving"));
+    let physical = needs_layout.then(|| physical_layout(dir)).transpose()?;
+    if let Some(column) = sort {
+        if !matches!(
+            column,
+            "pack" | "bytes" | "nodes" | "collections" | "syncs" | "segments" | "interleaving"
+        ) {
+            bail!("unknown shards sort column `{column}`");
+        }
+        shard_entries.sort_by(|left, right| {
+            let value = |entry: &(u64, u64, u8)| match column {
+                "bytes" => entry.1,
+                "nodes" => node_counts
+                    .as_ref()
+                    .and_then(|counts| counts.get(&entry.0))
+                    .copied()
+                    .unwrap_or(0),
+                "collections" => collection_counts
+                    .as_ref()
+                    .and_then(|counts| counts.get(&entry.0))
+                    .copied()
+                    .unwrap_or(0),
+                "syncs" => stats_map.get(&entry.0).copied().unwrap_or_default().2,
+                "segments" => physical
+                    .as_ref()
+                    .and_then(|stats| stats.packs.get(&entry.0))
+                    .map_or(0, |stats| stats.segments),
+                "interleaving" => physical
+                    .as_ref()
+                    .and_then(|stats| stats.packs.get(&entry.0))
+                    .map_or(0, |stats| {
+                        stats
+                            .segments
+                            .saturating_sub(stats.collections.len() as u64)
+                    }),
+                _ => 0,
+            };
+            if column == "pack" {
+                left.0.cmp(&right.0)
+            } else {
+                value(right)
+                    .cmp(&value(left))
+                    .then_with(|| left.0.cmp(&right.0))
+            }
+        });
+    }
     let total_collections = collection_counts
         .as_ref()
         .map(|_| PackfileStorage::collection_directory_from_disk(dir).len());
@@ -506,6 +699,34 @@ fn cmd_shards_in_dir(dir: &Path) -> anyhow::Result<()> {
         collection_counts.as_ref(),
         total_collections,
     );
+    if let Some(physical) = physical {
+        let runs: u64 = physical.packs.values().map(|stats| stats.segments).sum();
+        let interleaved: u64 = physical
+            .packs
+            .values()
+            .map(|stats| {
+                stats
+                    .segments
+                    .saturating_sub(stats.collections.len() as u64)
+            })
+            .sum();
+        println!("physical layout: {runs} contiguous runs; {interleaved} excess runs from interleaving (includes superseded frames)");
+        println!(
+            "{:>19}  {:>11}  {:>6}  {:>10}  {:>12}",
+            "pack id", "collections", "runs", "excess", "largest run"
+        );
+        for (pack_id, _, _) in &shard_entries {
+            let stats = physical.packs.get(pack_id);
+            let collections = stats.map_or(0, |stats| stats.collections.len());
+            let runs = stats.map_or(0, |stats| stats.segments);
+            let excess = runs.saturating_sub(collections as u64);
+            let largest = stats.map_or(0, |stats| stats.largest_segment_bytes);
+            println!(
+                "0x{pack_id:016x}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
+                fmt_bytes(largest)
+            );
+        }
+    }
     println!("* active pack");
     println!(
         "{} pack(s), {}",
@@ -1758,7 +1979,7 @@ fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Re
     store.persist_shard_collections()?;
     drop(store);
     println!("post-repack shard state:");
-    cmd_shards(cli, false)?;
+    cmd_shards(cli, false, false, None)?;
     Ok(())
 }
 
@@ -1839,9 +2060,12 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 mod tests {
     use super::{
         event_room_id, fmt_disk_megabytes, fmt_megabytes, matrix_create_details,
-        parse_pack_id_selector, parse_pack_selectors,
+        parse_pack_id_selector, parse_pack_selectors, physical_layout,
     };
+    use bytes::Bytes;
+    use mtxdb_core::packfile::{write_header, write_record, Record};
     use simd_json::OwnedValue;
+    use std::fs::File;
 
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
@@ -1936,5 +2160,44 @@ mod tests {
             matrix_create_details(&event).as_deref(),
             Some("<missing event_id> by <missing sender>")
         );
+    }
+
+    #[test]
+    fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_cli_layout_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let collection_a = [0xA1; 16];
+        let collection_b = [0xB2; 16];
+        for (pack_id, records) in [
+            (0_u64, vec![collection_a, collection_b, collection_a]),
+            (1_u64, vec![collection_a]),
+        ] {
+            let path = dir.join(format!("pack_{pack_id:016x}.pack"));
+            let mut file = File::create(path).unwrap();
+            write_header(&mut file, pack_id).unwrap();
+            for (index, collection_id) in records.into_iter().enumerate() {
+                write_record(
+                    &mut file,
+                    &Record {
+                        collection_id,
+                        hash: [index as u8; 16],
+                        data: Bytes::from_static(b"payload"),
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        let layout = physical_layout(&dir).unwrap();
+        let a = &layout.collections[&collection_a];
+        assert_eq!(a.pack_bytes.len(), 2, "A spans two packs");
+        assert_eq!(a.segments, 3, "A-B-A in pack 0 plus A in pack 1");
+        assert_eq!(layout.packs[&0].segments, 3);
+        assert_eq!(layout.packs[&1].segments, 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -25,9 +25,13 @@ pub(crate) enum Commands {
     },
     Collections {
         all: bool,
+        layout: bool,
+        sort: Option<String>,
     },
     Shards {
         all: bool,
+        layout: bool,
+        sort: Option<String>,
     },
     Info {
         collection: String,
@@ -131,6 +135,10 @@ fn sub_shards() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("List packs in every independent pool"),
         )
+        .arg(layout_arg())
+        .arg(sort_arg(
+            "pack, bytes, nodes, collections, syncs, segments, interleaving",
+        ))
 }
 
 fn sub_collections() -> Command {
@@ -143,6 +151,22 @@ fn sub_collections() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("List collections in every independent pool"),
         )
+        .arg(layout_arg())
+        .arg(sort_arg("slot, collection, nodes, shards, index-ram, disk, packs, tail, segments, fragmentation"))
+}
+
+fn layout_arg() -> Arg {
+    Arg::new("layout")
+        .long("layout")
+        .action(ArgAction::SetTrue)
+        .help("Scan physical pack layout and show fragmentation columns and summary")
+}
+
+fn sort_arg(help: &'static str) -> Arg {
+    Arg::new("sort")
+        .long("sort")
+        .value_name("COLUMN")
+        .help(help)
 }
 
 fn sub_sync() -> Command {
@@ -333,9 +357,13 @@ fn parse_cli() -> Cli {
         },
         Some(("collections", m)) => Commands::Collections {
             all: m.get_flag("all"),
+            layout: m.get_flag("layout"),
+            sort: m.get_one::<String>("sort").cloned(),
         },
         Some(("shards", m)) => Commands::Shards {
             all: m.get_flag("all"),
+            layout: m.get_flag("layout"),
+            sort: m.get_one::<String>("sort").cloned(),
         },
         Some(("info", m)) => Commands::Info {
             collection: m.get_one::<String>("collection").unwrap().clone(),
