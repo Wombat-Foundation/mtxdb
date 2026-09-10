@@ -152,7 +152,7 @@ fn sub_collections() -> Command {
                 .help("List collections in every independent pool"),
         )
         .arg(layout_arg())
-        .arg(sort_arg("slot, collection, nodes, shards, index-ram, disk, packs, tail, segments, fragmentation"))
+        .arg(sort_arg("slot, collection, nodes, shards, index-ram, disk, packs, avoidable, segments, fragmentation"))
 }
 
 fn layout_arg() -> Arg {

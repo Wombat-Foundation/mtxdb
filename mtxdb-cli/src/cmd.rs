@@ -422,6 +422,18 @@ fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> an
     cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, sort)
 }
 
+/// Bytes that could be moved to maximize one collection's largest pack extent.
+fn avoidable_spread_bytes(stats: Option<&CollectionPhysicalLayout>) -> u64 {
+    let Some(stats) = stats else {
+        return 0;
+    };
+    let largest_pack = stats.pack_bytes.values().copied().max().unwrap_or(0);
+    stats
+        .disk_bytes
+        .min(mtxdb_core::shard::MAX_SHARD_BYTES)
+        .saturating_sub(largest_pack)
+}
+
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
 /// avoided: each pool owns an independent 16-byte namespace and lifecycle.
 #[allow(
@@ -471,7 +483,7 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
                 | "index-ram"
                 | "disk"
                 | "packs"
-                | "tail"
+                | "avoidable"
                 | "segments"
                 | "fragmentation"
         ) {
@@ -495,15 +507,9 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
             "disk" => right_layout
                 .map_or(0, |s| s.disk_bytes)
                 .cmp(&left_layout.map_or(0, |s| s.disk_bytes)),
-            "tail" => right_layout
-                .map_or(0, |s| {
-                    s.disk_bytes
-                        .saturating_sub(s.pack_bytes.values().copied().max().unwrap_or(0))
-                })
-                .cmp(&left_layout.map_or(0, |s| {
-                    s.disk_bytes
-                        .saturating_sub(s.pack_bytes.values().copied().max().unwrap_or(0))
-                })),
+            "avoidable" => {
+                avoidable_spread_bytes(right_layout).cmp(&avoidable_spread_bytes(left_layout))
+            }
             "segments" | "fragmentation" => score(right_layout).cmp(&score(left_layout)),
             _ => left_slot.cmp(right_slot),
         };
@@ -511,8 +517,8 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
     });
     if layout {
         println!(
-            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>8}  {:>13}",
-            "slot", "collection", "nodes", "packs", "disk", "runs", "largest", "tail"
+            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "slot", "collection", "nodes", "packs", "disk", "runs", "largest", "avoidable"
         );
     } else {
         println!(
@@ -551,15 +557,12 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
             let packs = stats.map_or(0, |s| s.pack_bytes.len());
             let runs = stats.map_or(0, |s| s.segments);
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
-            let tail = stats.map_or(0, |s| {
-                s.disk_bytes
-                    .saturating_sub(s.pack_bytes.values().copied().max().unwrap_or(0))
-            });
+            let avoidable = avoidable_spread_bytes(stats);
             println!(
-                "  {i:>4}  0x{hex}  {nodes:>7}  {packs:>6}  {:>13}  {runs:>5}  {:>8}  {:>13}",
+                "  {i:>4}  0x{hex}  {nodes:>7}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
                 fmt_disk_megabytes(disk),
                 fmt_bytes(largest),
-                fmt_bytes(tail)
+                fmt_bytes(avoidable)
             );
         } else {
             println!(
@@ -2059,8 +2062,9 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        event_room_id, fmt_disk_megabytes, fmt_megabytes, matrix_create_details,
-        parse_pack_id_selector, parse_pack_selectors, physical_layout,
+        avoidable_spread_bytes, event_room_id, fmt_disk_megabytes, fmt_megabytes,
+        matrix_create_details, parse_pack_id_selector, parse_pack_selectors, physical_layout,
+        CollectionPhysicalLayout,
     };
     use bytes::Bytes;
     use mtxdb_core::packfile::{write_header, write_record, Record};
@@ -2199,5 +2203,26 @@ mod tests {
         assert_eq!(layout.packs[&0].segments, 3);
         assert_eq!(layout.packs[&1].segments, 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn avoidable_spread_excludes_a_collections_required_spill() {
+        let capacity = mtxdb_core::shard::MAX_SHARD_BYTES;
+        let mut ideal = CollectionPhysicalLayout {
+            disk_bytes: capacity.saturating_add(100),
+            ..CollectionPhysicalLayout::default()
+        };
+        ideal.pack_bytes.insert(0, capacity);
+        ideal.pack_bytes.insert(1, 100);
+        assert_eq!(avoidable_spread_bytes(Some(&ideal)), 0);
+
+        let mut fragmented = ideal;
+        fragmented.pack_bytes.clear();
+        fragmented.pack_bytes.insert(0, capacity / 2);
+        fragmented.pack_bytes.insert(1, capacity / 2 + 100);
+        assert_eq!(
+            avoidable_spread_bytes(Some(&fragmented)),
+            capacity.saturating_sub(capacity / 2 + 100)
+        );
     }
 }
