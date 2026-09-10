@@ -1132,30 +1132,16 @@ fn cmd_import(
     Ok(())
 }
 
-/// Export every live record in one collection as a JSONL stream. A read-only frame
-/// scan avoids rebuilding every collection's in-memory index just to enumerate one
-/// collection. Scanning packs in pack-ID order lets a later physical copy replace
-/// an older one with the same node ID.
+/// Export every live JSON record in one collection as a JSONL stream. A read-only
+/// frame scan avoids stale persisted collection summaries and rebuilding every
+/// collection's in-memory index just to enumerate one collection. Scanning packs
+/// in pack-ID order lets a later physical copy replace an older one with the same
+/// node ID.
 fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(collection)?;
     let pool_dir = selected_pool_dir(cli)?;
-    let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&pool_dir) else {
-        bail!("collection directory is unavailable; run `mtxdb sync` before exporting");
-    };
-    if !summaries.iter().any(|(id, _, _)| *id == collection_id) {
-        bail!("collection {collection} not found");
-    }
-    let collection_shards = PackfileStorage::collection_shards_from_disk(&pool_dir)
-        .and_then(|by_collection| by_collection.get(&collection_id).cloned())
-        .context("collection shard directory is unavailable; run `mtxdb sync` before exporting")?;
-    let collection_shards: HashSet<u64> = collection_shards.into_iter().collect();
-
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
-    let mut shards: Vec<_> = pool
-        .all_shards()
-        .into_iter()
-        .filter(|(_, shard)| collection_shards.contains(&shard.pack_id))
-        .collect();
+    let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
 
     let mut locations = HashMap::new();
@@ -1172,6 +1158,9 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
             }
         }
     }
+    if locations.is_empty() {
+        bail!("collection {collection} not found");
+    }
 
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
@@ -1183,7 +1172,11 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
             .context("export record location disappeared during scan")?;
         let (_, shard) = &shards[shard_index];
         let record = ShardPool::read_at(shard, offset)?;
-        output.write_all(&record.data)?;
+        let mut bytes = record.data.to_vec();
+        let value: OwnedValue = simd_json::to_owned_value(&mut bytes)
+            .with_context(|| format!("record {} is not valid JSON", hex_encode(&node_id)))?;
+        let json = value.to_string();
+        output.write_all(json.as_bytes())?;
         output.write_all(b"\n")?;
         exported = exported.saturating_add(1);
     }

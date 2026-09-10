@@ -1029,8 +1029,8 @@ impl ShardPool {
     /// [`serialized_len`]: crate::packfile::Record::serialized_len
     ///
     /// # Errors
-    /// Returns `StorageError::Corrupt` on a truncated/invalid length
-    /// prefix, `StorageError::Io` on I/O failure.
+    /// Returns `StorageError::Corrupt` on a truncated or invalid frame,
+    /// `StorageError::Io` on I/O failure.
     ///
     /// # Panics
     /// Panics only on internal invariant violation (unreachable path).
@@ -1074,7 +1074,19 @@ impl ShardPool {
                 )));
             }
 
-            return Ok(4_u64.wrapping_add(u64::from(frame_len)).wrapping_add(4));
+            let frame_end = prefix_end
+                .checked_add(frame_len as usize)
+                .and_then(|end| end.checked_add(4));
+            if frame_end.map_or(true, |end| end > mem.len()) {
+                if attempt == 0 {
+                    drop(guard);
+                    Self::remap_shard(shard)?;
+                    continue;
+                }
+                return Err(StorageError::Corrupt("truncated frame body or CRC".into()));
+            }
+
+            return Ok(u64::from(frame_len) + 8);
         }
         unreachable!("record_disk_len_at remap-retry is bounded to two iterations")
     }
@@ -1551,6 +1563,25 @@ mod tests {
         assert_eq!(read.collection_id[0], 0x01);
         assert_eq!(read.hash[0], 0xAA);
         assert_eq!(read.data.as_ref(), b"hello shard");
+    }
+
+    #[test]
+    fn record_disk_len_rejects_truncated_frame_body() {
+        let dir = test_dir("disk_len_truncated_frame");
+        let pool = ShardPool::open(dir).unwrap();
+        let (slot, offset) = pool
+            .put_record(&test_record(0x01, 0xAA, b"truncated frame"))
+            .unwrap();
+        let shard = pool.get_shard(slot).unwrap();
+
+        let len = shard.file.metadata().unwrap().len();
+        shard.file.set_len(len - 1).unwrap();
+        *shard.mmap.write() = None;
+
+        assert!(matches!(
+            ShardPool::record_disk_len_at(&shard, offset),
+            Err(crate::storage::StorageError::Corrupt(_))
+        ));
     }
 
     #[test]
