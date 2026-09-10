@@ -480,7 +480,7 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
                 | "collection"
                 | "nodes"
                 | "shards"
-                | "index-ram"
+                | "index"
                 | "disk"
                 | "packs"
                 | "avoidable"
@@ -503,7 +503,7 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
             "shards" | "packs" => right_layout
                 .map_or(0, |s| s.pack_bytes.len())
                 .cmp(&left_layout.map_or(0, |s| s.pack_bytes.len())),
-            "index-ram" => right.2.cmp(&left.2),
+            "index" => right.2.cmp(&left.2),
             "disk" => right_layout
                 .map_or(0, |s| s.disk_bytes)
                 .cmp(&left_layout.map_or(0, |s| s.disk_bytes)),
@@ -523,7 +523,7 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
     } else {
         println!(
             "  {:>4}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
-            "slot", "collection", "nodes", "shards", "index RAM", "disk"
+            "slot", "collection", "nodes", "shards", "index", "disk"
         );
     }
     let mut total_nodes = 0_usize;
@@ -949,7 +949,7 @@ fn cmd_info(cli: &Cli, collection: &str) -> anyhow::Result<()> {
             .find(|(id, _, _)| *id == collection_id)
         {
             println!(
-                "collection {hex}: {len} nodes, {} index RAM",
+                "collection {hex}: {len} nodes, {} index",
                 fmt_megabytes(mem)
             );
             let shards = collection_shards
@@ -989,7 +989,7 @@ fn cmd_info(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     match store.collection_index_info(&collection_id) {
         Some((len, mem)) => {
             println!(
-                "collection {hex}: {len} nodes, {} index RAM",
+                "collection {hex}: {len} nodes, {} index",
                 fmt_megabytes(mem)
             );
             let shards = store.collection_referenced_pack_ids(&collection_id);
@@ -1336,13 +1336,22 @@ fn cmd_import(
     // One writer owns the entire batch: it prevents another writer from
     // interleaving halfway through a shell glob, and lets us publish one
     // complete shard/collection snapshot once the final input has been handled.
+    let pool_dir = selected_pool_dir(cli)?;
+    // Admission is based on the actual pack contents rather than a sidecar:
+    // a stale summary must not make an unestablished room look established.
+    let mut established_collections = matrix_create_collections_on_disk(&pool_dir)?;
     let store = open_store(cli)?;
     let mut failures = 0_usize;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
-        if let Err(error) = cmd_import_file(&store, path, collection_override) {
+        if let Err(error) = cmd_import_file(
+            &store,
+            path,
+            collection_override,
+            &mut established_collections,
+        ) {
             eprintln!("{}: {error:#}", path.display());
             failures = failures.saturating_add(1);
         }
@@ -1416,6 +1425,7 @@ fn cmd_import_file(
     store: &PackfileStorage,
     path: &Path,
     collection_override: Option<&str>,
+    established_collections: &mut HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
     let content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let is_jsonl = path
@@ -1446,23 +1456,12 @@ fn cmd_import_file(
     // operator identify which input/store overlap caused the no-op.
     let mut already_present_ids = Vec::with_capacity(3);
 
-    let collection_id = if let Some(r) = collection_override {
-        parse_collection_id(r)?
-    } else {
-        let rid = detected_collection.with_context(|| {
-            let first_event = events
-                .first()
-                .and_then(event_id)
-                .unwrap_or("<missing event_id>");
-            format!(
-                "could not detect collection_id (first event: {first_event}); pass --collection for this input"
-            )
-        })?;
-        let hash = blake3::hash(rid.as_bytes());
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&hash.as_bytes()[..16]);
-        id
-    };
+    let (collection_id, batch_has_create) = resolve_import_collection(
+        &events,
+        detected_collection.as_deref(),
+        collection_override,
+        established_collections,
+    )?;
 
     let collection_hex = hex_encode(&collection_id);
 
@@ -1498,6 +1497,10 @@ fn cmd_import_file(
         event_count = event_count.saturating_add(1);
     }
 
+    if batch_has_create {
+        established_collections.insert(collection_id);
+    }
+
     eprintln!("imported {event_count} events to collection {collection_hex}");
     if skipped > 0 {
         eprintln!("skipped {skipped} events (missing event_id)");
@@ -1515,6 +1518,88 @@ fn cmd_import_file(
     }
 
     Ok(())
+}
+
+/// Resolve a Matrix input's room collection and prove that it is established
+/// before any record from the input is written.
+fn resolve_import_collection(
+    events: &[OwnedValue],
+    detected_collection: Option<&str>,
+    collection_override: Option<&str>,
+    established_collections: &HashSet<[u8; 16]>,
+) -> anyhow::Result<([u8; 16], bool)> {
+    let room_ids: HashSet<_> = events.iter().filter_map(event_room_id).collect();
+    if room_ids.len() > 1 {
+        bail!("input contains events for multiple room IDs; split it into one room per input");
+    }
+    let room_id = room_ids.into_iter().next();
+    let collection_id = if let Some(value) = collection_override {
+        let collection_id = parse_collection_id(value)?;
+        if let Some(room_id) = room_id {
+            let expected = collection_id_for_room(room_id);
+            if collection_id != expected {
+                bail!(
+                    "--collection {value} does not match Matrix room_id {room_id}; refusing to mix room data into another collection"
+                );
+            }
+        }
+        collection_id
+    } else {
+        let room_id = room_id.or(detected_collection).with_context(|| {
+            let first_event = events
+                .first()
+                .and_then(event_id)
+                .unwrap_or("<missing event_id>");
+            format!(
+                "could not detect collection_id (first event: {first_event}); pass --collection for this input"
+            )
+        })?;
+        collection_id_for_room(room_id)
+    };
+    let batch_has_create = room_id.is_some_and(|room_id| matrix_batch_has_create(events, room_id));
+    if !batch_has_create && !established_collections.contains(&collection_id) {
+        let room = room_id.unwrap_or("the selected collection");
+        bail!(
+            "refusing to import events for {room}: no valid m.room.create event is in this input or already on disk"
+        );
+    }
+    Ok((collection_id, batch_has_create))
+}
+
+fn collection_id_for_room(room_id: &str) -> [u8; 16] {
+    let hash = blake3::hash(room_id.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
+    id
+}
+
+/// Return every collection that already contains a valid Matrix establishing
+/// record. This deliberately decodes pack payloads: the collection directory
+/// says nothing about whether a room has a create event.
+fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 16]>> {
+    let mut established = HashSet::new();
+    if !dir.exists() || glob_pack_files(dir)?.is_empty() {
+        return Ok(established);
+    }
+    let pool = ShardPool::open_read_only(dir.into())
+        .context("opening shard store for Matrix create validation")?;
+    for (_, shard) in pool.all_shards() {
+        let file = fs::File::open(&shard.path)?;
+        let mut reader = BufReader::new(file);
+        if mtxdb_core::packfile::read_header(&mut reader)?.is_none() {
+            continue;
+        }
+        while let Some(record) = mtxdb_core::packfile::read_record(&mut reader)? {
+            let mut bytes = record.data.to_vec();
+            let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
+                continue;
+            };
+            if matrix_create_event_id(&event).is_some() {
+                established.insert(record.collection_id);
+            }
+        }
+    }
+    Ok(established)
 }
 
 fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
@@ -1572,6 +1657,49 @@ fn event_id(value: &OwnedValue) -> Option<&str> {
         },
         _ => None,
     }
+}
+
+/// A create event establishes a Matrix room only when it is a state event
+/// with the empty state key and a stable event ID.
+fn matrix_create_event_id(event: &OwnedValue) -> Option<&str> {
+    (event_string_field(event, "type") == Some("m.room.create")
+        && event_string_field(event, "state_key") == Some(""))
+    .then(|| event_id(event))
+    .flatten()
+}
+
+/// Matrix v1/v2 commonly encode auth events as `[event_id, hashes]`; later
+/// versions encode them as event-ID strings. Accept both wire forms.
+fn event_auth_references(event: &OwnedValue, target: &str) -> bool {
+    let OwnedValue::Object(fields) = event else {
+        return false;
+    };
+    let Some(OwnedValue::Array(auth_events)) = fields.get("auth_events") else {
+        return false;
+    };
+    auth_events.iter().any(|reference| match reference {
+        OwnedValue::String(event_id) => event_id == target,
+        OwnedValue::Array(parts) => {
+            matches!(parts.first(), Some(OwnedValue::String(event_id)) if event_id == target)
+        }
+        _ => false,
+    })
+}
+
+/// A v1–v11 create event normally carries `room_id`; v12 permits the create
+/// event to omit it, so associate that create through an auth edge from a room
+/// event in the same batch.
+fn matrix_batch_has_create(events: &[OwnedValue], room_id: &str) -> bool {
+    events.iter().any(|event| {
+        let Some(create_id) = matrix_create_event_id(event) else {
+            return false;
+        };
+        event_room_id(event) == Some(room_id)
+            || events.iter().any(|candidate| {
+                event_room_id(candidate) == Some(room_id)
+                    && event_auth_references(candidate, create_id)
+            })
+    })
 }
 
 fn event_string_field<'a>(value: &'a OwnedValue, field: &str) -> Option<&'a str> {
@@ -2062,13 +2190,14 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        avoidable_spread_bytes, event_room_id, fmt_disk_megabytes, fmt_megabytes,
-        matrix_create_details, parse_pack_id_selector, parse_pack_selectors, physical_layout,
-        CollectionPhysicalLayout,
+        avoidable_spread_bytes, collection_id_for_room, event_room_id, fmt_disk_megabytes,
+        fmt_megabytes, matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
+        parse_pack_selectors, physical_layout, resolve_import_collection, CollectionPhysicalLayout,
     };
     use bytes::Bytes;
     use mtxdb_core::packfile::{write_header, write_record, Record};
     use simd_json::OwnedValue;
+    use std::collections::HashSet;
     use std::fs::File;
 
     fn owned_value(json: &str) -> OwnedValue {
@@ -2164,6 +2293,71 @@ mod tests {
             matrix_create_details(&event).as_deref(),
             Some("<missing event_id> by <missing sender>")
         );
+    }
+
+    #[test]
+    fn matrix_batch_requires_a_valid_create_for_its_room() {
+        let direct_create = owned_value(
+            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org"}"#,
+        );
+        let missing_state_key = owned_value(
+            r#"{"type":"m.room.create","event_id":"$not-a-state-event","room_id":"!room:example.org"}"#,
+        );
+        let message = owned_value(
+            r#"{"type":"m.room.message","event_id":"$message","room_id":"!room:example.org"}"#,
+        );
+
+        assert!(matrix_batch_has_create(
+            &[direct_create, message.clone()],
+            "!room:example.org"
+        ));
+        assert!(!matrix_batch_has_create(
+            &[missing_state_key, message],
+            "!room:example.org"
+        ));
+    }
+
+    #[test]
+    fn matrix_batch_associates_a_room_id_less_create_through_auth() {
+        let create = owned_value(r#"{"type":"m.room.create","state_key":"","event_id":"$create"}"#);
+        let modern_auth = owned_value(
+            r#"{"type":"m.room.message","event_id":"$message","room_id":"!room:example.org","auth_events":["$create"]}"#,
+        );
+        let legacy_auth = owned_value(
+            r#"{"type":"m.room.message","event_id":"$legacy","room_id":"!room:example.org","auth_events":[["$create",{}]]}"#,
+        );
+
+        assert!(matrix_batch_has_create(
+            &[create.clone(), modern_auth],
+            "!room:example.org"
+        ));
+        assert!(matrix_batch_has_create(
+            &[create, legacy_auth],
+            "!room:example.org"
+        ));
+    }
+
+    #[test]
+    fn import_admission_rejects_an_unestablished_room_before_writing() {
+        let message = owned_value(
+            r#"{"type":"m.room.message","event_id":"$message","room_id":"!room:example.org"}"#,
+        );
+        let error = resolve_import_collection(&[message], None, None, &HashSet::new())
+            .expect_err("a room without a batch or persisted create must be rejected");
+        assert!(error
+            .to_string()
+            .contains("no valid m.room.create event is in this input or already on disk"));
+    }
+
+    #[test]
+    fn import_admission_accepts_a_batch_that_establishes_its_room() {
+        let create = owned_value(
+            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org"}"#,
+        );
+        let (collection_id, batch_has_create) =
+            resolve_import_collection(&[create], None, None, &HashSet::new()).unwrap();
+        assert_eq!(collection_id, collection_id_for_room("!room:example.org"));
+        assert!(batch_has_create);
     }
 
     #[test]
