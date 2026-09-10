@@ -6,33 +6,36 @@ only stores a 16-byte collection ID, a 16-byte node ID, and opaque bytes. A
 template gives an importer enough information to derive those IDs and to state
 which source bytes are retained.
 
-`format: mtxdb.collection-template/v1` is the current format. The reference
-template for Matrix event JSON is
-[`matrix-event-v1.yaml`](matrix-event-v1.yaml).
+`format: mtxdb.collection-template/v1` is the current format. Its generic
+reference grammar is [`collection-template-v1.yaml`](collection-template-v1.yaml).
+[`matrix-event-v1.yaml`](matrix-event-v1.yaml) is one application profile; it
+does not define the generic vocabulary.
 
 ## Semantics
 
-| Section               | Meaning                                                                                                 |
-| --------------------- | ------------------------------------------------------------------------------------------------------- |
-| `input`               | Accepted source encoding and record framing.                                                            |
-| `identity`            | JSON field used as the logical record identity and the stable digest used for mtxdb's 16-byte node ID.  |
-| `collection`          | JSON field that scopes nodes into a collection and the digest used for its 16-byte collection ID.       |
-| `collection_metadata` | Collection kind, user-facing identifier, and fields extracted from its required primordial record.      |
-| `primordial`          | The record that establishes a collection's metadata and invariants before it may be created.            |
-| `retention`           | Whether the original source object is stored unchanged, or an explicit allow-list projection is stored. |
-| `relationships`       | Optional reference fields used for graph traversal; they do not change the stored object.               |
-| `validation`          | Required fields and the defined behaviour for records that do not meet the template.                    |
+| Section                 | Meaning                                                                                                |
+| ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| `input`                 | Accepted source encoding and record framing.                                                           |
+| `record.identity`       | JSON field used as the logical record identity and the stable digest used for mtxdb's 16-byte node ID. |
+| `record.payload`        | Complete source retention or an explicit derived projection.                                           |
+| `collection.key`        | JSON field that scopes nodes into a collection and the digest used for its 16-byte collection ID.      |
+| `collection.display_id` | User-facing identifier, distinct from the internal digest key.                                         |
+| `metadata`              | Application metadata persisted with the collection.                                                    |
+| `primordial`            | The record that establishes a collection's metadata and invariants before it may be created.           |
+| `relationships`         | Optional reference fields used for graph traversal; they do not change the stored object.              |
+| `validation`            | Required fields and the defined behaviour for records that do not meet the template.                   |
+| `extensions`            | Namespaced application policy; the generic storage engine does not interpret it.                       |
 
 JSON paths are RFC 6901 JSON Pointers. `"/event_id"` therefore identifies a
 top-level `event_id`; `"/"` means the complete source object.
 
 ## Retention policy
 
-`retain: source` is the safe default. It preserves unknown fields, signatures,
+`record.payload.mode: source` is the safe default. It preserves unknown fields, signatures,
 hashes, `unsigned`, and future protocol extensions. It is appropriate whenever
 the database is an archive or an interchange format.
 
-`retain: projection` is opt-in and requires an explicit `include` list. It is
+`record.payload.mode: projection` is opt-in and requires an explicit `include` list. It is
 for derived caches only: omitting a field is a data-model decision and must not
 be presented as a lossless import. A template must never use an implicit
 deny-list or silently discard fields it does not recognize.
@@ -40,8 +43,8 @@ deny-list or silently discard fields it does not recognize.
 ## Collection metadata and primordial records
 
 The 16-byte collection ID in a pack frame is an internal digest key, never the
-collection's user-facing name. `collection_metadata.friendly_id` declares the
-source identifier shown by user interfaces and exports. Metadata is persisted
+collection's user-facing name. `collection.display_id` declares the source
+identifier shown by user interfaces and exports. `metadata` is persisted
 with the collection rather than inferred from arbitrary later records.
 
 Templates that need collection-wide invariants declare a `primordial` rule. A
@@ -58,10 +61,10 @@ event, rather than requiring `room_id` on the create PDU itself.
 
 ## Versioned protocol behaviour
 
-Templates may bind a collection to a `room_version_profiles` entry when its
-primordial record is accepted. This is necessary because an event's identity
-rules can vary by protocol version. The Matrix template defines these initial
-boundaries:
+An application extension may bind a collection to a version-specific policy
+when its primordial record is accepted. This is necessary when a record's
+identity rules vary by protocol version. The Matrix extension does so through
+the executable `MatrixRoomVersion` policy:
 
 | Room version | Event ID                                          | State resolution | Canonical-number rule | Storage impact                                                                                         |
 | ------------ | ------------------------------------------------- | ---------------- | --------------------- | ------------------------------------------------------------------------------------------------------ |

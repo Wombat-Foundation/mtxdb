@@ -1,4 +1,5 @@
-# Matrix event JSON mapping for mtxdb.collection-template/v1.
+# Matrix profile expressed in mtxdb.collection-template/v1.
+# See collection-template-v1.yaml for the generic language.
 #
 # This describes the policy; it does not alter source events. The current CLI
 # importer implements the same identity and collection derivation, and retains
@@ -16,39 +17,47 @@ input:
       - jsonl
       - federation-response
 
-identity:
-  pointer: /event_id
-  type: string
-  required: true
-  node_id:
-    algorithm: blake3-128
-    input: utf8
-  rationale: >-
-    Matrix event_id is the immutable protocol identity used by prev_events,
-    auth_events, federation APIs, and state references.
+record:
+  identity:
+    pointer: /event_id
+    type: string
+    required: true
+    node_id:
+      algorithm: blake3-128
+      input: utf8
+    rationale: >-
+      Matrix event_id is the immutable protocol identity used by prev_events,
+      auth_events, federation APIs, and state references.
+  payload:
+    mode: source
+    pointer: /
+    rationale: >-
+      Preserve the complete received event, including signatures, hashes,
+      unsigned data, unknown fields, and protocol extensions.
 
 collection:
   kind: room
-  pointer: /room_id
-  type: string
-  required: true
-  friendly_id:
+  key:
+    pointer: /room_id
+    type: string
+    required: true
+    collection_id:
+      algorithm: blake3-128
+      input: utf8
+    override: explicit-collection-id
+  display_id:
     pointer: /room_id
     display: source-value
-  collection_id:
-    algorithm: blake3-128
-    input: utf8
-  override: explicit-collection-id
 
-collection_metadata:
+metadata:
   persistence: collection-sidecar
   fields:
     kind:
       value: room
     room_id:
-      source: collection.friendly_id
+      source: collection.display_id
     origin_domain:
-      source: collection.friendly_id
+      source: collection.display_id
       transform: matrix-room-id-server-name
     room_version:
       source: primordial:/content/room_version
@@ -67,7 +76,7 @@ primordial:
     /state_key: ""
   membership:
     any_of:
-      - record:/room_id equals collection.friendly_id
+      - record_key_equals_collection_key: true
       - referenced_by: /auth_events
   uniqueness: exactly-one
   reject_collection_if_missing: true
@@ -75,128 +84,20 @@ primordial:
     The create event establishes the room version and creator set. Matrix v12
     create PDUs may omit room_id, so they are associated through auth_events.
 
-# A collection binds one profile from this table when its primordial record is
-# accepted. The binding is immutable collection metadata: later events do not
-# get to reinterpret their event IDs under a different room version.
-room_version_profiles:
-  "1":
-    event_id:
-      format: server-assigned
-      field_is_in_reference_hash: true
-      verification: cannot-rederive-from-event
-    room_id:
-      format: server-assigned
-      origin_domain: required
-    state_resolution: v1
-    canonical_json:
-      strict_numbers: false
-    redaction: v1-v5
-  "2":
-    event_id:
-      format: server-assigned
-      field_is_in_reference_hash: true
-      verification: cannot-rederive-from-event
-    room_id:
-      format: server-assigned
-      origin_domain: required
-    state_resolution: v2
-    canonical_json:
-      strict_numbers: false
-    redaction: v1-v5
-  "3":
-    event_id:
-      format: reference-hash
-      algorithm: sha256
-      preimage: canonical-redacted-json
-      wire_encoding: unpadded-standard-base64
-      verification: required-for-verified-import
-    room_id:
-      format: server-assigned
-      origin_domain: required
-    state_resolution: v2
-    canonical_json:
-      strict_numbers: false
-    redaction: v1-v5
-  "4-5":
-    event_id:
-      format: reference-hash
-      algorithm: sha256
-      preimage: canonical-redacted-json
-      wire_encoding: unpadded-url-safe-base64
-    room_id: { format: server-assigned, origin_domain: required }
-    state_resolution: v2
-    canonical_json: { strict_numbers: false }
-    redaction: v1-v5
-  "6-8":
-    event_id: { format: reference-hash, wire_encoding: unpadded-url-safe-base64 }
-    room_id: { format: server-assigned, origin_domain: required }
-    state_resolution: v2
-    canonical_json: { strict_numbers: true }
-    redaction: v6-v8
-    capabilities: { knock: "7+", restricted_join: "8+" }
-  "9-10":
-    event_id: { format: reference-hash, wire_encoding: unpadded-url-safe-base64 }
-    room_id: { format: server-assigned, origin_domain: required }
-    state_resolution: v2
-    canonical_json: { strict_numbers: true }
-    redaction: v9-v10
-    capabilities: { knock: true, restricted_join: true, knock_restricted_join: "10+" }
-  "11":
-    event_id: { format: reference-hash, wire_encoding: unpadded-url-safe-base64 }
-    room_id: { format: server-assigned, origin_domain: required }
-    state_resolution: v2
-    canonical_json: { strict_numbers: true }
-    redaction: v11-plus
-  "12":
-    event_id: { format: reference-hash, wire_encoding: unpadded-url-safe-base64 }
-    room_id: { format: create-event-id }
-    state_resolution: v2.1
-    canonical_json: { strict_numbers: true }
-    redaction: v11-plus
-    create_rules: { additional_creators: true, room_id_omitted_on_create: true }
-
-# Archive import validates only what is necessary to identify and correctly
-# namespace a stored source record. Verified import additionally proves that
-# the protocol identity and signatures are valid. State resolution is a third,
-# separate consumer of the stored graph; it must not be implied by successful
-# archival import.
-validation_profiles:
-  archive:
-    require:
-      - valid-json
-      - identity
-      - collection-membership
-      - primordial-record-for-new-collection
-    retain: source
-    verify_reference_hash: false
-    verify_signatures: false
-    evaluate_auth: false
-    apply_redaction: false
-  verified:
-    extends: archive
-    verify_reference_hash: true
-    verify_signatures: true
-    # Redaction is an input to canonical-redacted JSON, so it is required for
-    # reference-hash and signature verification. It never replaces the stored
-    # source object.
-    redaction_for_verification: true
-    evaluate_auth: false
-  state-resolution:
-    extends: verified
-    evaluate_auth: true
-    state_resolution: required
-    redacted_view: derived-only
-
-retention:
-  mode: source
-  pointer: /
-  keep:
-    - "*"
-  skip: []
-  rationale: >-
-    Preserve the complete received event, including signatures, hashes,
-    unsigned data, unknown fields, and protocol extensions. This is an archive,
-    not a redaction or fixture-normalization pass.
+extensions:
+  matrix:
+    # This is an immutable collection binding, not a generic-template field.
+    room_version:
+      source: primordial:/content/room_version
+      default: "1"
+      policy: mtxdb-core::MatrixRoomVersion
+    # The Rust policy supplies the versioned Matrix rules: v1–v2 assigned IDs;
+    # v3 standard Base64 reference hashes; v4+ URL-safe hashes; canonical
+    # numbers from v6; versioned redaction; and v12 room-ID derivation.
+    validation_profiles:
+      archive: { verify_reference_hash: false, verify_signatures: false }
+      verified: { verify_reference_hash: true, verify_signatures: true }
+      state-resolution: { evaluate_auth: true, state_resolution: required }
 
 relationships:
   - name: prev-events
@@ -215,7 +116,7 @@ validation:
 # Projection is deliberately not enabled above. A derived-cache template would
 # use this shape, with every retained field named explicitly:
 #
-# retention:
-#   mode: projection
-#   include: [/event_id, /room_id, /type, /sender, /state_key, /content]
-#   skip: [/unsigned, /signatures]
+# record:
+#   payload:
+#     mode: projection
+#     include: [/event_id, /room_id, /type, /sender, /state_key, /content]

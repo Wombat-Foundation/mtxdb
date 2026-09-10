@@ -1,0 +1,70 @@
+# Generic collection-template language, version 1.
+#
+# This is a schema-shaped reference, not an application template. Replace each
+# <...> value when defining a concrete profile. Protocol-specific rules belong
+# below `extensions.<protocol-name>`, never in the generic vocabulary.
+format: mtxdb.collection-template/v1
+name: <template-name>
+version: 1
+
+input:
+  encoding: json
+  framing: jsonl
+
+record:
+  identity:
+    # RFC 6901 JSON Pointer to the stable source-level record identity.
+    pointer: /<record-id>
+    type: string
+    required: true
+    node_id:
+      algorithm: blake3-128
+      input: utf8
+  payload:
+    # `source` stores the entire received record. `projection` requires an
+    # explicit allow-list and is intended only for derived caches.
+    mode: source
+    pointer: /
+
+collection:
+  # Application-defined label; mtxdb itself does not interpret this value.
+  kind: <collection-kind>
+  key:
+    pointer: /<collection-key>
+    type: string
+    required: true
+    collection_id:
+      algorithm: blake3-128
+      input: utf8
+    override: explicit-collection-id
+  # A source-facing identifier. It is distinct from the internal digest key.
+  display_id:
+    pointer: /<collection-key>
+    display: source-value
+
+# Set `required_for_collection_creation` only when a collection cannot be
+# meaningfully admitted without an establishing record.
+primordial:
+  required_for_collection_creation: false
+  selector: {}
+  membership:
+    record_key_equals_collection_key: true
+  uniqueness: at-most-one
+  reject_collection_if_missing: false
+
+# Metadata is persisted with a collection after its primordial record is
+# accepted. Sources may be a record pointer, collection.display_id, or a
+# template extension expression.
+metadata:
+  persistence: collection-sidecar
+  fields: {}
+
+relationships: []
+
+validation:
+  on_missing_identity: reject_record
+  on_missing_collection: reject_record
+  on_invalid_json: reject_record
+  report: per-input-summary
+
+extensions: {}

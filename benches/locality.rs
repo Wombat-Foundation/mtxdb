@@ -121,6 +121,85 @@ impl ZipfianCollectionSampler {
     }
 }
 
+// ── OS-level I/O counters ───────────────────────────────────────────
+
+/// Point-in-time snapshot of this process's page-fault and read-syscall
+/// counters, used to approximate "random seeks" against the mmap-backed
+/// packfiles. Reads here go through `mmap`, not `pread`/`read`, so a
+/// major page fault — the kernel pulling a page in from the backing file
+/// because it wasn't already resident — is the closest analog this
+/// engine has to a physical random seek; `read_syscalls` is reported
+/// alongside it mostly to show it stays flat (proving the mmap path
+/// really is the one doing the work).
+///
+/// Linux-only (`/proc/self/stat`, `/proc/self/io`); `capture` returns
+/// `None` everywhere else.
+#[derive(Debug, Clone, Copy, Default)]
+struct IoSnapshot {
+    major_faults: u64,
+    minor_faults: u64,
+    read_syscalls: u64,
+}
+
+impl IoSnapshot {
+    #[cfg(target_os = "linux")]
+    fn capture() -> Option<Self> {
+        // /proc/self/stat's `comm` field (2nd, parenthesized) can itself
+        // contain spaces or parens, so locate fields by splitting after
+        // the *last* ')' rather than by raw whitespace index.
+        let stat = fs::read_to_string("/proc/self/stat").ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        // After the comm field, `state` is field 3 (index 0), so
+        // minflt (field 10) is index 7 and majflt (field 12) is index 9.
+        let minor_faults = fields.get(7)?.parse().ok()?;
+        let major_faults = fields.get(9)?.parse().ok()?;
+
+        // Best-effort: some kernels/containers lack task I/O accounting,
+        // in which case just report 0 read syscalls rather than losing
+        // the fault counts above too.
+        let read_syscalls = fs::read_to_string("/proc/self/io")
+            .ok()
+            .and_then(|io| {
+                io.lines()
+                    .find_map(|line| line.strip_prefix("syscr:"))
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(0);
+
+        Some(Self {
+            major_faults,
+            minor_faults,
+            read_syscalls,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn capture() -> Option<Self> {
+        None
+    }
+
+    /// Counters accumulated between an earlier snapshot and `self`.
+    fn delta(self, earlier: Self) -> Self {
+        Self {
+            major_faults: self.major_faults.saturating_sub(earlier.major_faults),
+            minor_faults: self.minor_faults.saturating_sub(earlier.minor_faults),
+            read_syscalls: self.read_syscalls.saturating_sub(earlier.read_syscalls),
+        }
+    }
+}
+
+fn print_io_delta(delta: Option<IoSnapshot>) {
+    match delta {
+        Some(d) => {
+            println!("  Major page faults:    {} (~random seeks)", d.major_faults);
+            println!("  Minor page faults:    {}", d.minor_faults);
+            println!("  Read syscalls:        {}", d.read_syscalls);
+        }
+        None => println!("  Page fault/syscall counters unavailable (Linux only)"),
+    }
+}
+
 // ── Cache eviction ─────────────────────────────────────────────────
 
 fn drop_caches_for_dir(dir: &Path) -> bool {
@@ -204,6 +283,7 @@ pub fn run_stage1_locality_benchmark(
     let evicted_pre = drop_caches_for_dir(&temp_dir);
 
     let store_pre = PackfileStorage::open_read_only(temp_dir.clone()).unwrap();
+    let pre_io_before = IoSnapshot::capture();
     let pre_start = Instant::now();
     let mut pre_found = 0;
 
@@ -217,6 +297,9 @@ pub fn run_stage1_locality_benchmark(
         }
     }
     let pre_latency = pre_start.elapsed();
+    let pre_io_delta = pre_io_before
+        .zip(IoSnapshot::capture())
+        .map(|(b, a)| a.delta(b));
 
     let pre_packs_touched = store_pre
         .collection_referenced_pack_ids(&sampler.elephant_id())
@@ -232,6 +315,7 @@ pub fn run_stage1_locality_benchmark(
     );
     println!("  Pre-Repack Latency:   {pre_latency:.2?}");
     println!("  Pack IDs Referenced:  {pre_packs_touched}");
+    print_io_delta(pre_io_delta);
 
     // --- Phase C: Batch Repack ---
     println!("\n[3/4] Executing Batch Repack...");
@@ -260,6 +344,7 @@ pub fn run_stage1_locality_benchmark(
     let evicted_post = drop_caches_for_dir(&temp_dir);
 
     let store_post = PackfileStorage::open_read_only(temp_dir.clone()).unwrap();
+    let post_io_before = IoSnapshot::capture();
     let post_start = Instant::now();
     let mut post_found = 0;
 
@@ -273,6 +358,9 @@ pub fn run_stage1_locality_benchmark(
         }
     }
     let post_latency = post_start.elapsed();
+    let post_io_delta = post_io_before
+        .zip(IoSnapshot::capture())
+        .map(|(b, a)| a.delta(b));
     let post_packs_touched = store_post
         .collection_referenced_pack_ids(&sampler.elephant_id())
         .len();
@@ -287,6 +375,7 @@ pub fn run_stage1_locality_benchmark(
     );
     println!("  Post-Repack Latency:  {post_latency:.2?}");
     println!("  Pack IDs Referenced:  {post_packs_touched}");
+    print_io_delta(post_io_delta);
 
     // --- Summary ---
     println!("\n═══════════════════════════════════════════════════════════════");
@@ -303,6 +392,16 @@ pub fn run_stage1_locality_benchmark(
     println!("  ───────────────────────────────────────────────────────────");
     println!("  Pack IDs:             {initial_pack_count} -> {post_pack_count}");
     println!("  Latency:              {pre_latency:.2?} -> {post_latency:.2?}");
+    if let (Some(pre_io), Some(post_io)) = (pre_io_delta, post_io_delta) {
+        println!(
+            "  Major page faults:    {} -> {} (~random seeks)",
+            pre_io.major_faults, post_io.major_faults
+        );
+        println!(
+            "  Read syscalls:        {} -> {}",
+            pre_io.read_syscalls, post_io.read_syscalls
+        );
+    }
     println!(
         "  Speedup:              {:.2}x",
         pre_latency.as_secs_f64() / post_latency.as_secs_f64()
