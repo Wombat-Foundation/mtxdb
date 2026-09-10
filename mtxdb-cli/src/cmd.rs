@@ -2188,7 +2188,7 @@ mod tests {
                     &mut file,
                     &Record {
                         collection_id,
-                        hash: [index as u8; 16],
+                        hash: [u8::try_from(index).expect("fixture index fits in u8"); 16],
                         data: Bytes::from_static(b"payload"),
                     },
                 )
