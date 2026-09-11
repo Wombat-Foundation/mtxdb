@@ -113,7 +113,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Info { collection } => cmd_info(cli, collection),
         Commands::Scan { shard } => cmd_scan(cli, shard),
-        Commands::Import { paths, collection } => cmd_import(cli, paths, collection.as_deref()),
+        Commands::Import {
+            paths,
+            collection,
+            template,
+        } => cmd_import(cli, paths, collection.as_deref(), template.as_deref()),
         Commands::Export { collection } => cmd_export(cli, collection),
         Commands::Repack {
             collection,
@@ -1186,7 +1190,11 @@ fn cmd_import(
     cli: &Cli,
     paths: &[std::path::PathBuf],
     collection_override: Option<&str>,
+    template: Option<&Path>,
 ) -> anyhow::Result<()> {
+    if let Some(template) = template {
+        load_matrix_event_template(template)?;
+    }
     // One writer owns the entire batch: it prevents another writer from
     // interleaving halfway through a shell glob, and lets us publish one
     // complete shard/collection snapshot once the final input has been handled.
@@ -1217,6 +1225,83 @@ fn cmd_import(
         bail!("import completed with {failures} failed input file(s)");
     }
     Ok(())
+}
+
+/// Load the executable Matrix archive profile. The importer currently has one
+/// implementation, so accepting a different template would be dishonest: its
+/// identity, membership, and establishment rules must match this profile.
+fn load_matrix_event_template(path: &Path) -> anyhow::Result<()> {
+    let mut bytes =
+        fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
+    let template: OwnedValue = simd_json::to_owned_value(&mut bytes)
+        .with_context(|| format!("template {} is not valid JSON", path.display()))?;
+    let required = [
+        (["format"].as_slice(), "mtxdb.collection-template/v1"),
+        (["name"].as_slice(), "matrix-event-v1"),
+        (
+            ["record", "identity", "extract", "kind"].as_slice(),
+            "json-pointer-rfc-6901",
+        ),
+        (
+            ["record", "identity", "extract", "path"].as_slice(),
+            "/event_id",
+        ),
+        (
+            ["collection", "membership", "extract", "kind"].as_slice(),
+            "json-pointer-rfc-6901",
+        ),
+        (
+            ["collection", "membership", "extract", "path"].as_slice(),
+            "/room_id",
+        ),
+    ];
+    for (keys, expected) in required {
+        let actual = template_string_at(&template, keys);
+        if actual != Some(expected) {
+            bail!(
+                "template {} must set {} to {:?}, got {:?}",
+                path.display(),
+                keys.join("."),
+                expected,
+                actual
+            );
+        }
+    }
+    if template_bool_at(&template, &["establishment", "required"]) != Some(true) {
+        bail!(
+            "template {} must require an establishment record",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn template_string_at<'a>(value: &'a OwnedValue, keys: &[&str]) -> Option<&'a str> {
+    let mut value = value;
+    for key in keys {
+        let OwnedValue::Object(object) = value else {
+            return None;
+        };
+        value = object.get(*key)?;
+    }
+    match value {
+        OwnedValue::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn template_bool_at(value: &OwnedValue, keys: &[&str]) -> Option<bool> {
+    let mut value = value;
+    for key in keys {
+        let OwnedValue::Object(object) = value else {
+            return None;
+        };
+        value = object.get(*key)?;
+    }
+    match value {
+        OwnedValue::Static(simd_json::StaticNode::Bool(value)) => Some(*value),
+        _ => None,
+    }
 }
 
 /// Export every live JSON record in one collection as a JSONL stream. A read-only
@@ -2045,11 +2130,12 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 mod tests {
     use super::{
         collection_id_for_room, event_room_id, fmt_disk_megabytes, fmt_megabytes,
-        matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
-        parse_pack_selectors, resolve_import_collection,
+        load_matrix_event_template, matrix_batch_has_create, matrix_create_details,
+        parse_pack_id_selector, parse_pack_selectors, resolve_import_collection,
     };
     use simd_json::OwnedValue;
     use std::collections::HashSet;
+    use std::path::Path;
 
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
@@ -2209,6 +2295,14 @@ mod tests {
             resolve_import_collection(&[create], None, None, &HashSet::new()).unwrap();
         assert_eq!(collection_id, collection_id_for_room("!room:example.org"));
         assert!(batch_has_create);
+    }
+
+    #[test]
+    fn checked_in_matrix_template_matches_the_executable_importer() {
+        let template =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../templates/matrix-event-v1.json");
+        load_matrix_event_template(&template)
+            .expect("checked-in Matrix template must be executable");
     }
 
     // `physical_layout`/`avoidable_spread_bytes` coverage now lives with

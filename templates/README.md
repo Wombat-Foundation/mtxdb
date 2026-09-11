@@ -6,9 +6,9 @@ only stores a 16-byte collection ID, a 16-byte node ID, and opaque bytes. A
 template gives an importer enough information to derive those IDs and to state
 which source bytes are retained.
 
-`format: mtxdb.collection-template/v1` is the current format. Its generic
-reference grammar is [`collection-template-v1.yaml`](collection-template-v1.yaml).
-[`matrix-event-v1.yaml`](matrix-event-v1.yaml) is one application profile; it
+`"format": "mtxdb.collection-template/v1"` is the current format. Its generic
+reference grammar is [`collection-template-v1.json`](collection-template-v1.json).
+[`matrix-event-v1.json`](matrix-event-v1.json) is one application profile; it
 does not define the generic vocabulary.
 
 ## Semantics
@@ -18,43 +18,43 @@ does not define the generic vocabulary.
 | `input`                 | Accepted source encoding and record framing.                                                           |
 | `record.identity`       | JSON field used as the logical record identity and the stable digest used for mtxdb's 16-byte node ID. |
 | `record.payload`        | Complete source retention or an explicit derived projection.                                           |
-| `collection.key`        | JSON field that scopes nodes into a collection and the digest used for its 16-byte collection ID.      |
-| `collection.display_id` | User-facing identifier, distinct from the internal digest key.                                         |
+| `collection.membership` | Extractor that scopes nodes into a collection and the digest used for its 16-byte collection ID.       |
+| `collection.labels`     | User-facing identifiers, distinct from the internal digest key.                                        |
 | `metadata`              | Application metadata persisted with the collection.                                                    |
-| `primordial`            | The record that establishes a collection's metadata and invariants before it may be created.           |
-| `relationships`         | Optional reference fields used for graph traversal; they do not change the stored object.              |
+| `establishment`         | The record that establishes a collection's metadata and invariants before it may be created.           |
+| `edges`                 | Optional typed references used for graph traversal; they do not change the stored object.              |
 | `validation`            | Required fields and the defined behaviour for records that do not meet the template.                   |
 | `extensions`            | Namespaced application policy; the generic storage engine does not interpret it.                       |
 
-JSON paths are RFC 6901 JSON Pointers. `"/event_id"` therefore identifies a
+Extractors explicitly name their syntax. `"json-pointer-rfc-6901"` paths such as `"/event_id"` identify a
 top-level `event_id`; `"/"` means the complete source object.
 
 ## Retention policy
 
-`record.payload.mode: source` is the safe default. It preserves unknown fields, signatures,
+`record.payload.policy: retain-source` is the safe default. It preserves unknown fields, signatures,
 hashes, `unsigned`, and future protocol extensions. It is appropriate whenever
 the database is an archive or an interchange format.
 
-`record.payload.mode: projection` is opt-in and requires an explicit `include` list. It is
+`record.payload.policy: projection` is opt-in and requires an explicit `include` list. It is
 for derived caches only: omitting a field is a data-model decision and must not
 be presented as a lossless import. A template must never use an implicit
 deny-list or silently discard fields it does not recognize.
 
-## Collection metadata and primordial records
+## Collection metadata and establishment records
 
 The 16-byte collection ID in a pack frame is an internal digest key, never the
 collection's user-facing name. `collection.display_id` declares the source
 identifier shown by user interfaces and exports. `metadata` is persisted
 with the collection rather than inferred from arbitrary later records.
 
-Templates that need collection-wide invariants declare a `primordial` rule. A
+Templates that need collection-wide invariants declare an `establishment` rule. A
 new collection is admitted only after one record matches that rule and its
 metadata can be extracted. Subsequent partial imports may use existing,
-validated metadata, but cannot create a new collection without the primordial
+validated metadata, but cannot create a new collection without the establishment
 record. This avoids accepting a disconnected fragment as if it described a
 complete collection.
 
-For Matrix, the primordial record is the `m.room.create` state event with an
+For Matrix, the establishment record is the `m.room.create` state event with an
 empty `state_key`. Room-version-12 create PDUs can omit `room_id`, so membership
 is established from another room record's `auth_events` reference to the create
 event, rather than requiring `room_id` on the create PDU itself.

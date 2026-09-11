@@ -42,6 +42,7 @@ pub(crate) enum Commands {
     Import {
         paths: Vec<PathBuf>,
         collection: Option<String>,
+        template: Option<PathBuf>,
     },
     Export {
         collection: String,
@@ -230,6 +231,12 @@ fn sub_import() -> Command {
                 .long("collection")
                 .help("Collection ID (hex, 32 chars). Auto-detected if omitted"),
         )
+        .arg(
+            Arg::new("template")
+                .long("template")
+                .value_name("FILE")
+                .help("JSON collection template; currently supports matrix-event-v1"),
+        )
 }
 
 fn sub_export() -> Command {
@@ -378,6 +385,7 @@ fn parse_cli() -> Cli {
                 .map(PathBuf::from)
                 .collect(),
             collection: m.get_one::<String>("collection").cloned(),
+            template: m.get_one::<String>("template").map(PathBuf::from),
         },
         Some(("export", m)) => Commands::Export {
             collection: m.get_one::<String>("collection").unwrap().clone(),
