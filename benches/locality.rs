@@ -15,12 +15,14 @@
     clippy::uninlined_format_args
 )]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use mtxdb_core::packfile::{self, storage::PackfileStorage};
+use mtxdb_core::shard::ShardPool;
 use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
 
 const MAX_DATA_LEN: usize = 65535 - 100;
@@ -303,6 +305,83 @@ fn count_segments(base_dir: &Path, collection_id: &[u8; 16]) -> u64 {
         .ok()
         .and_then(|layout| layout.collections.get(collection_id).map(|c| c.segments))
         .unwrap_or(0)
+}
+
+/// Prototype of "intra-shard compaction on fill": reads every record
+/// physically in `shard_path` and writes a fresh pack file to
+/// `dest_path` containing the same records reordered so each
+/// collection's own entries are contiguous. Entirely local to this one
+/// shard — no reachability walk, no `live_roots`/`extract_edges`
+/// callback, no other shard or collection touched, and no record ever
+/// dropped (this is pure reorganization, not GC; unlike
+/// `repack_collection_reachable`'s full-closure walk, this has no way
+/// to know what's live, so it can't reclaim space — only real GC via
+/// the existing `needs_repack`/`repack_collection_reachable` path can).
+/// That's what makes this operation's cost bounded by one shard's own
+/// size, not by the total footprint of every collection that happens
+/// to have a record in it: the whole point of scoping it this way.
+///
+/// Deliberately uses only the public API surface a real caller would
+/// have: `scan_packfile` for the physical layout, and `store.get` (the
+/// already-open store's ordinary read path — cache/index, not raw
+/// frame parsing) for payload bytes. Written to a *separate* directory
+/// rather than swapped into the live store, since safely retiring the
+/// original shard would need index-update machinery this prototype
+/// intentionally doesn't touch.
+///
+/// Returns `(records_written, bytes_written, wall_time)`.
+fn compact_shard_intra(
+    store: &PackfileStorage,
+    shard_path: &Path,
+    dest_path: &Path,
+    dest_pack_id: u64,
+) -> std::io::Result<(usize, u64, Duration)> {
+    let start = Instant::now();
+    let entries = packfile::scan_packfile(shard_path)?;
+
+    // Group by collection_id, preserving each collection's first-seen
+    // order. Grouping — not any fancier reordering — is the entire
+    // point: turn N interleaved runs per collection into 1.
+    let mut order: Vec<[u8; 16]> = Vec::new();
+    let mut by_collection: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
+    for (collection_id, hash, _offset) in entries {
+        by_collection
+            .entry(collection_id)
+            .or_insert_with(|| {
+                order.push(collection_id);
+                Vec::new()
+            })
+            .push(hash);
+    }
+
+    let mut file = fs::File::create(dest_path)?;
+    packfile::write_header(&mut file, dest_pack_id)?;
+
+    let mut records_written = 0usize;
+    let mut bytes_written = 0u64;
+    for collection_id in &order {
+        for hash in &by_collection[collection_id] {
+            // A record scan_packfile just reported should always still
+            // be gettable through the live store's own index moments
+            // later — skip gracefully rather than unwrap, since this is
+            // a prototype measuring locality, not a correctness-critical
+            // path.
+            let Some(data) = store
+                .get(collection_id, hash)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+            else {
+                continue;
+            };
+            let record = packfile::Record {
+                collection_id: *collection_id,
+                hash: *hash,
+                data: data.bytes,
+            };
+            bytes_written += packfile::write_record(&mut file, &record)?;
+            records_written += 1;
+        }
+    }
+    Ok((records_written, bytes_written, start.elapsed()))
 }
 
 // ── Cache eviction ─────────────────────────────────────────────────
@@ -700,6 +779,130 @@ pub fn run_stage1_locality_benchmark(
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+/// Prototype: what would happen if every shard were compacted
+/// (`compact_shard_intra`) the moment it filled, during the *same*
+/// ingest as Phase B — instead of leaving interleaved shards untouched
+/// until an explicit batch repack? Runs Phase B's exact ingest
+/// (50,000 records / 500 collections, default ~256 MB cap), then
+/// compacts each of the resulting shards independently into a
+/// *separate* directory (not swapped into the live store — see
+/// `compact_shard_intra`'s docs for why), and reports the elephant
+/// collection's fragmentation before/after alongside the compaction's
+/// own cost, to check whether it's actually cheap and bounded per
+/// shard rather than scaling with total store size the way a full
+/// batch repack does.
+pub fn run_stage1_intra_shard_compaction_prototype() {
+    let total_records = 50_000;
+    let collection_count = 500;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "mtxdb_stage1_locality_compact_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let sampler = ZipfianCollectionSampler::new(collection_count);
+    let mut payload_gen = PseudoRandomPayload::new(0xDEAD_BEEF);
+
+    println!("\n[1/3] Ingesting the same Zipfian workload as Phase B (50,000 records / 500 collections)...");
+    let store = PackfileStorage::open(temp_dir.clone()).unwrap();
+    for i in 0..total_records {
+        let collection = sampler.sample(i);
+        let nid = node_id(i);
+        let payload_size = (1024 + (i % 30) * 1024).min(MAX_DATA_LEN);
+        let payload = payload_gen.generate_bytes(payload_size);
+        store
+            .put(&collection, &nid, &NodeData::new(Bytes::from(payload)))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+
+    let summaries = store.shard_summaries();
+    row("Rotated packs:", summaries.len());
+
+    let pre_layout = packfile::layout::physical_layout(&temp_dir).unwrap();
+    let pre_stats = pre_layout.collections.get(&sampler.elephant_id());
+    let pre_segments = pre_stats.map_or(0, |c| c.segments);
+    let pre_packs_referenced = pre_stats.map_or(0, |c| c.pack_bytes.len());
+    row("Packs referenced (before):", pre_packs_referenced);
+    row("Segments (before):", pre_segments);
+
+    println!(
+        "\n[2/3] Compacting each shard's own contents (grouped by collection) \
+         independently — no other shard touched..."
+    );
+    let compacted_dir = temp_dir.join("compacted");
+    fs::create_dir_all(&compacted_dir).unwrap();
+
+    let mut total_records_written = 0usize;
+    let mut total_bytes_written = 0u64;
+    let mut total_time = Duration::ZERO;
+    for summary in &summaries {
+        let shard_path = ShardPool::pack_path(&temp_dir, summary.pack_id);
+        let dest_path = ShardPool::pack_path(&compacted_dir, summary.pack_id);
+        let (records, bytes, time) =
+            compact_shard_intra(&store, &shard_path, &dest_path, summary.pack_id).unwrap();
+        subrow(
+            &format!("shard {:#06x}:", summary.pack_id),
+            format!("{records} records, {} in {time:.2?}", format_bytes(bytes)),
+        );
+        total_records_written += records;
+        total_bytes_written += bytes;
+        total_time += time;
+    }
+    row(
+        "Compaction total:",
+        format!(
+            "{total_records_written} records, {} across {} independent shards in {total_time:.2?}",
+            format_bytes(total_bytes_written),
+            summaries.len()
+        ),
+    );
+
+    println!("\n[3/3] Measuring the compacted copy's layout (not swapped into the live store)...");
+    let post_layout = packfile::layout::physical_layout(&compacted_dir).unwrap();
+    let post_stats = post_layout.collections.get(&sampler.elephant_id());
+    let post_segments = post_stats.map_or(0, |c| c.segments);
+    let post_packs_referenced = post_stats.map_or(0, |c| c.pack_bytes.len());
+
+    println!("\n═══════════════════════════════════════════════════════════════");
+    println!("  PHASE D: INTRA-SHARD COMPACTION-ON-FILL PROTOTYPE");
+    println!("═══════════════════════════════════════════════════════════════");
+    row("Total records:", total_records);
+    row("Collections:", collection_count);
+    row("Shards:", summaries.len());
+    println!("  ───────────────────────────────────────────────────────────");
+    row(
+        "Packs referenced:",
+        format!(
+            "{pre_packs_referenced} -> {post_packs_referenced} \
+             (unchanged: compaction never moves data between shards)"
+        ),
+    );
+    row(
+        "Segments:",
+        format!("{pre_segments} -> {post_segments} (pure local reordering)"),
+    );
+    row(
+        "Compaction cost:",
+        format!(
+            "{total_records_written} records / {} / {total_time:.2?}, \
+             {} independent per-shard passes",
+            format_bytes(total_bytes_written),
+            summaries.len()
+        ),
+    );
+    println!("═══════════════════════════════════════════════════════════════");
+
+    // Drop before removing the directory, not after: `ShardPool`'s
+    // `Drop` impl does its own best-effort final stats flush, which
+    // would otherwise fail (and print a stderr warning) trying to
+    // write into a directory that's already gone.
+    drop(store);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 fn main() {
     println!("mtxdb stage 1 locality benchmark");
     if vmtouch_on_path() {
@@ -733,4 +936,15 @@ fn main() {
     // latency/page-faults/syscalls should drop accordingly.
     println!("\n\n### Phase C: compact tiny packs into ~256 MB packs ###");
     run_stage1_locality_benchmark(800, 20, Some(32 * 1024), None);
+
+    // Phase B's batch repack fixed cross-collection interleaving only by
+    // rewriting each collection's *entire* reachable set, wherever it
+    // physically lives — a full-closure operation whose cost scales with
+    // total store size (759 MB / 97K read syscalls just to open it).
+    // This phase asks a narrower question: does *purely local*
+    // compaction — reorganize one shard's own contents by collection,
+    // touch nothing else — get most of the same fragmentation win for a
+    // cost bounded by that one shard's size instead?
+    println!("\n\n### Phase D: intra-shard compaction on fill (prototype) ###");
+    run_stage1_intra_shard_compaction_prototype();
 }
