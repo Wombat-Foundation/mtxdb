@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use bytes::Bytes;
-use mtxdb_core::packfile::storage::PackfileStorage;
+use mtxdb_core::packfile::{self, storage::PackfileStorage};
 use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
 
 const MAX_DATA_LEN: usize = 65535 - 100;
@@ -281,6 +281,30 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+// ── Fragmentation ───────────────────────────────────────────────────
+
+/// Counts the number of maximal contiguous runs of `collection_id`'s own
+/// records across the true physical on-disk layout of every shard in
+/// `base_dir` — a sharper fragmentation signal than `Pack IDs Referenced`
+/// (distinct files touched), since a collection's records can be
+/// non-contiguous *within* a single shard file too: multiple collections
+/// sharing one "home" shard interleave their writes at the byte level,
+/// so one collection's data can show up as many small scattered runs
+/// even inside a single file. Repacking should collapse many such runs
+/// (e.g. hundreds, spread across many files) into one contiguous run in
+/// one file.
+///
+/// Delegates to `mtxdb_core::packfile::layout::physical_layout` — the
+/// same scan `mtxdb collections --layout`'s `runs` column uses — rather
+/// than reimplementing the scan here, so both stay backed by one
+/// canonical implementation instead of two that could silently drift.
+fn count_segments(base_dir: &Path, collection_id: &[u8; 16]) -> u64 {
+    packfile::layout::physical_layout(base_dir)
+        .ok()
+        .and_then(|layout| layout.collections.get(collection_id).map(|c| c.segments))
+        .unwrap_or(0)
+}
+
 // ── Cache eviction ─────────────────────────────────────────────────
 
 /// Outcome of attempting to evict `dir`'s page-cache contents via
@@ -465,6 +489,7 @@ pub fn run_stage1_locality_benchmark(
     let pre_packs_touched = store_pre
         .collection_referenced_pack_ids(&sampler.elephant_id())
         .len();
+    let pre_segments = count_segments(&temp_dir, &sampler.elephant_id());
 
     row("Cache state:", evicted_pre.cache_state_label());
     evicted_pre.warn_if_not_evicted();
@@ -478,6 +503,7 @@ pub fn run_stage1_locality_benchmark(
         format!("{pre_latency:.2?} (elephant only)"),
     );
     subrow("packs referenced:", pre_packs_touched);
+    subrow("segments:", pre_segments);
     print_io_delta(pre_io_delta);
 
     // --- Phase C: Batch Repack ---
@@ -546,6 +572,7 @@ pub fn run_stage1_locality_benchmark(
     let post_packs_touched = store_post
         .collection_referenced_pack_ids(&sampler.elephant_id())
         .len();
+    let post_segments = count_segments(&temp_dir, &sampler.elephant_id());
 
     row("Cache state:", evicted_post.cache_state_label());
     evicted_post.warn_if_not_evicted();
@@ -559,6 +586,7 @@ pub fn run_stage1_locality_benchmark(
         format!("{post_latency:.2?} (elephant only)"),
     );
     subrow("packs referenced:", post_packs_touched);
+    subrow("segments:", post_segments);
     print_io_delta(post_io_delta);
 
     // --- Summary ---
@@ -599,6 +627,27 @@ pub fn run_stage1_locality_benchmark(
                 format_bytes(post_open_io.disk_read_bytes)
             ),
         );
+        subrow(
+            "minor faults:",
+            format!(
+                "{} -> {}",
+                pre_open_io.minor_faults, post_open_io.minor_faults
+            ),
+        );
+        subrow(
+            "major faults:",
+            format!(
+                "{} -> {}",
+                pre_open_io.major_faults, post_open_io.major_faults
+            ),
+        );
+        subrow(
+            "read syscalls:",
+            format!(
+                "{} -> {}",
+                pre_open_io.read_syscalls, post_open_io.read_syscalls
+            ),
+        );
     }
     row(
         "Query latency:",
@@ -608,6 +657,7 @@ pub fn run_stage1_locality_benchmark(
         "packs referenced:",
         format!("{pre_packs_touched} -> {post_packs_touched}"),
     );
+    subrow("segments:", format!("{pre_segments} -> {post_segments}"));
     if let (Some(pre_io), Some(post_io)) = (pre_io_delta, post_io_delta) {
         subrow(
             "disk read:",

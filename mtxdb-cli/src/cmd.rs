@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
+use mtxdb_core::packfile::layout::{
+    avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout,
+};
 use mtxdb_core::shard::ShardPool;
 use mtxdb_core::storage::{NodeData, StorageEngine};
 use mtxdb_core::{DatabaseLayout, PackfileStorage, ShardType};
@@ -72,143 +75,6 @@ fn fmt_disk_megabytes(bytes: u64) -> String {
         fraction = 0;
     }
     format!("{whole}.{fraction:03} MB")
-}
-
-/// Raw, on-disk layout. It intentionally includes superseded frames: this is
-/// the physical interleaving a sequential scan sees, not a claim about a
-/// collection's live index footprint.
-#[derive(Default)]
-struct PhysicalLayout {
-    collections: HashMap<[u8; 16], CollectionPhysicalLayout>,
-    packs: HashMap<u64, PackPhysicalLayout>,
-}
-
-#[derive(Default)]
-struct CollectionPhysicalLayout {
-    disk_bytes: u64,
-    pack_bytes: HashMap<u64, u64>,
-    segments: u64,
-    largest_segment_bytes: u64,
-}
-
-#[derive(Default)]
-struct PackPhysicalLayout {
-    collections: HashSet<[u8; 16]>,
-    segments: u64,
-    largest_segment_bytes: u64,
-}
-
-/// Scan physical frame placement without allocating payloads. A torn active
-/// tail is ignored, just as the ordinary disk accounting scan does.
-fn physical_layout(dir: &Path) -> anyhow::Result<PhysicalLayout> {
-    // 1-byte flags + 4-byte uncompressed_len + 16-byte collection_id + 16-byte
-    // hash — the fixed part of a v3 frame's payload, preceding the
-    // (possibly zstd-compressed) node bytes.
-    const FRAME_FIXED_LEN: u64 = 1 + 4 + 16 + 16;
-
-    let mut layout = PhysicalLayout::default();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if !path
-            .extension()
-            .is_some_and(|extension| extension == "pack")
-        {
-            continue;
-        }
-        let file = fs::File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let Some(header) = mtxdb_core::packfile::read_header(&mut reader)? else {
-            continue;
-        };
-        let pack_id = header.pack_id;
-        let mut current_run: Option<([u8; 16], u64)> = None;
-        let mut discard = [0_u8; 8192];
-        loop {
-            let mut len = [0_u8; 4];
-            match reader.read_exact(&mut len) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error.into()),
-            }
-            let frame_len = u64::from(u32::from_le_bytes(len));
-            if !(FRAME_FIXED_LEN..=u64::from(mtxdb_core::packfile::MAX_RECORD_LEN))
-                .contains(&frame_len)
-            {
-                bail!("invalid record length {frame_len} while measuring collection disk usage");
-            }
-            // Skip the flags byte and uncompressed_len field to reach collection_id
-            // — this scan only needs the collection ID, not whether/how the node
-            // bytes that follow are compressed.
-            let mut flags_and_uncompressed_len = [0_u8; 5];
-            match reader.read_exact(&mut flags_and_uncompressed_len) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error.into()),
-            }
-            let mut collection_id = [0_u8; 16];
-            match reader.read_exact(&mut collection_id) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error.into()),
-            }
-            let mut remaining = frame_len.saturating_sub(21).saturating_add(4);
-            let mut complete = true;
-            while remaining != 0 {
-                let chunk_len = usize::try_from(remaining)
-                    .unwrap_or(usize::MAX)
-                    .min(discard.len());
-                match reader.read_exact(&mut discard[..chunk_len]) {
-                    Ok(()) => remaining = remaining.saturating_sub(chunk_len as u64),
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                        complete = false;
-                        break;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            // A concurrent append may expose a torn tail. If the final read
-            // was short, leave it for the next listing once it is complete.
-            if !complete {
-                break;
-            }
-            let record_bytes = frame_len.saturating_add(8);
-            let collection = layout.collections.entry(collection_id).or_default();
-            collection.disk_bytes = collection.disk_bytes.saturating_add(record_bytes);
-            let pack_bytes = collection.pack_bytes.entry(pack_id).or_default();
-            *pack_bytes = pack_bytes.saturating_add(record_bytes);
-            layout
-                .packs
-                .entry(pack_id)
-                .or_default()
-                .collections
-                .insert(collection_id);
-
-            match &mut current_run {
-                Some((run_collection, run_bytes)) if *run_collection == collection_id => {
-                    *run_bytes = run_bytes.saturating_add(record_bytes);
-                }
-                Some(_) => {
-                    finish_physical_run(&mut layout, pack_id, current_run.take());
-                    current_run = Some((collection_id, record_bytes));
-                }
-                None => current_run = Some((collection_id, record_bytes)),
-            }
-        }
-        finish_physical_run(&mut layout, pack_id, current_run);
-    }
-    Ok(layout)
-}
-
-fn finish_physical_run(layout: &mut PhysicalLayout, pack_id: u64, run: Option<([u8; 16], u64)>) {
-    let Some((collection_id, bytes)) = run else {
-        return;
-    };
-    let collection = layout.collections.entry(collection_id).or_default();
-    collection.segments = collection.segments.saturating_add(1);
-    collection.largest_segment_bytes = collection.largest_segment_bytes.max(bytes);
-    let pack = layout.packs.entry(pack_id).or_default();
-    pack.segments = pack.segments.saturating_add(1);
-    pack.largest_segment_bytes = pack.largest_segment_bytes.max(bytes);
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -420,18 +286,6 @@ fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> an
         return Ok(());
     }
     cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, sort)
-}
-
-/// Bytes that could be moved to maximize one collection's largest pack extent.
-fn avoidable_spread_bytes(stats: Option<&CollectionPhysicalLayout>) -> u64 {
-    let Some(stats) = stats else {
-        return 0;
-    };
-    let largest_pack = stats.pack_bytes.values().copied().max().unwrap_or(0);
-    stats
-        .disk_bytes
-        .min(mtxdb_core::shard::MAX_SHARD_BYTES)
-        .saturating_sub(largest_pack)
 }
 
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
@@ -2190,15 +2044,12 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        avoidable_spread_bytes, collection_id_for_room, event_room_id, fmt_disk_megabytes,
-        fmt_megabytes, matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
-        parse_pack_selectors, physical_layout, resolve_import_collection, CollectionPhysicalLayout,
+        collection_id_for_room, event_room_id, fmt_disk_megabytes, fmt_megabytes,
+        matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
+        parse_pack_selectors, resolve_import_collection,
     };
-    use bytes::Bytes;
-    use mtxdb_core::packfile::{write_header, write_record, Record};
     use simd_json::OwnedValue;
     use std::collections::HashSet;
-    use std::fs::File;
 
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
@@ -2360,63 +2211,7 @@ mod tests {
         assert!(batch_has_create);
     }
 
-    #[test]
-    fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
-        let dir = std::env::temp_dir().join(format!(
-            "mtxdb_cli_layout_{}_{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let collection_a = [0xA1; 16];
-        let collection_b = [0xB2; 16];
-        for (pack_id, records) in [
-            (0_u64, vec![collection_a, collection_b, collection_a]),
-            (1_u64, vec![collection_a]),
-        ] {
-            let path = dir.join(format!("pack_{pack_id:016x}.pack"));
-            let mut file = File::create(path).unwrap();
-            write_header(&mut file, pack_id).unwrap();
-            for (index, collection_id) in records.into_iter().enumerate() {
-                write_record(
-                    &mut file,
-                    &Record {
-                        collection_id,
-                        hash: [u8::try_from(index).expect("fixture index fits in u8"); 16],
-                        data: Bytes::from_static(b"payload"),
-                    },
-                )
-                .unwrap();
-            }
-        }
-
-        let layout = physical_layout(&dir).unwrap();
-        let a = &layout.collections[&collection_a];
-        assert_eq!(a.pack_bytes.len(), 2, "A spans two packs");
-        assert_eq!(a.segments, 3, "A-B-A in pack 0 plus A in pack 1");
-        assert_eq!(layout.packs[&0].segments, 3);
-        assert_eq!(layout.packs[&1].segments, 1);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn avoidable_spread_excludes_a_collections_required_spill() {
-        let capacity = mtxdb_core::shard::MAX_SHARD_BYTES;
-        let mut ideal = CollectionPhysicalLayout {
-            disk_bytes: capacity.saturating_add(100),
-            ..CollectionPhysicalLayout::default()
-        };
-        ideal.pack_bytes.insert(0, capacity);
-        ideal.pack_bytes.insert(1, 100);
-        assert_eq!(avoidable_spread_bytes(Some(&ideal)), 0);
-
-        let mut fragmented = ideal;
-        fragmented.pack_bytes.clear();
-        fragmented.pack_bytes.insert(0, capacity / 2);
-        fragmented.pack_bytes.insert(1, capacity / 2 + 100);
-        assert_eq!(
-            avoidable_spread_bytes(Some(&fragmented)),
-            capacity.saturating_sub(capacity / 2 + 100)
-        );
-    }
+    // `physical_layout`/`avoidable_spread_bytes` coverage now lives with
+    // their implementation in `mtxdb_core::packfile::layout::tests` —
+    // this crate just imports and displays them, nothing left to test here.
 }

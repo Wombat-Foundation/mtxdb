@@ -1,3 +1,5 @@
+/// Physical, on-disk layout scanning — see [`layout::physical_layout`].
+pub mod layout;
 /// The [`PackfileStorage`](storage::PackfileStorage) engine and its supporting types.
 pub mod storage;
 use std::fs::{File, OpenOptions};
