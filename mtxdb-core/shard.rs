@@ -1619,14 +1619,40 @@ mod tests {
             now.saturating_sub(persisted_at) < 5,
             "persisted_at must be a recent timestamp, not zero or garbage"
         );
+        // `ShardPool`'s `Drop` impl does its own best-effort final stats
+        // flush (`persist_stats_best_effort`) unconditionally, even
+        // though nothing changed since the `sync_all` above — so
+        // dropping `pool` legitimately bumps `shard_stats.bin`'s
+        // timestamp to whatever `SystemTime::now()` reads *at drop
+        // time*, which can differ from `persisted_at` by a second if a
+        // wall-clock boundary falls between the two. Asserting exact
+        // equality with the pre-drop value below would be pinning an
+        // implementation-timing coincidence, not a real invariant —
+        // hence the `>=`-and-recent checks instead, further down.
         drop(pool);
 
-        // A fresh pool reading the same base_dir must restore the
-        // timestamp along with the counters, not just the counters —
-        // otherwise a read-only `mtxdb shards` invocation could show a
-        // real snapshot's numbers next to a `None`/unknown age.
+        // A fresh pool reading the same base_dir must restore *a*
+        // recent timestamp along with the counters, not just the
+        // counters — otherwise a read-only `mtxdb shards` invocation
+        // could show a real snapshot's numbers next to a `None`/unknown
+        // age.
         let reopened = ShardPool::open(dir).unwrap();
-        assert_eq!(reopened.stats_persisted_at(), Some(persisted_at));
+        let reopened_persisted_at = reopened
+            .stats_persisted_at()
+            .expect("stats must survive a reopen, not come back None");
+        assert!(
+            reopened_persisted_at >= persisted_at,
+            "reopened persisted_at ({reopened_persisted_at}) must not be older than the \
+             pre-drop snapshot ({persisted_at})"
+        );
+        let now_after_reopen = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now_after_reopen.saturating_sub(reopened_persisted_at) < 5,
+            "reopened persisted_at must still be a recent timestamp"
+        );
     }
 
     #[test]
