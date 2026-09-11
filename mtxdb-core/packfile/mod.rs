@@ -212,27 +212,35 @@ pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64>
     let frame_len = FRAME_FIXED_LEN
         .checked_add(u32::try_from(node_bytes.len()).expect("bounded by MAX_RECORD_LEN"))
         .expect("bounded by MAX_RECORD_LEN");
+    let total_len = 4_u64.wrapping_add(u64::from(frame_len)).wrapping_add(4);
 
-    writer.write_all(&frame_len.to_le_bytes())?;
-    writer.write_all(&[flags])?;
-    writer.write_all(&uncompressed_len.to_le_bytes())?;
-    writer.write_all(&record.collection_id)?;
-    writer.write_all(&record.hash)?;
-    writer.write_all(node_bytes)?;
+    // Assemble the whole frame in one buffer and issue a single
+    // `write_all`, rather than one syscall per field. `writer` is
+    // usually a raw `File` clone (shard files are written directly,
+    // not through a `BufWriter`), so 7 separate small writes meant 7
+    // separate `write()` syscalls per record — real, avoidable
+    // overhead on the hottest path in the engine, unrelated to actual
+    // disk speed.
+    let mut buf = Vec::with_capacity(usize::try_from(total_len).unwrap_or(0));
+    buf.extend_from_slice(&frame_len.to_le_bytes());
+    buf.push(flags);
+    buf.extend_from_slice(&uncompressed_len.to_le_bytes());
+    buf.extend_from_slice(&record.collection_id);
+    buf.extend_from_slice(&record.hash);
+    buf.extend_from_slice(node_bytes);
 
     // CRC covers len + flags + uncompressed_len + collection_id + hash + node_bytes,
-    // i.e. the bytes as written to disk (compressed, when compressed).
+    // i.e. the bytes as written to disk (compressed, when compressed) —
+    // exactly `buf`'s contents so far, hashed in one pass since CRC32
+    // over one contiguous buffer is identical to the same bytes hashed
+    // via several `update` calls.
     let mut crc = crc32fast::Hasher::new();
-    crc.update(&frame_len.to_le_bytes());
-    crc.update(&[flags]);
-    crc.update(&uncompressed_len.to_le_bytes());
-    crc.update(&record.collection_id);
-    crc.update(&record.hash);
-    crc.update(node_bytes);
+    crc.update(&buf);
     let checksum = crc.finalize();
-    writer.write_all(&checksum.to_le_bytes())?;
+    buf.extend_from_slice(&checksum.to_le_bytes());
 
-    let total_len = 4_u64.wrapping_add(u64::from(frame_len)).wrapping_add(4);
+    writer.write_all(&buf)?;
+
     Ok(total_len)
 }
 

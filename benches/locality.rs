@@ -330,12 +330,24 @@ fn count_segments(base_dir: &Path, collection_id: &[u8; 16]) -> u64 {
 /// intentionally doesn't touch.
 ///
 /// Returns `(records_written, bytes_written, wall_time)`.
+/// `(records_written, bytes_written, write_time, fsync_time)`. `fsync_time`
+/// is broken out separately because it dominates everything else here:
+/// a standalone test on this machine found `fsync()` alone costs ~1.7s
+/// for a 256 MB file, even though writing that same data (into page
+/// cache, no durability guarantee) takes ~0.1s. Skipping the fsync
+/// entirely would make this look many times cheaper than
+/// `repack_collections_reachable` (which does call `sync_dirty`) for
+/// reasons that have nothing to do with either one's algorithm —
+/// comparing without it would be comparing a durable operation against
+/// a non-durable one and calling the difference "locality."
+type CompactionCost = (usize, u64, Duration, Duration);
+
 fn compact_shard_intra(
     store: &PackfileStorage,
     shard_path: &Path,
     dest_path: &Path,
     dest_pack_id: u64,
-) -> std::io::Result<(usize, u64, Duration)> {
+) -> std::io::Result<CompactionCost> {
     let start = Instant::now();
     let entries = packfile::scan_packfile(shard_path)?;
 
@@ -381,7 +393,16 @@ fn compact_shard_intra(
             records_written += 1;
         }
     }
-    Ok((records_written, bytes_written, start.elapsed()))
+    let write_time = start.elapsed();
+
+    // Real durability, matching what `sync_dirty` does for a real
+    // repack — see `CompactionCost`'s doc comment for why omitting
+    // this would make the comparison dishonest.
+    let fsync_start = Instant::now();
+    file.sync_all()?;
+    let fsync_time = fsync_start.elapsed();
+
+    Ok((records_written, bytes_written, write_time, fsync_time))
 }
 
 // ── Cache eviction ─────────────────────────────────────────────────
@@ -825,8 +846,8 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
     let pre_stats = pre_layout.collections.get(&sampler.elephant_id());
     let pre_segments = pre_stats.map_or(0, |c| c.segments);
     let pre_packs_referenced = pre_stats.map_or(0, |c| c.pack_bytes.len());
-    row("Packs referenced (before):", pre_packs_referenced);
-    row("Segments (before):", pre_segments);
+    row("Packs referenced:", pre_packs_referenced);
+    row("Segments:", pre_segments);
 
     println!(
         "\n[2/3] Compacting each shard's own contents (grouped by collection) \
@@ -837,27 +858,37 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
 
     let mut total_records_written = 0usize;
     let mut total_bytes_written = 0u64;
-    let mut total_time = Duration::ZERO;
+    let mut total_write_time = Duration::ZERO;
+    let mut total_fsync_time = Duration::ZERO;
     for summary in &summaries {
         let shard_path = ShardPool::pack_path(&temp_dir, summary.pack_id);
         let dest_path = ShardPool::pack_path(&compacted_dir, summary.pack_id);
-        let (records, bytes, time) =
+        let (records, bytes, write_time, fsync_time) =
             compact_shard_intra(&store, &shard_path, &dest_path, summary.pack_id).unwrap();
         subrow(
             &format!("shard {:#06x}:", summary.pack_id),
-            format!("{records} records, {} in {time:.2?}", format_bytes(bytes)),
+            format!(
+                "{records} records, {} — write {write_time:.2?}, fsync {fsync_time:.2?}",
+                format_bytes(bytes)
+            ),
         );
         total_records_written += records;
         total_bytes_written += bytes;
-        total_time += time;
+        total_write_time += write_time;
+        total_fsync_time += fsync_time;
     }
     row(
         "Compaction total:",
         format!(
-            "{total_records_written} records, {} across {} independent shards in {total_time:.2?}",
+            "{total_records_written} records, {} across {} independent shards",
             format_bytes(total_bytes_written),
             summaries.len()
         ),
+    );
+    subrow("write time:", format!("{total_write_time:.2?}"));
+    subrow(
+        "fsync time:",
+        format!("{total_fsync_time:.2?} (dominates — see compact_shard_intra's docs)"),
     );
 
     println!("\n[3/3] Measuring the compacted copy's layout (not swapped into the live store)...");
@@ -887,12 +918,13 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
     row(
         "Compaction cost:",
         format!(
-            "{total_records_written} records / {} / {total_time:.2?}, \
-             {} independent per-shard passes",
+            "{total_records_written} records / {}, {} independent per-shard passes",
             format_bytes(total_bytes_written),
             summaries.len()
         ),
     );
+    subrow("write time:", format!("{total_write_time:.2?}"));
+    subrow("fsync time:", format!("{total_fsync_time:.2?}"));
     println!("═══════════════════════════════════════════════════════════════");
 
     // Drop before removing the directory, not after: `ShardPool`'s
