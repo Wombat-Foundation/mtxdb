@@ -2441,6 +2441,7 @@ impl StorageEngine for PackfileStorage {
         };
 
         let mut index_needs_rebuild = false;
+        let mut resolved_cache_entries = Vec::with_capacity(entries.len());
 
         for (id, data) in entries {
             let record = Record {
@@ -2448,9 +2449,9 @@ impl StorageEngine for PackfileStorage {
                 hash: *id,
                 data: data.bytes.clone(),
             };
-            
+
             let (shard_id, offset) = self.shards.put_record(&record)?;
-            
+
             if !index_needs_rebuild {
                 if index.insert(id, shard_id, offset).is_err() {
                     index_needs_rebuild = true;
@@ -2471,7 +2472,7 @@ impl StorageEngine for PackfileStorage {
                     }
                 }
             }
-            cache.insert(*id, Arc::new(data_to_cache));
+            resolved_cache_entries.push((*id, Arc::new(data_to_cache)));
         }
 
         if index_needs_rebuild {
@@ -2481,6 +2482,12 @@ impl StorageEngine for PackfileStorage {
                 collection_id,
                 &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
             );
+        }
+
+        // Apply all cache mutations ONLY after all disk writes succeed.
+        // This ensures a failed batch doesn't leak partial state into the shared cache.
+        for (id, data) in resolved_cache_entries {
+            cache.insert(id, data);
         }
 
         self.store_generation(collection_id, index, Some(cache))?;
