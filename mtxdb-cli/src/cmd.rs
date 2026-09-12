@@ -1398,12 +1398,13 @@ fn extract_pointer_string<'a>(value: &'a OwnedValue, pointer: &str) -> Option<&'
 }
 
 /// Parse an RFC 6901 array index segment. Rejects leading zeroes (except
-/// for the single digit `"0"`) and non-numeric input.
+/// for the single digit `"0"`), non-digit characters, and signs. RFC 6901
+/// permits only `0` or `[1-9][0-9]*`.
 fn parse_array_index(segment: &str) -> Option<usize> {
-    if segment.is_empty() {
+    let bytes = segment.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let bytes = segment.as_bytes();
     if bytes.len() > 1 && bytes[0] == b'0' {
         return None; // leading zero
     }
@@ -2531,6 +2532,9 @@ mod tests {
         // Leading zeroes in array indices are forbidden by RFC 6901.
         assert_eq!(extract_pointer_string(&event, "/auth_events/01"), None);
         assert_eq!(extract_pointer_string(&event, "/auth_events/00"), None);
+        // Signs and non-digit characters are forbidden by RFC 6901.
+        assert_eq!(extract_pointer_string(&event, "/auth_events/+1"), None);
+        assert_eq!(extract_pointer_string(&event, "/auth_events/-1"), None);
         // Invalid tilde escapes (~2, ~a, trailing ~) are forbidden.
         assert_eq!(extract_pointer_string(&event, "/a~2b"), None);
         assert_eq!(extract_pointer_string(&event, "/a~ab"), None);
