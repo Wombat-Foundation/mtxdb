@@ -2423,9 +2423,68 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<(), StorageError> {
-        for (id, data) in entries {
-            self.put(collection_id, id, data)?;
+        if entries.is_empty() {
+            return Ok(());
         }
+
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+
+        let old_gen = self.generation(collection_id);
+        let mut index = match &old_gen {
+            Some(g) => g.index.clone(),
+            None => LossyIndex::new(4096),
+        };
+        let cache = match &old_gen {
+            Some(g) => g.cache.clone(),
+            None => Arc::new(NodeCache::new(self.cache_capacity)),
+        };
+
+        let mut index_needs_rebuild = false;
+
+        for (id, data) in entries {
+            let record = Record {
+                collection_id: *collection_id,
+                hash: *id,
+                data: data.bytes.clone(),
+            };
+            
+            let (shard_id, offset) = self.shards.put_record(&record)?;
+            
+            if !index_needs_rebuild {
+                if index.insert(id, shard_id, offset).is_err() {
+                    index_needs_rebuild = true;
+                } else {
+                    let pack_id = self
+                        .shards
+                        .get_shard(shard_id)
+                        .map_or(u64::from(shard_id), |s| s.pack_id);
+                    self.record_new_shard_collection(pack_id, collection_id);
+                }
+            }
+
+            let mut data_to_cache = data.clone();
+            for child in &mut data_to_cache.children {
+                if let NodeRef::Lazy(child_id) = child {
+                    if let Some(child_data) = self.pinned.get(child_id) {
+                        *child = NodeRef::Resolved(*child_id, child_data);
+                    }
+                }
+            }
+            cache.insert(*id, Arc::new(data_to_cache));
+        }
+
+        if index_needs_rebuild {
+            index = self.rebuild_index(collection_id)?;
+            // rebuild_index automatically discovers all the records we just appended
+            self.replace_collection_shard_counts(
+                collection_id,
+                &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+            );
+        }
+
+        self.store_generation(collection_id, index, Some(cache))?;
+
         Ok(())
     }
 
