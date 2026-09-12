@@ -90,6 +90,10 @@ type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
 /// Replacement index entries produced while copying one repack collection.
 type RepackOffsets = Vec<([u8; 16], u16, u64)>;
+/// Return type of [`PackfileStorage::repack_scan_incremental`]: the merged
+/// live-location map and (on the incremental path) the previous cursor state
+/// that the adjacency helpers need to skip re-reading already-seen nodes.
+type RepackScanResult = (RepackRecordMap, Option<RepackIncrementalState>);
 
 /// One scanned record's `(shard_id, hash, offset)`, as accumulated per
 /// collection during `PackfileStorage::open_with_options`'s initial scan.
@@ -273,6 +277,15 @@ struct RepackIncrementalState {
     /// The deduplicated hash → (`shard_id`, offset) map from the last repack.
     /// The next repack merges newly-scanned entries into this map.
     live_map: HashMap<[u8; 16], (u16, u64)>,
+    /// Cached edge lists for every node that survived the last repack.
+    /// Lets the BFS and full-scan adjacency walks skip re-reading disk for
+    /// nodes that were already seen — turning O(total) disk reads per repack
+    /// call into O(delta) reads for only nodes added since the last repack.
+    adjacency: HashMap<[u8; 16], Vec<[u8; 16]>>,
+    /// The live-roots snapshot from the last repack. Used to identify which
+    /// roots are genuinely new so the incremental BFS can seed only those,
+    /// rather than re-walking the entire reachable set from scratch.
+    prev_roots: Vec<[u8; 16]>,
 }
 
 const DEFAULT_REPACK_THRESHOLD_ENTRIES: u64 = 2048;
@@ -1535,29 +1548,42 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption.
-    ///
     /// Builds this repack's deduped `hash → (shard_id, offset)` map,
-    /// incrementally where possible.
+    /// incrementally where possible, and returns the previous
+    /// [`RepackIncrementalState`] (moved out, not cloned) so the caller can
+    /// reuse its `adjacency` cache when deciding which nodes need fresh disk
+    /// reads.
     ///
-    /// If a previous repack left cursor state for this collection, starts from
-    /// that repack's `live_map` and scans each shard only from the byte
-    /// offset it had reached last time (via
-    /// [`packfile::scan_packfile_from`]), merging newly-appended records
-    /// in. Otherwise (first repack for this collection) falls back to a full
-    /// scan of every shard from byte zero. This is what turns the O(n²)
-    /// cost of repeatedly rescanning a growing collection from scratch into
-    /// O(n) total scan work across all repack calls.
+    /// On the incremental path the previous `live_map` is extended in-place
+    /// with only the newly-appended entries from each shard (O(delta) scan
+    /// work per repack call rather than O(total)). On the cold-start path
+    /// (first repack for this collection) every shard is scanned from byte
+    /// zero.
+    ///
+    /// Returns `(hash_to_shard_offset, Some(prev))` on the incremental path
+    /// and `(hash_to_shard_offset, None)` on the cold-start path. The caller
+    /// must pass `prev` to the adjacency helpers to unlock the incremental
+    /// BFS optimisation; when it is `None` the caller uses the full-scan
+    /// adjacency helpers instead.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure scanning a shard.
     fn repack_scan_incremental(
         &self,
         collection_id: &[u8; 16],
-    ) -> Result<HashMap<[u8; 16], (u16, u64)>, StorageError> {
-        let cursors = self.repack_incremental.read();
-        if let Some(prev) = cursors.get(collection_id) {
-            // Incremental: start from the previous live_map and scan only
-            // bytes appended since the last repack.
+    ) -> Result<RepackScanResult, StorageError> {
+        // Check for existing state under a read lock, then move it out under a
+        // write lock if present — O(1) ownership transfer, no clone.
+        let has_prev = self.repack_incremental.read().contains_key(collection_id);
+        if has_prev {
+            let prev = self
+                .repack_incremental
+                .write()
+                .remove(collection_id)
+                .expect("entry was present under read lock and collection mutex is held");
+
+            // Scan only bytes appended since the last repack, merging into
+            // the stolen live_map in-place — O(delta) work, not O(total).
             let mut map = prev.live_map.clone();
             for (shard_id, shard) in self.shards.all_shards() {
                 let start = prev.scan_offsets.get(&shard_id).copied().unwrap_or(0);
@@ -1569,10 +1595,9 @@ impl PackfileStorage {
                     }
                 }
             }
-            Ok(map)
+            Ok((map, Some(prev)))
         } else {
             // First repack: full scan of every shard.
-            drop(cursors);
             let scanned = self.scan_collection_records(collection_id)?;
             let mut map = HashMap::new();
             for (shard_id, entries) in &scanned {
@@ -1580,20 +1605,151 @@ impl PackfileStorage {
                     map.insert(*hash, (*shard_id, *offset));
                 }
             }
-            Ok(map)
+            Ok((map, None))
         }
     }
 
+    /// Incremental BFS reachability walk.
+    ///
+    /// Uses the adjacency cache from `prev` to avoid re-reading disk for nodes
+    /// that were already known-live after the last repack. Only newly-added
+    /// nodes (those absent from `prev.adjacency`) require a disk read.
+    ///
+    /// **Root-removal invariant (critical):** This function must NOT be called
+    /// when the current root set is a strict subset of `prev.prev_roots` (i.e.
+    /// any root was removed since the last repack). In that case nodes
+    /// exclusively reachable through the removed root would remain in the live
+    /// set indefinitely, because `visited` in `prev.adjacency` only grows —
+    /// nothing in this incremental path forces a re-check of reachability.
+    /// The caller ([`Self::repack_collection_reachable`]) detects root removal
+    /// and falls back to [`Self::bfs_live_set`] (cold-start, full BFS) for
+    /// that repack, then saves a fresh cursor so subsequent repacks can be
+    /// incremental again.
+    ///
+    /// **Memory:** `prev.adjacency` holds `O(live_nodes` × `avg_fanout`) hashes
+    /// (≈ `live_nodes × avg_fanout × 16` bytes) in RAM per collection. This
+    /// is the cost of eliminating the O(live) disk reads per repack call —
+    /// callers should be aware for large collections.
+    fn bfs_live_set_incremental(
+        roots: &[[u8; 16]],
+        hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
+        prev: &RepackIncrementalState,
+        pinned: &HashMap<u16, Arc<Shard>>,
+        extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+    ) -> Result<AdjacencyResult, StorageError> {
+        // Seed with roots that are not already in the cached live set.
+        // Anything in prev.adjacency was reachable last time and — given no
+        // root was removed — is still reachable now; no need to re-expand it.
+        let mut visited: HashSet<[u8; 16]> = prev.adjacency.keys().copied().collect();
+        let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
+        let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> =
+            prev.adjacency.keys().map(|h| (*h, vec![])).collect();
+
+        for root in roots {
+            if hash_to_shard_offset.contains_key(root) && visited.insert(*root) {
+                queue.push_back(*root);
+            }
+        }
+
+        while let Some(hash) = queue.pop_front() {
+            // Fast path: edge list already cached — no disk read needed.
+            if let Some(edges) = prev.adjacency.get(&hash) {
+                for edge in edges {
+                    if hash_to_shard_offset.contains_key(edge) && visited.insert(*edge) {
+                        queue.push_back(*edge);
+                    }
+                }
+                adjacency.insert(hash, edges.clone());
+                continue;
+            }
+
+            // Slow path: new node, must read from disk.
+            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
+                continue;
+            };
+            let Some(old_shard) = pinned.get(&shard_id) else {
+                continue;
+            };
+            let record = Self::read_at(old_shard, offset)?;
+            let edges = extract_edges(&hash, &record.data);
+            for edge in &edges {
+                if hash_to_shard_offset.contains_key(edge) && visited.insert(*edge) {
+                    queue.push_back(*edge);
+                }
+            }
+            adjacency.insert(hash, edges);
+        }
+
+        // Restrict adjacency to the actual visited set — entries inherited
+        // from prev that are no longer in hash_to_shard_offset (e.g. they
+        // were in a shard that was later dropped) must not survive.
+        adjacency.retain(|h, _| visited.contains(h) && hash_to_shard_offset.contains_key(h));
+
+        let mut live_hashes: Vec<[u8; 16]> = visited
+            .into_iter()
+            .filter(|h| hash_to_shard_offset.contains_key(h))
+            .collect();
+        live_hashes.sort_unstable();
+        Ok((live_hashes, adjacency))
+    }
+
+    /// Incremental full-adjacency scan (no-roots / preserve-everything path).
+    ///
+    /// For each hash in `hash_to_shard_offset`, reuses the cached edge list
+    /// from `prev.adjacency` when available — avoiding a disk read for any
+    /// node that survived the last repack. Only genuinely new hashes (not in
+    /// the cache) require a disk read.
+    ///
+    /// All hashes in `hash_to_shard_offset` are live (no GC in this path),
+    /// so the result is always the full map.
+    ///
+    /// **Memory:** same as [`Self::bfs_live_set_incremental`] — see that doc.
+    fn scan_full_adjacency_incremental(
+        hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
+        prev: &RepackIncrementalState,
+        pinned: &HashMap<u16, Arc<Shard>>,
+        extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
+    ) -> Result<AdjacencyResult, StorageError> {
+        let mut all_hashes: Vec<[u8; 16]> = hash_to_shard_offset.keys().copied().collect();
+        all_hashes.sort_unstable();
+        let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> =
+            HashMap::with_capacity(hash_to_shard_offset.len());
+
+        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
+            // Fast path: node was live last time, edge list is cached.
+            if let Some(edges) = prev.adjacency.get(hash) {
+                adjacency.insert(*hash, edges.clone());
+                continue;
+            }
+            // Slow path: new node, must read from disk.
+            if let Some(shard) = pinned.get(&shard_id) {
+                let record = Self::read_at(shard, offset)?;
+                let edges = extract_edges(hash, &record.data);
+                adjacency.insert(*hash, edges);
+            }
+        }
+        Ok((all_hashes, adjacency))
+    }
+
     /// Saves the cursor state a future call to [`Self::repack_scan_incremental`]
-    /// needs: each shard's current byte length (the next repack's scan
-    /// start point) and the deduped live map restricted to hashes that
-    /// actually survived into `new_offsets` — anything this repack dropped
-    /// must not resurface via the carried-forward map next time.
+    /// needs: each shard's current byte length (the next repack's scan start
+    /// point), the deduped live map restricted to hashes that survived into
+    /// `new_offsets`, the adjacency cache for those survivors (so the next
+    /// repack's BFS/scan can skip re-reading disk for already-seen nodes), and
+    /// the roots snapshot (so the next repack can detect whether any root was
+    /// removed and fall back to a full BFS sweep if so).
+    ///
+    /// Anything this repack dropped must not resurface via the carried-forward
+    /// `live_map` or adjacency cache next time.
     fn repack_save_incremental_state(
         &self,
         collection_id: &[u8; 16],
         new_offsets: &[([u8; 16], u16, u64)],
+        adjacency: HashMap<[u8; 16], Vec<[u8; 16]>>,
+        current_roots: &[[u8; 16]],
     ) {
+        let surviving: HashSet<[u8; 16]> = new_offsets.iter().map(|&(h, _, _)| h).collect();
+
         let mut scan_offsets = HashMap::new();
         for (shard_id, shard) in self.shards.all_shards() {
             scan_offsets.insert(shard_id, shard.file_len());
@@ -1602,11 +1758,19 @@ impl PackfileStorage {
             .iter()
             .map(|&(hash, shard_id, offset)| (hash, (shard_id, offset)))
             .collect();
+        // Evict dropped nodes from the adjacency cache so they can't
+        // re-enter the live set on a future incremental BFS pass.
+        let next_adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = adjacency
+            .into_iter()
+            .filter(|(h, _)| surviving.contains(h))
+            .collect();
         self.repack_incremental.write().insert(
             *collection_id,
             RepackIncrementalState {
                 scan_offsets,
                 live_map: next_live_map,
+                adjacency: next_adjacency,
+                prev_roots: current_roots.to_vec(),
             },
         );
     }
@@ -1627,7 +1791,9 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<RepackPlan, StorageError> {
-        let hash_to_shard_offset = self.repack_scan_incremental(collection_id)?;
+        // plan is read-only: discard the prev_state (we don't update incremental
+        // cursor on a dry-run, so there's nothing to do with it here).
+        let (hash_to_shard_offset, _prev_state) = self.repack_scan_incremental(collection_id)?;
         self.plan_collection_repack_from_map(collection_id, &hash_to_shard_offset, &extract_edges)
     }
 
@@ -1807,6 +1973,10 @@ impl PackfileStorage {
     ///
     /// # Panics
     /// Panics if any hash in the CSR exceeds `u32::MAX` local ID space.
+    // Four dispatch arms (roots/no-roots × incremental/cold-start) plus root-removal
+    // detection make this function long; splitting it would just move the complexity
+    // without reducing it.
+    #[allow(clippy::too_many_lines)]
     pub fn repack_collection_reachable(
         &self,
         collection_id: &[u8; 16],
@@ -1815,7 +1985,7 @@ impl PackfileStorage {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
-        let hash_to_shard_offset = self.repack_scan_incremental(collection_id)?;
+        let (hash_to_shard_offset, prev_state) = self.repack_scan_incremental(collection_id)?;
 
         // Pin every shard this call could possibly read from before any
         // writes happen — see pin_shards' doc for why this must come
@@ -1824,13 +1994,53 @@ impl PackfileStorage {
 
         let roots = self.live_roots.read().get(collection_id).cloned();
 
-        let (live_hashes, adjacency) = match roots {
-            Some(roots) if !roots.is_empty() => {
-                Self::bfs_live_set(&roots, &hash_to_shard_offset, &pinned, &extract_edges)?
+        // Root-removal detection: if any root present in the previous repack's
+        // snapshot is absent from the current root set, nodes exclusively
+        // reachable through that removed root may be stuck in the cached live
+        // set indefinitely (the incremental adjacency cache only grows — it has
+        // no mechanism to re-derive reachability). Fall back to a full cold-start
+        // BFS for this repack so those nodes can actually be collected. Once the
+        // full sweep completes, the saved cursor is fresh and subsequent repacks
+        // can be incremental again.
+        let roots_shrunk = prev_state.as_ref().is_some_and(|prev| {
+            let current_root_set: HashSet<[u8; 16]> =
+                roots.as_deref().unwrap_or(&[]).iter().copied().collect();
+            prev.prev_roots
+                .iter()
+                .any(|r| !current_root_set.contains(r))
+        });
+        // Use incremental adjacency only when prev state exists AND no root was removed.
+        let use_incremental = prev_state.is_some() && !roots_shrunk;
+
+        let (live_hashes, adjacency) = match (roots.as_deref(), use_incremental) {
+            (Some(roots), true) if !roots.is_empty() => {
+                // Incremental BFS: only expand from roots not already in the
+                // cached live set; reuse cached edge lists for everything else.
+                Self::bfs_live_set_incremental(
+                    roots,
+                    &hash_to_shard_offset,
+                    prev_state.as_ref().expect("use_incremental implies Some"),
+                    &pinned,
+                    &extract_edges,
+                )?
             }
-            // No live roots configured: we don't know what's garbage, so
-            // preserve everything.
-            _ => Self::scan_full_adjacency(&hash_to_shard_offset, &pinned, &extract_edges)?,
+            (Some(roots), false) if !roots.is_empty() => {
+                // Cold-start BFS: root set shrank or first repack — full walk.
+                Self::bfs_live_set(roots, &hash_to_shard_offset, &pinned, &extract_edges)?
+            }
+            (_, true) => {
+                // No live roots, incremental path: only read disk for new nodes.
+                Self::scan_full_adjacency_incremental(
+                    &hash_to_shard_offset,
+                    prev_state.as_ref().expect("use_incremental implies Some"),
+                    &pinned,
+                    &extract_edges,
+                )?
+            }
+            _ => {
+                // No live roots, cold-start: preserve everything, read all.
+                Self::scan_full_adjacency(&hash_to_shard_offset, &pinned, &extract_edges)?
+            }
         };
 
         let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
@@ -1913,7 +2123,8 @@ impl PackfileStorage {
             .and_modify(|c| *c = c.saturating_add(1))
             .or_insert(1);
 
-        self.repack_save_incremental_state(collection_id, &new_offsets);
+        let current_roots: Vec<[u8; 16]> = roots.as_deref().unwrap_or(&[]).to_vec();
+        self.repack_save_incremental_state(collection_id, &new_offsets, adjacency, &current_roots);
 
         // Fsync the shards this repack just wrote into and persist the
         // updated stats snapshot as part of finishing the repack, rather
@@ -2124,7 +2335,23 @@ impl PackfileStorage {
                 &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
             );
             self.swap_generation(collection_id, index)?;
-            self.repack_save_incremental_state(collection_id, &new_offsets);
+            // The batch path does a full cold-start scan (scan_collection_record_maps),
+            // so we have no incremental adjacency to carry forward. Pass an empty
+            // map so the next single-collection repack starts with a fresh cache
+            // (it will populate it from the full BFS on that first pass).
+            let batch_roots: Vec<[u8; 16]> = self
+                .live_roots
+                .read()
+                .get(collection_id)
+                .cloned()
+                .unwrap_or_default();
+            self.repack_save_incremental_state(
+                collection_id,
+                &new_offsets,
+                HashMap::new(),
+                &batch_roots,
+            );
+
             self.repack_count.fetch_add(1, Ordering::Relaxed);
             self.repack_kept_total
                 .fetch_add(kept as u64, Ordering::Relaxed);
@@ -3628,6 +3855,111 @@ mod tests {
         assert_eq!(stats2.kept_total, stats.kept_total + kept2 as u64);
         assert_eq!(stats2.dropped_total, stats.dropped_total + dropped2 as u64);
         assert_eq!(store.repack_count_for_collection(&TEST_COLLECTION), 2);
+    }
+
+    /// Verify the root-removal fallback: if a live root is removed between
+    /// repacks, nodes exclusively reachable through it must not stay in the
+    /// cached live set indefinitely. Without the fallback, the incremental
+    /// adjacency cache only grows and those nodes would never be collected.
+    #[test]
+    fn test_repack_incremental_root_removal_forces_full_sweep() {
+        let dir = test_dir("repack_root_removal_fallback");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Graph:
+        //   root_a -> shared -> base
+        //   root_b -> shared -> base
+        //   orphan_a -> orphan_dep    (reachable only via root_a)
+        //
+        // First repack: both root_a and root_b are live. Everything survives.
+        // Second repack: only root_b is live. orphan_a and orphan_dep must be
+        // collected. Without the root-removal fallback they would remain in the
+        // incremental live set permanently.
+        let root_a = distinct_id(1);
+        let root_b = distinct_id(2);
+        let shared = distinct_id(3);
+        let base = distinct_id(4);
+        let orphan_a = distinct_id(5);
+        let orphan_dep = distinct_id(6);
+
+        for (id, bytes) in [
+            (root_a, b"root_a".as_slice()),
+            (root_b, b"root_b".as_slice()),
+            (shared, b"shared".as_slice()),
+            (base, b"base".as_slice()),
+            (orphan_a, b"orphan_a".as_slice()),
+            (orphan_dep, b"orphan_dep".as_slice()),
+        ] {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &id,
+                    &NodeData::new(bytes::Bytes::from_static(bytes)),
+                )
+                .unwrap();
+        }
+
+        let edges = std::collections::HashMap::from([
+            (root_a, vec![shared, orphan_a]),
+            (root_b, vec![shared]),
+            (shared, vec![base]),
+            (orphan_a, vec![orphan_dep]),
+        ]);
+        let extract = |hash: &[u8; 16], _data: &[u8]| -> Vec<[u8; 16]> {
+            edges.get(hash).cloned().unwrap_or_default()
+        };
+
+        // First repack: both roots live — everything reachable from either root
+        // survives and the incremental adjacency cache is populated.
+        store.set_live_roots(&TEST_COLLECTION, vec![root_a, root_b]);
+        let (kept1, dropped1) = store
+            .repack_collection_reachable(&TEST_COLLECTION, extract)
+            .unwrap();
+        assert_eq!(kept1, 6, "all nodes should survive with both roots live");
+        assert_eq!(dropped1, 0);
+
+        // Now remove root_a — switch to root_b only.
+        // orphan_a and orphan_dep are now exclusively reachable through root_a,
+        // which was removed. The root-removal fallback must trigger a full BFS
+        // sweep so they are actually collected, rather than remaining in the
+        // stale incremental live set forever.
+        store.set_live_roots(&TEST_COLLECTION, vec![root_b]);
+        let (kept2, dropped2) = store
+            .repack_collection_reachable(&TEST_COLLECTION, extract)
+            .unwrap();
+        assert_eq!(
+            kept2, 3,
+            "root_b, shared, base should survive; root_a, orphan_a, orphan_dep must be GC'd"
+        );
+        assert_eq!(
+            dropped2, 3,
+            "root_a, orphan_a, and orphan_dep must be collected once root_a is removed from live roots"
+        );
+
+        assert!(
+            store.get(&TEST_COLLECTION, &orphan_a).unwrap().is_none(),
+            "orphan_a must be gone after root_a was removed"
+        );
+        assert!(
+            store.get(&TEST_COLLECTION, &orphan_dep).unwrap().is_none(),
+            "orphan_dep must be gone after root_a was removed"
+        );
+        assert!(
+            store.get(&TEST_COLLECTION, &root_a).unwrap().is_none(),
+            "root_a itself has no incoming edges so it is unreachable from root_b"
+        );
+        assert!(
+            store.get(&TEST_COLLECTION, &root_b).unwrap().is_some(),
+            "root_b must still be present"
+        );
+        assert!(
+            store.get(&TEST_COLLECTION, &shared).unwrap().is_some(),
+            "shared must still be present"
+        );
+        assert!(
+            store.get(&TEST_COLLECTION, &base).unwrap().is_some(),
+            "base must still be present"
+        );
     }
 
     /// Repack drops unreachable *records* from the index (`dropped` count),
