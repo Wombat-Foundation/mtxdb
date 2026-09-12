@@ -1283,6 +1283,8 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
             "/room_id",
         ),
     ];
+    let mut identity_pointer = None;
+    let mut membership_pointer = None;
     for (keys, expected) in required {
         let actual = template_string_at(&template, keys);
         if actual != Some(expected) {
@@ -1294,7 +1296,18 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
                 actual
             );
         }
+        // The equality check above already pins these two to the one
+        // profile mtxdb executes; capture the validated value itself
+        // (rather than re-typing the literal) so the compiled template
+        // reflects what the file actually said.
+        if keys == ["record", "identity", "extract", "path"].as_slice() {
+            identity_pointer = actual;
+        } else if keys == ["collection", "membership", "extract", "path"].as_slice() {
+            membership_pointer = actual;
+        }
     }
+    let identity_pointer = identity_pointer.context("record identity pointer missing")?;
+    let membership_pointer = membership_pointer.context("collection membership pointer missing")?;
     if template_bool_at(&template, &["establishment", "required"]) != Some(true) {
         bail!(
             "template {} must require an establishment record",
@@ -1305,42 +1318,58 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         &template,
         ["record", "identity", "internal_key", "algorithm"].as_slice(),
     )
-    .unwrap_or("blake3-128")
-    .to_owned();
+    .unwrap_or("blake3-128");
+    validate_digest_algorithm(node_id_algorithm)
+        .with_context(|| format!("template {} record identity internal_key", path.display()))?;
     let collection_id_algorithm = template_string_at(
         &template,
         ["collection", "internal_key", "algorithm"].as_slice(),
     )
-    .unwrap_or("blake3-128")
-    .to_owned();
+    .unwrap_or("blake3-128");
+    validate_digest_algorithm(collection_id_algorithm)
+        .with_context(|| format!("template {} collection internal_key", path.display()))?;
     Ok(CollectionTemplate {
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
         record_identity: RecordIdentityRule {
-            pointer: "/event_id".into(),
-            node_id_algorithm,
+            pointer: identity_pointer.to_owned(),
+            node_id_algorithm: node_id_algorithm.to_owned(),
         },
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
-            pointer: "/room_id".into(),
-            collection_id_algorithm,
-            display_id_pointer: "/room_id".into(),
+            pointer: membership_pointer.to_owned(),
+            collection_id_algorithm: collection_id_algorithm.to_owned(),
+            display_id_pointer: membership_pointer.to_owned(),
         },
     })
 }
 
+/// Digest algorithms `derive_template_key` knows how to compute. Checked at
+/// template-compile time so an unsupported algorithm is rejected up front,
+/// rather than surfacing mid-import on the first record that needs it.
+fn validate_digest_algorithm(algorithm: &str) -> anyhow::Result<()> {
+    match algorithm {
+        "blake3-128" => Ok(()),
+        other => bail!("unsupported internal-key algorithm `{other}`"),
+    }
+}
+
 /// Resolve an RFC 6901 JSON pointer against a parsed event, returning the
-/// string it names. Only the single-segment top-level pointers mtxdb's
-/// templates currently use (e.g. `/event_id`) are exercised, but this walks
-/// the full pointer so a deeper path is not silently misread.
+/// string it names. Supports object-member and array-index segments; the
+/// empty pointer denotes the whole document per the RFC. A non-empty
+/// pointer must start with `/`.
 fn extract_pointer_string<'a>(value: &'a OwnedValue, pointer: &str) -> Option<&'a str> {
     let mut current = value;
-    for segment in pointer.split('/').skip(1) {
-        let segment = segment.replace("~1", "/").replace("~0", "~");
-        let OwnedValue::Object(object) = current else {
-            return None;
-        };
-        current = object.get(segment.as_str())?;
+    if !pointer.is_empty() {
+        let rest = pointer.strip_prefix('/')?;
+        for segment in rest.split('/') {
+            let segment = segment.replace("~1", "/").replace("~0", "~");
+            current = match current {
+                OwnedValue::Object(object) => object.get(segment.as_str())?,
+                OwnedValue::Array(array) => array.get(segment.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
+        }
     }
     match current {
         OwnedValue::String(value) => Some(value.as_str()),
@@ -1349,17 +1378,15 @@ fn extract_pointer_string<'a>(value: &'a OwnedValue, pointer: &str) -> Option<&'
 }
 
 /// Derive mtxdb's internal 128-bit key for one template-extracted value.
-/// `blake3-128` is the only algorithm any shipped template names today.
+/// The algorithm is assumed already validated by
+/// [`validate_digest_algorithm`] (either at template-compile time or in
+/// [`default_matrix_import_template`]).
 fn derive_template_key(algorithm: &str, extracted: &str) -> anyhow::Result<[u8; 16]> {
-    match algorithm {
-        "blake3-128" => {
-            let hash = blake3::hash(extracted.as_bytes());
-            let mut id = [0u8; 16];
-            id.copy_from_slice(&hash.as_bytes()[..16]);
-            Ok(id)
-        }
-        other => bail!("unsupported internal-key algorithm `{other}`"),
-    }
+    validate_digest_algorithm(algorithm)?;
+    let hash = blake3::hash(extracted.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
+    Ok(id)
 }
 
 /// Run a template's record-identity rule against one event, producing the
@@ -2236,9 +2263,10 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_import_template, default_matrix_import_template, event_room_id, fmt_disk_megabytes,
-        fmt_megabytes, matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
-        parse_pack_selectors, resolve_import_collection, template_collection_id,
+        compile_import_template, default_matrix_import_template, event_room_id,
+        extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, matrix_batch_has_create,
+        matrix_create_details, parse_pack_id_selector, parse_pack_selectors,
+        resolve_import_collection, template_collection_id,
     };
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -2416,6 +2444,53 @@ mod tests {
         let compiled = compile_import_template(Some(&template_path))
             .expect("checked-in Matrix template must be executable");
         assert_eq!(compiled, default_matrix_import_template());
+    }
+
+    #[test]
+    fn compile_import_template_rejects_an_unsupported_digest_algorithm() {
+        let template = br#"{
+            "format": "mtxdb.collection-template/v1",
+            "name": "matrix-event-v1",
+            "record": {
+                "identity": {
+                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                    "internal_key": {"algorithm": "sha256-truncated"}
+                }
+            },
+            "collection": {
+                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
+            },
+            "establishment": {"required": true}
+        }"#;
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb-cli-test-{}-{}",
+            std::process::id(),
+            "unsupported-digest"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("template.json");
+        std::fs::write(&path, template).unwrap();
+        let error = compile_import_template(Some(&path)).expect_err(
+            "an unsupported digest algorithm must be rejected at compile time, not mid-import",
+        );
+        assert!(
+            format!("{error:#}").contains("unsupported internal-key algorithm"),
+            "unexpected error: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pointer_extraction_supports_array_indices_and_rejects_bad_pointers() {
+        let event = owned_value(r#"{"auth_events": ["$a", "$b"], "event_id": "$c"}"#);
+        assert_eq!(extract_pointer_string(&event, "/auth_events/1"), Some("$b"));
+        // A non-empty pointer must start with `/`; a bare field name is not
+        // a valid RFC 6901 pointer and must not silently resolve anything.
+        assert_eq!(extract_pointer_string(&event, "event_id"), None);
+        // Out-of-range and non-numeric array segments must not panic or
+        // fall through to some other value.
+        assert_eq!(extract_pointer_string(&event, "/auth_events/9"), None);
+        assert_eq!(extract_pointer_string(&event, "/auth_events/x"), None);
     }
 
     // `physical_layout`/`avoidable_spread_bytes` coverage now lives with
