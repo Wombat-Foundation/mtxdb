@@ -104,6 +104,7 @@ install:	##H Install CLI from source
 clean: ##H Clean build artifacts
 	$(CARGO) clean
 	cd mtxdb-cli && $(CARGO) clean
+	cd mtxdb-core && $(CARGO) clean
 	cd mtxdb-ffi && $(CARGO) clean
 	cd mtxdb-wasm && $(CARGO) clean
 	rm -rf .coverage/ lcov.info
