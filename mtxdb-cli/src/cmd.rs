@@ -1358,15 +1358,35 @@ fn validate_digest_algorithm(algorithm: &str) -> anyhow::Result<()> {
 /// string it names. Supports object-member and array-index segments; the
 /// empty pointer denotes the whole document per the RFC. A non-empty
 /// pointer must start with `/`.
+///
+/// Segments are validated per the RFC: `~` may only be followed by `0` or
+/// `1` (invalid escapes like `~2` are rejected), and array indices must
+/// not carry leading zeroes (except the single digit `0`).
 fn extract_pointer_string<'a>(value: &'a OwnedValue, pointer: &str) -> Option<&'a str> {
     let mut current = value;
     if !pointer.is_empty() {
         let rest = pointer.strip_prefix('/')?;
-        for segment in rest.split('/') {
-            let segment = segment.replace("~1", "/").replace("~0", "~");
+        for raw_segment in rest.split('/') {
+            // RFC 6901 §4: only ~0 and ~1 are valid escape sequences.
+            // Reject any ~ not followed by 0 or 1 before unescaping.
+            let mut chars = raw_segment.chars();
+            while let Some(c) = chars.next() {
+                if c == '~' {
+                    match chars.next() {
+                        Some('0' | '1') => {}
+                        _ => return None,
+                    }
+                }
+            }
+            let segment = raw_segment.replace("~1", "/").replace("~0", "~");
             current = match current {
                 OwnedValue::Object(object) => object.get(segment.as_str())?,
-                OwnedValue::Array(array) => array.get(segment.parse::<usize>().ok()?)?,
+                OwnedValue::Array(array) => {
+                    // RFC 6901: array indices are non-negative integers
+                    // without leading zeroes; "0" is the sole zero.
+                    let index = parse_array_index(&segment)?;
+                    array.get(index)?
+                }
                 _ => return None,
             };
         }
@@ -1375,6 +1395,19 @@ fn extract_pointer_string<'a>(value: &'a OwnedValue, pointer: &str) -> Option<&'
         OwnedValue::String(value) => Some(value.as_str()),
         _ => None,
     }
+}
+
+/// Parse an RFC 6901 array index segment. Rejects leading zeroes (except
+/// for the single digit `"0"`) and non-numeric input.
+fn parse_array_index(segment: &str) -> Option<usize> {
+    if segment.is_empty() {
+        return None;
+    }
+    let bytes = segment.as_bytes();
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None; // leading zero
+    }
+    segment.parse::<usize>().ok()
 }
 
 /// Derive mtxdb's internal 128-bit key for one template-extracted value.
@@ -2482,8 +2515,12 @@ mod tests {
 
     #[test]
     fn pointer_extraction_supports_array_indices_and_rejects_bad_pointers() {
-        let event = owned_value(r#"{"auth_events": ["$a", "$b"], "event_id": "$c"}"#);
+        let event =
+            owned_value(r#"{"auth_events": ["$a", "$b"], "event_id": "$c", "a~1b": "escaped"}"#);
+        // Valid array index.
         assert_eq!(extract_pointer_string(&event, "/auth_events/1"), Some("$b"));
+        // Valid tilde escaping: ~0 → ~, ~1 → /.
+        assert_eq!(extract_pointer_string(&event, "/a~01b"), Some("escaped"));
         // A non-empty pointer must start with `/`; a bare field name is not
         // a valid RFC 6901 pointer and must not silently resolve anything.
         assert_eq!(extract_pointer_string(&event, "event_id"), None);
@@ -2491,6 +2528,13 @@ mod tests {
         // fall through to some other value.
         assert_eq!(extract_pointer_string(&event, "/auth_events/9"), None);
         assert_eq!(extract_pointer_string(&event, "/auth_events/x"), None);
+        // Leading zeroes in array indices are forbidden by RFC 6901.
+        assert_eq!(extract_pointer_string(&event, "/auth_events/01"), None);
+        assert_eq!(extract_pointer_string(&event, "/auth_events/00"), None);
+        // Invalid tilde escapes (~2, ~a, trailing ~) are forbidden.
+        assert_eq!(extract_pointer_string(&event, "/a~2b"), None);
+        assert_eq!(extract_pointer_string(&event, "/a~ab"), None);
+        assert_eq!(extract_pointer_string(&event, "/a~"), None);
     }
 
     // `physical_layout`/`avoidable_spread_bytes` coverage now lives with
