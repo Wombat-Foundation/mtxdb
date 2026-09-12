@@ -65,12 +65,13 @@ crc32fast = "1.4"
 # as explicitly registered by `mtxdb-core`. Keep its direct shared dependencies
 # here so `cargo bench` from the database root works.
 #
-# `storage.rs` is already registered with `harness = false` under
-# `mtxdb-core`'s own [[bench]] (see mtxdb-core/Cargo.toml) — that's what
-# makes `cargo bench --bench storage` run its `fn main()` instead of being
-# wrapped in the default libtest harness (which would report "0 tests").
-# `locality.rs` needs the same treatment for this (root) package, since
-# nothing else registers it.
+# Each custom bench has its own `fn main()`, so root-package discovery must
+# opt out of Cargo's default libtest harness. The mtxdb-core registrations do
+# not apply to `cargo bench --benches` at this workspace root.
+
+[[bench]]
+name = "storage"
+harness = false
 
 [[bench]]
 name = "locality"
