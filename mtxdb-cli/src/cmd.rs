@@ -1334,34 +1334,49 @@ fn validate_required_keys<'a>(
 fn extract_display_id_pointer<'a>(
     template: &'a OwnedValue,
     membership_pointer: &'a str,
-) -> &'a str {
-    let mut display_id_pointer = membership_pointer;
+    path: &Path,
+) -> anyhow::Result<&'a str> {
+    let display_id_pointer = membership_pointer;
     if let Some(labels) = template
         .get("collection")
         .and_then(|c| c.get("labels"))
         .and_then(|l| l.as_array())
     {
         for label in labels {
-            if let OwnedValue::Object(obj) = label {
-                if let Some(OwnedValue::String(name)) = obj.get("name") {
-                    if name == "display_id" {
-                        if let Some(OwnedValue::String(val)) = obj.get("value") {
-                            if val == "membership-value" {
-                                display_id_pointer = membership_pointer;
-                            } else {
-                                display_id_pointer = val;
-                            }
-                        } else if let Some(OwnedValue::Object(val)) = obj.get("value") {
-                            if let Some(OwnedValue::String(path)) = val.get("path") {
-                                display_id_pointer = path;
-                            }
-                        }
-                    }
-                }
+            let OwnedValue::Object(obj) = label else {
+                bail!(
+                    "template {} declares a collection label that is not an object",
+                    path.display()
+                );
+            };
+            let Some(OwnedValue::String(name)) = obj.get("name") else {
+                bail!(
+                    "template {} declares a collection label without a name",
+                    path.display()
+                );
+            };
+            if name != "display_id" {
+                continue;
+            }
+            let Some(OwnedValue::String(val)) = obj.get("value") else {
+                bail!(
+                    "template {} requests a display label with a non-string value {:?}, which \
+                     the importer cannot persist; only the membership value is supported as a \
+                     display identifier",
+                    path.display(),
+                    obj.get("value")
+                );
+            };
+            if val != "membership-value" {
+                bail!(
+                    "template {} requests display label {val:?}, which the importer cannot \
+                     persist; only the membership value is supported as a display identifier",
+                    path.display()
+                );
             }
         }
     }
-    display_id_pointer
+    Ok(display_id_pointer)
 }
 
 fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemplate> {
@@ -1393,7 +1408,34 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     .unwrap_or("blake3-128");
     validate_digest_algorithm(collection_id_algorithm)
         .with_context(|| format!("template {} collection internal_key", path.display()))?;
-    let display_id_pointer = extract_display_id_pointer(&template, membership_pointer);
+    if let Some(policy) = template
+        .get("record")
+        .and_then(|r| r.get("payload"))
+        .and_then(|p| p.get("policy"))
+    {
+        match policy {
+            OwnedValue::String(s) if s == "retain-source" => {}
+            OwnedValue::String(s) => {
+                bail!(
+                    "template {} payload policy {s:?} is not supported: only `retain-source` is \
+                     implemented, so a `projection` policy must not silently compile to \
+                     full-source retention",
+                    path.display()
+                );
+            }
+            other => {
+                bail!(
+                    "template {} payload policy must be a string naming a supported policy; got \
+                     {other:?}",
+                    path.display()
+                );
+            }
+        }
+    }
+    // The importer persists no collection-label metadata, so a template that
+    // requests a distinct display identifier cannot honor that request. Reject
+    // it rather than silently dropping the configured label.
+    let display_id_pointer = extract_display_id_pointer(&template, membership_pointer, path)?;
 
     Ok(CollectionTemplate {
         name: "matrix-event-v1".into(),
@@ -2404,15 +2446,37 @@ mod tests {
         compile_import_template, default_matrix_import_template, event_room_id,
         extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, matrix_batch_has_create,
         matrix_create_details, parse_pack_id_selector, parse_pack_selectors,
-        resolve_import_collection, template_collection_id,
+        resolve_import_collection, template_collection_id, CollectionTemplate,
     };
     use simd_json::OwnedValue;
     use std::collections::HashSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
         simd_json::to_owned_value(&mut bytes).expect("valid JSON fixture")
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb-cli-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn compile_reject(template: &[u8]) -> anyhow::Result<CollectionTemplate> {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("template.json");
+        std::fs::write(&path, template).unwrap();
+        let result = compile_import_template(Some(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+        result
     }
 
     #[test]
@@ -2600,22 +2664,130 @@ mod tests {
             },
             "establishment": {"required": true}
         }"#;
-        let dir = std::env::temp_dir().join(format!(
-            "mtxdb-cli-test-{}-{}",
-            std::process::id(),
-            "unsupported-digest"
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("template.json");
-        std::fs::write(&path, template).unwrap();
-        let error = compile_import_template(Some(&path)).expect_err(
+        let error = compile_reject(template).expect_err(
             "an unsupported digest algorithm must be rejected at compile time, not mid-import",
         );
         assert!(
             format!("{error:#}").contains("unsupported internal-key algorithm"),
             "unexpected error: {error:#}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_import_template_rejects_a_projection_payload_policy() {
+        let template = br#"{
+            "format": "mtxdb.collection-template/v1",
+            "name": "matrix-event-v1",
+            "record": {
+                "identity": {
+                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                    "internal_key": {"algorithm": "blake3-128"}
+                },
+                "payload": {"policy": "projection", "include": ["/type", "/sender"]}
+            },
+            "collection": {
+                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
+            },
+            "establishment": {"required": true}
+        }"#;
+        let error = compile_reject(template).expect_err(
+            "a projection payload policy must be rejected instead of degrading to full-source retention",
+        );
+        assert!(
+            format!("{error:#}").contains(r#"payload policy "projection" is not supported"#),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn compile_import_template_rejects_a_non_string_payload_policy() {
+        let template = br#"{
+            "format": "mtxdb.collection-template/v1",
+            "name": "matrix-event-v1",
+            "record": {
+                "identity": {
+                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                    "internal_key": {"algorithm": "blake3-128"}
+                },
+                "payload": {"policy": 42}
+            },
+            "collection": {
+                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
+            },
+            "establishment": {"required": true}
+        }"#;
+        let error = compile_reject(template).expect_err(
+            "a present non-string payload policy must be rejected instead of silently compiling to source retention",
+        );
+        assert!(
+            format!("{error:#}").contains("payload policy must be a string"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn compile_import_template_rejects_a_distinct_display_label() {
+        let template = br#"{
+            "format": "mtxdb.collection-template/v1",
+            "name": "matrix-event-v1",
+            "record": {
+                "identity": {
+                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                    "internal_key": {"algorithm": "blake3-128"}
+                },
+                "payload": {"policy": "retain-source"}
+            },
+            "collection": {
+                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
+                "labels": [{"name": "display_id", "value": "/canonical_alias"}]
+            },
+            "establishment": {"required": true}
+        }"#;
+        let error = compile_reject(template).expect_err(
+            "a distinct display label must be rejected since the importer cannot persist it",
+        );
+        assert!(
+            format!("{error:#}").contains("display label"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn compile_import_template_rejects_a_malformed_display_label() {
+        for label_value in [
+            r#"{"kind":"json-pointer-rfc-6901"}"#,
+            r#"{"path": 42}"#,
+            r"42",
+            r"null",
+            r#"["/canonical_alias"]"#,
+            r"true",
+        ] {
+            let template = format!(
+                r#"{{
+                "format": "mtxdb.collection-template/v1",
+                "name": "matrix-event-v1",
+                "record": {{
+                    "identity": {{
+                        "extract": {{"kind": "json-pointer-rfc-6901", "path": "/event_id"}},
+                        "internal_key": {{"algorithm": "blake3-128"}}
+                    }},
+                    "payload": {{"policy": "retain-source"}}
+                }},
+                "collection": {{
+                    "membership": {{"extract": {{"kind": "json-pointer-rfc-6901", "path": "/room_id"}}}},
+                    "labels": [{{"name": "display_id", "value": {label_value}}}]
+                }},
+                "establishment": {{"required": true}}
+            }}"#
+            );
+            let error = compile_reject(template.as_bytes()).expect_err(
+                "a malformed display label value must not silently fall back to the membership pointer",
+            );
+            assert!(
+                format!("{error:#}").contains("display label"),
+                "unexpected error for label value {label_value}: {error:#}"
+            );
+        }
     }
 
     #[test]
