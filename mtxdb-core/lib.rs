@@ -40,6 +40,6 @@ pub use packfile::{storage::PackfileStorage, Record};
 pub use shard::ShardPool;
 pub use storage::{NodeData, NodeId, StorageEngine};
 pub use template::{
-    EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding, RoomIdPolicy,
-    RoomMetadata, StateResolutionPolicy, ValidationProfile,
+    CollectionKeyRule, CollectionTemplate, PayloadPolicy, RecordIdentityRule,
+    COLLECTION_TEMPLATE_FORMAT_V1,
 };
