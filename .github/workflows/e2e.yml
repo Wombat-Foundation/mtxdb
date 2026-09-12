@@ -16,7 +16,6 @@ env:
 jobs:
   equiv-determ:
     runs-on: ubuntu-latest
-    env:
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,14 +36,12 @@ jobs:
       - name: Run Rust test suite
         run: make test
 
-      - name: Upload E2E Diff on Failure
+      - name: Upload test artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-failure-artifacts
+          name: rust-test-artifacts
           path: |
-            *.diff
             *.json
             *.log
-            .lake/build/
           retention-days: 5
