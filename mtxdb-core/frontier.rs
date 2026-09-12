@@ -69,16 +69,17 @@ pub fn fetch_frontier_batch<S: StorageEngine>(
         .collect())
 }
 
-/// Concurrently fetch all nodes in a frontier batch.
+/// Fetch all nodes in a frontier batch.
 ///
-/// **Note:** This is an alias for [`fetch_frontier_batch`] and currently
-/// performs sequential I/O. A true concurrent implementation (`io_uring`,
-/// thread pool) that issues all reads in parallel is planned but not
-/// yet implemented.
+/// Performs sequential I/O via [`fetch_frontier_batch`]. The sorted physical
+/// offset ordering is usually preferable for packfile/HDD reads.
+///
+/// A true concurrent implementation (`io_uring`, thread pool) is planned but
+/// not yet implemented. Callers should not assume parallelism here.
 ///
 /// # Errors
 /// Returns `StorageError::Io` on I/O failure from the storage engine.
-pub fn fetch_frontier_concurrent<S: StorageEngine>(
+pub fn fetch_frontier_sequential<S: StorageEngine>(
     engine: &S,
     collection_id: &[u8; 16],
     batch: &FrontierBatch,
@@ -209,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_frontier_concurrent() {
+    fn test_fetch_frontier_sequential() {
         use crate::storage::InMemoryStorage;
 
         let engine = InMemoryStorage::new();
@@ -233,7 +234,7 @@ mod tests {
             .unwrap();
 
         let batch = FrontierBatch::new(vec![id1, id2, [3u8; 16]]); // id3 not in store
-        let results = fetch_frontier_concurrent(&engine, &collection, &batch).unwrap();
+        let results = fetch_frontier_sequential(&engine, &collection, &batch).unwrap();
 
         assert_eq!(results.len(), 3);
         assert!(results[0].1.is_some());
