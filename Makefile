@@ -41,7 +41,10 @@ fix: ##H Apply auto-fixes with clippy (only core)
 .PHONY: doc
 doc: ##H Build docs
 	$(CARGO) test --workspace --doc
-	$(CARGO) doc --workspace --no-deps
+	# Document library crates only — the mtxdb-cli binary shares the name
+	# "mtxdb" with the root facade lib, hitting cargo #6313.  Skip it;
+	# CLI usage is covered by `mtxdb --help`.
+	$(CARGO) doc -p mtxdb -p mtxdb-core --no-deps
 	echo '<meta http-equiv="refresh" content="0;url=mtxdb/index.html">' > target/doc/index.html
 
 
