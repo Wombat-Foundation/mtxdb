@@ -11,7 +11,10 @@ use mtxdb_core::packfile::layout::{
 };
 use mtxdb_core::shard::ShardPool;
 use mtxdb_core::storage::{NodeData, StorageEngine};
-use mtxdb_core::{DatabaseLayout, PackfileStorage, ShardType};
+use mtxdb_core::{
+    CollectionKeyRule, CollectionTemplate, DatabaseLayout, PackfileStorage, PayloadPolicy,
+    RecordIdentityRule, ShardType,
+};
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
 
@@ -1192,9 +1195,7 @@ fn cmd_import(
     collection_override: Option<&str>,
     template: Option<&Path>,
 ) -> anyhow::Result<()> {
-    if let Some(template) = template {
-        load_matrix_event_template(template)?;
-    }
+    let import_template = compile_import_template(template)?;
     // One writer owns the entire batch: it prevents another writer from
     // interleaving halfway through a shell glob, and lets us publish one
     // complete shard/collection snapshot once the final input has been handled.
@@ -1212,6 +1213,7 @@ fn cmd_import(
             &store,
             path,
             collection_override,
+            &import_template,
             &mut established_collections,
         ) {
             eprintln!("{}: {error:#}", path.display());
@@ -1227,10 +1229,36 @@ fn cmd_import(
     Ok(())
 }
 
-/// Load the executable Matrix archive profile. The importer currently has one
-/// implementation, so accepting a different template would be dishonest: its
-/// identity, membership, and establishment rules must match this profile.
-fn load_matrix_event_template(path: &Path) -> anyhow::Result<()> {
+/// The built-in Matrix archive profile, used whenever `--template` is not
+/// given. It is kept identical to `matrix-event-v1.json`'s identity,
+/// membership, and payload rules, so a caller who never passes `--template`
+/// still runs through the same generic extraction path as one who does.
+fn default_matrix_import_template() -> CollectionTemplate {
+    CollectionTemplate {
+        name: "matrix-event-v1".into(),
+        collection_kind: "room".into(),
+        record_identity: RecordIdentityRule {
+            pointer: "/event_id".into(),
+            node_id_algorithm: "blake3-128".into(),
+        },
+        payload: PayloadPolicy::Source,
+        collection_key: CollectionKeyRule {
+            pointer: "/room_id".into(),
+            collection_id_algorithm: "blake3-128".into(),
+            display_id_pointer: "/room_id".into(),
+        },
+    }
+}
+
+/// Compile the selected template into the executable profile the importer
+/// runs identity and collection extraction through. With no `--template`,
+/// this is [`default_matrix_import_template`]; the importer has one real
+/// implementation, so a file-based template must describe that same profile
+/// rather than silently taking effect as a different one.
+fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemplate> {
+    let Some(path) = path else {
+        return Ok(default_matrix_import_template());
+    };
     let mut bytes =
         fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
     let template: OwnedValue = simd_json::to_owned_value(&mut bytes)
@@ -1273,7 +1301,89 @@ fn load_matrix_event_template(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    Ok(())
+    let node_id_algorithm = template_string_at(
+        &template,
+        ["record", "identity", "internal_key", "algorithm"].as_slice(),
+    )
+    .unwrap_or("blake3-128")
+    .to_owned();
+    let collection_id_algorithm = template_string_at(
+        &template,
+        ["collection", "internal_key", "algorithm"].as_slice(),
+    )
+    .unwrap_or("blake3-128")
+    .to_owned();
+    Ok(CollectionTemplate {
+        name: "matrix-event-v1".into(),
+        collection_kind: "room".into(),
+        record_identity: RecordIdentityRule {
+            pointer: "/event_id".into(),
+            node_id_algorithm,
+        },
+        payload: PayloadPolicy::Source,
+        collection_key: CollectionKeyRule {
+            pointer: "/room_id".into(),
+            collection_id_algorithm,
+            display_id_pointer: "/room_id".into(),
+        },
+    })
+}
+
+/// Resolve an RFC 6901 JSON pointer against a parsed event, returning the
+/// string it names. Only the single-segment top-level pointers mtxdb's
+/// templates currently use (e.g. `/event_id`) are exercised, but this walks
+/// the full pointer so a deeper path is not silently misread.
+fn extract_pointer_string<'a>(value: &'a OwnedValue, pointer: &str) -> Option<&'a str> {
+    let mut current = value;
+    for segment in pointer.split('/').skip(1) {
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        let OwnedValue::Object(object) = current else {
+            return None;
+        };
+        current = object.get(segment.as_str())?;
+    }
+    match current {
+        OwnedValue::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Derive mtxdb's internal 128-bit key for one template-extracted value.
+/// `blake3-128` is the only algorithm any shipped template names today.
+fn derive_template_key(algorithm: &str, extracted: &str) -> anyhow::Result<[u8; 16]> {
+    match algorithm {
+        "blake3-128" => {
+            let hash = blake3::hash(extracted.as_bytes());
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&hash.as_bytes()[..16]);
+            Ok(id)
+        }
+        other => bail!("unsupported internal-key algorithm `{other}`"),
+    }
+}
+
+/// Run a template's record-identity rule against one event, producing the
+/// node ID that storage keys it by.
+fn template_node_id(
+    template: &CollectionTemplate,
+    event: &OwnedValue,
+) -> anyhow::Result<Option<[u8; 16]>> {
+    let Some(extracted) = extract_pointer_string(event, &template.record_identity.pointer) else {
+        return Ok(None);
+    };
+    derive_template_key(&template.record_identity.node_id_algorithm, extracted).map(Some)
+}
+
+/// Run a template's collection-key rule against an already-extracted
+/// membership value (e.g. a Matrix `room_id`), producing the collection ID.
+fn template_collection_id(
+    template: &CollectionTemplate,
+    membership_value: &str,
+) -> anyhow::Result<[u8; 16]> {
+    derive_template_key(
+        &template.collection_key.collection_id_algorithm,
+        membership_value,
+    )
 }
 
 fn template_string_at<'a>(value: &'a OwnedValue, keys: &[&str]) -> Option<&'a str> {
@@ -1364,6 +1474,7 @@ fn cmd_import_file(
     store: &PackfileStorage,
     path: &Path,
     collection_override: Option<&str>,
+    template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
     let content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -1399,6 +1510,7 @@ fn cmd_import_file(
         &events,
         detected_collection.as_deref(),
         collection_override,
+        template,
         established_collections,
     )?;
 
@@ -1409,9 +1521,10 @@ fn cmd_import_file(
             skipped = skipped.saturating_add(1);
             continue;
         };
-        let event_hash = blake3::hash(incoming_event_id.as_bytes());
-        let mut id_bytes = [0u8; 16];
-        id_bytes.copy_from_slice(&event_hash.as_bytes()[..16]);
+        let Some(id_bytes) = template_node_id(template, ev)? else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
 
         let event_bytes = ev.encode().into_bytes();
         if let Some(existing) = store.get(&collection_id, &id_bytes)? {
@@ -1465,6 +1578,7 @@ fn resolve_import_collection(
     events: &[OwnedValue],
     detected_collection: Option<&str>,
     collection_override: Option<&str>,
+    template: &CollectionTemplate,
     established_collections: &HashSet<[u8; 16]>,
 ) -> anyhow::Result<([u8; 16], bool)> {
     let room_ids: HashSet<_> = events.iter().filter_map(event_room_id).collect();
@@ -1475,7 +1589,7 @@ fn resolve_import_collection(
     let collection_id = if let Some(value) = collection_override {
         let collection_id = parse_collection_id(value)?;
         if let Some(room_id) = room_id {
-            let expected = collection_id_for_room(room_id);
+            let expected = template_collection_id(template, room_id)?;
             if collection_id != expected {
                 bail!(
                     "--collection {value} does not match Matrix room_id {room_id}; refusing to mix room data into another collection"
@@ -1493,7 +1607,7 @@ fn resolve_import_collection(
                 "could not detect collection_id (first event: {first_event}); pass --collection for this input"
             )
         })?;
-        collection_id_for_room(room_id)
+        template_collection_id(template, room_id)?
     };
     let batch_has_create = room_id.is_some_and(|room_id| matrix_batch_has_create(events, room_id));
     if !batch_has_create && !established_collections.contains(&collection_id) {
@@ -1503,13 +1617,6 @@ fn resolve_import_collection(
         );
     }
     Ok((collection_id, batch_has_create))
-}
-
-fn collection_id_for_room(room_id: &str) -> [u8; 16] {
-    let hash = blake3::hash(room_id.as_bytes());
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash.as_bytes()[..16]);
-    id
 }
 
 /// Return every collection that already contains a valid Matrix establishing
@@ -2129,9 +2236,9 @@ fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_id_for_room, event_room_id, fmt_disk_megabytes, fmt_megabytes,
-        load_matrix_event_template, matrix_batch_has_create, matrix_create_details,
-        parse_pack_id_selector, parse_pack_selectors, resolve_import_collection,
+        compile_import_template, default_matrix_import_template, event_room_id, fmt_disk_megabytes,
+        fmt_megabytes, matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
+        parse_pack_selectors, resolve_import_collection, template_collection_id,
     };
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -2279,7 +2386,8 @@ mod tests {
         let message = owned_value(
             r#"{"type":"m.room.message","event_id":"$message","room_id":"!room:example.org"}"#,
         );
-        let error = resolve_import_collection(&[message], None, None, &HashSet::new())
+        let template = default_matrix_import_template();
+        let error = resolve_import_collection(&[message], None, None, &template, &HashSet::new())
             .expect_err("a room without a batch or persisted create must be rejected");
         assert!(error
             .to_string()
@@ -2291,18 +2399,23 @@ mod tests {
         let create = owned_value(
             r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org"}"#,
         );
+        let template = default_matrix_import_template();
         let (collection_id, batch_has_create) =
-            resolve_import_collection(&[create], None, None, &HashSet::new()).unwrap();
-        assert_eq!(collection_id, collection_id_for_room("!room:example.org"));
+            resolve_import_collection(&[create], None, None, &template, &HashSet::new()).unwrap();
+        assert_eq!(
+            collection_id,
+            template_collection_id(&template, "!room:example.org").unwrap()
+        );
         assert!(batch_has_create);
     }
 
     #[test]
     fn checked_in_matrix_template_matches_the_executable_importer() {
-        let template =
+        let template_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../templates/matrix-event-v1.json");
-        load_matrix_event_template(&template)
+        let compiled = compile_import_template(Some(&template_path))
             .expect("checked-in Matrix template must be executable");
+        assert_eq!(compiled, default_matrix_import_template());
     }
 
     // `physical_layout`/`avoidable_spread_bytes` coverage now lives with
