@@ -1112,18 +1112,18 @@ fn main() {
     eprintln!("  DECISION MATRIX ('large' scenario, measured signals only)");
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  read syscalls (cold):  {}", large.read_syscalls);
-    eprintln!("  index loss rate:       {:.2}%", large.index_loss_rate);
-    eprintln!("  warm cache hit rate:   {:.1}%", large.warm_hit_rate);
+    eprintln!("  index loss rate:       {:.4}%", large.index_loss_rate);
+    eprintln!("  warm cache hit rate:   {:.4}%", large.warm_hit_rate);
     eprintln!(
         "  cold throughput:       {:.0} gets/sec",
         large.cold_gets_per_sec
     );
     eprintln!(
-        "  warm throughput:       {:.0} gets/sec ({:.1}x cold)",
+        "  warm throughput:       {:.0} gets/sec ({:.4}x cold)",
         large.warm_gets_per_sec,
         large.warm_gets_per_sec / large.cold_gets_per_sec
     );
-    eprintln!("  small cache warm hit:  {:.1}%", pressure.warm_hit_rate);
+    eprintln!("  small cache warm hit:  {:.4}%", pressure.warm_hit_rate);
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  If read syscalls (cold) > 6:     -> Concurrent Frontier I/O");
     eprintln!("    (mmap collapses per-record reads to O(1) syscalls; a rise");
