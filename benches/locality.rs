@@ -366,8 +366,9 @@ fn compact_shard_intra(
             .push(hash);
     }
 
-    let mut file = fs::File::create(dest_path)?;
-    packfile::write_header(&mut file, dest_pack_id)?;
+    let file = fs::File::create(dest_path)?;
+    let mut buffered = std::io::BufWriter::with_capacity(1024 * 1024, file);
+    packfile::write_header(&mut buffered, dest_pack_id)?;
 
     let mut records_written = 0usize;
     let mut bytes_written = 0u64;
@@ -389,15 +390,19 @@ fn compact_shard_intra(
                 hash: *hash,
                 data: data.bytes,
             };
-            bytes_written += packfile::write_record(&mut file, &record)?;
+            bytes_written += packfile::write_record(&mut buffered, &record)?;
             records_written += 1;
         }
     }
+
+    // Flush the BufWriter into the OS page cache before stopping the write timer.
+    std::io::Write::flush(&mut buffered)?;
     let write_time = start.elapsed();
 
     // Real durability, matching what `sync_dirty` does for a real
     // repack — see `CompactionCost`'s doc comment for why omitting
     // this would make the comparison dishonest.
+    let file = buffered.into_inner().map_err(|e| e.into_error())?;
     let fsync_start = Instant::now();
     file.sync_all()?;
     let fsync_time = fsync_start.elapsed();
