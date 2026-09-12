@@ -898,6 +898,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
         elapsed: std::time::Duration,
         syscalls: u64,
         disk_read_bytes: u64,
+        evicted: bool,
     }
 
     // Shared measurement scaffolding: clear cache, evict page cache, time
@@ -911,7 +912,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
                       f: &dyn Fn(&[NodeId]) -> usize|
      -> Row {
         store.collection_cache(&ROOM).clear();
-        let _ = drop_caches_for_dir(&dir);
+        let evicted = drop_caches_for_dir(&dir);
         let io_before = IoStats::read_now();
         let t = Instant::now();
         let found = f(targets);
@@ -925,6 +926,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
             elapsed,
             syscalls: io_after.syscr.saturating_sub(io_before.syscr),
             disk_read_bytes: io_after.read_bytes.saturating_sub(io_before.read_bytes),
+            evicted,
         }
     };
 
@@ -982,6 +984,9 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
     eprintln!("  just visited in a sane order. Compare against the naive");
     eprintln!("  rows to see how much of the gap sorting actually closes.");
     eprintln!("═══════════════════════════════════════════════════════════════");
+    if rows.iter().any(|r| !r.evicted) {
+        eprintln!("  Note: vmtouch unavailable or failed; the above timings are warm reads.");
+    }
     eprintln!();
 
     drop(store);

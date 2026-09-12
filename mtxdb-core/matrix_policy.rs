@@ -45,6 +45,17 @@ pub enum ReferenceHashEncoding {
     UrlSafeBase64NoPad,
 }
 
+/// What fields are stripped before calculating a reference-hash event ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceHashInputPolicy {
+    /// Room version 1 to 5.
+    V1ToV5,
+    /// Room version 6 to 8.
+    V6ToV8,
+    /// Room version 9 and later.
+    V9Plus,
+}
+
 /// Versioned Matrix redaction content table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedactionPolicy {
@@ -165,6 +176,18 @@ impl MatrixRoomVersion {
             Self::V6 | Self::V7 | Self::V8 => RedactionPolicy::V6ToV8,
             Self::V9 | Self::V10 => RedactionPolicy::V9ToV10,
             Self::V11 | Self::V12 => RedactionPolicy::V11Plus,
+        }
+    }
+
+    /// Versioned reference hash input rules.
+    #[must_use]
+    pub const fn reference_hash_input_policy(self) -> ReferenceHashInputPolicy {
+        match self {
+            Self::V1 | Self::V2 | Self::V3 | Self::V4 | Self::V5 => {
+                ReferenceHashInputPolicy::V1ToV5
+            }
+            Self::V6 | Self::V7 | Self::V8 => ReferenceHashInputPolicy::V6ToV8,
+            _ => ReferenceHashInputPolicy::V9Plus,
         }
     }
 

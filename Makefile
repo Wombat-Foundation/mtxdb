@@ -19,14 +19,14 @@ all: format lint doc fix test install
 
 .PHONY: format
 format: ##H Format code
-	-prettier -w $$(git ls-files '*.md' '*.y*ml' '*.json')
-	-pre-commit run --all-files
-	$(CARGO) sort --workspace --grouped
+	prettier -w $$(git ls-files '*.md' '*.y*ml' '*.json')
+	pre-commit run --all-files
+	if command -v cargo-sort >/dev/null 2>&1; then $(CARGO) sort --workspace --grouped; else echo "cargo-sort not found, skipping"; fi
 
 .PHONY: check
 check: ##H Cargo check (core) and code dupe
 	$(CARGO) check  --workspace --all-targets --all-features
-	-jscpd $$(git ls-files '*.rs')
+	jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
 lint: ##H Run clippy lints (only core, not full workspace)
@@ -34,8 +34,8 @@ lint: ##H Run clippy lints (only core, not full workspace)
 
 .PHONY: fix
 fix: ##H Apply auto-fixes with clippy (only core)
-	# TODO: filter if p=<set>, --manifest-path mtxdb-cli/Cargo.toml
 	$(CARGO) clippy --fix  --workspace --allow-dirty --allow-staged --allow-no-vcs --all-targets --all-features
+	$(CARGO) clippy --fix --manifest-path mtxdb-cli/Cargo.toml --allow-dirty --allow-staged --allow-no-vcs --all-targets --all-features
 
 
 .PHONY: doc
@@ -97,7 +97,7 @@ build: ##H Build all
 
 .PHONY: install
 install:	##H Install CLI from source
-	$(CARGO) install --locked --timings --path mtxdb-cli
+	$(CARGO) install --locked --path mtxdb-cli
 
 
 .PHONY: clean

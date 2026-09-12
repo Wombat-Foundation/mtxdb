@@ -70,6 +70,6 @@
       "index": "packed-adjacency"
     }
   ],
-  "validation": { "on_missing_identity": "reject-record", "on_missing_membership": "reject-record" },
+  "validation": { "on_missing_identity": "reject-record", "on_missing_membership": "allow-if-established" },
   "extensions": { "matrix": { "room_version_policy": "mtxdb-core::MatrixRoomVersion" } }
 }

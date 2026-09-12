@@ -802,6 +802,7 @@ pub fn run_stage1_locality_benchmark(
     );
     println!("═══════════════════════════════════════════════════════════════");
 
+    drop(store_post);
     let _ = fs::remove_dir_all(&temp_dir);
 }
 

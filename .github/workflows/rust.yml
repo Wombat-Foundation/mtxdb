@@ -69,23 +69,23 @@ jobs:
       # distinguished by `matrix.label`, not `matrix.rust`.
       - name: Lint (default features)
         if: matrix.label == 'MSRV (default features)'
-        run: CARGO_FEATURE_ARGS="--locked" make lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test (default features)
         if: matrix.label == 'MSRV (default features)'
-        run: CARGO_FEATURE_ARGS="--locked" make rust/test
+        run: cargo test --locked --workspace --lib --tests
 
       - name: Lint (cli feature)
         if: matrix.label == 'cli feature'
-        run: CARGO_FEATURE_ARGS="--locked --features cli" make lint
+        run: cargo clippy --locked --features cli --workspace --all-targets -- -D warnings
 
       - name: Test (cli feature)
         if: matrix.label == 'cli feature'
-        run: CARGO_FEATURE_ARGS="--locked --features cli" make rust/test
+        run: cargo test --locked --features cli --workspace --lib --tests
 
       - name: Build CLI
         if: matrix.label == 'cli feature'
-        run: make build
+        run: cargo build --release --manifest-path mtxdb-cli/Cargo.toml
 
   all-features:
     name: Rust ${{ matrix.rust }} all features
@@ -118,10 +118,10 @@ jobs:
           cargo --version
 
       - name: Lint
-        run: CARGO_FEATURE_ARGS="--locked --all-features" make lint
+        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: CARGO_FEATURE_ARGS="--locked --all-features" make rust/test
+        run: cargo test --locked --all-features --workspace --lib --tests
 
   checks:
     name: Format, Coverage, and Summary
@@ -150,10 +150,10 @@ jobs:
           cargo install cargo-sort
 
       - name: Format Check
-        run: make format
+        run: make format && git diff --exit-code
 
       - name: Lint (Clippy)
-        run: CARGO_FEATURE_ARGS="--locked --all-features" make lint
+        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
 
       - name: Install nightly toolchain (for llvm-cov)
         run: rustup toolchain install nightly --profile minimal
@@ -162,10 +162,10 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test Suite
-        run: set -o pipefail; CARGO_FEATURE_ARGS="--locked --all-features" make rust/test 2>&1 | tee test-results.txt
+        run: set -o pipefail; cargo test --locked --all-features --workspace --lib --tests 2>&1 | tee test-results.txt
 
       - name: Code Coverage
-        run: make rust/coverage
+        run: make cov
 
       - name: Upload Test Results
         if: always()

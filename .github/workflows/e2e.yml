@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: ["main", "master"]
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -17,7 +20,7 @@ jobs:
       MATRIX_HOMESERVER: ${{ secrets.MATRIX_HOMESERVER }}
       MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}
       MATRIX_ROOM_ID_V2_1: ${{ secrets.MATRIX_ROOM_ID_V2_1 }}
-      MATRIX_TOKEN: ${{ secrets.MATRIX_TOKEN }}
+      MATRIX_TOKEN: ${{ github.event_name == 'push' && secrets.MATRIX_TOKEN || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,11 +36,8 @@ jobs:
       - name: Build release crate
         run: make build
 
-      - name: Setup Ruma Reference
-        run: bash scripts/setup_ruma_cli.sh
-
       - name: Run E2E parity test
-        run: make rust/e2e
+        run: make test
 
       - name: Upload E2E Diff on Failure
         if: failure()

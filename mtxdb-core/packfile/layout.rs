@@ -11,10 +11,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Seek};
 use std::path::Path;
 
-use super::{read_header, FRAME_FIXED_LEN, MAX_RECORD_LEN};
+use super::{read_header, read_record_metadata};
 
 /// Raw, on-disk physical layout of every pack file in a directory.
 #[derive(Debug, Default)]
@@ -87,72 +87,33 @@ pub fn physical_layout(dir: &Path) -> io::Result<PhysicalLayout> {
     let mut layout = PhysicalLayout::default();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if !path
-            .extension()
-            .is_some_and(|extension| extension == "pack")
-        {
+        if path.extension().and_then(|s| s.to_str()) != Some("pack") {
             continue;
         }
-        let file = File::open(path)?;
+
+        let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
         let Some(header) = read_header(&mut reader)? else {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "missing or invalid magic header in .pack file: {}",
+                    path.display()
+                ),
+            ));
         };
         let pack_id = header.pack_id;
         let mut current_run: Option<([u8; 16], u64)> = None;
-        let mut discard = [0_u8; 8192];
         loop {
-            let mut len = [0_u8; 4];
-            match reader.read_exact(&mut len) {
-                Ok(()) => {}
+            let offset = reader.stream_position()?;
+            let meta = match read_record_metadata(&mut reader) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => break,
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
-            }
-            let frame_len = u64::from(u32::from_le_bytes(len));
-            if !(u64::from(FRAME_FIXED_LEN)..=u64::from(MAX_RECORD_LEN)).contains(&frame_len) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid record length {frame_len} while measuring collection disk usage"
-                    ),
-                ));
-            }
-            // Skip the flags byte and uncompressed_len field to reach
-            // collection_id — this scan only needs the collection ID,
-            // not whether/how the node bytes that follow are compressed.
-            let mut flags_and_uncompressed_len = [0_u8; 5];
-            match reader.read_exact(&mut flags_and_uncompressed_len) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error),
-            }
-            let mut collection_id = [0_u8; 16];
-            match reader.read_exact(&mut collection_id) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error),
-            }
-            let mut remaining = frame_len.saturating_sub(21).saturating_add(4);
-            let mut complete = true;
-            while remaining != 0 {
-                let chunk_len = usize::try_from(remaining)
-                    .unwrap_or(usize::MAX)
-                    .min(discard.len());
-                match reader.read_exact(&mut discard[..chunk_len]) {
-                    Ok(()) => remaining = remaining.saturating_sub(chunk_len as u64),
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                        complete = false;
-                        break;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            // A concurrent append may expose a torn tail. If the final
-            // read was short, leave it for the next scan once complete.
-            if !complete {
-                break;
-            }
-            let record_bytes = frame_len.saturating_add(8);
+            };
+            let record_bytes = reader.stream_position()?.saturating_sub(offset);
+            let collection_id = meta.collection_id;
             let collection = layout.collections.entry(collection_id).or_default();
             collection.disk_bytes = collection.disk_bytes.saturating_add(record_bytes);
             let pack_bytes = collection.pack_bytes.entry(pack_id).or_default();

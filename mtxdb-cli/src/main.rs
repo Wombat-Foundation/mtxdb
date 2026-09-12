@@ -1,7 +1,6 @@
 //! CLI for the mtxdb content-addressed storage engine.
 
 mod cmd;
-mod matrix_policy;
 
 use std::path::PathBuf;
 

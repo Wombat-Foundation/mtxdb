@@ -24,6 +24,8 @@ pub mod frontier;
 pub mod index;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
+/// Matrix-specific room-version policy.
+pub mod matrix_policy;
 /// On-disk packfile format and the storage engine built on top of it.
 pub mod packfile;
 /// Fixed-size shard file pool that packfiles are written into.
@@ -36,6 +38,10 @@ pub mod template;
 pub use cache::NodeCache;
 pub use index::LossyIndex;
 pub use layout::{DatabaseLayout, ShardType};
+pub use matrix_policy::{
+    EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding, RoomIdPolicy,
+    RoomMetadata, StateResolutionPolicy,
+};
 pub use packfile::{storage::PackfileStorage, Record};
 pub use shard::ShardPool;
 pub use storage::{NodeData, NodeId, StorageEngine};

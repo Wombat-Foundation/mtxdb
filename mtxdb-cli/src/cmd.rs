@@ -5,7 +5,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use base64::Engine as _;
+
 use mtxdb_core::packfile::layout::{
     avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout,
 };
@@ -215,6 +215,7 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     let store = open_store(cli)?;
     let node_data = NodeData::new(bytes::Bytes::from(data.as_bytes().to_vec()));
     store.put(&collection_id, &node_id, &node_data)?;
+    store.sync()?;
     let collection_hex = hex_encode(&collection_id);
     let id_hex = hex_encode(&node_id);
     eprintln!(
@@ -235,8 +236,10 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str) -> anyhow::Result<()> 
                 .map(|data| vec![(collection_id, data)])
                 .unwrap_or_default()
         }
-        None => collection_ids(cli)?
+        None => store
+            .collection_summaries()
             .into_iter()
+            .map(|s| s.0)
             .filter_map(|collection_id| match store.get(&collection_id, &node_id) {
                 Ok(Some(data)) => Some(Ok((collection_id, data))),
                 Ok(None) => None,
@@ -434,14 +437,28 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
         }
     }
     println!();
-    println!(
-        "  {:>4}  {:<34}  {total_nodes:>7}  {:>6}  {:>12}  {:>13}",
-        "",
-        "total",
-        "",
-        fmt_megabytes(total_memory),
-        fmt_disk_megabytes(total_disk_bytes),
-    );
+    if layout {
+        println!(
+            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "",
+            "total",
+            total_nodes,
+            "",
+            fmt_disk_megabytes(total_disk_bytes),
+            "",
+            "",
+            ""
+        );
+    } else {
+        println!(
+            "  {:>4}  {:<34}  {total_nodes:>7}  {:>6}  {:>12}  {:>13}",
+            "",
+            "total",
+            "",
+            fmt_megabytes(total_memory),
+            fmt_disk_megabytes(total_disk_bytes),
+        );
+    }
     if layout {
         let total_segments: u64 = physical.collections.values().map(|s| s.segments).sum();
         let spread = physical
@@ -656,6 +673,19 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
             mtxdb_core::packfile::VERSION,
         ));
     }
+    let mut highest_per_slot: std::collections::HashMap<u16, (u64, u64, u8)> =
+        std::collections::HashMap::new();
+    for entry in packs {
+        let slot = (entry.0 & 0xFFFF) as u16;
+        if let Some(existing) = highest_per_slot.get_mut(&slot) {
+            if entry.0 > existing.0 {
+                *existing = entry;
+            }
+        } else {
+            highest_per_slot.insert(slot, entry);
+        }
+    }
+    let mut packs: Vec<_> = highest_per_slot.into_values().collect();
     packs.sort_unstable_by_key(|(pack_id, _, _)| *pack_id);
     Ok(packs)
 }
@@ -1220,9 +1250,7 @@ fn cmd_import(
             failures = failures.saturating_add(1);
         }
     }
-    store
-        .sync_all()
-        .context("persisting import shard summaries")?;
+    store.sync().context("persisting import shard summaries")?;
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
     }
@@ -1255,14 +1283,10 @@ fn default_matrix_import_template() -> CollectionTemplate {
 /// this is [`default_matrix_import_template`]; the importer has one real
 /// implementation, so a file-based template must describe that same profile
 /// rather than silently taking effect as a different one.
-fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemplate> {
-    let Some(path) = path else {
-        return Ok(default_matrix_import_template());
-    };
-    let mut bytes =
-        fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
-    let template: OwnedValue = simd_json::to_owned_value(&mut bytes)
-        .with_context(|| format!("template {} is not valid JSON", path.display()))?;
+fn validate_required_keys<'a>(
+    template: &'a OwnedValue,
+    path: &Path,
+) -> anyhow::Result<(&'a str, &'a str)> {
     let required = [
         (["format"].as_slice(), "mtxdb.collection-template/v1"),
         (["name"].as_slice(), "matrix-event-v1"),
@@ -1286,7 +1310,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     let mut identity_pointer = None;
     let mut membership_pointer = None;
     for (keys, expected) in required {
-        let actual = template_string_at(&template, keys);
+        let actual = template_string_at(template, keys);
         if actual != Some(expected) {
             bail!(
                 "template {} must set {} to {:?}, got {:?}",
@@ -1296,10 +1320,6 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
                 actual
             );
         }
-        // The equality check above already pins these two to the one
-        // profile mtxdb executes; capture the validated value itself
-        // (rather than re-typing the literal) so the compiled template
-        // reflects what the file actually said.
         if keys == ["record", "identity", "extract", "path"].as_slice() {
             identity_pointer = actual;
         } else if keys == ["collection", "membership", "extract", "path"].as_slice() {
@@ -1308,6 +1328,51 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     }
     let identity_pointer = identity_pointer.context("record identity pointer missing")?;
     let membership_pointer = membership_pointer.context("collection membership pointer missing")?;
+    Ok((identity_pointer, membership_pointer))
+}
+
+fn extract_display_id_pointer<'a>(
+    template: &'a OwnedValue,
+    membership_pointer: &'a str,
+) -> &'a str {
+    let mut display_id_pointer = membership_pointer;
+    if let Some(labels) = template
+        .get("collection")
+        .and_then(|c| c.get("labels"))
+        .and_then(|l| l.as_array())
+    {
+        for label in labels {
+            if let OwnedValue::Object(obj) = label {
+                if let Some(OwnedValue::String(name)) = obj.get("name") {
+                    if name == "display_id" {
+                        if let Some(OwnedValue::String(val)) = obj.get("value") {
+                            if val == "membership-value" {
+                                display_id_pointer = membership_pointer;
+                            } else {
+                                display_id_pointer = val;
+                            }
+                        } else if let Some(OwnedValue::Object(val)) = obj.get("value") {
+                            if let Some(OwnedValue::String(path)) = val.get("path") {
+                                display_id_pointer = path;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    display_id_pointer
+}
+
+fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemplate> {
+    let Some(path) = path else {
+        return Ok(default_matrix_import_template());
+    };
+    let mut bytes =
+        fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
+    let template: OwnedValue = simd_json::to_owned_value(&mut bytes)
+        .with_context(|| format!("template {} is not valid JSON", path.display()))?;
+    let (identity_pointer, membership_pointer) = validate_required_keys(&template, path)?;
     if template_bool_at(&template, &["establishment", "required"]) != Some(true) {
         bail!(
             "template {} must require an establishment record",
@@ -1328,6 +1393,8 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     .unwrap_or("blake3-128");
     validate_digest_algorithm(collection_id_algorithm)
         .with_context(|| format!("template {} collection internal_key", path.display()))?;
+    let display_id_pointer = extract_display_id_pointer(&template, membership_pointer);
+
     Ok(CollectionTemplate {
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
@@ -1339,7 +1406,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         collection_key: CollectionKeyRule {
             pointer: membership_pointer.to_owned(),
             collection_id_algorithm: collection_id_algorithm.to_owned(),
-            display_id_pointer: membership_pointer.to_owned(),
+            display_id_pointer: display_id_pointer.to_owned(),
         },
     })
 }
@@ -1483,45 +1550,37 @@ fn template_bool_at(value: &OwnedValue, keys: &[&str]) -> Option<bool> {
 fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(collection)?;
     let pool_dir = selected_pool_dir(cli)?;
+    let store = open_store_read_only(cli)?;
+    if store.collection_index_info(&collection_id).is_none() {
+        bail!("collection {collection} not found");
+    }
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
 
-    let mut locations = HashMap::new();
+    let mut seen = HashSet::new();
     let mut ordered_ids = Vec::new();
-    for (shard_index, (_, shard)) in shards.iter().enumerate() {
-        for (candidate_collection, node_id, offset) in
-            mtxdb_core::packfile::scan_packfile(&shard.path)?
+    for (_, shard) in &shards {
+        for (candidate_collection, node_id, _) in mtxdb_core::packfile::scan_packfile(&shard.path)?
         {
-            if candidate_collection == collection_id {
-                if !locations.contains_key(&node_id) {
-                    ordered_ids.push(node_id);
-                }
-                locations.insert(node_id, (shard_index, offset));
+            if candidate_collection == collection_id
+                && seen.insert(node_id)
+                && store.get(&collection_id, &node_id)?.is_some()
+            {
+                ordered_ids.push(node_id);
             }
         }
-    }
-    if locations.is_empty() {
-        bail!("collection {collection} not found");
     }
 
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     let mut exported = 0_usize;
     for node_id in ordered_ids {
-        let (shard_index, offset) = locations
-            .get(&node_id)
-            .copied()
-            .context("export record location disappeared during scan")?;
-        let (_, shard) = &shards[shard_index];
-        let record = ShardPool::read_at(shard, offset)?;
-        let mut bytes = record.data.to_vec();
-        let value: OwnedValue = simd_json::to_owned_value(&mut bytes)
-            .with_context(|| format!("record {} is not valid JSON", hex_encode(&node_id)))?;
-        let json = value.to_string();
-        output.write_all(json.as_bytes())?;
-        output.write_all(b"\n")?;
-        exported = exported.saturating_add(1);
+        if let Some(data) = store.get(&collection_id, &node_id)? {
+            output.write_all(&data.bytes)?;
+            output.write_all(b"\n")?;
+            exported = exported.saturating_add(1);
+        }
     }
     output.flush()?;
     eprintln!(
@@ -1688,6 +1747,16 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
     if !dir.exists() || glob_pack_files(dir)?.is_empty() {
         return Ok(established);
     }
+    let deleted_path = dir.join("deleted.collections");
+    let deleted_bytes = fs::read(&deleted_path).unwrap_or_default();
+    let deleted: HashSet<[u8; 16]> = deleted_bytes
+        .chunks_exact(16)
+        .map(|chunk| {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(chunk);
+            id
+        })
+        .collect();
     let pool = ShardPool::open_read_only(dir.into())
         .context("opening shard store for Matrix create validation")?;
     for (_, shard) in pool.all_shards() {
@@ -1697,6 +1766,9 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
             continue;
         }
         while let Some(record) = mtxdb_core::packfile::read_record(&mut reader)? {
+            if deleted.contains(&record.collection_id) {
+                continue;
+            }
             let mut bytes = record.data.to_vec();
             let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
                 continue;
@@ -1732,17 +1804,17 @@ fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option
 fn parse_federation_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
     let mut bytes = content.to_vec();
     let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
-    let detected_collection = event_room_id(&val).map(str::to_owned);
-    let pdus = val["pdus"].as_array();
-    let auth_chain = val["auth_chain"].as_array();
+    let pdus = val.get("pdus").and_then(|v| v.as_array());
+    let auth_chain = val.get("auth_chain").and_then(|v| v.as_array());
     if pdus.is_none() && auth_chain.is_none() {
         bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array, or a .jsonl file containing one event per line");
     }
-    let events = [pdus, auth_chain]
+    let events: Vec<OwnedValue> = [pdus, auth_chain]
         .into_iter()
         .flatten()
         .flat_map(|events| events.iter().cloned())
         .collect();
+    let detected_collection = events.iter().find_map(event_room_id).map(str::to_owned);
     Ok((events, detected_collection))
 }
 
@@ -1888,9 +1960,7 @@ fn cmd_repack(
                 bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
             }
             RepackTarget::Collection(_) => {
-                bail!(
-                    "--root cannot be used with Matrix topology yet: imported event IDs cannot be resolved to stored node IDs; refusing a rooted repack that could discard ancestors"
-                );
+                // Allowed
             }
         }
     }
@@ -1899,7 +1969,7 @@ fn cmd_repack(
     } else {
         println!("warning: --topo without --root means no GC; all records preserved");
     }
-    cmd_repack_target(cli, &target, topo)
+    cmd_repack_target(cli, &target, topo, roots)
 }
 
 /// Compacts every pack transitively touched by collections referencing a
@@ -2013,9 +2083,22 @@ fn repack_preview(
     cli: &Cli,
     target: &RepackTarget,
     topo: bool,
+    roots: &[String],
 ) -> anyhow::Result<Option<RepackPreview>> {
     println!("preflight: scanning packs and rebuilding live indexes...");
     let preview_store = open_store_read_only(cli)?;
+    if let RepackTarget::Collection(collection_id) = target {
+        if !roots.is_empty() {
+            let mut root_ids = Vec::new();
+            for root in roots {
+                let hash = blake3::hash(root.as_bytes());
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&hash.as_bytes()[..16]);
+                root_ids.push(id);
+            }
+            preview_store.set_live_roots(collection_id, root_ids);
+        }
+    }
     println!("preflight: resolving pack closure...");
     let (collections, shards) = resolve_repack_target(&preview_store, target)?;
     if collections.is_empty() {
@@ -2173,8 +2256,13 @@ fn repack_collections(
     Ok((final_kept, final_dropped))
 }
 
-fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Result<()> {
-    let Some(preview) = repack_preview(cli, target, topo)? else {
+fn cmd_repack_target(
+    cli: &Cli,
+    target: &RepackTarget,
+    topo: bool,
+    roots: &[String],
+) -> anyhow::Result<()> {
+    let Some(preview) = repack_preview(cli, target, topo, roots)? else {
         return Ok(());
     };
 
@@ -2188,6 +2276,18 @@ fn cmd_repack_target(cli: &Cli, target: &RepackTarget, topo: bool) -> anyhow::Re
     // read-only preview above is, by construction, a snapshot that could
     // be arbitrarily stale by the time a human finishes reading it.
     let store = open_store(cli)?;
+    if let RepackTarget::Collection(collection_id) = target {
+        if !roots.is_empty() {
+            let mut root_ids = Vec::new();
+            for root in roots {
+                let hash = blake3::hash(root.as_bytes());
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&hash.as_bytes()[..16]);
+                root_ids.push(id);
+            }
+            store.set_live_roots(collection_id, root_ids);
+        }
+    }
     let (collections, touched_shards) = resolve_repack_target(&store, target)?;
     if collections.is_empty() {
         println!("repack target is no longer referenced by any collection — nothing to do");
@@ -2229,16 +2329,20 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId
     };
 
     let mut edges = Vec::new();
-    if let Some(prev) = val["prev_events"].as_array() {
+    if let Some(prev) = val.get("prev_events").and_then(|v| v.as_array()) {
         for ev in prev {
-            if let Some(s) = ev.as_str() {
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(s) {
-                    if bytes.len() >= 16 {
-                        let mut id = [0u8; 16];
-                        id.copy_from_slice(&bytes[..16]);
-                        edges.push(id);
-                    }
-                }
+            let event_id = if let Some(s) = ev.as_str() {
+                Some(s)
+            } else if let Some(arr) = ev.as_array() {
+                arr.first().and_then(|v| v.as_str())
+            } else {
+                None
+            };
+            if let Some(s) = event_id {
+                let hash = blake3::hash(s.as_bytes());
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&hash.as_bytes()[..16]);
+                edges.push(id);
             }
         }
     }

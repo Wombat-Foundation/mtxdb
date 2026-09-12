@@ -7,12 +7,15 @@
 pub const COLLECTION_TEMPLATE_FORMAT_V1: &str = "mtxdb.collection-template/v1";
 
 /// How a record's stored payload is selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadPolicy {
     /// Retain the complete received source record.
     Source,
     /// Retain only an explicit, derived projection of the source record.
-    Projection,
+    Projection {
+        /// RFC 6901 pointers to fields that should be included in the projection.
+        include: Vec<String>,
+    },
 }
 
 /// Generic identity rule for an application record.

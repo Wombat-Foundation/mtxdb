@@ -361,10 +361,14 @@ impl ShardPool {
     /// Same as [`Self::open`], plus `InvalidInput` if `max_shard_bytes`
     /// is zero or exceeds [`MAX_SHARD_BYTES`].
     pub fn open_with_max_shard_bytes(base_dir: PathBuf, max_shard_bytes: u64) -> io::Result<Self> {
-        if max_shard_bytes == 0 || max_shard_bytes > MAX_SHARD_BYTES {
+        let min_required = (packfile::HEADER_LEN as u64)
+            .saturating_add(4)
+            .saturating_add(u64::from(packfile::FRAME_FIXED_LEN))
+            .saturating_add(4);
+        if max_shard_bytes < min_required || max_shard_bytes > MAX_SHARD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("max_shard_bytes must be in 1..={MAX_SHARD_BYTES}, got {max_shard_bytes}"),
+                format!("max_shard_bytes must be in {min_required}..={MAX_SHARD_BYTES}, got {max_shard_bytes}"),
             ));
         }
         Self::open_internal(base_dir, true, max_shard_bytes, true)
@@ -519,6 +523,18 @@ impl ShardPool {
         pack_files.sort_unstable_by_key(|(pack_id, _)| *pack_id);
 
         for (pack_id, path) in pack_files {
+            if writable {
+                let _ = packfile::scan_and_recover_packfile(&path).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "corrupt pack {}; failed to scan and recover: {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            }
+
             // Validate the file before accepting it. A valid v4 file
             // must have the right magic, version, and CRC. If it
             // doesn't, the pool is corrupt — fail open rather than
@@ -691,11 +707,39 @@ impl ShardPool {
         }
     }
 
-    /// Seed a collection's home shard — used at startup to approximate where a
-    /// collection's most recent data already lives (from a content scan elsewhere,
-    /// since `ShardPool::open` itself only discovers shard *files*, not
-    /// their collection contents). Normal routing updates the home automatically
-    /// from then on via `put_record`.
+    /// Discovers new pack files on disk and adds them to the pool.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if reading the directory fails.
+    pub fn discover_shards(&self) -> io::Result<()> {
+        let pack_files = Self::discover_pack_files(&self.base_dir)?;
+        let mut shards = self.shards.write();
+        let existing: std::collections::HashSet<u64> =
+            shards.iter().flatten().map(|s| s.pack_id).collect();
+        let mut sorted_files = pack_files;
+        sorted_files.sort_unstable_by_key(|(id, _)| *id);
+        for (pack_id, path) in sorted_files {
+            if existing.contains(&pack_id) {
+                continue;
+            }
+            let empty_slot = shards.iter().position(Option::is_none);
+            if let Some(slot) = empty_slot {
+                if let Ok(file) = crate::packfile::open_packfile(&path, false, pack_id) {
+                    if let Ok(meta) = file.metadata() {
+                        shards[slot] = Some(std::sync::Arc::new(Shard::new(
+                            u16::try_from(slot).unwrap_or(0),
+                            pack_id,
+                            file,
+                            path,
+                            meta.len(),
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_collection_home(&self, collection_id: &[u8; 16], slot: u16) {
         self.collection_home.write().insert(*collection_id, slot);
     }
@@ -1077,9 +1121,12 @@ impl ShardPool {
             let offset_usize = usize::try_from(offset)
                 .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
 
+            let file_len = shard.file.metadata().map_err(StorageError::Io)?.len();
+            let file_len_usize = usize::try_from(file_len).unwrap_or(usize::MAX);
+
             if offset_usize
                 .checked_add(4)
-                .map_or(true, |end| end > mem.len())
+                .map_or(true, |end| end > file_len_usize || end > mem.len())
             {
                 if attempt == 0 {
                     drop(guard);
@@ -1102,7 +1149,7 @@ impl ShardPool {
             let frame_end = prefix_end
                 .checked_add(frame_len as usize)
                 .and_then(|end| end.checked_add(4));
-            if frame_end.map_or(true, |end| end > mem.len()) {
+            if frame_end.map_or(true, |end| end > file_len_usize || end > mem.len()) {
                 if attempt == 0 {
                     drop(guard);
                     Self::remap_shard(shard)?;
@@ -1139,7 +1186,13 @@ impl ShardPool {
             let offset = usize::try_from(offset)
                 .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
 
-            if offset.checked_add(4).map_or(true, |end| end > mem.len()) {
+            let file_len = shard.file.metadata().map_err(StorageError::Io)?.len();
+            let file_len_usize = usize::try_from(file_len).unwrap_or(usize::MAX);
+
+            if offset
+                .checked_add(4)
+                .map_or(true, |end| end > file_len_usize || end > mem.len())
+            {
                 if attempt == 0 {
                     drop(guard);
                     Self::remap_shard(shard)?;
@@ -1166,7 +1219,7 @@ impl ShardPool {
                 .checked_add(4)
                 .ok_or_else(|| StorageError::Corrupt("crc_pos + 4 overflow".into()))?;
 
-            if frame_end > mem.len() {
+            if frame_end > file_len_usize || frame_end > mem.len() {
                 if attempt == 0 {
                     drop(guard);
                     Self::remap_shard(shard)?;
@@ -1450,22 +1503,17 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_dirty(&self) -> io::Result<()> {
-        // Keep this lock through the fsync and removal. An append that
-        // completes during the fsync blocks before marking itself dirty, so
-        // it cannot be accidentally cleared by this generation of the sync.
+        let shards = self.shards.read();
         let mut dirty_set = self.dirty.lock();
         let dirty: Vec<u16> = dirty_set.iter().copied().collect();
         if dirty.is_empty() {
             return Ok(());
         }
-        {
-            let shards = self.shards.read();
-            for &id in &dirty {
-                if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
-                    shard.file.sync_all()?;
-                    shard.sync_count.fetch_add(1, Ordering::Relaxed);
-                    dirty_set.remove(&id);
-                }
+        for &id in &dirty {
+            if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
+                shard.file.sync_all()?;
+                shard.sync_count.fetch_add(1, Ordering::Relaxed);
+                dirty_set.remove(&id);
             }
         }
         drop(dirty_set);
@@ -1481,11 +1529,8 @@ impl ShardPool {
     ///
     /// Does nothing if the slot is already empty or is the active write shard.
     pub fn retire_slot(&self, slot: u16) {
-        // Acquire dirty then shards to maintain lock order: dirty → shards
-        // (matching sync_dirty). Hold both through the retirement so the
-        // dirty bit is only cleared when the shard actually leaves the pool.
-        let mut dirty = self.dirty.lock();
         let mut shards = self.shards.write();
+        let mut dirty = self.dirty.lock();
 
         if *self.active_write.lock() == slot {
             return; // leave dirty unchanged — sync_dirty must fsync later

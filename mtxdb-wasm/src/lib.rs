@@ -28,8 +28,17 @@ impl MdbStorage {
     ///
     /// Only works on WASI targets with a mounted filesystem.
     #[wasm_bindgen(constructor)]
-    pub fn open(path: &str) -> Result<MdbStorage, JsValue> {
-        let storage = PackfileStorage::open(PathBuf::from(path))
+    pub fn open(path: &str, pool: Option<String>) -> Result<MdbStorage, JsValue> {
+        let layout = mtxdb_core::DatabaseLayout::open(PathBuf::from(path))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let shard_type = match pool.as_deref() {
+            Some("state") => mtxdb_core::ShardType::State,
+            Some("auth-chain") => mtxdb_core::ShardType::AuthChain,
+            _ => mtxdb_core::ShardType::EventDag,
+        };
+        let pool_dir = layout.pool_dir(shard_type)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let storage = PackfileStorage::open(pool_dir)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(Self { inner: storage })
     }

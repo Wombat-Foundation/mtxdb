@@ -1241,6 +1241,9 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `StorageError` if reading or parsing the underlying shards fails.
     pub fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+        self.shards.discover_shards()?;
         let new_index = self.rebuild_index(collection_id)?;
         let existing_cache = self.generation(collection_id).map(|g| g.cache.clone());
         self.store_generation(collection_id, new_index, existing_cache)

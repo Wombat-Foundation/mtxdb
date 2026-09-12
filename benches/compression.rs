@@ -79,7 +79,7 @@ fn payload(kind: PayloadKind, len: usize, seed: usize) -> Vec<u8> {
             // Repeated Matrix JSON vocabulary is deliberately a positive
             // control: unlike a hash-heavy HAMT node, it should demonstrate
             // the space benefit that motivated per-frame compression.
-            const FRAGMENT: &[u8] = br#"{\"type\":\"m.room.message\",\"sender\":\"@alice:example.org\",\"content\":{\"msgtype\":\"m.text\",\"body\":\"federated event payload with recurring fields\"},\"origin_server_ts\":1710000000000}"#;
+            const FRAGMENT: &[u8] = br#"{"type":"m.room.message","sender":"@alice:example.org","content":{"msgtype":"m.text","body":"federated event payload with recurring fields"},"origin_server_ts":1710000000000}"#;
             while bytes.len() < len {
                 bytes.extend_from_slice(FRAGMENT);
             }
@@ -122,15 +122,27 @@ fn write_record_raw(writer: &mut impl Write, record: &Record) -> io::Result<u64>
     Ok(total_len)
 }
 
+struct BlackBoxWriter;
+
+impl Write for BlackBoxWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        std::hint::black_box(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn measure(
     records: &[Record],
-    write: impl Fn(&mut io::Sink, &Record) -> io::Result<u64>,
+    write: impl Fn(&mut BlackBoxWriter, &Record) -> io::Result<u64>,
 ) -> (Duration, u64) {
     // Warm allocator and codec initialization outside the timed region.
-    let mut warm_sink = io::sink();
+    let mut warm_sink = BlackBoxWriter;
     let _ = write(&mut warm_sink, &records[0]).expect("warm write succeeds");
 
-    let mut sink = io::sink();
+    let mut sink = BlackBoxWriter;
     let started = Instant::now();
     let bytes = records
         .iter()

@@ -16,6 +16,6 @@ Running Matrix servers on spinning, mechanical drives—made _less_ painful.
 The storage engine is format-agnostic. Its application-specific mapping policy
 is declared by a versioned YAML collection template: record identity, collection
 key, payload-retention policy, relationships, and validation behaviour. The Matrix
-reference policy is [`templates/matrix-event-v1.yaml`](templates/matrix-event-v1.yaml);
+reference policy is [`templates/matrix-event-v1.json`](templates/matrix-event-v1.json);
 see [`templates/README.md`](templates/README.md) for the generic format and why
 Matrix uses `event_id` as its logical identity.

@@ -52,12 +52,29 @@ pub enum MdbError {
 /// Null on error, otherwise an opaque handle. Caller must destroy with
 /// `mdb_storage_destroy`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mdb_storage_open(path: *const c_char) -> *mut MdbStorage {
+pub unsafe extern "C" fn mdb_storage_open(path: *const c_char, pool: *const c_char) -> *mut MdbStorage {
     let c_str = match unsafe { CStr::from_ptr(path) }.to_str() {
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    let storage = match PackfileStorage::open(std::path::PathBuf::from(c_str)) {
+    let layout = match mtxdb_core::DatabaseLayout::open(std::path::PathBuf::from(c_str)) {
+        Ok(l) => l,
+        Err(_) => return ptr::null_mut(),
+    };
+    let shard_type = if pool.is_null() {
+        mtxdb_core::ShardType::EventDag
+    } else {
+        match unsafe { CStr::from_ptr(pool) }.to_str() {
+            Ok("state") => mtxdb_core::ShardType::State,
+            Ok("auth-chain") => mtxdb_core::ShardType::AuthChain,
+            _ => mtxdb_core::ShardType::EventDag,
+        }
+    };
+    let pool_dir = match layout.pool_dir(shard_type) {
+        Ok(d) => d,
+        Err(_) => return ptr::null_mut(),
+    };
+    let storage = match PackfileStorage::open(pool_dir) {
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };

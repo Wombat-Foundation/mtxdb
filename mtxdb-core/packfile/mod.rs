@@ -121,10 +121,20 @@ pub struct Record {
 /// append would land after corrupt bytes.
 fn read_frame_len_prefix(reader: &mut impl Read) -> io::Result<Option<[u8; 4]>> {
     let mut len_buf = [0u8; 4];
-    if reader.read(&mut len_buf[..1])? == 0 {
-        return Ok(None);
+    let mut bytes_read = 0;
+    while bytes_read < 4 {
+        let n = reader.read(&mut len_buf[bytes_read..])?;
+        if n == 0 {
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "torn length prefix",
+            ));
+        }
+        bytes_read = bytes_read.saturating_add(n);
     }
-    reader.read_exact(&mut len_buf[1..])?;
     Ok(Some(len_buf))
 }
 
@@ -413,11 +423,7 @@ const SCAN_DISCARD_BUF_LEN: usize = 8192;
 ///
 /// # Errors
 /// Same conditions as [`read_record`] (invalid length, unsupported flags,
-/// CRC mismatch), except a compressed frame's `uncompressed_len` is not
-/// bounds-checked against [`MAX_DATA_LEN`] here — this function never
-/// allocates a decompression buffer sized from it, so that check (which
-/// exists in `read_record` specifically to bound that allocation) doesn't
-/// apply.
+/// CRC mismatch, invalid `uncompressed_len`).
 ///
 /// # Panics
 /// Never in practice: the only internal `checked_sub`/`expect` pair
@@ -445,6 +451,27 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
             io::ErrorKind::InvalidData,
             format!("unsupported record flags: {flags:#04x}"),
         ));
+    }
+    let uncompressed_len = u32::from_le_bytes(fixed[1..5].try_into().unwrap());
+    if flags & FLAG_COMPRESSED != 0 {
+        if uncompressed_len > MAX_DATA_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
+            ));
+        }
+    } else {
+        let node_bytes_len = frame_len
+            .checked_sub(FRAME_FIXED_LEN)
+            .expect("frame_len >= FRAME_FIXED_LEN, checked above");
+        if uncompressed_len != node_bytes_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "raw node length {node_bytes_len} != framed uncompressed_len {uncompressed_len}"
+                ),
+            ));
+        }
     }
     let mut collection_id = [0u8; 16];
     collection_id.copy_from_slice(&fixed[5..21]);
@@ -530,16 +557,27 @@ pub fn write_header(writer: &mut impl Write, pack_id: u64) -> io::Result<()> {
 ///
 /// Returns `io::Error` for a non-EOF read failure.
 pub fn read_version(reader: &mut impl Read) -> io::Result<Option<u8>> {
-    let mut prefix = [0u8; 5];
-    match reader.read_exact(&mut prefix) {
+    let mut magic = [0u8; 4];
+    match reader.read_exact(&mut magic) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    if prefix[..4] != MAGIC {
+    if magic != MAGIC {
         return Ok(None);
     }
-    Ok(Some(prefix[4]))
+    let mut version = [0u8; 1];
+    match reader.read_exact(&mut version) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing version byte",
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(Some(version[0]))
 }
 
 /// Read and validate a shard file's reserved header.
@@ -571,23 +609,34 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     // pre-cutover v1 file (bare 5-byte header) can easily be shorter
     // than HEADER_LEN in total, and version mismatch has to be detected
     // regardless of how much data follows it.
-    let mut prefix = [0u8; 5];
-    match reader.read_exact(&mut prefix) {
+    let mut magic = [0u8; 4];
+    match reader.read_exact(&mut magic) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    if prefix[..4] != MAGIC {
+    if magic != MAGIC {
         return Ok(None);
     }
-    if prefix[4] != VERSION {
+    let mut version = [0u8; 1];
+    match reader.read_exact(&mut version) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing version byte",
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    let version = version[0];
+    if version != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "packfile format version {:#04x} is not supported by this build \
+                "packfile format version {version:#04x} is not supported by this build \
                  (only {VERSION:#04x}) — this looks like a pre-cutover store; \
-                 reset or migrate it rather than opening it with this version",
-                prefix[4]
+                 reset or migrate it rather than opening it with this version"
             ),
         ));
     }
@@ -596,7 +645,8 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     // reserved header. Running out of bytes here means a genuinely
     // truncated v2 header, which is corruption, not "not a packfile".
     let mut buf = [0u8; HEADER_LEN];
-    buf[..5].copy_from_slice(&prefix);
+    buf[..4].copy_from_slice(&magic);
+    buf[4] = version;
     reader.read_exact(&mut buf[5..]).map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
             io::Error::new(
@@ -786,6 +836,13 @@ pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<Scan
         }
     } else {
         use std::io::Seek;
+        let file_len = reader.get_ref().metadata()?.len();
+        if start_offset > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("start_offset {start_offset} exceeds file length {file_len} (likely a stale cursor from a previous epoch)"),
+            ));
+        }
         reader.seek(io::SeekFrom::Start(start_offset))?;
     }
 
