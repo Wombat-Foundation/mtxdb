@@ -2671,7 +2671,6 @@ impl StorageEngine for PackfileStorage {
         };
 
         let mut index_needs_rebuild = false;
-        let mut resolved_cache_entries = Vec::with_capacity(entries.len());
 
         for (id, data) in entries {
             let record = Record {
@@ -2693,16 +2692,6 @@ impl StorageEngine for PackfileStorage {
                     self.record_new_shard_collection(pack_id, collection_id);
                 }
             }
-
-            let mut data_to_cache = data.clone();
-            for child in &mut data_to_cache.children {
-                if let NodeRef::Lazy(child_id) = child {
-                    if let Some(child_data) = self.pinned.get(child_id) {
-                        *child = NodeRef::Resolved(*child_id, child_data);
-                    }
-                }
-            }
-            resolved_cache_entries.push((*id, Arc::new(data_to_cache)));
         }
 
         if index_needs_rebuild {
@@ -2714,10 +2703,20 @@ impl StorageEngine for PackfileStorage {
             );
         }
 
-        // Apply all cache mutations ONLY after all disk writes succeed.
-        // This ensures a failed batch doesn't leak partial state into the shared cache.
-        for (id, data) in resolved_cache_entries {
-            cache.insert(id, data);
+        // Apply cache mutations only after all disk writes succeed, so a
+        // failed batch does not leak partial state into the shared cache.
+        // Resolve and insert one entry at a time: retaining a prepared clone
+        // of the entire batch here would defeat the cache's size bound.
+        for (id, data) in entries {
+            let mut data_to_cache = data.clone();
+            for child in &mut data_to_cache.children {
+                if let NodeRef::Lazy(child_id) = child {
+                    if let Some(child_data) = self.pinned.get(child_id) {
+                        *child = NodeRef::Resolved(*child_id, child_data);
+                    }
+                }
+            }
+            cache.insert(*id, Arc::new(data_to_cache));
         }
 
         self.store_generation(collection_id, index, Some(cache))?;
