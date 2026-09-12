@@ -59,6 +59,7 @@ mtxdb-core = { path = "mtxdb-core" }
 
 [dev-dependencies]
 bytes = "1.5"
+crc32fast = "1.4"
 
 # BENCHES — `benches/storage.rs` is discovered by this root package as well
 # as explicitly registered by `mtxdb-core`. Keep its direct shared dependencies
@@ -73,6 +74,10 @@ bytes = "1.5"
 
 [[bench]]
 name = "locality"
+harness = false
+
+[[bench]]
+name = "compression"
 harness = false
 
 # BUILD PROFILES — must be plain [profile.*], never nested under

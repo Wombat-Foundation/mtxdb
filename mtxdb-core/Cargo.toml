@@ -49,5 +49,10 @@ name = "locality"
 path = "../benches/locality.rs"
 harness = false
 
+[[bench]]
+name = "compression"
+path = "../benches/compression.rs"
+harness = false
+
 [lints]
 workspace = true
