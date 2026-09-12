@@ -2331,12 +2331,7 @@ impl StorageEngine for PackfileStorage {
             data: data.bytes.clone(),
         };
 
-        let start = std::time::Instant::now();
         let (shard_id, offset) = self.shards.put_record(&record)?;
-        eprintln!(
-            "mtxdb put_record elapsed: {} us",
-            start.elapsed().as_micros()
-        );
 
         let (index, cache) = {
             let old_gen = self.generation(collection_id);
