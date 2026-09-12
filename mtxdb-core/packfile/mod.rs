@@ -191,6 +191,33 @@ const ZSTD_LEVEL: i32 = 3;
 /// # Panics
 /// Panics if the record's fixed fields plus plaintext data exceed `u32::MAX`.
 pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64> {
+    write_record_with_options(writer, record, true)
+}
+
+/// Like [`write_record`], but lets the caller skip the zstd attempt
+/// entirely via `compress: false`.
+///
+/// Some pools (e.g. HAMT nodes/roots, whose bytes are dense structural
+/// hashes rather than text) never shrink under zstd — the compressor
+/// still has to run its full match-finding pass before falling back to
+/// raw storage, so a pool that never benefits pays that cost on every
+/// single write for nothing. `compress: false` skips the attempt
+/// altogether and always stores the payload raw. This never changes the
+/// on-disk frame format: a `false` caller just always takes the "doesn't
+/// shrink" branch that `compress: true` already falls back to at read
+/// time, so raw and compressed frames continue to coexist exactly as
+/// documented on [`Record`].
+///
+/// # Errors
+/// Same as [`write_record`].
+///
+/// # Panics
+/// Same as [`write_record`].
+pub fn write_record_with_options(
+    writer: &mut impl Write,
+    record: &Record,
+    compress: bool,
+) -> io::Result<u64> {
     let uncompressed_len =
         u32::try_from(record.data.len()).expect("record payload exceeds u32::MAX");
     let plaintext_frame_len = FRAME_FIXED_LEN
@@ -203,7 +230,9 @@ pub fn write_record(writer: &mut impl Write, record: &Record) -> io::Result<u64>
         ));
     }
 
-    let compressed = zstd::bulk::compress(&record.data, ZSTD_LEVEL).ok();
+    let compressed = compress
+        .then(|| zstd::bulk::compress(&record.data, ZSTD_LEVEL).ok())
+        .flatten();
     let (flags, node_bytes): (u8, &[u8]) = match &compressed {
         Some(c) if c.len() < record.data.len() => (FLAG_COMPRESSED, c.as_slice()),
         _ => (0, &record.data),

@@ -284,7 +284,22 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `io::Error` if the base directory cannot be created or read.
     pub fn open(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true, None)
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true, None, true)
+    }
+
+    /// Open a packfile storage with `compress` controlling whether records
+    /// are zstd-attempted on write (see
+    /// [`crate::packfile::write_record_with_options`]) — pass `false` for a
+    /// pool whose payloads (e.g. HAMT nodes/roots) never benefit, to skip
+    /// paying the compressor's cost on every put.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn open_with_compression(
+        base_dir: PathBuf,
+        compress: bool,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true, None, compress)
     }
 
     /// Open a packfile storage that rotates shards at `max_shard_bytes`
@@ -307,6 +322,7 @@ impl PackfileStorage {
             None,
             true,
             Some(max_shard_bytes),
+            true,
         )
     }
 
@@ -323,7 +339,7 @@ impl PackfileStorage {
     /// Returns `io::Error` if the directory can't be read, has no shards
     /// yet, or a writer already holds the exclusive lock.
     pub fn open_read_only(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, false, None)
+        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, false, None, true)
     }
 
     /// Open a packfile storage with a custom per-collection cache capacity.
@@ -334,7 +350,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         cache_capacity: usize,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, None, true, None)
+        Self::open_with_options(base_dir, cache_capacity, None, true, None, true)
     }
 
     /// Open a packfile storage with a swizzle callback for in-cache pointer resolution.
@@ -346,7 +362,7 @@ impl PackfileStorage {
         cache_capacity: usize,
         swizzle: SwizzleFn,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, Some(swizzle), true, None)
+        Self::open_with_options(base_dir, cache_capacity, Some(swizzle), true, None, true)
     }
 
     fn open_with_options(
@@ -355,15 +371,20 @@ impl PackfileStorage {
         swizzle: Option<SwizzleFn>,
         writable: bool,
         max_shard_bytes: Option<u64>,
+        compress: bool,
     ) -> Result<Self, std::io::Error> {
         fs::create_dir_all(&base_dir)?;
 
         let shards = if writable {
             match max_shard_bytes {
+                // Custom rotation thresholds are only used by benchmarks/
+                // tests today, none of which also need to disable
+                // compression, so this combination just keeps the default.
                 Some(max_shard_bytes) => {
                     ShardPool::open_with_max_shard_bytes(base_dir.clone(), max_shard_bytes)?
                 }
-                None => ShardPool::open(base_dir.clone())?,
+                None if compress => ShardPool::open(base_dir.clone())?,
+                None => ShardPool::open_with_compression(base_dir.clone(), false)?,
             }
         } else {
             ShardPool::open_read_only(base_dir.clone())?

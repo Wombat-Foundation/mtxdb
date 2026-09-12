@@ -298,6 +298,11 @@ pub struct ShardPool {
     /// never writes anything, including its own (always-zero) stats
     /// snapshot, so it can't race the real writer's.
     writable: bool,
+    /// Whether records written through this pool are zstd-attempted (see
+    /// [`crate::packfile::write_record_with_options`]). `false` for a pool
+    /// whose payloads never shrink under compression (e.g. HAMT nodes),
+    /// to skip paying the compressor's cost on every write for no benefit.
+    compress: bool,
     /// Present only for a writable pool — `open_read_only` takes no lock
     /// at all, since it never writes or truncates anything (that risk
     /// lives one layer up, in `PackfileStorage`'s collection-index rebuild, not
@@ -332,7 +337,19 @@ impl ShardPool {
     /// Returns `io::Error` on directory read failure, packfile open
     /// failure, or if another process already holds the writer lock.
     pub fn open(base_dir: PathBuf) -> io::Result<Self> {
-        Self::open_internal(base_dir, true, MAX_SHARD_BYTES)
+        Self::open_internal(base_dir, true, MAX_SHARD_BYTES, true)
+    }
+
+    /// Open or create a shard pool as its exclusive writer, with `compress`
+    /// controlling whether records are zstd-attempted on write (see
+    /// [`crate::packfile::write_record_with_options`]) — pass `false` for a
+    /// pool whose payloads (e.g. HAMT nodes/roots) never benefit, to skip
+    /// paying the compressor's cost on every put.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn open_with_compression(base_dir: PathBuf, compress: bool) -> io::Result<Self> {
+        Self::open_internal(base_dir, true, MAX_SHARD_BYTES, compress)
     }
 
     /// Open or create a shard pool as its exclusive writer, rotating
@@ -350,7 +367,7 @@ impl ShardPool {
                 format!("max_shard_bytes must be in 1..={MAX_SHARD_BYTES}, got {max_shard_bytes}"),
             ));
         }
-        Self::open_internal(base_dir, true, max_shard_bytes)
+        Self::open_internal(base_dir, true, max_shard_bytes, true)
     }
 
     /// Open a shard pool as a read-only observer, coexisting with a
@@ -367,9 +384,10 @@ impl ShardPool {
     /// Returns `io::Error` on directory read failure, or if the directory
     /// has no shards yet.
     pub fn open_read_only(base_dir: PathBuf) -> io::Result<Self> {
-        // A read-only pool never writes, so the rotation threshold is
-        // never consulted — pass the default for consistency.
-        Self::open_internal(base_dir, false, MAX_SHARD_BYTES)
+        // A read-only pool never writes, so the rotation threshold and
+        // compression policy are never consulted — pass the defaults for
+        // consistency.
+        Self::open_internal(base_dir, false, MAX_SHARD_BYTES, true)
     }
 
     /// Discovers packfiles in the pool directory.
@@ -454,7 +472,12 @@ impl ShardPool {
         Ok(pack_files)
     }
 
-    fn open_internal(base_dir: PathBuf, writable: bool, max_shard_bytes: u64) -> io::Result<Self> {
+    fn open_internal(
+        base_dir: PathBuf,
+        writable: bool,
+        max_shard_bytes: u64,
+        compress: bool,
+    ) -> io::Result<Self> {
         if writable {
             fs::create_dir_all(&base_dir)?;
         } else if !base_dir.is_dir() {
@@ -578,6 +601,7 @@ impl ShardPool {
             stats_persisted_at: RwLock::new(stats_persisted_at),
             last_stats_flush: RwLock::new(None),
             writable,
+            compress,
             #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         })
@@ -1002,7 +1026,8 @@ impl ShardPool {
 
                 // The actual on-disk length — may be smaller than
                 // `max_record_len` when the payload compressed.
-                let record_len = packfile::write_record(&mut file, record)?;
+                let record_len =
+                    packfile::write_record_with_options(&mut file, record, self.compress)?;
                 let new_len = offset.checked_add(record_len).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "offset + record_len overflow")
                 })?;
