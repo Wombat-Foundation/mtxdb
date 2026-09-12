@@ -1337,12 +1337,14 @@ fn extract_display_id_pointer<'a>(
     path: &Path,
 ) -> anyhow::Result<&'a str> {
     let display_id_pointer = membership_pointer;
-    if let Some(labels) = template
-        .get("collection")
-        .and_then(|c| c.get("labels"))
-        .and_then(|l| l.as_array())
-    {
-        for label in labels {
+    if let Some(labels) = template.get("collection").and_then(|c| c.get("labels")) {
+        let OwnedValue::Array(labels) = labels else {
+            bail!(
+                "template {} collection.labels must be an array of label objects; got {labels:?}",
+                path.display()
+            );
+        };
+        for label in labels.iter() {
             let OwnedValue::Object(obj) = label else {
                 bail!(
                     "template {} declares a collection label that is not an object",
@@ -2748,6 +2750,33 @@ mod tests {
         );
         assert!(
             format!("{error:#}").contains("display label"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn compile_import_template_rejects_non_array_labels() {
+        let template = br#"{
+            "format": "mtxdb.collection-template/v1",
+            "name": "matrix-event-v1",
+            "record": {
+                "identity": {
+                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                    "internal_key": {"algorithm": "blake3-128"}
+                },
+                "payload": {"policy": "retain-source"}
+            },
+            "collection": {
+                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
+                "labels": {"name": "display_id", "value": "membership-value"}
+            },
+            "establishment": {"required": true}
+        }"#;
+        let error = compile_reject(template).expect_err(
+            "a present non-array collection.labels must not be silently treated as absent",
+        );
+        assert!(
+            format!("{error:#}").contains("collection.labels must be an array"),
             "unexpected error: {error:#}"
         );
     }
