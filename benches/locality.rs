@@ -421,8 +421,8 @@ enum Eviction {
 impl Eviction {
     fn cache_state_label(&self) -> String {
         match self {
-            Self::Evicted => "Cold (Evicted)".to_string(),
-            Self::NotFound => "Warm (vmtouch NOT FOUND on PATH)".to_string(),
+            Self::Evicted => "Cold (Evicted)".to_owned(),
+            Self::NotFound => "Warm (vmtouch NOT FOUND on PATH)".to_owned(),
             Self::Failed(msg) => format!("Warm (vmtouch eviction FAILED: {msg})"),
         }
     }
@@ -450,7 +450,7 @@ fn drop_caches_for_dir(dir: &Path) -> Eviction {
         .output()
     {
         Ok(output) if output.status.success() => Eviction::Evicted,
-        Ok(output) => Eviction::Failed(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Ok(output) => Eviction::Failed(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Eviction::NotFound,
         Err(e) => Eviction::Failed(e.to_string()),
     }
@@ -471,7 +471,7 @@ fn vmtouch_on_path() -> bool {
 // ── Benchmark ──────────────────────────────────────────────────────
 
 fn shard_bytes_label(n: Option<u64>) -> String {
-    n.map_or_else(|| "default (~256 MB)".to_string(), |n| n.to_string())
+    n.map_or_else(|| "default (~256 MB)".to_owned(), |n| n.to_string())
 }
 
 /// Runs the ingest → pre-repack query → repack → post-repack query cycle.
