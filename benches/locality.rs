@@ -329,17 +329,17 @@ fn count_segments(base_dir: &Path, collection_id: &[u8; 16]) -> u64 {
 /// original shard would need index-update machinery this prototype
 /// intentionally doesn't touch.
 ///
-/// Returns `(records_written, bytes_written, wall_time)`.
-/// `(records_written, bytes_written, write_time, fsync_time)`. `fsync_time`
-/// is broken out separately because it dominates everything else here:
-/// a standalone test on this machine found `fsync()` alone costs ~1.7s
-/// for a 256 MB file, even though writing that same data (into page
-/// cache, no durability guarantee) takes ~0.1s. Skipping the fsync
-/// entirely would make this look many times cheaper than
-/// `repack_collections_reachable` (which does call `sync_dirty`) for
-/// reasons that have nothing to do with either one's algorithm —
-/// comparing without it would be comparing a durable operation against
-/// a non-durable one and calling the difference "locality."
+/// Returns `(records_written, bytes_written, write_time, fsync_time)`.
+/// `fsync_time` is broken out separately — not because it reliably
+/// dominates (that depends on how much the buffered write already forced
+/// out to disk before `sync_all` runs, and on the underlying filesystem/
+/// hardware), but because skipping it entirely would make this look
+/// cheaper than `repack_collections_reachable` (which does call
+/// `sync_dirty`) for reasons that have nothing to do with either one's
+/// algorithm — comparing without it would be comparing a durable
+/// operation against a non-durable one and calling the difference
+/// "locality." Report both numbers as measured; don't assume either one
+/// dominates without checking this run's actual output.
 type CompactionCost = (usize, u64, Duration, Duration);
 
 fn compact_shard_intra(
@@ -892,10 +892,7 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
         ),
     );
     subrow("write time:", format!("{total_write_time:.2?}"));
-    subrow(
-        "fsync time:",
-        format!("{total_fsync_time:.2?} (dominates — see compact_shard_intra's docs)"),
-    );
+    subrow("fsync time:", format!("{total_fsync_time:.2?}"));
 
     println!("\n[3/3] Measuring the compacted copy's layout (not swapped into the live store)...");
     let post_layout = packfile::layout::physical_layout(&compacted_dir).unwrap();
