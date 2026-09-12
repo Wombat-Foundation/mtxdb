@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -12,6 +13,15 @@ ROW = re.compile(
     r"(?P<size>\d+) B\s+raw\s+[\d.]+ us.*?zstd\s+(?P<micros>[\d.]+) us",
     re.MULTILINE,
 )
+
+# `benches/compression.rs` emits precisely these cases. Keeping the expected
+# set here prevents a first run (whose baseline is `{}`) from accepting a
+# truncated benchmark output and publishing only a partial baseline.
+EXPECTED_METRICS = {
+    f"compression/{kind}/{size}B/zstd_us"
+    for kind in ("HAMT-shaped", "Matrix-JSON-like", "incompressible")
+    for size in (64, 256, 1_024, 4_096)
+}
 
 
 def load_json(path: Path) -> dict[str, float]:
@@ -44,6 +54,15 @@ def parse_current(path: Path) -> dict[str, float]:
         raise ValueError(
             f"no compression benchmark metrics found in {path}; refusing to publish an empty baseline"
         )
+    if set(metrics) != EXPECTED_METRICS:
+        missing = sorted(EXPECTED_METRICS - set(metrics))
+        unexpected = sorted(set(metrics) - EXPECTED_METRICS)
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected: {', '.join(unexpected)}")
+        raise ValueError(f"incomplete compression benchmark output ({'; '.join(details)})")
     return metrics
 
 
@@ -54,14 +73,22 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--margin", type=float, default=0.10)
     args = parser.parse_args()
-    if args.margin < 0:
-        parser.error("--margin must not be negative")
+    if not math.isfinite(args.margin) or args.margin < 0:
+        parser.error("--margin must be a finite, non-negative number")
 
     try:
         current = parse_current(Path(args.current))
         best = load_json(Path(args.best))
     except ValueError as error:
         parser.error(str(error))
+
+    missing = sorted(set(best) - set(current))
+    if missing:
+        parser.error(
+            "benchmark output omits metrics present in the best baseline; "
+            "stale best values would otherwise be published untouched: "
+            + ", ".join(missing)
+        )
 
     regressions = []
     updated = dict(best)

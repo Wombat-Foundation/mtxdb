@@ -109,7 +109,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             id,
             data,
         } => cmd_put(cli, collection, id, data),
-        Commands::Get { collection, id } => cmd_get(cli, collection.as_deref(), id),
+        Commands::Get {
+            collection,
+            id,
+            text,
+        } => cmd_get(cli, collection.as_deref(), id, *text),
         Commands::Collections { all, layout, sort } => {
             cmd_collections(cli, *all, *layout, sort.as_deref())
         }
@@ -225,7 +229,7 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     Ok(())
 }
 
-fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str) -> anyhow::Result<()> {
+fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, text: bool) -> anyhow::Result<()> {
     let node_id = parse_get_id(id)?;
     let store = open_store_read_only(cli)?;
     let matches: Vec<([u8; 16], NodeData)> = match collection {
@@ -251,9 +255,10 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str) -> anyhow::Result<()> 
         [] => bail!("not found"),
         [(_, data)] => {
             io::stdout().write_all(&data.bytes)?;
-            // Only decorate textual payloads with a trailing newline; a binary
-            // payload must be emitted byte-exact.
-            if std::str::from_utf8(&data.bytes).is_ok() && !data.bytes.ends_with(b"\n") {
+            // Never decorate payload bytes: binary records can decode as
+            // valid UTF-8, so only append a trailing newline when the caller
+            // explicitly opted into `--text`.
+            if text && !data.bytes.ends_with(b"\n") {
                 io::stdout().write_all(b"\n")?;
             }
         }

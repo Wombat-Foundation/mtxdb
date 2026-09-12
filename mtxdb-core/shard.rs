@@ -128,6 +128,10 @@ const POOL_META_VERSION: u8 = 1;
 /// processes sharing the same `base_dir`).
 static STATS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Disambiguates pack-creation tmp filenames; paired with the process id
+/// like [`STATS_TMP_COUNTER`].
+static PACK_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl ShardStats {
     fn encode(self, pack_id: u64, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&pack_id.to_le_bytes());
@@ -588,8 +592,7 @@ impl ShardPool {
                 &base_dir,
                 pack_id.checked_add(1).expect("pack_id overflow"),
             )?;
-            let path = Self::pack_path(&base_dir, pack_id);
-            let file = packfile::open_packfile(&path, true, pack_id)?;
+            let (file, path) = Self::create_packfile_atomically(&base_dir, pack_id)?;
             let file_len = file.metadata()?.len();
             shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
             next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
@@ -952,6 +955,27 @@ impl ShardPool {
     #[must_use]
     pub fn pack_path(base_dir: &Path, pack_id: u64) -> PathBuf {
         base_dir.join(format!("pack_{pack_id:016x}.pack"))
+    }
+
+    /// Initialize a pack under a non-discoverable temporary name, then rename
+    /// it into place. Directory scanners consequently observe either no pack
+    /// or a fully written header, never a partially initialized canonical file.
+    fn create_packfile_atomically(base_dir: &Path, pack_id: u64) -> io::Result<(File, PathBuf)> {
+        let path = Self::pack_path(base_dir, pack_id);
+        let unique = PACK_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{}.{unique}", std::process::id()));
+        let file = match packfile::open_packfile(&tmp_path, true, pack_id) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = fs::rename(&tmp_path, &path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        Ok((file, path))
     }
 
     /// Get a reference to a shard by ID.
@@ -1354,8 +1378,7 @@ impl ShardPool {
                 // would leave a pack_id in use with no pool.meta reservation.
                 Self::persist_pool_meta_at(&self.base_dir, next)?;
 
-                let path = Self::pack_path(&self.base_dir, pack_id);
-                let file = packfile::open_packfile(&path, true, pack_id)?;
+                let (file, path) = Self::create_packfile_atomically(&self.base_dir, pack_id)?;
                 let file_len = file.metadata()?.len();
                 shards[candidate as usize] = Some(Arc::new(Shard::new(
                     candidate, pack_id, file, path, file_len,

@@ -57,10 +57,8 @@ pub unsafe extern "C" fn mdb_storage_open(path: *const c_char, pool: *const c_ch
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    let layout = match mtxdb_core::DatabaseLayout::open(std::path::PathBuf::from(c_str)) {
-        Ok(l) => l,
-        Err(_) => return ptr::null_mut(),
-    };
+    // Validate the pool name up front so an unsupported value fails without
+    // creating the database descriptor or any pool directories.
     let shard_type = if pool.is_null() {
         mtxdb_core::ShardType::EventDag
     } else {
@@ -70,6 +68,10 @@ pub unsafe extern "C" fn mdb_storage_open(path: *const c_char, pool: *const c_ch
             Ok("auth-chain") => mtxdb_core::ShardType::AuthChain,
             _ => return ptr::null_mut(),
         }
+    };
+    let layout = match mtxdb_core::DatabaseLayout::open(std::path::PathBuf::from(c_str)) {
+        Ok(l) => l,
+        Err(_) => return ptr::null_mut(),
     };
     let pool_dir = match layout.pool_dir(shard_type) {
         Ok(d) => d,

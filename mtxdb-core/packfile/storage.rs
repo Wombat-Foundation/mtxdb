@@ -1275,11 +1275,18 @@ impl PackfileStorage {
                 // `IndexSlot` can only represent offsets up to `2^28 - 2`
                 // (the 28-bit offset field reserves the sentinel). Offsets a
                 // legacy or externally created oversized shard can no longer
-                // fit are skipped rather than panicking the rebuild: writes
-                // are already capped at `MAX_SHARD_BYTES`.
-                if offset <= (1u64 << 28) - 2 {
-                    let _ = index.insert(&hash, shard_id, offset);
+                // fit are rejected rather than silently skipped: writes are
+                // already capped at `MAX_SHARD_BYTES`, so a record beyond
+                // the limit means the shard did not come from this engine,
+                // and silently indexing around it would make its data
+                // unreachable while reporting a successful rebuild.
+                if offset > (1u64 << 28) - 2 {
+                    return Err(StorageError::Corrupt(format!(
+                        "shard {shard_id} holds record {hash:?} at offset {offset}, beyond the index offset limit {}",
+                        (1u64 << 28) - 2
+                    )));
                 }
+                let _ = index.insert(&hash, shard_id, offset);
             }
         }
         Ok(index)

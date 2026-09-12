@@ -22,6 +22,7 @@ pub(crate) enum Commands {
     Get {
         collection: Option<String>,
         id: String,
+        text: bool,
     },
     Collections {
         all: bool,
@@ -330,6 +331,12 @@ fn sub_get() -> Command {
                 .required(true)
                 .help("Node ID (32 hex characters) or Matrix event ID"),
         )
+        .arg(
+            Arg::new("text")
+                .long("text")
+                .action(ArgAction::SetTrue)
+                .help("Append a trailing newline when printing (payloads are emitted byte-exact by default)"),
+        )
 }
 
 fn parse_cli() -> Cli {
@@ -361,6 +368,7 @@ fn parse_cli() -> Cli {
         Some(("get", m)) => Commands::Get {
             collection: m.get_one::<String>("collection").cloned(),
             id: m.get_one::<String>("id").unwrap().clone(),
+            text: m.get_flag("text"),
         },
         Some(("collections", m)) => Commands::Collections {
             all: m.get_flag("all"),

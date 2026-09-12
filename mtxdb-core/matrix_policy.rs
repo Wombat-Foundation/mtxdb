@@ -50,7 +50,7 @@ pub enum ReferenceHashEncoding {
 pub enum ReferenceHashInputPolicy {
     /// Event IDs are server-assigned, so no reference-hash input exists.
     NotApplicable,
-    /// Room version 1 to 5.
+    /// Room version 3 to 5 (V1 and V2 use server-assigned event IDs).
     V1ToV5,
     /// Room version 6 to 8.
     V6ToV8,
