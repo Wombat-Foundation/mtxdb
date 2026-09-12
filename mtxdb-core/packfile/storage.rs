@@ -1177,21 +1177,40 @@ impl PackfileStorage {
         // succeed but disappears on the next startup scan.
         if is_new {
             self.clear_deleted_collection(collection_id)?;
-        }
-
-        self.collections
-            .write()
-            .entry(*collection_id)
-            .or_insert_with(|| {
-                ArcSwap::from_pointee(RoomGeneration {
-                    index: LossyIndex::new(0),
-                    cache: Arc::new(NodeCache::new(self.cache_capacity)),
+            self.collections
+                .write()
+                .entry(*collection_id)
+                .or_insert_with(|| {
+                    ArcSwap::from_pointee(RoomGeneration {
+                        index: LossyIndex::new(0),
+                        cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                    })
                 })
-            })
-            .store(new_gen);
+                .store(new_gen);
 
-        if is_new && !self.collection_order.read().contains(collection_id) {
-            self.collection_order.write().push(*collection_id);
+            if !self.collection_order.read().contains(collection_id) {
+                self.collection_order.write().push(*collection_id);
+            }
+        } else {
+            // Fast path: just update the ArcSwap using a read lock on the map.
+            // This avoids a global write lock on every single put() call.
+            let read_guard = self.collections.read();
+            if let Some(arc_swap) = read_guard.get(collection_id) {
+                arc_swap.store(new_gen);
+            } else {
+                // Fallback in case of a race condition with a deletion
+                drop(read_guard);
+                self.collections
+                    .write()
+                    .entry(*collection_id)
+                    .or_insert_with(|| {
+                        ArcSwap::from_pointee(RoomGeneration {
+                            index: LossyIndex::new(0),
+                            cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                        })
+                    })
+                    .store(new_gen);
+            }
         }
         Ok(())
     }
