@@ -2349,9 +2349,7 @@ impl StorageEngine for PackfileStorage {
             hash: *id,
             data: data.bytes.clone(),
         };
-
         let (shard_id, offset) = self.shards.put_record(&record)?;
-
         let (index, cache) = {
             let old_gen = self.generation(collection_id);
             let mut index = match &old_gen {
