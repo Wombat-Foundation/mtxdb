@@ -1195,6 +1195,16 @@ impl PackfileStorage {
         }
         Ok(())
     }
+    /// Forces a re-scan of a collection's shards from disk and atomically swaps in the new index.
+    /// This is designed for multi-worker environments to pull in external appends on demand.
+    ///
+    /// # Errors
+    /// Returns `StorageError` if reading or parsing the underlying shards fails.
+    pub fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        let new_index = self.rebuild_index(collection_id)?;
+        let existing_cache = self.generation(collection_id).map(|g| g.cache.clone());
+        self.store_generation(collection_id, new_index, existing_cache)
+    }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
         let scanned = self.scan_collection_records(collection_id)?;
@@ -2321,7 +2331,12 @@ impl StorageEngine for PackfileStorage {
             data: data.bytes.clone(),
         };
 
+        let start = std::time::Instant::now();
         let (shard_id, offset) = self.shards.put_record(&record)?;
+        eprintln!(
+            "mtxdb put_record elapsed: {} us",
+            start.elapsed().as_micros()
+        );
 
         let (index, cache) = {
             let old_gen = self.generation(collection_id);
@@ -3258,6 +3273,35 @@ mod tests {
 
         let got = store.get(&TEST_COLLECTION, &extra).unwrap().unwrap();
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"y"));
+    }
+
+    #[test]
+    fn test_refresh_collection_multi_worker_visibility() {
+        let dir = test_dir("refresh_collection_multi_worker");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+
+        // Open a read-only instance BEFORE the writer writes the data.
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+
+        let id = [0xAA; 16];
+        writer
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"multi_worker_test")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+
+        // Reader's in-memory index should be completely unaware of the new write.
+        assert!(reader.get(&TEST_COLLECTION, &id).unwrap().is_none());
+
+        // Trigger the external refresh, simulating a cache invalidation signal.
+        reader.refresh_collection(&TEST_COLLECTION).unwrap();
+
+        // Reader should now have correctly loaded the delta and rebuilt its index.
+        let got = reader.get(&TEST_COLLECTION, &id).unwrap().unwrap();
+        assert_eq!(got.bytes, bytes::Bytes::from_static(b"multi_worker_test"));
     }
 
     #[test]
