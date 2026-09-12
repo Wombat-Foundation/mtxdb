@@ -1539,22 +1539,14 @@ impl PackfileStorage {
     /// Builds this repack's deduped `hash → (shard_id, offset)` map,
     /// incrementally where possible.
     ///
-    /// If a previous repack left cursor state for this collection, **moves**
-    /// (not clones) the stored `live_map` out of the cursor entry and scans
-    /// each shard only from the byte offset it had reached last time (via
-    /// [`packfile::scan_packfile_from`]), merging newly-appended records in.
-    /// Moving rather than cloning keeps each repack call's allocation cost
-    /// proportional to the *delta* (new bytes since the last repack), not the
-    /// total accumulated map size — eliminating the O(n) clone-per-call that
-    /// would otherwise make repeated repacks O(n²) overall.
-    ///
-    /// The cursor entry is transiently absent from `repack_incremental` between
-    /// this call and the `repack_save_incremental_state` call at the end of
-    /// `repack_collection_reachable`; any concurrent `plan_collection_repack`
-    /// landing in that window will fall back to a full scan, which is safe.
-    ///
-    /// Otherwise (first repack for this collection) falls back to a full scan
-    /// of every shard from byte zero.
+    /// If a previous repack left cursor state for this collection, starts from
+    /// that repack's `live_map` and scans each shard only from the byte
+    /// offset it had reached last time (via
+    /// [`packfile::scan_packfile_from`]), merging newly-appended records
+    /// in. Otherwise (first repack for this collection) falls back to a full
+    /// scan of every shard from byte zero. This is what turns the O(n²)
+    /// cost of repeatedly rescanning a growing collection from scratch into
+    /// O(n) total scan work across all repack calls.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure scanning a shard.
@@ -1562,28 +1554,11 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
     ) -> Result<HashMap<[u8; 16], (u16, u64)>, StorageError> {
-        // Check under a read lock whether incremental state exists.
-        let has_prev = self.repack_incremental.read().contains_key(collection_id);
-        if has_prev {
-            // Incremental path: take the write lock and *move* the previous
-            // live_map out of the cursor entry (O(1), no clone) rather than
-            // cloning it (O(n) per call → O(n²) total across all repacks).
-            //
-            // The entry is transiently absent from `repack_incremental` from
-            // here until `repack_save_incremental_state` restores it at the
-            // end of `repack_collection_reachable`. Any concurrent
-            // `plan_collection_repack` that lands in this window will not hold
-            // the collection mutex and will safely fall back to a full scan,
-            // which is exactly what happens before the first repack anyway.
-            let prev = self
-                .repack_incremental
-                .write()
-                .remove(collection_id)
-                .expect("entry was present under read lock and collection mutex is held");
-
-            // Scan only bytes appended since the last repack and merge into
-            // the stolen map in-place — O(delta) work, not O(total).
-            let mut map = prev.live_map;
+        let cursors = self.repack_incremental.read();
+        if let Some(prev) = cursors.get(collection_id) {
+            // Incremental: start from the previous live_map and scan only
+            // bytes appended since the last repack.
+            let mut map = prev.live_map.clone();
             for (shard_id, shard) in self.shards.all_shards() {
                 let start = prev.scan_offsets.get(&shard_id).copied().unwrap_or(0);
                 let entries =
@@ -1597,6 +1572,7 @@ impl PackfileStorage {
             Ok(map)
         } else {
             // First repack: full scan of every shard.
+            drop(cursors);
             let scanned = self.scan_collection_records(collection_id)?;
             let mut map = HashMap::new();
             for (shard_id, entries) in &scanned {
