@@ -44,5 +44,10 @@ name = "storage"
 path = "../benches/storage.rs"
 harness = false
 
+[[bench]]
+name = "locality"
+path = "../benches/locality.rs"
+harness = false
+
 [lints]
 workspace = true
