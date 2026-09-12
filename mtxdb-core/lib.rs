@@ -39,8 +39,8 @@ pub use cache::NodeCache;
 pub use index::LossyIndex;
 pub use layout::{DatabaseLayout, ShardType};
 pub use matrix_policy::{
-    EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding, RoomIdPolicy,
-    RoomMetadata, StateResolutionPolicy,
+    EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
+    ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
 };
 pub use packfile::{storage::PackfileStorage, Record};
 pub use shard::ShardPool;

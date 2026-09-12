@@ -65,9 +65,10 @@ pub unsafe extern "C" fn mdb_storage_open(path: *const c_char, pool: *const c_ch
         mtxdb_core::ShardType::EventDag
     } else {
         match unsafe { CStr::from_ptr(pool) }.to_str() {
+            Ok("event-dag") => mtxdb_core::ShardType::EventDag,
             Ok("state") => mtxdb_core::ShardType::State,
             Ok("auth-chain") => mtxdb_core::ShardType::AuthChain,
-            _ => mtxdb_core::ShardType::EventDag,
+            _ => return ptr::null_mut(),
         }
     };
     let pool_dir = match layout.pool_dir(shard_type) {
@@ -271,10 +272,11 @@ mod tests {
     fn test_ffi_roundtrip() {
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("mdb_ffi_test_{pid}"));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = CString::new(dir.to_str().unwrap()).unwrap();
-        let handle = unsafe { mdb_storage_open(path.as_ptr()) };
+        let handle = unsafe { mdb_storage_open(path.as_ptr(), ptr::null()) };
         assert!(!handle.is_null());
 
         let collection = [0x01u8; 16];
@@ -305,6 +307,19 @@ mod tests {
             mdb_node_data_destroy(node);
             mdb_storage_destroy(handle);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn storage_open_rejects_unknown_pool() {
+        let dir = std::env::temp_dir().join(format!("mdb_ffi_bad_pool_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = CString::new(dir.to_str().unwrap()).unwrap();
+        let pool = CString::new("not-a-pool").unwrap();
+
+        let handle = unsafe { mdb_storage_open(path.as_ptr(), pool.as_ptr()) };
+        assert!(handle.is_null());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

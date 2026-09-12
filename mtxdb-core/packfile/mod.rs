@@ -569,12 +569,10 @@ pub fn read_version(reader: &mut impl Read) -> io::Result<Option<u8>> {
     let mut version = [0u8; 1];
     match reader.read_exact(&mut version) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing version byte",
-            ));
-        }
+        // `read_version` is deliberately only a lightweight probe.  A file
+        // ending immediately after MAGIC is still too short to identify a
+        // version, just like one ending part-way through MAGIC.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
     Ok(Some(version[0]))
@@ -1324,6 +1322,12 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let err = read_header(&mut cursor).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_read_version_magic_without_version_is_not_an_invalid_header() {
+        let mut cursor = Cursor::new(MAGIC);
+        assert_eq!(read_version(&mut cursor).unwrap(), None);
     }
 
     #[test]

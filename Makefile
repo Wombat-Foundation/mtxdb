@@ -35,7 +35,6 @@ lint: ##H Run clippy lints (only core, not full workspace)
 .PHONY: fix
 fix: ##H Apply auto-fixes with clippy (only core)
 	$(CARGO) clippy --fix  --workspace --allow-dirty --allow-staged --allow-no-vcs --all-targets --all-features
-	$(CARGO) clippy --fix --manifest-path mtxdb-cli/Cargo.toml --allow-dirty --allow-staged --allow-no-vcs --all-targets --all-features
 
 
 .PHONY: doc

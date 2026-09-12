@@ -9,9 +9,9 @@ def main():
     failed = sys.argv[2]
     ignored = sys.argv[3]
 
-    badge_svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="120" height="20">
-    <rect width="120" height="20" fill="#555"/>
-    <text x="60" y="14" fill="#fff" text-anchor="middle">Tests: {passed} P / {failed} F</text>
+    badge_svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="160" height="20">
+    <rect width="160" height="20" fill="#555"/>
+    <text x="80" y="14" fill="#fff" text-anchor="middle">Tests: {passed} P / {failed} F / {ignored} I</text>
 </svg>"""
 
     with open("tests.svg", "w") as f:

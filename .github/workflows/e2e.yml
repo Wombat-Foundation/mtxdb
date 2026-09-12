@@ -1,5 +1,5 @@
 ---
-name: Ruma SDK E2E
+name: Rust Tests
 
 on:
   push:
@@ -17,15 +17,13 @@ jobs:
   equiv-determ:
     runs-on: ubuntu-latest
     env:
-      MATRIX_HOMESERVER: ${{ secrets.MATRIX_HOMESERVER }}
-      MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}
-      MATRIX_ROOM_ID_V2_1: ${{ secrets.MATRIX_ROOM_ID_V2_1 }}
-      MATRIX_TOKEN: ${{ github.event_name == 'push' && secrets.MATRIX_TOKEN || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.SUBMODULE_ACCESS_TOKEN || github.token }}
-          submodules: ${{ secrets.SUBMODULE_ACCESS_TOKEN && 'recursive' || 'false' }}
+          # This job executes pull-request code; do not leave a checkout
+          # credential available to it. The test suite does not use docs.
+          persist-credentials: false
+          submodules: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -36,7 +34,7 @@ jobs:
       - name: Build release crate
         run: make build
 
-      - name: Run E2E parity test
+      - name: Run Rust test suite
         run: make test
 
       - name: Upload E2E Diff on Failure

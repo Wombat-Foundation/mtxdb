@@ -77,11 +77,11 @@ jobs:
 
       - name: Lint (cli feature)
         if: matrix.label == 'cli feature'
-        run: cargo clippy --locked --features cli --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test (cli feature)
         if: matrix.label == 'cli feature'
-        run: cargo test --locked --features cli --workspace --lib --tests
+        run: cargo test --locked --workspace --lib --tests
 
       - name: Build CLI
         if: matrix.label == 'cli feature'

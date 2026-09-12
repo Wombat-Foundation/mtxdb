@@ -6,6 +6,11 @@ lcov.info
 # test / in-repo db
 /pools
 
+# python
+__pycache__
+.pytest_cache
+.mypy_cache
+
 # other stuff
 .env
 docs/*.md

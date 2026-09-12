@@ -710,7 +710,8 @@ impl ShardPool {
     /// Discovers new pack files on disk and adds them to the pool.
     ///
     /// # Errors
-    /// Returns `io::Error` if reading the directory fails.
+    /// Returns `io::Error` if reading the directory, opening a discovered
+    /// pack, reading its metadata, or allocating a shard slot fails.
     pub fn discover_shards(&self) -> io::Result<()> {
         let pack_files = Self::discover_pack_files(&self.base_dir)?;
         let mut shards = self.shards.write();
@@ -722,20 +723,19 @@ impl ShardPool {
             if existing.contains(&pack_id) {
                 continue;
             }
-            let empty_slot = shards.iter().position(Option::is_none);
-            if let Some(slot) = empty_slot {
-                if let Ok(file) = crate::packfile::open_packfile(&path, false, pack_id) {
-                    if let Ok(meta) = file.metadata() {
-                        shards[slot] = Some(std::sync::Arc::new(Shard::new(
-                            u16::try_from(slot).unwrap_or(0),
-                            pack_id,
-                            file,
-                            path,
-                            meta.len(),
-                        )));
-                    }
-                }
-            }
+            let slot = shards.iter().position(Option::is_none).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "shard pool full while discovering pack files",
+                )
+            })?;
+            let file = crate::packfile::open_packfile(&path, false, pack_id)?;
+            let file_len = file.metadata()?.len();
+            let slot = u16::try_from(slot)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid shard slot"))?;
+            shards[usize::from(slot)] = Some(std::sync::Arc::new(Shard::new(
+                slot, pack_id, file, path, file_len,
+            )));
         }
         Ok(())
     }
@@ -2371,6 +2371,17 @@ mod tests {
             }
             Ok(_) => panic!("expected error for torn shard header"),
         }
+    }
+
+    #[test]
+    fn discover_shards_reports_an_unopenable_new_pack() {
+        let dir = test_dir("discover_unopenable_pack");
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        let path = ShardPool::pack_path(&dir, 1);
+        std::fs::write(path, b"MTX").unwrap();
+
+        let error = pool.discover_shards().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     /// `stats()` must reflect actual write/read/sync activity, so callers

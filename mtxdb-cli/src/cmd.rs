@@ -251,7 +251,11 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str) -> anyhow::Result<()> 
         [] => bail!("not found"),
         [(_, data)] => {
             io::stdout().write_all(&data.bytes)?;
-            io::stdout().write_all(b"\n")?;
+            // Only decorate textual payloads with a trailing newline; a binary
+            // payload must be emitted byte-exact.
+            if std::str::from_utf8(&data.bytes).is_ok() && !data.bytes.ends_with(b"\n") {
+                io::stdout().write_all(b"\n")?;
+            }
         }
         _ => bail!(
             "node ID {id} is present in multiple collections ({}); specify --collection",
@@ -673,19 +677,6 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
             mtxdb_core::packfile::VERSION,
         ));
     }
-    let mut highest_per_slot: std::collections::HashMap<u16, (u64, u64, u8)> =
-        std::collections::HashMap::new();
-    for entry in packs {
-        let slot = (entry.0 & 0xFFFF) as u16;
-        if let Some(existing) = highest_per_slot.get_mut(&slot) {
-            if entry.0 > existing.0 {
-                *existing = entry;
-            }
-        } else {
-            highest_per_slot.insert(slot, entry);
-        }
-    }
-    let mut packs: Vec<_> = highest_per_slot.into_values().collect();
     packs.sort_unstable_by_key(|(pack_id, _, _)| *pack_id);
     Ok(packs)
 }
@@ -1250,7 +1241,9 @@ fn cmd_import(
             failures = failures.saturating_add(1);
         }
     }
-    store.sync().context("persisting import shard summaries")?;
+    store
+        .sync_all()
+        .context("persisting import shard and collection summaries")?;
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
     }

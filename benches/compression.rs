@@ -1,7 +1,7 @@
 //! Raw-versus-zstd write-cost microbenchmark for packfile frames.
 //!
 //! Run with `cargo bench -p mtxdb-core --bench compression`. This measures
-//! CPU-side frame production only: output goes to `io::sink()` so filesystem
+//! CPU-side frame production only: output goes to a black-box discard writer so filesystem
 //! latency, shard rotation, index insertion, and fsync do not obscure the
 //! per-record cost of `write_record`'s unconditional zstd attempt.
 //!

@@ -270,10 +270,14 @@ pub struct PackfileStorage {
 }
 
 /// Per-collection state for incremental repack.
+#[derive(Clone)]
 struct RepackIncrementalState {
     /// Per-shard byte offset: next scan starts here (file length at end
     /// of last scan). Shards not in this map haven't been scanned yet.
-    scan_offsets: HashMap<u16, u64>,
+    // A slot can be retired and reused for a different pack.  Keep the
+    // pack_id beside the cursor so an offset from the old incarnation is
+    // never applied to the replacement file.
+    scan_offsets: HashMap<u16, (u64, u64)>,
     /// The deduplicated hash → (`shard_id`, offset) map from the last repack.
     /// The next repack merges newly-scanned entries into this map.
     live_map: HashMap<[u8; 16], (u16, u64)>,
@@ -1268,7 +1272,14 @@ impl PackfileStorage {
         let mut index = LossyIndex::new(total.saturating_mul(2).max(16));
         for (shard_id, entries) in scanned {
             for (hash, offset) in entries {
-                let _ = index.insert(&hash, shard_id, offset);
+                // `IndexSlot` can only represent offsets up to `2^28 - 2`
+                // (the 28-bit offset field reserves the sentinel). Offsets a
+                // legacy or externally created oversized shard can no longer
+                // fit are skipped rather than panicking the rebuild: writes
+                // are already capped at `MAX_SHARD_BYTES`.
+                if offset <= (1u64 << 28) - 2 {
+                    let _ = index.insert(&hash, shard_id, offset);
+                }
             }
         }
         Ok(index)
@@ -1582,11 +1593,39 @@ impl PackfileStorage {
                 .remove(collection_id)
                 .expect("entry was present under read lock and collection mutex is held");
 
+            let shards = self.shards.all_shards();
+            let current_pack_ids: HashMap<u16, u64> = shards
+                .iter()
+                .map(|(shard_id, shard)| (*shard_id, shard.pack_id))
+                .collect();
+            // Slot IDs are recyclable.  A cursor (and every entry in the
+            // carried live_map) is meaningful only for the pack incarnation
+            // that produced it.  On any replacement or disappearance, start
+            // over rather than mixing old offsets with the new pack.
+            let pack_changed = prev
+                .scan_offsets
+                .iter()
+                .any(|(shard_id, (pack_id, _))| current_pack_ids.get(shard_id) != Some(pack_id));
+            if pack_changed {
+                let scanned = self.scan_collection_records(collection_id)?;
+                let mut map = HashMap::new();
+                for (shard_id, entries) in scanned {
+                    for (hash, offset) in entries {
+                        map.insert(hash, (shard_id, offset));
+                    }
+                }
+                return Ok((map, None));
+            }
+
             // Scan only bytes appended since the last repack, merging into
             // the stolen live_map in-place — O(delta) work, not O(total).
             let mut map = prev.live_map.clone();
-            for (shard_id, shard) in self.shards.all_shards() {
-                let start = prev.scan_offsets.get(&shard_id).copied().unwrap_or(0);
+            for (shard_id, shard) in shards {
+                let start = prev
+                    .scan_offsets
+                    .get(&shard_id)
+                    .filter(|(pack_id, _)| *pack_id == shard.pack_id)
+                    .map_or(0, |(_, offset)| *offset);
                 let entries =
                     packfile::scan_packfile_from(&shard.path, start).map_err(StorageError::Io)?;
                 for (rid, hash, offset) in entries {
@@ -1642,8 +1681,10 @@ impl PackfileStorage {
         // root was removed — is still reachable now; no need to re-expand it.
         let mut visited: HashSet<[u8; 16]> = prev.adjacency.keys().copied().collect();
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
-        let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> =
-            prev.adjacency.keys().map(|h| (*h, vec![])).collect();
+        // Retain the cached edges for already-live nodes.  Initialising these
+        // entries with empty vectors loses prior edges when they are not put
+        // back on the queue during an incremental rooted repack.
+        let mut adjacency = prev.adjacency.clone();
 
         for root in roots {
             if hash_to_shard_offset.contains_key(root) && visited.insert(*root) {
@@ -1752,7 +1793,7 @@ impl PackfileStorage {
 
         let mut scan_offsets = HashMap::new();
         for (shard_id, shard) in self.shards.all_shards() {
-            scan_offsets.insert(shard_id, shard.file_len());
+            scan_offsets.insert(shard_id, (shard.pack_id, shard.file_len()));
         }
         let next_live_map: HashMap<[u8; 16], (u16, u64)> = new_offsets
             .iter()
@@ -1791,10 +1832,24 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<RepackPlan, StorageError> {
-        // plan is read-only: discard the prev_state (we don't update incremental
-        // cursor on a dry-run, so there's nothing to do with it here).
-        let (hash_to_shard_offset, _prev_state) = self.repack_scan_incremental(collection_id)?;
-        self.plan_collection_repack_from_map(collection_id, &hash_to_shard_offset, &extract_edges)
+        // `repack_scan_incremental` moves the cursor out to avoid cloning on
+        // real repacks.  A plan must leave that state untouched, and must not
+        // race a real repack while temporarily doing so.
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+        let saved_state = self.repack_incremental.read().get(collection_id).cloned();
+        let result = self
+            .repack_scan_incremental(collection_id)
+            .and_then(|(map, _)| {
+                self.plan_collection_repack_from_map(collection_id, &map, &extract_edges)
+            });
+        let mut states = self.repack_incremental.write();
+        if let Some(state) = saved_state {
+            states.insert(*collection_id, state);
+        } else {
+            states.remove(collection_id);
+        }
+        result
     }
 
     fn plan_collection_repack_from_map(

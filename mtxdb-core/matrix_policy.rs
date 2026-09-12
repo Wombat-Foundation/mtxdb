@@ -48,6 +48,8 @@ pub enum ReferenceHashEncoding {
 /// What fields are stripped before calculating a reference-hash event ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceHashInputPolicy {
+    /// Event IDs are server-assigned, so no reference-hash input exists.
+    NotApplicable,
     /// Room version 1 to 5.
     V1ToV5,
     /// Room version 6 to 8.
@@ -183,9 +185,8 @@ impl MatrixRoomVersion {
     #[must_use]
     pub const fn reference_hash_input_policy(self) -> ReferenceHashInputPolicy {
         match self {
-            Self::V1 | Self::V2 | Self::V3 | Self::V4 | Self::V5 => {
-                ReferenceHashInputPolicy::V1ToV5
-            }
+            Self::V1 | Self::V2 => ReferenceHashInputPolicy::NotApplicable,
+            Self::V3 | Self::V4 | Self::V5 => ReferenceHashInputPolicy::V1ToV5,
             Self::V6 | Self::V7 | Self::V8 => ReferenceHashInputPolicy::V6ToV8,
             _ => ReferenceHashInputPolicy::V9Plus,
         }
@@ -262,6 +263,10 @@ mod tests {
         assert_eq!(
             MatrixRoomVersion::V2.state_resolution_policy(),
             StateResolutionPolicy::V2
+        );
+        assert_eq!(
+            MatrixRoomVersion::V1.reference_hash_input_policy(),
+            ReferenceHashInputPolicy::NotApplicable
         );
         assert_eq!(
             MatrixRoomVersion::V3.event_id_policy(),

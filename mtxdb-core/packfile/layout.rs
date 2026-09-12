@@ -87,21 +87,21 @@ pub fn physical_layout(dir: &Path) -> io::Result<PhysicalLayout> {
     let mut layout = PhysicalLayout::default();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("pack") {
+        if !is_canonical_pack_path(&path) {
             continue;
         }
 
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
-        let Some(header) = read_header(&mut reader)? else {
-            return Err(io::Error::new(
+        // A canonical pool filename is an assertion that this is ours: retain
+        // header/CRC errors for it.  Non-canonical `.pack` files were skipped
+        // above because they may belong to another application.
+        let header = read_header(&mut reader)?.ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "missing or invalid magic header in .pack file: {}",
-                    path.display()
-                ),
-            ));
-        };
+                format!("missing magic header in pack file: {}", path.display()),
+            )
+        })?;
         let pack_id = header.pack_id;
         let mut current_run: Option<([u8; 16], u64)> = None;
         loop {
@@ -139,6 +139,21 @@ pub fn physical_layout(dir: &Path) -> io::Result<PhysicalLayout> {
         finish_physical_run(&mut layout, pack_id, current_run);
     }
     Ok(layout)
+}
+
+fn is_canonical_pack_path(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some(id) = stem.strip_prefix("pack_") else {
+        return false;
+    };
+    path.extension()
+        .is_some_and(|extension| extension == "pack")
+        && id.len() == 16
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn finish_physical_run(layout: &mut PhysicalLayout, pack_id: u64, run: Option<([u8; 16], u64)>) {
@@ -217,5 +232,24 @@ mod tests {
             avoidable_spread_bytes(Some(&fragmented)),
             capacity.saturating_sub(capacity / 2 + 100)
         );
+    }
+
+    #[test]
+    fn physical_layout_ignores_unrelated_pack_files_but_rejects_bad_pool_packs() {
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_core_layout_foreign_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("other-app.pack"), b"not an mdb pack").unwrap();
+        assert!(physical_layout(&dir).unwrap().packs.is_empty());
+
+        std::fs::write(dir.join("pack_0000000000000000.pack"), b"not an mdb pack").unwrap();
+        assert_eq!(
+            physical_layout(&dir).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
