@@ -479,6 +479,13 @@ fn shard_bytes_label(n: Option<u64>) -> String {
     n.map_or_else(|| "default (~256 MB)".to_owned(), |n| n.to_string())
 }
 
+/// Compact machine-readable tag for a shard cap, for `bench:` rows: the raw
+/// byte value when set, else "default". Used so a parser can split the
+/// phase A / B / C output purely by `ingest->repack` caps.
+fn cap_tag(n: Option<u64>) -> String {
+    n.map_or_else(|| "default".to_owned(), |v| v.to_string())
+}
+
 /// Runs the ingest → pre-repack query → repack → post-repack query cycle.
 ///
 /// `repack_max_shard_bytes` is the shard cap the *repack* step reopens the
@@ -801,6 +808,43 @@ pub fn run_stage1_locality_benchmark(
         ),
     );
     println!("═══════════════════════════════════════════════════════════════");
+    println!(
+        "bench: elephant MAX={} REPACK={} RECORDS={} COLS={} \
+         PACKS_PRE={} PACKS_POST={} SAMPLE={} \
+         OPEN_PRE_US={:.3} OPEN_POST_US={:.3} \
+         QUERY_PRE_US={:.3} QUERY_POST_US={:.3} \
+         PACKS_REF_PRE={} PACKS_REF_POST={} SEGMENTS_PRE={} SEGMENTS_POST={} \
+         OPEN_DISK_PRE={} OPEN_DISK_POST={} OPEN_SYSCALLS_PRE={} OPEN_SYSCALLS_POST={} \
+         QUERY_DISK_PRE={} QUERY_DISK_POST={} QUERY_SYSCALLS_PRE={} QUERY_SYSCALLS_POST={} \
+         FOUND_PRE={} FOUND_POST={} REPACK_MS={:.3} SPEEDUP_X={:.3}",
+        cap_tag(max_shard_bytes),
+        cap_tag(repack_max_shard_bytes),
+        total_records,
+        collection_count,
+        initial_pack_count,
+        post_pack_count,
+        sample_keys.len(),
+        pre_open_time.as_secs_f64() * 1_000_000.0,
+        post_open_time.as_secs_f64() * 1_000_000.0,
+        pre_latency.as_secs_f64() * 1_000_000.0,
+        post_latency.as_secs_f64() * 1_000_000.0,
+        pre_packs_touched,
+        post_packs_touched,
+        pre_segments,
+        post_segments,
+        pre_open_io_delta.map_or(0, |delta| delta.disk_read_bytes),
+        post_open_io_delta.map_or(0, |delta| delta.disk_read_bytes),
+        pre_open_io_delta.map_or(0, |delta| delta.read_syscalls),
+        post_open_io_delta.map_or(0, |delta| delta.read_syscalls),
+        pre_io_delta.map_or(0, |delta| delta.disk_read_bytes),
+        post_io_delta.map_or(0, |delta| delta.disk_read_bytes),
+        pre_io_delta.map_or(0, |delta| delta.read_syscalls),
+        post_io_delta.map_or(0, |delta| delta.read_syscalls),
+        pre_found,
+        post_found,
+        repack_time.as_secs_f64() * 1_000.0,
+        pre_latency.as_secs_f64() / post_latency.as_secs_f64(),
+    );
 
     drop(store_post);
     let _ = fs::remove_dir_all(&temp_dir);
@@ -929,6 +973,22 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
     subrow("write time:", format!("{total_write_time:.2?}"));
     subrow("fsync time:", format!("{total_fsync_time:.2?}"));
     println!("═══════════════════════════════════════════════════════════════");
+    println!(
+        "bench: compact RECORDS={} COLS={} SHARDS={} \
+         PACKS_REF_PRE={} PACKS_REF_POST={} SEGMENTS_PRE={} SEGMENTS_POST={} \
+         WRITTEN={} BYTES={} WRITE_MS={:.3} FSYNC_MS={:.3}",
+        total_records,
+        collection_count,
+        summaries.len(),
+        pre_packs_referenced,
+        post_packs_referenced,
+        pre_segments,
+        post_segments,
+        total_records_written,
+        total_bytes_written,
+        total_write_time.as_secs_f64() * 1_000.0,
+        total_fsync_time.as_secs_f64() * 1_000.0,
+    );
 
     // Drop before removing the directory, not after: `ShardPool`'s
     // `Drop` impl does its own best-effort final stats flush, which
