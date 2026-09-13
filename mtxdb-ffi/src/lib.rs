@@ -84,6 +84,59 @@ pub unsafe extern "C" fn mdb_storage_open(path: *const c_char, pool: *const c_ch
     Box::into_raw(Box::new(MdbStorage { inner: storage }))
 }
 
+/// Open a storage instance read-only at the given path, coexisting with a
+/// concurrent writer process on the same directory (see
+/// `PackfileStorage::open_read_only`'s doc comment for the locking
+/// contract). No exclusive write lock is taken, so this succeeds even
+/// while another process holds `mdb_storage_open`'s write lock -- the
+/// call that fails in that situation.
+///
+/// A read-only-opened handle's in-memory index is a snapshot from open
+/// time; it does not see the writer's later writes automatically. Any
+/// write attempted through it (`mdb_put`) fails at the OS level (the
+/// underlying files are opened without write access) rather than
+/// corrupting anything.
+///
+/// # Safety
+/// `path` must be a valid null-terminated UTF-8 C string.
+///
+/// # Returns
+/// Null on error, otherwise an opaque handle. Caller must destroy with
+/// `mdb_storage_destroy`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mdb_storage_open_read_only(
+    path: *const c_char,
+    pool: *const c_char,
+) -> *mut MdbStorage {
+    let c_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+    let shard_type = if pool.is_null() {
+        mtxdb_core::ShardType::EventDag
+    } else {
+        match unsafe { CStr::from_ptr(pool) }.to_str() {
+            Ok("event-dag") => mtxdb_core::ShardType::EventDag,
+            Ok("state") => mtxdb_core::ShardType::State,
+            Ok("auth-chain") => mtxdb_core::ShardType::AuthChain,
+            _ => return ptr::null_mut(),
+        }
+    };
+    let layout = match mtxdb_core::DatabaseLayout::open(std::path::PathBuf::from(c_str)) {
+        Ok(l) => l,
+        Err(_) => return ptr::null_mut(),
+    };
+    let pool_dir = match layout.pool_dir(shard_type) {
+        Ok(d) => d,
+        Err(_) => return ptr::null_mut(),
+    };
+    let storage = match PackfileStorage::open_read_only(pool_dir) {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+    Box::into_raw(Box::new(MdbStorage { inner: storage }))
+}
+
 /// Destroy a storage instance and release all resources.
 ///
 /// # Safety
