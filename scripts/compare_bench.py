@@ -166,6 +166,13 @@ class Scenario:
     columns: list[str]
     rows: list[dict] = field(default_factory=list)
     track: list[str] = field(default_factory=list)
+    machine: str = ""
+
+    def with_machine(self, machine: str) -> "Scenario":
+        """Return a copy carrying this run's machine/spec fingerprint, so the
+        CSV history can tell machines apart without a schema change."""
+        self.machine = machine
+        return self
 
 
 def load_json(path: Path) -> dict[str, float]:
@@ -733,14 +740,16 @@ def append_scenario_csv(directory: Path, scenario: Scenario) -> None:
     is_new = not path.exists()
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     sha = get_git_sha()
-    header = ["timestamp", "git_sha", *scenario.columns]
+    header = ["timestamp", "git_sha", "machine", *scenario.columns]
 
     with open(path, "a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         if is_new:
             writer.writerow(header)
         for row in scenario.rows:
-            writer.writerow([ts, sha, *(row[col] for col in scenario.columns)])
+            writer.writerow(
+                [ts, sha, scenario.machine, *(row[col] for col in scenario.columns)]
+            )
     print(f"Appended {len(scenario.rows)} rows to {path}.")
 
 
@@ -762,6 +771,12 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--margin", type=float, default=0.10)
     parser.add_argument(
+        "--machine",
+        metavar="SPEC",
+        help="machine/spec fingerprint recorded in each CSV row (default: "
+        "git_sha; set per machine, e.g. from `cpu_info.sh` output)",
+    )
+    parser.add_argument(
         "--csv-dir",
         metavar="DIR",
         help="append parsed metrics to typed per-scenario CSV files in this "
@@ -776,6 +791,10 @@ def main() -> None:
         best = load_json(Path(args.best))
     except ValueError as error:
         parser.error(str(error))
+
+    if args.machine:
+        for scenario in scenarios:
+            scenario.with_machine(args.machine)
 
     if args.csv_dir:
         for scenario in scenarios:
