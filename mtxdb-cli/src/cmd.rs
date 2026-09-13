@@ -571,7 +571,9 @@ fn print_pack_physical_layout(
         .map(|stats| stats.collections.len() as u64)
         .sum();
     if interleaving_worth_noting(collections_total, interleaved) {
-        println!("note: {interleaved} excess runs from interleaving across collections sharing packs");
+        println!(
+            "note: {interleaved} excess runs from interleaving across collections sharing packs"
+        );
         println!("      repack is never automatic — run `mtxdb repack --all` to fold each");
         println!("      collection into a single contiguous run");
     }

@@ -202,15 +202,10 @@ fn sub_completions() -> Command {
 fn sub_scan() -> Command {
     Command::new("scan")
         .about("Scan a packfile and print records")
-        .arg(
-            Arg::new("shard")
-                .required(true)
-                .value_name("PACK_ID")
-                .help(
-                    "Pack ID from `shards`, for example 0x0000000000000003 — not a \
+        .arg(Arg::new("shard").required(true).value_name("PACK_ID").help(
+            "Pack ID from `shards`, for example 0x0000000000000003 — not a \
                      collection ID (those are 32 hex digits)",
-                ),
-        )
+        ))
 }
 
 fn sub_info() -> Command {
