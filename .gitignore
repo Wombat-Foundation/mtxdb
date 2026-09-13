@@ -6,8 +6,9 @@ lcov.info
 # test / in-repo db
 /pools
 
-# benchmark CSV history is committed; only the raw capture is transient
+# benchmark CSV history is committed; only the raw captures are transient
 /benches/csv/latest.txt
+/benches/csv/latest-external.txt
 
 # python
 __pycache__

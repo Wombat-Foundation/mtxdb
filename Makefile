@@ -90,6 +90,10 @@ bench: ##H Run benchmarks and append results to the CSV history in benches/csv/
 		--machine "$$(cat benches/csv/machine.txt 2>/dev/null || hostname)" \
 		--csv-dir benches/csv
 
+.PHONY: _bench/external
+_bench/external: ##H Comparison bench (mtxdb vs mdbx vs sqlite) -> benches/csv/external.csv + table
+	python3 scripts/external_bench.py
+
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Build, install, & clean
