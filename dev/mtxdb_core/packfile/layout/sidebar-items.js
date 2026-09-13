@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["avoidable_spread_bytes","physical_layout"],"struct":["CollectionPhysicalLayout","PackPhysicalLayout","PhysicalLayout"]};

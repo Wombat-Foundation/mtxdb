@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_SHARDS","MAX_SHARD_BYTES"],"struct":["Shard","ShardPool","ShardStats","ShardSummary"],"type":["ShardEntry"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["CacheStats","DagWalk","PackfileStorage","RepackPlan","RepackStats","WalkLimits"],"type":["SwizzleFn"]};

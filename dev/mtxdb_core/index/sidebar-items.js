@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DeserializationError","InsertError"],"struct":["IndexSlot","LookupIter","LossyIndex"]};
