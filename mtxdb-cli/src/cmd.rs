@@ -135,7 +135,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_repack(cli, collection.as_deref(), shards, *all, root, *topo),
         Commands::Delete { collections, yes } => cmd_delete(cli, collections, *yes),
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
-        Commands::Sync => cmd_sync(cli),
+        Commands::Sync { all } => cmd_sync(cli, *all),
     }
 }
 
@@ -299,8 +299,10 @@ fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> an
             if index != 0 {
                 println!();
             }
+            println!("{SECTION_RULE}");
             println!("{}:", shard_type.as_str());
             cmd_collections_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort)?;
+            println!("{SECTION_RULE}");
         }
         return Ok(());
     }
@@ -504,6 +506,11 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
 /// headers, then decodes the small `shard_stats.bin` and
 /// `shard_collections.bin` sidecars for counters and live-node counts.
 /// Safe to run against a directory a live writer process owns.
+/// Rule printed above and below each shard-type's block when a command
+/// lists every independent pool at once (`--all`) — the section header and
+/// table alone read as one undifferentiated wall of numbers otherwise.
+const SECTION_RULE: &str = "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~";
+
 fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     if all {
         let db_layout = open_layout(cli)?;
@@ -511,8 +518,10 @@ fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow:
             if index != 0 {
                 println!();
             }
+            println!("{SECTION_RULE}");
             println!("{}:", shard_type.as_str());
             cmd_shards_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort)?;
+            println!("{SECTION_RULE}");
         }
         return Ok(());
     }
@@ -2433,7 +2442,20 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
 /// bootstrapping `shard_stats.bin`/`shard_collections.bin` for a store whose
 /// writer process has never called `sync_all`, or just refreshing them
 /// on demand.
-fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
+fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
+    if all {
+        let db_layout = open_layout(cli)?;
+        for shard_type in ShardType::ALL {
+            let store = PackfileStorage::open(pool_dir(&db_layout, shard_type)?)
+                .context("failed to open store")?;
+            store.sync_all()?;
+            eprintln!(
+                "{}: synced: persisted shard IO stats and shard\u{2192}collection directory",
+                shard_type.as_str()
+            );
+        }
+        return Ok(());
+    }
     let store = open_store(cli)?;
     store.sync_all()?;
     eprintln!("synced: persisted shard IO stats and shard\u{2192}collection directory");

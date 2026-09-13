@@ -62,7 +62,9 @@ pub(crate) enum Commands {
     Completions {
         shell: String,
     },
-    Sync,
+    Sync {
+        all: bool,
+    },
 }
 
 fn build_cli() -> Command {
@@ -172,7 +174,15 @@ fn sort_arg(help: &'static str) -> Arg {
 }
 
 fn sub_sync() -> Command {
-    Command::new("sync").about("Bootstrap or refresh persisted shard stats")
+    Command::new("sync")
+        .about("Bootstrap or refresh persisted shard stats")
+        .arg(
+            Arg::new("all")
+                .short('a')
+                .long("all")
+                .action(ArgAction::SetTrue)
+                .help("Sync every independent pool, not just the selected `-t` one"),
+        )
 }
 
 fn sub_completions() -> Command {
@@ -426,7 +436,9 @@ fn parse_cli() -> Cli {
         Some(("completions", m)) => Commands::Completions {
             shell: m.get_one::<String>("shell").unwrap().clone(),
         },
-        Some(("sync", _)) => Commands::Sync,
+        Some(("sync", m)) => Commands::Sync {
+            all: m.get_flag("all"),
+        },
         _ => {
             build_cli().print_help().unwrap();
             std::process::exit(0);
