@@ -21,7 +21,10 @@ all: format lint doc fix test install
 format: ##H Format code
 	prettier -w $$(git ls-files '*.md' '*.y*ml' '*.json')
 	pre-commit run --all-files
-	if command -v cargo-sort >/dev/null 2>&1; then $(CARGO) sort --workspace --grouped; else echo "cargo-sort not found, skipping"; fi
+	-isort $$(git ls-files '*.py')
+	-ruff format $$(git ls-files '*.py')
+	-ruff check --fix $$(git ls-files '*.py')
+	$(CARGO) sort --workspace --grouped
 
 .PHONY: check
 check: ##H Cargo check (core) and code dupe
@@ -31,6 +34,7 @@ check: ##H Cargo check (core) and code dupe
 .PHONY: lint
 lint: ##H Run clippy lints (only core, not full workspace)
 	$(CARGO) clippy  --workspace --all-targets --all-features -- $(if $(CI),-D warnings)
+	-flake8 --max-line-length 88 $$(git ls-files '*.py')
 
 .PHONY: fix
 fix: ##H Apply auto-fixes with clippy (only core)

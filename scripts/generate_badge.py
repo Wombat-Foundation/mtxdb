@@ -1,5 +1,6 @@
 import sys
 
+
 def main():
     if len(sys.argv) < 4:
         print("Usage: generate_badge.py <passed> <failed> <ignored>")
@@ -9,13 +10,18 @@ def main():
     failed = sys.argv[2]
     ignored = sys.argv[3]
 
+    text = (
+        '<text x="80" y="14" fill="#fff" text-anchor="middle">'
+        f"Tests: {passed} P / {failed} F / {ignored} I</text>"
+    )
     badge_svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="160" height="20">
     <rect width="160" height="20" fill="#555"/>
-    <text x="80" y="14" fill="#fff" text-anchor="middle">Tests: {passed} P / {failed} F / {ignored} I</text>
+    {text}
 </svg>"""
 
     with open("tests.svg", "w") as f:
         f.write(badge_svg)
+
 
 if __name__ == "__main__":
     main()

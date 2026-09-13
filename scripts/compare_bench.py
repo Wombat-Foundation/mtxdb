@@ -1,10 +1,12 @@
 import argparse
+import csv
 import json
 import math
 import re
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-
 
 # The compression benchmark prints one stable row for each payload kind and
 # size. Its zstd time is the cost this job tracks; lower is better.
@@ -36,7 +38,8 @@ ROW_OPEN = re.compile(
     r"^bench: open L=(?P<label>[\d.]+)gb N=\d+ COLS=\d+ WRITE_MS=(?P<write>[\d.]+) "
     r"PACK=(?P<pack>\d+) INDEX=(?P<index>\d+) "
     r"WARM_OPEN_US=(?P<warm_open>[\d.]+) WARM_LOOKUP_US=(?P<warm_lookup>[\d.]+) "
-    r"EVICTED_OPEN_US=(?P<evict_open>[\d.]+) EVICTED_LOOKUP_US=(?P<evict_lookup>[\d.]+)",
+    r"EVICTED_OPEN_US=(?P<evict_open>[\d.]+) "
+    r"EVICTED_LOOKUP_US=(?P<evict_lookup>[\d.]+)",
     re.MULTILINE,
 )
 
@@ -66,7 +69,9 @@ def load_json(path: Path) -> dict[str, float]:
         isinstance(key, str) and isinstance(value, (int, float))
         for key, value in data.items()
     ):
-        raise ValueError(f"benchmark baseline {path} must be an object of numeric metrics")
+        raise ValueError(
+            f"benchmark baseline {path} must be an object of numeric metrics"
+        )
     return data
 
 
@@ -99,8 +104,11 @@ def external_metrics(output: str) -> dict[str, float]:
         metrics[base + "append_sync_ms"] = float(match["append_sync"])
         metrics[base + "files_bytes"] = float(match["files"])
         metrics[base + f"bytes_{match['mem_label']}"] = float(match["mem"])
-        for name in ("append_loop_ms", "append_sync_all_ms"):
-            value = match[name]
+        for name, group in (
+            ("append_loop_ms", "append_loop"),
+            ("append_sync_all_ms", "append_sync_all"),
+        ):
+            value = match[group]
             if value is not None:
                 metrics[base + name] = float(value)
     return metrics
@@ -118,7 +126,8 @@ def parse_current(path: Path) -> dict[str, float]:
     }
     if not compression:
         raise ValueError(
-            f"no compression benchmark metrics found in {path}; refusing to publish an empty baseline"
+            "no compression benchmark metrics found in "
+            f"{path}; refusing to publish an empty baseline"
         )
     if set(compression) != EXPECTED_METRICS:
         missing = sorted(EXPECTED_METRICS - set(compression))
@@ -128,7 +137,9 @@ def parse_current(path: Path) -> dict[str, float]:
             details.append(f"missing: {', '.join(missing)}")
         if unexpected:
             details.append(f"unexpected: {', '.join(unexpected)}")
-        raise ValueError(f"incomplete compression benchmark output ({'; '.join(details)})")
+        raise ValueError(
+            f"incomplete compression benchmark output ({'; '.join(details)})"
+        )
 
     open_ = open_metrics(output)
     if open_:
@@ -156,12 +167,84 @@ def parse_current(path: Path) -> dict[str, float]:
     return {**compression, **open_, **ext}
 
 
+def get_git_sha() -> str:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+def append_history_csv(path: Path, metrics: dict[str, float]) -> None:
+    """Append parsed metrics to a long-format CSV history.
+
+    Schema: `timestamp,git_sha,bench,engine,size_gb,metric_name,value`. One
+    row per metric from every family in `metrics` (compression / open / ext);
+    the header is written only when the file did not previously exist. Long
+    form is deliberate: adding a new metric (e.g. `checkpoint_io_ms` or
+    `post_replay_len_ms`) never requires a schema migration.
+    """
+    is_new = not path.exists()
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    sha = get_git_sha()
+    rows: list[list[str]] = []
+
+    for name, value in sorted(metrics.items()):
+        parts = name.split("/")
+        family = parts[0]
+        rest = parts[1:]
+        if family == "ext":
+            engine = rest[0]
+            size_gb = rest[1].removesuffix("gb") if len(rest) > 1 else ""
+            metric = "/".join(rest[2:])
+        elif family in ("open",):
+            engine = "mtxdb"
+            size_gb = rest[0].removesuffix("gb") if rest else ""
+            metric = "/".join(rest[1:])
+        else:
+            engine = "mtxdb"
+            size_gb = ""
+            metric = "/".join(rest)
+        rows.append([ts, sha, family, engine, size_gb, metric, f"{value:.6f}"])
+
+    with open(path, "a", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        if is_new:
+            writer.writerow(
+                [
+                    "timestamp",
+                    "git_sha",
+                    "bench",
+                    "engine",
+                    "size_gb",
+                    "metric_name",
+                    "value",
+                ]
+            )
+        for row in rows:
+            writer.writerow(row)
+    print(f"Appended {len(rows)} metrics to {path}.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--current", required=True)
     parser.add_argument("--best", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--margin", type=float, default=0.10)
+    parser.add_argument(
+        "--csv",
+        metavar="PATH",
+        help="append parsed metrics as long-format rows to this CSV "
+        "(schema: ts, engine, size_gb, metric_name, value; header written "
+        "only when the file is new)",
+    )
     args = parser.parse_args()
     if not math.isfinite(args.margin) or args.margin < 0:
         parser.error("--margin must be a finite, non-negative number")
@@ -172,6 +255,9 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
 
+    if args.csv:
+        append_history_csv(Path(args.csv), current)
+
     # Metrics present in last best but not reproducible by this run. Only the
     # opt-in families can be stale (compression is exact-checked above), e.g.
     # a previous run used a wider size sweep or enabled the external bench.
@@ -179,8 +265,7 @@ def main() -> None:
     stale = sorted(set(best) - set(current))
     if stale:
         print(
-            "dropping stale best metrics not produced by this run: "
-            + ", ".join(stale),
+            "dropping stale best metrics not produced by this run: " + ", ".join(stale),
             file=sys.stderr,
         )
 
