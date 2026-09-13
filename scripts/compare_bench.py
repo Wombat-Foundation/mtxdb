@@ -743,7 +743,7 @@ def append_scenario_csv(directory: Path, scenario: Scenario) -> None:
     header = ["timestamp", "git_sha", "machine", *scenario.columns]
 
     with open(path, "a", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         if is_new:
             writer.writerow(header)
         for row in scenario.rows:
