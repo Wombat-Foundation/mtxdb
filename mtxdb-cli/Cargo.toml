@@ -26,7 +26,7 @@ clap = { version = "=4.6.6", default-features = false, features = ["std", "env",
 clap_complete = "=4.6.9"
 hex = "0.4"
 mtxdb-core = { path = "../mtxdb-core" }
-simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
+simd-json = { version = "0.18", default-features = false, features = ["runtime-detection", "serde_impl"] }
 
 [lints]
 workspace = true

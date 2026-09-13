@@ -23,6 +23,7 @@ pub(crate) enum Commands {
         collection: Option<String>,
         id: String,
         text: bool,
+        raw: bool,
     },
     Collections {
         all: bool,
@@ -340,19 +341,35 @@ fn sub_get() -> Command {
         .arg(Arg::new("collection").short('r').long("collection"))
         .arg(
             Arg::new("id")
+                .index(1)
+                .required_unless_present("id_option")
+                .help("Node ID (32 hex characters) or Matrix event ID"),
+        )
+        .arg(
+            Arg::new("id_option")
                 .short('i')
                 .long("id")
-                .required(true)
+                .conflicts_with("id")
                 .help("Node ID (32 hex characters) or Matrix event ID"),
         )
         .arg(
             Arg::new("text")
                 .long("text")
                 .action(ArgAction::SetTrue)
-                .help("Append a trailing newline when printing (payloads are emitted byte-exact by default)"),
+                .help("Append a trailing newline when printing a non-JSON payload"),
+        )
+        .arg(
+            Arg::new("raw")
+                .long("raw")
+                .action(ArgAction::SetTrue)
+                .help("Emit payload bytes verbatim instead of pretty-printing JSON"),
         )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive clap-to-command mapping is clearest in one match"
+)]
 fn parse_cli() -> Cli {
     let matches = build_cli().get_matches();
 
@@ -381,8 +398,13 @@ fn parse_cli() -> Cli {
         },
         Some(("get", m)) => Commands::Get {
             collection: m.get_one::<String>("collection").cloned(),
-            id: m.get_one::<String>("id").unwrap().clone(),
+            id: m
+                .get_one::<String>("id")
+                .or_else(|| m.get_one::<String>("id_option"))
+                .expect("clap requires either positional ID or --id")
+                .clone(),
             text: m.get_flag("text"),
+            raw: m.get_flag("raw"),
         },
         Some(("collections", m)) => Commands::Collections {
             all: m.get_flag("all"),

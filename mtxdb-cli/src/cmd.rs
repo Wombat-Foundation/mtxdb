@@ -113,7 +113,8 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection,
             id,
             text,
-        } => cmd_get(cli, collection.as_deref(), id, *text),
+            raw,
+        } => cmd_get(cli, collection.as_deref(), id, *text, *raw),
         Commands::Collections { all, layout, sort } => {
             cmd_collections(cli, *all, *layout, sort.as_deref())
         }
@@ -229,7 +230,13 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     Ok(())
 }
 
-fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, text: bool) -> anyhow::Result<()> {
+fn cmd_get(
+    cli: &Cli,
+    collection: Option<&str>,
+    id: &str,
+    text: bool,
+    raw: bool,
+) -> anyhow::Result<()> {
     let node_id = parse_get_id(id)?;
     let store = open_store_read_only(cli)?;
     let matches: Vec<([u8; 16], NodeData)> = match collection {
@@ -254,7 +261,8 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, text: bool) -> anyhow:
     match matches.as_slice() {
         [] => bail!("not found"),
         [(_, data)] => {
-            io::stdout().write_all(&data.bytes)?;
+            let output = (!raw).then(|| pretty_json_stream(&data.bytes)).flatten();
+            io::stdout().write_all(output.as_deref().unwrap_or(&data.bytes))?;
             // Never decorate payload bytes: binary records can decode as
             // valid UTF-8, so only append a trailing newline when the caller
             // explicitly opted into `--text`.
@@ -272,6 +280,72 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, text: bool) -> anyhow:
         ),
     }
     Ok(())
+}
+
+/// Pretty-print a stream of JSON objects or arrays, returning `None` for a
+/// non-JSON payload so `get` can retain its binary-storage behaviour.
+fn pretty_json_stream(bytes: &[u8]) -> Option<Vec<u8>> {
+    let values = split_json_stream(bytes)?;
+    let mut output = Vec::new();
+    for value in values {
+        let mut value = value.to_vec();
+        let json = simd_json::to_owned_value(&mut value).ok()?;
+        let formatted = simd_json::to_string_pretty(&json).ok()?;
+        output.extend_from_slice(formatted.as_bytes());
+        output.push(b'\n');
+    }
+    Some(output)
+}
+
+/// Splits adjacent top-level JSON objects/arrays while respecting strings and
+/// escapes. Matrix payloads are objects, but arrays are equally valid JSON
+/// documents and cheap to support here.
+fn split_json_stream(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut values = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+            start = start.saturating_add(1);
+        }
+        let opener = *bytes.get(start)?;
+        if !matches!(opener, b'{' | b'[') {
+            return None;
+        }
+        let mut depth = 0_u32;
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut end = start;
+        for (offset, byte) in bytes[start..].iter().copied().enumerate() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => quoted = true,
+                b'{' | b'[' => depth = depth.checked_add(1)?,
+                b'}' | b']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        end = start.checked_add(offset)?.checked_add(1)?;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end == start || quoted {
+            return None;
+        }
+        values.push(&bytes[start..end]);
+        start = end;
+    }
+    (!values.is_empty()).then_some(values)
 }
 
 /// Enumerate live collections from the persisted directory. Stores created before
@@ -1300,7 +1374,7 @@ fn cmd_scan_collection(cli: &Cli, selector: &str) -> anyhow::Result<()> {
                 matched_pack = true;
                 frames = frames.saturating_add(1);
                 println!(
-                    "  pack=0x{:016x} id={} @ {offset}",
+                    "  pack: 0x{:016x} id: {} @ {offset}",
                     shard.pack_id,
                     hex_encode(&node_id)
                 );
