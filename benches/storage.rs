@@ -449,33 +449,57 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     }
 }
 
+/// Deterministic, incompressible payload seeded per node. A shared constant
+/// payload would zstd-compress to near-zero on disk and make a "1 GB open"
+/// measure a tiny scan; per-node splitmix keeps the on-disk size honest.
+fn incompressible_payload(seed: u64, bytes_len: usize) -> bytes::Bytes {
+    let mut rng = Rng::new(seed);
+    let mut out = Vec::with_capacity(bytes_len);
+    while out.len() < bytes_len {
+        out.extend_from_slice(&rng.next_u64().to_le_bytes());
+    }
+    out.truncate(bytes_len);
+    bytes::Bytes::from(out)
+}
+
 /// Measure the cost hidden by a short-lived `mtxdb get` invocation.
 ///
 /// The normal read benchmarks above deliberately keep one store open, which is
 /// the right model for Synapse but not for the CLI. A CLI process must rebuild
 /// every collection index before its first point lookup because those indexes
-/// are currently in-memory only. Keep this separate from the point-read
-/// benchmark so a future persisted lookup-index can make the open time fall
-/// without obscuring the cost of the final `get` itself.
-fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
+/// are currently in-memory only (see `DESIGN-open-and-index-persistence.md`).
+/// Keep this separate from the point-read benchmark so a future persisted
+/// lookup-index can make the open time fall without obscuring the cost of the
+/// final `get` itself.
+///
+/// `target_gb` sets the nominal dataset size: the node count is derived from it
+/// and `payload_bytes`, and the on-disk pack size tracks it because payloads
+/// are incompressible.
+#[allow(clippy::uninlined_format_args)]
+fn run_oneshot_open_benchmark(
+    target_gb: f64,
+    collection_count: usize,
+    payload_bytes: usize,
+) -> (String, f64) {
     assert!(
         collection_count > 0,
         "benchmark needs at least one collection"
     );
+    assert!(payload_bytes > 0, "benchmark needs a nonzero payload size");
 
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!(
-        "mtxdb_bench_oneshot_open_{total_nodes}_{collection_count}_{pid}"
-    ));
+    let dir = std::env::temp_dir().join(format!("mtxdb_bench_oneshot_open_{pid}_gb_{target_gb}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
-    let payload = bytes::Bytes::from(vec![b'x'; 1024]);
-    let target_id = DagGenerator::node_id(0);
+    let total_nodes = (target_gb * 1e9) as usize / payload_bytes;
+    assert!(total_nodes > 0, "target_gb is too small for payload_bytes");
+    let target_id = DagGenerator::node_id(total_nodes / 2);
     let mut target_collection = [0u8; 16];
     target_collection[..8].copy_from_slice(&0_u64.to_le_bytes());
 
     let store = PackfileStorage::open(dir.clone()).unwrap();
+    let write_started = Instant::now();
     for node in 0..total_nodes {
         let mut collection = [0u8; 16];
         collection[..8].copy_from_slice(
@@ -483,14 +507,16 @@ fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
                 .expect("usize always fits in u64")
                 .to_le_bytes(),
         );
+        let payload = incompressible_payload(node as u64, payload_bytes);
         store
             .put(
                 &collection,
                 &DagGenerator::node_id(node),
-                &NodeData::new(payload.clone()),
+                &NodeData::new(payload),
             )
             .unwrap();
     }
+    let write_elapsed = write_started.elapsed();
     store.sync_all().unwrap();
     drop(store);
 
@@ -500,27 +526,44 @@ fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
         let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
         let open_elapsed = started.elapsed();
 
+        // LossyIndex resident bytes (sum over all per-collection indices). This
+        // is the number that becomes the checkpoint-file size in the persisted
+        // index design; it is isolated from the mmap'd packfile page cache.
+        let index_bytes: u64 = store
+            .collection_summaries()
+            .iter()
+            .map(|(_, _, bytes)| *bytes as u64)
+            .sum();
+
         let lookup_started = Instant::now();
         let found = store.get(&target_collection, &target_id).unwrap().is_some();
         let lookup_elapsed = lookup_started.elapsed();
         assert!(found, "target must survive reopening");
-        (open_elapsed, lookup_elapsed)
+        (open_elapsed, lookup_elapsed, index_bytes)
     };
 
     // The write phase leaves pages resident, providing the honest warm
     // baseline. Eviction is explicitly reported below rather than calling the
     // following measurement "cold" when vmtouch is unavailable.
-    let (warm_open, warm_lookup) = measure();
+    let (warm_open, warm_lookup, _) = measure();
     let evicted = drop_caches_for_dir(&dir);
-    let (after_evict_open, after_evict_lookup) = measure();
+    let (after_evict_open, after_evict_lookup, index_bytes) = measure();
 
     eprintln!("═══════════════════════════════════════════════════════════════");
-    eprintln!("  ONE-SHOT CLI OPEN + GET");
+    eprintln!("  ONE-SHOT CLI OPEN + GET ({target_gb} GB nominal)");
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  Nodes / collections:    {total_nodes} / {collection_count}");
     eprintln!(
         "  Pack bytes:              {:.2} MB",
         pack_bytes as f64 / 1e6
+    );
+    eprintln!(
+        "  Index resident (slots):  {:.2} MB",
+        index_bytes as f64 / 1e6
+    );
+    eprintln!(
+        "  Write phase:             {:.2} s",
+        write_elapsed.as_secs_f64()
     );
     eprintln!("  Warm open/index rebuild: {warm_open:.2?}");
     eprintln!("  Warm point lookup:       {warm_lookup:.2?}");
@@ -545,7 +588,85 @@ fn run_oneshot_open_benchmark(total_nodes: usize, collection_count: usize) {
     }
     eprintln!();
 
+    let label = format!("{target_gb:.3}");
+    let label = label.trim_end_matches('0').trim_end_matches('.');
+    println!(
+        "bench: open L={label}gb N={total_nodes} COLS={collection_count} WRITE_MS={:.1} \
+         PACK={pack_bytes} INDEX={index_bytes} WARM_OPEN_US={warm_open_us:.1} \
+         WARM_LOOKUP_US={warm_lookup_us:.1} EVICTED_OPEN_US={after_evict_open_us:.1} \
+         EVICTED_LOOKUP_US={after_evict_lookup_us:.1}",
+        write_elapsed.as_secs_f64() * 1e3,
+        warm_open_us = warm_open.as_secs_f64() * 1e6,
+        warm_lookup_us = warm_lookup.as_secs_f64() * 1e6,
+        after_evict_open_us = after_evict_open.as_secs_f64() * 1e6,
+        after_evict_lookup_us = after_evict_lookup.as_secs_f64() * 1e6,
+    );
+
+    let lb = label.to_owned();
+    let evicted_open_secs = after_evict_open.as_secs_f64();
     let _ = fs::remove_dir_all(&dir);
+    (lb, evicted_open_secs)
+}
+
+/// Sweep the one-shot open metric over a bracketed set of dataset sizes, plus
+/// a per-GB scaling check when at least two points were measured.
+///
+/// Defaults to `0.1` GB so `cargo bench` / CI stays cheap; set
+/// `MTXDB_BENCH_OPEN_GB=1,100,1000` for the real curve (see
+/// `DESIGN-open-and-index-persistence.md`).
+fn run_open_size_sweep() {
+    let gbs: Vec<f64> = match std::env::var("MTXDB_BENCH_OPEN_GB") {
+        Ok(raw) => raw
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<f64>()
+                    .expect("invalid MTXDB_BENCH_OPEN_GB")
+            })
+            .filter(|g| *g > 0.0)
+            .collect(),
+        Err(std::env::VarError::NotPresent) => vec![0.1],
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("MTXDB_BENCH_OPEN_GB must be valid UTF-8")
+        }
+    };
+    assert!(
+        !gbs.is_empty(),
+        "MTXDB_BENCH_OPEN_GB must list at least one size"
+    );
+
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(gbs.len());
+    for gb in &gbs {
+        let (_, evicted_open_secs) = run_oneshot_open_benchmark(*gb, 39, 1024);
+        points.push((*gb, evicted_open_secs));
+    }
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    if points.len() >= 2 {
+        eprintln!("═══════════════════════════════════════════════════════════════");
+        eprintln!("  OPEN SCALING SHAPE (evicted open time vs dataset GB)");
+        eprintln!("═══════════════════════════════════════════════════════════════");
+        for (idx, (gb, secs)) in points.iter().enumerate().skip(1) {
+            let (prev_gb, prev_secs) = points[idx - 1];
+            let open_ratio = secs / prev_secs;
+            let gb_ratio = gb / prev_gb;
+            let per_gb = open_ratio / gb_ratio;
+            let shape = if per_gb > 1.1 {
+                "superlinear"
+            } else if per_gb < 0.9 {
+                "sublinear"
+            } else {
+                "linear"
+            };
+            eprintln!(
+                "  {prev_gb} GB -> {gb} GB: open x{open_ratio:.2} vs data x{gb_ratio:.2} \
+                 ({per_gb:.2}x per GB, {shape})"
+            );
+        }
+        eprintln!("  Linear (=> index rebuild is a straight scan); superlinear suggests");
+        eprintln!("  page-cache pressure or rehash amplification driving the bigger sizes.");
+        eprintln!();
+    }
 }
 
 // ── Synthetic HAMT state trie (root + L1, structural sharing) ───────
@@ -1083,7 +1204,7 @@ fn main() {
     let large = run_benchmark("large", 100_000, 2_000);
     let pressure = run_benchmark("pressure", 100_000, 100);
 
-    run_oneshot_open_benchmark(100_000, 39);
+    run_open_size_sweep();
 
     run_intent_benchmark(20_000);
 

@@ -55,8 +55,22 @@ verbose_file_reads = "warn"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Opt-in external comparison benchmarks (MDBX + SQLite), see
+# DESIGN-open-and-index-persistence.md §2.3. Gated behind a feature so the
+# default `cargo bench` / CI never builds or ships either engine; both are
+# comparison-only dev dependencies.
+#   libmdbx:   wrapped library Apache-2.0 (since v0.13), wrapper crate MPL-2.0
+#   rusqlite:  MIT (bundled SQLite is public domain)
+compare-external = ["dep:libmdbx", "dep:rusqlite"]
+
 [dependencies]
+# External comparison backends for `benches/compare_external.rs`, optional so
+# the default build never touches them (and this package is publish=false,
+# so they can never leak into a published artifact either).
+libmdbx = { version = "0.6", optional = true }
 mtxdb-core = { path = "mtxdb-core" }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 bytes = "1.5"
@@ -84,6 +98,14 @@ harness = false
 [[bench]]
 name = "compression"
 harness = false
+
+# Three-way MDBX / SQLite / mtxdb comparison. Opt-in via
+# `--features compare-external`; `required-features` means `cargo bench`
+# (and CI) skips it — and never builds libmdbx/rusqlite — unless requested.
+[[bench]]
+name = "compare_external"
+harness = false
+required-features = ["compare-external"]
 
 # BUILD PROFILES — must be plain [profile.*], never nested under
 # [workspace.*]; Cargo only recognizes profiles at this exact table name
