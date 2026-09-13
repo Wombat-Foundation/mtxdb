@@ -35,7 +35,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build rustdoc for master
-        run: make -C master doc
+        run: |
+          if [ -f "master/Cargo.toml" ]; then
+            make -C master doc
+          else
+            echo "master/Cargo.toml not found, skipping docs for master"
+            mkdir -p master/target/doc
+          fi
 
       - name: Build rustdoc for dev
         run: make -C dev doc
@@ -44,16 +50,23 @@ jobs:
         run: |
           prepare() {
             local src="$1" dst="$2"
+            if [ ! -d "$src" ] || [ -z "$(ls -A "$src")" ]; then
+              echo "$src is empty or does not exist, skipping"
+              mkdir -p "$dst"
+              return 0
+            fi
             cp -a "$src" "$dst"
             # Depth-reduction: only files that are about to move out of
             # mtxdb/ get one level shallower, so only rewrite those --
             # dependency-crate docs and the src/ source-view mirrors stay
             # at their original depth and must not have their `../` count
             # touched.
-            find "$dst"/mtxdb \( -name '*.html' -o -name '*.js' \) -print0 | xargs -0 perl -pi -e \
-              's{(href|src|content|data-[a-z-]+)="((?:\.\./)+)}{ my $n = length($2)/3; my $p = $n > 1 ? "../" x ($n-1) : "./"; $1 . "=\"" . $p }ge'
-            cp -a "$dst"/mtxdb/. "$dst"/
-            rm -rf "$dst"/mtxdb
+            if [ -d "$dst/mtxdb" ]; then
+              find "$dst"/mtxdb \( -name '*.html' -o -name '*.js' \) -print0 | xargs -0 perl -pi -e \
+                's{(href|src|content|data-[a-z-]+)="((?:\.\./)+)}{ my $n = length($2)/3; my $p = $n > 1 ? "../" x ($n-1) : "./"; $1 . "=" . "\"" . $p }ge'
+              cp -a "$dst"/mtxdb/. "$dst"/
+              rm -rf "$dst"/mtxdb
+            fi
             # Crate-index rename: applies tree-wide regardless of whether
             # the linking file moved -- any page anywhere may reference the
             # crate's now-flattened index.
