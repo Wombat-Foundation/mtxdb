@@ -38,7 +38,7 @@ pub(crate) enum Commands {
         collection: String,
     },
     Scan {
-        shard: String,
+        selector: String,
     },
     Import {
         paths: Vec<PathBuf>,
@@ -201,11 +201,13 @@ fn sub_completions() -> Command {
 
 fn sub_scan() -> Command {
     Command::new("scan")
-        .about("Scan a packfile and print records")
-        .arg(Arg::new("shard").required(true).value_name("PACK_ID").help(
-            "Pack ID from `shards`, for example 0x0000000000000003 — not a \
-                     collection ID (those are 32 hex digits)",
-        ))
+        .about("Scan a packfile or collection and print physical records")
+        .arg(
+            Arg::new("selector")
+                .required(true)
+                .value_name("PACK_ID|COLLECTION")
+                .help("Pack ID from `shards` (1–16 hex digits), or a 32-hex-digit collection ID"),
+        )
 }
 
 fn sub_info() -> Command {
@@ -396,7 +398,7 @@ fn parse_cli() -> Cli {
             collection: m.get_one::<String>("collection").unwrap().clone(),
         },
         Some(("scan", m)) => Commands::Scan {
-            shard: m.get_one::<String>("shard").unwrap().clone(),
+            selector: m.get_one::<String>("selector").unwrap().clone(),
         },
         Some(("import", m)) => Commands::Import {
             paths: m

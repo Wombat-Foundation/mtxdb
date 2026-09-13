@@ -1,3 +1,5 @@
+pub mod format;
+
 /// Per-slot entry in the lossy fanout index.
 ///
 /// Layout: `[24-bit tag | 12-bit shard_id | 28-bit offset]` packed into a `u64`.
@@ -98,9 +100,20 @@ pub struct LossyIndex {
     shift: u32,
     /// The flat slot array.
     slots: Vec<IndexSlot>,
+    /// The first 64 bits of each slot's hash. Index slots intentionally pack
+    /// only a tag, shard, and offset; retaining the home hash separately lets
+    /// a live writer grow the table without rescanning the packfiles.
+    homes: Vec<u64>,
+    /// `deserialize` restores slots without their source hashes. Such an
+    /// index remains readable, but must be rebuilt from packfiles if it ever
+    /// needs to grow.
+    can_grow: bool,
     /// Number of occupied slots.
     len: u32,
 }
+
+/// The slot plus its retained home-hash used by a live index generation.
+const LIVE_SLOT_BYTES: usize = std::mem::size_of::<IndexSlot>() + std::mem::size_of::<u64>();
 
 impl LossyIndex {
     /// Create a new index with at least `min_capacity` slots.
@@ -118,6 +131,8 @@ impl LossyIndex {
             capacity,
             shift,
             slots: vec![IndexSlot::empty(); capacity_usize],
+            homes: vec![0; capacity_usize],
+            can_grow: true,
             len: 0,
         }
     }
@@ -126,7 +141,12 @@ impl LossyIndex {
     #[inline]
     fn bucket(&self, hash: &[u8; 16]) -> usize {
         let top_bytes = u64::from_be_bytes(hash[..8].try_into().unwrap());
-        let masked = (top_bytes >> self.shift) & u64::from(self.mask);
+        self.bucket_for_home(top_bytes)
+    }
+
+    #[inline]
+    fn bucket_for_home(&self, home: u64) -> usize {
+        let masked = (home >> self.shift) & u64::from(self.mask);
         // Safety: masked is always <= mask < capacity which fits in usize on all platforms
         usize::try_from(masked).unwrap_or(usize::MAX)
     }
@@ -157,7 +177,10 @@ impl LossyIndex {
         offset: u64,
     ) -> Result<(), InsertError> {
         let tag = Self::tag(hash);
-        let mut bucket = self.bucket(hash);
+        let home = u64::from_be_bytes([
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+        ]);
+        let mut bucket = self.bucket_for_home(home);
 
         loop {
             let slot = self.slots[bucket];
@@ -168,6 +191,7 @@ impl LossyIndex {
                     return Err(InsertError::TableFull);
                 }
                 self.slots[bucket] = IndexSlot::new(tag, shard_id, offset);
+                self.homes[bucket] = home;
                 self.len = self.len.wrapping_add(1);
                 return Ok(());
             }
@@ -175,10 +199,38 @@ impl LossyIndex {
             // (same hash, different offset after repack)
             if slot.tag() == tag {
                 self.slots[bucket] = IndexSlot::new(tag, shard_id, offset);
+                self.homes[bucket] = home;
                 return Ok(());
             }
             bucket = bucket.wrapping_add(1) & self.mask as usize;
         }
+    }
+
+    /// Double this live index's capacity without reading packfiles.
+    ///
+    /// Returns `false` for an index deserialized from the compact on-disk
+    /// representation, whose original hashes are unavailable for rehashing.
+    /// Callers should retain their existing packfile rebuild fallback in that
+    /// case.
+    pub fn grow(&mut self) -> bool {
+        if !self.can_grow || self.capacity > u32::MAX / 2 {
+            return false;
+        }
+        let mut grown = Self::new(self.capacity as usize * 2);
+        for (slot, home) in self.slots.iter().copied().zip(self.homes.iter().copied()) {
+            if slot.is_empty() {
+                continue;
+            }
+            let mut bucket = grown.bucket_for_home(home);
+            while !grown.slots[bucket].is_empty() {
+                bucket = bucket.wrapping_add(1) & grown.mask as usize;
+            }
+            grown.slots[bucket] = slot;
+            grown.homes[bucket] = home;
+            grown.len = grown.len.wrapping_add(1);
+        }
+        *self = grown;
+        true
     }
 
     /// Look up a hash in the index.
@@ -231,7 +283,7 @@ impl LossyIndex {
     #[must_use]
     pub fn memory_usage(&self) -> usize {
         (self.capacity as usize)
-            .wrapping_mul(8)
+            .wrapping_mul(LIVE_SLOT_BYTES)
             .wrapping_add(std::mem::size_of::<Self>())
     }
 
@@ -242,7 +294,7 @@ impl LossyIndex {
         let minimum = entries.saturating_mul(2).max(16);
         let capacity = minimum.next_power_of_two();
         capacity
-            .wrapping_mul(std::mem::size_of::<IndexSlot>())
+            .wrapping_mul(LIVE_SLOT_BYTES)
             .wrapping_add(std::mem::size_of::<Self>())
     }
 
@@ -355,6 +407,8 @@ impl LossyIndex {
             capacity,
             shift,
             slots,
+            homes: vec![0; capacity_usize],
+            can_grow: false,
             len,
         })
     }
@@ -522,12 +576,27 @@ mod tests {
         assert!(index.is_empty());
         assert_eq!(
             index.memory_usage(),
-            128 * 8 + std::mem::size_of::<LossyIndex>()
+            128 * LIVE_SLOT_BYTES + std::mem::size_of::<LossyIndex>()
         );
 
         let mut index = LossyIndex::new(128);
         index.insert(&test_hash(0x01), 0, 1).unwrap();
         assert!(!index.is_empty());
+    }
+
+    #[test]
+    fn test_grow_preserves_existing_lookups() {
+        let mut index = LossyIndex::new(16);
+        let hashes: Vec<_> = (0..12).map(splitmix_hash).collect();
+        for (offset, hash) in hashes.iter().enumerate() {
+            index.insert(hash, 0, offset as u64).unwrap();
+        }
+        assert!(index.grow());
+        assert_eq!(index.len(), hashes.len());
+        for (offset, hash) in hashes.iter().enumerate() {
+            assert_eq!(index.lookup(hash), Some((0, offset as u64)));
+        }
+        index.insert(&splitmix_hash(12), 0, 12).unwrap();
     }
 
     #[test]

@@ -2702,8 +2702,15 @@ impl StorageEngine for PackfileStorage {
             };
             let index_full = index.insert(id, shard_id, offset).is_err();
             if index_full {
-                index = self.rebuild_index(collection_id)?;
-                let _ = index.insert(id, shard_id, offset);
+                if index.grow() {
+                    // The failed insert did not mutate the table, so retry it
+                    // after the in-memory rehash. This is the normal capacity
+                    // path and must not turn into a full-pack scan.
+                    let _ = index.insert(id, shard_id, offset);
+                } else {
+                    index = self.rebuild_index(collection_id)?;
+                    let _ = index.insert(id, shard_id, offset);
+                }
                 // The rebuild re-derived the collection's entire live set from
                 // scratch, so its shard distribution needs a full
                 // recompute too, not just crediting this one record.
@@ -2775,9 +2782,18 @@ impl StorageEngine for PackfileStorage {
             let (shard_id, offset) = self.shards.put_record(&record)?;
 
             if !index_needs_rebuild {
-                if index.insert(id, shard_id, offset).is_err() {
-                    index_needs_rebuild = true;
+                let inserted = if index.insert(id, shard_id, offset).is_ok() {
+                    true
+                } else if index.grow() {
+                    // `insert` leaves the table unchanged on TableFull, so
+                    // retrying with the record's still-available location is
+                    // sufficient; no pack scan is needed for pure growth.
+                    index.insert(id, shard_id, offset).is_ok()
                 } else {
+                    index_needs_rebuild = true;
+                    false
+                };
+                if inserted {
                     let pack_id = self
                         .shards
                         .get_shard(shard_id)

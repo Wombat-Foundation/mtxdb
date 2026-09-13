@@ -119,7 +119,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         }
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Info { collection } => cmd_info(cli, collection),
-        Commands::Scan { shard } => cmd_scan(cli, shard),
+        Commands::Scan { selector } => cmd_scan(cli, selector),
         Commands::Import {
             paths,
             collection,
@@ -1250,6 +1250,13 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
 }
 
 fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    if selector
+        .strip_prefix("0x")
+        .or_else(|| selector.strip_prefix("0X"))
+        .is_some_and(|hex| hex.len() == 32)
+    {
+        return cmd_scan_collection(cli, selector);
+    }
     let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
@@ -1270,6 +1277,47 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         let id_hex = hex_encode(node_id);
         println!("  collection={collection_hex} id={id_hex} @ {offset}");
     }
+    Ok(())
+}
+
+/// Print every physical frame for a collection across all packs. This is a
+/// diagnostic scan, so superseded copies are deliberately retained in the
+/// output; use `export` to enumerate only the collection's live records.
+fn cmd_scan_collection(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    let collection_id = parse_collection_id(selector)?;
+    let pool_dir = selected_pool_dir(cli)?;
+    let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
+    let mut shards = pool.all_shards();
+    shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
+
+    let mut frames = 0_usize;
+    let mut packs = 0_usize;
+    for (_, shard) in shards {
+        let records = mtxdb_core::packfile::scan_packfile(&shard.path)?;
+        let mut matched_pack = false;
+        for (record_collection_id, node_id, offset) in records {
+            if record_collection_id == collection_id {
+                matched_pack = true;
+                frames = frames.saturating_add(1);
+                println!(
+                    "  pack=0x{:016x} id={} @ {offset}",
+                    shard.pack_id,
+                    hex_encode(&node_id)
+                );
+            }
+        }
+        packs = packs.saturating_add(usize::from(matched_pack));
+    }
+
+    if frames == 0 {
+        bail!("collection {selector} not found in any pack");
+    }
+    println!(
+        "collection {}: {frames} physical record{} across {packs} pack{}",
+        hex_encode(&collection_id),
+        if frames == 1 { "" } else { "s" },
+        if packs == 1 { "" } else { "s" },
+    );
     Ok(())
 }
 
