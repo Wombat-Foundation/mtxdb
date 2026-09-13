@@ -57,6 +57,54 @@ ROW_EXT = re.compile(
 )
 
 
+# Storage-scenario rows (`benches/storage.rs`). Each emits one machine row per
+# scenario (locality), per intent axis (graph/state/timeline), per swarm
+# mode/target combination, and per repack events/interval point. The default
+# parameter set is what `main()` always runs; when a family is present it must
+# cover those defaults so a truncated capture is never published as complete.
+DEFAULT_LOCALITY_LABELS = {"small", "medium", "large", "pressure"}
+DEFAULT_INTENT_EVENTS = {"20000"}
+DEFAULT_SWARM_COMBOS = {
+    ("get_many", "adversarial"),
+    ("get_many", "organic"),
+    ("naive", "adversarial"),
+    ("naive", "organic"),
+}
+DEFAULT_REPACK_POINTS = {("10000", "1000"), ("20000", "1000")}
+
+ROW_LOCALITY = re.compile(
+    r"^bench: locality L=(?P<label>\w+) N=\d+ CACHE=\d+ "
+    r"PACK_BYTES=(?P<pack>\d+) WRITE_EVENTS_PER_SEC=(?P<write_eps>[\d.]+) "
+    r"READ_SYSCALLS=(?P<read_syscalls>\d+) DISK_READ_BYTES=(?P<disk_reads>\d+) "
+    r"INDEX_LOSS_PCT=(?P<index_loss>[\d.]+) COLD_GETS_PER_SEC=(?P<cold_gets>[\d.]+) "
+    r"WARM_HIT_PCT=(?P<warm_hit>[\d.]+) WARM_GETS_PER_SEC=(?P<warm_gets>[\d.]+)",
+    re.MULTILINE,
+)
+
+ROW_INTENT = re.compile(
+    r"^bench: intent EVENTS=(?P<events>\d+) "
+    r"GRAPH_CALLS=(?P<graph_calls>\d+) STATE_CALLS=(?P<state_calls>\d+) "
+    r"TIMELINE_CALLS=(?P<timeline_calls>\d+) GRAPH_BYTES=(?P<graph_bytes>\d+) "
+    r"STATE_BYTES=(?P<state_bytes>\d+) TIMELINE_BYTES=(?P<timeline_bytes>\d+)",
+    re.MULTILINE,
+)
+
+ROW_SWARM = re.compile(
+    r"^bench: swarm HISTORY=(?P<history>\d+) SWARM=(?P<swarm>\d+) "
+    r"MODE=(?P<mode>\w+) TARGET=(?P<target>\w+) FOUND=(?P<found>\d+)/(?P<total>\d+) "
+    r"ELAPSED_US=(?P<elapsed>[\d.]+) SYSCALLS=(?P<syscalls>\d+) "
+    r"DISK_READ_BYTES=(?P<disk>\d+) EVICTED=(?P<evicted>\w+)",
+    re.MULTILINE,
+)
+
+ROW_REPACK = re.compile(
+    r"^bench: repack EVENTS=(?P<events>\d+) INTERVAL=(?P<interval>\d+) "
+    r"RUNS=(?P<runs>\d+) TOTAL_MS=(?P<total>[\d.]+) WRITE_MS=(?P<write>[\d.]+) "
+    r"REPACK_MS=(?P<repack>[\d.]+)",
+    re.MULTILINE,
+)
+
+
 def load_json(path: Path) -> dict[str, float]:
     try:
         data = json.loads(path.read_text())
@@ -114,6 +162,53 @@ def external_metrics(output: str) -> dict[str, float]:
     return metrics
 
 
+def storage_metrics(output: str) -> dict[str, float]:
+    """Parse the storage-scenario `bench:` rows (locality / intent / swarm /
+    repack). Metric names carry the scenario parameters in the path, matching
+    the long-format CSV schema without needing extra columns."""
+    metrics: dict[str, float] = {}
+
+    for m in ROW_LOCALITY.finditer(output):
+        base = f"locality/{m['label']}/"
+        metrics[base + "pack_bytes"] = float(m["pack"])
+        metrics[base + "write_events_per_sec"] = float(m["write_eps"])
+        metrics[base + "read_syscalls"] = float(m["read_syscalls"])
+        metrics[base + "disk_read_bytes"] = float(m["disk_reads"])
+        metrics[base + "index_loss_pct"] = float(m["index_loss"])
+        metrics[base + "cold_gets_per_sec"] = float(m["cold_gets"])
+        metrics[base + "warm_hit_pct"] = float(m["warm_hit"])
+        metrics[base + "warm_gets_per_sec"] = float(m["warm_gets"])
+
+    for m in ROW_INTENT.finditer(output):
+        base = f"intent/{m['events']}/"
+        for metric, group in (
+            ("graph_calls", "graph_calls"),
+            ("state_calls", "state_calls"),
+            ("timeline_calls", "timeline_calls"),
+            ("graph_bytes", "graph_bytes"),
+            ("state_bytes", "state_bytes"),
+            ("timeline_bytes", "timeline_bytes"),
+        ):
+            metrics[base + metric] = float(m[group])
+
+    for m in ROW_SWARM.finditer(output):
+        base = f"swarm/{m['history']}/{m['mode']}/{m['target']}/"
+        metrics[base + "found"] = float(m["found"])
+        metrics[base + "total"] = float(m["total"])
+        metrics[base + "elapsed_us"] = float(m["elapsed"])
+        metrics[base + "syscalls"] = float(m["syscalls"])
+        metrics[base + "disk_read_bytes"] = float(m["disk"])
+
+    for m in ROW_REPACK.finditer(output):
+        base = f"repack/{m['events']}/{m['interval']}/"
+        metrics[base + "runs"] = float(m["runs"])
+        metrics[base + "total_ms"] = float(m["total"])
+        metrics[base + "write_ms"] = float(m["write"])
+        metrics[base + "repack_ms"] = float(m["repack"])
+
+    return metrics
+
+
 def parse_current(path: Path) -> dict[str, float]:
     try:
         output = path.read_text()
@@ -164,7 +259,47 @@ def parse_current(path: Path) -> dict[str, float]:
                     + ", ".join(sorted(DEFAULT_EXT_LABELS - eng_labels))
                 )
 
-    return {**compression, **open_, **ext}
+    storage = storage_metrics(output)
+    storage_labels = {
+        name.split("/")[1] for name in storage if name.startswith("locality/")
+    }
+    if storage_labels and not DEFAULT_LOCALITY_LABELS <= storage_labels:
+        raise ValueError(
+            "locality output omits default labels "
+            + ", ".join(sorted(DEFAULT_LOCALITY_LABELS - storage_labels))
+        )
+    intent_events = {
+        name.split("/")[1] for name in storage if name.startswith("intent/")
+    }
+    if intent_events and not DEFAULT_INTENT_EVENTS <= intent_events:
+        raise ValueError(
+            "intent output omits default event counts "
+            + ", ".join(sorted(DEFAULT_INTENT_EVENTS - intent_events))
+        )
+    swarm_combos = {
+        (name.split("/")[2], name.split("/")[3])
+        for name in storage
+        if name.startswith("swarm/")
+    }
+    if swarm_combos and not DEFAULT_SWARM_COMBOS <= swarm_combos:
+        missing = sorted(DEFAULT_SWARM_COMBOS - swarm_combos)
+        raise ValueError(
+            "swarm output omits default mode/target combos "
+            + ", ".join(f"{m}/{t}" for m, t in missing)
+        )
+    repack_points = {
+        (name.split("/")[1], name.split("/")[2])
+        for name in storage
+        if name.startswith("repack/")
+    }
+    if repack_points and not DEFAULT_REPACK_POINTS <= repack_points:
+        missing = sorted(DEFAULT_REPACK_POINTS - repack_points)
+        raise ValueError(
+            "repack output omits default events/interval points "
+            + ", ".join(f"{e}@{i}" for e, i in missing)
+        )
+
+    return {**compression, **open_, **ext, **storage}
 
 
 def get_git_sha() -> str:
@@ -185,8 +320,9 @@ def append_history_csv(path: Path, metrics: dict[str, float]) -> None:
     """Append parsed metrics to a long-format CSV history.
 
     Schema: `timestamp,git_sha,bench,engine,size_gb,metric_name,value`. One
-    row per metric from every family in `metrics` (compression / open / ext);
-    the header is written only when the file did not previously exist. Long
+    row per metric from every family in `metrics` (compression / open / ext /
+    locality / intent / swarm / repack); the header is written only when the
+    file did not previously exist. Long
     form is deliberate: adding a new metric (e.g. `checkpoint_io_ms` or
     `post_replay_len_ms`) never requires a schema migration.
     """

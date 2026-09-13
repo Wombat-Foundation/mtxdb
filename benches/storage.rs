@@ -408,6 +408,15 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
 
     let avg_edges = dag.total_edge_refs() as f64 / total_events as f64;
 
+    println!(
+        "bench: locality L={label} N={total_events} CACHE={cache_entries} \
+         PACK_BYTES={pack_size} WRITE_EVENTS_PER_SEC={:.0} READ_SYSCALLS={read_syscalls} \
+         DISK_READ_BYTES={disk_reads} INDEX_LOSS_PCT={index_loss_rate:.4} \
+         COLD_GETS_PER_SEC={cold_gets_per_sec:.0} WARM_HIT_PCT={warm_hit_rate:.4} \
+         WARM_GETS_PER_SEC={warm_gets_per_sec:.0}",
+        total_events as f64 / write_elapsed.as_secs_f64(),
+    );
+
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  {label}: {total_events} events, cache={cache_entries} entries");
     eprintln!("═══════════════════════════════════════════════════════════════");
@@ -922,6 +931,13 @@ fn run_intent_benchmark(total_events: usize) {
         }
     };
 
+    println!(
+        "bench: intent EVENTS={total_events} GRAPH_CALLS={graph_calls} \
+         STATE_CALLS={state_calls} TIMELINE_CALLS={timeline_calls} \
+         GRAPH_BYTES={graph_bytes} STATE_BYTES={state_bytes} \
+         TIMELINE_BYTES={timeline_bytes}",
+    );
+
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!(
         "  READ-INTENT BREAKDOWN ({total_events} events, {} tips)",
@@ -1091,6 +1107,21 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
         measure_naive("naive", "organic", &organic_targets),
     ];
 
+    for r in &rows {
+        println!(
+            "bench: swarm HISTORY={history_len} SWARM={swarm_size} MODE={} TARGET={} \
+             FOUND={}/{} ELAPSED_US={:.1} SYSCALLS={} DISK_READ_BYTES={} EVICTED={}",
+            r.mode,
+            r.target,
+            r.found,
+            r.total,
+            r.elapsed.as_secs_f64() * 1e6,
+            r.syscalls,
+            r.disk_read_bytes,
+            r.evicted,
+        );
+    }
+
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  REACTION SWARM ({history_len} history events, {swarm_size} reactions)");
     eprintln!("═══════════════════════════════════════════════════════════════");
@@ -1190,6 +1221,13 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
 
     eprintln!(
         "bench: repack amplification ({total_events} events, repack every {repack_interval})"
+    );
+    println!(
+        "bench: repack EVENTS={total_events} INTERVAL={repack_interval} RUNS={repack_count} \
+         TOTAL_MS={:.1} WRITE_MS={:.1} REPACK_MS={:.1}",
+        total_elapsed.as_secs_f64() * 1e3,
+        write_only_time.as_secs_f64() * 1e3,
+        total_repack_time.as_secs_f64() * 1e3,
     );
     eprintln!("  total time:   {total_elapsed:.2?}");
     eprintln!("  write time:   {write_only_time:.2?}");
