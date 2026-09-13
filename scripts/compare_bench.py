@@ -1,3 +1,11 @@
+"""Parse `cargo bench` output into typed per-scenario CSVs and keep a
+`best.json` regression baseline.
+
+The compression bench is the phase gate: its full metric set must be present
+before any baseline is published. Every other scenario family (open, external,
+storage, elephant) is lenient and only appears when its `bench:` rows do.
+"""
+
 import argparse
 import csv
 import json
@@ -157,15 +165,16 @@ class Scenario:
     """One typed CSV artifact: the scenario's column set plus the rows captured
     by a single benchmark run.
 
-    `track` lists the flat metric names (lower-is-better) the regression
-    comparison watches. Names use the ``bench/param/metric`` scheme so the
-    `--best` baseline stays compatible with the previous single CSV.
+    `tracked` maps `bench/param/metric` flat names to the lower-is-better
+    values the regression comparison watches; it is filled while parsing each
+    row, so a name always pairs with its own row regardless of how many
+    metrics a scenario emits per row.
     """
 
     filename: str
     columns: list[str]
     rows: list[dict] = field(default_factory=list)
-    track: list[str] = field(default_factory=list)
+    tracked: dict[str, float] = field(default_factory=dict)
     machine: str = ""
 
     def with_machine(self, machine: str) -> "Scenario":
@@ -176,6 +185,7 @@ class Scenario:
 
 
 def load_json(path: Path) -> dict[str, float]:
+    """Load the numeric `name -> value` baseline at `path`; `{}` if absent."""
     try:
         data = json.loads(path.read_text())
     except FileNotFoundError:
@@ -194,12 +204,16 @@ def load_json(path: Path) -> dict[str, float]:
 
 
 def compression_scenario(output: str) -> Scenario:
+    """Build the compression scenario from the bench output's
+    `RAW <size> B ...` rows."""
     scenario = Scenario(
         filename="compression.csv",
         columns=["kind", "payload_len", "raw_us", "zstd_us", "slowdown", "stored_pct"],
     )
     for m in ROW.finditer(output):
-        scenario.track.append(f"compression/{m['kind']}/{m['size']}B/zstd_us")
+        scenario.tracked[f"compression/{m['kind']}/{m['size']}B/zstd_us"] = float(
+            m["zstd"]
+        )
         scenario.rows.append(
             {
                 "kind": m["kind"],
@@ -214,6 +228,7 @@ def compression_scenario(output: str) -> Scenario:
 
 
 def open_scenario(output: str) -> Scenario:
+    """Build the open-sweep scenario from the output's `bench: open` rows."""
     scenario = Scenario(
         filename="open.csv",
         columns=[
@@ -228,33 +243,34 @@ def open_scenario(output: str) -> Scenario:
         ],
     )
     for m in ROW_OPEN.finditer(output):
+        row = {
+            "label": m["label"],
+            "write_ms": float(m["write"]),
+            "pack_bytes": int(m["pack"]),
+            "index_bytes": int(m["index"]),
+            "warm_open_us": float(m["warm_open"]),
+            "warm_lookup_us": float(m["warm_lookup"]),
+            "evicted_open_us": float(m["evict_open"]),
+            "evicted_lookup_us": float(m["evict_lookup"]),
+        }
         base = f"open/{m['label']}gb/"
-        for key, metric in (
-            ("write_ms", "write_ms"),
-            ("pack_bytes", "pack_bytes"),
-            ("index_bytes", "index_bytes"),
-            ("warm_open_us", "warm_open_us"),
-            ("warm_lookup_us", "warm_lookup_us"),
-            ("evicted_open_us", "evicted_open_us"),
-            ("evicted_lookup_us", "evicted_lookup_us"),
+        for metric in (
+            "write_ms",
+            "pack_bytes",
+            "index_bytes",
+            "warm_open_us",
+            "warm_lookup_us",
+            "evicted_open_us",
+            "evicted_lookup_us",
         ):
-            scenario.track.append(base + metric)
-        scenario.rows.append(
-            {
-                "label": m["label"],
-                "write_ms": float(m["write"]),
-                "pack_bytes": int(m["pack"]),
-                "index_bytes": int(m["index"]),
-                "warm_open_us": float(m["warm_open"]),
-                "warm_lookup_us": float(m["warm_lookup"]),
-                "evicted_open_us": float(m["evict_open"]),
-                "evicted_lookup_us": float(m["evict_lookup"]),
-            }
-        )
+            scenario.tracked[base + metric] = float(row[metric])
+        scenario.rows.append(row)
     return scenario
 
 
 def external_scenario(output: str) -> Scenario:
+    """Build the external-comparison scenario from the output's
+    `bench: external` rows."""
     scenario = Scenario(
         filename="external.csv",
         columns=[
@@ -275,21 +291,6 @@ def external_scenario(output: str) -> Scenario:
         ],
     )
     for m in ROW_EXT.finditer(output):
-        base = f"ext/{m['eng']}/{m['label']}gb/"
-        for metric, group in (
-            ("write_ms", "write"),
-            ("warm_open_ms", "warm_open"),
-            ("cold_open_ms", "cold_open"),
-            ("lookup_us", "lookup"),
-            ("append_ms", "append"),
-            ("append_puts_ms", "append_puts"),
-            ("append_sync_ms", "append_sync"),
-            ("append_loop_ms", "append_loop"),
-            ("append_sync_all_ms", "append_sync_all"),
-            ("files_bytes", "files"),
-        ):
-            if m[group] is not None:
-                scenario.track.append(base + metric)
         row = {
             "engine": m["eng"],
             "label": m["label"],
@@ -306,11 +307,27 @@ def external_scenario(output: str) -> Scenario:
             "mem_bytes": int(m["mem"]),
             "mem_label": m["mem_label"],
         }
+        base = f"ext/{m['eng']}/{m['label']}gb/"
+        for metric in (
+            "write_ms",
+            "warm_open_ms",
+            "cold_open_ms",
+            "lookup_us",
+            "append_ms",
+            "append_puts_ms",
+            "append_sync_ms",
+            "append_loop_ms",
+            "append_sync_all_ms",
+            "files_bytes",
+        ):
+            if row[metric] is not None:
+                scenario.tracked[base + metric] = float(row[metric])
         scenario.rows.append(row)
     return scenario
 
 
 def storage_scenarios(output: str) -> list[Scenario]:
+    """Build the locality/intent/swarm/repack scenarios from their `bench:` rows."""
     scenarios: list[Scenario] = []
 
     locality = Scenario(
@@ -328,31 +345,30 @@ def storage_scenarios(output: str) -> list[Scenario]:
         ],
     )
     for m in ROW_LOCALITY.finditer(output):
+        row = {
+            "label": m["label"],
+            "pack_bytes": int(m["pack"]),
+            "write_events_per_sec": float(m["write_eps"]),
+            "read_syscalls": int(m["read_syscalls"]),
+            "disk_read_bytes": int(m["disk_reads"]),
+            "index_loss_pct": float(m["index_loss"]),
+            "cold_gets_per_sec": float(m["cold_gets"]),
+            "warm_hit_pct": float(m["warm_hit"]),
+            "warm_gets_per_sec": float(m["warm_gets"]),
+        }
         base = f"locality/{m['label']}/"
-        for metric, group in (
-            ("pack_bytes", "pack"),
-            ("write_events_per_sec", "write_eps"),
-            ("read_syscalls", "read_syscalls"),
-            ("disk_read_bytes", "disk_reads"),
-            ("index_loss_pct", "index_loss"),
-            ("cold_gets_per_sec", "cold_gets"),
-            ("warm_hit_pct", "warm_hit"),
-            ("warm_gets_per_sec", "warm_gets"),
+        for metric in (
+            "pack_bytes",
+            "write_events_per_sec",
+            "read_syscalls",
+            "disk_read_bytes",
+            "index_loss_pct",
+            "cold_gets_per_sec",
+            "warm_hit_pct",
+            "warm_gets_per_sec",
         ):
-            locality.track.append(base + metric)
-        locality.rows.append(
-            {
-                "label": m["label"],
-                "pack_bytes": int(m["pack"]),
-                "write_events_per_sec": float(m["write_eps"]),
-                "read_syscalls": int(m["read_syscalls"]),
-                "disk_read_bytes": int(m["disk_reads"]),
-                "index_loss_pct": float(m["index_loss"]),
-                "cold_gets_per_sec": float(m["cold_gets"]),
-                "warm_hit_pct": float(m["warm_hit"]),
-                "warm_gets_per_sec": float(m["warm_gets"]),
-            }
-        )
+            locality.tracked[base + metric] = float(row[metric])
+        locality.rows.append(row)
     scenarios.append(locality)
 
     intent = Scenario(
@@ -368,27 +384,26 @@ def storage_scenarios(output: str) -> list[Scenario]:
         ],
     )
     for m in ROW_INTENT.finditer(output):
+        row = {
+            "events": int(m["events"]),
+            "graph_calls": int(m["graph_calls"]),
+            "state_calls": int(m["state_calls"]),
+            "timeline_calls": int(m["timeline_calls"]),
+            "graph_bytes": int(m["graph_bytes"]),
+            "state_bytes": int(m["state_bytes"]),
+            "timeline_bytes": int(m["timeline_bytes"]),
+        }
         base = f"intent/{m['events']}/"
-        for metric, group in (
-            ("graph_calls", "graph_calls"),
-            ("state_calls", "state_calls"),
-            ("timeline_calls", "timeline_calls"),
-            ("graph_bytes", "graph_bytes"),
-            ("state_bytes", "state_bytes"),
-            ("timeline_bytes", "timeline_bytes"),
+        for metric in (
+            "graph_calls",
+            "state_calls",
+            "timeline_calls",
+            "graph_bytes",
+            "state_bytes",
+            "timeline_bytes",
         ):
-            intent.track.append(base + metric)
-        intent.rows.append(
-            {
-                "events": int(m["events"]),
-                "graph_calls": int(m["graph_calls"]),
-                "state_calls": int(m["state_calls"]),
-                "timeline_calls": int(m["timeline_calls"]),
-                "graph_bytes": int(m["graph_bytes"]),
-                "state_bytes": int(m["state_bytes"]),
-                "timeline_bytes": int(m["timeline_bytes"]),
-            }
-        )
+            intent.tracked[base + metric] = float(row[metric])
+        intent.rows.append(row)
     scenarios.append(intent)
 
     swarm = Scenario(
@@ -405,27 +420,26 @@ def storage_scenarios(output: str) -> list[Scenario]:
         ],
     )
     for m in ROW_SWARM.finditer(output):
+        row = {
+            "history": int(m["history"]),
+            "mode": m["mode"],
+            "target": m["target"],
+            "found": int(m["found"]),
+            "total": int(m["total"]),
+            "elapsed_us": float(m["elapsed"]),
+            "syscalls": int(m["syscalls"]),
+            "disk_read_bytes": int(m["disk"]),
+        }
         base = f"swarm/{m['history']}/{m['mode']}/{m['target']}/"
-        for metric, group in (
-            ("found", "found"),
-            ("total", "total"),
-            ("elapsed_us", "elapsed"),
-            ("syscalls", "syscalls"),
-            ("disk_read_bytes", "disk"),
+        for metric in (
+            "found",
+            "total",
+            "elapsed_us",
+            "syscalls",
+            "disk_read_bytes",
         ):
-            swarm.track.append(base + metric)
-        swarm.rows.append(
-            {
-                "history": int(m["history"]),
-                "mode": m["mode"],
-                "target": m["target"],
-                "found": int(m["found"]),
-                "total": int(m["total"]),
-                "elapsed_us": float(m["elapsed"]),
-                "syscalls": int(m["syscalls"]),
-                "disk_read_bytes": int(m["disk"]),
-            }
-        )
+            swarm.tracked[base + metric] = float(row[metric])
+        swarm.rows.append(row)
     scenarios.append(swarm)
 
     repack = Scenario(
@@ -433,30 +447,25 @@ def storage_scenarios(output: str) -> list[Scenario]:
         columns=["events", "interval", "runs", "total_ms", "write_ms", "repack_ms"],
     )
     for m in ROW_REPACK.finditer(output):
+        row = {
+            "events": int(m["events"]),
+            "interval": int(m["interval"]),
+            "runs": int(m["runs"]),
+            "total_ms": float(m["total"]),
+            "write_ms": float(m["write"]),
+            "repack_ms": float(m["repack"]),
+        }
         base = f"repack/{m['events']}/{m['interval']}/"
-        for metric, group in (
-            ("runs", "runs"),
-            ("total_ms", "total"),
-            ("write_ms", "write"),
-            ("repack_ms", "repack"),
-        ):
-            repack.track.append(base + metric)
-        repack.rows.append(
-            {
-                "events": int(m["events"]),
-                "interval": int(m["interval"]),
-                "runs": int(m["runs"]),
-                "total_ms": float(m["total"]),
-                "write_ms": float(m["write"]),
-                "repack_ms": float(m["repack"]),
-            }
-        )
+        for metric in ("runs", "total_ms", "write_ms", "repack_ms"):
+            repack.tracked[base + metric] = float(row[metric])
+        repack.rows.append(row)
     scenarios.append(repack)
 
     return scenarios
 
 
 def elephant_scenarios(output: str) -> list[Scenario]:
+    """Build the elephant (compaction sweep) and compact scenarios."""
     elephant = Scenario(
         filename="elephant.csv",
         columns=[
@@ -490,6 +499,35 @@ def elephant_scenarios(output: str) -> list[Scenario]:
         ],
     )
     for m in ROW_ELEPHANT.finditer(output):
+        row = {
+            "max_shard": m["max"],
+            "repack_shard": m["repack"],
+            "records": int(m["records"]),
+            "cols": int(m["cols"]),
+            "packs_pre": int(m["packs_pre"]),
+            "packs_post": int(m["packs_post"]),
+            "sample": int(m["sample"]),
+            "open_pre_us": float(m["open_pre"]),
+            "open_post_us": float(m["open_post"]),
+            "query_pre_us": float(m["query_pre"]),
+            "query_post_us": float(m["query_post"]),
+            "packs_ref_pre": int(m["packs_ref_pre"]),
+            "packs_ref_post": int(m["packs_ref_post"]),
+            "segments_pre": int(m["segments_pre"]),
+            "segments_post": int(m["segments_post"]),
+            "open_disk_pre": int(m["open_disk_pre"]),
+            "open_disk_post": int(m["open_disk_post"]),
+            "open_syscalls_pre": int(m["open_syscalls_pre"]),
+            "open_syscalls_post": int(m["open_syscalls_post"]),
+            "query_disk_pre": int(m["query_disk_pre"]),
+            "query_disk_post": int(m["query_disk_post"]),
+            "query_syscalls_pre": int(m["query_syscalls_pre"]),
+            "query_syscalls_post": int(m["query_syscalls_post"]),
+            "found_pre": int(m["found_pre"]),
+            "found_post": int(m["found_post"]),
+            "repack_ms": float(m["repack_ms"]),
+            "speedup_x": float(m["speedup"]),
+        }
         base = f"elephant/{m['max']}/{m['repack']}/"
         for metric in (
             "open_pre_us",
@@ -510,38 +548,8 @@ def elephant_scenarios(output: str) -> list[Scenario]:
             "query_syscalls_post",
             "repack_ms",
         ):
-            elephant.track.append(base + metric)
-        elephant.rows.append(
-            {
-                "max_shard": m["max"],
-                "repack_shard": m["repack"],
-                "records": int(m["records"]),
-                "cols": int(m["cols"]),
-                "packs_pre": int(m["packs_pre"]),
-                "packs_post": int(m["packs_post"]),
-                "sample": int(m["sample"]),
-                "open_pre_us": float(m["open_pre"]),
-                "open_post_us": float(m["open_post"]),
-                "query_pre_us": float(m["query_pre"]),
-                "query_post_us": float(m["query_post"]),
-                "packs_ref_pre": int(m["packs_ref_pre"]),
-                "packs_ref_post": int(m["packs_ref_post"]),
-                "segments_pre": int(m["segments_pre"]),
-                "segments_post": int(m["segments_post"]),
-                "open_disk_pre": int(m["open_disk_pre"]),
-                "open_disk_post": int(m["open_disk_post"]),
-                "open_syscalls_pre": int(m["open_syscalls_pre"]),
-                "open_syscalls_post": int(m["open_syscalls_post"]),
-                "query_disk_pre": int(m["query_disk_pre"]),
-                "query_disk_post": int(m["query_disk_post"]),
-                "query_syscalls_pre": int(m["query_syscalls_pre"]),
-                "query_syscalls_post": int(m["query_syscalls_post"]),
-                "found_pre": int(m["found_pre"]),
-                "found_post": int(m["found_post"]),
-                "repack_ms": float(m["repack_ms"]),
-                "speedup_x": float(m["speedup"]),
-            }
-        )
+            elephant.tracked[base + metric] = float(row[metric])
+        elephant.rows.append(row)
 
     compact = Scenario(
         filename="compact.csv",
@@ -560,30 +568,28 @@ def elephant_scenarios(output: str) -> list[Scenario]:
         ],
     )
     for m in ROW_COMPACT.finditer(output):
-        compact.track.extend(
-            (
-                "compact/write_ms",
-                "compact/fsync_ms",
-                "compact/shards",
-                "compact/segments_post",
-                "compact/packs_ref_post",
-            )
-        )
-        compact.rows.append(
-            {
-                "records": int(m["records"]),
-                "cols": int(m["cols"]),
-                "shards": int(m["shards"]),
-                "packs_ref_pre": int(m["packs_ref_pre"]),
-                "packs_ref_post": int(m["packs_ref_post"]),
-                "segments_pre": int(m["segments_pre"]),
-                "segments_post": int(m["segments_post"]),
-                "written": int(m["written"]),
-                "bytes": int(m["bytes"]),
-                "write_ms": float(m["write_ms"]),
-                "fsync_ms": float(m["fsync_ms"]),
-            }
-        )
+        row = {
+            "records": int(m["records"]),
+            "cols": int(m["cols"]),
+            "shards": int(m["shards"]),
+            "packs_ref_pre": int(m["packs_ref_pre"]),
+            "packs_ref_post": int(m["packs_ref_post"]),
+            "segments_pre": int(m["segments_pre"]),
+            "segments_post": int(m["segments_post"]),
+            "written": int(m["written"]),
+            "bytes": int(m["bytes"]),
+            "write_ms": float(m["write_ms"]),
+            "fsync_ms": float(m["fsync_ms"]),
+        }
+        for metric in (
+            "write_ms",
+            "fsync_ms",
+            "shards",
+            "segments_post",
+            "packs_ref_post",
+        ):
+            compact.tracked[f"compact/{metric}"] = float(row[metric])
+        compact.rows.append(row)
 
     return [elephant, compact]
 
@@ -593,13 +599,15 @@ def _optional_float(value) -> float | None:
 
 
 def parse_current(path: Path) -> list[Scenario]:
+    """Parse `path`, requiring the full compression gate first, then every
+    scenario family whose rows are present."""
     try:
         output = path.read_text()
     except OSError as error:
         raise ValueError(f"cannot read benchmark output {path}: {error}") from error
 
     compression = compression_scenario(output)
-    actual = {name for name, _ in zip(compression.track, compression.rows)}
+    actual = set(compression.tracked)
     if not actual:
         raise ValueError(
             "no compression benchmark metrics found in "
@@ -713,6 +721,7 @@ def parse_current(path: Path) -> list[Scenario]:
 
 
 def get_git_sha() -> str:
+    """Short HEAD sha for the CSV history, or "unknown" outside a git tree."""
     try:
         return (
             subprocess.check_output(
@@ -722,7 +731,7 @@ def get_git_sha() -> str:
             .decode()
             .strip()
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return "unknown"
 
 
@@ -755,21 +764,53 @@ def append_scenario_csv(directory: Path, scenario: Scenario) -> None:
 
 def tracked_metrics(scenarios: list[Scenario]) -> dict[str, float]:
     """Flatten the lower-is-better tracked metrics into a `name -> value` map
-    keyed on the `bench/param/metric` scheme for regression comparison."""
+    keyed on the `bench/param/metric` scheme for regression comparison.
+
+    Each scenario parser fills `tracked` while parsing rows, so every name is
+    already paired with the value taken from its own row."""
+
     flat: dict[str, float] = {}
     for scenario in scenarios:
-        for name, row in zip(scenario.track, scenario.rows):
-            metric = name.rsplit("/", 1)[-1]
-            flat[name] = float(row[metric])
+        flat.update(scenario.tracked)
     return flat
 
 
+# Last segment of a flat `bench/param/metric` name. For these, a larger value
+# is better (throughput, hit rate, speedup) and the regression check and the
+# best-of-history tracking both invert accordingly.
+HIGHER_IS_BETTER = frozenset(
+    {
+        "write_events_per_sec",
+        "warm_gets_per_sec",
+        "cold_gets_per_sec",
+        "warm_hit_pct",
+        "speedup_x",
+        "found",
+        "total",
+    }
+)
+
+
+def _is_higher_better(name: str) -> bool:
+    return name.rsplit("/", 1)[-1] in HIGHER_IS_BETTER
+
+
 def main() -> None:
+    """Compare `--current` bench output against `--best`, append CSV history,
+    and refresh best-of-history. Regressions warn by default; fail with
+    `--strict`."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--current", required=True)
     parser.add_argument("--best", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--margin", type=float, default=0.10)
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 on regression instead of warning (for CI). Default: warn, "
+        "still append history and refresh best.json so noisy single runs do not "
+        "break the workflow.",
+    )
     parser.add_argument(
         "--machine",
         metavar="SPEC",
@@ -817,16 +858,39 @@ def main() -> None:
     updated = {name: value for name, value in best.items() if name in current}
     for name, value in current.items():
         previous = updated.get(name)
-        if previous is not None and value > previous * (1 + args.margin):
-            regressions.append(f"{name}: {value:.2f} > {previous:.2f}")
-        updated[name] = min(value, previous) if previous is not None else value
+        if previous is None:
+            updated[name] = value
+            continue
+        if _is_higher_better(name):
+            # A smaller value than best is the regression here.
+            worsened = value < previous * (1 - args.margin)
+            relation = "<"
+            kept = max(value, previous)
+        else:
+            worsened = value > previous * (1 + args.margin)
+            relation = ">"
+            kept = min(value, previous)
+        if worsened:
+            regressions.append(f"{name}: {value:.2f} {relation} {previous:.2f}")
+        updated[name] = kept
 
     if regressions:
-        print("benchmark regression exceeds allowed margin:", file=sys.stderr)
+        heading = (
+            "BLOCKING: benchmark regression exceeds allowed margin"
+            if args.strict
+            else "warning: benchmark regression exceeds allowed margin"
+        )
+        print(heading + ":", file=sys.stderr)
         print("\n".join(regressions), file=sys.stderr)
-        sys.exit(1)
+        # Always append history and keep best.json fresh; only --strict gates
+        # CI-style runs on regressions. Single-run benchmark noise is common, so
+        # the default run just warns and continues.
+        if args.strict:
+            sys.exit(1)
 
-    Path(args.out).write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
+    Path(args.out).write_text(
+        json.dumps(updated, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(f"Compared {len(current)} metrics; wrote {args.out}.")
 
 

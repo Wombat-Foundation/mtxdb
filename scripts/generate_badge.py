@@ -1,7 +1,10 @@
+"""Render a small "Tests: P / F / I" shield-style badge to tests.svg."""
+
 import sys
 
 
 def main():
+    """Read P/F/I counts from argv and write tests.svg."""
     if len(sys.argv) < 4:
         print("Usage: generate_badge.py <passed> <failed> <ignored>")
         sys.exit(1)
@@ -19,7 +22,7 @@ def main():
     {text}
 </svg>"""
 
-    with open("tests.svg", "w") as f:
+    with open("tests.svg", "w", encoding="utf-8") as f:
         f.write(badge_svg)
 
 
