@@ -248,10 +248,13 @@ pub struct PackfileStorage {
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
     put_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
-    /// Serializes the read-modify-write `deleted.collections` file. Collection locks
-    /// protect a collection's lifecycle, but distinct collections may be recreated or
-    /// deleted concurrently.
-    deleted_collections_lock: parking_lot::Mutex<()>,
+    /// In-memory cache of the `deleted.collections` file, seeded once at
+    /// `open()` from disk. Guards both the set and the read-modify-write of
+    /// the backing file, so a plain membership check (the common case: most
+    /// collections were never deleted) never touches disk. Collection locks
+    /// protect a collection's lifecycle, but distinct collections may be
+    /// recreated or deleted concurrently, hence the separate lock here.
+    deleted_collections: parking_lot::Mutex<HashSet<[u8; 16]>>,
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
@@ -516,7 +519,7 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
-            deleted_collections_lock: parking_lot::Mutex::new(()),
+            deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
@@ -861,19 +864,28 @@ impl PackfileStorage {
     }
 
     fn persist_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
-        let _guard = self.deleted_collections_lock.lock();
         let path = Self::deleted_collections_path(&self.base_dir);
-        let mut set = Self::load_deleted_collections(&self.base_dir);
+        let mut set = self.deleted_collections.lock();
         set.insert(*collection_id);
         let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
         fs::write(&path, &bytes).map_err(StorageError::Io)?;
         Ok(())
     }
 
+    /// Fast path for `store_generation`'s new-collection case: most
+    /// collections were never deleted, so check the in-memory cache before
+    /// paying for a lock + no-op write. Avoids re-reading `deleted.collections`
+    /// from disk on every first write to a new collection — previously this
+    /// reloaded the whole file from disk unconditionally, which under a cold
+    /// page cache turned a batch of first-writes across many collections into
+    /// one serialized disk read per collection.
+    fn is_deleted_collection(&self, collection_id: &[u8; 16]) -> bool {
+        self.deleted_collections.lock().contains(collection_id)
+    }
+
     fn clear_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
-        let _guard = self.deleted_collections_lock.lock();
         let path = Self::deleted_collections_path(&self.base_dir);
-        let mut set = Self::load_deleted_collections(&self.base_dir);
+        let mut set = self.deleted_collections.lock();
         if set.remove(collection_id) {
             let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
             fs::write(&path, &bytes).map_err(StorageError::Io)?;
@@ -1236,7 +1248,9 @@ impl PackfileStorage {
         // generation. A failure must fail the write: otherwise it appears to
         // succeed but disappears on the next startup scan.
         if is_new {
-            self.clear_deleted_collection(collection_id)?;
+            if self.is_deleted_collection(collection_id) {
+                self.clear_deleted_collection(collection_id)?;
+            }
             self.collections
                 .write()
                 .entry(*collection_id)
