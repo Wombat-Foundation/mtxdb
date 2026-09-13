@@ -379,7 +379,7 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
+            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; \
              CREATE TABLE IF NOT EXISTS nodes(pk BLOB PRIMARY KEY, val BLOB) WITHOUT ROWID;",
         )
         .unwrap();
@@ -466,10 +466,16 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
 
 // ── Driver ──────────────────────────────────────────────────────────
 
+/// Root for benchmark scratch data: `MTXDB_BENCH_ROOT` env override, else
+/// the session temp dir. Sizeable sweeps (100 GB–1 TB) must not run on a
+/// RAM-backed tmpfs; point this at a real disk with headroom.
+fn bench_root() -> std::path::PathBuf {
+    std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+}
+
 fn run_backend(backend: Backend, target_gb: f64) {
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!(
-        "mtxdb_bench_compare_{pid}_{}_{target_gb}",
+    let dir = bench_root().join(format!(
+        "mtxdb_bench_compare_{}_{target_gb}",
         backend.name()
     ));
     let _ = fs::remove_dir_all(&dir);

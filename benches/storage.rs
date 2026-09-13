@@ -284,6 +284,13 @@ fn drop_caches_for_dir(dir: &std::path::Path) -> bool {
 
 // ── Benchmark harness ───────────────────────────────────────────────
 
+/// Root for benchmark scratch data: `MTXDB_BENCH_ROOT` env override, else
+/// the session temp dir. GB-scale sweeps (1–1000 GB) must not run on a
+/// RAM-backed tmpfs; point this at a real disk with headroom.
+fn bench_root() -> std::path::PathBuf {
+    std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+}
+
 /// Measured results from one scenario run, used to drive the decision
 /// matrix on real signals instead of structurally-fixed ones.
 struct BenchResult {
@@ -295,8 +302,7 @@ struct BenchResult {
 }
 
 fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> BenchResult {
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_{label}_{total_events}_{pid}"));
+    let dir = bench_root().join(format!("mtxdb_bench_{label}_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -487,16 +493,23 @@ fn run_oneshot_open_benchmark(
     );
     assert!(payload_bytes > 0, "benchmark needs a nonzero payload size");
 
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_oneshot_open_{pid}_gb_{target_gb}"));
+    let dir = bench_root().join(format!("mtxdb_bench_oneshot_open_gb_{target_gb}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
     let total_nodes = (target_gb * 1e9) as usize / payload_bytes;
     assert!(total_nodes > 0, "target_gb is too small for payload_bytes");
-    let target_id = DagGenerator::node_id(total_nodes / 2);
+    let target_node_index = total_nodes / 2;
+    let target_id = DagGenerator::node_id(target_node_index);
     let mut target_collection = [0u8; 16];
-    target_collection[..8].copy_from_slice(&0_u64.to_le_bytes());
+    // The target node lives in the same round-robin collection the write loop
+    // used; querying a hardcoded collection 0 would miss whenever
+    // `target_node_index % collection_count != 0` (e.g. 1 GB / 39 cols → 1).
+    target_collection[..8].copy_from_slice(
+        &u64::try_from(target_node_index % collection_count)
+            .expect("usize always fits in u64")
+            .to_le_bytes(),
+    );
 
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let write_started = Instant::now();
@@ -801,8 +814,7 @@ fn auth_chain(dag: &DagGenerator, start: usize, max_depth: usize) -> HashSet<usi
 /// vs. materialized-state vs. integration-as-is decision should be made
 /// on, not a guess.
 fn run_intent_benchmark(total_events: usize) {
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_intent_{total_events}_{pid}"));
+    let dir = bench_root().join(format!("mtxdb_bench_intent_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -969,8 +981,7 @@ fn reaction_id(salt: u64, idx: u64) -> NodeId {
 }
 
 fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_swarm_{history_len}_{pid}"));
+    let dir = bench_root().join(format!("mtxdb_bench_swarm_{history_len}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -1141,8 +1152,7 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
 // live_roots to a fixed-size set instead — not done here; see this
 // session's plan notes on the flat-vs-topo/GC-bound benchmark.
 fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("mtxdb_bench_repack_{total_events}_{pid}"));
+    let dir = bench_root().join(format!("mtxdb_bench_repack_{total_events}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 

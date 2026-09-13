@@ -61,16 +61,23 @@ path = "src/lib.rs"
 # default `cargo bench` / CI never builds or ships either engine; both are
 # comparison-only dev dependencies.
 #   libmdbx:   wrapped library Apache-2.0 (since v0.13), wrapper crate MPL-2.0
-#   rusqlite:  MIT (bundled SQLite is public domain)
+#   rusqlite:  MIT (links the system libsqlite3, itself public domain)
 compare-external = ["dep:libmdbx", "dep:rusqlite"]
 
 [dependencies]
 # External comparison backends for `benches/compare_external.rs`, optional so
 # the default build never touches them (and this package is publish=false,
 # so they can never leak into a published artifact either).
+#
+# rusqlite deliberately omits `bundled`: bundling compiles SQLite's C
+# amalgamation from source on every build needing the feature, on top of
+# libsqlite3-sys's own bindgen run. Linking the system libsqlite3 (found via
+# pkg-config) skips that compile step; it costs requiring sqlite3 dev headers
+# to be installed wherever `--features compare-external` is actually used,
+# which is fine for an opt-in comparison bench that never ships.
 libmdbx = { version = "0.6", optional = true }
 mtxdb-core = { path = "mtxdb-core" }
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.32", optional = true }
 
 [dev-dependencies]
 bytes = "1.5"
