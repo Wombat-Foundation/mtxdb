@@ -505,8 +505,7 @@ impl PackfileStorage {
                 &shards,
                 cache_capacity,
                 &mut scan_out,
-            )
-            .map_err(std::io::Error::other)?;
+            )?;
         }
 
         Ok(Self {

@@ -176,6 +176,18 @@ impl From<std::io::Error> for StorageError {
     }
 }
 
+impl From<StorageError> for std::io::Error {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Io(error) => error,
+            StorageError::Corrupt(message) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+            }
+            other => std::io::Error::other(other.to_string()),
+        }
+    }
+}
+
 /// In-memory storage engine for tests.
 ///
 /// Partitions nodes by collection. Each collection's nodes are tracked in a
@@ -363,6 +375,20 @@ mod tests {
         let io = std::io::Error::other("y");
         let e: StorageError = io.into();
         assert!(matches!(e, StorageError::Io(_)));
+    }
+
+    #[test]
+    fn test_io_error_from_storage_error_preserves_kinds() {
+        let inner = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pb");
+        let e: std::io::Error = StorageError::Io(inner).into();
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
+
+        let corrupted: std::io::Error = StorageError::Corrupt("mbz".into()).into();
+        assert_eq!(corrupted.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(corrupted.to_string(), "mbz");
+
+        let not_found: std::io::Error = StorageError::NotFound([0; 16]).into();
+        assert_eq!(not_found.kind(), std::io::ErrorKind::Other);
     }
 
     #[test]
