@@ -129,6 +129,25 @@ const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8;
 /// collection's stable insertion ordinal(8).
 const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8;
 
+/// The largest record offset `IndexSlot` can represent: its 28-bit offset
+/// field stores `offset + 1`, reserving the all-zeros encoding for the empty
+/// sentinel. Offsets beyond this can only come from legacy or externally
+/// created oversized packs — this engine's own writes rotate long before
+/// reaching it (`MAX_SHARD_BYTES` caps each shard's file size).
+const PACK_INDEX_OFFSET_LIMIT: u64 = (1u64 << 28) - 2;
+
+/// Reject a record whose in-shard offset the 28-bit `IndexSlot` field cannot
+/// represent, so the caller surfaces a `StorageError::Corrupt` instead of
+/// silently dropping the record (or panicking in `IndexSlot::new`).
+fn check_index_offset(shard_id: u16, hash: &[u8; 16], offset: u64) -> Result<(), StorageError> {
+    if offset > PACK_INDEX_OFFSET_LIMIT {
+        return Err(StorageError::Corrupt(format!(
+            "shard {shard_id} holds record {hash:?} at offset {offset}, beyond the index offset limit {PACK_INDEX_OFFSET_LIMIT}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct PersistedShardRoom {
     pack_id: u64,
@@ -486,7 +505,8 @@ impl PackfileStorage {
                 &shards,
                 cache_capacity,
                 &mut scan_out,
-            );
+            )
+            .map_err(std::io::Error::other)?;
         }
 
         Ok(Self {
@@ -523,7 +543,7 @@ impl PackfileStorage {
         shards: &ShardPool,
         cache_capacity: usize,
         out: &mut RoomScanOutput,
-    ) {
+    ) -> Result<(), StorageError> {
         // Seed each collection's home shard from the scan: the shard of its
         // last-scanned record is a best-effort proxy for "most recent"
         // (shards are scanned in ascending ID order, and IDs generally
@@ -536,6 +556,7 @@ impl PackfileStorage {
         }
         let mut index = LossyIndex::new(records.len().saturating_mul(2).max(16));
         for (shard_id, hash, offset, _pack_id) in records {
+            check_index_offset(*shard_id, hash, *offset)?;
             let _ = index.insert(hash, *shard_id, *offset);
         }
         let counts = index.shard_counts();
@@ -567,6 +588,7 @@ impl PackfileStorage {
                 cache: Arc::new(NodeCache::new(cache_capacity)),
             }),
         );
+        Ok(())
     }
 
     fn generation(&self, collection_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
@@ -791,12 +813,13 @@ impl PackfileStorage {
         Ok(maps)
     }
 
-    fn build_index(offsets: &[([u8; 16], u16, u64)]) -> LossyIndex {
+    fn build_index(offsets: &[([u8; 16], u16, u64)]) -> Result<LossyIndex, StorageError> {
         let mut index = LossyIndex::new(offsets.len().saturating_mul(2).max(16));
         for (hash, shard_id, offset) in offsets {
+            check_index_offset(*shard_id, hash, *offset)?;
             let _ = index.insert(hash, *shard_id, *offset);
         }
-        index
+        Ok(index)
     }
 
     /// Convert a slot-keyed `shard_counts` from `LossyIndex` to a pack_id-keyed
@@ -1272,20 +1295,15 @@ impl PackfileStorage {
         let mut index = LossyIndex::new(total.saturating_mul(2).max(16));
         for (shard_id, entries) in scanned {
             for (hash, offset) in entries {
-                // `IndexSlot` can only represent offsets up to `2^28 - 2`
-                // (the 28-bit offset field reserves the sentinel). Offsets a
-                // legacy or externally created oversized shard can no longer
-                // fit are rejected rather than silently skipped: writes are
-                // already capped at `MAX_SHARD_BYTES`, so a record beyond
-                // the limit means the shard did not come from this engine,
-                // and silently indexing around it would make its data
-                // unreachable while reporting a successful rebuild.
-                if offset > (1u64 << 28) - 2 {
-                    return Err(StorageError::Corrupt(format!(
-                        "shard {shard_id} holds record {hash:?} at offset {offset}, beyond the index offset limit {}",
-                        (1u64 << 28) - 2
-                    )));
-                }
+                // `IndexSlot` can only represent offsets up to
+                // `PACK_INDEX_OFFSET_LIMIT`. Offsets a legacy or externally
+                // created oversized shard can no longer fit are rejected
+                // rather than silently skipped: writes are already capped at
+                // `MAX_SHARD_BYTES`, so a record beyond the limit means the
+                // shard did not come from this engine, and silently indexing
+                // around it would make its data unreachable while reporting a
+                // successful rebuild.
+                check_index_offset(shard_id, &hash, offset)?;
                 let _ = index.insert(&hash, shard_id, offset);
             }
         }
@@ -2166,7 +2184,7 @@ impl PackfileStorage {
 
         let kept = new_offsets.len();
 
-        let index = Self::build_index(&new_offsets);
+        let index = Self::build_index(&new_offsets)?;
         self.replace_collection_shard_counts(
             collection_id,
             &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
@@ -2391,7 +2409,7 @@ impl PackfileStorage {
                 &mut output_state,
             )?;
             let kept = new_offsets.len();
-            let index = Self::build_index(&new_offsets);
+            let index = Self::build_index(&new_offsets)?;
             self.replace_collection_shard_counts(
                 collection_id,
                 &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
@@ -3663,6 +3681,14 @@ mod tests {
 
         let got = store.get(&TEST_COLLECTION, &extra).unwrap().unwrap();
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"y"));
+    }
+
+    #[test]
+    fn test_index_offset_gate_rejects_unrepresentable_offsets() {
+        let hash = [0x5A; 16];
+        assert!(check_index_offset(0, &hash, PACK_INDEX_OFFSET_LIMIT).is_ok());
+        assert!(check_index_offset(0, &hash, PACK_INDEX_OFFSET_LIMIT + 1).is_err());
+        assert!(check_index_offset(0, &hash, u64::MAX).is_err());
     }
 
     #[test]
