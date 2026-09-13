@@ -298,11 +298,10 @@ fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> an
         for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
             if index != 0 {
                 println!();
+                println!();
             }
-            println!("{SECTION_RULE}");
-            println!("{}:", shard_type.as_str());
+            print_section_header(shard_type);
             cmd_collections_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort)?;
-            println!("{SECTION_RULE}");
         }
         return Ok(());
     }
@@ -511,17 +510,27 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
 /// table alone read as one undifferentiated wall of numbers otherwise.
 const SECTION_RULE: &str = "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~";
 
+/// Prints one `--all` section's fenced header: a rule, an uppercased
+/// `-- NAME --` banner (hyphens in the pool's directory name become spaces,
+/// e.g. `event-dag` -> `EVENT DAG`), another rule, then a blank line.
+fn print_section_header(shard_type: ShardType) {
+    let banner = shard_type.as_str().replace('-', " ").to_uppercase();
+    println!("{SECTION_RULE}");
+    println!("-- {banner} --");
+    println!("{SECTION_RULE}");
+    println!();
+}
+
 fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     if all {
         let db_layout = open_layout(cli)?;
         for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
             if index != 0 {
                 println!();
+                println!();
             }
-            println!("{SECTION_RULE}");
-            println!("{}:", shard_type.as_str());
+            print_section_header(shard_type);
             cmd_shards_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort)?;
-            println!("{SECTION_RULE}");
         }
         return Ok(());
     }
