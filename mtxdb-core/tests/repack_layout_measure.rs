@@ -14,9 +14,7 @@ fn collection_id(seed: u8) -> [u8; 16] {
     let mut id = [0u8; 16];
     id[0] = seed;
     for i in 1..16 {
-        id[i] = id[i - 1]
-            .wrapping_mul(31)
-            .wrapping_add(seed.rotate_left(3));
+        id[i] = id[i - 1].wrapping_mul(31).wrapping_add(seed.rotate_left(3));
     }
     id
 }

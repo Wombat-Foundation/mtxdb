@@ -508,7 +508,8 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
 /// Rule printed above and below each shard-type's block when a command
 /// lists every independent pool at once (`--all`) — the section header and
 /// table alone read as one undifferentiated wall of numbers otherwise.
-const SECTION_RULE: &str = "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~";
+const SECTION_RULE: &str =
+    "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~";
 
 /// Prints one `--all` section's fenced header: a rule, an uppercased
 /// `-- NAME --` banner (hyphens in the pool's directory name become spaces,
@@ -519,6 +520,61 @@ fn print_section_header(shard_type: ShardType) {
     println!("-- {banner} --");
     println!("{SECTION_RULE}");
     println!();
+}
+
+/// Whether `--layout`'s interleaving count is worth an actionable note:
+/// at least one extra run per collection on average (excess runs ≥ number
+/// of collections sharing packs). Below that — a few collections each split
+/// a couple of times by a shared active pack — it's expected write
+/// interleaving, not a fragmentation problem worth advice about.
+#[must_use]
+fn interleaving_worth_noting(collections: u64, excess_runs: u64) -> bool {
+    excess_runs >= collections.max(1)
+}
+
+/// Physical-layout block of `mtxdb shards --layout`: per-pack contiguous
+/// runs, interleaving excess, and — when fragmentation is worth acting on —
+/// the note that repack is never automatic.
+fn print_pack_physical_layout(
+    shard_entries: &[(u64, u64, u8)],
+    physical: &mtxdb_core::packfile::layout::PhysicalLayout,
+) {
+    let runs: u64 = physical.packs.values().map(|stats| stats.segments).sum();
+    let interleaved: u64 = physical
+        .packs
+        .values()
+        .map(|stats| {
+            stats
+                .segments
+                .saturating_sub(stats.collections.len() as u64)
+        })
+        .sum();
+    println!("physical layout: {runs} contiguous runs; {interleaved} excess runs from interleaving (includes superseded frames)");
+    println!(
+        "{:>19}  {:>11}  {:>6}  {:>10}  {:>12}",
+        "pack id", "collections", "runs", "excess", "largest run"
+    );
+    for (pack_id, _, _) in shard_entries {
+        let stats = physical.packs.get(pack_id);
+        let collections = stats.map_or(0, |stats| stats.collections.len());
+        let runs = stats.map_or(0, |stats| stats.segments);
+        let excess = runs.saturating_sub(collections as u64);
+        let largest = stats.map_or(0, |stats| stats.largest_segment_bytes);
+        println!(
+            "0x{pack_id:016x}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
+            fmt_bytes(largest)
+        );
+    }
+    let collections_total: u64 = physical
+        .packs
+        .values()
+        .map(|stats| stats.collections.len() as u64)
+        .sum();
+    if interleaving_worth_noting(collections_total, interleaved) {
+        println!("note: {interleaved} excess runs from interleaving across collections sharing packs");
+        println!("      repack is never automatic — run `mtxdb repack --all` to fold each");
+        println!("      collection into a single contiguous run");
+    }
 }
 
 fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
@@ -608,32 +664,7 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
         total_collections,
     );
     if let Some(physical) = physical {
-        let runs: u64 = physical.packs.values().map(|stats| stats.segments).sum();
-        let interleaved: u64 = physical
-            .packs
-            .values()
-            .map(|stats| {
-                stats
-                    .segments
-                    .saturating_sub(stats.collections.len() as u64)
-            })
-            .sum();
-        println!("physical layout: {runs} contiguous runs; {interleaved} excess runs from interleaving (includes superseded frames)");
-        println!(
-            "{:>19}  {:>11}  {:>6}  {:>10}  {:>12}",
-            "pack id", "collections", "runs", "excess", "largest run"
-        );
-        for (pack_id, _, _) in &shard_entries {
-            let stats = physical.packs.get(pack_id);
-            let collections = stats.map_or(0, |stats| stats.collections.len());
-            let runs = stats.map_or(0, |stats| stats.segments);
-            let excess = runs.saturating_sub(collections as u64);
-            let largest = stats.map_or(0, |stats| stats.largest_segment_bytes);
-            println!(
-                "0x{pack_id:016x}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
-                fmt_bytes(largest)
-            );
-        }
+        print_pack_physical_layout(&shard_entries, &physical);
     }
     println!("* active pack");
     println!(
@@ -1204,6 +1235,13 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
         bail!("invalid pack ID `{selector}`; use the 0x-prefixed ID shown by `mtxdb shards`");
     };
     if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if hex.len() == 32 {
+            bail!(
+                "invalid pack ID `{selector}`; that's 32 hex digits, which looks like a \
+                 collection ID, not a pack ID — pack IDs are 1–16 hex digits, shown by \
+                 `mtxdb shards`"
+            );
+        }
         bail!("invalid pack ID `{selector}`; expected 1–16 hexadecimal digits after 0x");
     }
     u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
@@ -2475,9 +2513,10 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 mod tests {
     use super::{
         compile_import_template, default_matrix_import_template, event_room_id,
-        extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, matrix_batch_has_create,
-        matrix_create_details, parse_pack_id_selector, parse_pack_selectors,
-        resolve_import_collection, template_collection_id, CollectionTemplate,
+        extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, interleaving_worth_noting,
+        matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
+        parse_pack_selectors, resolve_import_collection, template_collection_id,
+        CollectionTemplate,
     };
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -2508,6 +2547,22 @@ mod tests {
         let result = compile_import_template(Some(&path));
         let _ = std::fs::remove_dir_all(&dir);
         result
+    }
+
+    #[test]
+    fn interleaving_note_fires_only_on_average_fragmentation() {
+        // The user's state-pool case: ~10 extra runs per collection.
+        assert!(interleaving_worth_noting(10319, 104_933));
+        // One extra run per collection on average is the threshold.
+        assert!(interleaving_worth_noting(250, 250));
+        // A few collections each split a couple of times is noise.
+        assert!(!interleaving_worth_noting(250, 200));
+        // No interleaving at all, or tiny stores, stays quiet.
+        assert!(!interleaving_worth_noting(250, 0));
+        assert!(!interleaving_worth_noting(1, 0));
+        // Degenerate guards (unit-test the clamp, not realistic data).
+        assert!(interleaving_worth_noting(0, 1));
+        assert!(!interleaving_worth_noting(0, 0));
     }
 
     #[test]

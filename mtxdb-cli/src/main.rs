@@ -206,7 +206,10 @@ fn sub_scan() -> Command {
             Arg::new("shard")
                 .required(true)
                 .value_name("PACK_ID")
-                .help("Pack ID from `shards`, for example 0x0000000000000003"),
+                .help(
+                    "Pack ID from `shards`, for example 0x0000000000000003 — not a \
+                     collection ID (those are 32 hex digits)",
+                ),
         )
 }
 
@@ -216,7 +219,11 @@ fn sub_info() -> Command {
         .arg(
             Arg::new("collection")
                 .required(true)
-                .value_name("COLLECTION"),
+                .value_name("COLLECTION")
+                .help(
+                    "Collection ID (32 hex digits), e.g. `mtxdb info \
+                     0x0102030405060708090a0b0c0d0e0f10` — takes the ID directly, no subcommand",
+                ),
         )
 }
 
