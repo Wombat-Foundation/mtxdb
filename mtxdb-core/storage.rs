@@ -132,6 +132,24 @@ pub trait StorageEngine: Send + Sync {
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
     fn sync(&self) -> Result<(), StorageError>;
+
+    /// Force a re-scan of a collection's shards from disk and atomically
+    /// swap in the freshly-built index, picking up records another process
+    /// wrote after this one last loaded (or never loaded) the collection.
+    ///
+    /// Every implementation's in-memory index is private to the process
+    /// that built it (see `PackfileStorage`'s per-process `LossyIndex`) --
+    /// there is no ambient cross-process invalidation, so a multi-worker
+    /// deployment must call this explicitly on a suspected miss to pull in
+    /// another worker's writes. Default no-op: engines with no on-disk
+    /// shard files of their own to rescan (e.g. `InMemoryStorage`, used
+    /// only in single-process tests) have nothing to refresh.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on I/O failure re-reading shard files.
+    fn refresh_collection(&self, _collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 /// Errors returned by [`StorageEngine`] operations.

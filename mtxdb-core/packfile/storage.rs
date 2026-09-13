@@ -2823,6 +2823,10 @@ impl StorageEngine for PackfileStorage {
     fn sync(&self) -> Result<(), StorageError> {
         Ok(self.shards.sync_dirty()?)
     }
+
+    fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        Self::refresh_collection(self, collection_id)
+    }
 }
 
 impl PackfileStorage {
