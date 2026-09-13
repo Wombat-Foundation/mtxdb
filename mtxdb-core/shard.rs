@@ -632,11 +632,13 @@ impl ShardPool {
     /// advisory-lock API and no dependency, so it needs one thing real
     /// `flock` gives for free: recovery if the previous holder crashed
     /// without cleaning up (`WriterLock`'s `Drop` handles the clean-exit
-    /// case). We store our PID in the file and, if creation fails because
-    /// it already exists, check whether that PID is still alive
-    /// (`/proc/<pid>` on Linux) before concluding the lock is genuinely
-    /// held — a stale file from a killed process is removed and retried
-    /// once rather than wrongly blocking forever.
+    /// case). We store our `{pid, starttime}` in the file and, if creation
+    /// fails because it already exists, check whether that exact process
+    /// (not just that PID number) is still alive before concluding the
+    /// lock is genuinely held — a stale file from a killed process is
+    /// removed and retried once rather than wrongly blocking forever. The
+    /// starttime is what makes this safe across PID reuse (see
+    /// `lock_holder_is_dead`) — a bare PID is not enough on its own.
     #[cfg(not(target_arch = "wasm32"))]
     fn acquire_writer_lock(base_dir: &Path) -> io::Result<WriterLock> {
         let lock_path = base_dir.join(".mtxdb.lock");
@@ -660,8 +662,10 @@ impl ShardPool {
         }
     }
 
-    /// Atomically create the lock file and write our PID into it. No
-    /// `sync_all` here: the PID is advisory only, and `lock_holder_is_dead`
+    /// Atomically create the lock file and write our `{pid, starttime}`
+    /// into it (Linux) or just our PID (elsewhere, where starttime can't be
+    /// read and `lock_holder_is_dead` never trusts a bare PID anyway). No
+    /// `sync_all` here: this is advisory only, and `lock_holder_is_dead`
     /// already fails closed (treats an unparsable file as "might be
     /// alive") on a torn write from a crash mid-write — there's no
     /// correctness reason to pay an fsync on every lock acquisition to
@@ -672,10 +676,32 @@ impl ShardPool {
             .write(true)
             .create_new(true)
             .open(lock_path)?;
-        write!(file, "{}", std::process::id())
+        let pid = std::process::id();
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(start_time) = Self::proc_start_time("self") {
+                return write!(file, "{pid} {start_time}");
+            }
+        }
+        write!(file, "{pid}")
     }
 
-    /// Liveness check for whoever wrote `lock_path`'s PID. Only verifies
+    /// Reads field 22 (`starttime`, clock ticks since boot) out of
+    /// `/proc/<pid_or_self>/stat`. Parses from the *last* `)` rather than
+    /// splitting on whitespace from the start: the second field (`comm`,
+    /// the executable name in parens) can itself contain spaces and
+    /// parens, which would otherwise misalign every field after it — a
+    /// classic `/proc/stat` parsing bug. Field 22 is the 20th
+    /// whitespace-separated token after that closing paren (field 3 is the
+    /// first token after it).
+    #[cfg(target_os = "linux")]
+    fn proc_start_time(pid_or_self: &str) -> Option<u64> {
+        let contents = fs::read_to_string(format!("/proc/{pid_or_self}/stat")).ok()?;
+        let after_comm = contents.rsplit_once(')')?.1;
+        after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()
+    }
+
+    /// Liveness check for whoever wrote `lock_path`. Only verifies
     /// anything on Linux (`/proc/<pid>`); everywhere else this
     /// conservatively assumes the holder might still be alive.
     ///
@@ -687,10 +713,24 @@ impl ShardPool {
     /// timestamp while the lock is held — that trades a rare stuck-lock
     /// annoyance (fixable by deleting the file) for an occasional silent
     /// second writer and packfile corruption, the wrong side of that
-    /// trade. A real fix needs a refreshed heartbeat/lease or a real OS
-    /// advisory lock per platform, not a bare creation timestamp; until
-    /// one of those lands, non-Linux platforms fail closed and require
-    /// manual recovery from a hard crash.
+    /// trade.
+    ///
+    /// A bare `/proc/<pid>` existence check is *not* enough on its own,
+    /// either: PIDs get recycled by the OS, and a container commonly has
+    /// long-lived sibling processes (postgres, redis, nginx, ...) that
+    /// outlive many respawns of a crash-looping writer. Once the OS
+    /// happens to reuse a dead writer's old PID number for one of those
+    /// unrelated long-lived processes, a plain PID check reports "alive"
+    /// forever — not because the original holder is still running, but
+    /// because something else now coincidentally has that PID — poisoning
+    /// recovery permanently. Comparing the recorded `starttime` (written
+    /// at lock-acquisition time) against the current holder of that PID
+    /// closes this: a reused PID almost certainly has a different
+    /// starttime, so a mismatch means the original writer is gone even
+    /// though its old PID number is (again) in use. A lock file written by
+    /// an older binary (bare PID, no starttime) has nothing to compare
+    /// against and fails closed exactly as before, same as any other
+    /// unparsable content.
     #[cfg(not(target_arch = "wasm32"))]
     fn lock_holder_is_dead(lock_path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -698,10 +738,27 @@ impl ShardPool {
             let Ok(contents) = fs::read_to_string(lock_path) else {
                 return false;
             };
-            let Ok(pid) = contents.trim().parse::<u32>() else {
+            let mut fields = contents.split_whitespace();
+            let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
                 return false;
             };
-            !Path::new(&format!("/proc/{pid}")).exists()
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return true;
+            }
+            // The PID exists as a live process, but that alone doesn't mean
+            // it's still our original writer (see doc comment above) —
+            // disambiguate via starttime when we have one to compare.
+            match fields.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(recorded_start) => match Self::proc_start_time(&pid.to_string()) {
+                    Some(current_start) => current_start != recorded_start,
+                    // Couldn't read the current holder's stat (raced with
+                    // its own exit, permissions, ...) — fail closed.
+                    None => false,
+                },
+                // Old-format lock file, or starttime collection failed at
+                // creation time — nothing to disambiguate a reuse with.
+                None => false,
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1990,6 +2047,73 @@ mod tests {
         assert!(
             second.is_ok(),
             "a new writer must be able to open once the previous one has dropped"
+        );
+    }
+
+    /// A lock file recording our own actual `{pid, starttime}` (exactly
+    /// what a live writer's own lock file looks like) must correctly be
+    /// treated as held, not stale — otherwise a legitimately-running
+    /// writer could have its own lock reclaimed out from under it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_lock_with_matching_starttime_is_not_reclaimed() {
+        let dir = test_dir("lock_matching_starttime_alive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join(".mtxdb.lock");
+        let pid = std::process::id();
+        let start = ShardPool::proc_start_time("self").expect("must read our own starttime");
+        std::fs::write(&lock_path, format!("{pid} {start}")).unwrap();
+
+        assert!(
+            !ShardPool::lock_holder_is_dead(&lock_path),
+            "a lock file matching our own live pid+starttime must not be reclaimable"
+        );
+    }
+
+    /// The actual regression this fix exists for: a lock file whose PID
+    /// has been recycled onto a *different* still-running process (a
+    /// long-lived sidecar taking over a dead writer's old PID number, in
+    /// the original bug's terms) must be reclaimed, not treated as held
+    /// forever. We simulate "different process" the same way the real
+    /// check would distinguish one: same PID, mismatched starttime.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_lock_with_stale_starttime_is_reclaimed_despite_live_pid() {
+        let dir = test_dir("lock_stale_starttime_pid_reused");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join(".mtxdb.lock");
+        let pid = std::process::id();
+        let real_start = ShardPool::proc_start_time("self").expect("must read our own starttime");
+        // A starttime that cannot possibly be ours: any recorded starttime
+        // must exactly match `/proc/<pid>/stat`'s live value, so simply
+        // perturbing it stands in for "this pid now belongs to someone
+        // else" without needing to actually fork/reap a process to force a
+        // real-world PID recycle.
+        let impostor_start = real_start.wrapping_add(1);
+        std::fs::write(&lock_path, format!("{pid} {impostor_start}")).unwrap();
+
+        assert!(
+            ShardPool::lock_holder_is_dead(&lock_path),
+            "a starttime mismatch on a live pid must be treated as a recycled-PID impostor, not the original holder"
+        );
+    }
+
+    /// An old-format lock file (bare PID, no starttime — what a pre-fix
+    /// binary writes) has nothing to disambiguate a PID reuse with, so it
+    /// must keep failing closed exactly as before: a live PID is always
+    /// treated as held, never reclaimed just because we can't check
+    /// further. This is a no-regression guarantee for the previous format.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_old_format_lock_file_with_live_pid_still_fails_closed() {
+        let dir = test_dir("lock_old_format_live_pid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join(".mtxdb.lock");
+        std::fs::write(&lock_path, format!("{}", std::process::id())).unwrap();
+
+        assert!(
+            !ShardPool::lock_holder_is_dead(&lock_path),
+            "a bare-PID (pre-fix) lock file for a still-live pid must fail closed, not be reclaimed"
         );
     }
 
