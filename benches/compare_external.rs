@@ -146,7 +146,11 @@ const APPEND_RECORDS: usize = 1_000;
 /// index and therefore require a full checkpoint rewrite.
 const STEADY_APPEND_RECORDS: usize = 256;
 const STEADY_APPEND_BATCHES: usize = 3;
-const DEFAULT_BENCH_CACHE_CAPACITY: usize = 100_000;
+/// The point-read sweep uses unique IDs, so it measures cache misses. Keep
+/// the comparison cache-free by default; opt into the production 100k-entry
+/// per-collection cache with `MTXDB_BENCH_CACHE_CAPACITY=100000` when
+/// measuring a reuse/cache-hit workload.
+const DEFAULT_BENCH_CACHE_CAPACITY: usize = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -760,7 +764,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
          APPEND_PUTS_MS={:.2} APPEND_SYNC_MS={:.2}{loop_part}{sync_all_part} \
          STEADY_APPEND={STEADY_APPEND_RECORDS} STEADY_APPEND_MS={:.2} \
          STEADY_APPEND_PUTS_MS={:.2} STEADY_APPEND_SYNC_MS={:.2} \
-         FILES={} MEM={} MEM_LABEL={} RSS_OPEN={} PSS_OPEN={} RSS_WARM={} PSS_WARM={}",
+         FILES={} MEM={} MEM_LABEL={} RSS_OPEN={} PSS_OPEN={} RSS_WARM={} PSS_WARM={} CACHE_CAPACITY={}",
         backend.name(),
         run.write_ms,
         run.warm_open_ms,
@@ -779,6 +783,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
         run.rss_pss_open.1,
         run.rss_pss_warm.0,
         run.rss_pss_warm.1,
+        cache_capacity_from_env(),
     );
 
     let loop_note = run.append_loop_ms.map_or(String::new(), |v| {
