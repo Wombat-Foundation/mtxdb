@@ -228,6 +228,17 @@ pub fn write_record_with_options(
     record: &Record,
     compress: bool,
 ) -> io::Result<u64> {
+    let buf = encode_record_with_options(record, compress)?;
+    writer.write_all(&buf)?;
+    Ok(buf.len() as u64)
+}
+
+/// Encode one record into its complete on-disk frame.
+///
+/// Kept separate from [`write_record_with_options`] so appenders which use
+/// positioned writes can retain their file cursor and avoid an `lseek` per
+/// record. The result includes the length prefix and checksum.
+pub(crate) fn encode_record_with_options(record: &Record, compress: bool) -> io::Result<Vec<u8>> {
     let uncompressed_len =
         u32::try_from(record.data.len()).expect("record payload exceeds u32::MAX");
     let plaintext_frame_len = FRAME_FIXED_LEN
@@ -278,9 +289,12 @@ pub fn write_record_with_options(
     let checksum = crc.finalize();
     buf.extend_from_slice(&checksum.to_le_bytes());
 
-    writer.write_all(&buf)?;
-
-    Ok(total_len)
+    debug_assert_eq!(
+        buf.len() as u64,
+        total_len,
+        "encoded frame length must match its length prefix"
+    );
+    Ok(buf)
 }
 
 /// Read a single record from the packfile. Returns `None` on EOF.

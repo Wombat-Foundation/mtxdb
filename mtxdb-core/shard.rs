@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1132,8 +1134,12 @@ impl ShardPool {
 
             let (offset, record_len) = {
                 let guard = shard.append_lock.lock();
-                let mut file = shard.file.try_clone()?;
-                let offset = file.seek(io::SeekFrom::End(0))?;
+                let file = shard.file.try_clone()?;
+                // `append_lock` serializes writers and `file_len` is updated
+                // before that lock is released, making it the authoritative
+                // next offset. A positioned write avoids seeking this cloned
+                // descriptor to EOF for every record.
+                let offset = shard.file_len.load(Ordering::Acquire);
 
                 // Check capacity while holding the append lock and after
                 // seeking to the true end — avoids TOCTOU race where two
@@ -1151,8 +1157,16 @@ impl ShardPool {
 
                 // The actual on-disk length — may be smaller than
                 // `max_record_len` when the payload compressed.
-                let record_len =
-                    packfile::write_record_with_options(&mut file, record, self.compress)?;
+                let frame = packfile::encode_record_with_options(record, self.compress)?;
+                #[cfg(unix)]
+                file.write_all_at(&frame, offset)?;
+                #[cfg(not(unix))]
+                {
+                    let mut file = file;
+                    file.seek(io::SeekFrom::Start(offset))?;
+                    file.write_all(&frame)?;
+                }
+                let record_len = frame.len() as u64;
                 let new_len = offset.checked_add(record_len).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "offset + record_len overflow")
                 })?;
@@ -1202,8 +1216,7 @@ impl ShardPool {
             let offset_usize = usize::try_from(offset)
                 .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
 
-            let file_len = shard.file.metadata().map_err(StorageError::Io)?.len();
-            let file_len_usize = usize::try_from(file_len).unwrap_or(usize::MAX);
+            let file_len_usize = usize::try_from(shard.file_len()).unwrap_or(usize::MAX);
 
             if offset_usize
                 .checked_add(4)
@@ -1267,8 +1280,7 @@ impl ShardPool {
             let offset = usize::try_from(offset)
                 .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
 
-            let file_len = shard.file.metadata().map_err(StorageError::Io)?.len();
-            let file_len_usize = usize::try_from(file_len).unwrap_or(usize::MAX);
+            let file_len_usize = usize::try_from(shard.file_len()).unwrap_or(usize::MAX);
 
             if offset
                 .checked_add(4)
@@ -1404,6 +1416,10 @@ impl ShardPool {
             *guard =
                 Some(packfile::map_pack(&shard.file).map_err(crate::storage::StorageError::Io)?);
         }
+        // A read-only pool can observe an append made by another process. Its
+        // local atomic is only a steady-state fast-path cache, so publish the
+        // length verified while remapping before retrying the read.
+        shard.file_len.store(file_len, Ordering::Release);
         Ok(())
     }
 
