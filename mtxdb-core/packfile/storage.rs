@@ -48,6 +48,17 @@ pub enum OpenPath {
     FullScan,
 }
 
+/// Where a checkpoint-path open sourced each collection's per-shard counts
+/// and home-shard assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookkeepingSource {
+    /// Reconstructed from the fingerprint-gated `shard_collections.bin`
+    /// records — no slot walk across any collection index.
+    Sidecar,
+    /// Computed by walking every slot of every collection index.
+    SlotScan,
+}
+
 /// Wall-clock breakdown of one `PackfileStorage` open, by phase. Measured
 /// with a handful of `Instant::now()` deltas on the open path only, so
 /// recording these doesn't perturb the numbers they report.
@@ -77,6 +88,9 @@ pub struct OpenTimings {
     pub total: std::time::Duration,
     /// Which index-loading path was taken.
     pub path: OpenPath,
+    /// Where per-shard counts and home-shard assignment came from (checkpoint
+    /// path only; the fallback path builds them from the scan).
+    pub bookkeeping_source: BookkeepingSource,
 }
 
 impl Default for OpenTimings {
@@ -90,6 +104,7 @@ impl Default for OpenTimings {
             full_scan: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
             path: OpenPath::FullScan,
+            bookkeeping_source: BookkeepingSource::SlotScan,
         }
     }
 }
@@ -203,15 +218,16 @@ struct RoomScanOutput {
 /// treated exactly like a missing/corrupt file (see
 /// `read_persisted_shard_collections`) — reset or let the next sync
 /// regenerate it, not a format this reader tries to still understand.
-/// This sidecar has changed shape twice already (adding insertion order,
-/// then switching `shard_id` for `pack_id`) and briefly kept read
-/// support for every prior version each time; none of that carries
-/// forward, since nothing depends on reading a store from before the
-/// current format existed.
+/// This sidecar has changed shape three times already (adding insertion
+/// order, switching `shard_id` for `pack_id`, then v4 adding the
+/// pack-fingerprint gate); none of that carries forward, since nothing
+/// depends on reading a store from before the current format existed.
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
-const SHARD_ROOMS_VERSION: u8 = 3;
-/// Header size: magic(4) + version(1) + `persisted_at`(8).
-const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8;
+/// v4 pins the reduced bookkeeping to the exact `(pack_id, file_len)` set by
+/// carrying the same `pack_fingerprint` as the index checkpoint.
+const SHARD_ROOMS_VERSION: u8 = 4;
+/// Header size: magic(4) + version(1) + `pack_fingerprint(8)` + `persisted_at(8)`.
+const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
 /// One entry: `pack_id`(8) + `collection_id`(16) + count(8) + the
 /// collection's stable insertion ordinal(8).
 const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8;
@@ -243,12 +259,26 @@ struct PersistedShardRoom {
     insertion_order: u64,
 }
 
+/// A decoded shard→collection directory: the pack set it was written
+/// against, when it was written, and the per-(pack, collection) records.
+#[derive(Clone)]
+struct PersistedShardDirectory {
+    /// The `pack_fingerprint` of the `(pack_id, file_len)` set the counts
+    /// apply to. Only a directory whose fingerprint equals the index
+    /// checkpoint's may serve open's per-shard bookkeeping without re-walking
+    /// every slot — any other directory is stale (or corrupt) and must be
+    /// ignored in favor of the slot walk.
+    fingerprint: u64,
+    /// Unix-seconds timestamp of when the directory was persisted.
+    persisted_at: u64,
+    /// One record per (pack, collection) the store contains.
+    records: Vec<PersistedShardRoom>,
+}
+
 /// Decode the small inspection sidecar. This is deliberately shared by all
 /// read-only CLI summary helpers so they agree on validation and format
 /// compatibility.
-fn read_persisted_shard_collections(
-    base_dir: &std::path::Path,
-) -> Option<(u64, Vec<PersistedShardRoom>)> {
+fn read_persisted_shard_collections(base_dir: &std::path::Path) -> Option<PersistedShardDirectory> {
     let buf = fs::read(base_dir.join("shard_collections.bin")).ok()?;
     if buf.len() < SHARD_ROOMS_HEADER_LEN
         || &buf[0..4] != SHARD_ROOMS_MAGIC
@@ -260,7 +290,8 @@ fn read_persisted_shard_collections(
     if body.len().checked_rem(SHARD_ROOMS_RECORD_LEN) != Some(0) {
         return None;
     }
-    let persisted_at = u64::from_le_bytes(buf[5..13].try_into().ok()?);
+    let fingerprint = u64::from_le_bytes(buf[5..13].try_into().ok()?);
+    let persisted_at = u64::from_le_bytes(buf[13..21].try_into().ok()?);
     let records = body
         .chunks_exact(SHARD_ROOMS_RECORD_LEN)
         .map(|chunk| {
@@ -277,12 +308,16 @@ fn read_persisted_shard_collections(
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some((persisted_at, records))
+    Some(PersistedShardDirectory {
+        fingerprint,
+        persisted_at,
+        records,
+    })
 }
 
 /// The durable insertion order supplied by the inspection directory.
 fn persisted_collection_order(base_dir: &std::path::Path) -> Option<Vec<[u8; 16]>> {
-    let (_, records) = read_persisted_shard_collections(base_dir)?;
+    let records = read_persisted_shard_collections(base_dir)?.records;
     let mut orders: HashMap<[u8; 16], u64> = HashMap::new();
     for record in records {
         let order = record.insertion_order;
@@ -889,6 +924,70 @@ impl PackfileStorage {
         base_dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE)
     }
 
+    /// Attempt to recover the per-shard/collection bookkeeping from the
+    /// inspection sidecar, gated on the checkpoint's own pack fingerprint.
+    ///
+    /// Returns `BookkeepingSource::Sidecar` plus the slotted counts (for home
+    /// shard selection) and pack-keyed entries (for the shard directory) only
+    /// when the sidecar is gated to this exact pack set and describes every
+    /// non-deleted collection completely — per-pack counts must sum to the
+    /// checkpoint's own slot count. Stale, corrupt, or absent sidecars (or
+    /// one referencing packs that aren't live open shards) fall through to
+    /// `BookkeepingSource::SlotScan` with empty maps: correctness never
+    /// depends on the sidecar, it only accelerates.
+    #[allow(clippy::type_complexity)]
+    fn gated_sidecar_bookkeeping(
+        base_dir: &std::path::Path,
+        checkpoint: &crate::index::checkpoint::LoadedCheckpoint,
+        open_shards: &[(u16, u64, PathBuf, u64)],
+        deleted_collections: &HashSet<[u8; 16]>,
+    ) -> (
+        BookkeepingSource,
+        HashMap<[u8; 16], HashMap<u16, u64>>,
+        HashMap<[u8; 16], Vec<(u64, u64)>>,
+    ) {
+        let mut counts: HashMap<[u8; 16], HashMap<u16, u64>> = HashMap::new();
+        let mut pack_entries: HashMap<[u8; 16], Vec<(u64, u64)>> = HashMap::new();
+        let Some(directory) = read_persisted_shard_collections(base_dir) else {
+            return (BookkeepingSource::SlotScan, counts, pack_entries);
+        };
+        if directory.fingerprint != checkpoint.fingerprint {
+            return (BookkeepingSource::SlotScan, counts, pack_entries);
+        }
+        let pack_to_slot: HashMap<u64, u16> = open_shards
+            .iter()
+            .map(|(slot, pack_id, _, _)| (*pack_id, *slot))
+            .collect();
+        for record in &directory.records {
+            if deleted_collections.contains(&record.collection_id) {
+                continue;
+            }
+            let Some(slot) = pack_to_slot.get(&record.pack_id) else {
+                return (BookkeepingSource::SlotScan, counts, pack_entries);
+            };
+            counts
+                .entry(record.collection_id)
+                .or_default()
+                .insert(*slot, record.count);
+            pack_entries
+                .entry(record.collection_id)
+                .or_default()
+                .push((record.pack_id, record.count));
+        }
+        for loaded in &checkpoint.collections {
+            if deleted_collections.contains(&loaded.collection_id) {
+                continue;
+            }
+            let Some(slot_counts) = counts.get(&loaded.collection_id) else {
+                return (BookkeepingSource::SlotScan, counts, pack_entries);
+            };
+            if slot_counts.values().copied().sum::<u64>() != u64::from(loaded.slot_count) {
+                return (BookkeepingSource::SlotScan, counts, pack_entries);
+            }
+        }
+        (BookkeepingSource::Sidecar, counts, pack_entries)
+    }
+
     /// Fast-path index loading for `open_with_options`: build the
     /// per-collection state directly from the persisted-index checkpoint
     /// instead of rescanning every packfile.
@@ -928,6 +1027,21 @@ impl PackfileStorage {
             .map(|(slot, pack_id, _, _)| (*slot, *pack_id))
             .collect();
 
+        // The inspection sidecar is the same reduced per-(pack, collection)
+        // bookkeeping the loop below would recover by walking every slot of
+        // every collection index. Accept it only when it is gated to this
+        // exact pack set and describes every non-deleted collection completely
+        // (see `gated_sidecar_bookkeeping`); any mismatch falls through to the
+        // faithful slot walk, because the sidecar is an acceleration and
+        // correctness never depends on it.
+        let (bookkeeping_source, mut sidecar_counts, mut sidecar_pack_entries) =
+            Self::gated_sidecar_bookkeeping(
+                base_dir,
+                &checkpoint,
+                open_shards,
+                deleted_collections,
+            );
+
         let mut scan_out = RoomScanOutput::default();
         let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
         let materialization_started = std::time::Instant::now();
@@ -946,28 +1060,54 @@ impl PackfileStorage {
                 loaded.capacity,
                 loaded.slot_count,
             );
-            let counts = index.shard_counts();
+            let counts = match bookkeeping_source {
+                BookkeepingSource::Sidecar => sidecar_counts
+                    .remove(&loaded.collection_id)
+                    .unwrap_or_default(),
+                BookkeepingSource::SlotScan => index.shard_counts(),
+            };
             // Seed the home shard from the highest shard a slot references —
             // the nearest proxy for the scan path's "shard of the last
             // record", since slots were appended in shard-id order.
             if let Some(&home_shard) = counts.keys().max() {
                 shards.set_collection_home(&loaded.collection_id, home_shard);
             }
-            for (&shard_id, &count) in &counts {
-                let pack_id = slot_to_pack_id
-                    .get(&shard_id)
-                    .copied()
-                    .unwrap_or(u64::from(shard_id));
-                scan_out
-                    .shard_collections
-                    .entry(pack_id)
-                    .or_default()
-                    .insert(loaded.collection_id, count);
-                scan_out
-                    .collection_shards
-                    .entry(loaded.collection_id)
-                    .or_default()
-                    .insert(pack_id);
+            match bookkeeping_source {
+                BookkeepingSource::SlotScan => {
+                    for (&shard_id, &count) in &counts {
+                        let pack_id = slot_to_pack_id
+                            .get(&shard_id)
+                            .copied()
+                            .unwrap_or(u64::from(shard_id));
+                        scan_out
+                            .shard_collections
+                            .entry(pack_id)
+                            .or_default()
+                            .insert(loaded.collection_id, count);
+                        scan_out
+                            .collection_shards
+                            .entry(loaded.collection_id)
+                            .or_default()
+                            .insert(pack_id);
+                    }
+                }
+                BookkeepingSource::Sidecar => {
+                    for (pack_id, count) in sidecar_pack_entries
+                        .remove(&loaded.collection_id)
+                        .unwrap_or_default()
+                    {
+                        scan_out
+                            .shard_collections
+                            .entry(pack_id)
+                            .or_default()
+                            .insert(loaded.collection_id, count);
+                        scan_out
+                            .collection_shards
+                            .entry(loaded.collection_id)
+                            .or_default()
+                            .insert(pack_id);
+                    }
+                }
             }
             scan_out.collections.insert(
                 loaded.collection_id,
@@ -979,6 +1119,7 @@ impl PackfileStorage {
             collection_order.push(loaded.collection_id);
         }
         timings.index_materialization = materialization_started.elapsed();
+        timings.bookkeeping_source = bookkeeping_source;
 
         Some((scan_out, collection_order))
     }
@@ -1381,12 +1522,28 @@ impl PackfileStorage {
     /// Writes to a temp file and renames into place, same crash-safety
     /// pattern as `ShardPool::persist_stats`.
     ///
+    /// The header pins the directory to the `pack_fingerprint` of the
+    /// current committed pack set. Only the caller writing right after
+    /// flush+fsync (the index-checkpoint rewrite) is guaranteed to produce a
+    /// fingerprint matching the checkpoint's, which is what lets open rebuild
+    /// per-shard counts from these records instead of walking every slot; any
+    /// other write leaves a directory that open either accepts (pack set
+    /// unchanged) or safely falls back from.
+    ///
     /// # Errors
     /// Returns `StorageError` on write or rename failure.
     pub fn persist_shard_collections(&self) -> Result<(), StorageError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(SHARD_ROOMS_MAGIC);
         buf.push(SHARD_ROOMS_VERSION);
+        let packs: Vec<(u64, u64)> = self
+            .shards
+            .all_shards()
+            .into_iter()
+            .map(|(_, shard)| (shard.pack_id, shard.file_len()))
+            .collect();
+        let fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
+        buf.extend_from_slice(&fingerprint.to_le_bytes());
         let persisted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -1498,6 +1655,16 @@ impl PackfileStorage {
         )
         .map_err(StorageError::Io)?;
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+        // Keep the inspection directory gated to the same pack set the
+        // checkpoint just became: ride the checkpoint rewrite (best-effort)
+        // so the next open can rebuild per-shard counts from records instead
+        // of walking every slot. Deliberately not wired to bare sync_all —
+        // after a dirty sync() the checkpoint advances to a new fingerprint
+        // while a sync_all-only sidecar would stay stale, silently regressing
+        // the very reopen this sidecar exists to speed up. A failure here
+        // leaves the previous directory stale; the fingerprint gate then
+        // falls back to the slot walk until the next rewrite.
+        self.persist_shard_collections_best_effort();
         Ok(())
     }
 
@@ -1522,7 +1689,7 @@ impl PackfileStorage {
     /// feature, or a writer hasn't flushed it yet).
     #[must_use]
     pub fn collection_directory_from_disk(base_dir: &std::path::Path) -> Vec<([u8; 16], u64)> {
-        let Some((_, records)) = read_persisted_shard_collections(base_dir) else {
+        let Some(records) = read_persisted_shard_collections(base_dir).map(|d| d.records) else {
             return Vec::new();
         };
         let mut totals: HashMap<[u8; 16], (u64, u64)> = HashMap::new();
@@ -1578,7 +1745,7 @@ impl PackfileStorage {
     pub fn collection_shards_from_disk(
         base_dir: &std::path::Path,
     ) -> Option<HashMap<[u8; 16], Vec<u64>>> {
-        let (_, records) = read_persisted_shard_collections(base_dir)?;
+        let records = read_persisted_shard_collections(base_dir)?.records;
         let mut shards: HashMap<[u8; 16], Vec<u64>> = HashMap::new();
         for record in records {
             shards
@@ -1601,7 +1768,7 @@ impl PackfileStorage {
     /// explicitly open the store and rebuild its indexes instead.
     #[must_use]
     pub fn shard_node_counts_from_disk(base_dir: &std::path::Path) -> Option<HashMap<u64, u64>> {
-        let (_, records) = read_persisted_shard_collections(base_dir)?;
+        let records = read_persisted_shard_collections(base_dir)?.records;
         let mut totals = HashMap::new();
         for record in records {
             let total = totals.entry(record.pack_id).or_insert(0_u64);
@@ -1620,7 +1787,7 @@ impl PackfileStorage {
     pub fn shard_collection_counts_from_disk(
         base_dir: &std::path::Path,
     ) -> Option<HashMap<u64, u64>> {
-        let (_, records) = read_persisted_shard_collections(base_dir)?;
+        let records = read_persisted_shard_collections(base_dir)?.records;
         let mut totals = HashMap::new();
         for record in records {
             let count = totals.entry(record.pack_id).or_insert(0_u64);
@@ -1635,7 +1802,7 @@ impl PackfileStorage {
     /// `ShardPool::stats_persisted_at` does for shard IO stats.
     #[must_use]
     pub fn collection_directory_persisted_at(base_dir: &std::path::Path) -> Option<u64> {
-        read_persisted_shard_collections(base_dir).map(|(persisted_at, _)| persisted_at)
+        read_persisted_shard_collections(base_dir).map(|d| d.persisted_at)
     }
 
     /// Pin one `Arc<Shard>` per distinct shard id, keeping each shard's file

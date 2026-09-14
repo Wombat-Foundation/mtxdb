@@ -188,6 +188,104 @@ mod tests {
     }
 
     #[test]
+    fn shard_directory_bookkeeping_gate_and_fallback() {
+        use mtxdb_core::packfile::storage::{BookkeepingSource, OpenPath};
+
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_sidecar_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+        drop(store);
+
+        let sidecar = dir.join("shard_collections.bin");
+        let header_fingerprint_offset = 5usize;
+        let last_assert = |reopened: &PackfileStorage, source: BookkeepingSource| {
+            let open = reopened
+                .open_timings()
+                .expect("open must record its phase timings");
+            assert_eq!(
+                open.path,
+                OpenPath::Checkpoint,
+                "every case here keeps a valid checkpoint; only bookkeeping source changes"
+            );
+            assert_eq!(
+                open.bookkeeping_source, source,
+                "bookkeeping must come from the expected source"
+            );
+            assert_all_records(reopened);
+        };
+
+        // Happy path: a valid fingerprint-gated directory serves the open's
+        // per-shard bookkeeping without walking any slots.
+        assert!(
+            sidecar.exists(),
+            "sync_all must persist the shard→collection directory"
+        );
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        last_assert(&reopened, BookkeepingSource::Sidecar);
+        drop(reopened);
+
+        // Corrupt: garbage bytes → the slot-walk fallback, still correct.
+        std::fs::write(&sidecar, vec![0xAB; 256]).unwrap();
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        last_assert(&reopened, BookkeepingSource::SlotScan);
+        drop(reopened);
+
+        // Stale fingerprint: regenerate a valid directory (write + sync), then
+        // flip one byte inside its fingerprint header so it no longer matches
+        // the checkpoint's → fall back, still correct.
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let cid = collection_id(1);
+        let extra = node_id(1, 555);
+        store
+            .put(
+                &cid,
+                &extra,
+                &NodeData::new(Bytes::from(payload_for(1, 555))),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+        std::fs::write(&sidecar, {
+            let mut bytes = std::fs::read(&sidecar).unwrap();
+            bytes[header_fingerprint_offset] ^= 0xFF;
+            bytes
+        })
+        .unwrap();
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        last_assert(&reopened, BookkeepingSource::SlotScan);
+        drop(reopened);
+
+        // Missing: removed entirely → same fallback, still correct.
+        std::fs::remove_file(&sidecar).unwrap();
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        last_assert(&reopened, BookkeepingSource::SlotScan);
+        drop(reopened);
+
+        // The gate also recovers: one more write + sync regenerates a valid
+        // directory and the fast path returns.
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let extra = node_id(2, 555);
+        store
+            .put(
+                &collection_id(2),
+                &extra,
+                &NodeData::new(Bytes::from(payload_for(2, 555))),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        last_assert(&reopened, BookkeepingSource::Sidecar);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn corrupt_or_missing_checkpoint_falls_back_to_rescan() {
         let dir =
             std::env::temp_dir().join(format!("mtxdb_index_checkpoint_bad_{}", std::process::id()));
