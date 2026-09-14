@@ -2187,8 +2187,10 @@ impl PackfileStorage {
     fn test_persist_index_checkpoint_with_delay(
         &self,
         delay: std::time::Duration,
+        entered_unlocked_window: &AtomicBool,
     ) -> Result<(), StorageError> {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
+            entered_unlocked_window.store(true, Ordering::Release);
             return Ok(());
         }
         let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
@@ -2218,6 +2220,11 @@ impl PackfileStorage {
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         drop(guards);
         drop(create_guard);
+
+        // The test waits on this: it now *knows* the rewrite is sleeping in
+        // its unlocked window rather than guessing via a fixed sleep, so a
+        // put issued from here provably overlaps the delay.
+        entered_unlocked_window.store(true, Ordering::Release);
 
         std::thread::sleep(delay);
 
@@ -5749,25 +5756,27 @@ mod tests {
             .unwrap();
         store.delete_collection(&throwaway).unwrap();
 
-        let entered_unlocked_window = AtomicBool::new(false);
+        let entered_unlocked_window = std::sync::Arc::new(AtomicBool::new(false));
         let put_elapsed = std::sync::Mutex::new(None::<Duration>);
 
         thread::scope(|scope| {
             {
                 let store = &store;
+                let hook_flag = std::sync::Arc::clone(&entered_unlocked_window);
                 scope.spawn(move || {
                     store
-                        .test_persist_index_checkpoint_with_delay(ARTIFICIAL_DELAY)
+                        .test_persist_index_checkpoint_with_delay(ARTIFICIAL_DELAY, &hook_flag)
                         .unwrap();
                 });
             }
-            // A generous head start: the locked prefix (flush + fingerprint +
-            // snapshot + rotation) does no artificial or real I/O-heavy work,
-            // so by the time this elapses the rewrite thread is reliably
-            // already sleeping inside the artificial delay, not still in the
-            // locked section.
-            thread::sleep(Duration::from_millis(50));
-            entered_unlocked_window.store(true, Ordering::Relaxed);
+            // Wait for the hook to confirm it has released every lock and is
+            // now sleeping inside the artificial delay — a real signal from
+            // the rewrite thread, not a fixed-sleep guess that depends on
+            // test-machine timing. The put issued below then provably runs
+            // concurrently with the unlocked rewrite window.
+            while !entered_unlocked_window.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
 
             let started = Instant::now();
             store
@@ -5780,7 +5789,6 @@ mod tests {
             *put_elapsed.lock().unwrap() = Some(started.elapsed());
         });
 
-        assert!(entered_unlocked_window.load(Ordering::Relaxed));
         let put_elapsed = put_elapsed.into_inner().unwrap().unwrap();
         assert!(
             put_elapsed < ARTIFICIAL_DELAY / 3,

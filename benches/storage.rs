@@ -1256,15 +1256,15 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
 /// serialize + fsync + rename now runs unlocked, so a concurrent `put()` no
 /// longer waits on the rewrite's lock. This bench measures the *observed*
 /// latency at real disk speed, which also includes genuine device-level
-/// contention (`put()`'s own write/fsync queuing behind the rewrite's on the
+/// contention (`put()`'s own buffered write queuing behind the rewrite's on the
 /// same disk) that the lock-scope fix neither causes nor removes — so
-/// `PUT_MAX_MS` approaching or exceeding `REWRITE_MS` here is expected at
-/// times and not on its own evidence of a regression. The actual lock-scope
+/// `PUT_APPEND_MAX_MS` approaching or exceeding `REWRITE_MS` here is expected
+/// at times and not on its own evidence of a regression. The actual lock-scope
 /// claim (put doesn't block on the *lock*) is proven deterministically,
 /// independent of disk speed, by the `test_put_does_not_block_on_slow_checkpoint_rewrite`
 /// unit test (uses an injected delay instead of real I/O, runs in
 /// milliseconds on every `cargo test`). This bench exists to track the real
-/// end-to-end number as a trend, not as a pass/fail gate.
+/// append-latency number as a trend, not as a pass/fail gate.
 fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_collection: usize) {
     let dir = bench_root().join(format!(
         "mtxdb_bench_checkpoint_latency_{collections}x{records_per_collection}"
@@ -1312,12 +1312,18 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
     let done = std::sync::atomic::AtomicBool::new(false);
     let rewrites_done = AtomicU64::new(0);
     let max_put_latency_micros = AtomicU64::new(0);
+    // Set by the rewrite thread after its very first sync_all, so the
+    // sampler cannot finish all 500 puts before any rewrite has begun —
+    // without this, a fast/lucky runner yields a serial (non-concurrent)
+    // sample with REWRITES=0.
+    let first_rewrite_done = std::sync::atomic::AtomicBool::new(false);
 
     std::thread::scope(|scope| {
         {
             let store = &store;
             let done = &done;
             let rewrites_done = &rewrites_done;
+            let first_rewrite_done = &first_rewrite_done;
             scope.spawn(move || {
                 let mut r = 0u64;
                 while !done.load(Ordering::Relaxed) {
@@ -1334,6 +1340,9 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
                     store.delete_collection(&throwaway).unwrap();
                     store.sync_all().unwrap();
                     r += 1;
+                    if r == 1 {
+                        first_rewrite_done.store(true, Ordering::Relaxed);
+                    }
                 }
                 rewrites_done.store(r, Ordering::Relaxed);
             });
@@ -1342,7 +1351,14 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
             let store = &store;
             let done = &done;
             let max_put_latency_micros = &max_put_latency_micros;
+            let first_rewrite_done = &first_rewrite_done;
             scope.spawn(move || {
+                // Start barrier: don't begin sampling until the background
+                // rewrite thread has completed its first sync_all, so the
+                // sampled put()s actually run concurrently with rewrites.
+                while !first_rewrite_done.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
                 let mut collection = [0u8; 16];
                 collection[0] = 0xEE;
                 for i in 0..500u64 {
@@ -1369,21 +1385,23 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
     );
     println!(
         "bench: checkpoint_latency COLLECTIONS={collections} RECORDS_PER_COLLECTION={records_per_collection} \
-         REWRITE_MS={:.3} PUT_MAX_MS={:.3} REWRITES={}",
+         REWRITE_MS={:.3} PUT_APPEND_MAX_MS={:.3} REWRITES={}",
         baseline_rewrite.as_secs_f64() * 1e3,
         max_put_latency.as_secs_f64() * 1e3,
         rewrites_done.load(Ordering::Relaxed),
     );
     eprintln!("  baseline full rewrite:      {baseline_rewrite:.2?}");
-    eprintln!("  max concurrent put latency: {max_put_latency:.2?}");
+    eprintln!("  max concurrent append:      {max_put_latency:.2?}");
     eprintln!(
         "  concurrent rewrites during put sampling: {}",
         rewrites_done.load(Ordering::Relaxed)
     );
+    eprintln!("  Note: PUT_APPEND_MAX_MS is append/page-cache latency only — the timed put()");
+    eprintln!("  does NOT fsync; durability is committed by the background thread's separate");
+    eprintln!("  sync_all(). It approaching or exceeding REWRITE_MS here does NOT by itself mean");
     eprintln!(
-        "  Note: PUT_MAX_MS approaching or exceeding REWRITE_MS here does NOT by itself mean"
+        "  the lock scope regressed — put() still does its own buffered write, which can queue"
     );
-    eprintln!("  the lock scope regressed — put() still does its own write/fsync, which can queue");
     eprintln!(
         "  behind the rewrite's write+fsync at the OS/disk level even though no lock is held."
     );
@@ -1396,9 +1414,7 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
     eprintln!(
         "  independent of disk speed, by test_put_does_not_block_on_slow_checkpoint_rewrite."
     );
-    eprintln!(
-        "  Use this bench to track real end-to-end latency trends, not as a pass/fail signal."
-    );
+    eprintln!("  Use this bench to track real append-latency trends, not as a pass/fail signal.");
     eprintln!();
 
     drop(store);
