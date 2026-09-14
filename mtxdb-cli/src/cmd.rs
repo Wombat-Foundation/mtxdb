@@ -1106,6 +1106,10 @@ fn print_pack_lifetime(path: &Path) {
 }
 
 /// Print the same per-pack summary row `mtxdb shards` would, for one pack ID.
+#[allow(
+    clippy::too_many_lines,
+    reason = "prints one pack's stats, physical layout, and per-collection breakdown in sequence"
+)]
 fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let pack_id = parse_pack_id_selector(selector)?;
     let dir = selected_pool_dir(cli)?;
@@ -1120,13 +1124,20 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let (stats_map, _) = decode_stats_snapshot(&dir);
     let node_counts = PackfileStorage::shard_node_counts_from_disk(&dir);
     let collection_counts = PackfileStorage::shard_collection_counts_from_disk(&dir);
+    // Scoped to the selected pack, not the pool: `shard_entries` (and thus
+    // the table's per-row bytes/nodes/syncs) already contain only this one
+    // pack, so the "total" row below must match rather than mixing in
+    // pool-wide collection/index figures from every other pack.
     let total_collections = collection_counts
         .as_ref()
-        .map(|_| PackfileStorage::collection_directory_from_disk(&dir).len());
-    let (index_requirement, index_requirements_by_shard) = index_requirements_from_disk(&dir)
-        .map_or((None, None), |(total, by_shard)| {
-            (Some(total), Some(by_shard))
-        });
+        .and_then(|counts| counts.get(&pack_id))
+        .map(|&count| usize::try_from(count).unwrap_or(usize::MAX));
+    let index_requirements_by_shard =
+        index_requirements_from_disk(&dir).map(|(_, by_shard)| by_shard);
+    let index_requirement = index_requirements_by_shard
+        .as_ref()
+        .and_then(|by_shard| by_shard.get(&pack_id))
+        .copied();
     print_shard_table(
         &shard_entries,
         &stats_map,
@@ -1162,41 +1173,61 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     );
 
     let collection_shards = PackfileStorage::collection_shards_from_disk(&dir);
-    if let Ok(physical) = physical_layout(&dir) {
-        print_pack_physical_layout(&shard_entries, &physical);
-        if let Some(pack_layout) = physical.packs.get(&pack_id) {
-            let mut collections: Vec<[u8; 16]> = pack_layout.collections.iter().copied().collect();
-            collections.sort_unstable();
-            println!();
-            println!("{:>34}  {:>10}", "collection", "bytes");
-            for collection_id in collections {
-                let collection_layout = physical.collections.get(&collection_id);
-                let bytes = collection_layout
-                    .and_then(|layout| layout.pack_bytes.get(&pack_id))
-                    .copied()
-                    .unwrap_or(0);
-                let other_packs = collection_shards
-                    .as_ref()
-                    .and_then(|shards| shards.get(&collection_id))
-                    .map_or(0, |shards| shards.len().saturating_sub(1));
-                let note = if other_packs > 0 {
-                    let spread = collection_layout
-                        .map_or(0, CollectionPhysicalLayout::avoidable_spread_bytes);
-                    format!(
-                        "(also in {other_packs} other pack{}, {} avoidably spread)",
-                        if other_packs == 1 { "" } else { "s" },
-                        fmt_bytes(spread)
-                    )
-                } else {
-                    String::new()
-                };
-                println!(
-                    "{:>34}  {:>10}  {}",
-                    hex_encode(&collection_id),
-                    fmt_bytes(bytes),
-                    note
-                );
+    match physical_layout(&dir) {
+        Ok(physical) => {
+            print_pack_physical_layout(&shard_entries, &physical);
+            if let Some(pack_layout) = physical.packs.get(&pack_id) {
+                let mut collections: Vec<[u8; 16]> =
+                    pack_layout.collections.iter().copied().collect();
+                collections.sort_unstable();
+                println!();
+                println!("{:>34}  {:>10}", "collection", "bytes");
+                for collection_id in collections {
+                    let collection_layout = physical.collections.get(&collection_id);
+                    let bytes = collection_layout
+                        .and_then(|layout| layout.pack_bytes.get(&pack_id))
+                        .copied()
+                        .unwrap_or(0);
+                    // A selected pack that holds only superseded frames for this
+                    // collection is absent from `collection_shards` (which lists
+                    // only live/reachable packs), so `pack_id` itself may not be
+                    // among `shards` here -- subtracting one unconditionally
+                    // would then undercount the collection's other live packs.
+                    let shards = collection_shards
+                        .as_ref()
+                        .and_then(|shards| shards.get(&collection_id));
+                    let other_packs = shards.map_or(0, |shards| {
+                        if shards.contains(&pack_id) {
+                            shards.len().saturating_sub(1)
+                        } else {
+                            shards.len()
+                        }
+                    });
+                    let note = if other_packs > 0 {
+                        let spread = collection_layout
+                            .map_or(0, CollectionPhysicalLayout::avoidable_spread_bytes);
+                        format!(
+                            "(also in {other_packs} other pack{}, {} avoidably spread)",
+                            if other_packs == 1 { "" } else { "s" },
+                            fmt_bytes(spread)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "{:>34}  {:>10}  {}",
+                        hex_encode(&collection_id),
+                        fmt_bytes(bytes),
+                        note
+                    );
+                }
             }
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: unable to compute physical layout for `{}`: {error}",
+                dir.display()
+            );
         }
     }
     Ok(())
