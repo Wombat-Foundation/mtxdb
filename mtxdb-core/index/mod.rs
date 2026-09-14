@@ -1,5 +1,7 @@
+use memmap2::Mmap;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub mod checkpoint;
 pub mod format;
@@ -102,8 +104,10 @@ pub struct LossyIndex {
     mask: u32,
     /// Shift to extract top bits from hash for bucket index.
     shift: u32,
-    /// The flat slot array.
-    slots: Vec<AtomicU64>,
+    /// The flat slot array. Checkpoint-loaded indexes borrow the immutable
+    /// raw slots from their mmap until their first write, which clones them
+    /// into the owned atomic representation.
+    slots: SlotStorage,
     /// The first 64 bits of each slot's hash. Index slots intentionally pack
     /// only a tag, shard, and offset; retaining the home hash separately lets
     /// a live writer grow the table without rescanning the packfiles.
@@ -116,18 +120,50 @@ pub struct LossyIndex {
     len: AtomicU32,
 }
 
+#[derive(Debug)]
+enum SlotStorage {
+    Owned(Vec<AtomicU64>),
+    Mmap { mmap: Arc<Mmap>, offset: usize },
+}
+
+impl SlotStorage {
+    #[inline]
+    fn get(&self, index: usize) -> u64 {
+        match self {
+            Self::Owned(slots) => slots[index].load(Ordering::Acquire),
+            Self::Mmap { mmap, offset } => {
+                let start = offset.saturating_add(index.saturating_mul(8));
+                let bytes: [u8; 8] = mmap[start..start.saturating_add(8)]
+                    .try_into()
+                    .expect("validated checkpoint slot range");
+                u64::from_le_bytes(bytes)
+            }
+        }
+    }
+
+    fn materialize(&self, capacity: usize) -> Vec<AtomicU64> {
+        (0..capacity)
+            .map(|index| AtomicU64::new(self.get(index)))
+            .collect()
+    }
+}
+
 impl Clone for LossyIndex {
     fn clone(&self) -> Self {
         Self {
             capacity: self.capacity,
             mask: self.mask,
             shift: self.shift,
-            slots: self
-                .slots
-                .iter()
-                .map(|slot| AtomicU64::new(slot.load(Ordering::Acquire)))
-                .collect(),
-            homes: Mutex::new(self.homes.lock().clone()),
+            slots: SlotStorage::Owned(self.slots.materialize(self.capacity as usize)),
+            // Checkpoint-backed indexes deliberately omit source hashes. On
+            // their first write, clone their slots into owned storage but
+            // keep an empty home table; `can_grow` remains false, so a later
+            // capacity boundary correctly falls back to a pack rebuild.
+            homes: Mutex::new(if self.is_mmap_backed() {
+                vec![0; self.capacity as usize]
+            } else {
+                self.homes.lock().clone()
+            }),
             can_grow: self.can_grow,
             len: AtomicU32::new(self.len.load(Ordering::Acquire)),
         }
@@ -152,7 +188,7 @@ impl LossyIndex {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
-            slots: (0..capacity_usize).map(|_| AtomicU64::new(0)).collect(),
+            slots: SlotStorage::Owned((0..capacity_usize).map(|_| AtomicU64::new(0)).collect()),
             homes: Mutex::new(vec![0; capacity_usize]),
             can_grow: true,
             len: AtomicU32::new(0),
@@ -200,7 +236,10 @@ impl LossyIndex {
         let mut bucket = self.bucket_for_home(home);
 
         loop {
-            let slot = IndexSlot(self.slots[bucket].load(Ordering::Acquire));
+            let SlotStorage::Owned(slots) = &self.slots else {
+                return Err(InsertError::TableFull);
+            };
+            let slot = IndexSlot(slots[bucket].load(Ordering::Acquire));
             if slot.is_empty() {
                 // Only reject when actually inserting into a new slot
                 let threshold = self.capacity.wrapping_mul(3) / 4;
@@ -211,8 +250,7 @@ impl LossyIndex {
                 // the slot last so concurrent readers see either the prior
                 // empty slot or a complete record location.
                 self.homes.lock()[bucket] = home;
-                self.slots[bucket]
-                    .store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
+                slots[bucket].store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
@@ -220,8 +258,7 @@ impl LossyIndex {
             // (same hash, different offset after repack)
             if slot.tag() == tag {
                 self.homes.lock()[bucket] = home;
-                self.slots[bucket]
-                    .store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
+                slots[bucket].store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
                 return Ok(());
             }
             bucket = bucket.wrapping_add(1) & self.mask as usize;
@@ -240,17 +277,20 @@ impl LossyIndex {
         }
         let grown = Self::new(self.capacity as usize * 2);
         let homes = self.homes.lock();
-        for (slot, home) in self.slots.iter().zip(homes.iter().copied()) {
-            let slot = IndexSlot(slot.load(Ordering::Acquire));
+        for (index, home) in homes.iter().copied().enumerate() {
+            let slot = IndexSlot(self.slots.get(index));
             if slot.is_empty() {
                 continue;
             }
             let mut bucket = grown.bucket_for_home(home);
-            while !IndexSlot(grown.slots[bucket].load(Ordering::Relaxed)).is_empty() {
+            while !IndexSlot(grown.slot_at(bucket)).is_empty() {
                 bucket = bucket.wrapping_add(1) & grown.mask as usize;
             }
             grown.homes.lock()[bucket] = home;
-            grown.slots[bucket].store(slot.0, Ordering::Relaxed);
+            let SlotStorage::Owned(slots) = &grown.slots else {
+                unreachable!("new index is owned")
+            };
+            slots[bucket].store(slot.0, Ordering::Relaxed);
             grown.len.fetch_add(1, Ordering::Relaxed);
         }
         Some(grown)
@@ -282,7 +322,7 @@ impl LossyIndex {
         let tag = Self::tag(hash);
         let bucket = self.bucket(hash);
         LookupIter {
-            slots: &self.slots,
+            index: self,
             tag,
             bucket,
             mask: self.mask as usize,
@@ -328,8 +368,8 @@ impl LossyIndex {
     #[must_use]
     pub fn referenced_shard_ids(&self) -> [bool; crate::shard::MAX_SHARDS] {
         let mut seen = [false; crate::shard::MAX_SHARDS];
-        for slot in &self.slots {
-            let slot = IndexSlot(slot.load(Ordering::Acquire));
+        for index in 0..self.capacity as usize {
+            let slot = IndexSlot(self.slot_at(index));
             if !slot.is_empty() {
                 let id = slot.shard_id() as usize;
                 if id < crate::shard::MAX_SHARDS {
@@ -350,8 +390,8 @@ impl LossyIndex {
     #[must_use]
     pub fn shard_counts(&self) -> std::collections::HashMap<u16, u64> {
         let mut counts = std::collections::HashMap::new();
-        for slot in &self.slots {
-            let slot = IndexSlot(slot.load(Ordering::Acquire));
+        for index in 0..self.capacity as usize {
+            let slot = IndexSlot(self.slot_at(index));
             if !slot.is_empty() {
                 let entry = counts.entry(slot.shard_id()).or_insert(0u64);
                 *entry = entry.saturating_add(1);
@@ -369,8 +409,8 @@ impl LossyIndex {
     /// past it.
     #[must_use]
     pub fn references_shard(&self, shard_id: u16) -> bool {
-        self.slots.iter().any(|slot| {
-            let slot = IndexSlot(slot.load(Ordering::Acquire));
+        (0..self.capacity as usize).any(|index| {
+            let slot = IndexSlot(self.slot_at(index));
             !slot.is_empty() && slot.shard_id() == shard_id
         })
     }
@@ -381,8 +421,8 @@ impl LossyIndex {
         let byte_len = 8_usize.wrapping_add((self.capacity as usize).wrapping_mul(8));
         let mut buf = Vec::with_capacity(byte_len);
         buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
-        for slot in &self.slots {
-            let slot = IndexSlot(slot.load(Ordering::Acquire));
+        for index in 0..self.capacity as usize {
+            let slot = IndexSlot(self.slot_at(index));
             buf.extend_from_slice(&slot.0.to_le_bytes());
         }
         buf
@@ -433,11 +473,37 @@ impl LossyIndex {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
-            slots,
+            slots: SlotStorage::Owned(slots),
             homes: Mutex::new(vec![0; capacity_usize]),
             can_grow: false,
             len: AtomicU32::new(len),
         })
+    }
+
+    /// Build a read-only index directly over a validated checkpoint's raw
+    /// slots. The first write clones it into the normal owned representation.
+    #[must_use]
+    pub fn from_mmap_slots(mmap: Arc<Mmap>, offset: usize, capacity: u32, len: u32) -> Self {
+        Self {
+            mask: capacity.wrapping_sub(1),
+            capacity,
+            shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
+            slots: SlotStorage::Mmap { mmap, offset },
+            homes: Mutex::new(Vec::new()),
+            can_grow: false,
+            len: AtomicU32::new(len),
+        }
+    }
+
+    /// True while the index borrows raw slots from a checkpoint mapping.
+    #[must_use]
+    pub fn is_mmap_backed(&self) -> bool {
+        matches!(self.slots, SlotStorage::Mmap { .. })
+    }
+
+    #[inline]
+    fn slot_at(&self, index: usize) -> u64 {
+        self.slots.get(index)
     }
 }
 
@@ -486,7 +552,7 @@ impl std::error::Error for DeserializationError {}
 /// Yields `(shard_id, offset)` for each slot whose 24-bit tag matches,
 /// terminating at the first empty slot or after the full capacity is probed.
 pub struct LookupIter<'a> {
-    slots: &'a [AtomicU64],
+    index: &'a LossyIndex,
     tag: u32,
     bucket: usize,
     mask: usize,
@@ -500,7 +566,7 @@ impl Iterator for LookupIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.remaining > 0 {
             self.remaining = self.remaining.wrapping_sub(1);
-            let slot = IndexSlot(self.slots[self.bucket].load(Ordering::Acquire));
+            let slot = IndexSlot(self.index.slot_at(self.bucket));
             if slot.is_empty() {
                 return None;
             }

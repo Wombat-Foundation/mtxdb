@@ -27,6 +27,9 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use memmap2::Mmap;
 
 use super::format::{
     CheckpointHeader, CollectionDirEntry, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN,
@@ -51,10 +54,12 @@ pub struct LoadedCheckpoint {
     pub fingerprint: u64,
     /// One entry per collection, in the checkpoint's directory order.
     pub collections: Vec<LoadedCollection>,
+    /// Keeps the raw slot arrays alive for mmap-backed indexes built from
+    /// this checkpoint.
+    pub mmap: Arc<Mmap>,
 }
 
-/// One collection's raw slots, ready for [`crate::index::LossyIndex::deserialize`]
-/// (the 8-byte capacity header prefix is included in `blob`).
+/// One collection's raw slots in the checkpoint mapping.
 #[derive(Debug)]
 pub struct LoadedCollection {
     /// The collection whose slots these are.
@@ -62,8 +67,12 @@ pub struct LoadedCollection {
     /// Checkpoint generation for this collection (reserved for a future
     /// delta-log; always 0 today).
     pub generation: u64,
-    /// The 8-byte capacity header followed by `capacity * 8` raw slots.
-    pub blob: Vec<u8>,
+    /// Absolute byte offset of the raw `capacity * 8` slot array.
+    pub slots_offset: usize,
+    /// Allocated index capacity.
+    pub capacity: u32,
+    /// Number of non-empty slots, recorded at checkpoint write time.
+    pub slot_count: u32,
 }
 
 /// Deterministic FNV-1a hash of the `(pack_id, file_len)` set a checkpoint
@@ -196,7 +205,9 @@ pub fn write_checkpoint(
 /// checkpoint", and the caller falls back to rebuilding from the packs.
 #[must_use]
 pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
-    let buf = fs::read(path).ok()?;
+    let file = fs::File::open(path).ok()?;
+    let mmap = Arc::new(crate::packfile::map_pack(&file).ok()?);
+    let buf: &[u8] = &mmap;
     let header_bytes: [u8; CHECKPOINT_HEADER_LEN] = buf[..CHECKPOINT_HEADER_LEN].try_into().ok()?;
     let header = CheckpointHeader::decode(&header_bytes)?;
     if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
@@ -230,21 +241,20 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
         }
         let slots_len = (entry.capacity as usize).checked_mul(8)?;
         let region = slot_base.checked_add(usize::try_from(entry.slots_offset).ok()?)?;
-        let slots = buf.get(region..region.checked_add(slots_len)?)?;
-
-        let mut blob = Vec::with_capacity(8usize.wrapping_add(slots_len));
-        blob.extend_from_slice(&u64::from(entry.capacity).to_le_bytes());
-        blob.extend_from_slice(slots);
+        buf.get(region..region.checked_add(slots_len)?)?;
         collections.push(LoadedCollection {
             collection_id: entry.collection_id,
             generation: entry.generation,
-            blob,
+            slots_offset: region,
+            capacity: entry.capacity,
+            slot_count: entry.slot_count,
         });
     }
 
     Some(LoadedCheckpoint {
         fingerprint: header.pack_fingerprint,
         collections,
+        mmap,
     })
 }
 
@@ -329,18 +339,26 @@ mod tests {
             3,
             "checkpoint must preserve directory order and count"
         );
+        let mmap = Arc::clone(&loaded.mmap);
         for ((case, loaded), (_blob_id, expected_blob)) in
             cases.iter().zip(&loaded.collections).zip(&blobs)
         {
             let (expected_id, seed, count) = case;
             assert_eq!(loaded.collection_id, *expected_id);
+            let slots_len = (loaded.capacity as usize).saturating_mul(8);
             assert_eq!(
-                loaded.blob, *expected_blob,
+                &mmap[loaded.slots_offset..loaded.slots_offset.saturating_add(slots_len)],
+                &expected_blob[8..],
                 "slots must round-trip verbatim"
             );
 
-            // The deserialized index must find every hash the live index had.
-            let loaded_index = LossyIndex::deserialize(&loaded.blob).unwrap();
+            // The mmap-backed index must find every hash the live index had.
+            let loaded_index = LossyIndex::from_mmap_slots(
+                Arc::clone(&mmap),
+                loaded.slots_offset,
+                loaded.capacity,
+                loaded.slot_count,
+            );
             let original_index = LossyIndex::deserialize(expected_blob).unwrap();
             for i in 0..*count {
                 let hash = hash_for(*seed, i);

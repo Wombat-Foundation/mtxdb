@@ -937,9 +937,15 @@ impl PackfileStorage {
                 // logical-delete set is authoritative.
                 continue;
             }
-            // Malformed slots mean the checkpoint can't be trusted; rescan is
-            // the only faithful path.
-            let index = LossyIndex::deserialize(&loaded.blob).ok()?;
+            // The checkpoint reader has already validated this range. Keep it
+            // mmap-backed through the read-only fast path; the first writer
+            // copy-on-writes it into the normal atomic slot array.
+            let index = LossyIndex::from_mmap_slots(
+                Arc::clone(&checkpoint.mmap),
+                loaded.slots_offset,
+                loaded.capacity,
+                loaded.slot_count,
+            );
             let counts = index.shard_counts();
             // Seed the home shard from the highest shard a slot references —
             // the nearest proxy for the scan path's "shard of the last
@@ -3209,7 +3215,7 @@ impl StorageEngine for PackfileStorage {
         };
         let (shard_id, offset) = self.shards.put_record(&record)?;
         if let Some(gen) = self.generation(collection_id) {
-            if gen.index.insert(id, shard_id, offset).is_ok() {
+            if !gen.index.is_mmap_backed() && gen.index.insert(id, shard_id, offset).is_ok() {
                 let pack_id = self
                     .shards
                     .get_shard(shard_id)
