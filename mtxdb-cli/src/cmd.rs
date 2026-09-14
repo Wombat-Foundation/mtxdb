@@ -1396,9 +1396,18 @@ fn cmd_scan(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Res
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
-        println!("  collection={collection_hex} id={id_hex} @ {offset}");
-        if verbose {
-            print_scan_payload(&ShardPool::read_at(&shard, *offset)?.data);
+        let data = verbose
+            .then(|| ShardPool::read_at(&shard, *offset))
+            .transpose()?;
+        let suffix = data
+            .as_ref()
+            .and_then(|data| scan_payload_suffix(&data.data));
+        println!(
+            "  collection={collection_hex} id={id_hex} @ {offset}{suffix}",
+            suffix = suffix.as_deref().unwrap_or("")
+        );
+        if let Some(data) = data.filter(|data| scan_payload_suffix(&data.data).is_none()) {
+            print_scan_payload(&data.data);
         }
     }
     print_scan_limit_note(records.len(), max_rows);
@@ -1426,13 +1435,22 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> 
                 matched_pack = true;
                 frames = frames.saturating_add(1);
                 if frames <= max_rows {
+                    let data = verbose
+                        .then(|| ShardPool::read_at(&shard, offset))
+                        .transpose()?;
+                    let suffix = data
+                        .as_ref()
+                        .and_then(|data| scan_payload_suffix(&data.data));
                     println!(
-                        "  pack: 0x{:016x} id: {} @ {offset}",
+                        "  pack: 0x{:016x} id: {} @ {offset}{suffix}",
                         shard.pack_id,
-                        hex_encode(&node_id)
+                        hex_encode(&node_id),
+                        suffix = suffix.as_deref().unwrap_or(""),
                     );
-                    if verbose {
-                        print_scan_payload(&ShardPool::read_at(&shard, offset)?.data);
+                    if let Some(data) =
+                        data.filter(|data| scan_payload_suffix(&data.data).is_none())
+                    {
+                        print_scan_payload(&data.data);
                     }
                 }
             }
@@ -1470,13 +1488,18 @@ fn print_scan_limit_note(total: usize, limit: usize) {
 /// Print a readable payload for `scan --verbose` without ever treating an
 /// arbitrary binary record as terminal text.
 fn print_scan_payload(data: &[u8]) {
-    if let Some(pretty) = pretty_json_stream(data) {
-        for line in String::from_utf8_lossy(&pretty).lines() {
-            println!("    {line}");
-        }
-    } else {
-        println!("    payload: {} bytes (non-JSON)", data.len());
+    let pretty = pretty_json_stream(data).expect("non-JSON payloads use an inline suffix");
+    for line in String::from_utf8_lossy(&pretty).lines() {
+        println!("    {line}");
     }
+}
+
+/// Return an inline summary for a binary payload; JSON payloads are printed
+/// below their record because their formatted representation spans lines.
+fn scan_payload_suffix(data: &[u8]) -> Option<String> {
+    pretty_json_stream(data)
+        .is_none()
+        .then(|| format!(" payload: {} bytes (non-JSON)", data.len()))
 }
 
 fn cmd_import(
