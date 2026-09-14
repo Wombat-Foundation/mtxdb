@@ -70,6 +70,13 @@ pub struct Shard {
 
 /// A byte range which keeps the mmap that backs it alive.  `Bytes::from_owner`
 /// turns this into a cheap, cloneable `Bytes` without copying the range.
+///
+/// Packfiles are append-only and repack is copy-on-write, so replacing the
+/// pool's current mapping never changes bytes in an existing mapping. A
+/// recovery scan may truncate a torn tail while an old range is still alive;
+/// that range remains memory-safe but can only observe the old, stale bytes.
+/// No surviving index entry refers to a recovered-away tail, so it cannot be
+/// reached by a later lookup.
 struct MmapRange {
     mmap: Arc<Mmap>,
     start: usize,
