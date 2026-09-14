@@ -778,11 +778,9 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
     let total_collections = collection_counts
         .as_ref()
         .map(|_| PackfileStorage::collection_directory_from_disk(dir).len());
-    let index_requirement =
-        PackfileStorage::collection_summaries_from_disk(dir).and_then(|summaries| {
-            summaries
-                .into_iter()
-                .try_fold(0_usize, |total, (_, _, memory)| total.checked_add(memory))
+    let (index_requirement, index_requirements_by_shard) = index_requirements_from_disk(dir)
+        .map_or((None, None), |(total, by_shard)| {
+            (Some(total), Some(by_shard))
         });
     print_shard_table(
         &shard_entries,
@@ -791,6 +789,7 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
         collection_counts.as_ref(),
         total_collections,
         index_requirement,
+        index_requirements_by_shard.as_ref(),
     );
     if let Some(physical) = physical {
         print_pack_physical_layout(&shard_entries, &physical);
@@ -802,6 +801,23 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
         stats_snapshot_summary(persisted_at)
     );
     Ok(())
+}
+
+/// Calculate each pack's associated collection-index allocation and the
+/// de-duplicated allocation for the whole pool from the persisted directory.
+fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize>)> {
+    let summaries = PackfileStorage::collection_summaries_from_disk(dir)?;
+    let collection_shards = PackfileStorage::collection_shards_from_disk(dir)?;
+    let mut total = 0_usize;
+    let mut by_shard = HashMap::new();
+    for (collection_id, _, memory) in summaries {
+        total = total.checked_add(memory)?;
+        for pack_id in collection_shards.get(&collection_id)? {
+            let entry = by_shard.entry(*pack_id).or_insert(0_usize);
+            *entry = entry.checked_add(memory)?;
+        }
+    }
+    Some((total, by_shard))
 }
 
 /// Discover only canonical v4 `pack_{pack_id:016x}.pack` files.
@@ -911,6 +927,7 @@ fn print_shard_table(
     collection_counts: Option<&std::collections::HashMap<u64, u64>>,
     total_collections: Option<usize>,
     index_requirement: Option<usize>,
+    index_requirements_by_shard: Option<&HashMap<u64, usize>>,
 ) {
     // `ShardPool::open_internal` restores the newest pack as its append
     // destination. Mirror that recovery rule here without opening a writer.
@@ -918,7 +935,7 @@ fn print_shard_table(
 
     println!(
         "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
-        "pack id", "ver", "bytes", "nodes", "collections", "index req", "syncs",
+        "pack id", "ver", "bytes", "nodes", "collections", "index", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
@@ -931,6 +948,9 @@ fn print_shard_table(
         let collections = collection_counts
             .and_then(|counts| counts.get(&pack_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
+        let index_requirement = index_requirements_by_shard
+            .and_then(|requirements| requirements.get(&pack_id))
+            .map_or_else(|| "?".to_owned(), |bytes| fmt_megabytes(*bytes));
         println!(
             "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
             format!(
@@ -945,7 +965,7 @@ fn print_shard_table(
             fmt_bytes(file_bytes),
             nodes,
             collections,
-            "",
+            index_requirement,
             sc,
         );
         total_bytes = total_bytes.saturating_add(file_bytes);
@@ -965,6 +985,12 @@ fn print_shard_table(
         index_requirement.map_or_else(|| "?".to_owned(), fmt_megabytes),
         total_syncs,
     );
+    if let (Some(total), Some(by_shard)) = (index_requirement, index_requirements_by_shard) {
+        let per_shard_total = by_shard.values().copied().sum::<usize>();
+        if per_shard_total > total {
+            println!("note: per-pack index requirements overlap for collections spanning packs; total is de-duplicated");
+        }
+    }
 }
 
 /// Short summary of the persisted shard-statistics snapshot age.
