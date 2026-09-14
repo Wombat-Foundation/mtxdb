@@ -15,6 +15,7 @@ use mtxdb_core::PackfileStorage;
 /// Opaque handle to a PackfileStorage instance.
 pub struct MdbStorage {
     inner: PackfileStorage,
+    read_only: bool,
 }
 
 /// Opaque handle to node data.
@@ -81,7 +82,10 @@ pub unsafe extern "C" fn mdb_storage_open(path: *const c_char, pool: *const c_ch
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    Box::into_raw(Box::new(MdbStorage { inner: storage }))
+    Box::into_raw(Box::new(MdbStorage {
+        inner: storage,
+        read_only: false,
+    }))
 }
 
 /// Open a storage instance read-only at the given path, coexisting with a
@@ -122,11 +126,11 @@ pub unsafe extern "C" fn mdb_storage_open_read_only(
             _ => return ptr::null_mut(),
         }
     };
-    let layout = match mtxdb_core::DatabaseLayout::open(std::path::PathBuf::from(c_str)) {
+    let layout = match mtxdb_core::DatabaseLayout::open_read_only(std::path::PathBuf::from(c_str)) {
         Ok(l) => l,
         Err(_) => return ptr::null_mut(),
     };
-    let pool_dir = match layout.pool_dir(shard_type) {
+    let pool_dir = match layout.pool_dir_read_only(shard_type) {
         Ok(d) => d,
         Err(_) => return ptr::null_mut(),
     };
@@ -134,7 +138,10 @@ pub unsafe extern "C" fn mdb_storage_open_read_only(
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    Box::into_raw(Box::new(MdbStorage { inner: storage }))
+    Box::into_raw(Box::new(MdbStorage {
+        inner: storage,
+        read_only: true,
+    }))
 }
 
 /// Destroy a storage instance and release all resources.
@@ -167,6 +174,9 @@ pub unsafe extern "C" fn mdb_put(
     let Some(storage) = (unsafe { handle.as_ref() }) else {
         return MdbError::InvalidInput;
     };
+    if storage.read_only {
+        return MdbError::Io;
+    }
     let collection = unsafe { read_id(collection_id) };
     let id = unsafe { read_id(node_id) };
     let bytes = unsafe { slice::from_raw_parts(data, data_len) };
@@ -295,6 +305,9 @@ pub unsafe extern "C" fn mdb_sync(handle: *mut MdbStorage) -> MdbError {
     let Some(storage) = (unsafe { handle.as_ref() }) else {
         return MdbError::InvalidInput;
     };
+    if storage.read_only {
+        return MdbError::Io;
+    }
     match storage.inner.sync() {
         Ok(()) => MdbError::Ok,
         Err(_) => MdbError::Io,
@@ -311,6 +324,9 @@ pub unsafe extern "C" fn mdb_delete_collection(handle: *mut MdbStorage, collecti
     let Some(storage) = (unsafe { handle.as_ref() }) else {
         return MdbError::InvalidInput;
     };
+    if storage.read_only {
+        return MdbError::Io;
+    }
     let collection = unsafe { read_id(collection_id) };
     match storage.inner.delete_collection(&collection) {
         Ok(()) => MdbError::Ok,
@@ -375,6 +391,63 @@ mod tests {
         let handle = unsafe { mdb_storage_open(path.as_ptr(), pool.as_ptr()) };
         assert!(handle.is_null());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_only_open_neither_initializes_nor_mutates() {
+        let pid = std::process::id();
+        let missing = std::env::temp_dir().join(format!("mdb_ffi_read_only_missing_{pid}"));
+        std::fs::remove_dir_all(&missing).ok();
+        let missing_path = CString::new(missing.to_str().unwrap()).unwrap();
+        let missing_handle = unsafe { mdb_storage_open_read_only(missing_path.as_ptr(), ptr::null()) };
+        assert!(missing_handle.is_null());
+        assert!(!missing.exists());
+
+        let dir = std::env::temp_dir().join(format!("mdb_ffi_read_only_{pid}"));
+        std::fs::remove_dir_all(&dir).ok();
+        let path = CString::new(dir.to_str().unwrap()).unwrap();
+        let collection = [0x01u8; 16];
+        let id = [0x42u8; 16];
+        let data = b"read-only";
+
+        let writer = unsafe { mdb_storage_open(path.as_ptr(), ptr::null()) };
+        assert!(!writer.is_null());
+        assert!(matches!(
+            unsafe {
+                mdb_put(
+                    writer,
+                    collection.as_ptr(),
+                    id.as_ptr(),
+                    data.as_ptr(),
+                    data.len(),
+                )
+            },
+            MdbError::Ok
+        ));
+        unsafe { mdb_storage_destroy(writer) };
+
+        let reader = unsafe { mdb_storage_open_read_only(path.as_ptr(), ptr::null()) };
+        assert!(!reader.is_null());
+        assert!(matches!(
+            unsafe { mdb_put(reader, collection.as_ptr(), id.as_ptr(), data.as_ptr(), data.len()) },
+            MdbError::Io
+        ));
+        assert!(matches!(unsafe { mdb_sync(reader) }, MdbError::Io));
+        assert!(matches!(
+            unsafe { mdb_delete_collection(reader, collection.as_ptr()) },
+            MdbError::Io
+        ));
+        unsafe { mdb_storage_destroy(reader) };
+
+        let writer = unsafe { mdb_storage_open(path.as_ptr(), ptr::null()) };
+        assert!(!writer.is_null());
+        let node = unsafe { mdb_get(writer, collection.as_ptr(), id.as_ptr()) };
+        assert!(!node.is_null());
+        unsafe {
+            mdb_node_data_destroy(node);
+            mdb_storage_destroy(writer);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

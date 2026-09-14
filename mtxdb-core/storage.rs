@@ -198,10 +198,16 @@ impl From<StorageError> for std::io::Error {
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::Io(error) => error,
+            StorageError::NotFound(_) => {
+                std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string())
+            }
+            StorageError::VerificationFailed(_) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            }
             StorageError::Corrupt(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, message)
             }
-            other => std::io::Error::other(other.to_string()),
+            StorageError::Internal(message) => std::io::Error::other(message),
         }
     }
 }
@@ -406,7 +412,13 @@ mod tests {
         assert_eq!(corrupted.to_string(), "mbz");
 
         let not_found: std::io::Error = StorageError::NotFound([0; 16]).into();
-        assert_eq!(not_found.kind(), std::io::ErrorKind::Other);
+        assert_eq!(not_found.kind(), std::io::ErrorKind::NotFound);
+
+        let verification_failed: std::io::Error = StorageError::VerificationFailed([0; 16]).into();
+        assert_eq!(verification_failed.kind(), std::io::ErrorKind::InvalidData);
+
+        let internal: std::io::Error = StorageError::Internal("mbz".into()).into();
+        assert_eq!(internal.kind(), std::io::ErrorKind::Other);
     }
 
     #[test]

@@ -96,6 +96,58 @@ impl DatabaseLayout {
         Ok(path)
     }
 
+    /// Return a named pool's directory without creating it or any parent.
+    ///
+    /// # Errors
+    /// Returns an error if the pool directory does not exist.
+    pub fn pool_dir_read_only(&self, shard_type: ShardType) -> io::Result<PathBuf> {
+        let path = self.root.join("pools").join(shard_type.as_str());
+        if !path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("pool directory does not exist: {}", path.display()),
+            ));
+        }
+        Ok(path)
+    }
+
+    /// Open a database root in read-only mode.
+    ///
+    /// Unlike [`Self::open`], this never creates directories or writes
+    /// `db.meta`. It validates the root already exists, contains a valid
+    /// descriptor, and is not a legacy flat store.
+    ///
+    /// # Errors
+    /// Returns an error if the root does not exist, contains an
+    /// unrecognized descriptor, or has a legacy flat layout.
+    pub fn open_read_only(root: PathBuf) -> io::Result<Self> {
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("database root does not exist: {}", root.display()),
+            ));
+        }
+        let meta_path = root.join(DB_META_FILENAME);
+        if !meta_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing database descriptor: {}", meta_path.display()),
+            ));
+        }
+        let contents = fs::read(&meta_path)?;
+        if contents != DB_META {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unrecognized mtxdb database descriptor: {}",
+                    meta_path.display()
+                ),
+            ));
+        }
+        Self::reject_legacy_flat_store(&root)?;
+        Ok(Self { root })
+    }
+
     fn reject_legacy_flat_store(root: &Path) -> io::Result<()> {
         for entry in fs::read_dir(root)? {
             let entry = entry?;
@@ -179,5 +231,13 @@ mod tests {
         let err = DatabaseLayout::open(root).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("legacy flat"));
+    }
+
+    #[test]
+    fn read_only_open_never_initializes_a_root() {
+        let root = test_dir("read_only_missing");
+        let err = DatabaseLayout::open_read_only(root.clone()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!root.exists());
     }
 }
