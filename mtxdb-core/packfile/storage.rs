@@ -10,11 +10,16 @@ use parking_lot::RwLock;
 
 use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
+use crate::index::format::DeltaFrame;
 use crate::index::LossyIndex;
 use crate::packfile::{self, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
 use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
+
+use crate::index::delta::{
+    self, DELTA_FRAME_LEN, DELTA_LOG_HEADER_LEN, DELTA_LOG_TRAILER_LEN, INDEX_DELTA_FILE,
+};
 
 /// Callback that rewrites a node's child references given resolved child data,
 /// used to inline already-cached children in place of lazy hash pointers.
@@ -80,8 +85,13 @@ pub struct OpenTimings {
     pub fingerprint: std::time::Duration,
     /// Deserializing checkpoint index blobs into live collections (checkpoint
     /// path) or building per-collection indexes from scanned records
-    /// (fallback path).
+    /// (fallback path). On the checkpoint path this includes replaying any
+    /// fingerprint/generation-gated delta-log frames on top of the raw slots.
     pub index_materialization: std::time::Duration,
+    /// Reading the delta log, validating its gates, and applying frames to
+    /// each affected collection (checkpoint path only; ZERO when there is no
+    /// committed log to replay).
+    pub delta_replay: std::time::Duration,
     /// The full packfile scan + torn-tail recovery pass (fallback only).
     pub full_scan: std::time::Duration,
     /// Total synchronous wall time of the open.
@@ -101,6 +111,7 @@ impl Default for OpenTimings {
             checkpoint_decode: std::time::Duration::ZERO,
             fingerprint: std::time::Duration::ZERO,
             index_materialization: std::time::Duration::ZERO,
+            delta_replay: std::time::Duration::ZERO,
             full_scan: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
             path: OpenPath::FullScan,
@@ -121,6 +132,10 @@ pub struct SyncTimings {
     pub pack_fsync: std::time::Duration,
     /// Writing the shard→collection metadata sidecar.
     pub sidecar: std::time::Duration,
+    /// Persisting the index checkpoint (complete rewrite) or appending the
+    /// incremental delta log instead (ZERO on the path not taken; the appended
+    /// case is measured when a dirty `sync()` can continue an existing log).
+    pub delta_log: std::time::Duration,
     /// Persisting the index checkpoint.
     pub checkpoint: std::time::Duration,
     /// Total wall time of the `sync_all` call.
@@ -238,6 +253,13 @@ const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8;
 /// created oversized packs — this engine's own writes rotate long before
 /// reaching it (`MAX_SHARD_BYTES` caps each shard's file size).
 const PACK_INDEX_OFFSET_LIMIT: u64 = (1u64 << 28) - 2;
+
+/// Byte ceiling for the incremental index delta log. Once a session's
+/// accumulated frames exceed this, the next `sync()` stops appending and does
+/// a full checkpoint rewrite (which truncates the log), keeping replay cost
+/// and the log file bounded. Frames are 36 bytes each, so this is on the order
+/// of ~230k appends between full rewrites.
+const DELTA_LOG_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Reject a record whose in-shard offset the 28-bit `IndexSlot` field cannot
 /// represent, so the caller surfaces a `StorageError::Corrupt` instead of

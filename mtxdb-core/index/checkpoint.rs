@@ -113,8 +113,10 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
 }
 
 /// Write a complete checkpoint atomically: temp file, fsync, rename over the
-/// final path. `collections` holds each collection's `serialize` blob, the
-/// first collection listed becoming the first in the directory order.
+/// final path. `collections` holds each collection's `serialize` blob plus the
+/// index generation it was written at (recorded in its directory entry so a
+/// delta log's frames can be gated against the same generation on replay),
+/// the first collection listed becoming the first in the directory order.
 ///
 /// # Errors
 /// Returns `io::Error` on any failure; the previous checkpoint (if any) is
@@ -122,7 +124,7 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
 pub fn write_checkpoint(
     path: &Path,
     fingerprint: u64,
-    collections: &[([u8; 16], &[u8])],
+    collections: &[([u8; 16], u64, &[u8])],
 ) -> std::io::Result<()> {
     let count = u32::try_from(collections.len())
         .map_err(|_| std::io::Error::other("too many collections for checkpoint u32"))?;
@@ -131,7 +133,7 @@ pub fn write_checkpoint(
         .and_then(|n| n.checked_mul(COLLECTION_DIR_ENTRY_LEN as u64))
         .ok_or_else(|| std::io::Error::other("checkpoint directory size overflow"))?;
     let mut slots_bytes: u64 = 0;
-    for (_, blob) in collections {
+    for (_, _, blob) in collections {
         let blob_len = u64::try_from(blob.len().saturating_sub(8))
             .map_err(|_| std::io::Error::other("collection slot array too large"))?;
         slots_bytes = slots_bytes
@@ -155,7 +157,7 @@ pub fn write_checkpoint(
 
     let mut slots_offset: u64 = 0;
     let mut dir_entries = Vec::with_capacity(collections.len());
-    for (collection_id, blob) in collections {
+    for (collection_id, generation, blob) in collections {
         let capacity = blob_capacity(blob)
             .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
         let capacity32 = u32::try_from(capacity)
@@ -166,7 +168,7 @@ pub fn write_checkpoint(
             .map_err(|_| std::io::Error::other("collection slot array too large"))?;
         dir_entries.push(CollectionDirEntry {
             collection_id: *collection_id,
-            generation: 0,
+            generation: *generation,
             slots_offset,
             capacity: capacity32,
             slot_count: blob_slot_count(blob),
@@ -178,7 +180,7 @@ pub fn write_checkpoint(
     for entry in &dir_entries {
         buf.extend_from_slice(&entry.encode());
     }
-    for (_, blob) in collections {
+    for (_, _, blob) in collections {
         buf.extend_from_slice(&blob[8..]);
     }
 
@@ -322,7 +324,7 @@ mod tests {
             fingerprint,
             &blobs
                 .iter()
-                .map(|(id, blob)| (*id, blob.as_slice()))
+                .map(|(id, blob)| (*id, 0, blob.as_slice()))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -408,7 +410,7 @@ mod tests {
             0,
             &blobs
                 .iter()
-                .map(|(id, b)| (*id, b.as_slice()))
+                .map(|(id, b)| (*id, 0, b.as_slice()))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -427,7 +429,7 @@ mod tests {
             0,
             &blobs
                 .iter()
-                .map(|(id, b)| (*id, b.as_slice()))
+                .map(|(id, b)| (*id, 0, b.as_slice()))
                 .collect::<Vec<_>>(),
         )
         .unwrap();

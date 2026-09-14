@@ -4,7 +4,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub mod checkpoint;
+pub mod delta;
 pub mod format;
+
+use crate::index::delta::DeltaReplayError;
+use crate::index::format::DeltaFrame;
 
 /// Per-slot entry in the lossy fanout index.
 ///
@@ -229,6 +233,22 @@ impl LossyIndex {
     /// Returns `InsertError::TableFull` if the table has less than 25% free slots
     /// and the hash is not already present (overwrites are always allowed).
     pub fn insert(&self, hash: &[u8; 16], shard_id: u16, offset: u64) -> Result<(), InsertError> {
+        self.insert_tracked(hash, shard_id, offset).map(|_| ())
+    }
+
+    /// Like [`Self::insert`], but also reports the write's exact landing spot —
+    /// the affected bucket and the packed slot value stored there — so the
+    /// delta persistence layer can append a replay frame without re-probing.
+    ///
+    /// # Errors
+    /// Returns `InsertError::TableFull` under the same conditions as
+    /// [`Self::insert`] (the table is left unmodified).
+    pub fn insert_tracked(
+        &self,
+        hash: &[u8; 16],
+        shard_id: u16,
+        offset: u64,
+    ) -> Result<(u32, u64), InsertError> {
         let tag = Self::tag(hash);
         let home = u64::from_be_bytes([
             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
@@ -250,19 +270,57 @@ impl LossyIndex {
                 // the slot last so concurrent readers see either the prior
                 // empty slot or a complete record location.
                 self.homes.lock()[bucket] = home;
-                slots[bucket].store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
+                let value = IndexSlot::new(tag, shard_id, offset).0;
+                slots[bucket].store(value, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+                return Ok((bucket as u32, value));
             }
             // If same tag already exists at this bucket, overwrite
             // (same hash, different offset after repack)
             if slot.tag() == tag {
                 self.homes.lock()[bucket] = home;
-                slots[bucket].store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
-                return Ok(());
+                let value = IndexSlot::new(tag, shard_id, offset).0;
+                slots[bucket].store(value, Ordering::Release);
+                return Ok((bucket as u32, value));
             }
             bucket = bucket.wrapping_add(1) & self.mask as usize;
         }
+    }
+
+    /// Apply recorded delta frames on top of a checkpoint-backed index,
+    /// replicating the live insert/overwrite sequence that produced them.
+    ///
+    /// Only valid on an owned (materialized) index — callers must clone an
+    /// mmap-backed index first. Frames are applied exactly as the live
+    /// session wrote them: an overwrite of a non-empty slot leaves the length
+    /// unchanged, a write into an empty slot increments it. The index's `len`
+    /// after replay therefore equals the checkpoint's occupancy plus the
+    /// number of fresh-slot writes, which is what the sidecar integrity sum
+    /// checks against.
+    ///
+    /// # Errors
+    /// Returns `DeltaReplayError` if a frame targets a bucket outside this
+    /// index's capacity (a structurally inconsistent log, rejected wholesale)
+    /// or the index is still mmap-backed.
+    pub fn replay_frames(&self, frames: &[DeltaFrame]) -> Result<(), DeltaReplayError> {
+        let SlotStorage::Owned(slots) = &self.slots else {
+            return Err(DeltaReplayError::RequiresOwnedIndex);
+        };
+        for frame in frames {
+            let bucket = frame.bucket as usize;
+            if bucket >= self.capacity as usize {
+                return Err(DeltaReplayError::FrameOutOfBounds {
+                    bucket: frame.bucket,
+                    capacity: self.capacity,
+                });
+            }
+            let previous = slots[bucket].load(Ordering::Acquire);
+            if previous == 0 && frame.slot != 0 {
+                self.len.fetch_add(1, Ordering::Relaxed);
+            }
+            slots[bucket].store(frame.slot, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Double this live index's capacity without reading packfiles.
