@@ -371,8 +371,10 @@ impl LossyIndex {
     /// post-restart resize cannot use [`Self::grow`].  The packed slots still
     /// retain every `(shard_id, offset)`, however.  A caller can therefore
     /// recover only the `len` source hashes from the authoritative records
-    /// and rehash in `O(capacity + len)`, instead of rescanning every pack in
-    /// the store.  The callback must return the hash for precisely the
+    /// and rehash without rescanning every pack in the store. Locations are
+    /// visited in `(shard, offset)` order rather than hash-table order, so a
+    /// cold mmap walk follows pack order and lets the kernel coalesce page
+    /// faults/read-ahead. The callback must return the hash for precisely the
     /// supplied location.
     ///
     /// `Ok(None)` means the table cannot grow further; callers retain their
@@ -385,16 +387,22 @@ impl LossyIndex {
             return Ok(None);
         }
 
-        let grown = Self::new(self.capacity as usize * 2);
+        let mut locations = Vec::with_capacity(self.len());
         for index in 0..self.capacity as usize {
             let slot = IndexSlot(self.slot_at(index));
             if slot.is_empty() {
                 continue;
             }
-            let hash = hash_at(slot.shard_id(), slot.offset(), slot.tag())?;
+            locations.push((slot.shard_id(), slot.offset(), slot.tag()));
+        }
+        locations.sort_unstable_by_key(|(shard_id, offset, _)| (*shard_id, *offset));
+
+        let grown = Self::new(self.capacity as usize * 2);
+        for (shard_id, offset, slot_tag) in locations {
+            let hash = hash_at(shard_id, offset, slot_tag)?;
             // A doubled table is at most 37.5% full because insertion only
             // requests growth at 75%, so this cannot hit TableFull.
-            let _ = grown.insert(&hash, slot.shard_id(), slot.offset());
+            let _ = grown.insert(&hash, shard_id, offset);
         }
         Ok(Some(grown))
     }
