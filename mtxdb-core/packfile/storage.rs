@@ -10,16 +10,11 @@ use parking_lot::RwLock;
 
 use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
-use crate::index::format::DeltaFrame;
 use crate::index::LossyIndex;
 use crate::packfile::{self, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
 use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
-
-use crate::index::delta::{
-    self, DELTA_FRAME_LEN, DELTA_LOG_HEADER_LEN, DELTA_LOG_TRAILER_LEN, INDEX_DELTA_FILE,
-};
 
 /// Callback that rewrites a node's child references given resolved child data,
 /// used to inline already-cached children in place of lazy hash pointers.
@@ -148,6 +143,7 @@ impl Default for SyncTimings {
             pack_flush: std::time::Duration::ZERO,
             pack_fsync: std::time::Duration::ZERO,
             sidecar: std::time::Duration::ZERO,
+            delta_log: std::time::Duration::ZERO,
             checkpoint: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
         }
@@ -1656,7 +1652,7 @@ impl PackfileStorage {
 
         let order = self.collection_order.read().clone();
         let collections = self.collections.read();
-        let mut entries: Vec<([u8; 16], Vec<u8>)> = Vec::with_capacity(order.len());
+        let mut entries: Vec<([u8; 16], u64, Vec<u8>)> = Vec::with_capacity(order.len());
         for collection_id in &order {
             let Some(generation) = collections
                 .get(collection_id)
@@ -1664,11 +1660,14 @@ impl PackfileStorage {
             else {
                 continue;
             };
-            entries.push((*collection_id, generation.index.serialize()));
+            // Collection generations are introduced for delta replay. Until
+            // the delta writer publishes a layout-changing generation, the
+            // checkpoint's initial generation is zero.
+            entries.push((*collection_id, 0, generation.index.serialize()));
         }
-        let blobs: Vec<([u8; 16], &[u8])> = entries
+        let blobs: Vec<([u8; 16], u64, &[u8])> = entries
             .iter()
-            .map(|(collection_id, blob)| (*collection_id, blob.as_slice()))
+            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
             .collect();
         crate::index::checkpoint::write_checkpoint(
             &Self::index_checkpoint_path(&self.base_dir),
