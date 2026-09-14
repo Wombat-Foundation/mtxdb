@@ -4437,6 +4437,12 @@ impl StorageEngine for PackfileStorage {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the live-index fast path and its clone-on-demand fallback read clearest \
+                  kept together rather than split across helpers that would each need most \
+                  of the same state (old_gen, owned_index, structural_change) threaded through"
+    )]
     fn put_many(
         &self,
         collection_id: &[u8; 16],
@@ -4458,8 +4464,29 @@ impl StorageEngine for PackfileStorage {
         };
 
         let old_gen = self.generation(collection_id);
-        let mut index = match &old_gen {
-            Some(g) => g.index.clone(),
+        let generation = old_gen.as_ref().map_or(1, |g| g.generation);
+        let cache = match &old_gen {
+            Some(g) => g.cache.clone(),
+            None => Arc::new(NodeCache::new(self.cache_capacity)),
+        };
+
+        // Fast path, mirroring `put`'s single-record optimization (see its
+        // comment): as long as the collection already has an owned,
+        // materialized index — not the very first write since a checkpoint
+        // reopen — every record in this batch that fits without growth
+        // mutates that live, already-published index directly. `owned_index`
+        // stays `None` for as long as that holds, so the O(capacity) clone
+        // below never runs and no new generation ever gets published —
+        // exactly `put`'s in-place success path, just looped over the
+        // batch. It is materialized, once, only when a structural change is
+        // actually required: growth, the first write since a checkpoint
+        // reopen (mmap-backed), or a brand-new collection. A clone taken
+        // partway through the batch (a mid-batch grow) still captures every
+        // record already applied via the live path, since those mutations
+        // landed on the very object being cloned.
+        let mut owned_index: Option<LossyIndex> = match &old_gen {
+            Some(g) if !g.index.is_mmap_backed() => None,
+            Some(g) => Some(g.index.clone()),
             // Unlike `put`'s single-record path, we know exactly how many
             // records this brand-new collection is about to receive -- size
             // from that instead of the old flat 4096-slot (32 KiB) floor,
@@ -4470,14 +4497,17 @@ impl StorageEngine for PackfileStorage {
             // `put_many` call) would otherwise still hit `grow()` almost
             // immediately, invalidating the delta log and forcing a full
             // checkpoint rewrite on the next sync.
-            None => LossyIndex::new(entries.len().saturating_mul(2).max(64)),
+            None => Some(LossyIndex::new(
+                entries
+                    .len()
+                    .saturating_mul(2)
+                    .max(NEW_COLLECTION_INDEX_FLOOR),
+            )),
         };
-        let generation = old_gen.as_ref().map_or(1, |g| g.generation);
-        let cache = match &old_gen {
-            Some(g) => g.cache.clone(),
-            None => Arc::new(NodeCache::new(self.cache_capacity)),
-        };
-
+        // Whether this call must publish a new generation at all. Starts
+        // true exactly when `owned_index` already had to be materialized
+        // above; flips true the moment a mid-batch grow/rebuild happens.
+        let mut structural_change = owned_index.is_some();
         let mut index_needs_rebuild = false;
 
         for (id, data) in entries {
@@ -4489,53 +4519,73 @@ impl StorageEngine for PackfileStorage {
 
             let (shard_id, offset) = self.shards.put_record(&record)?;
 
-            if !index_needs_rebuild {
-                let inserted = if let Ok((bucket, slot)) =
-                    self.insert_index(collection_id, &index, id, shard_id, offset)?
-                {
-                    self.record_delta(collection_id, generation, bucket, slot);
-                    true
-                } else if let Some(grown) = index.grow() {
-                    // `insert_tracked` leaves the table unchanged on TableFull,
-                    // so retrying with the record's still-available location is
-                    // sufficient; no pack scan is needed for pure growth. The
-                    // grow changes the collection's shape, so the delta log is
-                    // invalidated and no frame is recorded for this (or any
-                    // later) overwrite in the batch.
-                    self.invalidate_delta_log();
-                    let inserted = grown.insert(id, shard_id, offset).is_ok();
-                    index = grown;
-                    inserted
-                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
-                    // The checkpoint does not retain homes, but its slots
-                    // retain locations. Recover only those identities and
-                    // retry; do not scan every pack in the store.
-                    self.invalidate_delta_log();
-                    let inserted = grown.insert(id, shard_id, offset).is_ok();
-                    index = grown;
-                    inserted
-                } else {
-                    index_needs_rebuild = true;
-                    self.invalidate_delta_log();
-                    false
-                };
-                if inserted {
-                    let pack_id = self
-                        .shards
-                        .get_shard(shard_id)
-                        .map_or(u64::from(shard_id), |s| s.pack_id);
-                    self.record_new_shard_collection(pack_id, collection_id);
+            if index_needs_rebuild {
+                continue;
+            }
+
+            // Whichever index is authoritative for this insert: the owned
+            // copy once one exists, else the collection's live, still-shared
+            // index — only reachable here when it's neither mmap-backed nor
+            // absent, both of which already forced `owned_index` above.
+            let live: &LossyIndex = match owned_index.as_ref() {
+                Some(index) => index,
+                None => {
+                    &old_gen
+                        .as_ref()
+                        .expect("live path implies an existing generation")
+                        .index
                 }
+            };
+
+            let inserted = if let Ok((bucket, slot)) =
+                self.insert_index(collection_id, live, id, shard_id, offset)?
+            {
+                self.record_delta(collection_id, generation, bucket, slot);
+                true
+            } else if let Some(grown) = live.grow() {
+                // `insert_tracked` leaves the table unchanged on TableFull,
+                // so retrying with the record's still-available location is
+                // sufficient; no pack scan is needed for pure growth. The
+                // grow changes the collection's shape, so the delta log is
+                // invalidated and no frame is recorded for this (or any
+                // later) overwrite in the batch.
+                self.invalidate_delta_log();
+                structural_change = true;
+                let inserted = grown.insert(id, shard_id, offset).is_ok();
+                owned_index = Some(grown);
+                inserted
+            } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, live) {
+                // The checkpoint does not retain homes, but its slots
+                // retain locations. Recover only those identities and
+                // retry; do not scan every pack in the store.
+                self.invalidate_delta_log();
+                structural_change = true;
+                let inserted = grown.insert(id, shard_id, offset).is_ok();
+                owned_index = Some(grown);
+                inserted
+            } else {
+                index_needs_rebuild = true;
+                structural_change = true;
+                self.invalidate_delta_log();
+                false
+            };
+            if inserted {
+                let pack_id = self
+                    .shards
+                    .get_shard(shard_id)
+                    .map_or(u64::from(shard_id), |s| s.pack_id);
+                self.record_new_shard_collection(pack_id, collection_id);
             }
         }
 
         if index_needs_rebuild {
-            index = self.rebuild_index(collection_id)?;
+            let rebuilt = self.rebuild_index(collection_id)?;
             // rebuild_index automatically discovers all the records we just appended
             self.replace_collection_shard_counts(
                 collection_id,
-                &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+                &self.slot_counts_to_pack_id_counts(&rebuilt.shard_counts()),
             );
+            owned_index = Some(rebuilt);
         }
 
         // Apply cache mutations only after all disk writes succeed, so a
@@ -4554,7 +4604,16 @@ impl StorageEngine for PackfileStorage {
             cache.insert(*id, Arc::new(data_to_cache));
         }
 
-        self.store_generation(collection_id, index, Some(cache), false)?;
+        if structural_change {
+            let index = owned_index
+                .expect("structural_change is only set once owned_index is materialized");
+            self.store_generation(collection_id, index, Some(cache), false)?;
+        } else {
+            // Every record landed on the live, already-published index in
+            // place -- no new generation to publish, matching `put`'s
+            // in-place success path.
+            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -6127,6 +6186,85 @@ mod tests {
 
         let got = store.get(&TEST_COLLECTION, &extra).unwrap().unwrap();
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"y"));
+    }
+
+    #[test]
+    fn test_put_many_fast_path_mutates_live_index_without_cloning() {
+        // Regression coverage for put_many's live-index fast path: prove it
+        // through observable behavior (every record readable, across
+        // several separate put_many calls to the same collection, none of
+        // which needs to grow) rather than asserting the clone didn't
+        // happen internally.
+        let dir = test_dir("put_many_fast_path_live_mutation");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // First call materializes the collection (no live index to reuse
+        // yet); every call after it should take the fast path.
+        for batch in 0..8u32 {
+            let entries: Vec<_> = (0..20u32)
+                .map(|i| {
+                    let mut id = [0u8; 16];
+                    id[0..4].copy_from_slice(&batch.to_le_bytes());
+                    id[4..8].copy_from_slice(&i.to_le_bytes());
+                    (
+                        id,
+                        NodeData::new(bytes::Bytes::from(format!("v{batch}-{i}"))),
+                    )
+                })
+                .collect();
+            store.put_many(&TEST_COLLECTION, &entries).unwrap();
+        }
+
+        for batch in 0..8u32 {
+            for i in 0..20u32 {
+                let mut id = [0u8; 16];
+                id[0..4].copy_from_slice(&batch.to_le_bytes());
+                id[4..8].copy_from_slice(&i.to_le_bytes());
+                let got = store.get(&TEST_COLLECTION, &id).unwrap().unwrap();
+                assert_eq!(got.bytes, bytes::Bytes::from(format!("v{batch}-{i}")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_put_many_growth_mid_batch_keeps_records_inserted_before_the_grow() {
+        // Exercises the fast path's trickiest transition: some records in
+        // the batch insert via the live, shared index (no clone), then a
+        // later record in the *same* batch forces a grow — which must
+        // materialize an owned index that still contains everything the
+        // live path already applied, not just what comes after the grow.
+        let dir = test_dir("put_many_growth_mid_batch");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Get the collection's live index past its NEW_COLLECTION_INDEX_FLOOR
+        // starting capacity via ordinary put_many calls (fast path), then
+        // issue one big batch that must cross the 75%-load grow threshold
+        // partway through.
+        let seed: Vec<_> = (0..40u32)
+            .map(|i| {
+                let mut id = [1u8; 16];
+                id[4..8].copy_from_slice(&i.to_le_bytes());
+                (id, NodeData::new(bytes::Bytes::from(format!("seed{i}"))))
+            })
+            .collect();
+        store.put_many(&TEST_COLLECTION, &seed).unwrap();
+
+        let growth_batch: Vec<_> = (0..200u32)
+            .map(|i| {
+                let mut id = [2u8; 16];
+                id[4..8].copy_from_slice(&i.to_le_bytes());
+                (id, NodeData::new(bytes::Bytes::from(format!("grow{i}"))))
+            })
+            .collect();
+        store.put_many(&TEST_COLLECTION, &growth_batch).unwrap();
+
+        for (id, data) in seed.iter().chain(&growth_batch) {
+            let got = store.get(&TEST_COLLECTION, id).unwrap().unwrap();
+            assert_eq!(
+                &got.bytes, &data.bytes,
+                "record must survive the mid-batch grow"
+            );
+        }
     }
 
     #[test]
