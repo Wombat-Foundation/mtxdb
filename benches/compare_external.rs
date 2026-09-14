@@ -150,13 +150,24 @@ fn collection_for(node: usize) -> [u8; 16] {
     collection
 }
 
+fn mtxdb_open(dir: &std::path::Path) -> PackfileStorage {
+    // MTXDB_BENCH_COMPRESS=0 opens the store with per-record zstd disabled, to
+    // measure the raw append path against mdbx/sqlite. The bench payload is
+    // seeded-incompressible anyway, so compression only pure overhead here.
+    if std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0") {
+        PackfileStorage::open_with_compression(dir.to_path_buf(), false).unwrap()
+    } else {
+        PackfileStorage::open(dir.to_path_buf()).unwrap()
+    }
+}
+
 fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // ── Build ──
     // Keep the rw store open for the append phase: production keeps a live
     // handle (Synapse's writer), so an append must not pay a fresh
     // full-scan open that a benchmark would otherwise hide inside it.
     let started = Instant::now();
-    let store_rw = PackfileStorage::open(dir.to_path_buf()).unwrap();
+    let store_rw = mtxdb_open(dir);
     for node in 0..nodes {
         store_rw
             .put(
