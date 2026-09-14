@@ -29,7 +29,19 @@ METRICS = [
     ("append_ms", "batch append"),
     ("append_sync_ms", "append sync"),
     ("files_bytes", "on-disk bytes"),
+    ("mem_bytes", "index size"),
 ]
+
+
+def _human_bytes(value: int) -> str:
+    """Compact byte count, e.g. 2099456 -> '2.1MB'."""
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{value}"
+
 
 BENCH_CMD = [
     "cargo",
@@ -83,7 +95,19 @@ def print_table() -> None:
         latest[row["engine"]] = row
     engines = ["mtxdb", "mdbx", "sqlite"]
     columns = [m[1] for m in METRICS]
-    values = [[latest[engine][m[0]] for m in METRICS] for engine in engines]
+
+    def cell(engine: str, metric: str) -> str:
+        value = latest[engine][metric]
+        if metric != "mem_bytes":
+            return value
+        label = latest[engine]["mem_label"]
+        if label == "index_bytes":
+            return f"{_human_bytes(int(value))} idx"
+        # mdbx / sqlite keep their B-tree in the DB file's own mapping — the
+        # "index" is not a separate resident structure.
+        return "in-file"
+
+    values = [[cell(engine, m[0]) for m in METRICS] for engine in engines]
     widths = [
         max(len(columns[i]) + 2, *(len(r[i]) for r in values))
         for i in range(len(columns))
