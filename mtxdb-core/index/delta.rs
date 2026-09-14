@@ -69,6 +69,11 @@ pub struct DeltaLog {
     pub frames: Vec<DeltaFrame>,
     /// The pack fingerprint the final committed batch was written against.
     pub tail_fingerprint: u64,
+    /// Byte length of the committed region in the log file (through the last
+    /// committed trailer). A session continuing this log appends at this
+    /// boundary — it is the answer to "has a base header already been
+    /// written", independent of any fresh-session default.
+    pub file_len: u64,
 }
 
 /// Encode the fixed-width log header for `base_fingerprint`.
@@ -171,6 +176,9 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
         base_fingerprint,
         frames,
         tail_fingerprint: tail_fingerprint?,
+        // `offset` is the frontier of the last committed batch: the loop only
+        // breaks past a committed trailer or before a torn/unparseable tail.
+        file_len: u64::try_from(offset).unwrap_or(u64::MAX),
     })
 }
 
