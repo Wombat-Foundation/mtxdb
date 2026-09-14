@@ -64,13 +64,13 @@ const MAX_DELTA_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
 /// Current wire version (see the header's version byte).
 ///
-/// v2 repurposes the trailer's 4 reserved bytes as a CRC32 of the batch's
-/// frame bytes, so a batch whose frames were
-/// corrupted after being written — but which still happens to pass the
-/// fingerprint/generation gates in `storage.rs` — is caught and dropped at
-/// read time instead of being replayed as valid index state. A v1 log fails
-/// the version check below and falls back to a full rescan, same as any
-/// other structurally rejected log.
+/// v2 repurposes the trailer's 4 reserved bytes as a CRC32 covering the
+/// batch's frame bytes and its tail fingerprint, so a batch corrupted after
+/// being written — whether in the frames or just the fingerprint — but which
+/// still happens to pass the fingerprint/generation gates in `storage.rs` is
+/// caught and dropped at read time instead of being replayed as valid index
+/// state. A v1 log fails the version check below and falls back to a full
+/// rescan, same as any other structurally rejected log.
 const DELTA_LOG_VERSION: u8 = 2;
 const DELTA_BATCH_MAGIC: &[u8; 4] = b"MDLB";
 const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"DLTR";
@@ -117,8 +117,8 @@ pub fn encode_batch_header(frame_count: u32) -> [u8; DELTA_BATCH_HEADER_LEN] {
 }
 
 /// Encode the fixed-width batch trailer for `tail_fingerprint`, with `crc`
-/// the CRC32 of the batch's frame bytes (stored at byte offset 4 of the
-/// trailer's reserved field).
+/// the CRC32 of the batch's frame bytes and `tail_fingerprint` together
+/// (stored at byte offset 4 of the trailer's reserved field).
 #[must_use]
 pub fn encode_trailer(tail_fingerprint: u64, crc: u32) -> [u8; DELTA_LOG_TRAILER_LEN] {
     let mut bytes = [0u8; DELTA_LOG_TRAILER_LEN];
@@ -128,11 +128,17 @@ pub fn encode_trailer(tail_fingerprint: u64, crc: u32) -> [u8; DELTA_LOG_TRAILER
     bytes
 }
 
-/// CRC32 of one batch's frame bytes (the payload between the batch header
-/// and trailer), as stored in the trailer's reserved field.
+/// CRC32 covering one batch's frame bytes *and* its `tail_fingerprint`, as
+/// stored in the trailer's reserved field. Folding the fingerprint into the
+/// CRC means fingerprint-only corruption (the frame bytes untouched) is also
+/// caught here, rather than relying solely on the fingerprint gate in
+/// `storage.rs` matching it against the wrong thing.
 #[must_use]
-fn frames_crc(frames_bytes: &[u8]) -> u32 {
-    crc32fast::hash(frames_bytes)
+fn batch_crc(frames_bytes: &[u8], tail_fingerprint: u64) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(frames_bytes);
+    hasher.update(&tail_fingerprint.to_le_bytes());
+    hasher.finalize()
 }
 
 /// Length in bytes of one fully framed batch carrying `frame_count` frames.
@@ -204,24 +210,26 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
                 .try_into()
                 .ok()?,
         );
-        if frames_crc(frames_bytes) != stored_crc {
-            // The frame bytes were corrupted after being written (bit rot,
-            // torn/partial write not otherwise caught by the length framing,
-            // etc). Trust nothing from this batch onward — same as a torn
-            // trailer, everything already accumulated from earlier committed
-            // batches is kept, but this and any later batch are dropped
-            // rather than replayed as valid index state.
+        let batch_tail_fingerprint = u64::from_le_bytes(
+            buf[trailer_start.saturating_add(TRAILER_FINGERPRINT_OFFSET)
+                ..trailer_start.saturating_add(16)]
+                .try_into()
+                .ok()?,
+        );
+        if batch_crc(frames_bytes, batch_tail_fingerprint) != stored_crc {
+            // The frame bytes or the tail fingerprint were corrupted after
+            // being written (bit rot, torn/partial write not otherwise
+            // caught by the length framing, etc). Trust nothing from this
+            // batch onward — same as a torn trailer, everything already
+            // accumulated from earlier committed batches is kept, but this
+            // and any later batch are dropped rather than replayed as valid
+            // index state.
             break;
         }
         for frame_bytes in frames_bytes.chunks_exact(DELTA_FRAME_LEN) {
             frames.push(DeltaFrame::decode(frame_bytes)?);
         }
-        tail_fingerprint = Some(u64::from_le_bytes(
-            buf[trailer_start.saturating_add(TRAILER_FINGERPRINT_OFFSET)
-                ..trailer_start.saturating_add(16)]
-                .try_into()
-                .ok()?,
-        ));
+        tail_fingerprint = Some(batch_tail_fingerprint);
         offset = batch_end;
     }
     Some(DeltaLog {
@@ -267,7 +275,10 @@ pub fn append_batch(
     }
     file.write_all(&frames_bytes)?;
     appended = appended.saturating_add(frames_bytes.len());
-    file.write_all(&encode_trailer(tail_fingerprint, frames_crc(&frames_bytes)))?;
+    file.write_all(&encode_trailer(
+        tail_fingerprint,
+        batch_crc(&frames_bytes, tail_fingerprint),
+    ))?;
     appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
     file.sync_all()?;
     Ok(appended)
@@ -462,6 +473,37 @@ mod tests {
 
         let log = read_delta_log(&path).expect("first committed batch must still be trusted");
         assert_eq!(log.tail_fingerprint, 11, "corrupted batch must be dropped");
+        assert_eq!(log.frames.len(), 1);
+        assert_eq!(log.frames[0], test_frame(0, 3));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn corrupted_tail_fingerprint_is_rejected_by_crc() {
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_delta_fp_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_DELTA_FILE);
+        // A committed batch, then a second batch whose frame bytes are
+        // untouched but whose trailer fingerprint is corrupted after being
+        // written. The CRC covers the fingerprint too, so this must be
+        // caught even though every frame decodes fine.
+        append_batch(&path, true, 7, &[test_frame(0, 3)], 11).unwrap();
+        append_batch(&path, false, 7, &[test_frame(1, 3), test_frame(2, 3)], 22).unwrap();
+        let mut full = std::fs::read(&path).unwrap();
+        // Flip the last byte of the file: the trailer's tail_fingerprint
+        // field, not any frame byte.
+        let last = full.len() - 1;
+        full[last] ^= 0xFF;
+        std::fs::write(&path, &full).unwrap();
+
+        let log = read_delta_log(&path).expect("first committed batch must still be trusted");
+        assert_eq!(
+            log.tail_fingerprint, 11,
+            "batch with corrupted fingerprint must be dropped"
+        );
         assert_eq!(log.frames.len(), 1);
         assert_eq!(log.frames[0], test_frame(0, 3));
 
