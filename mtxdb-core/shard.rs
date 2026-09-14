@@ -1259,8 +1259,8 @@ impl ShardPool {
     ///
     /// The record is *buffered*, not necessarily on disk: offsets are handed
     /// out into the shard's virtual `[file_len, file_len + pending)` region
-    /// and the matching frame bytes are committed to the page cache by
-    /// [`Self::flush_shard`]. Reads of a virtual offset first flush (see
+    /// and the matching frame bytes are committed to the page cache by a
+    /// later flush. Reads of a virtual offset first flush (see
     /// [`Self::read_at`]), so callers observing the returned offset always
     /// see the record.
     ///
