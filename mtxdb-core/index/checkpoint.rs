@@ -1,12 +1,14 @@
 //! On-disk serialization of the per-collection indexes (`index.checkpoint`).
 //!
 //! Packfiles stay authoritative: this file is a rebuildable acceleration
-//! structure. Every `sync`/`sync_all` rewrites the *entire* checkpoint
-//! atomically (temp file + rename) so the on-disk index is never older than
-//! the durable pack state it describes — no delta log is needed for
-//! correctness, and a crash at any point leaves either the previous
-//! checkpoint (whose fingerprint no longer matches the packs, forcing a
-//! faithful rescan on next open) or the fully written new one.
+//! structure. A full `rewrite` (see `PackfileStorage::persist_index_checkpoint`)
+//! is done atomically (temp file + rename) whenever the delta log can't
+//! continue — a structural change, a broken continuation, or the log's size
+//! cap. Between rewrites, incremental index mutations are persisted as
+//! batches in the `index.delta` log ([`crate::index::delta`]); the checkpoint
+//! pins the exact pack set those frames continue, and a crash at any point
+//! leaves a fingerprint mismatch the next open resolves with a rescan — never
+//! a wrong replay.
 //!
 //! Layout (all little-endian, fixed width — see [`crate::index::format`]):
 //!
@@ -20,8 +22,9 @@
 //!
 //! The header's `pack_fingerprint` is a deterministic hash of the
 //! `(pack_id, length)` set the checkpoint describes. An opener only trusts
-//! the file when that fingerprint matches the packs currently on disk; any
-//! append, rotation, or repack changes it and forces a rescan.
+//! the file when that fingerprint matches the packs currently on disk (optionally
+//! with a gated delta replay continuing it); any append, rotation, or repack
+//! changes it and forces a rescan.
 
 use std::fs;
 use std::io::Write as _;

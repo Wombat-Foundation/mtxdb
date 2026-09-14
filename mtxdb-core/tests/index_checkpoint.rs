@@ -488,31 +488,43 @@ mod tests {
     }
 
     #[test]
-    fn clean_sync_skips_checkpoint_rewrite_but_a_write_rewrites() {
+    #[allow(clippy::too_many_lines)]
+    fn clean_sync_writes_nothing_but_a_write_appends_delta_and_structural_change_rewrites() {
+        use mtxdb_core::index::delta::INDEX_DELTA_FILE;
+        use mtxdb_core::packfile::storage::OpenPath;
+
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_dirty_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
 
+        let delta_path = dir.join(INDEX_DELTA_FILE);
+
         let store = make_store(&dir);
         store.sync_all().unwrap();
-        let first_mtime = std::fs::metadata(checkpoint_path(&dir))
-            .unwrap()
-            .modified()
-            .unwrap();
+        let first_checkpoint = std::fs::read(checkpoint_path(&dir)).unwrap();
+        assert!(
+            !delta_path.exists(),
+            "the initial sync rewrites and re-bases, leaving no delta log"
+        );
 
-        // A second sync with no writes between must not rewrite the checkpoint.
+        // A second sync with no writes between writes nothing at all: neither
+        // the checkpoint nor a delta log.
         store.sync_all().unwrap();
-        let second_mtime = std::fs::metadata(checkpoint_path(&dir))
-            .unwrap()
-            .modified()
-            .unwrap();
-        let first_key = duration_as_nanos(first_mtime, second_mtime);
-        assert_eq!(first_key, 0, "a clean sync must not rewrite the checkpoint");
+        assert_eq!(
+            std::fs::read(checkpoint_path(&dir)).unwrap(),
+            first_checkpoint,
+            "a clean sync must not rewrite the checkpoint"
+        );
+        assert!(
+            !delta_path.exists(),
+            "a clean sync must not create a delta log"
+        );
         drop(store);
 
-        // A write followed by sync must rewrite it.
+        // A plain write's sync appends one delta batch and must NOT rewrite the
+        // checkpoint — that is the entire point of the delta writer.
         let store = PackfileStorage::open(dir.clone()).unwrap();
         let cid = collection_id(1);
         let nid = node_id(1, 777);
@@ -520,22 +532,191 @@ mod tests {
             .put(&cid, &nid, &NodeData::new(Bytes::from(payload_for(1, 777))))
             .unwrap();
         store.sync_all().unwrap();
-        let third_mtime = std::fs::metadata(checkpoint_path(&dir))
-            .unwrap()
-            .modified()
-            .unwrap();
-        assert_ne!(
-            duration_as_nanos(second_mtime, third_mtime),
-            0,
-            "a write followed by sync must rewrite the checkpoint"
+        let sync = store
+            .sync_timings()
+            .expect("sync must record its phase timings");
+        assert!(
+            sync.delta_log > std::time::Duration::ZERO,
+            "a plain write's sync must persist via a delta append"
         );
+        assert_eq!(
+            sync.checkpoint,
+            std::time::Duration::ZERO,
+            "a plain write's sync must not rewrite the checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(checkpoint_path(&dir)).unwrap(),
+            first_checkpoint,
+            "a delta append leaves the checkpoint byte-identical"
+        );
+        assert!(
+            delta_path.exists(),
+            "a plain write's sync must leave a delta log"
+        );
+        drop(store);
+
+        // The append replays on the fast reopen path and serves the record.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let open = reopened
+            .open_timings()
+            .expect("open must record its phase timings");
+        assert_eq!(
+            open.path,
+            OpenPath::Checkpoint,
+            "a delta log must replay onto its checkpoint, not rescan"
+        );
+        assert!(
+            open.delta_replay > std::time::Duration::ZERO,
+            "reopening a delta-extended store must pay the replay"
+        );
+        let got = reopened
+            .get(&cid, &nid)
+            .expect("lookup succeeds")
+            .expect("appended record must be served");
+        assert_eq!(got.bytes.as_ref(), payload_for(1, 777).as_slice());
+        drop(reopened);
+
+        // A structural change (a delete invalidates the log mid-session) must
+        // force the next dirty sync into a full checkpoint rewrite, which
+        // re-bases and truncates the delta log.
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &cid,
+                &node_id(1, 778),
+                &NodeData::new(Bytes::from(payload_for(1, 778))),
+            )
+            .unwrap();
+        store.delete_collection(&collection_id(2)).unwrap();
+        store.sync_all().unwrap();
+        let sync = store
+            .sync_timings()
+            .expect("sync must record its phase timings");
+        assert!(
+            sync.checkpoint > std::time::Duration::ZERO,
+            "a structural change must eventually rewrite the checkpoint"
+        );
+        assert_eq!(
+            sync.delta_log,
+            std::time::Duration::ZERO,
+            "a structural change must not try to append"
+        );
+        assert!(
+            !delta_path.exists(),
+            "the rewrite re-bases the log and truncates its file"
+        );
+        assert_ne!(
+            std::fs::read(checkpoint_path(&dir)).unwrap(),
+            first_checkpoint,
+            "the structural rewrite must change the checkpoint"
+        );
+        drop(store);
+
+        // The rewritten checkpoint serves both writes and keeps the deletion.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.collection_ids().len(),
+            2,
+            "the deleted collection must not come back"
+        );
+        for (nid, i) in [(node_id(1, 777), 777), (node_id(1, 778), 778)] {
+            let got = reopened
+                .get(&cid, &nid)
+                .expect("lookup succeeds")
+                .expect("record survives the structural rewrite");
+            assert_eq!(got.bytes.as_ref(), payload_for(1, i).as_slice());
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    fn duration_as_nanos(from: std::time::SystemTime, to: std::time::SystemTime) -> u128 {
-        to.duration_since(from)
-            .unwrap_or_else(|e| e.duration())
-            .as_nanos()
+    /// Regression for the inherited-log `write_header` bug: a session that opens
+    /// onto an existing committed delta log must CONTINUE it (one batch per
+    /// sync, no second base header). The old logic derived "fresh file?" from
+    /// a session-default `log_bytes == 0`, so a reopened session's first append
+    /// re-wrote the 16-byte log header MID-FILE; the reader then stopped at the
+    /// first batch magic and stranded the first batch's tail fingerprint,
+    /// rejecting the whole log on the next open.
+    #[test]
+    fn reopened_session_continues_an_inherited_delta_log() {
+        use mtxdb_core::index::delta::{self, INDEX_DELTA_FILE};
+        use mtxdb_core::packfile::storage::OpenPath;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_delta_continue_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let delta_path = dir.join(INDEX_DELTA_FILE);
+
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Session 1: one write, one append batch.
+        let cid = collection_id(1);
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &cid,
+                &node_id(1, 900),
+                &NodeData::new(Bytes::from(payload_for(1, 900))),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+        assert_eq!(
+            delta::read_delta_log(&delta_path)
+                .expect("session 1 must leave a decodable log")
+                .frames
+                .len(),
+            1,
+            "session 1 appends exactly one frame"
+        );
+
+        // Session 2 inherits the committed log; its append must continue the
+        // file, not re-write the base header.
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &cid,
+                &node_id(1, 901),
+                &NodeData::new(Bytes::from(payload_for(1, 901))),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        let log = delta::read_delta_log(&delta_path)
+            .expect("both appends must decode as one continued log");
+        assert_eq!(
+            log.frames.len(),
+            2,
+            "the reopened session's append must decode as a second batch"
+        );
+
+        // The tail is whatever the packs actually are now — the gate check
+        // below proves it (Checkpoint path requires tail == local fingerprint),
+        // and both records must be served.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let open = reopened
+            .open_timings()
+            .expect("open must record its phase timings");
+        assert_eq!(
+            open.path,
+            OpenPath::Checkpoint,
+            "a two-batch continued log must replay cleanly (tail == local fingerprint)"
+        );
+        assert!(open.delta_replay > std::time::Duration::ZERO);
+        for (nid, i) in [(node_id(1, 900), 900), (node_id(1, 901), 901)] {
+            let got = reopened
+                .get(&cid, &nid)
+                .expect("lookup succeeds")
+                .expect("record survives the continued log");
+            assert_eq!(got.bytes.as_ref(), payload_for(1, i).as_slice());
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

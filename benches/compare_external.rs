@@ -203,10 +203,11 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     let write_ms = started.elapsed().as_secs_f64() * 1e3;
     if let Some(sync) = store_rw.sync_timings() {
         eprintln!(
-            "    mtxdb sync_all: flush {:.2}ms + fsync {:.2}ms + sidecar {:.2}ms + checkpoint {:.2}ms = {:.2}ms",
+            "    mtxdb sync_all: flush {:.2}ms + fsync {:.2}ms + sidecar {:.2}ms + delta {:.2}ms + checkpoint {:.2}ms = {:.2}ms",
             sync.pack_flush.as_secs_f64() * 1e3,
             sync.pack_fsync.as_secs_f64() * 1e3,
             sync.sidecar.as_secs_f64() * 1e3,
+            sync.delta_log.as_secs_f64() * 1e3,
             sync.checkpoint.as_secs_f64() * 1e3,
             sync.total.as_secs_f64() * 1e3,
         );
@@ -240,12 +241,13 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
     if let Some(open) = store.open_timings() {
         eprintln!(
-            "    mtxdb open path={:?}: shard {:.2}ms + metadata {:.2}ms + checkpoint {:.2}ms + fingerprint {:.2}ms + materialize {:.2}ms + full_scan {:.2}ms = {:.2}ms",
+            "    mtxdb open path={:?}: shard {:.2}ms + metadata {:.2}ms + checkpoint {:.2}ms + fingerprint {:.2}ms + replay {:.2}ms + materialize {:.2}ms + full_scan {:.2}ms = {:.2}ms",
             open.path,
             open.shard_open.as_secs_f64() * 1e3,
             open.metadata_load.as_secs_f64() * 1e3,
             open.checkpoint_decode.as_secs_f64() * 1e3,
             open.fingerprint.as_secs_f64() * 1e3,
+            open.delta_replay.as_secs_f64() * 1e3,
             open.index_materialization.as_secs_f64() * 1e3,
             open.full_scan.as_secs_f64() * 1e3,
             open.total.as_secs_f64() * 1e3,
@@ -307,9 +309,10 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     let append_ms = append_puts_ms + append_sync_ms;
     if let Some(sync) = store_rw.sync_timings() {
         eprintln!(
-            "    mtxdb sync: flush {:.2}ms + fsync {:.2}ms + checkpoint {:.2}ms = {:.2}ms",
+            "    mtxdb sync: flush {:.2}ms + fsync {:.2}ms + delta {:.2}ms + checkpoint {:.2}ms = {:.2}ms",
             sync.pack_flush.as_secs_f64() * 1e3,
             sync.pack_fsync.as_secs_f64() * 1e3,
+            sync.delta_log.as_secs_f64() * 1e3,
             sync.checkpoint.as_secs_f64() * 1e3,
             sync.total.as_secs_f64() * 1e3,
         );
