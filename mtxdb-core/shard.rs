@@ -1995,10 +1995,12 @@ impl ShardPool {
         self.flush_all()?;
         let flush_elapsed = flush_started.elapsed();
         let fsync_started = Instant::now();
+        let had_dirty;
         {
             let shards = self.shards.read();
             let mut dirty_set = self.dirty.lock();
             let dirty: Vec<u16> = dirty_set.iter().copied().collect();
+            had_dirty = !dirty.is_empty();
             for &id in &dirty {
                 if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
                     shard.file.sync_all()?;
@@ -2009,7 +2011,9 @@ impl ShardPool {
         }
         let fsync_elapsed = fsync_started.elapsed();
         *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
-        self.persist_stats_best_effort();
+        if had_dirty {
+            self.persist_stats_best_effort();
+        }
         Ok(())
     }
 
