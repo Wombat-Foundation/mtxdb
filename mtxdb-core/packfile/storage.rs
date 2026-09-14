@@ -997,7 +997,12 @@ impl PackfileStorage {
         if let Some(&(last_shard_id, _, _, _)) = records.last() {
             shards.set_collection_home(collection_id, last_shard_id);
         }
-        let index = LossyIndex::new(records.len().saturating_mul(2).max(16));
+        let index = LossyIndex::new(
+            records
+                .len()
+                .saturating_mul(2)
+                .max(NEW_COLLECTION_INDEX_FLOOR),
+        );
         for (shard_id, hash, offset, _pack_id) in records {
             check_index_offset(*shard_id, hash, *offset)?;
             let _ = index.insert(hash, *shard_id, *offset);
@@ -1675,7 +1680,12 @@ impl PackfileStorage {
     }
 
     fn build_index(offsets: &[([u8; 16], u16, u64)]) -> Result<LossyIndex, StorageError> {
-        let index = LossyIndex::new(offsets.len().saturating_mul(2).max(16));
+        let index = LossyIndex::new(
+            offsets
+                .len()
+                .saturating_mul(2)
+                .max(NEW_COLLECTION_INDEX_FLOOR),
+        );
         for (hash, shard_id, offset) in offsets {
             check_index_offset(*shard_id, hash, *offset)?;
             let _ = index.insert(hash, *shard_id, *offset);
@@ -2792,7 +2802,7 @@ impl PackfileStorage {
         self.shards.flush_all()?;
         let scanned = self.scan_collection_records(collection_id)?;
         let total: usize = scanned.iter().map(|(_, e)| e.len()).sum();
-        let index = LossyIndex::new(total.saturating_mul(2).max(16));
+        let index = LossyIndex::new(total.saturating_mul(2).max(NEW_COLLECTION_INDEX_FLOOR));
         for (shard_id, entries) in scanned {
             for (hash, offset) in entries {
                 // `IndexSlot` can only represent offsets up to
@@ -6154,6 +6164,14 @@ mod tests {
         // Reader should now have correctly loaded the delta and rebuilt its index.
         let got = reader.get(&TEST_COLLECTION, &id).unwrap().unwrap();
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"multi_worker_test"));
+        assert_eq!(
+            reader
+                .collection_index_info(&TEST_COLLECTION)
+                .expect("refreshed collection exists")
+                .2,
+            u32::try_from(NEW_COLLECTION_INDEX_FLOOR).unwrap(),
+            "a refresh rebuild keeps the same minimum capacity as a new collection"
+        );
     }
 
     #[test]
@@ -6970,6 +6988,21 @@ mod tests {
             live_capacity, 64,
             "sanity check: a fresh one-node collection's live index capacity \
              is NEW_COLLECTION_INDEX_FLOOR"
+        );
+
+        // Force `open` down its packfile-scan path rather than letting it use
+        // the serialized checkpoint, then ensure the reconstructed index has
+        // the same floor as the original collection.
+        drop(store);
+        fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .collection_index_info(&TEST_COLLECTION)
+                .expect("scanned collection exists")
+                .2,
+            u32::try_from(NEW_COLLECTION_INDEX_FLOOR).unwrap(),
+            "an open-time scan keeps the new-collection index floor"
         );
 
         let from_disk = PackfileStorage::collection_summaries_from_disk(&dir)

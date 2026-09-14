@@ -115,12 +115,12 @@ def append_rows(scenario: Scenario) -> int:
     return len(scenario.rows)
 
 
-def print_table(rows: list[dict], default_run: bool = True) -> None:
+def print_table(rows: list[dict], default_run: bool | None = True) -> None:
     """Render the three engines side by side from a run's external rows.
 
-    `default_run` distinguishes a plain 0.1 GB run (no MTXDB_BENCH_EXT_GB in
-    the environment) from an explicit size, so the reminder only appears when
-    the note is accurate.
+    `default_run` distinguishes a plain 0.1 GB run (``True``) from an explicit
+    size (``False``). ``None`` means the raw capture came from an earlier run,
+    whose environment is unknowable, so no size claim is printed.
     """
     latest: dict[str, dict] = {}
     for row in rows:
@@ -191,7 +191,7 @@ def print_table(rows: list[dict], default_run: bool = True) -> None:
             "this is the default 0.1 GB run; rerun with MTXDB_BENCH_EXT_GB=0.2 "
             "for a bigger sample"
         )
-    else:
+    elif default_run is False:
         _footer = (
             f"ran with MTXDB_BENCH_EXT_GB= {os.environ.get('MTXDB_BENCH_EXT_GB')} GB"
         )
@@ -223,7 +223,10 @@ def main() -> None:
         return
     if args.append:
         append_rows(scenario)
-    print_table(scenario.rows, default_run="MTXDB_BENCH_EXT_GB" not in os.environ)
+    # `--no-run` reuses a capture from another invocation. Its size setting
+    # is not recorded in the raw output, so do not infer it from this shell.
+    default_run = None if args.no_run else "MTXDB_BENCH_EXT_GB" not in os.environ
+    print_table(scenario.rows, default_run=default_run)
 
 
 if __name__ == "__main__":
