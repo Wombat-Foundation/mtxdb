@@ -1,3 +1,6 @@
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 pub mod checkpoint;
 pub mod format;
 
@@ -539,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_lookup() {
-        let mut index = LossyIndex::new(128);
+        let index = LossyIndex::new(128);
         let h1 = test_hash(0x01);
         let h2 = test_hash(0x02);
         let h3 = test_hash(0xFF);
@@ -557,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_linear_probing() {
-        let mut index = LossyIndex::new(16); // small table
+        let index = LossyIndex::new(16); // small table
         for i in 0..10u8 {
             let mut h = [0u8; 16];
             h[0] = i;
@@ -581,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_table_full_returns_error() {
-        let mut index = LossyIndex::new(16); // capacity 16, threshold 12
+        let index = LossyIndex::new(16); // capacity 16, threshold 12
         for i in 0..12u64 {
             let h = splitmix_hash(i);
             index.insert(&h, 0, i).unwrap();
@@ -603,7 +606,7 @@ mod tests {
             128 * LIVE_SLOT_BYTES + std::mem::size_of::<LossyIndex>()
         );
 
-        let mut index = LossyIndex::new(128);
+        let index = LossyIndex::new(128);
         index.insert(&test_hash(0x01), 0, 1).unwrap();
         assert!(!index.is_empty());
     }
@@ -625,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_overwrite_same_hash() {
-        let mut index = LossyIndex::new(128);
+        let index = LossyIndex::new(128);
         let h = test_hash(0x01);
         index.insert(&h, 0, 100).unwrap();
         index.insert(&h, 1, 200).unwrap(); // overwrite
@@ -635,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_serialize_roundtrip() {
-        let mut index = LossyIndex::new(128);
+        let index = LossyIndex::new(128);
         for i in 0..50u16 {
             let mut h = [0u8; 16];
             h[0] = (i & 0xFF) as u8;
@@ -704,7 +707,7 @@ mod tests {
     #[test]
     fn test_insert_preserves_distinct_entries_at_scale() {
         let n = 50_000usize;
-        let mut index = LossyIndex::new(n * 2);
+        let index = LossyIndex::new(n * 2);
         for i in 0..n {
             let h = splitmix_hash(i as u64);
             index.insert(&h, 0, i as u64).unwrap();
@@ -779,5 +782,3 @@ mod tests {
         assert_eq!(restored.lookup(&query), None);
     }
 }
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

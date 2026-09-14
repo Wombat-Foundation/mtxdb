@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn index_with_entries(seed: u16, count: usize) -> LossyIndex {
-        let mut index = LossyIndex::new(count.max(16).saturating_mul(2));
+        let index = LossyIndex::new(count.max(16).saturating_mul(2));
         for i in 0..count {
             let shard = u16::try_from(i % 64).unwrap();
             let _ = index.insert(&hash_for(seed, i), shard, (i as u64).wrapping_mul(128));
