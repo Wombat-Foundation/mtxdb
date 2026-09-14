@@ -16,10 +16,14 @@ pub const COLLECTION_DIR_ENTRY_LEN: usize = 40;
 
 /// One slot overwrite after a checkpoint.
 ///
-/// `bucket` identifies the home bucket, while `slot` is the packed
-/// [`crate::index::IndexSlot`] representation written at that bucket's probe
-/// position. `generation` prevents a delta for a pre-resize table being
-/// applied to a resized or repacked collection.
+/// `bucket` is the frame's landing bucket — the actual table position the
+/// slot was written at, after `insert_tracked` advanced past any occupied
+/// slots during linear probing — not the hash's home bucket. `replay_frames`
+/// writes directly to it, so a producer logging a frame at the home bucket
+/// instead would place the delta at the wrong slot. `slot` is the packed
+/// [`crate::index::IndexSlot`] representation stored there. `generation`
+/// prevents a delta for a pre-resize table being applied to a resized or
+/// repacked collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaFrame {
     /// The collection whose index changed.
