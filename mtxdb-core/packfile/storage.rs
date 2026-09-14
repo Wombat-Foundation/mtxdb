@@ -552,6 +552,21 @@ struct RepackIncrementalState {
 const DEFAULT_REPACK_THRESHOLD_ENTRIES: u64 = 2048;
 const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 
+/// Minimum `LossyIndex` capacity for a brand-new collection's first
+/// insert (`put` and `put_many`), in slots (8 bytes each).
+///
+/// Not the index's own 16-slot hard floor: at the ~75% load factor
+/// `grow()` targets, 16 slots admits only ~12 entries before the next
+/// insert forces a grow -- and every `grow()` invalidates the delta log
+/// (see its doc comment), forcing the next sync to do a full checkpoint
+/// rewrite instead of a cheap delta append. A workload that lands entries
+/// one at a time into a new collection (e.g. events arriving
+/// individually) would trade checkpoint bloat for far more frequent full
+/// rewrites. 64 slots (512 B) covers a "handful of records" collection
+/// without ever growing, while remaining ~64x smaller than the old flat
+/// 4096-slot (32 KiB) floor this replaced.
+const NEW_COLLECTION_INDEX_FLOOR: usize = 64;
+
 impl PackfileStorage {
     /// Open a packfile storage with default settings.
     ///
@@ -4282,7 +4297,20 @@ impl StorageEngine for PackfileStorage {
             let old_gen = self.generation(collection_id);
             let mut index = match &old_gen {
                 Some(g) => g.index.clone(),
-                None => LossyIndex::new(4096),
+                // A brand-new collection's first insert: no count hint to
+                // size from (unlike `put_many`, which knows `entries.len()`),
+                // so start at a small fixed floor and let `grow()` size it
+                // up as real entries land. Previously this was a flat
+                // 4096-slot (32 KiB) floor per collection regardless of how
+                // many records it would ever hold -- workloads with many
+                // small/near-empty collections (e.g. per-room collections
+                // holding a handful of records each) paid that 32 KiB up
+                // front per collection, dwarfing the actual data by orders
+                // of magnitude.
+                //
+                // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
+                // index's own smaller hard floor.
+                None => LossyIndex::new(NEW_COLLECTION_INDEX_FLOOR),
             };
             let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
             if let Ok((bucket, slot)) = inserted {
@@ -4368,7 +4396,17 @@ impl StorageEngine for PackfileStorage {
         let old_gen = self.generation(collection_id);
         let mut index = match &old_gen {
             Some(g) => g.index.clone(),
-            None => LossyIndex::new(4096),
+            // Unlike `put`'s single-record path, we know exactly how many
+            // records this brand-new collection is about to receive -- size
+            // from that instead of the old flat 4096-slot (32 KiB) floor,
+            // matching the `records.len().saturating_mul(2).max(16)` pattern
+            // used elsewhere in this file (e.g. checkpoint/pack rebuild).
+            // Floor is 64, not 16 -- see the matching comment on `put`'s
+            // `None` arm above: a small batch (e.g. a single-event
+            // `put_many` call) would otherwise still hit `grow()` almost
+            // immediately, invalidating the delta log and forcing a full
+            // checkpoint rewrite on the next sync.
+            None => LossyIndex::new(entries.len().saturating_mul(2).max(64)),
         };
         let generation = old_gen.as_ref().map_or(1, |g| g.generation);
         let cache = match &old_gen {
@@ -4849,10 +4887,11 @@ mod tests {
 
     #[test]
     fn checkpoint_index_growth_recovers_hashes_from_indexed_frames() {
-        // 4,096 slots admit exactly 3,072 entries; the next write is the
-        // restart-plus-growth boundary.  This used to rescan every pack for
-        // this collection because the checkpoint stores locations but not
-        // home hashes.
+        // A batch large enough to be a "real" collection. The checkpoint
+        // this reopen loads stores locations but not home hashes, so
+        // growing it (via the `put_many` call below) used to rescan every
+        // pack for this collection instead of recovering hashes from the
+        // indexed delta frames.
         const ENTRIES: usize = 3_072;
         let dir = test_dir("checkpoint_growth_recovery");
         let store = PackfileStorage::open(dir.clone())
@@ -5833,7 +5872,12 @@ mod tests {
         let cid = [0x22u8; 16];
         let mut written = Vec::new();
 
-        for i in 0..50u64 {
+        // Stay well under `NEW_COLLECTION_INDEX_FLOOR`'s 75%-load grow
+        // threshold (48 entries at the floor of 64): this test exercises
+        // checkpoint/epoch continuity across a simulated crash, not the
+        // index's grow() behavior, and a grow mid-round would invalidate
+        // the delta log this test is asserting still exists on disk.
+        for i in 0..10u64 {
             let mut id = [0u8; 16];
             id[1..9].copy_from_slice(&i.to_le_bytes());
             let bytes = bytes::Bytes::from(format!("round1 {i}"));
@@ -5842,7 +5886,7 @@ mod tests {
         }
         store.sync_all().unwrap(); // C0, D0 exists once round 2 appends below.
 
-        for i in 50..100u64 {
+        for i in 10..20u64 {
             let mut id = [0u8; 16];
             id[1..9].copy_from_slice(&i.to_le_bytes());
             let bytes = bytes::Bytes::from(format!("round2 {i}"));
