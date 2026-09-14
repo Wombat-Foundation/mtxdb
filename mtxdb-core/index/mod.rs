@@ -100,6 +100,10 @@ impl IndexSlot {
 /// - Empty slot terminates probe (write-once, no tombstones needed).
 /// - Tag collisions coexist in the probe chain; a tag is only a candidate
 ///   filter and never an overwrite/equality proof.
+/// - Owned indexes keep `homes` and `tails` identity side tables: two
+///   anonymous `u64`s (16 bytes) per slot beyond the packed slot array.
+///   Checkpoints retain only packed slots; identities are hydrated lazily
+///   from authoritative frame headers when a writer needs them.
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
 #[derive(Debug)]
 pub struct LossyIndex {

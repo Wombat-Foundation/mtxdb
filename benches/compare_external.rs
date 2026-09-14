@@ -146,6 +146,10 @@ const APPEND_RECORDS: usize = 1_000;
 /// index and therefore require a full checkpoint rewrite.
 const STEADY_APPEND_RECORDS: usize = 256;
 const STEADY_APPEND_BATCHES: usize = 3;
+/// Structural grows can land inside the sampling window at any dataset size.
+/// Keep sampling until this many delta-path batches are collected, bounded so
+/// a broken delta path fails clearly instead of emitting a NaN average.
+const MAX_STEADY_APPEND_ATTEMPTS: usize = STEADY_APPEND_BATCHES * 8;
 /// The point-read sweep uses unique IDs, so it measures cache misses. Keep
 /// the comparison cache-free by default; opt into the production 100k-entry
 /// per-collection cache with `MTXDB_BENCH_CACHE_CAPACITY=100000` when
@@ -412,11 +416,14 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // whether a *later* boundary lands inside this fixed window depends on
     // the dataset size (a grow invalidates the delta log, so that batch's
     // sync falls back to a full checkpoint rewrite). A contaminated batch is
-    // excluded from the steady averages rather than aborting the run.
+    // excluded from the steady averages. Collect the requested number of
+    // delta-path samples even if a boundary lands in this window.
     let mut steady_puts_ms = 0.0;
     let mut steady_sync_ms = 0.0;
     let mut steady_delta_batches = 0;
-    for batch in 0..STEADY_APPEND_BATCHES {
+    let mut steady_attempts: usize = 0;
+    for batch in 0..MAX_STEADY_APPEND_ATTEMPTS {
+        steady_attempts = steady_attempts.saturating_add(1);
         let puts_started = Instant::now();
         for bucket in 0..COLLECTIONS {
             let mut entries = Vec::with_capacity(STEADY_APPEND_RECORDS / COLLECTIONS + 1);
@@ -442,6 +449,9 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
             steady_delta_batches += 1;
             steady_puts_ms += puts_started.elapsed().as_secs_f64() * 1e3;
             steady_sync_ms += sync_started.elapsed().as_secs_f64() * 1e3;
+            if steady_delta_batches == STEADY_APPEND_BATCHES {
+                break;
+            }
         } else {
             eprintln!(
                 "    note: steady batch {batch} grew a collection index, so its sync \
@@ -450,8 +460,9 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         }
     }
     assert!(
-        steady_delta_batches > 0,
-        "no steady batch took the delta path; cannot report a steady append"
+        steady_delta_batches == STEADY_APPEND_BATCHES,
+        "collected {steady_delta_batches}/{STEADY_APPEND_BATCHES} delta-path steady batches \
+         in {MAX_STEADY_APPEND_ATTEMPTS} attempts; cannot report a representative steady append"
     );
     let steady_append_puts_ms = steady_puts_ms / steady_delta_batches as f64;
     let steady_append_sync_ms = steady_sync_ms / steady_delta_batches as f64;
@@ -462,7 +473,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     //     elsewhere, so this is the latency an append adds in production.
     let append_loop_started = Instant::now();
     for i in 0..APPEND_RECORDS {
-        let node = nodes + APPEND_RECORDS + STEADY_APPEND_BATCHES * STEADY_APPEND_RECORDS + i;
+        let node = nodes + APPEND_RECORDS + steady_attempts * STEADY_APPEND_RECORDS + i;
         store_rw
             .put(
                 &collection_for(node),
