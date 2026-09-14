@@ -67,7 +67,9 @@ ROW_EXT = re.compile(
     r"STEADY_APPEND_PUTS_MS=(?P<steady_append_puts>[\d.]+) "
     r"STEADY_APPEND_SYNC_MS=(?P<steady_append_sync>[\d.]+)"
     r" FILES=(?P<files>\d+) "
-    r"MEM=(?P<mem>\d+) MEM_LABEL=(?P<mem_label>\w+)",
+    r"MEM=(?P<mem>\d+) MEM_LABEL=(?P<mem_label>\w+) "
+    r"RSS_OPEN=(?P<rss_open>\d+) PSS_OPEN=(?P<pss_open>\d+) "
+    r"RSS_WARM=(?P<rss_warm>\d+) PSS_WARM=(?P<pss_warm>\d+)",
     re.MULTILINE,
 )
 
@@ -294,6 +296,10 @@ def external_scenario(output: str) -> Scenario:
             "files_bytes",
             "mem_bytes",
             "mem_label",
+            "rss_open_bytes",
+            "pss_open_bytes",
+            "rss_warm_bytes",
+            "pss_warm_bytes",
         ],
     )
     for m in ROW_EXT.finditer(output):
@@ -315,6 +321,10 @@ def external_scenario(output: str) -> Scenario:
             "files_bytes": int(m["files"]),
             "mem_bytes": int(m["mem"]),
             "mem_label": m["mem_label"],
+            "rss_open_bytes": int(m["rss_open"]),
+            "pss_open_bytes": int(m["pss_open"]),
+            "rss_warm_bytes": int(m["rss_warm"]),
+            "pss_warm_bytes": int(m["pss_warm"]),
         }
         base = f"ext/{m['eng']}/{m['label']}gb/"
         for metric in (
@@ -331,6 +341,13 @@ def external_scenario(output: str) -> Scenario:
             "steady_append_puts_ms",
             "steady_append_sync_ms",
             "files_bytes",
+            # `mem_bytes` is deliberately excluded: its meaning (mem_label)
+            # differs across engines (resident index vs. on-disk file), so
+            # it is not a lower-is-better series across engines. PSS is the
+            # one memory number this bench captures the same way for all
+            # three, via /proc/self/smaps_rollup, so it is trend-tracked.
+            "pss_open_bytes",
+            "pss_warm_bytes",
         ):
             if row[metric] is not None:
                 scenario.tracked[base + metric] = float(row[metric])

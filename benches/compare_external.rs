@@ -92,6 +92,37 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Process-wide (RSS, PSS) in bytes from `/proc/self/smaps_rollup`, best
+/// effort. PSS apportions shared file-backed pages (mmap'd packfiles, the
+/// mmap-backed MDBX/SQLite files) across mappings, so it is the honest
+/// cross-engine number; RSS overcounts shared pages if this process ever
+/// shares them with another. Returns `(0, 0)` on non-Linux or if the file
+/// is unreadable, and callers must not treat that as a real zero.
+fn smaps_rollup() -> (u64, u64) {
+    let Ok(contents) = fs::read_to_string("/proc/self/smaps_rollup") else {
+        return (0, 0);
+    };
+    let parse_kb = |line: &str, prefix: &str| -> Option<u64> {
+        line.strip_prefix(prefix).map(|rest| {
+            rest.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+                * 1024
+        })
+    };
+    let mut rss = 0u64;
+    let mut pss = 0u64;
+    for line in contents.lines() {
+        if let Some(v) = parse_kb(line, "Rss:") {
+            rss = v;
+        } else if let Some(v) = parse_kb(line, "Pss:") {
+            pss = v;
+        }
+    }
+    (rss, pss)
+}
+
 /// Evict every file under `dir` from the page cache (best-effort, vmtouch).
 /// Same rationale as `benches/storage.rs::drop_caches_for_dir`.
 fn drop_caches_for_dir(dir: &std::path::Path) -> bool {
@@ -150,6 +181,13 @@ struct Run {
     files: u64,
     mem: u64,
     mem_label: &'static str,
+    /// (RSS, PSS) bytes from `/proc/self/smaps_rollup`, sampled right after
+    /// the warm open (before any lookups touch pages) and again after the
+    /// sampled point-lookup pass. This isolates open-time residency from
+    /// pages the lookup pass pulls in, and is the one apples-to-apples
+    /// memory number across engines — `mem`/`mem_label` above are not.
+    rss_pss_open: (u64, u64),
+    rss_pss_warm: (u64, u64),
 }
 
 fn collection_for(node: usize) -> [u8; 16] {
@@ -261,6 +299,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
             open.total.as_secs_f64() * 1e3,
         );
     }
+    let rss_pss_open = smaps_rollup();
     let lookup_started = Instant::now();
     for node in 0..LOOKUP_SAMPLES.min(nodes) {
         assert!(
@@ -272,6 +311,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         );
     }
     let lookup_us = lookup_started.elapsed().as_secs_f64() * 1e6 / LOOKUP_SAMPLES.min(nodes) as f64;
+    let rss_pss_warm = smaps_rollup();
     drop(store);
 
     // ── Cold open + append ──
@@ -407,6 +447,8 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         files,
         mem,
         mem_label,
+        rss_pss_open,
+        rss_pss_warm,
     }
 }
 
@@ -442,6 +484,7 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
     let txn = db.begin_ro_txn().unwrap();
     let table = txn.open_table(None).unwrap();
     let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
+    let rss_pss_open = smaps_rollup();
     let lookup_started = Instant::now();
     for node in 0..LOOKUP_SAMPLES.min(nodes) {
         let key = node_id(node);
@@ -451,6 +494,7 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
         );
     }
     let lookup_us = lookup_started.elapsed().as_secs_f64() * 1e6 / LOOKUP_SAMPLES.min(nodes) as f64;
+    let rss_pss_warm = smaps_rollup();
     drop(txn);
     drop(db);
 
@@ -518,6 +562,8 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
         files,
         mem,
         mem_label,
+        rss_pss_open,
+        rss_pss_warm,
     }
 }
 
@@ -560,6 +606,7 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
     let conn = Connection::open(&db_path).unwrap();
     let mut stmt = conn.prepare("SELECT val FROM nodes WHERE pk=?1").unwrap();
     let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
+    let rss_pss_open = smaps_rollup();
     let lookup_started = Instant::now();
     for node in 0..LOOKUP_SAMPLES.min(nodes) {
         let row: Vec<u8> = stmt
@@ -568,6 +615,7 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
         assert!(!row.is_empty(), "every written value must be readable back");
     }
     let lookup_us = lookup_started.elapsed().as_secs_f64() * 1e6 / LOOKUP_SAMPLES.min(nodes) as f64;
+    let rss_pss_warm = smaps_rollup();
     drop(stmt);
     drop(conn);
 
@@ -638,6 +686,8 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
         files,
         mem,
         mem_label,
+        rss_pss_open,
+        rss_pss_warm,
     }
 }
 
@@ -681,7 +731,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
          APPEND_PUTS_MS={:.2} APPEND_SYNC_MS={:.2}{loop_part}{sync_all_part} \
          STEADY_APPEND={STEADY_APPEND_RECORDS} STEADY_APPEND_MS={:.2} \
          STEADY_APPEND_PUTS_MS={:.2} STEADY_APPEND_SYNC_MS={:.2} \
-         FILES={} MEM={} MEM_LABEL={}",
+         FILES={} MEM={} MEM_LABEL={} RSS_OPEN={} PSS_OPEN={} RSS_WARM={} PSS_WARM={}",
         backend.name(),
         run.write_ms,
         run.warm_open_ms,
@@ -696,6 +746,10 @@ fn run_backend(backend: Backend, target_gb: f64) {
         run.files,
         run.mem,
         run.mem_label,
+        run.rss_pss_open.0,
+        run.rss_pss_open.1,
+        run.rss_pss_warm.0,
+        run.rss_pss_warm.1,
     );
 
     let loop_note = run.append_loop_ms.map_or(String::new(), |v| {
@@ -718,6 +772,17 @@ fn run_backend(backend: Backend, target_gb: f64) {
         "    steady append ({STEADY_APPEND_BATCHES} × {STEADY_APPEND_RECORDS} records): puts {:.2}ms + sync {:.2}ms = {:.2}ms/batch",
         run.steady_append_puts_ms, run.steady_append_sync_ms, run.steady_append_ms
     );
+    if run.rss_pss_open == (0, 0) && run.rss_pss_warm == (0, 0) {
+        eprintln!("    Note: /proc/self/smaps_rollup unavailable; no RSS/PSS claim is made.");
+    } else {
+        eprintln!(
+            "    memory (PSS, cross-engine comparable): open {:.1}MB -> after lookups {:.1}MB  (RSS: {:.1}MB -> {:.1}MB)",
+            run.rss_pss_open.1 as f64 / 1e6,
+            run.rss_pss_warm.1 as f64 / 1e6,
+            run.rss_pss_open.0 as f64 / 1e6,
+            run.rss_pss_warm.0 as f64 / 1e6,
+        );
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }

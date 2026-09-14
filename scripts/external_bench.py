@@ -32,6 +32,14 @@ METRICS = [
     ("steady_append_sync_ms", "steady sync"),
     ("files_bytes", "on-disk bytes"),
     ("mem_bytes", "index size"),
+    # PSS (proportional set size, /proc/self/smaps_rollup) is the one memory
+    # number captured identically for all three engines, so it is the
+    # cross-engine-comparable column; "index size" above is not (see its
+    # mem_label: resident index bytes for mtxdb, on-disk file bytes for
+    # mdbx/sqlite). "mem open" is sampled right after the warm open, before
+    # any lookups touch pages; "mem warm" after the sampled lookup pass.
+    ("pss_open_bytes", "mem open"),
+    ("pss_warm_bytes", "mem warm"),
 ]
 
 
@@ -109,7 +117,7 @@ def print_table() -> None:
 
     def cell(engine: str, metric: str) -> str:
         value = latest[engine][metric]
-        if metric == "files_bytes":
+        if metric in ("files_bytes", "pss_open_bytes", "pss_warm_bytes"):
             return _human_bytes(int(value))
         if metric != "mem_bytes":
             # `csv` parsing normalizes `6.80` to `6.8`; restore the benchmark
