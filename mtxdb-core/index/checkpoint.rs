@@ -121,6 +121,17 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
 /// delta log's frames can be gated against the same generation on replay),
 /// the first collection listed becoming the first in the directory order.
 ///
+/// # Contract
+/// The `fingerprint` and every `collections` blob must be *captured
+/// atomically*: derived from pack-file lengths and index slots that were both
+/// observed while every collection's writer lock was held. This function only
+/// makes that already-consistent (pack set, index snapshot) pair durable; it
+/// cannot reconcile the two if a concurrent `put` changed either side between
+/// capture and this call. The sole caller
+/// (`PackfileStorage::persist_index_checkpoint`) satisfies this by pinning the
+/// pack lengths and all collection generations under every `put_mutex` (and
+/// rotating the delta epoch there too) before handing them to this function.
+///
 /// # Errors
 /// Returns `io::Error` on any failure; the previous checkpoint (if any) is
 /// left intact in that case.

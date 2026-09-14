@@ -489,13 +489,15 @@ fn incompressible_payload(seed: u64, bytes_len: usize) -> bytes::Bytes {
 ///
 /// `target_gb` sets the nominal dataset size: the node count is derived from it
 /// and `payload_bytes`, and the on-disk pack size tracks it because payloads
-/// are incompressible.
+/// are incompressible. Returns the ``bench:``-line label and, when the page
+/// cache was actually dropped, the evicted open time; `None` means eviction was
+/// unavailable or failed, so the caller must not treat the sample as cold.
 #[allow(clippy::uninlined_format_args)]
 fn run_oneshot_open_benchmark(
     target_gb: f64,
     collection_count: usize,
     payload_bytes: usize,
-) -> (String, f64) {
+) -> (String, Option<f64>) {
     assert!(
         collection_count > 0,
         "benchmark needs at least one collection"
@@ -612,20 +614,26 @@ fn run_oneshot_open_benchmark(
 
     let label = format!("{target_gb:.3}");
     let label = label.trim_end_matches('0').trim_end_matches('.');
+    let (evicted_open_us, evicted_lookup_us) = if evicted {
+        (
+            format!("{:.1}", after_evict_open.as_secs_f64() * 1e6),
+            format!("{:.1}", after_evict_lookup.as_secs_f64() * 1e6),
+        )
+    } else {
+        ("n/a".to_owned(), "n/a".to_owned())
+    };
     println!(
         "bench: open L={label}gb N={total_nodes} COLS={collection_count} WRITE_MS={:.1} \
          PACK={pack_bytes} INDEX={index_bytes} WARM_OPEN_US={warm_open_us:.1} \
-         WARM_LOOKUP_US={warm_lookup_us:.1} EVICTED_OPEN_US={after_evict_open_us:.1} \
-         EVICTED_LOOKUP_US={after_evict_lookup_us:.1}",
+         WARM_LOOKUP_US={warm_lookup_us:.1} EVICTED_OPEN_US={evicted_open_us} \
+         EVICTED_LOOKUP_US={evicted_lookup_us} EVICTED={evicted}",
         write_elapsed.as_secs_f64() * 1e3,
         warm_open_us = warm_open.as_secs_f64() * 1e6,
         warm_lookup_us = warm_lookup.as_secs_f64() * 1e6,
-        after_evict_open_us = after_evict_open.as_secs_f64() * 1e6,
-        after_evict_lookup_us = after_evict_lookup.as_secs_f64() * 1e6,
     );
 
     let lb = label.to_owned();
-    let evicted_open_secs = after_evict_open.as_secs_f64();
+    let evicted_open_secs = evicted.then_some(after_evict_open.as_secs_f64());
     let _ = fs::remove_dir_all(&dir);
     (lb, evicted_open_secs)
 }
@@ -660,7 +668,9 @@ fn run_open_size_sweep() {
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(gbs.len());
     for gb in &gbs {
         let (_, evicted_open_secs) = run_oneshot_open_benchmark(*gb, 39, 1024);
-        points.push((*gb, evicted_open_secs));
+        if let Some(evicted_open_secs) = evicted_open_secs {
+            points.push((*gb, evicted_open_secs));
+        }
     }
     points.sort_by(|a, b| a.0.total_cmp(&b.0));
 
@@ -1241,6 +1251,141 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Measures the write-stall the epoch-handoff protocol (see
+/// `PackfileStorage::persist_index_checkpoint`) removed: a full checkpoint
+/// rewrite's serialize + fsync + rename now runs unlocked, so a concurrent
+/// `put()` should complete in a small fraction of a full rewrite's own
+/// duration, not block for it. Reports both numbers so a regression (the
+/// lock scope creeping back to cover the unlocked window) shows up as
+/// `PUT_MAX_MS` approaching `REWRITE_MS` over time in tracked history,
+/// rather than only being caught by the deterministic
+/// `test_put_does_not_block_on_slow_checkpoint_rewrite` unit test (which
+/// proves the same property with an injected delay instead of real I/O, and
+/// runs on every `cargo test` since it's milliseconds; this bench is the
+/// real-disk-speed companion, run via `cargo bench`).
+fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_collection: usize) {
+    let dir = bench_root().join(format!(
+        "mtxdb_bench_checkpoint_latency_{collections}x{records_per_collection}"
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+
+    for c in 0..collections {
+        let mut collection = [0u8; 16];
+        collection[0] = 0xCC;
+        collection[1] = c as u8;
+        for i in 0..records_per_collection {
+            let mut id = [0u8; 16];
+            id[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            store
+                .put(
+                    &collection,
+                    &id,
+                    &NodeData::new(bytes::Bytes::from(format!("seed {c} {i}"))),
+                )
+                .unwrap();
+        }
+    }
+    store.sync_all().unwrap();
+
+    // Baseline: one full rewrite in isolation (forced via a structural
+    // invalidation), no concurrent puts.
+    let throwaway = [0xDDu8; 16];
+    store
+        .put(
+            &throwaway,
+            &[1u8; 16],
+            &NodeData::new(bytes::Bytes::from("x")),
+        )
+        .unwrap();
+    store.delete_collection(&throwaway).unwrap();
+    let rewrite_started = Instant::now();
+    store.sync_all().unwrap();
+    let baseline_rewrite = rewrite_started.elapsed();
+
+    // Now measure put() latency while full rewrites run continuously in the
+    // background — each iteration forces a fresh invalidation so the
+    // background thread keeps taking the full-rewrite path throughout.
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let rewrites_done = AtomicU64::new(0);
+    let max_put_latency_micros = AtomicU64::new(0);
+
+    std::thread::scope(|scope| {
+        {
+            let store = &store;
+            let done = &done;
+            let rewrites_done = &rewrites_done;
+            scope.spawn(move || {
+                let mut r = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    let mut throwaway = [0u8; 16];
+                    throwaway[0] = 0xDD;
+                    throwaway[1..9].copy_from_slice(&r.to_le_bytes());
+                    store
+                        .put(
+                            &throwaway,
+                            &[1u8; 16],
+                            &NodeData::new(bytes::Bytes::from("x")),
+                        )
+                        .unwrap();
+                    store.delete_collection(&throwaway).unwrap();
+                    store.sync_all().unwrap();
+                    r += 1;
+                }
+                rewrites_done.store(r, Ordering::Relaxed);
+            });
+        }
+        {
+            let store = &store;
+            let done = &done;
+            let max_put_latency_micros = &max_put_latency_micros;
+            scope.spawn(move || {
+                let mut collection = [0u8; 16];
+                collection[0] = 0xEE;
+                for i in 0..500u64 {
+                    let mut id = [0u8; 16];
+                    id[1..9].copy_from_slice(&i.to_le_bytes());
+                    let started = Instant::now();
+                    store
+                        .put(&collection, &id, &NodeData::new(bytes::Bytes::from("y")))
+                        .unwrap();
+                    let elapsed_micros = started.elapsed().as_micros() as u64;
+                    max_put_latency_micros.fetch_max(elapsed_micros, Ordering::Relaxed);
+                }
+                done.store(true, Ordering::Relaxed);
+            });
+        }
+    });
+
+    let max_put_latency =
+        std::time::Duration::from_micros(max_put_latency_micros.load(Ordering::Relaxed));
+
+    eprintln!(
+        "bench: checkpoint rewrite vs. concurrent put latency ({collections} collections x \
+         {records_per_collection} records)"
+    );
+    println!(
+        "bench: checkpoint_latency COLLECTIONS={collections} RECORDS_PER_COLLECTION={records_per_collection} \
+         REWRITE_MS={:.3} PUT_MAX_MS={:.3} REWRITES={}",
+        baseline_rewrite.as_secs_f64() * 1e3,
+        max_put_latency.as_secs_f64() * 1e3,
+        rewrites_done.load(Ordering::Relaxed),
+    );
+    eprintln!("  baseline full rewrite:      {baseline_rewrite:.2?}");
+    eprintln!("  max concurrent put latency: {max_put_latency:.2?}");
+    eprintln!(
+        "  concurrent rewrites during put sampling: {}",
+        rewrites_done.load(Ordering::Relaxed)
+    );
+    eprintln!("  If PUT_MAX_MS approaches or exceeds REWRITE_MS, the lock scope in");
+    eprintln!("  persist_index_checkpoint has regressed to cover the serialize+fsync again.");
+    eprintln!();
+
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
     eprintln!("Note: shard Drop deletes superseded shard files on drop,");
@@ -1260,6 +1405,8 @@ fn main() {
 
     run_repack_benchmark(10_000, 1_000);
     run_repack_benchmark(20_000, 1_000);
+
+    run_checkpoint_rewrite_latency_benchmark(60, 5_000);
 
     // ── Connectivity check ──
     eprintln!();

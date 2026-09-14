@@ -2112,6 +2112,77 @@ impl PackfileStorage {
         old_base_fingerprint
     }
 
+    /// Test-only: a byte-for-byte mirror of `persist_index_checkpoint`,
+    /// except it sleeps for `delay` right after releasing the locks (in
+    /// place of, not in addition to, the production function's body — this
+    /// is never called from non-test code and the production function is
+    /// untouched). Lets a test make the unlocked window arbitrarily long
+    /// without depending on a dataset large enough to make a real
+    /// serialize+fsync slow relative to test-machine noise. See
+    /// `test_put_does_not_block_on_slow_checkpoint_rewrite`.
+    #[cfg(test)]
+    fn test_persist_index_checkpoint_with_delay(
+        &self,
+        delay: std::time::Duration,
+    ) -> Result<(), StorageError> {
+        if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        collection_ids.sort_unstable();
+        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+        self.shards.flush_all()?;
+        let fingerprint = self.current_pack_fingerprint();
+        let order = self.collection_order.read().clone();
+        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
+            let collections = self.collections.read();
+            order
+                .iter()
+                .filter_map(|collection_id| {
+                    collections.get(collection_id).map(|g| {
+                        let generation = arc_swap::ArcSwapAny::load_full(g);
+                        (*collection_id, generation.generation, generation)
+                    })
+                })
+                .collect()
+        };
+        let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        drop(guards);
+
+        std::thread::sleep(delay);
+
+        let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
+            .iter()
+            .map(|(collection_id, generation, room)| {
+                (*collection_id, *generation, room.index.serialize())
+            })
+            .collect();
+        let blobs: Vec<([u8; 16], u64, &[u8])> = entries
+            .iter()
+            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
+            .collect();
+        crate::index::checkpoint::write_checkpoint(
+            &Self::index_checkpoint_path(&self.base_dir),
+            fingerprint,
+            &blobs,
+        )
+        .map_err(StorageError::Io)?;
+        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        self.retire_delta_epoch(old_base_fingerprint);
+        let guards = mutexes.iter().map(|m| m.lock()).collect::<Vec<_>>();
+        let has_unfinished_work = {
+            let state = self.delta_state.lock();
+            !state.pending.is_empty() || state.invalid
+        };
+        if !has_unfinished_work {
+            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+        }
+        drop(guards);
+        self.persist_shard_collections_best_effort();
+        Ok(())
+    }
+
     /// Test-only: perform exactly the locked prefix of
     /// `persist_index_checkpoint` (flush, fingerprint, index snapshot, epoch
     /// rotation) and then stop, *never* writing or renaming a checkpoint.
@@ -5523,132 +5594,87 @@ mod tests {
         );
     }
 
-    /// Validates the actual performance point of the epoch-handoff protocol:
-    /// a `put()`'s latency should not approach a full checkpoint rewrite's
-    /// duration, now that the rewrite's serialize + fsync run unlocked. Uses
-    /// a self-normalizing comparison (measured concurrent put latency vs. a
-    /// measured baseline rewrite on the same store/hardware) rather than an
-    /// absolute threshold, so it isn't sensitive to the test machine's speed.
+    /// Deterministic, fast regression guard for the epoch-handoff protocol's
+    /// actual point: a concurrent `put()` must not block on the checkpoint
+    /// rewrite's serialize/write/rename, no matter how long that takes.
+    /// Rather than inferring "not blocked" from a wall-clock race against
+    /// real disk I/O (slow, and only as reliable as the dataset is large
+    /// enough to make a real rewrite slow relative to test-machine noise —
+    /// see the git history on this function for the timing-based version
+    /// this replaced), this injects an artificial, arbitrarily long delay
+    /// into the unlocked window via a test-only hook and asserts a `put()`
+    /// issued after the rewrite has entered that window returns in a small
+    /// fraction of it. A proper wall-clock benchmark of this same property
+    /// lives in `benches/storage.rs` (`cargo bench`), where it belongs.
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn test_put_latency_does_not_include_checkpoint_rewrite() {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
+    fn test_put_does_not_block_on_slow_checkpoint_rewrite() {
+        use std::sync::atomic::AtomicBool;
         use std::thread;
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
-        const COLLECTIONS: usize = 18;
-        const RECORDS_PER_COLLECTION: usize = 3000;
+        const ARTIFICIAL_DELAY: Duration = Duration::from_millis(300);
 
-        let dir = test_dir("put_latency_vs_rewrite");
+        let dir = test_dir("put_not_blocked_by_slow_rewrite");
         let store = PackfileStorage::open(dir).unwrap();
 
-        // Seed enough data that a full rewrite (serialize every collection's
-        // index, fsync the result) takes long enough to measure reliably.
-        for c in 0..COLLECTIONS {
-            let mut collection = [0u8; 16];
-            collection[0] = 0xCC;
-            collection[1] = u8::try_from(c).unwrap();
-            for i in 0..RECORDS_PER_COLLECTION {
-                let mut id = [0u8; 16];
-                id[1..9].copy_from_slice(&(i as u64).to_le_bytes());
-                store
-                    .put(
-                        &collection,
-                        &id,
-                        &NodeData::new(bytes::Bytes::from(format!("seed {c} {i}"))),
-                    )
-                    .unwrap();
-            }
-        }
+        // Establish a first checkpoint so the forced rewrite below has
+        // something real to serialize and rewrite.
+        let cid = [0x33u8; 16];
+        store
+            .put(&cid, &[0u8; 16], &NodeData::new(bytes::Bytes::from("seed")))
+            .unwrap();
         store.sync_all().unwrap();
 
-        // Baseline: time one full rewrite in isolation (forced via a
-        // structural invalidation), no concurrent puts.
-        let mut throwaway = [0u8; 16];
-        throwaway[0] = 0xDD;
+        // Force the next rewrite via a structural invalidation.
+        let throwaway = [0x44u8; 16];
         store
             .put(
                 &throwaway,
-                &[1u8; 16],
+                &[0u8; 16],
                 &NodeData::new(bytes::Bytes::from("x")),
             )
             .unwrap();
         store.delete_collection(&throwaway).unwrap();
-        let rewrite_started = Instant::now();
-        store.persist_index_checkpoint_best_effort();
-        let baseline_rewrite = rewrite_started.elapsed();
-        assert!(
-            baseline_rewrite > std::time::Duration::from_micros(200),
-            "seeded dataset must make a full rewrite measurable (got {baseline_rewrite:?}); \
-             increase COLLECTIONS/RECORDS_PER_COLLECTION if this is flaky on faster hardware"
-        );
 
-        // Now measure put() latency *while* full rewrites run continuously in
-        // the background — each iteration forces a fresh invalidation so the
-        // background thread keeps taking the full-rewrite path throughout.
-        let done = AtomicBool::new(false);
-        let rewrites_done = AtomicU64::new(0);
-        let max_put_latency_micros = AtomicU64::new(0);
+        let entered_unlocked_window = AtomicBool::new(false);
+        let put_elapsed = std::sync::Mutex::new(None::<Duration>);
 
         thread::scope(|scope| {
             {
                 let store = &store;
-                let done = &done;
-                let rewrites_done = &rewrites_done;
                 scope.spawn(move || {
-                    let mut r = 0u64;
-                    while !done.load(Ordering::Relaxed) {
-                        let mut throwaway = [0u8; 16];
-                        throwaway[0] = 0xDD;
-                        throwaway[1..9].copy_from_slice(&r.to_le_bytes());
-                        store
-                            .put(
-                                &throwaway,
-                                &[1u8; 16],
-                                &NodeData::new(bytes::Bytes::from("x")),
-                            )
-                            .unwrap();
-                        store.delete_collection(&throwaway).unwrap();
-                        store.persist_index_checkpoint_best_effort();
-                        r += 1;
-                    }
-                    rewrites_done.store(r, Ordering::Relaxed);
+                    store
+                        .test_persist_index_checkpoint_with_delay(ARTIFICIAL_DELAY)
+                        .unwrap();
                 });
             }
-            {
-                let store = &store;
-                let done = &done;
-                let max_put_latency_micros = &max_put_latency_micros;
-                scope.spawn(move || {
-                    let mut collection = [0u8; 16];
-                    collection[0] = 0xEE;
-                    for i in 0..500u64 {
-                        let mut id = [0u8; 16];
-                        id[1..9].copy_from_slice(&i.to_le_bytes());
-                        let started = Instant::now();
-                        store
-                            .put(&collection, &id, &NodeData::new(bytes::Bytes::from("y")))
-                            .unwrap();
-                        let elapsed_micros =
-                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                        max_put_latency_micros.fetch_max(elapsed_micros, Ordering::Relaxed);
-                    }
-                    done.store(true, Ordering::Relaxed);
-                });
-            }
+            // A generous head start: the locked prefix (flush + fingerprint +
+            // snapshot + rotation) does no artificial or real I/O-heavy work,
+            // so by the time this elapses the rewrite thread is reliably
+            // already sleeping inside the artificial delay, not still in the
+            // locked section.
+            thread::sleep(Duration::from_millis(50));
+            entered_unlocked_window.store(true, Ordering::Relaxed);
+
+            let started = Instant::now();
+            store
+                .put(
+                    &cid,
+                    &[1u8; 16],
+                    &NodeData::new(bytes::Bytes::from("concurrent")),
+                )
+                .unwrap();
+            *put_elapsed.lock().unwrap() = Some(started.elapsed());
         });
 
-        let max_put_latency =
-            std::time::Duration::from_micros(max_put_latency_micros.load(Ordering::Relaxed));
-        eprintln!(
-            "baseline rewrite: {baseline_rewrite:?}, max concurrent put latency: \
-             {max_put_latency:?}, concurrent rewrites completed: {}",
-            rewrites_done.load(Ordering::Relaxed)
-        );
+        assert!(entered_unlocked_window.load(Ordering::Relaxed));
+        let put_elapsed = put_elapsed.into_inner().unwrap().unwrap();
         assert!(
-            max_put_latency < baseline_rewrite,
-            "a put's latency ({max_put_latency:?}) should stay well under a full rewrite's \
-             duration ({baseline_rewrite:?}) now that the rewrite's serialize+fsync run unlocked"
+            put_elapsed < ARTIFICIAL_DELAY / 3,
+            "a put() issued while a rewrite was sleeping in its unlocked window took \
+             {put_elapsed:?} — it should return almost immediately, not wait anywhere near the \
+             artificial {ARTIFICIAL_DELAY:?} delay; did the lock scope regress to holding \
+             put_mutex across the serialize/write/rename again?"
         );
     }
 

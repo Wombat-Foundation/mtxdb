@@ -34,7 +34,7 @@ check: ##H Cargo check (core) and code dupe
 .PHONY: lint
 lint: ##H Run clippy lints (only core, not full workspace)
 	$(CARGO) clippy  --workspace --all-targets --all-features -- $(if $(CI),-D warnings)
-	-flake8 --max-line-length 88 $$(git ls-files '*.py')
+	@if command -v flake8 >/dev/null 2>&1; then flake8 --max-line-length 88 $$(git ls-files '*.py'); fi
 
 .PHONY: fix
 fix: ##H Apply auto-fixes with clippy (only core)
@@ -84,7 +84,7 @@ cov: ##H Run code coverage and generate HTML report
 
 .PHONY: bench
 bench: ##H Run benchmarks and append results to the CSV history in benches/csv/
-	$(CARGO) bench --benches --all-features --all-targets | tee benches/csv/latest.txt
+	set -o pipefail; $(CARGO) bench --benches --all-features --all-targets | tee benches/csv/latest.txt
 	python3 scripts/compare_bench.py --current benches/csv/latest.txt \
 		--best benches/csv/best.json --out benches/csv/best.json \
 		--machine "$$(cat benches/csv/machine.txt 2>/dev/null || hostname)" \
