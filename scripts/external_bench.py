@@ -143,6 +143,7 @@ def print_table() -> None:
         + "  "
         + "  ".join(header_rows[i][1].rjust(widths[i]) for i in range(len(columns)))
     )
+    print()
     for engine, cells in zip(engines, values):
         print(
             f"{engine:>7}  "
