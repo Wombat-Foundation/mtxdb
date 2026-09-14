@@ -693,10 +693,15 @@ fn print_pack_physical_layout(
     shard_entries: &[(u64, u64, u8)],
     physical: &mtxdb_core::packfile::layout::PhysicalLayout,
 ) {
-    let runs: u64 = physical.packs.values().map(|stats| stats.segments).sum();
-    let interleaved: u64 = physical
-        .packs
-        .values()
+    // Aggregate only over the packs listed in `shard_entries`: the caller
+    // passes every pack for `mtxdb shards --layout` (pool-wide totals) but a
+    // single pack for `mtxdb info 0x…`, where reporting pool-wide runs while
+    // displaying only the selected pack would mislead.
+    let listed_packs = shard_entries
+        .iter()
+        .filter_map(|(pack_id, _, _)| physical.packs.get(pack_id));
+    let runs: u64 = listed_packs.clone().map(|stats| stats.segments).sum();
+    let interleaved: u64 = listed_packs
         .map(|stats| {
             stats
                 .segments
@@ -719,9 +724,9 @@ fn print_pack_physical_layout(
             fmt_bytes(largest)
         );
     }
-    let collections_total: u64 = physical
-        .packs
-        .values()
+    let collections_total: u64 = shard_entries
+        .iter()
+        .filter_map(|(pack_id, _, _)| physical.packs.get(pack_id))
         .map(|stats| stats.collections.len() as u64)
         .sum();
     if interleaving_worth_noting(collections_total, interleaved) {
