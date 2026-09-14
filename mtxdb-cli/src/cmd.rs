@@ -1017,7 +1017,58 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-fn cmd_info(cli: &Cli, collection: &str) -> anyhow::Result<()> {
+/// `info` accepts a collection selector (slot index or 32-hex collection ID)
+/// or a pack selector (`0x`-prefixed, 1–16 hex digits, as printed by
+/// `mtxdb shards`). Dispatch on the hex length the same way `scan` does.
+fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    if selector
+        .strip_prefix("0x")
+        .or_else(|| selector.strip_prefix("0X"))
+        .is_some_and(|hex| hex.len() != 32)
+    {
+        return cmd_info_pack(cli, selector);
+    }
+    cmd_info_collection(cli, selector)
+}
+
+/// Print the same per-pack summary row `mtxdb shards` would, for one pack ID.
+fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    let pack_id = parse_pack_id_selector(selector)?;
+    let dir = selected_pool_dir(cli)?;
+    let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
+        .into_iter()
+        .filter(|&(id, _, _)| id == pack_id)
+        .collect();
+    if shard_entries.is_empty() {
+        eprintln!("pack 0x{pack_id:016x}: not found");
+        return Ok(());
+    }
+    let (stats_map, _) = decode_stats_snapshot(&dir);
+    let node_counts = PackfileStorage::shard_node_counts_from_disk(&dir);
+    let collection_counts = PackfileStorage::shard_collection_counts_from_disk(&dir);
+    let total_collections = collection_counts
+        .as_ref()
+        .map(|_| PackfileStorage::collection_directory_from_disk(&dir).len());
+    let (index_requirement, index_requirements_by_shard) = index_requirements_from_disk(&dir)
+        .map_or((None, None), |(total, by_shard)| {
+            (Some(total), Some(by_shard))
+        });
+    print_shard_table(
+        &shard_entries,
+        &stats_map,
+        node_counts.as_ref(),
+        collection_counts.as_ref(),
+        total_collections,
+        index_requirement,
+        index_requirements_by_shard.as_ref(),
+    );
+    if let Ok(physical) = physical_layout(&dir) {
+        print_pack_physical_layout(&shard_entries, &physical);
+    }
+    Ok(())
+}
+
+fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let collection_id = match collection.parse::<usize>() {
         Ok(slot) => {
             let collections = collection_ids(cli)?;
