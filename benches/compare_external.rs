@@ -745,8 +745,8 @@ fn run_backend(backend: Backend, target_gb: f64) {
         .append_sync_all_ms
         .map_or(String::new(), |v| format!(" APPEND_SYNC_ALL_MS={v:.2}"));
     println!(
-        "bench: external ENG={} L={label}gb N={nodes} WRITE_MS={:.1} WARM_OPEN_MS={:.2} \
-         COLD_OPEN_MS={:.2} LOOKUP_US={:.2} APPEND={APPEND_RECORDS} APPEND_MS={:.2} \
+        "bench: external ENG={} L={label}gb N={nodes} WRITE_MS={:.1} WARM_OPEN_MS={:.3} \
+         COLD_OPEN_MS={:.3} LOOKUP_US={:.2} APPEND={APPEND_RECORDS} APPEND_MS={:.2} \
          APPEND_PUTS_MS={:.2} APPEND_SYNC_MS={:.2}{loop_part}{sync_all_part} \
          STEADY_APPEND={STEADY_APPEND_RECORDS} STEADY_APPEND_MS={:.2} \
          STEADY_APPEND_PUTS_MS={:.2} STEADY_APPEND_SYNC_MS={:.2} \
@@ -774,7 +774,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
     let loop_note = run.append_loop_ms.map_or(String::new(), |v| {
         format!(" (per-put loop {v:.2}ms, no sync in window)")
     });
-    eprintln!("  [{:>6}] {backend:?} @ {label} GB: write {:.2}s, warm open {:.2}ms, cold open {:.2}ms, lookup {:.2}us, append {:.2}ms = puts {:.2}ms + sync {:.2}ms{loop_note}, files {:.1}MB, mem {:.1}MB ({})",
+    eprintln!("  [{:>6}] {backend:?} @ {label} GB: write {:.2}s, warm open {:.3}ms, cold open {:.3}ms, lookup {:.2}us, append {:.2}ms = puts {:.2}ms + sync {:.2}ms{loop_note}, files {:.1}MB, mem {:.1}MB ({})",
         backend.name(), run.write_ms / 1e3, run.warm_open_ms, run.cold_open_ms,
         run.lookup_us, run.append_ms, run.append_puts_ms, run.append_sync_ms,
         run.files as f64 / 1e6, run.mem as f64 / 1e6, run.mem_label);

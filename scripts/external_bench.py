@@ -137,12 +137,15 @@ def print_table(rows: list[dict]) -> None:
         if metric in ("files_bytes", "pss_open_bytes", "pss_warm_bytes"):
             return _human_bytes(int(value))
         if metric != "mem_bytes":
-            # `csv` parsing normalizes `6.80` to `6.8`; restore the benchmark
+            # `csv` parsing normalizes `6.800` to `6.8`; restore the benchmark
             # display contract here. Bulk write intentionally remains one
-            # decimal, while all other time measurements use two.
-            return (
-                f"{float(value):.1f}" if metric == "write_ms" else f"{float(value):.2f}"
-            )
+            # decimal, warm/cold open use three (their spreads are small),
+            # and all other time measurements use two.
+            if metric == "write_ms":
+                return f"{float(value):.1f}"
+            if metric in ("warm_open_ms", "cold_open_ms"):
+                return f"{float(value):.3f}"
+            return f"{float(value):.2f}"
         label = latest[engine]["mem_label"]
         if label == "index_bytes":
             return f"{_human_bytes(int(value))} idx"
@@ -158,6 +161,8 @@ def print_table(rows: list[dict]) -> None:
         )
         for i in range(len(columns))
     ]
+
+    print()
     print(
         "".rjust(7)
         + "  "
