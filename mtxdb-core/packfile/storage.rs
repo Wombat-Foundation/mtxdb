@@ -2112,6 +2112,85 @@ impl PackfileStorage {
         old_base_fingerprint
     }
 
+    /// Test-only: perform exactly the locked prefix of
+    /// `persist_index_checkpoint` (flush, fingerprint, index snapshot, epoch
+    /// rotation) and then stop, *never* writing or renaming a checkpoint.
+    /// Simulates a crash between the D0→D1 rotation and C1's rename — the
+    /// window where D1 exists only in memory and no on-disk checkpoint names
+    /// its fingerprint yet.
+    #[cfg(test)]
+    fn test_rotate_epoch_without_checkpoint(&self) -> (u64, Option<u64>) {
+        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        collection_ids.sort_unstable();
+        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+        self.shards.flush_all().unwrap();
+        let fingerprint = self.current_pack_fingerprint();
+        let order = self.collection_order.read().clone();
+        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
+            let collections = self.collections.read();
+            order
+                .iter()
+                .filter_map(|collection_id| {
+                    collections.get(collection_id).map(|g| {
+                        let generation = arc_swap::ArcSwapAny::load_full(g);
+                        (*collection_id, generation.generation, generation)
+                    })
+                })
+                .collect()
+        };
+        let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        (fingerprint, old_base_fingerprint)
+    }
+
+    /// Test-only: perform everything `persist_index_checkpoint` does up
+    /// through the checkpoint rename and its directory fsync, but stop
+    /// *before* `retire_delta_epoch`. Simulates a crash between C1 becoming
+    /// durable and D0's retirement — the window where both C1+D1 (current)
+    /// and C0's now-stale D0 (orphaned) exist on disk simultaneously.
+    #[cfg(test)]
+    fn test_write_checkpoint_without_retire(&self) -> Result<(u64, Option<u64>), StorageError> {
+        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        collection_ids.sort_unstable();
+        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+        self.shards.flush_all()?;
+        let fingerprint = self.current_pack_fingerprint();
+        let order = self.collection_order.read().clone();
+        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
+            let collections = self.collections.read();
+            order
+                .iter()
+                .filter_map(|collection_id| {
+                    collections.get(collection_id).map(|g| {
+                        let generation = arc_swap::ArcSwapAny::load_full(g);
+                        (*collection_id, generation.generation, generation)
+                    })
+                })
+                .collect()
+        };
+        let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        drop(guards);
+        let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
+            .iter()
+            .map(|(collection_id, generation, room)| {
+                (*collection_id, *generation, room.index.serialize())
+            })
+            .collect();
+        let blobs: Vec<([u8; 16], u64, &[u8])> = entries
+            .iter()
+            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
+            .collect();
+        crate::index::checkpoint::write_checkpoint(
+            &Self::index_checkpoint_path(&self.base_dir),
+            fingerprint,
+            &blobs,
+        )
+        .map_err(StorageError::Io)?;
+        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        Ok((fingerprint, old_base_fingerprint))
+    }
+
     /// Remove the now-superseded delta-log epoch, once the checkpoint that
     /// makes it safe to discard is durably renamed. A no-op if this session
     /// had no prior epoch. Best-effort: a failure here leaves the retired
@@ -5442,6 +5521,267 @@ mod tests {
             lost.len(),
             written.len()
         );
+    }
+
+    /// Validates the actual performance point of the epoch-handoff protocol:
+    /// a `put()`'s latency should not approach a full checkpoint rewrite's
+    /// duration, now that the rewrite's serialize + fsync run unlocked. Uses
+    /// a self-normalizing comparison (measured concurrent put latency vs. a
+    /// measured baseline rewrite on the same store/hardware) rather than an
+    /// absolute threshold, so it isn't sensitive to the test machine's speed.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_put_latency_does_not_include_checkpoint_rewrite() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::thread;
+        use std::time::Instant;
+
+        const COLLECTIONS: usize = 18;
+        const RECORDS_PER_COLLECTION: usize = 3000;
+
+        let dir = test_dir("put_latency_vs_rewrite");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Seed enough data that a full rewrite (serialize every collection's
+        // index, fsync the result) takes long enough to measure reliably.
+        for c in 0..COLLECTIONS {
+            let mut collection = [0u8; 16];
+            collection[0] = 0xCC;
+            collection[1] = u8::try_from(c).unwrap();
+            for i in 0..RECORDS_PER_COLLECTION {
+                let mut id = [0u8; 16];
+                id[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+                store
+                    .put(
+                        &collection,
+                        &id,
+                        &NodeData::new(bytes::Bytes::from(format!("seed {c} {i}"))),
+                    )
+                    .unwrap();
+            }
+        }
+        store.sync_all().unwrap();
+
+        // Baseline: time one full rewrite in isolation (forced via a
+        // structural invalidation), no concurrent puts.
+        let mut throwaway = [0u8; 16];
+        throwaway[0] = 0xDD;
+        store
+            .put(
+                &throwaway,
+                &[1u8; 16],
+                &NodeData::new(bytes::Bytes::from("x")),
+            )
+            .unwrap();
+        store.delete_collection(&throwaway).unwrap();
+        let rewrite_started = Instant::now();
+        store.persist_index_checkpoint_best_effort();
+        let baseline_rewrite = rewrite_started.elapsed();
+        assert!(
+            baseline_rewrite > std::time::Duration::from_micros(200),
+            "seeded dataset must make a full rewrite measurable (got {baseline_rewrite:?}); \
+             increase COLLECTIONS/RECORDS_PER_COLLECTION if this is flaky on faster hardware"
+        );
+
+        // Now measure put() latency *while* full rewrites run continuously in
+        // the background — each iteration forces a fresh invalidation so the
+        // background thread keeps taking the full-rewrite path throughout.
+        let done = AtomicBool::new(false);
+        let rewrites_done = AtomicU64::new(0);
+        let max_put_latency_micros = AtomicU64::new(0);
+
+        thread::scope(|scope| {
+            {
+                let store = &store;
+                let done = &done;
+                let rewrites_done = &rewrites_done;
+                scope.spawn(move || {
+                    let mut r = 0u64;
+                    while !done.load(Ordering::Relaxed) {
+                        let mut throwaway = [0u8; 16];
+                        throwaway[0] = 0xDD;
+                        throwaway[1..9].copy_from_slice(&r.to_le_bytes());
+                        store
+                            .put(
+                                &throwaway,
+                                &[1u8; 16],
+                                &NodeData::new(bytes::Bytes::from("x")),
+                            )
+                            .unwrap();
+                        store.delete_collection(&throwaway).unwrap();
+                        store.persist_index_checkpoint_best_effort();
+                        r += 1;
+                    }
+                    rewrites_done.store(r, Ordering::Relaxed);
+                });
+            }
+            {
+                let store = &store;
+                let done = &done;
+                let max_put_latency_micros = &max_put_latency_micros;
+                scope.spawn(move || {
+                    let mut collection = [0u8; 16];
+                    collection[0] = 0xEE;
+                    for i in 0..500u64 {
+                        let mut id = [0u8; 16];
+                        id[1..9].copy_from_slice(&i.to_le_bytes());
+                        let started = Instant::now();
+                        store
+                            .put(&collection, &id, &NodeData::new(bytes::Bytes::from("y")))
+                            .unwrap();
+                        let elapsed_micros =
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                        max_put_latency_micros.fetch_max(elapsed_micros, Ordering::Relaxed);
+                    }
+                    done.store(true, Ordering::Relaxed);
+                });
+            }
+        });
+
+        let max_put_latency =
+            std::time::Duration::from_micros(max_put_latency_micros.load(Ordering::Relaxed));
+        eprintln!(
+            "baseline rewrite: {baseline_rewrite:?}, max concurrent put latency: \
+             {max_put_latency:?}, concurrent rewrites completed: {}",
+            rewrites_done.load(Ordering::Relaxed)
+        );
+        assert!(
+            max_put_latency < baseline_rewrite,
+            "a put's latency ({max_put_latency:?}) should stay well under a full rewrite's \
+             duration ({baseline_rewrite:?}) now that the rewrite's serialize+fsync run unlocked"
+        );
+    }
+
+    /// Crash-boundary: a crash between the D0→D1 epoch rotation and C1's
+    /// checkpoint rename. D1 exists only in the (now-lost) in-memory state;
+    /// nothing on disk names its fingerprint. The pack bytes for whatever
+    /// prompted the rotation are already physically flushed (rotation always
+    /// flushes first), so the reopen's local fingerprint has already moved
+    /// past D0's sealed tail — the trusted-log check fails and this must fall
+    /// back to a full rescan (packfiles stay authoritative), never silently
+    /// lose the data.
+    #[test]
+    fn test_crash_between_rotation_and_checkpoint_rename_falls_back_to_rescan() {
+        let dir = test_dir("crash_between_rotation_and_rename");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        let cid = [0x11u8; 16];
+        let mut written = Vec::new();
+
+        // Round 1: establish C0 via a full (first-ever) rewrite.
+        for i in 0..50u64 {
+            let mut id = [0u8; 16];
+            id[1..9].copy_from_slice(&i.to_le_bytes());
+            let bytes = bytes::Bytes::from(format!("round1 {i}"));
+            store.put(&cid, &id, &NodeData::new(bytes.clone())).unwrap();
+            written.push((id, bytes));
+        }
+        store.sync_all().unwrap();
+
+        // Round 2: a plain write's sync appends a delta batch continuing C0
+        // (D0), never rewriting the checkpoint.
+        for i in 50..100u64 {
+            let mut id = [0u8; 16];
+            id[1..9].copy_from_slice(&i.to_le_bytes());
+            let bytes = bytes::Bytes::from(format!("round2 {i}"));
+            store.put(&cid, &id, &NodeData::new(bytes.clone())).unwrap();
+            written.push((id, bytes));
+        }
+        store.sync_all().unwrap();
+
+        // Round 3: more writes, then simulate a crash exactly between the
+        // epoch rotation (which flushes these bytes and discards their
+        // not-yet-appended delta frames) and the checkpoint that would have
+        // validated the new epoch.
+        for i in 100..150u64 {
+            let mut id = [0u8; 16];
+            id[1..9].copy_from_slice(&i.to_le_bytes());
+            let bytes = bytes::Bytes::from(format!("round3 {i}"));
+            store.put(&cid, &id, &NodeData::new(bytes.clone())).unwrap();
+            written.push((id, bytes));
+        }
+        let _ = store.test_rotate_epoch_without_checkpoint();
+        drop(store); // simulated crash: no checkpoint, no retirement.
+
+        let reopened = PackfileStorage::open(dir).unwrap();
+        let open = reopened.open_timings().expect("open must record timings");
+        assert_eq!(
+            open.path,
+            OpenPath::FullScan,
+            "D0's sealed tail can no longer match the post-rotation pack state, so the \
+             stale-but-still-present log must be rejected wholesale, not partially replayed"
+        );
+        for (id, expected_bytes) in &written {
+            let got = reopened
+                .get(&cid, id)
+                .unwrap()
+                .expect("every write, including the un-appended round 3, survives via the packs");
+            assert_eq!(got.bytes.as_ref(), expected_bytes.as_ref());
+        }
+    }
+
+    /// Crash-boundary: a crash between C1's checkpoint rename becoming
+    /// durable and D0's retirement. Both C1 (+ the fresh, still-empty D1) and
+    /// the now-stale D0 exist on disk at once; the reopen must select C1 and
+    /// ignore D0 (base fingerprint no longer matches), and the orphaned D0
+    /// file must be swept away by the sweep-on-open cleanup.
+    #[test]
+    fn test_crash_between_checkpoint_rename_and_retirement_uses_new_checkpoint() {
+        let dir = test_dir("crash_between_rename_and_retire");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        let cid = [0x22u8; 16];
+        let mut written = Vec::new();
+
+        for i in 0..50u64 {
+            let mut id = [0u8; 16];
+            id[1..9].copy_from_slice(&i.to_le_bytes());
+            let bytes = bytes::Bytes::from(format!("round1 {i}"));
+            store.put(&cid, &id, &NodeData::new(bytes.clone())).unwrap();
+            written.push((id, bytes));
+        }
+        store.sync_all().unwrap(); // C0, D0 exists once round 2 appends below.
+
+        for i in 50..100u64 {
+            let mut id = [0u8; 16];
+            id[1..9].copy_from_slice(&i.to_le_bytes());
+            let bytes = bytes::Bytes::from(format!("round2 {i}"));
+            store.put(&cid, &id, &NodeData::new(bytes.clone())).unwrap();
+            written.push((id, bytes));
+        }
+        store.sync_all().unwrap(); // D0 now has a committed batch continuing C0.
+
+        let old_d0_fingerprint = {
+            let (_new_fingerprint, old_base_fingerprint) =
+                store.test_write_checkpoint_without_retire().unwrap();
+            old_base_fingerprint.expect("this session had a prior epoch (C0/D0) to retire")
+        };
+        let d0_path = PackfileStorage::delta_path(&dir, old_d0_fingerprint);
+        assert!(
+            d0_path.exists(),
+            "D0 must still be on disk immediately after the simulated crash point"
+        );
+        drop(store); // simulated crash: retire_delta_epoch never ran.
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let open = reopened.open_timings().expect("open must record timings");
+        assert_eq!(
+            open.path,
+            OpenPath::Checkpoint,
+            "C1 is durable and matches the current pack state exactly (no writes happened \
+             after the snapshot), so the reopen must take the fast path"
+        );
+        assert!(
+            !d0_path.exists(),
+            "the orphaned, now-unreachable D0 must be swept away by the writable open's cleanup"
+        );
+        for (id, expected_bytes) in &written {
+            let got = reopened
+                .get(&cid, id)
+                .unwrap()
+                .expect("every write survives a reopen onto the new checkpoint");
+            assert_eq!(got.bytes.as_ref(), expected_bytes.as_ref());
+        }
     }
 
     #[test]
