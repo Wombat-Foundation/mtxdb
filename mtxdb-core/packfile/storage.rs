@@ -6535,6 +6535,134 @@ mod tests {
     }
 
     #[test]
+    fn test_probe_reopen_first_append_sync_path() {
+        let dir = test_dir("probe_reopen_sync");
+        let total = 3051u32;
+        const COLL: [u8; 16] = [0x11; 16];
+        let payload_bytes = move |i: u32| {
+            let mut payload = vec![0u8; 1024];
+            let seed = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xDEAD_BEEF;
+            payload[0] = seed as u8;
+            payload[1] = (seed >> 8) as u8;
+            payload
+        };
+        let id_for = move |i: u32| {
+            let mut id = [0u8; 16];
+            id[0..4].copy_from_slice(&i.to_le_bytes());
+            id[8..12].copy_from_slice(&(i ^ 0x9E37_79B9).to_le_bytes());
+            id
+        };
+        {
+            let store = PackfileStorage::open_with_cache_and_policies(
+                dir.clone(),
+                0,
+                true,
+                packfile::ChecksumPolicy::Full,
+            )
+            .unwrap()
+            .with_append_policy(shard::AppendPolicy::buffered());
+            let mut batch = Vec::new();
+            for i in 0..total {
+                batch.push((
+                    id_for(i),
+                    NodeData::new(bytes::Bytes::from(payload_bytes(i))),
+                ));
+                if batch.len() == 256 {
+                    store.put_many(&COLL, &batch).unwrap();
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                store.put_many(&COLL, &batch).unwrap();
+            }
+            store.sync_all().unwrap();
+            let st = store.stats();
+            let room = store.generation(&COLL).unwrap();
+            eprintln!(
+                "BUILD done: cap={} len={} load={:.3} gen={} | clones={} grows={} ckpt_writes={} delta_appends={}",
+                room.index.capacity(),
+                room.index.len(),
+                room.index.len() as f64 / room.index.capacity() as f64,
+                room.generation,
+                st.put_many_clone_path_calls,
+                st.index_grow_count,
+                st.checkpoint_writes,
+                st.delta_appends,
+            );
+        }
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            let d = store.delta_state.lock();
+            eprintln!(
+                "REOPEN delta_state: base_fingerprint={:?} invalid={} pending={} log_bytes={}",
+                d.base_fingerprint,
+                d.invalid,
+                d.pending.len(),
+                d.log_bytes
+            );
+            let room = store.generation(&COLL).unwrap();
+            eprintln!(
+                "REOPEN room: cap={} len={} load={:.3} gen={} base_gen={:?}",
+                room.index.capacity(),
+                room.index.len(),
+                room.index.len() as f64 / room.index.capacity() as f64,
+                room.generation,
+                d.base_generations.get(&COLL),
+            );
+            drop(d);
+            drop(room);
+
+            let before = store.stats();
+            let mut batch = Vec::new();
+            for i in 0..32u32 {
+                batch.push((
+                    id_for(total + i),
+                    NodeData::new(bytes::Bytes::from_static(b"y")),
+                ));
+            }
+            store.put_many(&COLL, &batch).unwrap();
+            let after_put = store.stats();
+            let d = store.delta_state.lock();
+            eprintln!(
+                "AFTER REOPEN PUT: clones+={} grows+={} invalids+={} | pending={} invalid={}",
+                after_put.put_many_clone_path_calls - before.put_many_clone_path_calls,
+                after_put.index_grow_count - before.index_grow_count,
+                after_put.delta_invalidations - before.delta_invalidations,
+                d.pending.len(),
+                d.invalid,
+            );
+            drop(d);
+            store.sync().unwrap();
+            let st = store.stats();
+            let ts = store.sync_timings().unwrap();
+            eprintln!(
+                "REOPEN SYNC TIMINGS: flush={:?} fsync={:?} checkpoint={:?} delta={:?} total={:?}",
+                ts.pack_flush, ts.pack_fsync, ts.checkpoint, ts.delta_log, ts.total
+            );
+            eprintln!(
+                "REOPEN SYNC STATS: ckpt_writes+={} delta_appends+={}",
+                st.checkpoint_writes - before.checkpoint_writes,
+                st.delta_appends - before.delta_appends,
+            );
+
+            let mut batch = Vec::new();
+            for i in 31..(31 + 256) {
+                batch.push((
+                    id_for(total + i),
+                    NodeData::new(bytes::Bytes::from_static(b"z")),
+                ));
+            }
+            store.put_many(&COLL, &batch).unwrap();
+            store.sync().unwrap();
+            let ts = store.sync_timings().unwrap();
+            eprintln!(
+                "SECOND SYNC TIMINGS: checkpoint={:?} delta={:?} total={:?}",
+                ts.checkpoint, ts.delta_log, ts.total
+            );
+        }
+    }
+
+    #[test]
     fn test_rebuild_index_triggers_on_full_table() {
         let dir = test_dir("rebuild_index_full");
         let store = PackfileStorage::open(dir).unwrap();
