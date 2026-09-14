@@ -1901,17 +1901,29 @@ impl PackfileStorage {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
-        // Hold every collection's put_mutex across the fingerprint snapshot
-        // and the index serialization below (same sorted-lock pattern as
+        // Hold every collection's put_mutex across the fingerprint snapshot,
+        // the index serialization, and the delta-log rebase in
+        // `reset_delta_log_after_rewrite` below (same sorted-lock pattern as
         // `retire_empty_shards_after_batch`). Without this, a concurrent
-        // `put` can straddle the two: it lands its record between the pack
-        // fingerprint being captured and that collection's index generation
-        // being loaded, so the checkpoint pins a fingerprint that already
-        // includes the new bytes together with an index snapshot taken
-        // before the record's slot was published — a checkpoint that reopens
-        // cleanly (fingerprint matches, rescan skipped) but is silently
-        // missing that record, with the delta that would have covered it
-        // dropped by the rewrite below.
+        // `put` can straddle any pair of those steps: e.g. land its record
+        // between the pack fingerprint being captured and that collection's
+        // index generation being loaded, so the checkpoint pins a
+        // fingerprint that already includes the new bytes together with an
+        // index snapshot taken before the record's slot was published — a
+        // checkpoint that reopens cleanly (fingerprint matches, rescan
+        // skipped) but is silently missing that record. Releasing the locks
+        // any earlier than the rebase re-opens the same class of race one
+        // step later: a put that lands after the snapshot but before
+        // `reset_delta_log_after_rewrite` would have its delta frame
+        // recorded against the *old* base, then silently discarded when the
+        // rebase drops the pre-rewrite session's frames — losing the write
+        // outright rather than just costing a rescan. So the whole
+        // snapshot-serialize-write-rebase sequence has to be one critical
+        // section; the tradeoff is that a full checkpoint rewrite serializes
+        // with all collection writers for its duration, including the disk
+        // write. Bounded by the writer's own periodic-rewrite policy, and
+        // dirty `sync()` prefers the cheap delta-append path over this full
+        // rewrite whenever the log is still valid.
         let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
         collection_ids.sort_unstable();
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
