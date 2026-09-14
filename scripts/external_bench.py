@@ -1,22 +1,23 @@
 """Run the mtxdb / mdbx / sqlite comparison bench and print the summary table.
 
-Appends the run to the committed `benches/csv/external.csv` history using
-`compare_bench.py`'s CSV writer, so the columns, machine fingerprint, and
-timestamp/`git_sha` prefix match the `make bench` history exactly. Only the
-raw capture (`benches/csv/latest-external.txt`) is transient.
+Running the script directly only prints the table; it never touches the
+committed `benches/csv/external.csv` history. Pass `--append` (as
+`make _bench/external` does) to append the run using `compare_bench.py`'s
+CSV writer, so the columns, machine fingerprint, and timestamp/`git_sha`
+prefix match the `make bench` history exactly. Only the raw capture
+(`benches/csv/latest-external.txt`) is transient.
 
 The comparison bench is feature-gated (`--features compare-external`), so it
 is deliberately separate from the un-gated `make bench` flow.
 """
 
 import argparse
-import csv
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from compare_bench import append_scenario_csv, external_scenario
+from compare_bench import Scenario, append_scenario_csv, external_scenario
 
 ROOT = Path(__file__).resolve().parent.parent
 CSV_DIR = ROOT / "benches" / "csv"
@@ -98,9 +99,9 @@ def run_bench() -> None:
                 )
 
 
-def append_rows() -> int:
-    """Parse the run and append its external rows to benches/csv/external.csv."""
-    scenario = external_scenario(LATEST.read_text(encoding="utf-8"))
+def append_rows(scenario: Scenario) -> int:
+    """Tag a parsed run with its machine fingerprint and append it to
+    `benches/csv/external.csv`."""
     if not scenario.rows:
         print("warning: no `bench: external` rows parsed from the run", file=sys.stderr)
         return 0
@@ -114,10 +115,8 @@ def append_rows() -> int:
     return len(scenario.rows)
 
 
-def print_table() -> None:
-    """Render the three engines side by side from the external history."""
-    with (CSV_DIR / "external.csv").open(encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+def print_table(rows: list[dict]) -> None:
+    """Render the three engines side by side from a run's external rows."""
     latest: dict[str, dict] = {}
     for row in rows:
         latest[row["engine"]] = row
@@ -178,12 +177,17 @@ def print_table() -> None:
 
 
 def main() -> None:
-    """Wire the flow: bench, append, table."""
+    """Wire the flow: bench, then (optionally) append history, then table."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--no-run",
         action="store_true",
         help="skip the cargo bench run; only append + print from existing LATEST",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="append the run to benches/csv/external.csv history (default: skip)",
     )
     args = parser.parse_args()
 
@@ -191,9 +195,13 @@ def main() -> None:
         run_bench()
     if not LATEST.exists():
         raise SystemExit(f"{LATEST} missing; run without --no-run first")
-    appended = append_rows()
-    if appended:
-        print_table()
+    scenario = external_scenario(LATEST.read_text(encoding="utf-8"))
+    if not scenario.rows:
+        print("warning: no `bench: external` rows parsed from the run", file=sys.stderr)
+        return
+    if args.append:
+        append_rows(scenario)
+    print_table(scenario.rows)
 
 
 if __name__ == "__main__":
