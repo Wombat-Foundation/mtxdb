@@ -62,6 +62,25 @@ fn fmt_megabytes(bytes: usize) -> String {
     format!("{whole}.{fraction:05} MB")
 }
 
+/// Decimal kilobytes for per-collection index allocations, where MB would
+/// obscure the useful differences between small power-of-two tables.
+fn fmt_index_kilobytes(bytes: usize) -> String {
+    const BYTES_PER_KB: u64 = 1_000;
+    const FRACTION_SCALE: u64 = 100;
+
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    let mut whole = bytes / BYTES_PER_KB;
+    let mut fraction = (bytes % BYTES_PER_KB)
+        .saturating_mul(FRACTION_SCALE)
+        .saturating_add(BYTES_PER_KB / 2)
+        / BYTES_PER_KB;
+    if fraction == FRACTION_SCALE {
+        whole = whole.saturating_add(1);
+        fraction = 0;
+    }
+    format!("{whole}.{fraction:02} KB")
+}
+
 /// Physical disk use, where millibyte precision is enough to distinguish
 /// small records without making large-collection listings visually noisy.
 fn fmt_disk_megabytes(bytes: u64) -> String {
@@ -492,7 +511,11 @@ fn cmd_collections_in_dir(
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
     let total_rows = ordered.len();
-    let max_rows = usize::try_from(limit).unwrap_or(usize::MAX);
+    let max_rows = if limit <= 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    };
     for (i, (collection_id, nodes, memory)) in ordered.into_iter().take(max_rows) {
         let hex = hex_encode(collection_id);
         let shards = collection_shards
@@ -531,7 +554,7 @@ fn cmd_collections_in_dir(
         } else {
             println!(
                 "  {i:>4}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
-                fmt_megabytes(*memory),
+                fmt_index_kilobytes(*memory),
                 fmt_disk_megabytes(disk),
             );
         }
@@ -555,7 +578,7 @@ fn cmd_collections_in_dir(
             "",
             "total",
             "",
-            fmt_megabytes(total_memory),
+            fmt_index_kilobytes(total_memory),
             fmt_disk_megabytes(total_disk_bytes),
         );
     }

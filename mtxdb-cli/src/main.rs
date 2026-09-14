@@ -174,6 +174,7 @@ fn limit_arg() -> Arg {
         .short('l')
         .long("limit")
         .default_value("50")
+        .allow_hyphen_values(true)
         .value_parser(clap::value_parser!(i64))
         .help("Maximum rows to show (default: 50; 0 or negative means unlimited)")
 }
