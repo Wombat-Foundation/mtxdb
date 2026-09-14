@@ -191,6 +191,10 @@ def print_table(rows: list[dict], default_run: bool = True) -> None:
             "this is the default 0.1 GB run; rerun with MTXDB_BENCH_EXT_GB=0.2 "
             "for a bigger sample"
         )
+    else:
+        _footer = (
+            f"ran with MTXDB_BENCH_EXT_GB= {os.environ.get('MTXDB_BENCH_EXT_GB')} GB"
+        )
     print(_footer)
 
 
