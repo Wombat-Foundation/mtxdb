@@ -98,6 +98,15 @@ def print_table() -> None:
     engines = ["mtxdb", "mdbx", "sqlite"]
     columns = [m[1] for m in METRICS]
 
+    # Keep the terminal summary compact now that it shows both the structural
+    # grow cost and the ordinary steady-state append cost. Metric labels are
+    # intentionally two words at most, so render them as a two-line header
+    # without widening a column for the combined phrase.
+    header_rows = [
+        tuple(label.split(maxsplit=1)) if " " in label else ("", label)
+        for label in columns
+    ]
+
     def cell(engine: str, metric: str) -> str:
         value = latest[engine][metric]
         if metric == "files_bytes":
@@ -118,13 +127,21 @@ def print_table() -> None:
 
     values = [[cell(engine, m[0]) for m in METRICS] for engine in engines]
     widths = [
-        max(len(columns[i]) + 2, *(len(r[i]) for r in values))
+        max(
+            *(len(word) for word in header_rows[i]),
+            *(len(row[i]) for row in values),
+        )
         for i in range(len(columns))
     ]
     print(
+        "".rjust(7)
+        + "  "
+        + "  ".join(header_rows[i][0].rjust(widths[i]) for i in range(len(columns)))
+    )
+    print(
         "engine".rjust(7)
         + "  "
-        + "  ".join(label.rjust(widths[i]) for i, label in enumerate(columns))
+        + "  ".join(header_rows[i][1].rjust(widths[i]) for i in range(len(columns)))
     )
     for engine, cells in zip(engines, values):
         print(
