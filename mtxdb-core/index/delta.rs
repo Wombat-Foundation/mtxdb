@@ -167,13 +167,13 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
     // the measured length and the bytes read describe the same file; a
     // bounded read from that handle then cannot allocate past
     // `MAX_DELTA_LOG_FILE_BYTES`.
+    use std::io::Read;
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if len > MAX_DELTA_LOG_FILE_BYTES {
         return None;
     }
-    let mut buf = vec![0u8; len as usize];
-    use std::io::Read;
+    let mut buf = vec![0u8; usize::try_from(len).ok()?];
     file.read_exact(&mut buf).ok()?;
     if buf.len() < DELTA_LOG_HEADER_LEN {
         return None;

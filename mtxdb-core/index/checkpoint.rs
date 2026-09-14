@@ -266,7 +266,7 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
         }
         let slots_len = (entry.capacity as usize).checked_mul(8)?;
         let region = slot_base.checked_add(usize::try_from(entry.slots_offset).ok()?)?;
-        let slots = &buf.get(region..region.checked_add(slots_len)?)?[..];
+        let slots = buf.get(region..region.checked_add(slots_len)?)?;
         // The dual direction of the count check: an *understated* count (fewer
         // non-empty slots than the region actually holds) passes the
         // `slot_count <= capacity` bound above but seeds a post-restart
@@ -284,7 +284,7 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
         let mut occupied: u32 = 0;
         for slot in slots.chunks_exact(8) {
             if slot != [0u8; 8] {
-                occupied = occupied.checked_add(1).map_or(u32::MAX, |n| n);
+                occupied = occupied.saturating_add(1);
                 if occupied > declared {
                     return None;
                 }

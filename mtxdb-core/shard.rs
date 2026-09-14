@@ -1363,57 +1363,60 @@ impl ShardPool {
             // strictly necessary when compression would have made it fit.
             let max_record_len = record.serialized_len() as u64;
 
-            // Byte range this put occupies in `pending`, captured so the
-            // failed-flush rollback below can remove exactly this record's
-            // frame.
-            let pending_start;
-            let frame_len;
+            // `append_lock` serializes writers *and* flushers, and is held
+            // from the capacity check through the append, the automatic
+            // flush, and (on failure) the rollback. That is what makes the
+            // rollback safe: a shard is shared by many collections (its
+            // `collection_home` maps several collections onto the same
+            // slot), so per-collection put mutexes DON'T serialize the
+            // appenders — only this lock does. While it is held, no other
+            // put, of any collection, can append to `pending`, so our frame
+            // is provably the tail when the failed flush needs to retract
+            // it.
+            let append_guard = shard.append_lock.lock();
+            // `file_len` is updated at flush time, making the virtual end
+            // (committed length plus already-buffered frames) the
+            // authoritative next offset. No syscalls happen per append.
+            let committed = shard.file_len.load(Ordering::Acquire);
+            let buffered = shard.pending.lock().len() as u64;
+            let virtual_end = committed.checked_add(buffered).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "file_len + pending overflow")
+            })?;
 
-            let offset = {
-                let guard = shard.append_lock.lock();
-                // `append_lock` serializes writers and `file_len` is updated
-                // at flush time, making the virtual end (committed length
-                // plus already-buffered frames) the authoritative next
-                // offset. No syscalls happen per append.
-                let committed = shard.file_len.load(Ordering::Acquire);
-                let buffered = shard.pending.lock().len() as u64;
-                let virtual_end = committed.checked_add(buffered).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "file_len + pending overflow")
-                })?;
+            // Check capacity while holding the append lock and against
+            // the virtual end — avoids a TOCTOU race where two threads
+            // both pass the check then one exceeds the limit.
+            let fits = virtual_end
+                .checked_add(max_record_len)
+                .is_some_and(|sum| sum <= self.max_shard_bytes);
+            if !fits && committed > packfile::HEADER_LEN as u64 {
+                drop(append_guard);
+                // First make room: push the buffered bytes to disk so
+                // the capacity check is measured against real length.
+                self.flush_shard(&shard)?;
+                shard = self.rotate_collection_full_home(&record.collection_id, shard.slot)?;
+                continue;
+            }
 
-                // Check capacity while holding the append lock and against
-                // the virtual end — avoids a TOCTOU race where two threads
-                // both pass the check then one exceeds the limit.
-                let fits = virtual_end
-                    .checked_add(max_record_len)
-                    .is_some_and(|sum| sum <= self.max_shard_bytes);
-                if !fits && committed > packfile::HEADER_LEN as u64 {
-                    drop(guard);
-                    // First make room: push the buffered bytes to disk so
-                    // the capacity check is measured against real length.
-                    self.flush_shard(&shard)?;
-                    shard = self.rotate_collection_full_home(&record.collection_id, shard.slot)?;
-                    continue;
-                }
-
-                let frame = packfile::encode_record_with_options(
-                    record,
-                    self.compress,
-                    self.checksum_policy.computes_checksum(),
-                )?;
+            let frame = packfile::encode_record_with_options(
+                record,
+                self.compress,
+                self.checksum_policy.computes_checksum(),
+            )?;
+            let frame_len = frame.len();
+            let pending_start = {
                 let mut pending = shard.pending.lock();
-                pending_start = pending.len();
-                frame_len = frame.len();
+                let start = pending.len();
                 pending.extend_from_slice(&frame);
                 shard.pending_records.fetch_add(1, Ordering::Relaxed);
-                virtual_end
+                start
             };
 
             let flush_result = match self.append_policy {
-                AppendPolicy::Eager => self.flush_shard(&shard),
+                AppendPolicy::Eager => self.flush_shard_with_guard(&shard, &append_guard),
                 AppendPolicy::Buffered { max_pending_bytes } => {
                     if shard.pending.lock().len() >= max_pending_bytes {
-                        self.flush_shard(&shard)
+                        self.flush_shard_with_guard(&shard, &append_guard)
                     } else {
                         Ok(())
                     }
@@ -1423,21 +1426,24 @@ impl ShardPool {
                 // The caller sees `Err` and has not indexed this record, yet
                 // its frame is still in `pending` — a later flush would
                 // silently make a "failed" put durable, surfacing it as
-                // stored data on restart's full scan. Roll it back. Only a
-                // tail truncation is safe (frames are contiguous, and this
-                // shard's puts are serialized by the collection put_mutex,
-                // so no other put can have appended after ours); if a
-                // concurrent flusher already committed the buffer, the range
-                // is gone and the rollback is a no-op.
-                let _guard = shard.append_lock.lock();
+                // stored data on restart's full scan. Retract it: a failed
+                // flush leaves `pending` untouched, and `append_guard` is
+                // still held from the append so nothing appended after our
+                // frame, making the tail truncation exact. A torn write's
+                // partially-written prefix is also reined back (`set_len` to
+                // the still-current committed frontier) so leftover bytes
+                // never read back as phantom records on a rebuild.
                 let mut pending = shard.pending.lock();
-                if pending.len() == pending_start.saturating_add(frame_len) {
+                let end = pending_start.saturating_add(frame_len);
+                if pending.len() >= end {
                     pending.truncate(pending_start);
                     shard.pending_records.fetch_sub(1, Ordering::Relaxed);
+                    drop(pending);
+                    let _ = shard.file.set_len(committed);
                 }
                 return Err(e);
             }
-            return Ok((shard.slot, offset));
+            return Ok((shard.slot, virtual_end));
         }
     }
 
