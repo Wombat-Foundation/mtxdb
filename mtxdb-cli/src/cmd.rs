@@ -338,7 +338,7 @@ fn cmd_get(
     match matches.as_slice() {
         [] => bail!("not found"),
         [(_, data)] => {
-            let output = (!raw).then(|| pretty_json_stream(&data.bytes)).flatten();
+            let output = (!raw).then(|| pretty_print_payload(&data.bytes)).flatten();
             io::stdout().write_all(output.as_deref().unwrap_or(&data.bytes))?;
             // Never decorate payload bytes: binary records can decode as
             // valid UTF-8, so only append a trailing newline when the caller
@@ -423,6 +423,70 @@ fn split_json_stream(bytes: &[u8]) -> Option<Vec<&[u8]>> {
         start = end;
     }
     (!values.is_empty()).then_some(values)
+}
+
+/// Decode Synapse's `event_json`-mirror record layout: a fixed 8-byte binary
+/// header (big-endian `i32` `format_version`, big-endian `u32` length of
+/// `internal_metadata`) followed by the `internal_metadata` JSON string and
+/// then the PDU JSON string, with no delimiter between the two. mtxdb-core
+/// stores this as an opaque blob — it has no concept of the layout — so a
+/// plain JSON parse of the whole value fails; this recognizes that specific
+/// shape instead of leaving it as a "(non-JSON)" dead end.
+///
+/// Returns `None` for anything that doesn't fit the shape (including
+/// ordinary single-JSON-document payloads, which callers should try first),
+/// so this never mis-decodes unrelated record types.
+fn decode_event_json_record(data: &[u8]) -> Option<(i32, Vec<u8>, Vec<u8>)> {
+    const HEADER_LEN: usize = 8;
+    if data.len() < HEADER_LEN {
+        return None;
+    }
+    let format_version = i32::from_be_bytes(data[0..4].try_into().ok()?);
+    let metadata_len = usize::try_from(u32::from_be_bytes(data[4..8].try_into().ok()?)).ok()?;
+    let metadata_end = HEADER_LEN.checked_add(metadata_len)?;
+    let metadata_bytes = data.get(HEADER_LEN..metadata_end)?;
+    let json_bytes = data.get(metadata_end..)?;
+    // Both fields must themselves be complete, single JSON documents with
+    // nothing left over — anything else is not this record shape.
+    let metadata_pretty = single_json_document(metadata_bytes)?;
+    let json_pretty = single_json_document(json_bytes)?;
+    Some((format_version, metadata_pretty, json_pretty))
+}
+
+/// Like [`pretty_json_stream`], but requires the bytes to be exactly one
+/// JSON document with nothing trailing — used to validate a slice carved out
+/// of a larger binary record, where leftover bytes mean the slice boundary
+/// was wrong, not that formatting should stop early.
+fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
+    let values = split_json_stream(bytes)?;
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    let mut value = value.to_vec();
+    let json = simd_json::to_owned_value(&mut value).ok()?;
+    Some(json.encode_pp().into_bytes())
+}
+
+/// Pretty-print a record payload for display, recognizing known mtxdb/Synapse
+/// record shapes beyond plain JSON. Tries a plain JSON stream first (the
+/// common case), then the `event_json` mirror layout. Returns `None` when
+/// nothing recognized the bytes, so callers can fall back to a raw/binary
+/// display.
+fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
+    if let Some(plain) = pretty_json_stream(bytes) {
+        return Some(plain);
+    }
+    let (format_version, metadata, json) = decode_event_json_record(bytes)?;
+    let mut output = Vec::new();
+    output.extend_from_slice(
+        format!("// event_json record (format_version={format_version})\n// internal_metadata:\n")
+            .as_bytes(),
+    );
+    output.extend_from_slice(&metadata);
+    output.extend_from_slice(b"\n// json:\n");
+    output.extend_from_slice(&json);
+    output.push(b'\n');
+    Some(output)
 }
 
 /// Enumerate live collections from the persisted directory. Stores created before
@@ -1770,18 +1834,20 @@ fn print_scan_limit_note(total: usize, limit: usize) {
 /// Print a readable payload for `scan --verbose` without ever treating an
 /// arbitrary binary record as terminal text.
 fn print_scan_payload(data: &[u8]) {
-    let pretty = pretty_json_stream(data).expect("non-JSON payloads use an inline suffix");
+    let pretty = pretty_print_payload(data).expect("undecodable payloads use an inline suffix");
     for line in String::from_utf8_lossy(&pretty).lines() {
         println!("    {line}");
     }
 }
 
-/// Return an inline summary for a binary payload; JSON payloads are printed
-/// below their record because their formatted representation spans lines.
+/// Return an inline summary for a payload `pretty_print_payload` can't
+/// decode; a decodable payload (plain JSON, or a recognized record shape
+/// like `event_json`) is printed below its record instead because its
+/// formatted representation spans lines.
 fn scan_payload_suffix(data: &[u8]) -> Option<String> {
-    pretty_json_stream(data)
+    pretty_print_payload(data)
         .is_none()
-        .then(|| format!(" payload: {} bytes (non-JSON)", data.len()))
+        .then(|| format!(" payload: {} bytes (undecodable)", data.len()))
 }
 
 fn cmd_import(
@@ -3030,11 +3096,11 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_import_template, default_matrix_import_template, event_room_id,
-        extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, interleaving_worth_noting,
-        matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
-        parse_pack_selectors, resolve_import_collection, template_collection_id,
-        CollectionTemplate,
+        compile_import_template, decode_event_json_record, default_matrix_import_template,
+        event_room_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
+        interleaving_worth_noting, matrix_batch_has_create, matrix_create_details,
+        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        resolve_import_collection, template_collection_id, CollectionTemplate,
     };
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -3151,6 +3217,65 @@ mod tests {
                 "$create:example.org by @alice:example.org; creator @alice:example.org; room version 10"
             )
         );
+    }
+
+    /// Build a Synapse `event_json` mirror record: big-endian `i32`
+    /// `format_version`, big-endian `u32` `internal_metadata` length, then
+    /// the two JSON documents back to back with no delimiter.
+    fn encode_event_json_record(
+        format_version: i32,
+        internal_metadata: &str,
+        json: &str,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&format_version.to_be_bytes());
+        buf.extend_from_slice(
+            &u32::try_from(internal_metadata.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
+        buf.extend_from_slice(internal_metadata.as_bytes());
+        buf.extend_from_slice(json.as_bytes());
+        buf
+    }
+
+    #[test]
+    fn decode_event_json_record_splits_metadata_from_pdu() {
+        // The exact shape reported against a real event_json mirror record:
+        // internal_metadata carrying a device_id, followed directly by the
+        // PDU JSON with no delimiter between the two documents.
+        let metadata = r#"{"device_id":"KIVSBMDOUC"}"#;
+        let pdu = r#"{"signatures":{"test":{"ed25519:a_lPym":"sig"}},"unsigned":{"age_ts":4},"room_id":"!DZJveaTFXeqOdyrdeh:test","auth_events":[],"prev_events":[],"content":{"room_version":"11"},"depth":1,"hashes":{"sha256":"3sk9WqGW2B6W7tRNY5xwZ6qpHMiZX/hJWHBYx42uVyY"},"origin_server_ts":4,"sender":"@u1:test","state_key":"","type":"m.room.create"}"#;
+        let record = encode_event_json_record(3, metadata, pdu);
+
+        let (format_version, decoded_metadata, decoded_json) =
+            decode_event_json_record(&record).expect("recognized event_json record shape");
+        assert_eq!(format_version, 3);
+        let decoded_metadata = String::from_utf8(decoded_metadata).unwrap();
+        let decoded_json = String::from_utf8(decoded_json).unwrap();
+        assert!(decoded_metadata.contains("KIVSBMDOUC"));
+        assert!(decoded_json.contains("m.room.create"));
+
+        // pretty_print_payload must reach the same decode, not the plain
+        // single-JSON path (the whole record is not valid JSON on its own).
+        let pretty = pretty_print_payload(&record).expect("event_json record is decodable");
+        let pretty = String::from_utf8(pretty).unwrap();
+        assert!(pretty.contains("format_version=3"));
+        assert!(pretty.contains("KIVSBMDOUC"));
+        assert!(pretty.contains("m.room.create"));
+    }
+
+    #[test]
+    fn decode_event_json_record_rejects_plain_json_and_garbage() {
+        // A plain single JSON document is not this record shape — callers
+        // must try `pretty_json_stream` first, not route ordinary payloads
+        // through this decoder.
+        assert!(decode_event_json_record(br#"{"type":"m.room.message"}"#).is_none());
+        // Arbitrary short binary data, and a length field pointing past the
+        // end of the buffer, must not panic and must not be mistaken for a
+        // valid record.
+        assert!(decode_event_json_record(b"\x00\x01").is_none());
+        assert!(decode_event_json_record(&[0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF, b'x']).is_none());
     }
 
     #[test]
