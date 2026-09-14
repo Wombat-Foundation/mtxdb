@@ -803,13 +803,27 @@ fn run_backend(backend: Backend, target_gb: f64) {
     let sync_all_part = run
         .append_sync_all_ms
         .map_or(String::new(), |v| format!(" APPEND_SYNC_ALL_MS={v:.2}"));
+    // Only meaningful for mtxdb (the only engine with a read-time checkpoint
+    // integrity check to disable); recorded for every engine anyway so the
+    // CSV column is never absent and a comparison across engines/rows never
+    // has to guess whether a fast mtxdb open paid for its own CRC32 check.
+    let checksum_policy = match backend {
+        Backend::Mtxdb => {
+            match mtxdb_core::index::checkpoint::CheckpointChecksumPolicy::from_env() {
+                mtxdb_core::index::checkpoint::CheckpointChecksumPolicy::Full => "full",
+                mtxdb_core::index::checkpoint::CheckpointChecksumPolicy::WriteOnly => "writeonly",
+            }
+        }
+        Backend::Mdbx | Backend::Sqlite => "na",
+    };
     println!(
         "bench: external ENG={} L={label}gb N={nodes} WRITE_MS={:.1} WARM_OPEN_MS={:.3} \
          COLD_OPEN_MS={:.3} LOOKUP_US={:.2} APPEND={APPEND_RECORDS} APPEND_MS={:.2} \
          APPEND_PUTS_MS={:.2} APPEND_SYNC_MS={:.2}{loop_part}{sync_all_part} \
          STEADY_APPEND={STEADY_APPEND_RECORDS} STEADY_APPEND_MS={:.2} \
          STEADY_APPEND_PUTS_MS={:.2} STEADY_APPEND_SYNC_MS={:.2} \
-         FILES={} MEM={} MEM_LABEL={} RSS_OPEN={} PSS_OPEN={} RSS_WARM={} PSS_WARM={} CACHE_CAPACITY={}",
+         FILES={} MEM={} MEM_LABEL={} RSS_OPEN={} PSS_OPEN={} RSS_WARM={} PSS_WARM={} CACHE_CAPACITY={} \
+         CHECKSUM={checksum_policy}",
         backend.name(),
         run.write_ms,
         run.warm_open_ms,

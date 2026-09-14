@@ -42,6 +42,13 @@ METRICS = [
     # any lookups touch pages; "mem warm" after the sampled lookup pass.
     ("pss_open_bytes", "mem open ~"),
     ("pss_warm_bytes", "mem warm ~"),
+    # "full" (default, safe) or "writeonly" (MTXDB_CHECKPOINT_CHECKSUM=
+    # writeonly / MTXDB_BENCH_CHECKSUM=disabled: faster warm/cold open, less
+    # safe) for mtxdb; "na" for mdbx/sqlite, which have no equivalent
+    # read-time integrity check to disable. Printed so a fast mtxdb open
+    # never has to be taken on faith -- see the CRC32-regression writeup
+    # earlier this session.
+    ("checksum", "crc check mode"),
 ]
 
 
@@ -158,6 +165,8 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
 
     def cell(engine: str, metric: str) -> str:
         value = latest[engine][metric]
+        if metric == "checksum":
+            return str(value) or "?"
         if metric in ("files_bytes", "pss_open_bytes", "pss_warm_bytes"):
             return _human_bytes(int(value))
         if metric != "mem_bytes":
@@ -220,11 +229,23 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
             f"ran with MTXDB_BENCH_EXT_GB= {os.environ.get('MTXDB_BENCH_EXT_GB')} GB"
         )
     print(_footer)
-    if os.environ.get("MTXDB_BENCH_CHECKSUM") == "disabled":
+    # Read the effective policy back from mtxdb's own row (the "crc check
+    # mode" column above) rather than re-inspecting env vars here, so this
+    # note is accurate whether it came from this script's own
+    # MTXDB_BENCH_CHECKSUM=disabled alias or from MTXDB_CHECKPOINT_CHECKSUM
+    # set directly.
+    mtxdb_checksum = latest.get("mtxdb", {}).get("checksum")
+    if mtxdb_checksum == "writeonly":
         print(
-            "MTXDB_BENCH_CHECKSUM=disabled: mtxdb's read-time checkpoint "
-            "CRC32 verification is off for this run (warm/cold open faster, "
-            "less safe) — the engine's own default stays on"
+            "crc check mode=writeonly: mtxdb's read-time checkpoint CRC32 "
+            "verification is off for this run (warm/cold open faster, less "
+            "safe) — the engine's own default stays on"
+        )
+    elif mtxdb_checksum == "full":
+        print(
+            "crc check mode=full: mtxdb verified the checkpoint's CRC32 on "
+            "every open in this run (the safe default) — warm/cold open "
+            "numbers include that cost"
         )
 
 

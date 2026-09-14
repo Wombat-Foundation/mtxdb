@@ -46,6 +46,8 @@ pub(crate) enum Commands {
         selector: String,
         verbose: bool,
         limit: i64,
+        id: Option<String>,
+        raw: bool,
     },
     Import {
         paths: Vec<PathBuf>,
@@ -259,6 +261,19 @@ fn sub_scan() -> Command {
                 .long("verbose")
                 .action(ArgAction::SetTrue)
                 .help("Print each frame's JSON payload when available"),
+        )
+        .arg(
+            Arg::new("id")
+                .long("id")
+                .value_name("NODE_ID")
+                .help("Restrict the physical scan to one node ID"),
+        )
+        .arg(
+            Arg::new("raw")
+                .long("raw")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("verbose")
+                .help("Write one --id-selected physical frame's payload bytes verbatim to stdout"),
         )
         .arg(limit_arg())
 }
@@ -483,6 +498,8 @@ fn parse_cli() -> Cli {
         Some(("scan", m)) => Commands::Scan {
             selector: m.get_one::<String>("selector").unwrap().clone(),
             verbose: m.get_flag("verbose"),
+            id: m.get_one::<String>("id").cloned(),
+            raw: m.get_flag("raw"),
             limit: *m
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),

@@ -165,7 +165,9 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             selector,
             verbose,
             limit,
-        } => cmd_scan(cli, selector, *verbose, *limit),
+            id,
+            raw,
+        } => cmd_scan(cli, selector, *verbose, *limit, id.as_deref(), *raw),
         Commands::Import {
             paths,
             collection,
@@ -1986,7 +1988,18 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
     u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
 }
 
-fn cmd_scan(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Result<()> {
+fn cmd_scan(
+    cli: &Cli,
+    selector: &str,
+    verbose: bool,
+    limit: i64,
+    id: Option<&str>,
+    raw: bool,
+) -> anyhow::Result<()> {
+    if raw && id.is_none() {
+        bail!("--raw requires --id NODE_ID so scan can emit exactly one frame without ambiguity");
+    }
+    let node_id = id.map(parse_node_id).transpose()?;
     // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
     // it's `0x`-prefixed with something other than 32 hex digits after it —
     // everything else (bare 32 hex digits, or `0x` + 32 hex digits) is a
@@ -1998,7 +2011,7 @@ fn cmd_scan(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Res
         .or_else(|| selector.strip_prefix("0X"))
         .is_some_and(|hex| hex.len() != 32);
     if !looks_like_pack_id {
-        return cmd_scan_collection(cli, selector, verbose, limit);
+        return cmd_scan_collection(cli, selector, verbose, limit, node_id, raw);
     }
     let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -2010,6 +2023,24 @@ fn cmd_scan(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Res
         .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
     let path = &shard.path;
     let records = mtxdb_core::packfile::scan_packfile(path)?;
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|(_, record_id, _)| match node_id {
+            Some(wanted) => *record_id == wanted,
+            None => true,
+        })
+        .collect();
+    if raw {
+        let [(.., offset)] = records.as_slice() else {
+            bail!(
+                "--raw requires exactly one matching frame; found {} (use a pack selector to disambiguate)",
+                records.len()
+            );
+        };
+        let data = ShardPool::read_at_committed(&shard, *offset, true)?;
+        io::stdout().write_all(&data.data)?;
+        return Ok(());
+    }
     println!(
         "pack 0x{pack_id:016x}: {} bytes, {} records",
         std::fs::metadata(path)?.len(),
@@ -2040,7 +2071,14 @@ fn cmd_scan(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Res
 /// Print every physical frame for a collection across all packs. This is a
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
-fn cmd_scan_collection(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Result<()> {
+fn cmd_scan_collection(
+    cli: &Cli,
+    selector: &str,
+    verbose: bool,
+    limit: i64,
+    node_id: Option<[u8; 16]>,
+    raw: bool,
+) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
@@ -2050,13 +2088,22 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> 
     let mut frames = 0_usize;
     let mut packs = 0_usize;
     let max_rows = scan_limit(limit);
+    let mut raw_matches = Vec::new();
     for (_, shard) in shards {
         let records = mtxdb_core::packfile::scan_packfile(&shard.path)?;
         let mut matched_pack = false;
-        for (record_collection_id, node_id, offset) in records {
-            if record_collection_id == collection_id {
+        for (record_collection_id, record_id, offset) in records {
+            let id_matches = match node_id {
+                Some(wanted) => record_id == wanted,
+                None => true,
+            };
+            if record_collection_id == collection_id && id_matches {
                 matched_pack = true;
                 frames = frames.saturating_add(1);
+                if raw {
+                    raw_matches.push((shard.clone(), offset));
+                    continue;
+                }
                 if frames <= max_rows {
                     let data = verbose
                         .then(|| ShardPool::read_at_committed(&shard, offset, true))
@@ -2067,7 +2114,7 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> 
                     println!(
                         "  pack: 0x{:016x} id: {} @ {offset}{suffix}",
                         shard.pack_id,
-                        hex_encode(&node_id),
+                        hex_encode(&record_id),
                         suffix = suffix.as_deref().unwrap_or(""),
                     );
                     if let Some(data) =
@@ -2082,7 +2129,17 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> 
     }
 
     if frames == 0 {
-        bail!("collection {selector} not found in any pack");
+        bail!("no matching physical record found in collection {selector}");
+    }
+    if raw {
+        let [(shard, offset)] = raw_matches.as_slice() else {
+            bail!(
+                "--raw requires exactly one matching frame; found {frames} (use a pack selector to disambiguate)"
+            );
+        };
+        let data = ShardPool::read_at_committed(shard, *offset, true)?;
+        io::stdout().write_all(&data.data)?;
+        return Ok(());
     }
     println!(
         "collection {}: {frames} physical record{} across {packs} pack{}",

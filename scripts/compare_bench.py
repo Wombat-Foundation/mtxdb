@@ -69,7 +69,9 @@ ROW_EXT = re.compile(
     r" FILES=(?P<files>\d+) "
     r"MEM=(?P<mem>\d+) MEM_LABEL=(?P<mem_label>\w+) "
     r"RSS_OPEN=(?P<rss_open>\d+) PSS_OPEN=(?P<pss_open>\d+) "
-    r"RSS_WARM=(?P<rss_warm>\d+) PSS_WARM=(?P<pss_warm>\d+)",
+    r"RSS_WARM=(?P<rss_warm>\d+) PSS_WARM=(?P<pss_warm>\d+)"
+    r"(?: CACHE_CAPACITY=\d+)?"
+    r"(?: CHECKSUM=(?P<checksum>\w+))?",
     re.MULTILINE,
 )
 
@@ -300,6 +302,13 @@ def external_scenario(output: str) -> Scenario:
             "pss_open_bytes",
             "rss_warm_bytes",
             "pss_warm_bytes",
+            # "full" (default, verified every open), "writeonly" (verified
+            # only when written; MTXDB_CHECKPOINT_CHECKSUM=writeonly), or
+            # "na" for engines with no equivalent read-time check (mdbx,
+            # sqlite) -- recorded per row so a warm/cold-open comparison
+            # across history never has to guess which policy produced it.
+            # Captures before this column existed leave it blank.
+            "checksum",
         ],
     )
     for m in ROW_EXT.finditer(output):
@@ -325,6 +334,7 @@ def external_scenario(output: str) -> Scenario:
             "pss_open_bytes": int(m["pss_open"]),
             "rss_warm_bytes": int(m["rss_warm"]),
             "pss_warm_bytes": int(m["pss_warm"]),
+            "checksum": m["checksum"] or "",
         }
         base = f"ext/{m['eng']}/{m['label']}gb/"
         for metric in (
