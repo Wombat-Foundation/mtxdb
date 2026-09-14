@@ -70,14 +70,29 @@ BENCH_CMD = [
     "compare-external",
 ]
 
-ENGINES = ("mtxdb", "mdbx", "sqlite")
+# mtxdb is swept across its three checksum postures (mdbx/sqlite have no
+# equivalent knob -- see checksum_policy_from_env in compare_external.rs --
+# so they run once each). Each tuple is
+# (MTXDB_BENCH_EXT_ENGINE value, MTXDB_BENCH_CHECKSUM override or None, the
+# row's expected "engine" name). The override is set explicitly for every
+# mtxdb invocation, replacing whatever MTXDB_BENCH_CHECKSUM the caller's own
+# shell/`.env` may already export, so the sweep always produces exactly
+# these three regardless of ambient environment.
+INVOCATIONS = (
+    ("mtxdb", "disabled", "mtxdb_none"),
+    ("mtxdb", "writeonly", "mtxdb_writeonly"),
+    ("mtxdb", "full", "mtxdb_full"),
+    ("mdbx", None, "mdbx"),
+    ("sqlite", None, "sqlite"),
+)
+EXPECTED_ENGINES = tuple(row_name for _, _, row_name in INVOCATIONS)
 
 
 def validate_rows(rows: list[dict]) -> None:
     """Reject partial captures instead of publishing an incomplete comparison."""
     engines = {row["engine"] for row in rows}
-    if engines != set(ENGINES):
-        missing = ", ".join(sorted(set(ENGINES) - engines))
+    if engines != set(EXPECTED_ENGINES):
+        missing = ", ".join(sorted(set(EXPECTED_ENGINES) - engines))
         raise ValueError(f"external capture is incomplete; missing engines: {missing}")
     labels = {row["label"] for row in rows}
     if len(labels) != 1:
@@ -102,19 +117,23 @@ def run_bench() -> None:
     """
     CSV_DIR.mkdir(parents=True, exist_ok=True)
     with LATEST.open("wb") as out:
-        for engine in ENGINES:
-            env = {**os.environ, "MTXDB_BENCH_EXT_ENGINE": engine}
-            # MTXDB_BENCH_CHECKSUM=disabled is this bench's own opt-out knob,
-            # named separately from the engine's MTXDB_CHECKPOINT_CHECKSUM so
-            # a benchmark run can ask for it explicitly without anyone having
-            # to know the engine's own env var name. It only ever relaxes
-            # mtxdb's read-time checkpoint CRC32 verification (WriteOnly:
-            # still written on every checkpoint, just not re-verified on
-            # open) — it can't be used to silently weaken the default, since
-            # it has no effect unless this script is invoked with it set.
-            # Meaningless for mdbx/sqlite; harmless to pass either way.
-            if os.environ.get("MTXDB_BENCH_CHECKSUM") == "disabled":
-                env["MTXDB_CHECKPOINT_CHECKSUM"] = "writeonly"
+        for ext_engine, checksum, row_name in INVOCATIONS:
+            env = {**os.environ, "MTXDB_BENCH_EXT_ENGINE": ext_engine}
+            if checksum is not None:
+                # Always set explicitly (never left to inherit an ambient
+                # MTXDB_BENCH_CHECKSUM) so the three-row sweep is
+                # deterministic regardless of the caller's own shell/.env.
+                # This controls compare_external.rs's frame-level
+                # ChecksumPolicy directly (checksum_policy_from_env);
+                # "writeonly"/"disabled" additionally relax the checkpoint's
+                # own read-time CRC32 verification (MTXDB_CHECKPOINT_CHECKSUM
+                # -- see CheckpointChecksumPolicy) to the weakest available
+                # posture for that row, since a checkpoint has no "none"
+                # tier of its own.
+                env["MTXDB_BENCH_CHECKSUM"] = checksum
+                env["MTXDB_CHECKPOINT_CHECKSUM"] = (
+                    "writeonly" if checksum in ("writeonly", "disabled") else "full"
+                )
             proc = subprocess.run(
                 BENCH_CMD,
                 cwd=ROOT,
@@ -125,7 +144,7 @@ def run_bench() -> None:
             )
             if proc.returncode != 0:
                 raise SystemExit(
-                    f"comparison bench failed for engine={engine} "
+                    f"comparison bench failed for engine={row_name} "
                     f"(exit {proc.returncode}); logs in {LATEST}"
                 )
 
@@ -156,7 +175,18 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
     latest: dict[str, dict] = {}
     for row in rows:
         latest[row["engine"]] = row
-    engines = ["mtxdb", "mdbx", "sqlite"]
+    # Display names for the row label column; mtxdb's three checksum-policy
+    # variants (see INVOCATIONS) get a human label instead of their engine
+    # key. Falls back to the raw key for any row this table doesn't know
+    # about (an older/newer capture), so it degrades instead of crashing.
+    display_names = {
+        "mtxdb_none": "mtxdb (no crc)",
+        "mtxdb_writeonly": "mtxdb (writeonly)",
+        "mtxdb_full": "mtxdb (full crc32)",
+        "mdbx": "mdbx",
+        "sqlite": "sqlite",
+    }
+    engines = [e for e in EXPECTED_ENGINES if e in latest] or list(latest)
     columns = [m[1] for m in METRICS]
 
     # Each space-separated word occupies its own header line, keeping units
@@ -187,6 +217,8 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
         return "in-file"
 
     values = [[cell(engine, m[0]) for m in METRICS] for engine in engines]
+    labels = [display_names.get(engine, engine) for engine in engines]
+    label_width = max(len("engine"), *(len(label) for label in labels))
     widths = [
         max(
             *(len(word) for word in header_rows[i]),
@@ -197,24 +229,24 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
 
     print()
     print(
-        "".rjust(7)
+        "".rjust(label_width)
         + "  "
         + "  ".join(header_rows[i][0].rjust(widths[i]) for i in range(len(columns)))
     )
     print(
-        "engine".rjust(7)
+        "engine".rjust(label_width)
         + "  "
         + "  ".join(header_rows[i][1].rjust(widths[i]) for i in range(len(columns)))
     )
     print(
-        "".rjust(7)
+        "".rjust(label_width)
         + "  "
         + "  ".join(header_rows[i][2].rjust(widths[i]) for i in range(len(columns)))
     )
     print()
-    for engine, cells in zip(engines, values):
+    for label, cells in zip(labels, values):
         print(
-            f"{engine:>7}  "
+            f"{label:>{label_width}}  "
             + "  ".join(cell.rjust(widths[i]) for i, cell in enumerate(cells))
         )
     print()
@@ -229,23 +261,13 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
             f"ran with MTXDB_BENCH_EXT_GB= {os.environ.get('MTXDB_BENCH_EXT_GB')} GB"
         )
     print(_footer)
-    # Read the effective policy back from mtxdb's own row (the "crc check
-    # mode" column above) rather than re-inspecting env vars here, so this
-    # note is accurate whether it came from this script's own
-    # MTXDB_BENCH_CHECKSUM=disabled alias or from MTXDB_CHECKPOINT_CHECKSUM
-    # set directly.
-    mtxdb_checksum = latest.get("mtxdb", {}).get("checksum")
-    if mtxdb_checksum == "writeonly":
+    if any(engine.startswith("mtxdb_") for engine in engines):
         print(
-            "crc check mode=writeonly: mtxdb's read-time checkpoint CRC32 "
-            "verification is off for this run (warm/cold open faster, less "
-            "safe) — the engine's own default stays on"
-        )
-    elif mtxdb_checksum == "full":
-        print(
-            "crc check mode=full: mtxdb verified the checkpoint's CRC32 on "
-            "every open in this run (the safe default) — warm/cold open "
-            "numbers include that cost"
+            "mtxdb (no crc): both frame and checkpoint CRC32 off (fastest, "
+            "least safe) — mtxdb (writeonly): CRCs written but not "
+            "re-verified on read — mtxdb (full crc32): the engine's actual "
+            "default, verified on every read. mdbx/sqlite have no "
+            "equivalent read-time checksum of their own to sweep."
         )
 
 

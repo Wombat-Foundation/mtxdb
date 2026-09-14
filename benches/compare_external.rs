@@ -803,6 +803,21 @@ fn run_backend(backend: Backend, target_gb: f64) {
     let sync_all_part = run
         .append_sync_all_ms
         .map_or(String::new(), |v| format!(" APPEND_SYNC_ALL_MS={v:.2}"));
+    // mtxdb is the only backend with a checksum policy to sweep, so its row
+    // name carries the frame-level policy actually in effect
+    // (`checksum_policy_from_env`, set explicitly per invocation by
+    // `scripts/external_bench.py`) rather than always reporting plain
+    // "mtxdb" — three separate rows (no checksum / writeonly / full crc32)
+    // would otherwise collide on the same engine name. mdbx/sqlite have no
+    // equivalent knob, so they keep their plain name.
+    let engine_label = match backend {
+        Backend::Mtxdb => match checksum_policy_from_env() {
+            mtxdb_core::packfile::ChecksumPolicy::Full => "mtxdb_full",
+            mtxdb_core::packfile::ChecksumPolicy::WriteOnly => "mtxdb_writeonly",
+            mtxdb_core::packfile::ChecksumPolicy::Disabled => "mtxdb_none",
+        },
+        Backend::Mdbx | Backend::Sqlite => backend.name(),
+    };
     // Only meaningful for mtxdb (the only engine with a read-time checkpoint
     // integrity check to disable); recorded for every engine anyway so the
     // CSV column is never absent and a comparison across engines/rows never
@@ -824,7 +839,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
          STEADY_APPEND_PUTS_MS={:.2} STEADY_APPEND_SYNC_MS={:.2} \
          FILES={} MEM={} MEM_LABEL={} RSS_OPEN={} PSS_OPEN={} RSS_WARM={} PSS_WARM={} CACHE_CAPACITY={} \
          CHECKSUM={checksum_policy}",
-        backend.name(),
+        engine_label,
         run.write_ms,
         run.warm_open_ms,
         run.cold_open_ms,
