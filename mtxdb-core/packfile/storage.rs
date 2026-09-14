@@ -3265,18 +3265,46 @@ impl PackfileStorage {
     }
 
     /// Commit every open shard's buffered frames to the page cache without
-    /// fsyncing (see [`ShardPool::flush_all`]).
+    /// fsyncing (see [`ShardPool::flush_all`]). No-op under the default
+    /// [`crate::shard::AppendPolicy::Eager`], where every put already wrote
+    /// its own frame.
     ///
-    /// With the append buffer, a put's bytes live only in process memory until
-    /// a flush, and only in the page cache until a `sync_all`. This is the
-    /// explicit way to advance that boundary for all shards. A flushed store
-    /// also means a subsequent `PackfileStorage::open`/`open_read_only`
-    /// against the same directory sees the data.
+    /// Under [`crate::shard::AppendPolicy::Buffered`], a put's bytes live
+    /// only in process memory until a flush, and only in the page cache
+    /// until a `sync_all`. This is the explicit way to advance that boundary
+    /// for all shards. A flushed store also means a subsequent
+    /// `PackfileStorage::open`/`open_read_only` against the same directory
+    /// sees the data.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure.
     pub fn flush_all(&self) -> Result<(), StorageError> {
         Ok(self.shards.flush_all()?)
+    }
+
+    /// Replace this store's append policy — whether frames go to disk per
+    /// put (the default [`crate::shard::AppendPolicy::Eager`], historical
+    /// behavior) or accumulate for one positioned write per flush
+    /// ([`crate::shard::AppendPolicy::Buffered`]). See
+    /// [`crate::shard::AppendPolicy`] for the visibility/durability trade.
+    ///
+    /// Only affects future puts, so call it before the store starts handling
+    /// concurrent writes. For a batch import that ends in `sync_all` — or a
+    /// benchmark that syncs explicitly — `Buffered` usually wins:
+    ///
+    /// ```
+    /// use mtxdb_core::shard::AppendPolicy;
+    /// use mtxdb_core::PackfileStorage;
+    /// # let dir = std::env::temp_dir().join("mtxdb-doc-with-append-policy");
+    /// let store = PackfileStorage::open(dir.clone())
+    ///     .unwrap()
+    ///     .with_append_policy(AppendPolicy::buffered());
+    /// # std::fs::remove_dir_all(dir).ok();
+    /// ```
+    #[must_use]
+    pub fn with_append_policy(mut self, policy: shard::AppendPolicy) -> Self {
+        self.shards.set_append_policy(policy);
+        self
     }
 
     /// Best-effort, rate-limited flush of the shard→collection directory for a

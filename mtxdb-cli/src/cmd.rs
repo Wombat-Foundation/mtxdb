@@ -1552,7 +1552,12 @@ fn cmd_import(
     // Admission is based on the actual pack contents rather than a sidecar:
     // a stale summary must not make an unestablished room look established.
     let mut established_collections = matrix_create_collections_on_disk(&pool_dir)?;
-    let store = open_store(cli)?;
+    // Import buffers appends (one positioned write per ~1 MiB of frames
+    // instead of one per record) and ends with a single `sync_all`, which
+    // flushes and fsyncs everything below — the explicit durability schedule
+    // the buffered append policy is meant for. A `put` command that syncs
+    // per record stays on the default eager path.
+    let store = open_store(cli)?.with_append_policy(mtxdb_core::shard::AppendPolicy::buffered());
     let mut failures = 0_usize;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {

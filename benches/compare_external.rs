@@ -168,10 +168,18 @@ fn mtxdb_open(dir: &std::path::Path) -> PackfileStorage {
     // seeded-incompressible anyway, so compression only pure overhead here.
     let compress_off = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0");
     let checksum = checksum_policy_from_env();
+    // This bench syncs explicitly (sync_all after build, sync after append),
+    // so it opts into the buffered append policy: frames accumulate for one
+    // positioned write per ~1 MiB instead of one per record.
+    let policy = mtxdb_core::shard::AppendPolicy::buffered();
     if compress_off {
-        PackfileStorage::open_with_policies(dir.to_path_buf(), false, checksum).unwrap()
+        PackfileStorage::open_with_policies(dir.to_path_buf(), false, checksum)
+            .unwrap()
+            .with_append_policy(policy)
     } else {
-        PackfileStorage::open_with_policies(dir.to_path_buf(), true, checksum).unwrap()
+        PackfileStorage::open_with_policies(dir.to_path_buf(), true, checksum)
+            .unwrap()
+            .with_append_policy(policy)
     }
 }
 

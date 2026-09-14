@@ -29,20 +29,55 @@ pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 /// lets a shard produce an offset `IndexSlot::new` panics on.
 pub const MAX_SHARD_BYTES: u64 = (1u64 << 28) - 1;
 
-/// Records buffered in memory before a shard is flushed to disk as one
-/// positioned write. Keeps bulk writes from paying a `pwrite` (plus the
-/// per-record `try_clone` and file-length store) for every single record —
-/// the whole remaining bulk-write gap vs the bench's mdbx (which writes a
-/// memory-mapped in-memory transaction and pays persistence once at commit).
-///
-/// The trade: a buffered record is indexed and cache-resident but NOT yet
-/// on disk. It is made durable by the same contracts as before — nothing is
-/// durable until `sync_*` fsyncs — but `read_at`/`resolve_from_candidates`
-/// must not serve a virtual offset from the mmap, so reads of an offset
-/// `>= file_len` (the flush boundary) first flush that shard (one positioned
-/// write, then a normal mmap read). Sync, rotation, retirement, repack,
-/// checkpoint persistence, and deletion all flush first as well.
+/// Default in-memory threshold before a shard's buffered frames are written
+/// to disk as one positioned write. Keeps bulk writes from paying a
+/// `pwrite` (plus the per-record `try_clone` and file-length store) for
+/// every single record — the whole remaining bulk-write gap vs the bench's
+/// mdbx (which writes a memory-mapped in-memory transaction and pays
+/// persistence once at commit). The default [`AppendPolicy`] is
+/// [`AppendPolicy::Eager`], so this threshold only applies to pools opened
+/// with [`AppendPolicy::Buffered`].
 pub(crate) const PENDING_FLUSH_BYTES: usize = 1 << 20;
+
+/// When a shard's appended frames are written to its underlying pack file.
+///
+/// The default is [`AppendPolicy::Eager`]: every `put_record` commits its
+/// own frame with one positioned write, matching the engine's historical
+/// behavior. An unsynced put is therefore immediately visible to other
+/// processes reading the pack files, and survives this process exiting (a
+/// crash or power loss still requires an explicit `sync_*` to be durable).
+///
+/// [`AppendPolicy::Buffered`] defers those writes into one positioned write
+/// per shard once `max_pending_bytes` of frames have accumulated (or at the
+/// rotation/sync/read/repack/checkpoint boundaries that flush first). This
+/// is far faster for bulk writes — one `pwrite` per ~1 MiB instead of one
+/// per record — but it changes the visibility/durability boundary: unflushed bytes live only in
+/// this process's memory, are invisible to other processes, and are lost if
+/// this process exits before the next flush or `sync_*`. Opt into it only
+/// where the caller already flushes or syncs on its own durability schedule
+/// (e.g. a batch import that ends in `sync_all`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendPolicy {
+    /// Commit each record's frame with its own positioned write, exactly as
+    /// mtxdb always did before buffering existed.
+    Eager,
+    /// Accumulate frames in memory and write them out once
+    /// `max_pending_bytes` have been buffered for a shard.
+    Buffered {
+        /// Per-shard in-memory flush threshold, in buffered frame bytes.
+        max_pending_bytes: usize,
+    },
+}
+
+impl AppendPolicy {
+    /// [`AppendPolicy::Buffered`] at the default flush threshold (~1 MiB).
+    #[must_use]
+    pub fn buffered() -> Self {
+        Self::Buffered {
+            max_pending_bytes: PENDING_FLUSH_BYTES,
+        }
+    }
+}
 
 /// Scanned `(collection_id, hash, offset)` entry from a shard file.
 pub type ShardEntry = ([u8; 16], [u8; 16], u64);
@@ -370,6 +405,11 @@ pub struct ShardPool {
     /// [`Self::put_record`] hashes when appending and what
     /// [`Self::read_at`] verifies on point lookups.
     checksum_policy: packfile::ChecksumPolicy,
+    /// When a shard's appended frames are written to its pack file (see
+    /// [`AppendPolicy`]). Set at open; defaults to
+    /// [`AppendPolicy::Eager`], the historical per-put behavior. [`Self`]
+    /// owns it so `put_record`'s flush decision needs no extra indirection.
+    append_policy: AppendPolicy,
     /// Present only for a writable pool — `open_read_only` takes no lock
     /// at all, since it never writes or truncates anything (that risk
     /// lives one layer up, in `PackfileStorage`'s collection-index rebuild, not
@@ -754,6 +794,7 @@ impl ShardPool {
             writable,
             compress,
             checksum_policy,
+            append_policy: AppendPolicy::Eager,
             #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         })
@@ -1253,16 +1294,46 @@ impl ShardPool {
         self.checksum_policy
     }
 
+    /// The pool's append policy (see [`AppendPolicy`]) — whether frames go
+    /// to disk per put (the default [`AppendPolicy::Eager`]) or accumulate
+    /// for one positioned write per flush ([`AppendPolicy::Buffered`]).
+    #[must_use]
+    pub fn append_policy(&self) -> AppendPolicy {
+        self.append_policy
+    }
+
+    /// Replace the append policy. Only affects *future* `put_record` calls,
+    /// so call it before the pool is shared or before the first concurrent
+    /// puts — the policy is read unlocked by writers. See [`AppendPolicy`]
+    /// for the durability/visibility trade each choice makes.
+    ///
+    /// Consuming form of [`Self::set_append_policy`], for chaining:
+    /// `ShardPool::open(dir)?.with_append_policy(AppendPolicy::buffered())`.
+    #[must_use]
+    pub fn with_append_policy(mut self, policy: AppendPolicy) -> Self {
+        self.append_policy = policy;
+        self
+    }
+
+    /// In-place form of [`Self::with_append_policy`].
+    pub fn set_append_policy(&mut self, policy: AppendPolicy) {
+        self.append_policy = policy;
+    }
+
     /// Append a record to its collection's home shard (see `collection_home`).
     /// Returns `(slot, offset)`. Rotates the collection to a new home shard
     /// if its current one is full.
     ///
-    /// The record is *buffered*, not necessarily on disk: offsets are handed
-    /// out into the shard's virtual `[file_len, file_len + pending)` region
-    /// and the matching frame bytes are committed to the page cache by a
+    /// Under the default [`AppendPolicy::Eager`] the frame is written to the
+    /// page cache immediately — one positioned write per put, the historical
+    /// behavior (unsynced bytes survive this process exiting; durability on
+    /// crash/power loss still requires a `sync_*`). Under
+    /// [`AppendPolicy::Buffered`] the frame is appended to the shard's
+    /// in-memory pending region instead: offsets are handed out into the
+    /// virtual `[file_len, file_len + pending)` range and committed by a
     /// later flush. Reads of a virtual offset first flush (see
     /// [`Self::read_at`]), so callers observing the returned offset always
-    /// see the record.
+    /// see the record either way.
     ///
     /// # Errors
     /// Returns `io::Error` on write, flush, or rotation failure.
@@ -1314,8 +1385,13 @@ impl ShardPool {
                 virtual_end
             };
 
-            if shard.pending.lock().len() >= PENDING_FLUSH_BYTES {
-                self.flush_shard(&shard)?;
+            match self.append_policy {
+                AppendPolicy::Eager => self.flush_shard(&shard)?,
+                AppendPolicy::Buffered { max_pending_bytes } => {
+                    if shard.pending.lock().len() >= max_pending_bytes {
+                        self.flush_shard(&shard)?;
+                    }
+                }
             }
             return Ok((shard.slot, offset));
         }
@@ -1381,11 +1457,13 @@ impl ShardPool {
     }
 
     /// Commit every open shard's buffered frames to the page cache. No-op when
-    /// nothing is buffered. This is the durability boundary the append buffer
-    /// introduces: a put's bytes live only in process memory until a flush,
-    /// and only in the page cache until a sync. Callers that must observe a
-    /// shard's bytes exactly match the index (sync, checkpoint, repack,
-    /// delete, scan) flush by this.
+    /// nothing is buffered (always the case under the default
+    /// [`AppendPolicy::Eager`], where each put already wrote its own frame).
+    /// Under [`AppendPolicy::Buffered`] this is the durability boundary the
+    /// append buffer introduces: a put's bytes live only in process memory
+    /// until a flush, and only in the page cache until a sync. Callers that
+    /// must observe a shard's bytes exactly match the index (sync,
+    /// checkpoint, repack, delete, scan) flush by this.
     ///
     /// # Errors
     /// Returns `io::Error` if any shard's flush fails.
@@ -2202,9 +2280,12 @@ mod tests {
 
         let record = test_record(0x01, 0xCC, b"needs sync");
         let (slot, _offset) = pool.put_record(&record).unwrap();
-        // The dirty bit is set at flush time, so a buffered put alone is
-        // not yet tracked — sync_dirty flushes first, then syncs and clears.
-        assert!(!pool.dirty.lock().contains(&slot));
+        // Default policy is eager: the put is committed immediately, so the
+        // shard is already marked dirty and sync_dirty must clear it.
+        assert!(
+            pool.dirty.lock().contains(&slot),
+            "eager put must mark the shard dirty"
+        );
 
         pool.sync_dirty().unwrap();
         assert!(
@@ -2214,6 +2295,85 @@ mod tests {
 
         // A second sync with nothing new written is a no-op, not an error.
         pool.sync_dirty().unwrap();
+    }
+
+    /// Compatibility contract for the default eager policy: an unsynced put
+    /// is committed to the page cache immediately, so a fresh open of the
+    /// same directory sees the record even though `flush_all`/`sync` were
+    /// never called. This is the historical behavior buffering must not
+    /// silently change — callers that don't opt into buffering keep it.
+    #[test]
+    fn eager_put_is_visible_to_fresh_open_without_flush_or_sync() {
+        let dir = test_dir("eager_put_fresh_open");
+        let record = test_record(0x01, 0xAA, b"eager visibility");
+
+        let (offset, slot) = {
+            let pool = ShardPool::open(dir.clone()).unwrap();
+            let (slot, offset) = pool.put_record(&record).unwrap();
+            assert!(
+                pool.dirty.lock().contains(&slot),
+                "eager put must mark the shard dirty before any sync"
+            );
+            (offset, slot)
+        };
+
+        // Fresh process-equivalent open, no flush/sync anywhere.
+        let pool = ShardPool::open(dir).unwrap();
+        let read = pool
+            .read_at(&pool.get_shard(slot).unwrap(), offset, true)
+            .unwrap();
+        assert_eq!(read.data.as_ref(), b"eager visibility");
+    }
+
+    /// The buffered policy's known visibility boundary: an unflushed put
+    /// occupies only a virtual offset past the committed file length, so a
+    /// fresh open — which only sees committed bytes — must not be able to
+    /// read it back. This is opt-in behavior; eager callers never hit it.
+    #[test]
+    fn buffered_put_is_hidden_from_fresh_open_until_flush() {
+        let record = test_record(0x01, 0xBB, b"buffered invisibility");
+
+        // No flush before drop: the byte is only in the writer's memory, so
+        // a fresh open must not be able to read it back.
+        let dir = test_dir("buffered_put_fresh_open");
+        let (offset, slot) = {
+            let pool = ShardPool::open(dir.clone())
+                .unwrap()
+                .with_append_policy(AppendPolicy::buffered());
+            let (slot, offset) = pool.put_record(&record).unwrap();
+            assert!(
+                pool.dirty.lock().is_empty(),
+                "a buffered put alone must not dirty the shard"
+            );
+            (offset, slot)
+        };
+        let pool = ShardPool::open(dir).unwrap();
+        let shard = pool.get_shard(slot).unwrap();
+        assert!(
+            shard.file_len.load(Ordering::Acquire) <= offset,
+            "buffered byte must not have been committed to the file"
+        );
+        assert!(
+            pool.read_at(&shard, offset, true).is_err(),
+            "a fresh open must not see an unflushed buffered byte"
+        );
+
+        // flush_all before drop puts the frame on disk; a fresh open then
+        // reads the same offset back — the boundary is flush, not drop.
+        let dir = test_dir("buffered_put_fresh_open_flushed");
+        let (slot, offset) = {
+            let pool = ShardPool::open(dir.clone())
+                .unwrap()
+                .with_append_policy(AppendPolicy::buffered());
+            let (slot, offset) = pool.put_record(&record).unwrap();
+            pool.flush_all().unwrap();
+            (slot, offset)
+        };
+        let pool = ShardPool::open(dir).unwrap();
+        let read = pool
+            .read_at(&pool.get_shard(slot).unwrap(), offset, true)
+            .unwrap();
+        assert_eq!(read.data.as_ref(), b"buffered invisibility");
     }
 
     /// A real fsync succeeding must never be turned into a hard error by a
@@ -2895,7 +3055,11 @@ mod tests {
     #[test]
     fn test_shard_stats_track_write_sync() {
         let dir = test_dir("stats_tracking");
-        let pool = ShardPool::open(dir).unwrap();
+        // Buffered policy so the flush (triggered by the read of the still-
+        // virtual offset below) is what credits the write counters.
+        let pool = ShardPool::open(dir)
+            .unwrap()
+            .with_append_policy(AppendPolicy::buffered());
 
         let record = test_record(0x01, 0xAA, b"payload for stats");
         let (slot, offset) = pool.put_record(&record).unwrap();
@@ -3006,14 +3170,13 @@ mod tests {
         let dir = test_dir("retire_preserves_dirty");
         let pool = ShardPool::open(dir).unwrap();
 
-        // Put a record so the active shard is dirty. The dirty bit tracks
-        // committed bytes, so flush to cross the buffered→committed boundary.
+        // Put a record so the active shard is dirty. Default policy is eager, so
+        // the put alone commits it and marks the shard dirty.
         let record = test_record(1, 1, b"payload");
         let (slot, _offset) = pool.put_record(&record).unwrap();
-        pool.flush_all().unwrap();
         assert!(
             pool.dirty.lock().contains(&slot),
-            "active shard should be dirty after a flush of written data"
+            "active shard should be dirty after writing data"
         );
 
         // Attempting to retire the active shard should be a no-op.
