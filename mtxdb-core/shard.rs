@@ -1600,6 +1600,101 @@ impl ShardPool {
         Self::read_at_committed(shard, offset, verify)
     }
 
+    /// Read only a record's collection and content hash from its frame.
+    ///
+    /// This is the bounded recovery primitive for a checkpoint-backed index
+    /// that needs to grow: its slots retain locations but not full hashes.
+    /// It validates the frame's structural bounds but intentionally neither
+    /// copies nor decompresses the payload (nor walks it to calculate CRC).
+    ///
+    /// # Errors
+    /// Returns [`crate::storage::StorageError::Corrupt`] for malformed frames
+    /// and [`crate::storage::StorageError::Io`] if a pending frame cannot be
+    /// flushed or mapped.
+    ///
+    /// # Panics
+    /// Panics only on an internal invariant violation after frame bounds have
+    /// been validated.
+    pub fn record_identity_at(
+        &self,
+        shard: &Arc<Shard>,
+        offset: u64,
+    ) -> Result<([u8; 16], [u8; 16]), crate::storage::StorageError> {
+        use crate::storage::StorageError;
+        if offset >= shard.file_len() {
+            self.flush_shard(shard).map_err(StorageError::Io)?;
+        }
+
+        for attempt in 0..2 {
+            let guard = shard.mmap().map_err(StorageError::Io)?;
+            let Some(mapping) = guard.as_ref().cloned() else {
+                return Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "shard could not be mapped",
+                )));
+            };
+            drop(guard);
+            let mem = mapping.as_ref();
+            let offset = usize::try_from(offset)
+                .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
+            let file_len = usize::try_from(shard.file_len()).unwrap_or(usize::MAX);
+            let Some(prefix_end) = offset.checked_add(4) else {
+                return Err(StorageError::Corrupt("record offset overflow".into()));
+            };
+            if prefix_end > file_len || prefix_end > mem.len() {
+                if attempt == 0 {
+                    Self::remap_shard(shard)?;
+                    continue;
+                }
+                return Err(StorageError::Corrupt("truncated length prefix".into()));
+            }
+            let frame_len = u32::from_le_bytes(
+                mem[offset..prefix_end]
+                    .try_into()
+                    .expect("validated length prefix range"),
+            );
+            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
+                return Err(StorageError::Corrupt(format!(
+                    "invalid record length: {frame_len}"
+                )));
+            }
+            let Some(frame_end) = prefix_end
+                .checked_add(frame_len as usize)
+                .and_then(|end| end.checked_add(4))
+            else {
+                return Err(StorageError::Corrupt("record length overflow".into()));
+            };
+            let Some(metadata_end) = prefix_end.checked_add(37) else {
+                return Err(StorageError::Corrupt("record metadata overflow".into()));
+            };
+            if frame_end > file_len || frame_end > mem.len() || metadata_end > frame_end {
+                if attempt == 0 {
+                    Self::remap_shard(shard)?;
+                    continue;
+                }
+                return Err(StorageError::Corrupt("truncated record metadata".into()));
+            }
+            let flags = mem[prefix_end];
+            if flags & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED) != 0 {
+                return Err(StorageError::Corrupt(format!(
+                    "unsupported record flags: {flags:#04x}"
+                )));
+            }
+            let metadata_start = prefix_end
+                .checked_add(5)
+                .expect("validated record metadata prefix");
+            let collection_end = metadata_start
+                .checked_add(16)
+                .expect("validated record collection id");
+            let mut collection_id = [0; 16];
+            collection_id.copy_from_slice(&mem[metadata_start..collection_end]);
+            let mut hash = [0; 16];
+            hash.copy_from_slice(&mem[collection_end..metadata_end]);
+            return Ok((collection_id, hash));
+        }
+        unreachable!("record_identity_at remap-retry is bounded to two iterations")
+    }
+
     /// Read a record whose offset is already committed to disk (e.g. from
     /// `scan_packfile`, whose offsets are by construction within the file).
     /// Unlike [`Self::read_at`] this does not flush anything: a virtual

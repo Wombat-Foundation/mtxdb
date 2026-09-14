@@ -227,6 +227,13 @@ impl LossyIndex {
         top >> 8 // top 24 bits
     }
 
+    /// The packed-slot tag for `hash`, exposed to crate-local recovery code
+    /// that must validate a persisted slot against its authoritative frame.
+    #[inline]
+    pub(crate) fn tag_for_hash(hash: &[u8; 16]) -> u32 {
+        Self::tag(hash)
+    }
+
     /// Insert a (hash → `shard_id`, offset) mapping.
     ///
     /// # Errors
@@ -355,6 +362,41 @@ impl LossyIndex {
             grown.len.fetch_add(1, Ordering::Relaxed);
         }
         Some(grown)
+    }
+
+    /// Double the table by recovering each occupied entry's full hash from
+    /// its stored location.
+    ///
+    /// Checkpoint-backed indexes deliberately omit `homes`, so their first
+    /// post-restart resize cannot use [`Self::grow`].  The packed slots still
+    /// retain every `(shard_id, offset)`, however.  A caller can therefore
+    /// recover only the `len` source hashes from the authoritative records
+    /// and rehash in `O(capacity + len)`, instead of rescanning every pack in
+    /// the store.  The callback must return the hash for precisely the
+    /// supplied location.
+    ///
+    /// `Ok(None)` means the table cannot grow further; callers retain their
+    /// full-rebuild fallback for that terminal case.
+    pub(crate) fn grow_by_recovering_hashes<E>(
+        &self,
+        mut hash_at: impl FnMut(u16, u64, u32) -> Result<[u8; 16], E>,
+    ) -> Result<Option<Self>, E> {
+        if self.capacity > u32::MAX / 2 {
+            return Ok(None);
+        }
+
+        let grown = Self::new(self.capacity as usize * 2);
+        for index in 0..self.capacity as usize {
+            let slot = IndexSlot(self.slot_at(index));
+            if slot.is_empty() {
+                continue;
+            }
+            let hash = hash_at(slot.shard_id(), slot.offset(), slot.tag())?;
+            // A doubled table is at most 37.5% full because insertion only
+            // requests growth at 75%, so this cannot hit TableFull.
+            let _ = grown.insert(&hash, slot.shard_id(), slot.offset());
+        }
+        Ok(Some(grown))
     }
 
     /// Look up a hash in the index.
@@ -644,6 +686,7 @@ impl Iterator for LookupIter<'_> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn test_hash(byte: u8) -> [u8; 16] {
         let mut h = [0u8; 16];
@@ -683,6 +726,34 @@ mod tests {
         assert_eq!(index.lookup(&h2), Some((1, 200)));
         assert_eq!(index.lookup(&h3), Some((0, 999)));
         assert_eq!(index.lookup(&[0xFE; 16]), None);
+    }
+
+    #[test]
+    fn grow_by_recovering_hashes_rehashes_only_occupied_locations() {
+        let index = LossyIndex::new(16);
+        let mut hashes = HashMap::new();
+        for offset in 0..12u64 {
+            let mut hash = [0u8; 16];
+            hash[..8].copy_from_slice(&(offset.wrapping_mul(17).wrapping_add(1)).to_be_bytes());
+            hash[8] = u8::try_from(offset.wrapping_add(1)).unwrap();
+            index.insert(&hash, 3, offset).unwrap();
+            hashes.insert((3, offset), hash);
+        }
+
+        let mut recovered = 0usize;
+        let grown = index
+            .grow_by_recovering_hashes(|shard, offset, _tag| {
+                recovered = recovered.saturating_add(1);
+                Ok::<_, ()>(hashes[&(shard, offset)])
+            })
+            .unwrap()
+            .expect("a 16-slot table can double");
+
+        assert_eq!(recovered, 12, "recover exactly one hash per occupied slot");
+        assert_eq!(grown.capacity, 32);
+        for ((shard, offset), hash) in hashes {
+            assert_eq!(grown.lookup(&hash), Some((shard, offset)));
+        }
     }
 
     #[test]

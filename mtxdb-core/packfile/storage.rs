@@ -2342,6 +2342,41 @@ impl PackfileStorage {
         Ok(index)
     }
 
+    /// Rehash a checkpoint-derived index without rescanning unrelated packs.
+    ///
+    /// A compact checkpoint keeps the packed `(shard, offset)` slots but not
+    /// the 64-bit home hashes needed by [`LossyIndex::grow`].  Each occupied
+    /// slot still names an authoritative frame whose fixed metadata prefix
+    /// contains the full hash, so recover those identities and rehash only
+    /// this collection's entries.  A missing shard, malformed frame, or a
+    /// frame from another collection fails closed to the caller's existing
+    /// whole-collection scan fallback.
+    fn grow_checkpoint_index(
+        &self,
+        collection_id: &[u8; 16],
+        index: &LossyIndex,
+    ) -> Result<Option<LossyIndex>, StorageError> {
+        index.grow_by_recovering_hashes(|shard_id, offset, slot_tag| {
+            let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "checkpoint index refers to missing shard {shard_id}"
+                ))
+            })?;
+            let (found_collection, hash) = self.shards.record_identity_at(&shard, offset)?;
+            if &found_collection != collection_id {
+                return Err(StorageError::Corrupt(format!(
+                    "checkpoint index offset {offset} in shard {shard_id} belongs to another collection"
+                )));
+            }
+            if LossyIndex::tag_for_hash(&hash) != slot_tag {
+                return Err(StorageError::Corrupt(format!(
+                    "checkpoint index tag does not match frame at offset {offset} in shard {shard_id}"
+                )));
+            }
+            Ok(hash)
+        })
+    }
+
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
     ///
     /// # Errors
@@ -3814,6 +3849,12 @@ impl StorageEngine for PackfileStorage {
                     // path and must not turn into a full-pack scan.
                     let _ = grown.insert(id, shard_id, offset);
                     index = grown;
+                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
+                    // A checkpoint-backed index has locations but not homes.
+                    // Recovering the hashes from those locations is bounded
+                    // by this collection, unlike `rebuild_index`'s pack scan.
+                    let _ = grown.insert(id, shard_id, offset);
+                    index = grown;
                 } else {
                     index = self.rebuild_index(collection_id)?;
                     let _ = index.insert(id, shard_id, offset);
@@ -3884,26 +3925,35 @@ impl StorageEngine for PackfileStorage {
             let (shard_id, offset) = self.shards.put_record(&record)?;
 
             if !index_needs_rebuild {
-                let inserted =
-                    if let Ok((bucket, slot)) = index.insert_tracked(id, shard_id, offset) {
-                        self.record_delta(collection_id, generation, bucket, slot);
-                        true
-                    } else if let Some(grown) = index.grow() {
-                        // `insert_tracked` leaves the table unchanged on TableFull,
-                        // so retrying with the record's still-available location is
-                        // sufficient; no pack scan is needed for pure growth. The
-                        // grow changes the collection's shape, so the delta log is
-                        // invalidated and no frame is recorded for this (or any
-                        // later) overwrite in the batch.
-                        self.invalidate_delta_log();
-                        let inserted = grown.insert(id, shard_id, offset).is_ok();
-                        index = grown;
-                        inserted
-                    } else {
-                        index_needs_rebuild = true;
-                        self.invalidate_delta_log();
-                        false
-                    };
+                let inserted = if let Ok((bucket, slot)) =
+                    index.insert_tracked(id, shard_id, offset)
+                {
+                    self.record_delta(collection_id, generation, bucket, slot);
+                    true
+                } else if let Some(grown) = index.grow() {
+                    // `insert_tracked` leaves the table unchanged on TableFull,
+                    // so retrying with the record's still-available location is
+                    // sufficient; no pack scan is needed for pure growth. The
+                    // grow changes the collection's shape, so the delta log is
+                    // invalidated and no frame is recorded for this (or any
+                    // later) overwrite in the batch.
+                    self.invalidate_delta_log();
+                    let inserted = grown.insert(id, shard_id, offset).is_ok();
+                    index = grown;
+                    inserted
+                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
+                    // The checkpoint does not retain homes, but its slots
+                    // retain locations. Recover only those identities and
+                    // retry; do not scan every pack in the store.
+                    self.invalidate_delta_log();
+                    let inserted = grown.insert(id, shard_id, offset).is_ok();
+                    index = grown;
+                    inserted
+                } else {
+                    index_needs_rebuild = true;
+                    self.invalidate_delta_log();
+                    false
+                };
                 if inserted {
                     let pack_id = self
                         .shards
@@ -4297,6 +4347,63 @@ mod tests {
         store.put(&TEST_COLLECTION, &id, &data).unwrap();
         let got = store.get(&TEST_COLLECTION, &id).unwrap().unwrap();
         assert_eq!(got.bytes, data.bytes);
+    }
+
+    #[test]
+    fn checkpoint_index_growth_recovers_hashes_from_indexed_frames() {
+        // 4,096 slots admit exactly 3,072 entries; the next write is the
+        // restart-plus-growth boundary.  This used to rescan every pack for
+        // this collection because the checkpoint stores locations but not
+        // home hashes.
+        const ENTRIES: usize = 3_072;
+        let dir = test_dir("checkpoint_growth_recovery");
+        let store = PackfileStorage::open(dir.clone())
+            .unwrap()
+            .with_append_policy(crate::shard::AppendPolicy::buffered());
+        let entries: Vec<_> = (0..ENTRIES)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                let mixed = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                id[..8].copy_from_slice(&mixed.to_be_bytes());
+                id[8] = u8::try_from((i >> 16) & 0xFF).unwrap();
+                id[9] = u8::try_from((i >> 8) & 0xFF).unwrap();
+                id[10] = u8::try_from(i & 0xFF).unwrap();
+                (id, NodeData::new(bytes::Bytes::from_static(b"payload")))
+            })
+            .collect();
+        store.put_many(&TEST_COLLECTION, &entries).unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let checkpoint_index = reopened
+            .generation(&TEST_COLLECTION)
+            .expect("checkpoint collection exists");
+        assert!(checkpoint_index.index.is_mmap_backed());
+        let grown = reopened
+            .grow_checkpoint_index(&TEST_COLLECTION, &checkpoint_index.index)
+            .unwrap()
+            .expect("4K checkpoint index can grow");
+        assert_eq!(grown.len(), ENTRIES);
+        for (id, _) in &entries {
+            assert!(grown.lookup(id).is_some(), "recovered hash remains indexed");
+        }
+        drop(checkpoint_index);
+
+        // Exercise the actual put_many fallback too. It must publish a
+        // growable generation that contains both checkpoint and new entries.
+        let extra = [0xA5; 16];
+        reopened
+            .put_many(
+                &TEST_COLLECTION,
+                &[(extra, NodeData::new(bytes::Bytes::from_static(b"extra")))],
+            )
+            .unwrap();
+        assert!(reopened.get(&TEST_COLLECTION, &extra).unwrap().is_some());
+        assert!(reopened
+            .get(&TEST_COLLECTION, &entries[0].0)
+            .unwrap()
+            .is_some());
     }
 
     /// A writable open must not silently skip a corrupt pack and publish a
