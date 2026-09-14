@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["BookkeepingSource","OpenPath"],"struct":["CacheStats","DagWalk","OpenTimings","PackfileStorage","RepackPlan","RepackStats","SyncTimings","WalkLimits"],"type":["SwizzleFn"]};
+window.SIDEBAR_ITEMS = {"enum":["BookkeepingSource","OpenPath"],"struct":["CacheStats","DagWalk","OpenTimings","PackfileStorage","RepackPlan","RepackStats","SyncTimings","WalkLimits"],"type":["CollectionSummary","SwizzleFn"]};
