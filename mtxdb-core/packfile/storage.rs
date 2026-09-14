@@ -94,10 +94,10 @@ impl Default for OpenTimings {
     }
 }
 
-/// Wall-clock breakdown of one `PackfileStorage::sync_all`, by phase. The
-/// pack phases come from `ShardPool::last_sync_split` (which measures the
-/// flush and fsync legs separately) and the metadata phases from `sync_all`
-/// itself.
+/// Wall-clock breakdown of one sync — the append-path `sync()` (dirty-scoped
+/// flush/fsync) or the full `sync_all` — by phase. The pack phases come from
+/// `ShardPool::last_sync_split` (which measures the flush and fsync legs
+/// separately) and the metadata phases from the sync method itself.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncTimings {
     /// Writing buffered frames out to the pack files.
@@ -3395,8 +3395,18 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn sync(&self) -> Result<(), StorageError> {
+        let started = std::time::Instant::now();
+        let mut timings = SyncTimings::default();
         self.shards.sync_dirty()?;
+        if let Some((flush, fsync)) = self.shards.last_sync_split() {
+            timings.pack_flush = flush;
+            timings.pack_fsync = fsync;
+        }
+        let checkpoint_started = std::time::Instant::now();
         self.persist_index_checkpoint_best_effort();
+        timings.checkpoint = checkpoint_started.elapsed();
+        timings.total = started.elapsed();
+        *self.last_sync_timings.lock() = Some(timings);
         Ok(())
     }
 
@@ -3441,7 +3451,8 @@ impl PackfileStorage {
         *self.last_open_timings.lock()
     }
 
-    /// Wall-clock breakdown of the most recent `sync_all`, by phase.
+    /// Wall-clock breakdown of the most recent sync — `sync()`, `sync_all`,
+    /// or the bench's internal sync calls — by phase.
     #[must_use]
     pub fn sync_timings(&self) -> Option<SyncTimings> {
         *self.last_sync_timings.lock()

@@ -1972,7 +1972,8 @@ impl ShardPool {
         Ok(())
     }
 
-    /// (flush, fsync) wall-clock split of the last full `sync_all`, if any.
+    /// (flush, fsync) wall-clock split of the last sync — `sync_all` or the
+    /// dirty-scoped `sync_dirty` — if any.
     #[must_use]
     pub fn last_sync_split(&self) -> Option<(Duration, Duration)> {
         *self.last_sync_split.lock()
@@ -1990,21 +1991,24 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_dirty(&self) -> io::Result<()> {
+        let flush_started = Instant::now();
         self.flush_all()?;
-        let shards = self.shards.read();
-        let mut dirty_set = self.dirty.lock();
-        let dirty: Vec<u16> = dirty_set.iter().copied().collect();
-        if dirty.is_empty() {
-            return Ok(());
-        }
-        for &id in &dirty {
-            if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
-                shard.file.sync_all()?;
-                shard.sync_count.fetch_add(1, Ordering::Relaxed);
-                dirty_set.remove(&id);
+        let flush_elapsed = flush_started.elapsed();
+        let fsync_started = Instant::now();
+        {
+            let shards = self.shards.read();
+            let mut dirty_set = self.dirty.lock();
+            let dirty: Vec<u16> = dirty_set.iter().copied().collect();
+            for &id in &dirty {
+                if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
+                    shard.file.sync_all()?;
+                    shard.sync_count.fetch_add(1, Ordering::Relaxed);
+                    dirty_set.remove(&id);
+                }
             }
         }
-        drop(dirty_set);
+        let fsync_elapsed = fsync_started.elapsed();
+        *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
         self.persist_stats_best_effort();
         Ok(())
     }

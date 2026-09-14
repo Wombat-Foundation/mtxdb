@@ -305,6 +305,16 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     store_rw.sync().unwrap();
     let append_sync_ms = append_sync_started.elapsed().as_secs_f64() * 1e3;
     let append_ms = append_puts_ms + append_sync_ms;
+    if let Some(sync) = store_rw.sync_timings() {
+        eprintln!(
+            "    mtxdb sync: flush {:.2}ms + fsync {:.2}ms + sidecar {:.2}ms + checkpoint {:.2}ms = {:.2}ms",
+            sync.pack_flush.as_secs_f64() * 1e3,
+            sync.pack_fsync.as_secs_f64() * 1e3,
+            sync.sidecar.as_secs_f64() * 1e3,
+            sync.checkpoint.as_secs_f64() * 1e3,
+            sync.total.as_secs_f64() * 1e3,
+        );
+    }
 
     // One sync_all() on the same store: isolates the full-fsync + whole-sidecar
     // rewrite that sync()/sync_dirty skips — the doc footnote, not the number.
