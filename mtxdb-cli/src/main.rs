@@ -237,14 +237,16 @@ fn sub_scan() -> Command {
 
 fn sub_info() -> Command {
     Command::new("info")
-        .about("Show storage info for a collection")
+        .about("Show storage info for a collection or a pack")
         .arg(
             Arg::new("collection")
                 .required(true)
-                .value_name("COLLECTION")
+                .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "Collection ID (32 hex digits), e.g. `mtxdb info \
-                     0x0102030405060708090a0b0c0d0e0f10` — takes the ID directly, no subcommand",
+                    "A 32-hex-digit collection ID (`0x`-prefix optional), a collection's \
+                     slot index from `mtxdb collections`, or a pack ID from `mtxdb shards` \
+                     (1-16 hex digits, `0x`-prefix required) — e.g. `mtxdb info \
+                     0x0102030405060708090a0b0c0d0e0f10` or `mtxdb info 0x1`",
                 ),
         )
 }
