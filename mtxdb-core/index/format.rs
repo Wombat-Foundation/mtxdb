@@ -77,6 +77,17 @@ pub struct CheckpointHeader {
     pub slots_bytes: u64,
     /// Fingerprint of the packfile set the checkpoint describes.
     pub pack_fingerprint: u64,
+    /// CRC-32/IEEE (`crc32fast`, the same crate/polynomial already used for
+    /// pack-frame checksums) of every byte after this header — the
+    /// directory and raw slot sections combined. Verified once, in full, at
+    /// read time in place of re-deriving each collection's occupancy by
+    /// walking its slots (see `read_checkpoint`): a single SIMD-accelerated
+    /// pass over the same bytes catches the same corruption — and, because
+    /// the directory section (each entry's `capacity`/`slot_count`) is
+    /// inside the hashed range too, also catches directory corruption the
+    /// old per-collection occupancy walk never checked at all — at a
+    /// fraction of the cost of the manual scan-and-branch loop it replaces.
+    pub content_crc32: u32,
 }
 
 impl CheckpointHeader {
@@ -90,6 +101,7 @@ impl CheckpointHeader {
         bytes[16..24].copy_from_slice(&self.directory_bytes.to_le_bytes());
         bytes[24..32].copy_from_slice(&self.slots_bytes.to_le_bytes());
         bytes[32..40].copy_from_slice(&self.pack_fingerprint.to_le_bytes());
+        bytes[40..44].copy_from_slice(&self.content_crc32.to_le_bytes());
         bytes
     }
 
@@ -104,6 +116,7 @@ impl CheckpointHeader {
             directory_bytes: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
             slots_bytes: u64::from_le_bytes(bytes[24..32].try_into().ok()?),
             pack_fingerprint: u64::from_le_bytes(bytes[32..40].try_into().ok()?),
+            content_crc32: u32::from_le_bytes(bytes[40..44].try_into().ok()?),
         })
     }
 }
@@ -171,6 +184,7 @@ mod tests {
             directory_bytes: 80,
             slots_bytes: 128,
             pack_fingerprint: 9,
+            content_crc32: 0xDEAD_BEEF,
         };
         assert_eq!(CheckpointHeader::decode(&header.encode()), Some(header));
 

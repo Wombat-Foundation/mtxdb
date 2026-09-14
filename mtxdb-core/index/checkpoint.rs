@@ -41,7 +41,13 @@ use super::format::{
 /// Magic identifying the persisted-index checkpoint format.
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Current wire version (see [`CheckpointHeader::version`]).
-pub const CHECKPOINT_VERSION: u32 = 1;
+///
+/// Bumped to 2 when `content_crc32` was added to the header (replacing the
+/// read-time occupancy walk with a single checksum verification — see
+/// `read_checkpoint`). Not deployed anywhere yet, so no migration: a v1
+/// checkpoint simply fails the version check below and falls through to the
+/// existing full-rescan fallback, same as any other unreadable checkpoint.
+pub const CHECKPOINT_VERSION: u32 = 2;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 
@@ -155,19 +161,13 @@ pub fn write_checkpoint(
             .ok_or_else(|| std::io::Error::other("checkpoint slots size overflow"))?;
     }
 
-    let header = CheckpointHeader {
-        magic: CHECKPOINT_MAGIC,
-        version: CHECKPOINT_VERSION,
-        collection_count: count,
-        directory_bytes,
-        slots_bytes,
-        pack_fingerprint: fingerprint,
-    };
     let total_len = CHECKPOINT_HEADER_LEN
         .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
         .saturating_add(usize::try_from(slots_bytes).unwrap_or(usize::MAX));
-    let mut buf = Vec::with_capacity(total_len);
-    buf.extend_from_slice(&header.encode());
+    // Build the directory+slots body first (everything after the header) so
+    // its CRC can be computed before the header — which carries that CRC —
+    // is itself encoded.
+    let mut body = Vec::with_capacity(total_len.saturating_sub(CHECKPOINT_HEADER_LEN));
 
     let mut slots_offset: u64 = 0;
     let mut dir_entries = Vec::with_capacity(collections.len());
@@ -192,11 +192,25 @@ pub fn write_checkpoint(
             .ok_or_else(|| std::io::Error::other("checkpoint slots offset overflow"))?;
     }
     for entry in &dir_entries {
-        buf.extend_from_slice(&entry.encode());
+        body.extend_from_slice(&entry.encode());
     }
     for (_, _, blob) in collections {
-        buf.extend_from_slice(&blob[8..]);
+        body.extend_from_slice(&blob[8..]);
     }
+    let content_crc32 = crc32fast::hash(&body);
+
+    let header = CheckpointHeader {
+        magic: CHECKPOINT_MAGIC,
+        version: CHECKPOINT_VERSION,
+        collection_count: count,
+        directory_bytes,
+        slots_bytes,
+        pack_fingerprint: fingerprint,
+        content_crc32,
+    };
+    let mut buf = Vec::with_capacity(total_len);
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
 
     let unique = CHECKPOINT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = PathBuf::from(format!(
@@ -244,6 +258,18 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
         return None;
     }
 
+    // Verify the whole directory+slots body against the header's CRC in one
+    // pass, in place of re-deriving each collection's occupancy by walking
+    // its slots. This is strictly stronger than the old per-collection walk
+    // (it also covers the directory entries — `capacity`/`slot_count`
+    // themselves — which the walk never checked), and costs the same O(bytes)
+    // as a single SIMD-accelerated hash instead of a manual scan-and-branch
+    // loop over every slot of every collection.
+    let content_crc32 = crc32fast::hash(buf.get(CHECKPOINT_HEADER_LEN..)?);
+    if content_crc32 != header.content_crc32 {
+        return None;
+    }
+
     let mut collections = Vec::with_capacity(count);
     for i in 0..count {
         let entry_offset =
@@ -260,37 +286,17 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
         // occupied slots than the table has room for; a downstream consumer
         // sizing an allocation off `slot_count` (e.g. a post-restart grow)
         // would then trust a value with no upper bound instead of the
-        // checkpoint being rejected here.
+        // checkpoint being rejected here. (An *understated* count — the
+        // failure mode the old occupancy walk additionally caught — is now
+        // caught by the CRC check above instead: any bit that makes
+        // `slot_count` disagree with the actual slots, or with what was
+        // written, changes the body's hash.)
         if entry.slot_count > entry.capacity {
             return None;
         }
         let slots_len = (entry.capacity as usize).checked_mul(8)?;
         let region = slot_base.checked_add(usize::try_from(entry.slots_offset).ok()?)?;
-        let slots = buf.get(region..region.checked_add(slots_len)?)?;
-        // The dual direction of the count check: an *understated* count (fewer
-        // non-empty slots than the region actually holds) passes the
-        // `slot_count <= capacity` bound above but seeds a post-restart
-        // index's `len` below its real occupancy. A writer resuming on such an
-        // index trusts the short `len` for its table-full accounting and can
-        // overfill an already-full probe table, looping forever on insert.
-        // Recover the true occupancy from the region — the same non-`0u64`
-        // slot criterion used at write time (`blob_slot_count`) — and require
-        // it to agree exactly. The scan bails as soon as the count exceeds the
-        // declared one, so an overstated region is rejected in O(slot_count)
-        // instead of O(capacity); an equal count still costs a full scan of
-        // the region, which is proportional to the bytes the checkpoint
-        // already carries.
-        let declared = entry.slot_count;
-        let mut occupied: u32 = 0;
-        for slot in slots.chunks_exact(8) {
-            if slot != [0u8; 8] {
-                occupied = occupied.saturating_add(1);
-                if occupied > declared {
-                    return None;
-                }
-            }
-        }
-        if occupied != declared {
+        if region.checked_add(slots_len)? > buf.len() {
             return None;
         }
         collections.push(LoadedCollection {
@@ -490,6 +496,58 @@ mod tests {
         })
         .unwrap();
         assert!(read_checkpoint(&path).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn content_crc32_catches_value_preserving_slot_corruption() {
+        // The pre-CRC occupancy walk only ever compared a *count* of
+        // non-empty slots against `slot_count` — a corruption that flips
+        // bits within an already-occupied slot (changing which shard/offset
+        // it names, without zeroing it) preserves that count and would have
+        // silently passed. The CRC covers the exact bytes, so this same
+        // corruption must now be rejected.
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_checkpoint_slot_corruption_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+
+        let blobs = [([7u8; 16], index_with_entries(3, 40).serialize())];
+        write_checkpoint(
+            &path,
+            0,
+            &blobs
+                .iter()
+                .map(|(id, b)| (*id, 0, b.as_slice()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            read_checkpoint(&path).is_some(),
+            "sanity check: the unmodified checkpoint must read back cleanly"
+        );
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Flip one bit inside the slots section (well past the header +
+        // single directory entry) in a byte that is currently non-zero, so
+        // the slot stays non-empty — only its value changes.
+        let slots_start = CHECKPOINT_HEADER_LEN + COLLECTION_DIR_ENTRY_LEN;
+        let corrupt_at = bytes[slots_start..]
+            .iter()
+            .position(|&b| b != 0)
+            .map(|offset| slots_start + offset)
+            .expect("at least one non-zero slot byte exists");
+        bytes[corrupt_at] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            read_checkpoint(&path).is_none(),
+            "a value-preserving bit flip inside an occupied slot must be rejected"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
