@@ -38,10 +38,10 @@ struct LruState {
 }
 
 impl LruState {
-    fn with_capacity(cap: usize) -> Self {
+    fn empty() -> Self {
         Self {
-            map: HashMap::with_capacity(cap),
-            nodes: Vec::with_capacity(cap),
+            map: HashMap::new(),
+            nodes: Vec::new(),
             head: NIL,
             tail: NIL,
             free_list: NIL,
@@ -117,7 +117,14 @@ impl NodeCache {
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         Self {
-            state: RwLock::new(LruState::with_capacity(max_entries)),
+            // Empty per-collection caches are the normal state immediately
+            // after an mmap-backed open. Reserving the full cache budget here
+            // used to allocate a large HashMap for every collection before a
+            // single cache lookup could hit. Reserve only when the first node
+            // is actually admitted below; cache-miss reads remain allocation
+            // free and opening many collections no longer scales with cache
+            // capacity.
+            state: RwLock::new(LruState::empty()),
             max_entries,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -158,6 +165,11 @@ impl NodeCache {
         }
 
         let mut state = self.state.write();
+
+        if state.map.is_empty() && state.nodes.is_empty() {
+            state.map.reserve(self.max_entries);
+            state.nodes.reserve(self.max_entries);
+        }
 
         if let Some(&idx) = state.map.get(&id) {
             state.nodes[idx as usize].data = Some(data);
