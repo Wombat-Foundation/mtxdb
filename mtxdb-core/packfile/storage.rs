@@ -37,6 +37,93 @@ pub struct RepackPlan {
     pub shards_touched: Vec<u16>,
 }
 
+/// Which index-loading path a `PackfileStorage` open took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenPath {
+    /// A persisted index checkpoint validated against the current pack set's
+    /// fingerprint was loaded in place of a rescan.
+    Checkpoint,
+    /// No usable checkpoint: every pack's records were scanned and the
+    /// per-collection indexes rebuilt from scratch.
+    FullScan,
+}
+
+/// Wall-clock breakdown of one `PackfileStorage` open, by phase. Measured
+/// with a handful of `Instant::now()` deltas on the open path only, so
+/// recording these doesn't perturb the numbers they report.
+///
+/// The per-phase fields partition the synchronous open work; see the
+/// struct-level timing doc for what each phase covers. On the checkpoint
+/// path `full_scan` is zero; on the fallback path `checkpoint_decode` and
+/// `fingerprint` still reflect the attempt that failed validation (e.g. a
+/// missing or stale checkpoint) before the scan had to run.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenTimings {
+    /// Directory scan + shard file open/validation, plus writer-lock take.
+    pub shard_open: std::time::Duration,
+    /// Reading the collection-order and deleted-collections sidecars.
+    pub metadata_load: std::time::Duration,
+    /// Reading + decoding the persisted index checkpoint.
+    pub checkpoint_decode: std::time::Duration,
+    /// Recomupting the live `(pack_id, file_len)` set's fingerprint.
+    pub fingerprint: std::time::Duration,
+    /// Deserializing checkpoint index blobs into live collections (checkpoint
+    /// path) or building per-collection indexes from scanned records
+    /// (fallback path).
+    pub index_materialization: std::time::Duration,
+    /// The full packfile scan + torn-tail recovery pass (fallback only).
+    pub full_scan: std::time::Duration,
+    /// Total synchronous wall time of the open.
+    pub total: std::time::Duration,
+    /// Which index-loading path was taken.
+    pub path: OpenPath,
+}
+
+impl Default for OpenTimings {
+    fn default() -> Self {
+        Self {
+            shard_open: std::time::Duration::ZERO,
+            metadata_load: std::time::Duration::ZERO,
+            checkpoint_decode: std::time::Duration::ZERO,
+            fingerprint: std::time::Duration::ZERO,
+            index_materialization: std::time::Duration::ZERO,
+            full_scan: std::time::Duration::ZERO,
+            total: std::time::Duration::ZERO,
+            path: OpenPath::FullScan,
+        }
+    }
+}
+
+/// Wall-clock breakdown of one `PackfileStorage::sync_all`, by phase. The
+/// pack phases come from `ShardPool::last_sync_split` (which measures the
+/// flush and fsync legs separately) and the metadata phases from `sync_all`
+/// itself.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncTimings {
+    /// Writing buffered frames out to the pack files.
+    pub pack_flush: std::time::Duration,
+    /// fsync'ing the pack files.
+    pub pack_fsync: std::time::Duration,
+    /// Writing the shard→collection metadata sidecar.
+    pub sidecar: std::time::Duration,
+    /// Persisting the index checkpoint.
+    pub checkpoint: std::time::Duration,
+    /// Total wall time of the `sync_all` call.
+    pub total: std::time::Duration,
+}
+
+impl Default for SyncTimings {
+    fn default() -> Self {
+        Self {
+            pack_flush: std::time::Duration::ZERO,
+            pack_fsync: std::time::Duration::ZERO,
+            sidecar: std::time::Duration::ZERO,
+            checkpoint: std::time::Duration::ZERO,
+            total: std::time::Duration::ZERO,
+        }
+    }
+}
+
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
 ///
 /// Without a cap, a walk whose `stop_at` set is never reached (e.g. the
@@ -240,6 +327,33 @@ struct RoomGeneration {
 /// - **Reads**: `load_full()` once, see a consistent snapshot.
 /// - **Writes**: build new generation under put lock, swap atomically.
 /// - **Delete**: drop the generation — cache disappears with it.
+///
+/// # Timing instrumentation
+///
+/// Every open records a wall-clock breakdown of its phases (and which
+/// index-loading path it took) into [`OpenTimings`], surfaced via
+/// [`PackfileStorage::open_timings`]; every `sync_all` records a per-phase
+/// breakdown into [`SyncTimings`], surfaced via
+/// [`PackfileStorage::sync_timings`]. These exist to decide whether startup
+/// is dominated by deserialization (justifying mmap-ready persisted
+/// indexes) or by validation I/O, and whether sync is dominated by the
+/// checkpoint rewrite — before either format change is built. The cost is a
+/// handful of `Instant::now()` deltas on the open/sync paths only, never
+/// per record.
+///
+/// The phases measured:
+/// - **shard directory discovery/open**: directory scan plus each pack
+///   file's open and (for the writer) writer-lock take.
+/// - **metadata load**: the collection-order and deleted-collections
+///   sidecars.
+/// - **checkpoint decode**: reading + decoding the persisted index
+///   checkpoint from disk.
+/// - **fingerprint**: recomputing the live set of `(pack_id, file_len)`
+///   tuples and hashing them for validation against the checkpoint.
+/// - **index materialization**: deserializing checkpoint index blobs, or
+///   (on the fallback path) building per-collection indexes from a scan.
+/// - **full scan**: the fallback path's packfile scan + torn-tail recovery
+///   (zero on the checkpoint path).
 pub struct PackfileStorage {
     shards: ShardPool,
     collections: RwLock<HashMap<[u8; 16], ArcSwap<RoomGeneration>>>,
@@ -289,6 +403,11 @@ pub struct PackfileStorage {
     /// Wall-clock instant of the last `maybe_persist_shard_collections` flush,
     /// used to rate-limit that timer-driven path.
     last_shard_collections_flush: RwLock<Option<std::time::Instant>>,
+    /// Wall-clock breakdown of the most recent `open` — which index-loading
+    /// path was taken and how long each phase took — set at construction.
+    last_open_timings: parking_lot::Mutex<Option<OpenTimings>>,
+    /// Wall-clock breakdown of the most recent `sync_all`, by phase.
+    last_sync_timings: parking_lot::Mutex<Option<SyncTimings>>,
     /// Whether any collection data changed since the last `index.checkpoint`
     /// write. Set by every generation swap (`put`/`put_many`/`repack`/`refresh`);
     /// cleared only by a successful [`Self::persist_index_checkpoint`], so a
@@ -500,6 +619,7 @@ impl PackfileStorage {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn open_with_options(
         base_dir: PathBuf,
         cache_capacity: usize,
@@ -511,6 +631,10 @@ impl PackfileStorage {
     ) -> Result<Self, std::io::Error> {
         fs::create_dir_all(&base_dir)?;
 
+        let started = std::time::Instant::now();
+        let mut timings = OpenTimings::default();
+
+        let shard_open_started = std::time::Instant::now();
         let shards = if writable {
             match max_shard_bytes {
                 // Custom rotation thresholds are only used by benchmarks/
@@ -532,10 +656,12 @@ impl PackfileStorage {
         } else {
             ShardPool::open_read_only_with_policies(base_dir.clone(), checksum_policy)?
         };
+        timings.shard_open = shard_open_started.elapsed();
 
         // Phase 1: accumulate all records per collection across every shard so
         // the index can be sized once for the true total.
         let mut collection_entries: HashMap<[u8; 16], Vec<ShardRecord>> = HashMap::new();
+        let metadata_started = std::time::Instant::now();
         // Seed logical insertion order before scanning. A newly written collection
         // cannot appear in the sidecar until the next flush, so append it at
         // first physical sight below. Legacy v1 sidecars yield no order and
@@ -556,14 +682,17 @@ impl PackfileStorage {
         // rescan and index rebuild entirely. It is only trusted when every
         // pack on disk still matches the fingerprint it was written against.
         let deleted_collections = Self::load_deleted_collections(&base_dir);
+        timings.metadata_load = metadata_started.elapsed();
         if let Some((scan_out, collection_order)) = Self::checkpoint_scan_out(
             &base_dir,
             cache_capacity,
             &shards,
             &open_shards,
             &deleted_collections,
+            &mut timings,
         ) {
-            return Ok(Self::assemble(
+            timings.path = OpenPath::Checkpoint;
+            let store = Self::assemble(
                 shards,
                 scan_out,
                 collection_order,
@@ -571,9 +700,14 @@ impl PackfileStorage {
                 base_dir,
                 swizzle,
                 cache_capacity,
-            ));
+            );
+            timings.total = started.elapsed();
+            *store.last_open_timings.lock() = Some(timings);
+            return Ok(store);
         }
+        timings.path = OpenPath::FullScan;
 
+        let scan_started = std::time::Instant::now();
         for (shard_id, shard_pack_id, path, _file_len) in open_shards {
             // A read-only open must never touch the file at all — the
             // truncating recovery scan below is only safe when we're the
@@ -618,10 +752,12 @@ impl PackfileStorage {
             }
         }
         collection_order.retain(|collection_id| collection_entries.contains_key(collection_id));
+        timings.full_scan = scan_started.elapsed();
 
         let mut scan_out = RoomScanOutput::default();
 
         // Phase 2: build per-collection indexes sized to the true total.
+        let materialization_started = std::time::Instant::now();
         for collection_id in &collection_order {
             if deleted_collections.contains(collection_id) {
                 continue;
@@ -634,8 +770,9 @@ impl PackfileStorage {
                 &mut scan_out,
             )?;
         }
+        timings.index_materialization = materialization_started.elapsed();
 
-        Ok(Self::assemble(
+        let store = Self::assemble(
             shards,
             scan_out,
             collection_order,
@@ -643,7 +780,10 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             cache_capacity,
-        ))
+        );
+        timings.total = started.elapsed();
+        *store.last_open_timings.lock() = Some(timings);
+        Ok(store)
     }
 
     /// Builds one collection's index, cache, and shard-directory contribution
@@ -739,6 +879,8 @@ impl PackfileStorage {
             collection_shards: RwLock::new(scan_out.collection_shards),
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
+            last_open_timings: parking_lot::Mutex::new(None),
+            last_sync_timings: parking_lot::Mutex::new(None),
         }
     }
 
@@ -763,9 +905,14 @@ impl PackfileStorage {
         shards: &ShardPool,
         open_shards: &[(u16, u64, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
+        timings: &mut OpenTimings,
     ) -> Option<(RoomScanOutput, Vec<[u8; 16]>)> {
+        let decode_started = std::time::Instant::now();
         let checkpoint =
-            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir))?;
+            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir));
+        timings.checkpoint_decode = decode_started.elapsed();
+        let checkpoint = checkpoint?;
+        let fingerprint_started = std::time::Instant::now();
         let packs: Vec<(u64, u64)> = open_shards
             .iter()
             .map(|(_, pack_id, _, file_len)| (*pack_id, *file_len))
@@ -773,6 +920,7 @@ impl PackfileStorage {
         if checkpoint.fingerprint != crate::index::checkpoint::pack_fingerprint(&packs) {
             return None;
         }
+        timings.fingerprint = fingerprint_started.elapsed();
 
         let slot_to_pack_id: HashMap<u16, u64> = open_shards
             .iter()
@@ -781,6 +929,7 @@ impl PackfileStorage {
 
         let mut scan_out = RoomScanOutput::default();
         let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
+        let materialization_started = std::time::Instant::now();
         for loaded in &checkpoint.collections {
             if deleted_collections.contains(&loaded.collection_id) {
                 // The checkpoint may predate the deletion marker; the
@@ -822,6 +971,7 @@ impl PackfileStorage {
             );
             collection_order.push(loaded.collection_id);
         }
+        timings.index_materialization = materialization_started.elapsed();
 
         Some((scan_out, collection_order))
     }
@@ -3258,10 +3408,36 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `StorageError` on I/O failure.
     pub fn sync_all(&self) -> Result<(), StorageError> {
+        let started = std::time::Instant::now();
+        let mut timings = SyncTimings::default();
         self.shards.sync_all()?;
+        if let Some((flush, fsync)) = self.shards.last_sync_split() {
+            timings.pack_flush = flush;
+            timings.pack_fsync = fsync;
+        }
+        let sidecar_started = std::time::Instant::now();
         self.persist_shard_collections_best_effort();
+        timings.sidecar = sidecar_started.elapsed();
+        let checkpoint_started = std::time::Instant::now();
         self.persist_index_checkpoint_best_effort();
+        timings.checkpoint = checkpoint_started.elapsed();
+        timings.total = started.elapsed();
+        *self.last_sync_timings.lock() = Some(timings);
         Ok(())
+    }
+
+    /// Wall-clock breakdown of this store's most recent `open`, including
+    /// which index-loading path was taken. Set at construction; every store
+    /// returned by a `PackfileStorage::open*` constructor carries it.
+    #[must_use]
+    pub fn open_timings(&self) -> Option<OpenTimings> {
+        *self.last_open_timings.lock()
+    }
+
+    /// Wall-clock breakdown of the most recent `sync_all`, by phase.
+    #[must_use]
+    pub fn sync_timings(&self) -> Option<SyncTimings> {
+        *self.last_sync_timings.lock()
     }
 
     /// Commit every open shard's buffered frames to the page cache without

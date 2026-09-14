@@ -399,6 +399,10 @@ pub struct ShardPool {
     /// timer-driven path — separate from `stats_persisted_at`, which is
     /// the on-disk snapshot's own unix-seconds timestamp.
     last_stats_flush: RwLock<Option<Instant>>,
+    /// (flush, fsync) wall-clock split of the last full `sync_all`, used to
+    /// attribute sync cost between buffered frame write-out and the fsync
+    /// calls themselves. `None` until the first sync.
+    last_sync_split: Mutex<Option<(Duration, Duration)>>,
     /// Whether this pool holds the writer lock on `base_dir` (see `open`
     /// vs `open_read_only`). Gates `persist_stats`: a read-only pool
     /// never writes anything, including its own (always-zero) stats
@@ -660,6 +664,7 @@ impl ShardPool {
         Ok(pack_files)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn open_internal(
         base_dir: PathBuf,
         writable: bool,
@@ -800,6 +805,7 @@ impl ShardPool {
             collection_home: RwLock::new(HashMap::new()),
             stats_persisted_at: RwLock::new(stats_persisted_at),
             last_stats_flush: RwLock::new(None),
+            last_sync_split: Mutex::new(None),
             writable,
             compress,
             checksum_policy,
@@ -1949,7 +1955,10 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
+        let flush_started = Instant::now();
         self.flush_all()?;
+        let flush_elapsed = flush_started.elapsed();
+        let fsync_started = Instant::now();
         {
             let shards = self.shards.read();
             for shard in shards.iter().flatten() {
@@ -1957,8 +1966,16 @@ impl ShardPool {
                 shard.sync_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let fsync_elapsed = fsync_started.elapsed();
+        *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
         self.persist_stats_best_effort();
         Ok(())
+    }
+
+    /// (flush, fsync) wall-clock split of the last full `sync_all`, if any.
+    #[must_use]
+    pub fn last_sync_split(&self) -> Option<(Duration, Duration)> {
+        *self.last_sync_split.lock()
     }
 
     /// Sync only shards written to since the last sync.

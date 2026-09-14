@@ -104,6 +104,54 @@ mod tests {
     }
 
     #[test]
+    fn open_and_sync_timings_are_recorded() {
+        use mtxdb_core::packfile::storage::OpenPath;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_open_timings_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+
+        let sync = store
+            .sync_timings()
+            .expect("sync_all must record its phase timings");
+        assert!(
+            sync.total >= sync.pack_flush + sync.pack_fsync + sync.sidecar + sync.checkpoint,
+            "the phases must all fit inside the measured total ({} vs {})",
+            sync.total.as_nanos(),
+            (sync.pack_flush + sync.pack_fsync + sync.sidecar + sync.checkpoint).as_nanos()
+        );
+        drop(store);
+
+        // A synced store reopens on the checkpoint fast path, and the open's
+        // breakdown must say so (this is the deserialize-vs-IO question the
+        // instrumentation exists to answer — pin which path it reports).
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let open = reopened
+            .open_timings()
+            .expect("open must record its phase timings");
+        assert_eq!(
+            open.path,
+            OpenPath::Checkpoint,
+            "a store committed by sync_all must reopen from its checkpoint"
+        );
+        assert!(
+            open.total >= open.index_materialization,
+            "materialization must fit inside the open total"
+        );
+        assert!(
+            open.full_scan == std::time::Duration::ZERO,
+            "checkpoint path must not pay the fallback scan"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn corrupt_or_missing_checkpoint_falls_back_to_rescan() {
         let dir =
             std::env::temp_dir().join(format!("mtxdb_index_checkpoint_bad_{}", std::process::id()));
