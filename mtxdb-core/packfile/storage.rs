@@ -2109,16 +2109,10 @@ impl PackfileStorage {
         // memory. Briefly re-acquire every put_mutex (no I/O under them) so
         // this decision can't interleave with a put's own frame-push +
         // dirty-set (see `put_many`; the frame goes in before the flag).
-        // Re-lock the *extended* set (`ids_now`, which includes anything
-        // published during the initial scan), so a put to a collection that
-        // entered the locked window late is still pinned for this check.
-        let guards = ids_now
-            .iter()
-            .map(|id| {
-                let lock = self.put_mutex(id);
-                lock.lock()
-            })
-            .collect::<Vec<_>>();
+        // Re-lock the *extended* set (`lock_arcs` includes anything published
+        // during the initial scan), so a put to a collection that entered the
+        // locked window late is still pinned for this check.
+        let guards = lock_arcs.iter().map(|arc| arc.lock()).collect::<Vec<_>>();
         let has_unfinished_work = {
             let state = self.delta_state.lock();
             !state.pending.is_empty() || state.invalid
@@ -2184,14 +2178,13 @@ impl PackfileStorage {
         }
         let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
         collection_ids.sort_unstable();
-        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
-        let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+        let mut lock_arcs: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let create_guard = self.collection_creation.write();
         let ids_now: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
         for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
-            let lock = self.put_mutex(id);
-            guards.push(lock.lock());
+            lock_arcs.push(self.put_mutex(id));
         }
+        let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
         let order = self.collection_order.read().clone();
@@ -2231,7 +2224,7 @@ impl PackfileStorage {
         .map_err(StorageError::Io)?;
         let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
         self.retire_delta_epoch(old_base_fingerprint);
-        let guards = mutexes.iter().map(|m| m.lock()).collect::<Vec<_>>();
+        let guards = lock_arcs.iter().map(|m| m.lock()).collect::<Vec<_>>();
         let has_unfinished_work = {
             let state = self.delta_state.lock();
             !state.pending.is_empty() || state.invalid

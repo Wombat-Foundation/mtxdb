@@ -1366,8 +1366,8 @@ impl ShardPool {
             // Byte range this put occupies in `pending`, captured so the
             // failed-flush rollback below can remove exactly this record's
             // frame.
-            let mut pending_start = 0usize;
-            let mut frame_len = 0usize;
+            let pending_start;
+            let frame_len;
 
             let offset = {
                 let guard = shard.append_lock.lock();
@@ -1429,7 +1429,7 @@ impl ShardPool {
                 // so no other put can have appended after ours); if a
                 // concurrent flusher already committed the buffer, the range
                 // is gone and the rollback is a no-op.
-                let guard = shard.append_lock.lock();
+                let _guard = shard.append_lock.lock();
                 let mut pending = shard.pending.lock();
                 if pending.len() == pending_start.saturating_add(frame_len) {
                     pending.truncate(pending_start);
@@ -1459,8 +1459,20 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on flush failure.
     pub(crate) fn flush_shard(&self, shard: &Arc<Shard>) -> io::Result<()> {
+        let guard = shard.append_lock.lock();
+        self.flush_shard_with_guard(shard, &guard)
+    }
+
+    /// Body of `flush_shard` under a caller-supplied `append_lock` guard, so
+    /// a writer that already holds the lock (see `put_record`, which must
+    /// keep it across append → flush → rollback) can flush without
+    /// re-acquiring it.
+    fn flush_shard_with_guard(
+        &self,
+        shard: &Arc<Shard>,
+        _guard: &parking_lot::MutexGuard<'_, ()>,
+    ) -> io::Result<()> {
         {
-            let guard = shard.append_lock.lock();
             let mut pending_guard = shard.pending.lock();
             if pending_guard.is_empty() {
                 // Nothing buffered: nothing to commit or dirty.
@@ -1502,7 +1514,6 @@ impl ShardPool {
             // Hold `append_lock` for the whole commit (snapshot → write →
             // length/accounting update) so no put can observe a file_len
             // that hasn't caught up with bytes already handed out.
-            drop(guard);
         }
         self.dirty.lock().insert(shard.slot);
         Ok(())
