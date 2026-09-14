@@ -308,7 +308,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         let bytes: u64 = store
             .collection_summaries()
             .iter()
-            .map(|(_, _, b)| *b as u64)
+            .map(|(_, _, b, _)| *b as u64)
             .sum();
         drop(store);
         (bytes, "index_bytes")

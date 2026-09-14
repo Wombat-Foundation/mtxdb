@@ -216,14 +216,6 @@ impl LossyIndex {
     }
 
     /// This index's slot-table capacity (always a power of two).
-    ///
-    /// A plain accessor, not gated to test builds — capacity is a normal
-    /// property of the index, and the only reason nothing outside tests
-    /// calls it yet is that no caller has needed a load-factor figure. It
-    /// stays real `pub(crate)` API for whenever one does (e.g. a future
-    /// `collection_index_info` field); `allow` below just reflects that
-    /// its only *current* caller is a test.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn capacity(&self) -> u32 {
         self.capacity
@@ -547,13 +539,20 @@ impl LossyIndex {
             .wrapping_add(std::mem::size_of::<Self>())
     }
 
+    /// Slot-table capacity an index holding `entries` records would have
+    /// after the standard two-times-capacity allocation policy is applied —
+    /// i.e. without opening the index, e.g. from a persisted node count.
+    #[must_use]
+    pub fn capacity_for_entries(entries: usize) -> usize {
+        let minimum = entries.saturating_mul(2).max(16);
+        minimum.next_power_of_two()
+    }
+
     /// Memory that an index holding `entries` records would use after the
     /// standard two-times-capacity allocation policy is applied.
     #[must_use]
     pub fn memory_usage_for_entries(entries: usize) -> usize {
-        let minimum = entries.saturating_mul(2).max(16);
-        let capacity = minimum.next_power_of_two();
-        capacity
+        Self::capacity_for_entries(entries)
             .wrapping_mul(LIVE_SLOT_BYTES)
             .wrapping_add(std::mem::size_of::<Self>())
     }

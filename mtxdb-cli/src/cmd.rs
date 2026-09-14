@@ -62,6 +62,23 @@ fn fmt_megabytes(bytes: usize) -> String {
     format!("{whole}.{fraction:05} MB")
 }
 
+/// A collection index's occupancy as a percentage of its slot-table
+/// capacity — how full the hash table is, not how full the collection's
+/// storage is. The table rejects new inserts (forcing a grow or rebuild)
+/// once this crosses 75%, so a figure already near or at that mark
+/// explains why a collection's index just grew or is about to.
+fn fmt_load_factor(len: usize, capacity: u32) -> String {
+    if capacity == 0 {
+        return "load factor: n/a".to_owned();
+    }
+    // Collection sizes never approach f64's 52-bit mantissa, so this is
+    // display-only precision loss, not a real one.
+    #[allow(clippy::cast_precision_loss)]
+    let len_f64 = len as f64;
+    let percent = (len_f64 / f64::from(capacity)) * 100.0;
+    format!("load factor: {percent:.1}% ({len}/{capacity})")
+}
+
 /// Decimal kilobytes for per-collection index allocations, where MB would
 /// obscure the useful differences between small power-of-two tables.
 fn fmt_index_kilobytes(bytes: usize) -> String {
@@ -422,7 +439,7 @@ fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
     Ok(open_store_read_only(cli)?
         .collection_summaries()
         .into_iter()
-        .map(|(collection_id, _, _)| collection_id)
+        .map(|(collection_id, _, _, _)| collection_id)
         .collect())
 }
 
@@ -554,7 +571,7 @@ fn cmd_collections_in_dir(
     } else {
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
-    for (i, (collection_id, nodes, memory)) in ordered.into_iter().take(max_rows) {
+    for (i, (collection_id, nodes, memory, _capacity)) in ordered.into_iter().take(max_rows) {
         let hex = hex_encode(collection_id);
         let shards = collection_shards
             .as_ref()
@@ -849,7 +866,7 @@ fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize
     let collection_shards = PackfileStorage::collection_shards_from_disk(dir)?;
     let mut total = 0_usize;
     let mut by_shard = HashMap::new();
-    for (collection_id, _, memory) in summaries {
+    for (collection_id, _, memory, _capacity) in summaries {
         total = total.checked_add(memory)?;
         for pack_id in collection_shards.get(&collection_id)? {
             let entry = by_shard.entry(*pack_id).or_insert(0_usize);
@@ -1259,13 +1276,14 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
         PackfileStorage::collection_summaries_from_disk(&dir),
         PackfileStorage::collection_shards_from_disk(&dir),
     ) {
-        if let Some((_, len, mem)) = summaries
+        if let Some((_, len, mem, capacity)) = summaries
             .into_iter()
-            .find(|(id, _, _)| *id == collection_id)
+            .find(|(id, _, _, _)| *id == collection_id)
         {
             println!(
-                "collection {hex}: {len} nodes, {} index",
-                fmt_megabytes(mem)
+                "collection {hex}: {len} nodes, {} index ({})",
+                fmt_megabytes(mem),
+                fmt_load_factor(len, capacity)
             );
             let shards = collection_shards
                 .get(&collection_id)
@@ -1302,10 +1320,11 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     // create the sidecar.
     let store = open_store_read_only(cli)?;
     match store.collection_index_info(&collection_id) {
-        Some((len, mem)) => {
+        Some((len, mem, capacity)) => {
             println!(
-                "collection {hex}: {len} nodes, {} index",
-                fmt_megabytes(mem)
+                "collection {hex}: {len} nodes, {} index ({})",
+                fmt_megabytes(mem),
+                fmt_load_factor(len, capacity)
             );
             let shards = store.collection_referenced_pack_ids(&collection_id);
             print_collection_shards(&shards);
@@ -2966,7 +2985,7 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
     for collection_id in collection_ids {
         let count = store
             .collection_index_info(&collection_id)
-            .map_or(0, |(len, _)| len);
+            .map_or(0, |(len, _, _)| len);
         store.delete_collection(&collection_id)?;
         println!(
             "deleted {count} nodes for collection {}",

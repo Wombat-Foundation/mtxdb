@@ -556,7 +556,7 @@ fn run_oneshot_open_benchmark(
         let index_bytes: u64 = store
             .collection_summaries()
             .iter()
-            .map(|(_, _, bytes)| *bytes as u64)
+            .map(|(_, _, bytes, _)| *bytes as u64)
             .sum();
 
         let lookup_started = Instant::now();

@@ -213,6 +213,8 @@ type RepackScanResult = (RepackRecordMap, Option<RepackIncrementalState>);
 /// One scanned record's `(shard_id, hash, offset)`, as accumulated per
 /// collection during `PackfileStorage::open_with_options`'s initial scan.
 type ShardRecord = (u16, [u8; 16], u64, u64);
+/// `(collection_id, entry count, index memory usage in bytes, index capacity)`.
+pub type CollectionSummary = ([u8; 16], usize, usize, u32);
 
 /// Accumulator for `PackfileStorage::open_with_options`'s phase 2 —
 /// bundles the three maps `init_collection_from_scan` fills in per collection, so
@@ -1530,17 +1532,20 @@ impl PackfileStorage {
         Ok(results)
     }
 
-    /// A collection's `(entry count, memory usage in bytes)`, if the collection exists.
-    pub fn collection_index_info(&self, collection_id: &[u8; 16]) -> Option<(usize, usize)> {
+    /// A collection's `(entry count, memory usage in bytes, index capacity)`,
+    /// if the collection exists. `entry count / capacity` is the index's
+    /// load factor.
+    pub fn collection_index_info(&self, collection_id: &[u8; 16]) -> Option<(usize, usize, u32)> {
         self.collections.read().get(collection_id).map(|gen| {
             let g = gen.load();
-            (g.index.len(), g.index.memory_usage())
+            (g.index.len(), g.index.memory_usage(), g.index.capacity())
         })
     }
 
-    /// `(collection_id, entry count, memory usage in bytes)` for every known collection,
-    /// sorted by collection ID, in a single pass over the collection map.
-    pub fn collection_summaries(&self) -> Vec<([u8; 16], usize, usize)> {
+    /// `(collection_id, entry count, memory usage in bytes, index capacity)`
+    /// for every known collection, sorted by collection ID, in a single pass
+    /// over the collection map.
+    pub fn collection_summaries(&self) -> Vec<CollectionSummary> {
         let collections = self.collections.read();
         self.collection_order
             .read()
@@ -1548,7 +1553,12 @@ impl PackfileStorage {
             .filter_map(|id| {
                 collections.get(id).map(|gen| {
                     let g = gen.load();
-                    (*id, g.index.len(), g.index.memory_usage())
+                    (
+                        *id,
+                        g.index.len(),
+                        g.index.memory_usage(),
+                        g.index.capacity(),
+                    )
                 })
             })
             .collect()
@@ -1576,7 +1586,7 @@ impl PackfileStorage {
     pub fn needs_repack(&self, collection_id: &[u8; 16]) -> bool {
         let count = self
             .collection_index_info(collection_id)
-            .map_or(0, |(len, _)| len as u64);
+            .map_or(0, |(len, _, _)| len as u64);
         count
             >= self
                 .repack_threshold_entries
@@ -2503,16 +2513,18 @@ impl PackfileStorage {
     #[must_use]
     pub fn collection_summaries_from_disk(
         base_dir: &std::path::Path,
-    ) -> Option<Vec<([u8; 16], usize, usize)>> {
+    ) -> Option<Vec<CollectionSummary>> {
         Self::collection_directory_persisted_at(base_dir)?;
         Self::collection_directory_from_disk(base_dir)
             .into_iter()
             .map(|(collection_id, nodes)| {
                 let nodes = usize::try_from(nodes).ok()?;
+                let capacity = u32::try_from(LossyIndex::capacity_for_entries(nodes)).ok()?;
                 Some((
                     collection_id,
                     nodes,
                     LossyIndex::memory_usage_for_entries(nodes),
+                    capacity,
                 ))
             })
             .collect()
@@ -6898,7 +6910,7 @@ mod tests {
         let mut expected: Vec<([u8; 16], u64)> = store
             .collection_summaries()
             .into_iter()
-            .map(|(collection_id, count, _mem)| (collection_id, count as u64))
+            .map(|(collection_id, count, _mem, _cap)| (collection_id, count as u64))
             .collect();
         expected.sort_unstable_by_key(|(collection_id, _)| *collection_id);
 
