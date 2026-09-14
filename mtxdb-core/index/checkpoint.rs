@@ -253,16 +253,21 @@ pub fn write_checkpoint(
     let write_result = (|| -> std::io::Result<()> {
         let mut tmp = fs::File::create(&tmp_path)?;
         tmp.write_all(&buf)?;
-        // `sync_data` (fdatasync), not `sync_all` (fsync): this temp file is
-        // renamed over `path` immediately below and never opened by its own
-        // name again, so its inode metadata (mtime, etc.) durably surviving
-        // is irrelevant — only the data bytes and the file length need to.
-        // fdatasync still flushes any metadata required to read that data
-        // back (e.g. the extended size), it just skips the timestamp-only
-        // metadata fsync would also flush. The caller
-        // (`persist_index_checkpoint`) separately fsyncs the base directory
-        // after the rename, which is what makes the rename itself durable;
-        // this only trims the tmp file's own write cost.
+        // `sync_data` (fdatasync), not `sync_all` (fsync): per POSIX,
+        // fdatasync durably flushes the file's data plus whatever metadata
+        // is needed to retrieve it (the extended length included) — that's
+        // the whole content/length guarantee this write needs. It skips
+        // metadata that's *not* needed to read the data back (mtime/ctime).
+        // That's a real distinction, not a claim that all inode metadata is
+        // irrelevant here generally (permissions/ownership can still matter
+        // operationally) — it just happens that none of the metadata this
+        // skips is read back through this temp name: it's renamed over
+        // `path` immediately below and never opened by this name again. The
+        // caller (`persist_index_checkpoint`) separately fsyncs the base
+        // directory after the rename, which is what makes the rename itself
+        // durable; if that directory fsync fails, reopen falls back to
+        // whichever checkpoint (old or new) is actually intact rather than
+        // trusting the rename — this change doesn't alter that fallback.
         tmp.sync_data()
     })();
     if let Err(e) = write_result {
