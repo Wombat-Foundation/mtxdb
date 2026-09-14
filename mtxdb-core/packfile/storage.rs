@@ -1932,20 +1932,24 @@ impl PackfileStorage {
     /// second. A crash in between leaves a fingerprint mismatch that the next
     /// open resolves with a rescan; a crash after leaves a valid checkpoint.
     ///
-    /// The rewrite also re-bases the delta log: the checkpoint it just wrote
-    /// becomes the new log base fingerprint, each collection's generation is
-    /// recorded so the log's generation gate has something to check against,
-    /// and the stale on-disk log is truncated away (see
-    /// [`Self::reset_delta_log_after_rewrite`]). A crash between the
-    /// checkpoint rename and that truncation leaves a log whose base no longer
-    /// matches the checkpoint; the next open deletes it as stale — a rescan,
-    /// never a wrong replay.
+    /// The rewrite hands off the delta log across two epochs: the session
+    /// keeps appending to the log that continues the *old* checkpoint (D0)
+    /// right up to the rotation below, after which every `put` is recorded
+    /// against a fresh epoch (D1) named for the new checkpoint's fingerprint.
+    /// D0's file is untouched through the rotation and retired only once the
+    /// new checkpoint (C1) is durably renamed, so a crash at any point pairs
+    /// the loader with whichever log legitimately continues the checkpoint on
+    /// disk: before C1's rename C0 + D0 is authoritative, after it C1 + D1.
+    /// The log's fingerprint-based name is itself the safety gate — a stale
+    /// predecessor (D0) or an orphaned successor (D1) can never match the
+    /// checkpoint a reopen loads (see [`Self::delta_path`]).
     ///
     /// Cheap no-op when no collection data has changed since the last write
     /// (`index_checkpoint_dirty` cleared on success), so a writer that syncs
     /// repeatedly without writes doesn't rewrite the acceleration file. The
-    /// flag is only cleared after a successful write, so a transient failure
-    /// defers rather than drops the update.
+    /// flag is cleared only when nothing after this rewrite's snapshot is
+    /// left unpersisted (see the lock re-acquisition below), so a transient
+    /// failure or a racing write defers rather than drops the update.
     fn persist_index_checkpoint(&self) -> Result<(), StorageError> {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(());
@@ -2036,8 +2040,24 @@ impl PackfileStorage {
             &blobs,
         )
         .map_err(StorageError::Io)?;
-        self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         self.retire_delta_epoch(old_base_fingerprint);
+        // The unlocked serialize/write window above let concurrent puts land
+        // after the rotation. C1 was snapshotted before them, so such a put
+        // is durable only as a pending delta frame — if any frames, or a new
+        // invalidation, are still unapplied the dirty flag must survive so
+        // the next sync appends them to D1 instead of stranding them in
+        // memory. Briefly re-acquire every put_mutex (no I/O under them) so
+        // this decision can't interleave with a put's own frame-push +
+        // dirty-set (see `put_many`; the frame goes in before the flag).
+        let guards = mutexes.iter().map(|m| m.lock()).collect::<Vec<_>>();
+        let has_unfinished_work = {
+            let state = self.delta_state.lock();
+            !state.pending.is_empty() || state.invalid
+        };
+        if !has_unfinished_work {
+            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+        }
+        drop(guards);
         // Keep the inspection directory gated to the same pack set the
         // checkpoint just became: ride the checkpoint rewrite (best-effort)
         // so the next open can rebuild per-shard counts from records instead
@@ -2179,8 +2199,13 @@ impl PackfileStorage {
         )
         .map_err(StorageError::Io)?;
         state.log_bytes = state.log_bytes.saturating_add(appended as u64);
-        drop(state);
+        // Clear the dirty flag *under* the delta-state lock: a racing put
+        // pushes its frame (`record_delta`) before setting the flag, so
+        // clearing after `drop(state)` could clobber a frame that was pushed
+        // between the `mem::take` above and this store, leaving it stranded in
+        // memory with nothing to force its append.
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+        drop(state);
         self.persist_shard_collections_best_effort();
         Ok(())
     }
