@@ -54,5 +54,10 @@ name = "compression"
 path = "../benches/compression.rs"
 harness = false
 
+[[bench]]
+name = "repack_layout_measure"
+path = "../benches/repack_layout_measure.rs"
+harness = false
+
 [lints]
 workspace = true
