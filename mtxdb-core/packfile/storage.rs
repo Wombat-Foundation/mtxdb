@@ -2040,6 +2040,21 @@ impl PackfileStorage {
             &blobs,
         )
         .map_err(StorageError::Io)?;
+        // `write_checkpoint` fsyncs the new checkpoint's own bytes before
+        // renaming it into place, but the rename itself — the directory
+        // entry now pointing at the new inode — is only durable once the
+        // directory's own metadata is synced. Do that explicitly here rather
+        // than relying on `retire_delta_epoch`'s fsync (below) to cover it
+        // incidentally: that one only runs, and only after this rename, when
+        // there was a prior epoch to retire (`old_base_fingerprint.is_some()`
+        // and its `remove_file` succeeds) — a first-ever checkpoint, or a
+        // failed unlink, would otherwise leave the rename's durability
+        // resting on a later, unrelated sync happening to occur. Best-effort:
+        // a failure here is still safe, since a reopen after a crash before
+        // this fsync commits either observes the rename (fingerprint gate
+        // passes) or doesn't (falls back to the still-valid predecessor
+        // checkpoint) — never a torn or partially-visible rename.
+        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
         self.retire_delta_epoch(old_base_fingerprint);
         // The unlocked serialize/write window above let concurrent puts land
         // after the rotation. C1 was snapshotted before them, so such a put
@@ -2108,12 +2123,11 @@ impl PackfileStorage {
         };
         let path = Self::delta_path(&self.base_dir, old_base_fingerprint);
         if fs::remove_file(&path).is_ok() {
-            // `write_checkpoint` has already atomically renamed the new
-            // checkpoint at this point. Sync the directory after retiring its
-            // predecessor log so the rename-then-retire ordering is durable
-            // too; a failure is still safe (the base-fingerprint gate rejects
-            // the leftover log), but a successful return need not rely on
-            // that recovery path.
+            // The checkpoint rename's own durability is already covered by
+            // the caller's fsync right after `write_checkpoint` returns; this
+            // one covers the unlink instead, so the retired epoch's file
+            // doesn't linger past a crash — harmless either way (see the
+            // doc comment above), but tidier.
             let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
         }
     }
