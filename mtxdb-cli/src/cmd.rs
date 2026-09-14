@@ -142,7 +142,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_collections(cli, *all, *layout, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Info { collection } => cmd_info(cli, collection),
-        Commands::Scan { selector } => cmd_scan(cli, selector),
+        Commands::Scan { selector, verbose } => cmd_scan(cli, selector, *verbose),
         Commands::Import {
             paths,
             collection,
@@ -1365,13 +1365,13 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
     u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
 }
 
-fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+fn cmd_scan(cli: &Cli, selector: &str, verbose: bool) -> anyhow::Result<()> {
     if selector
         .strip_prefix("0x")
         .or_else(|| selector.strip_prefix("0X"))
         .is_some_and(|hex| hex.len() == 32)
     {
-        return cmd_scan_collection(cli, selector);
+        return cmd_scan_collection(cli, selector, verbose);
     }
     let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -1392,6 +1392,9 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
         println!("  collection={collection_hex} id={id_hex} @ {offset}");
+        if verbose {
+            print_scan_payload(&ShardPool::read_at(&shard, *offset)?.data);
+        }
     }
     Ok(())
 }
@@ -1399,7 +1402,7 @@ fn cmd_scan(cli: &Cli, selector: &str) -> anyhow::Result<()> {
 /// Print every physical frame for a collection across all packs. This is a
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
-fn cmd_scan_collection(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+fn cmd_scan_collection(cli: &Cli, selector: &str, verbose: bool) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
@@ -1420,6 +1423,9 @@ fn cmd_scan_collection(cli: &Cli, selector: &str) -> anyhow::Result<()> {
                     shard.pack_id,
                     hex_encode(&node_id)
                 );
+                if verbose {
+                    print_scan_payload(&ShardPool::read_at(&shard, offset)?.data);
+                }
             }
         }
         packs = packs.saturating_add(usize::from(matched_pack));
@@ -1435,6 +1441,18 @@ fn cmd_scan_collection(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         if packs == 1 { "" } else { "s" },
     );
     Ok(())
+}
+
+/// Print a readable payload for `scan --verbose` without ever treating an
+/// arbitrary binary record as terminal text.
+fn print_scan_payload(data: &[u8]) {
+    if let Some(pretty) = pretty_json_stream(data) {
+        for line in String::from_utf8_lossy(&pretty).lines() {
+            println!("    {line}");
+        }
+    } else {
+        println!("    payload: {} bytes (non-JSON)", data.len());
+    }
 }
 
 fn cmd_import(

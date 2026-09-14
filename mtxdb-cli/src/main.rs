@@ -41,6 +41,7 @@ pub(crate) enum Commands {
     },
     Scan {
         selector: String,
+        verbose: bool,
     },
     Import {
         paths: Vec<PathBuf>,
@@ -221,6 +222,13 @@ fn sub_scan() -> Command {
                 .required(true)
                 .value_name("PACK_ID|COLLECTION")
                 .help("Pack ID from `shards` (1–16 hex digits), or a 32-hex-digit collection ID"),
+        )
+        .arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .action(ArgAction::SetTrue)
+                .help("Print each frame's JSON payload when available"),
         )
 }
 
@@ -437,6 +445,7 @@ fn parse_cli() -> Cli {
         },
         Some(("scan", m)) => Commands::Scan {
             selector: m.get_one::<String>("selector").unwrap().clone(),
+            verbose: m.get_flag("verbose"),
         },
         Some(("import", m)) => Commands::Import {
             paths: m
