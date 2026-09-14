@@ -148,6 +148,42 @@ mod tests {
             "checkpoint path must not pay the fallback scan"
         );
 
+        // The writable store holds the directory's writer lock (a second
+        // writer on the same dir is refused), so release it before reopening.
+        drop(reopened);
+
+        // Stale fingerprint: a checkpoint that decodes cleanly but no longer
+        // matches the packs must fall back to the full scan — and record the
+        // fruitless fingerprint attempt it made (per the struct doc).
+        std::fs::write(checkpoint_path(&dir), {
+            let mut bytes = std::fs::read(checkpoint_path(&dir)).unwrap();
+            bytes[32] ^= 0xFF;
+            bytes
+        })
+        .unwrap();
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let open = reopened
+            .open_timings()
+            .expect("open must record its phase timings");
+        assert_eq!(
+            open.path,
+            OpenPath::FullScan,
+            "stale fingerprint must rescan"
+        );
+        assert!(
+            open.full_scan > std::time::Duration::ZERO,
+            "the fallback must actually scan"
+        );
+        assert!(
+            open.fingerprint > std::time::Duration::ZERO,
+            "the stale-fingerprint attempt must be attributed, not dropped"
+        );
+        assert!(
+            open.fingerprint <= open.total,
+            "fingerprint must fit inside the open total"
+        );
+        assert_all_records(&reopened);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -65,7 +65,7 @@ pub struct OpenTimings {
     pub metadata_load: std::time::Duration,
     /// Reading + decoding the persisted index checkpoint.
     pub checkpoint_decode: std::time::Duration,
-    /// Recomupting the live `(pack_id, file_len)` set's fingerprint.
+    /// Recomputing the live `(pack_id, file_len)` set's fingerprint.
     pub fingerprint: std::time::Duration,
     /// Deserializing checkpoint index blobs into live collections (checkpoint
     /// path) or building per-collection indexes from scanned records
@@ -918,6 +918,7 @@ impl PackfileStorage {
             .map(|(_, pack_id, _, file_len)| (*pack_id, *file_len))
             .collect();
         if checkpoint.fingerprint != crate::index::checkpoint::pack_fingerprint(&packs) {
+            timings.fingerprint = fingerprint_started.elapsed();
             return None;
         }
         timings.fingerprint = fingerprint_started.elapsed();
