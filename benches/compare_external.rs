@@ -231,9 +231,6 @@ fn mtxdb_open(dir: &std::path::Path) -> PackfileStorage {
 
 fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // ── Build ──
-    // Keep the rw store open for the append phase: production keeps a live
-    // handle (Synapse's writer), so an append must not pay a fresh
-    // full-scan open that a benchmark would otherwise hide inside it.
     let started = Instant::now();
     let store_rw = mtxdb_open(dir);
     for node in 0..nodes {
@@ -258,6 +255,21 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
             sync.total.as_secs_f64() * 1e3,
         );
     }
+    // NOTE: mtxdb's warm-open/lookup memory sample below is taken while
+    // `store_rw` is still alive (one rw handle + one ro snapshot), unlike
+    // MDBX/SQLite (build handle already dropped by this point), so it is
+    // not perfectly symmetric across engines yet. A prior attempt to drop
+    // and reopen `store_rw` here for symmetry surfaced a real, separate,
+    // reproducible cost: the first `put_many` to each of the 32 collections
+    // after a fresh reopen took ~80ms (not disk-cold — this bench runs on
+    // tmpfs — and not explained by LossyIndex::clone()'s materialize path,
+    // which is cheap for the mmap-backed case). That is a genuine finding
+    // worth its own investigation in the write path (`shard.rs`'s
+    // `put_record`/`shard_for_collection`, or `storage.rs`'s `put_many`),
+    // not something to paper over here by silently pre-warming it away —
+    // so the reopen is deferred until it doesn't contaminate append timing
+    // (see the "── Append ──" section below), and this sample stays
+    // asymmetric in the meantime.
 
     // Resident index bytes, isolated from the mmap'd packfiles: sum of the
     // per-collection LossyIndex slot arrays (the checkpoint-size input).
@@ -326,6 +338,13 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     drop(store);
 
     // ── Append ──
+    // Keep the same rw store open from the ── Build ── section: production
+    // keeps a live handle (Synapse's writer), so an append must not pay a
+    // fresh full-scan/reopen cost that a benchmark would otherwise hide
+    // inside it. (See the note above the memory sample: reopening `store_rw`
+    // here surfaced a real, separate, unexplained per-collection cost on a
+    // fresh handle's first write — not something to fold into this number
+    // until it's root-caused.)
     // (a) apples-to-apples "one batch, one sync": 1k nodes across the 32
     //     collections, one generation per collection via put_many, then a
     //     single dirty-scoped sync() — the primitive Synapse's 1 s timer
@@ -787,9 +806,42 @@ fn run_backend(backend: Backend, target_gb: f64) {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Parse `MTXDB_BENCH_EXT_ENGINE` (unset -> run all three in one process,
+/// the historical default; `mtxdb`/`mdbx`/`sqlite` -> run only that one).
+///
+/// Single-engine mode exists for `scripts/external_bench.py`, which invokes
+/// this binary three times, once per engine, so each backend gets its own
+/// fresh process for the RSS/PSS sampling in `run_backend`. Sequential
+/// in-process runs share one address space: allocator retention and a prior
+/// engine's still-resident pages would bias later engines' PSS/RSS, since
+/// `/proc/self/smaps_rollup` reports the whole process, not per-backend.
+fn engines_from_env() -> Vec<Backend> {
+    match std::env::var("MTXDB_BENCH_EXT_ENGINE") {
+        Ok(raw) => match raw.trim() {
+            "mtxdb" => vec![Backend::Mtxdb],
+            "mdbx" => vec![Backend::Mdbx],
+            "sqlite" => vec![Backend::Sqlite],
+            other => panic!("invalid MTXDB_BENCH_EXT_ENGINE: {other:?}"),
+        },
+        Err(std::env::VarError::NotPresent) => {
+            vec![Backend::Mtxdb, Backend::Mdbx, Backend::Sqlite]
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("MTXDB_BENCH_EXT_ENGINE must be valid UTF-8")
+        }
+    }
+}
+
 fn main() {
+    let engines = engines_from_env();
     eprintln!("external comparison bench — mtxdb vs MDBX vs SQLite (default 0.1 GB per engine)");
     eprintln!("set MTXDB_BENCH_EXT_GB=1,100,1000 (comma-separated GB targets) for the real curve");
+    if engines.len() == 1 {
+        eprintln!(
+            "MTXDB_BENCH_EXT_ENGINE={} set; running only that backend in this process",
+            engines[0].name()
+        );
+    }
     eprintln!();
 
     let gbs: Vec<f64> = match std::env::var("MTXDB_BENCH_EXT_GB") {
@@ -813,8 +865,8 @@ fn main() {
     );
 
     for gb in &gbs {
-        for backend in [Backend::Mtxdb, Backend::Mdbx, Backend::Sqlite] {
-            run_backend(backend, *gb);
+        for backend in &engines {
+            run_backend(*backend, *gb);
         }
     }
 

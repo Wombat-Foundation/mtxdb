@@ -11,6 +11,7 @@ is deliberately separate from the un-gated `make bench` flow.
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -62,22 +63,39 @@ BENCH_CMD = [
     "compare-external",
 ]
 
+ENGINES = ("mtxdb", "mdbx", "sqlite")
+
 
 def run_bench() -> None:
-    """Execute the comparison bench, capturing combined output to LATEST."""
+    """Run the comparison bench once per engine, each its own process.
+
+    `/proc/self/smaps_rollup`-based RSS/PSS sampling (see
+    `compare_external.rs::smaps_rollup`) reports the whole process, so
+    running all three engines in one `cargo bench` invocation would let
+    allocator retention and a prior engine's still-resident pages bias
+    later engines' numbers. `MTXDB_BENCH_EXT_ENGINE` restricts a run to a
+    single backend; running it three times, once per engine, gives each
+    one a fresh address space for that measurement. Output from all three
+    processes is concatenated into LATEST so `append_rows` parses it the
+    same as a single combined run.
+    """
     CSV_DIR.mkdir(parents=True, exist_ok=True)
     with LATEST.open("wb") as out:
-        proc = subprocess.run(
-            BENCH_CMD,
-            cwd=ROOT,
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
-    if proc.returncode != 0:
-        raise SystemExit(
-            f"comparison bench failed (exit {proc.returncode}); logs in {LATEST}"
-        )
+        for engine in ENGINES:
+            env = {**os.environ, "MTXDB_BENCH_EXT_ENGINE": engine}
+            proc = subprocess.run(
+                BENCH_CMD,
+                cwd=ROOT,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise SystemExit(
+                    f"comparison bench failed for engine={engine} "
+                    f"(exit {proc.returncode}); logs in {LATEST}"
+                )
 
 
 def append_rows() -> int:
