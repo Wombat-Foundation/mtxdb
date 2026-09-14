@@ -51,11 +51,20 @@ pub(crate) const PENDING_FLUSH_BYTES: usize = 1 << 20;
 /// per shard once `max_pending_bytes` of frames have accumulated (or at the
 /// rotation/sync/read/repack/checkpoint boundaries that flush first). This
 /// is far faster for bulk writes — one `pwrite` per ~1 MiB instead of one
-/// per record — but it changes the visibility/durability boundary: unflushed bytes live only in
-/// this process's memory, are invisible to other processes, and are lost if
-/// this process exits before the next flush or `sync_*`. Opt into it only
-/// where the caller already flushes or syncs on its own durability schedule
-/// (e.g. a batch import that ends in `sync_all`).
+/// per record — but it changes the durability boundary:
+///
+/// **Records since the last flush are lost on process crash.**
+///
+/// Unflushed bytes live only in this process's memory, are invisible to
+/// other processes, and are gone if this process exits — there is
+/// deliberately no recovery path for them. (Recovery machinery here only
+/// covers bytes already committed to a pack file: checkpoint writes flush
+/// first, so the persisted fingerprint and index describe only committed
+/// lengths, never buffered ones.) A crash therefore leaves on-disk state
+/// self-consistent but drops everything still in the buffer. Buffered is a
+/// pure throughput option trading crash-loss of the unflushed tail; opt
+/// into it only where the caller already flushes or syncs on its own
+/// durability schedule (e.g. a batch import that ends in `sync_all`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppendPolicy {
     /// Commit each record's frame with its own positioned write, exactly as

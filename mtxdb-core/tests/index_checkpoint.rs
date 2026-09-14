@@ -187,6 +187,84 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Accounting regression for the buffered append policy: a process crash
+    /// with bytes still in the RAM buffer must leave neither the pack files
+    /// nor the persisted fingerprint claiming those bytes. If either ran
+    /// ahead of real pack bytes, a later open could *falsely* pass the
+    /// fingerprint gate and serve an index describing data that was never
+    /// durably written — a worse failure than the rescan fallback. Assert
+    /// both halves independently at the last flushed boundary.
+    #[test]
+    fn buffered_crash_before_flush_leaves_pack_length_and_fingerprint_at_last_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_buffered_crash_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+
+        // Snapshot the committed boundary BEFORE the unsynced buffered put:
+        // the pack file's on-disk length and the checkpoint bytes holding
+        // the pack_fingerprint (computed from exactly those lengths).
+        let pack_path = dir.join("pack_0000000000000000.pack");
+        let pack_len_before = std::fs::metadata(&pack_path).unwrap().len();
+        let checkpoint_before = std::fs::read(checkpoint_path(&dir)).unwrap();
+        assert!(
+            pack_len_before > 0,
+            "the synced store must have committed pack bytes to snapshot"
+        );
+
+        // Buffer one more record and never flush it; dropping the store is
+        // the crash-equivalent (no flush, no sync, no checkpoint rewrite).
+        // NOTE: this couples ShardPool::drop to "best-effort stats persist
+        // only, no pending-buffer flush". If drop ever gains a flush-on-drop
+        // convenience path, this test would start validating drop's flush
+        // instead of crash semantics -- it should fail loudly, not silently
+        // pass, so keep the drop path here honest.
+        let store = store.with_append_policy(mtxdb_core::shard::AppendPolicy::buffered());
+        let cid = collection_id(1);
+        let ghost = node_id(1, 200);
+        store
+            .put(
+                &cid,
+                &ghost,
+                &NodeData::new(Bytes::from(payload_for(9, 200))),
+            )
+            .unwrap();
+        drop(store);
+
+        // (1) The buffered bytes never reached the pack file: its length is
+        // exactly the last flushed boundary, no tail.
+        assert_eq!(
+            std::fs::metadata(&pack_path).unwrap().len(),
+            pack_len_before,
+            "crash with an unflushed buffered record must not grow the pack file"
+        );
+
+        // (2) The persisted fingerprint did not incorporate the buffered
+        // bytes either: the checkpoint is byte-identical to the pre-crash
+        // snapshot, so it can never falsely validate a longer pack.
+        assert_eq!(
+            std::fs::read(checkpoint_path(&dir)).unwrap(),
+            checkpoint_before,
+            "crash with an unflushed buffered record must not rewrite the checkpoint"
+        );
+
+        // The fingerprint gate on the reopened store therefore still sits on
+        // exactly the committed reality: clean open, synced records present,
+        // ghost absent — no mismatch, no false pass, nothing resurrected.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_all_records(&reopened);
+        assert!(
+            reopened.get(&cid, &ghost).unwrap().is_none(),
+            "a never-flushed buffered record must not exist after a fresh open"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn deleted_collections_are_not_resurrected_by_stale_checkpoint() {
         let dir =
