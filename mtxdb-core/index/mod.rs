@@ -926,6 +926,42 @@ mod tests {
     }
 
     #[test]
+    fn replay_preserves_a_distinct_same_tag_slot() {
+        let mut first = [0u8; 16];
+        first[8] = 0x42;
+        first[15] = 1;
+        let mut second = first;
+        second[15] = 2;
+
+        // Model the checkpoint before the second write. Serialization omits
+        // identities, as the compact checkpoint format intentionally does.
+        let checkpoint_source = LossyIndex::new(16);
+        checkpoint_source.insert(&first, 0, 100).unwrap();
+        let checkpoint = LossyIndex::deserialize(&checkpoint_source.serialize()).unwrap();
+
+        // The live writer records the exact bucket/slot placement for the
+        // second colliding identity. Replay must preserve that placement; it
+        // must not re-run tag-only insertion and drop either record.
+        let live = LossyIndex::new(16);
+        live.insert(&first, 0, 100).unwrap();
+        let (bucket, slot) = live.insert_tracked(&second, 0, 200).unwrap();
+        checkpoint
+            .replay_frames(&[DeltaFrame {
+                collection_id: [0; 16],
+                bucket,
+                generation: 0,
+                slot,
+            }])
+            .unwrap();
+
+        assert_eq!(checkpoint.len(), 2);
+        assert_eq!(
+            checkpoint.lookup_all(&first).collect::<Vec<_>>(),
+            vec![(0, 100), (0, 200)]
+        );
+    }
+
+    #[test]
     fn test_serialize_roundtrip() {
         let index = LossyIndex::new(128);
         for i in 0..50u16 {
