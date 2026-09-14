@@ -363,10 +363,49 @@ static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// Index and cache are bundled so readers see a consistent triple
 /// via a single `ArcSwap::load()` — no three-lock coordination.
+///
+/// `generation` is the collection index's structural generation: it
+/// increments on every capacity-changing or shape-changing rebuild (growth,
+/// repack, refresh) and is preserved across plain COW writes. The delta log
+/// stamps every frame with the generation it was recorded under, so a log
+/// never replay-applies frames for a pre-resize table onto a resized one.
 #[derive(Clone)]
 struct RoomGeneration {
     index: LossyIndex,
     cache: Arc<NodeCache>,
+    generation: u64,
+}
+
+/// Session state for the incremental index delta log (`index.delta`).
+///
+/// A fresh checkpoint rewrite re-bases this structure; between rewrites, live
+/// index mutations are recorded as [`crate::index::format::DeltaFrame`]s in
+/// `pending` and appended as a single framed batch by the next `sync()`, so a
+/// dirty sync pays a few-dozen-byte append instead of a multi-megabyte
+/// checkpoint rewrite. A structurally unsafe transition sets `invalid` (see
+/// below), which forces the next sync back to a full rewrite.
+#[derive(Default)]
+struct DeltaState {
+    /// Fingerprint of the checkpoint this session continues. `None` when the
+    /// store opened via a full rescan and hasn't rewritten a checkpoint yet —
+    /// every such open forces the next dirty sync to a full rewrite.
+    base_fingerprint: Option<u64>,
+    /// Generation of each collection at the last full checkpoint rewrite. A
+    /// frame is only recorded when the collection's live generation still
+    /// equals this value; bumping a generation (structural change) therefore
+    /// silently stops recording for that collection until the next rewrite.
+    base_generations: HashMap<[u8; 16], u64>,
+    /// Frames accumulated since the last persist (checkpoint rewrite or delta
+    /// append). Cleared on every successful persist.
+    pending: Vec<DeltaFrame>,
+    /// Bytes already committed to the on-disk log (upper bound that a fresh
+    /// header may still need to be written). Resets to zero on rewrite.
+    log_bytes: u64,
+    /// When set, the pending log can no longer be continued correctly —
+    /// capacity growth, full rebuild, repack, refresh, and collection
+    /// create/delete all invalidate it because replay couldn't reconstruct the
+    /// index from the last checkpoint alone. Forces the next full rewrite.
+    invalid: bool,
 }
 
 /// A content-addressed packfile storage engine backed by a global shard pool.
@@ -470,6 +509,10 @@ pub struct PackfileStorage {
     /// cost, while a crash left a stale checkpoint is still always resolved by
     /// the fingerprint → rescan fallback.
     index_checkpoint_dirty: AtomicBool,
+    /// Session state for the incremental index delta log: the base checkpoint
+    /// fingerprint + generations the log continues, and the frames accumulated
+    /// since the last persist. See [`DeltaState`].
+    delta_state: parking_lot::Mutex<DeltaState>,
 }
 
 /// Per-collection state for incremental repack.
@@ -736,12 +779,13 @@ impl PackfileStorage {
         // pack on disk still matches the fingerprint it was written against.
         let deleted_collections = Self::load_deleted_collections(&base_dir);
         timings.metadata_load = metadata_started.elapsed();
-        if let Some((scan_out, collection_order)) = Self::checkpoint_scan_out(
+        if let Some((scan_out, collection_order, delta_state)) = Self::checkpoint_scan_out(
             &base_dir,
             cache_capacity,
             &shards,
             &open_shards,
             &deleted_collections,
+            writable,
             &mut timings,
         ) {
             timings.path = OpenPath::Checkpoint;
@@ -753,12 +797,20 @@ impl PackfileStorage {
                 base_dir,
                 swizzle,
                 cache_capacity,
+                delta_state,
             );
             timings.total = started.elapsed();
             *store.last_open_timings.lock() = Some(timings);
             return Ok(store);
         }
         timings.path = OpenPath::FullScan;
+        // The checkpoint/log gates rejected the persisted index state; never
+        // carry forward a stale log into the rescanned session — a writable
+        // open can delete it outright (read-only opens leave the file alone
+        // but will re-rescan, since the damaged bases can never trust it).
+        if writable {
+            let _ = std::fs::remove_file(base_dir.join(INDEX_DELTA_FILE));
+        }
 
         let scan_started = std::time::Instant::now();
         for (shard_id, shard_pack_id, path, _file_len) in open_shards {
@@ -833,6 +885,13 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             cache_capacity,
+            // A full rescan re-cooks every index from scratch, so no delta log
+            // can continue anything the checkpoint recorded; force the next
+            // dirty sync into a full checkpoint rewrite that re-bases the log.
+            DeltaState {
+                invalid: true,
+                ..DeltaState::default()
+            },
         );
         timings.total = started.elapsed();
         *store.last_open_timings.lock() = Some(timings);
@@ -893,6 +952,7 @@ impl PackfileStorage {
             ArcSwap::from_pointee(RoomGeneration {
                 index,
                 cache: Arc::new(NodeCache::new(cache_capacity)),
+                generation: 1,
             }),
         );
         Ok(())
@@ -910,6 +970,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         swizzle: Option<SwizzleFn>,
         cache_capacity: usize,
+        delta_state: DeltaState,
     ) -> Self {
         Self {
             shards,
@@ -934,12 +995,18 @@ impl PackfileStorage {
             index_checkpoint_dirty: AtomicBool::new(false),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
+            delta_state: parking_lot::Mutex::new(delta_state),
         }
     }
 
     /// Path of this store's persisted-index checkpoint.
     fn index_checkpoint_path(base_dir: &std::path::Path) -> PathBuf {
         base_dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE)
+    }
+
+    /// Path of this store's incremental index delta log.
+    fn delta_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join(INDEX_DELTA_FILE)
     }
 
     /// Attempt to recover the per-shard/collection bookkeeping from the
@@ -956,7 +1023,8 @@ impl PackfileStorage {
     #[allow(clippy::type_complexity)]
     fn gated_sidecar_bookkeeping(
         base_dir: &std::path::Path,
-        checkpoint: &crate::index::checkpoint::LoadedCheckpoint,
+        local_fingerprint: u64,
+        current_len: &HashMap<[u8; 16], u32>,
         open_shards: &[(u16, u64, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
     ) -> (
@@ -969,7 +1037,7 @@ impl PackfileStorage {
         let Some(directory) = read_persisted_shard_collections(base_dir) else {
             return (BookkeepingSource::SlotScan, counts, pack_entries);
         };
-        if directory.fingerprint != checkpoint.fingerprint {
+        if directory.fingerprint != local_fingerprint {
             return (BookkeepingSource::SlotScan, counts, pack_entries);
         }
         let pack_to_slot: HashMap<u64, u16> = open_shards
@@ -992,14 +1060,14 @@ impl PackfileStorage {
                 .or_default()
                 .push((record.pack_id, record.count));
         }
-        for loaded in &checkpoint.collections {
-            if deleted_collections.contains(&loaded.collection_id) {
+        for (collection_id, len) in current_len {
+            if deleted_collections.contains(collection_id) {
                 continue;
             }
-            let Some(slot_counts) = counts.get(&loaded.collection_id) else {
+            let Some(slot_counts) = counts.get(collection_id) else {
                 return (BookkeepingSource::SlotScan, counts, pack_entries);
             };
-            if slot_counts.values().copied().sum::<u64>() != u64::from(loaded.slot_count) {
+            if slot_counts.values().copied().sum::<u64>() != u64::from(*len) {
                 return (BookkeepingSource::SlotScan, counts, pack_entries);
             }
         }
@@ -1011,19 +1079,30 @@ impl PackfileStorage {
     /// instead of rescanning every packfile.
     ///
     /// Returns `None` — falling through to the full rescan — for a missing,
-    /// malformed, or stale checkpoint, or one that doesn't describe the pack
-    /// set currently on disk. The fast path deliberately skips the torn-tail
-    /// recovery scan, which is safe: a fingerprint match means the packs are
-    /// the exact state the previous session's last sync fsynced, so there can
-    /// be no torn tail to recover.
+    /// malformed, or stale checkpoint, one that doesn't describe the pack set
+    /// currently on disk, or a delta log that can't be replayed onto the
+    /// checkpoint. The fast path deliberately skips the torn-tail recovery
+    /// scan, which is safe: a fingerprint match means the packs are the exact
+    /// state the previous session's last sync fsynced, so there can be no torn
+    /// tail to recover.
+    ///
+    /// On success, also returns the fresh [`DeltaState`] for the session: the
+    /// delta log's base fingerprint (the checkpoint's) and each collection's
+    /// checkpoint generation, with `invalid` set only if a structural change
+    /// (e.g. a grow) forced replay to bail into a rescan — in which case this
+    /// function returns `None`, and the rescan path constructs the
+    /// invalidated state instead.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn checkpoint_scan_out(
         base_dir: &std::path::Path,
         cache_capacity: usize,
         shards: &ShardPool,
         open_shards: &[(u16, u64, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
+        writable: bool,
         timings: &mut OpenTimings,
-    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>)> {
+    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaState)> {
         let decode_started = std::time::Instant::now();
         let checkpoint =
             crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir));
@@ -1034,11 +1113,62 @@ impl PackfileStorage {
             .iter()
             .map(|(_, pack_id, _, file_len)| (*pack_id, *file_len))
             .collect();
-        if checkpoint.fingerprint != crate::index::checkpoint::pack_fingerprint(&packs) {
-            timings.fingerprint = fingerprint_started.elapsed();
-            return None;
-        }
+        let local_fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
         timings.fingerprint = fingerprint_started.elapsed();
+
+        // Generations at the checkpoint, per collection — used both to seed the
+        // new session's `DeltaState` and to gate whether any delta frames may be
+        // applied (a frame's stamp must equal the checkpoint generation it
+        // claims to continue, which also rules out the never-recorded ancestors
+        // of collections created or structurally changed since the checkpoint).
+        let mut ckpt_generations: HashMap<[u8; 16], u64> = checkpoint
+            .collections
+            .iter()
+            .filter(|loaded| !deleted_collections.contains(&loaded.collection_id))
+            .map(|loaded| (loaded.collection_id, loaded.generation))
+            .collect();
+
+        let delta_path = base_dir.join(INDEX_DELTA_FILE);
+        // A delta log can only continue a checkpoint whose packs have advanced
+        // (every append accompanies a flush that grows a pack, changing the
+        // fingerprint). When the packs still match the checkpoint exactly,
+        // any leftover log is stale — likely a crashed full rewrite that had
+        // already committed the new checkpoint but not yet deleted its
+        // predecessor log. Never replayed; removed on a writable open.
+        let replay_needed = local_fingerprint != checkpoint.fingerprint;
+        if !replay_needed {
+            if writable {
+                let _ = std::fs::remove_file(&delta_path);
+            }
+        }
+
+        // Gate the log (case B only): it must start at this checkpoint and end
+        // at the exact pack set now on disk, and every committed frame must
+        // target a checkpointed collection at its recorded checkpoint
+        // generation. Any failure rejects the log wholesale and falls through
+        // to the rescan — never a partial replay.
+        let mut replay_frames: Vec<DeltaFrame> = Vec::new();
+        if replay_needed {
+            let delta_started = std::time::Instant::now();
+            let log = delta::read_delta_log(&delta_path);
+            let trusted = log.as_ref().is_some_and(|log| {
+                log.base_fingerprint == checkpoint.fingerprint
+                    && log.tail_fingerprint == local_fingerprint
+                    && log.frames.iter().all(|frame| {
+                        ckpt_generations.get(&frame.collection_id) == Some(&frame.generation)
+                    })
+            });
+            if trusted {
+                replay_frames = log.map_or(Vec::new(), |log| log.frames);
+            } else {
+                timings.delta_replay = delta_started.elapsed();
+                if writable {
+                    let _ = std::fs::remove_file(&delta_path);
+                }
+                return None;
+            }
+            timings.delta_replay = delta_started.elapsed();
+        }
 
         let slot_to_pack_id: HashMap<u16, u64> = open_shards
             .iter()
@@ -1047,21 +1177,19 @@ impl PackfileStorage {
 
         // The inspection sidecar is the same reduced per-(pack, collection)
         // bookkeeping the loop below would recover by walking every slot of
-        // every collection index. Accept it only when it is gated to this
-        // exact pack set and describes every non-deleted collection completely
+        // every collection index. Accept it only when it is gated to the pack
+        // set now on disk and describes every non-deleted collection completely
         // (see `gated_sidecar_bookkeeping`); any mismatch falls through to the
         // faithful slot walk, because the sidecar is an acceleration and
         // correctness never depends on it.
-        let (bookkeeping_source, mut sidecar_counts, mut sidecar_pack_entries) =
-            Self::gated_sidecar_bookkeeping(
-                base_dir,
-                &checkpoint,
-                open_shards,
-                deleted_collections,
-            );
-
+        //
+        // Gating needs each collection's post-replay length (the checkpoint
+        // occupancy plus whatever fresh-slot writes the replayed frames add),
+        // so the sidecar check runs after materialization below.
         let mut scan_out = RoomScanOutput::default();
         let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
+        let mut current_len: HashMap<[u8; 16], u32> =
+            HashMap::with_capacity(checkpoint.collections.len());
         let materialization_started = std::time::Instant::now();
         for loaded in &checkpoint.collections {
             if deleted_collections.contains(&loaded.collection_id) {
@@ -1072,74 +1200,119 @@ impl PackfileStorage {
             // The checkpoint reader has already validated this range. Keep it
             // mmap-backed through the read-only fast path; the first writer
             // copy-on-writes it into the normal atomic slot array.
-            let index = LossyIndex::from_mmap_slots(
+            let mmap_index = LossyIndex::from_mmap_slots(
                 Arc::clone(&checkpoint.mmap),
                 loaded.slots_offset,
                 loaded.capacity,
                 loaded.slot_count,
             );
-            let counts = match bookkeeping_source {
-                BookkeepingSource::Sidecar => sidecar_counts
-                    .remove(&loaded.collection_id)
-                    .unwrap_or_default(),
-                BookkeepingSource::SlotScan => index.shard_counts(),
-            };
-            // Seed the home shard from the highest shard a slot references —
-            // the nearest proxy for the scan path's "shard of the last
-            // record", since slots were appended in shard-id order.
-            if let Some(&home_shard) = counts.keys().max() {
-                shards.set_collection_home(&loaded.collection_id, home_shard);
-            }
-            match bookkeeping_source {
-                BookkeepingSource::SlotScan => {
-                    for (&shard_id, &count) in &counts {
-                        let pack_id = slot_to_pack_id
-                            .get(&shard_id)
+            // Collections with replayed frames must be materialized (owned) so
+            // the frames can be applied on top of the raw checkpoint slots;
+            // everything else stays an O(1) mmap view.
+            let index = if replay_frames
+                .iter()
+                .any(|frame| frame.collection_id == loaded.collection_id)
+            {
+                let owned = mmap_index.clone();
+                if owned
+                    .replay_frames(
+                        &replay_frames
+                            .iter()
+                            .filter(|frame| frame.collection_id == loaded.collection_id)
                             .copied()
-                            .unwrap_or(u64::from(shard_id));
-                        scan_out
-                            .shard_collections
-                            .entry(pack_id)
-                            .or_default()
-                            .insert(loaded.collection_id, count);
-                        scan_out
-                            .collection_shards
-                            .entry(loaded.collection_id)
-                            .or_default()
-                            .insert(pack_id);
+                            .collect::<Vec<_>>(),
+                    )
+                    .is_err()
+                {
+                    // Structurally inconsistent with the checkpoint despite
+                    // passing the fingerprint/generation gates (e.g. a frame
+                    // bucket past this checkpoint's capacity). It can't be
+                    // replayed; fall through to the rescan.
+                    if writable {
+                        let _ = std::fs::remove_file(&delta_path);
                     }
+                    return None;
                 }
-                BookkeepingSource::Sidecar => {
-                    for (pack_id, count) in sidecar_pack_entries
-                        .remove(&loaded.collection_id)
-                        .unwrap_or_default()
-                    {
-                        scan_out
-                            .shard_collections
-                            .entry(pack_id)
-                            .or_default()
-                            .insert(loaded.collection_id, count);
-                        scan_out
-                            .collection_shards
-                            .entry(loaded.collection_id)
-                            .or_default()
-                            .insert(pack_id);
-                    }
-                }
-            }
+                owned
+            } else {
+                mmap_index
+            };
+            current_len.insert(loaded.collection_id, u32::try_from(index.len()).ok()?);
             scan_out.collections.insert(
                 loaded.collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
                     cache: Arc::new(NodeCache::new(cache_capacity)),
+                    generation: loaded.generation,
                 }),
             );
             collection_order.push(loaded.collection_id);
         }
         timings.index_materialization = materialization_started.elapsed();
+
+        let (bookkeeping_source, mut sidecar_counts, mut sidecar_pack_entries) =
+            Self::gated_sidecar_bookkeeping(
+                base_dir,
+                local_fingerprint,
+                &current_len,
+                open_shards,
+                deleted_collections,
+            );
         timings.bookkeeping_source = bookkeeping_source;
 
-        Some((scan_out, collection_order))
+        // Bookkeeping (home-shard seeding + shard directory) from the sidecar
+        // where that passed its gates, otherwise a slot walk of the — possibly
+        // replayed — live indexes.
+        let counts_lookup: HashMap<[u8; 16], HashMap<u16, u64>> = match bookkeeping_source {
+            BookkeepingSource::Sidecar => sidecar_counts,
+            BookkeepingSource::SlotScan => {
+                let mut out = HashMap::with_capacity(collection_order.len());
+                for collection_id in &collection_order {
+                    if let Some(gen) = scan_out.collections.get(collection_id) {
+                        out.insert(*collection_id, gen.load().index.shard_counts());
+                    }
+                }
+                out
+            }
+        };
+        for collection_id in &collection_order {
+            let counts = &counts_lookup[collection_id];
+            // Seed the home shard from the highest shard a slot references —
+            // the nearest proxy for the scan path's "shard of the last
+            // record", since slots were appended in shard-id order.
+            if let Some(&home_shard) = counts.keys().max() {
+                shards.set_collection_home(collection_id, home_shard);
+            }
+            for (&shard_id, &count) in counts {
+                let pack_id = slot_to_pack_id
+                    .get(&shard_id)
+                    .copied()
+                    .unwrap_or(u64::from(shard_id));
+                scan_out
+                    .shard_collections
+                    .entry(pack_id)
+                    .or_default()
+                    .insert(*collection_id, count);
+                scan_out
+                    .collection_shards
+                    .entry(*collection_id)
+                    .or_default()
+                    .insert(pack_id);
+            }
+        }
+        // Sidecar-pack entries were only needed for the directory; the
+        // `SlotScan` fallback derives counts straight from the indexes, and the
+        // sidecar pair is consumed above either way.
+        drop(sidecar_pack_entries);
+
+        let delta_state = DeltaState {
+            base_fingerprint: Some(checkpoint.fingerprint),
+            base_generations: ckpt_generations,
+            invalid: false,
+            ..DeltaState::default()
+        };
+
+        Some((scan_out, collection_order, delta_state))
     }
 
     fn generation(&self, collection_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
@@ -1620,6 +1793,41 @@ impl PackfileStorage {
         }
     }
 
+    /// Mark that the pending delta log can no longer be continued: a
+    /// structural change (capacity growth, full rebuild, repack, refresh, or a
+    /// collection create/delete) means replay onto the last checkpoint can't
+    /// reconstruct the new state, so the next sync must do a full checkpoint
+    /// rewrite (which re-bases the log) instead of an append.
+    fn invalidate_delta_log(&self) {
+        self.delta_state.lock().invalid = true;
+    }
+
+    /// Record a successful index mutation as a delta frame, if the delta log
+    /// can legitimately continue through it.
+    ///
+    /// Recording is suppressed whenever continuing the log is unsafe: after a
+    /// structural invalidation, or when the frame's collection isn't part of
+    /// the log's base checkpoint or has since changed shape (its live
+    /// generation no longer equals the base's). A suppressed frame simply
+    /// leaves the log unable to cover the write; the next sync notices the
+    /// gap (missing frames for some collection ⇒ base generation mismatch
+    /// recorded at checkpoint-decode time forces a full rewrite) and re-bases.
+    fn record_delta(&self, collection_id: &[u8; 16], generation: u64, bucket: u32, slot: u64) {
+        let mut state = self.delta_state.lock();
+        if state.invalid {
+            return;
+        }
+        if state.base_generations.get(collection_id) != Some(&generation) {
+            return;
+        }
+        state.pending.push(DeltaFrame {
+            collection_id: *collection_id,
+            bucket,
+            generation,
+            slot,
+        });
+    }
+
     /// Persist the full per-collection index state to `index.checkpoint`, so
     /// the next open can load it instead of rescanning every packfile.
     ///
@@ -1873,7 +2081,7 @@ impl PackfileStorage {
         index: LossyIndex,
     ) -> Result<(), StorageError> {
         let cache = self.generation(collection_id).map(|g| g.cache.clone());
-        self.store_generation(collection_id, index, cache)
+        self.store_generation(collection_id, index, cache, true)
     }
 
     /// Store a new generation for a collection, reusing the existing cache if present.
@@ -1882,16 +2090,36 @@ impl PackfileStorage {
     /// `collection_order` so that [`Self::collection_summaries`] will include it, and
     /// any prior tombstone in `deleted.collections` is cleared so the collection
     /// survives a restart.
+    ///
+    /// `bump_generation` marks a *shape* change to the index (capacity growth,
+    /// a from-scratch rebuild, repack, refresh) versus a plain COW update that
+    /// preserves the previous generation. Shape changes invalidate the pending
+    /// delta log — its frames were recorded against the old table, so they
+    /// can't be replayed onto the checkpoint's — and the next sync rewrites the
+    /// checkpoint instead of appending. Creating a brand-new collection also
+    /// invalidates the log: a log that predates the collection can't express
+    /// its records, so replaying it would silently omit every one.
     fn store_generation(
         &self,
         collection_id: &[u8; 16],
         index: LossyIndex,
         cache: Option<Arc<NodeCache>>,
+        bump_generation: bool,
     ) -> Result<(), StorageError> {
         let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
-        let new_gen = Arc::new(RoomGeneration { index, cache });
-
         let is_new = self.collections.read().get(collection_id).is_none();
+        let structural = bump_generation || is_new;
+        if structural {
+            self.invalidate_delta_log();
+        }
+        let generation = self.generation(collection_id).map_or(1, |gen| {
+            gen.generation.saturating_add(u64::from(bump_generation))
+        });
+        let new_gen = Arc::new(RoomGeneration {
+            index,
+            cache,
+            generation,
+        });
 
         // Clear a prior deletion marker before publishing the recreated
         // generation. A failure must fail the write: otherwise it appears to
@@ -1907,6 +2135,7 @@ impl PackfileStorage {
                     ArcSwap::from_pointee(RoomGeneration {
                         index: LossyIndex::new(0),
                         cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                        generation: 1,
                     })
                 })
                 .store(new_gen);
@@ -1930,6 +2159,7 @@ impl PackfileStorage {
                         ArcSwap::from_pointee(RoomGeneration {
                             index: LossyIndex::new(0),
                             cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                            generation: 1,
                         })
                     })
                     .store(new_gen);
@@ -1949,7 +2179,7 @@ impl PackfileStorage {
         self.shards.discover_shards()?;
         let new_index = self.rebuild_index(collection_id)?;
         let existing_cache = self.generation(collection_id).map(|g| g.cache.clone());
-        self.store_generation(collection_id, new_index, existing_cache)
+        self.store_generation(collection_id, new_index, existing_cache, true)
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
@@ -3473,7 +3703,7 @@ impl StorageEngine for PackfileStorage {
             (index, cache)
         };
 
-        self.store_generation(collection_id, index, Some(cache))?;
+        self.store_generation(collection_id, index, Some(cache), false);
 
         Ok(())
     }
@@ -3560,7 +3790,7 @@ impl StorageEngine for PackfileStorage {
             cache.insert(*id, Arc::new(data_to_cache));
         }
 
-        self.store_generation(collection_id, index, Some(cache))?;
+        self.store_generation(collection_id, index, Some(cache), false);
 
         Ok(())
     }
