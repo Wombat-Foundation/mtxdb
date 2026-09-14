@@ -146,6 +146,7 @@ const APPEND_RECORDS: usize = 1_000;
 /// index and therefore require a full checkpoint rewrite.
 const STEADY_APPEND_RECORDS: usize = 256;
 const STEADY_APPEND_BATCHES: usize = 3;
+const DEFAULT_BENCH_CACHE_CAPACITY: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -208,25 +209,46 @@ fn checksum_policy_from_env() -> mtxdb_core::packfile::ChecksumPolicy {
     }
 }
 
+fn cache_capacity_from_env() -> usize {
+    match std::env::var("MTXDB_BENCH_CACHE_CAPACITY") {
+        Ok(raw) => raw
+            .parse()
+            .expect("MTXDB_BENCH_CACHE_CAPACITY must be a non-negative integer"),
+        Err(std::env::VarError::NotPresent) => DEFAULT_BENCH_CACHE_CAPACITY,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("MTXDB_BENCH_CACHE_CAPACITY must be valid UTF-8")
+        }
+    }
+}
+
 fn mtxdb_open(dir: &std::path::Path) -> PackfileStorage {
     // MTXDB_BENCH_COMPRESS=0 opens the store with per-record zstd disabled, to
     // measure the raw append path against mdbx/sqlite. The bench payload is
     // seeded-incompressible anyway, so compression only pure overhead here.
     let compress_off = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0");
     let checksum = checksum_policy_from_env();
+    let cache_capacity = cache_capacity_from_env();
     // This bench syncs explicitly (sync_all after build, sync after append),
     // so it opts into the buffered append policy: frames accumulate for one
     // positioned write per ~1 MiB instead of one per record.
     let policy = mtxdb_core::shard::AppendPolicy::buffered();
-    if compress_off {
-        PackfileStorage::open_with_policies(dir.to_path_buf(), false, checksum)
-            .unwrap()
-            .with_append_policy(policy)
-    } else {
-        PackfileStorage::open_with_policies(dir.to_path_buf(), true, checksum)
-            .unwrap()
-            .with_append_policy(policy)
-    }
+    PackfileStorage::open_with_cache_and_policies(
+        dir.to_path_buf(),
+        cache_capacity,
+        !compress_off,
+        checksum,
+    )
+    .unwrap()
+    .with_append_policy(policy)
+}
+
+fn mtxdb_open_read_only(dir: &std::path::Path) -> PackfileStorage {
+    PackfileStorage::open_read_only_with_cache_and_policies(
+        dir.to_path_buf(),
+        cache_capacity_from_env(),
+        checksum_policy_from_env(),
+    )
+    .unwrap()
 }
 
 fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
@@ -274,11 +296,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // Resident index bytes, isolated from the mmap'd packfiles: sum of the
     // per-collection LossyIndex slot arrays (the checkpoint-size input).
     let (mem, mem_label) = {
-        let store = PackfileStorage::open_read_only_with_policies(
-            dir.to_path_buf(),
-            checksum_policy_from_env(),
-        )
-        .unwrap();
+        let store = mtxdb_open_read_only(dir);
         let bytes: u64 = store
             .collection_summaries()
             .iter()
@@ -291,11 +309,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
 
     // ── Warm open + sampled point lookups ──
     let started = Instant::now();
-    let store = PackfileStorage::open_read_only_with_policies(
-        dir.to_path_buf(),
-        checksum_policy_from_env(),
-    )
-    .unwrap();
+    let store = mtxdb_open_read_only(dir);
     let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
     if let Some(open) = store.open_timings() {
         eprintln!(
@@ -329,11 +343,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // ── Cold open + append ──
     let evicted = drop_caches_for_dir(dir);
     let started = Instant::now();
-    let store = PackfileStorage::open_read_only_with_policies(
-        dir.to_path_buf(),
-        checksum_policy_from_env(),
-    )
-    .unwrap();
+    let store = mtxdb_open_read_only(dir);
     let cold_open_ms = started.elapsed().as_secs_f64() * 1e3;
     drop(store);
 

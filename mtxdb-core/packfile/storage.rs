@@ -583,6 +583,31 @@ impl PackfileStorage {
         )
     }
 
+    /// Open a writable packfile storage with explicit cache, compression, and
+    /// checksum policies.
+    ///
+    /// `cache_capacity` applies independently to each collection; pass zero
+    /// to disable decoded-node caching entirely.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn open_with_cache_and_policies(
+        base_dir: PathBuf,
+        cache_capacity: usize,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(
+            base_dir,
+            cache_capacity,
+            None,
+            true,
+            None,
+            compress,
+            checksum_policy,
+        )
+    }
+
     /// Open a packfile storage with `compress` controlling whether records
     /// are zstd-attempted on write (see
     /// [`crate::packfile::write_record_with_options`]) — pass `false` for a
@@ -669,6 +694,30 @@ impl PackfileStorage {
         Self::open_with_options(
             base_dir,
             DEFAULT_CACHE_CAPACITY,
+            None,
+            false,
+            None,
+            true,
+            checksum_policy,
+        )
+    }
+
+    /// Open a read-only observer with explicit decoded-node cache and
+    /// checksum policies.
+    ///
+    /// `cache_capacity` applies independently to each collection; pass zero
+    /// to disable decoded-node caching entirely.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_read_only`].
+    pub fn open_read_only_with_cache_and_policies(
+        base_dir: PathBuf,
+        cache_capacity: usize,
+        checksum_policy: packfile::ChecksumPolicy,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(
+            base_dir,
+            cache_capacity,
             None,
             false,
             None,
