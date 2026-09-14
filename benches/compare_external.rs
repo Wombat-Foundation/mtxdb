@@ -342,10 +342,11 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     let rss_pss_warm = smaps_rollup();
     drop(store);
 
-    // ── Cold open + append ──
-    // Delete the valid checkpoint so this measures the documented full-scan
-    // path rather than a cold checkpoint open.
-    std::fs::remove_file(dir.join(mtxdb_core::index::checkpoint::INDEX_CHECKPOINT_FILE)).unwrap();
+    // ── Cold checkpoint open + append ──
+    // This deliberately measures reopening the persisted index after page
+    // eviction, which is comparable to MDBX/SQLite reopening their persisted
+    // B-trees. A checkpoint-free mtxdb index rebuild is a distinct diagnostic,
+    // not an apples-to-apples external-engine metric.
     let evicted = drop_caches_for_dir(dir);
     let started = Instant::now();
     let store = mtxdb_open_read_only(dir);

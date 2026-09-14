@@ -26,7 +26,7 @@ LATEST = CSV_DIR / "latest-external.txt"
 METRICS = [
     ("write_ms", "bulk write (ms)"),
     ("warm_open_ms", "warm open (ms)"),
-    ("cold_open_ms", "cold open (ms)"),
+    ("cold_open_ms", "cold checkpoint (ms)"),
     ("lookup_us", "point lookup (μs)"),
     ("append_ms", "grow append (ms)"),
     ("append_sync_ms", "grow sync (ms)"),
