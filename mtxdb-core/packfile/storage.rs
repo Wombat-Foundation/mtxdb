@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -289,6 +289,15 @@ pub struct PackfileStorage {
     /// Wall-clock instant of the last `maybe_persist_shard_collections` flush,
     /// used to rate-limit that timer-driven path.
     last_shard_collections_flush: RwLock<Option<std::time::Instant>>,
+    /// Whether any collection data changed since the last `index.checkpoint`
+    /// write. Set by every generation swap (`put`/`put_many`/`repack`/`refresh`);
+    /// cleared only by a successful [`Self::persist_index_checkpoint`], so a
+    /// failed write is retried on the next sync. Lets `sync()`/`sync_all()`
+    /// skip rewriting the checkpoint when nothing has changed since the last
+    /// one — a steady-state writer that syncs between writes pays no checkpoint
+    /// cost, while a crash left a stale checkpoint is still always resolved by
+    /// the fingerprint → rescan fallback.
+    index_checkpoint_dirty: AtomicBool,
 }
 
 /// Per-collection state for incremental repack.
@@ -439,15 +448,38 @@ impl PackfileStorage {
         let mut collection_order = persisted_collection_order(&base_dir).unwrap_or_default();
         let mut known_collections: HashSet<[u8; 16]> = collection_order.iter().copied().collect();
 
-        // Collect open shard info (slot, pack_id, path) before the scan loop so we
-        // don't hold the shards read-lock across the I/O-heavy scan.
-        let open_shards: Vec<(u16, u64, PathBuf)> = shards
+        // Collect open shard info (slot, pack_id, path, length) before the scan
+        // loop so we don't hold the shards read-lock across the I/O-heavy scan.
+        // The lengths feed the checkpoint fingerprint (see `index::checkpoint`).
+        let open_shards: Vec<(u16, u64, PathBuf, u64)> = shards
             .all_shards()
             .into_iter()
-            .map(|(id, shard)| (id, shard.pack_id, shard.path.clone()))
+            .map(|(id, shard)| (id, shard.pack_id, shard.path.clone(), shard.file_len()))
             .collect();
 
-        for (shard_id, shard_pack_id, path) in open_shards {
+        // A checkpoint from the previous session's last sync lets us skip the
+        // rescan and index rebuild entirely. It is only trusted when every
+        // pack on disk still matches the fingerprint it was written against.
+        let deleted_collections = Self::load_deleted_collections(&base_dir);
+        if let Some((scan_out, collection_order)) = Self::checkpoint_scan_out(
+            &base_dir,
+            cache_capacity,
+            &shards,
+            &open_shards,
+            &deleted_collections,
+        ) {
+            return Ok(Self::assemble(
+                shards,
+                scan_out,
+                collection_order,
+                deleted_collections,
+                base_dir,
+                swizzle,
+                cache_capacity,
+            ));
+        }
+
+        for (shard_id, shard_pack_id, path, _file_len) in open_shards {
             // A read-only open must never touch the file at all — the
             // truncating recovery scan below is only safe when we're the
             // sole writer (guaranteed by the writer lock); a read-only
@@ -492,9 +524,6 @@ impl PackfileStorage {
         }
         collection_order.retain(|collection_id| collection_entries.contains_key(collection_id));
 
-        // P1: load deleted collections set (persisted to disk)
-        let deleted_collections = Self::load_deleted_collections(&base_dir);
-
         let mut scan_out = RoomScanOutput::default();
 
         // Phase 2: build per-collection indexes sized to the true total.
@@ -511,27 +540,15 @@ impl PackfileStorage {
             )?;
         }
 
-        Ok(Self {
+        Ok(Self::assemble(
             shards,
-            collections: RwLock::new(scan_out.collections),
-            collection_order: RwLock::new(collection_order),
-            pinned: PinnedNodes::new(),
+            scan_out,
+            collection_order,
+            deleted_collections,
             base_dir,
             swizzle,
-            put_locks: parking_lot::Mutex::new(HashMap::new()),
-            deleted_collections: parking_lot::Mutex::new(deleted_collections),
-            live_roots: RwLock::new(HashMap::new()),
-            repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
-            repack_count: AtomicU64::new(0),
-            repack_kept_total: AtomicU64::new(0),
-            repack_dropped_total: AtomicU64::new(0),
-            repack_counts_by_collection: RwLock::new(HashMap::new()),
-            repack_incremental: RwLock::new(HashMap::new()),
-            shard_collections: RwLock::new(scan_out.shard_collections),
-            collection_shards: RwLock::new(scan_out.collection_shards),
-            last_shard_collections_flush: RwLock::new(None),
-        })
+        ))
     }
 
     /// Builds one collection's index, cache, and shard-directory contribution
@@ -591,6 +608,127 @@ impl PackfileStorage {
             }),
         );
         Ok(())
+    }
+
+    /// Assemble a fully constructed store from the per-collection state both
+    /// the rescan path and the checkpoint fast path produce, so the two share
+    /// one field-for-field constructor.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        shards: ShardPool,
+        scan_out: RoomScanOutput,
+        collection_order: Vec<[u8; 16]>,
+        deleted_collections: HashSet<[u8; 16]>,
+        base_dir: PathBuf,
+        swizzle: Option<SwizzleFn>,
+        cache_capacity: usize,
+    ) -> Self {
+        Self {
+            shards,
+            collections: RwLock::new(scan_out.collections),
+            collection_order: RwLock::new(collection_order),
+            pinned: PinnedNodes::new(),
+            base_dir,
+            swizzle,
+            put_locks: parking_lot::Mutex::new(HashMap::new()),
+            deleted_collections: parking_lot::Mutex::new(deleted_collections),
+            live_roots: RwLock::new(HashMap::new()),
+            repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
+            cache_capacity,
+            repack_count: AtomicU64::new(0),
+            repack_kept_total: AtomicU64::new(0),
+            repack_dropped_total: AtomicU64::new(0),
+            repack_counts_by_collection: RwLock::new(HashMap::new()),
+            repack_incremental: RwLock::new(HashMap::new()),
+            shard_collections: RwLock::new(scan_out.shard_collections),
+            collection_shards: RwLock::new(scan_out.collection_shards),
+            last_shard_collections_flush: RwLock::new(None),
+            index_checkpoint_dirty: AtomicBool::new(false),
+        }
+    }
+
+    /// Path of this store's persisted-index checkpoint.
+    fn index_checkpoint_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE)
+    }
+
+    /// Fast-path index loading for `open_with_options`: build the
+    /// per-collection state directly from the persisted-index checkpoint
+    /// instead of rescanning every packfile.
+    ///
+    /// Returns `None` — falling through to the full rescan — for a missing,
+    /// malformed, or stale checkpoint, or one that doesn't describe the pack
+    /// set currently on disk. The fast path deliberately skips the torn-tail
+    /// recovery scan, which is safe: a fingerprint match means the packs are
+    /// the exact state the previous session's last sync fsynced, so there can
+    /// be no torn tail to recover.
+    fn checkpoint_scan_out(
+        base_dir: &std::path::Path,
+        cache_capacity: usize,
+        shards: &ShardPool,
+        open_shards: &[(u16, u64, PathBuf, u64)],
+        deleted_collections: &HashSet<[u8; 16]>,
+    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>)> {
+        let checkpoint =
+            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir))?;
+        let packs: Vec<(u64, u64)> = open_shards
+            .iter()
+            .map(|(_, pack_id, _, file_len)| (*pack_id, *file_len))
+            .collect();
+        if checkpoint.fingerprint != crate::index::checkpoint::pack_fingerprint(&packs) {
+            return None;
+        }
+
+        let slot_to_pack_id: HashMap<u16, u64> = open_shards
+            .iter()
+            .map(|(slot, pack_id, _, _)| (*slot, *pack_id))
+            .collect();
+
+        let mut scan_out = RoomScanOutput::default();
+        let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
+        for loaded in &checkpoint.collections {
+            if deleted_collections.contains(&loaded.collection_id) {
+                // The checkpoint may predate the deletion marker; the
+                // logical-delete set is authoritative.
+                continue;
+            }
+            // Malformed slots mean the checkpoint can't be trusted; rescan is
+            // the only faithful path.
+            let index = LossyIndex::deserialize(&loaded.blob).ok()?;
+            let counts = index.shard_counts();
+            // Seed the home shard from the highest shard a slot references —
+            // the nearest proxy for the scan path's "shard of the last
+            // record", since slots were appended in shard-id order.
+            if let Some(&home_shard) = counts.keys().max() {
+                shards.set_collection_home(&loaded.collection_id, home_shard);
+            }
+            for (&shard_id, &count) in &counts {
+                let pack_id = slot_to_pack_id
+                    .get(&shard_id)
+                    .copied()
+                    .unwrap_or(u64::from(shard_id));
+                scan_out
+                    .shard_collections
+                    .entry(pack_id)
+                    .or_default()
+                    .insert(loaded.collection_id, count);
+                scan_out
+                    .collection_shards
+                    .entry(loaded.collection_id)
+                    .or_default()
+                    .insert(pack_id);
+            }
+            scan_out.collections.insert(
+                loaded.collection_id,
+                ArcSwap::from_pointee(RoomGeneration {
+                    index,
+                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                }),
+            );
+            collection_order.push(loaded.collection_id);
+        }
+
+        Some((scan_out, collection_order))
     }
 
     fn generation(&self, collection_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
@@ -1050,6 +1188,66 @@ impl PackfileStorage {
         }
     }
 
+    /// Persist the full per-collection index state to `index.checkpoint`, so
+    /// the next open can load it instead of rescanning every packfile.
+    ///
+    /// Called after every sync barrier — packfile data first, checkpoint
+    /// second. A crash in between leaves a fingerprint mismatch that the next
+    /// open resolves with a rescan; a crash after leaves a valid checkpoint.
+    ///
+    /// Cheap no-op when no collection data has changed since the last write
+    /// (`index_checkpoint_dirty` cleared on success), so a writer that syncs
+    /// repeatedly without writes doesn't rewrite the acceleration file. The
+    /// flag is only cleared after a successful write, so a transient failure
+    /// defers rather than drops the update.
+    fn persist_index_checkpoint(&self) -> Result<(), StorageError> {
+        if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let packs: Vec<(u64, u64)> = self
+            .shards
+            .all_shards()
+            .into_iter()
+            .map(|(_, shard)| (shard.pack_id, shard.file_len()))
+            .collect();
+        let fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
+
+        let order = self.collection_order.read().clone();
+        let collections = self.collections.read();
+        let mut entries: Vec<([u8; 16], Vec<u8>)> = Vec::with_capacity(order.len());
+        for collection_id in &order {
+            let Some(generation) = collections
+                .get(collection_id)
+                .map(arc_swap::ArcSwapAny::load)
+            else {
+                continue;
+            };
+            entries.push((*collection_id, generation.index.serialize()));
+        }
+        let blobs: Vec<([u8; 16], &[u8])> = entries
+            .iter()
+            .map(|(collection_id, blob)| (*collection_id, blob.as_slice()))
+            .collect();
+        crate::index::checkpoint::write_checkpoint(
+            &Self::index_checkpoint_path(&self.base_dir),
+            fingerprint,
+            &blobs,
+        )
+        .map_err(StorageError::Io)?;
+        self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Best-effort wrapper around [`Self::persist_index_checkpoint`] — logs
+    /// and swallows a failure rather than turning it into a hard error. The
+    /// checkpoint is an acceleration structure; packfiles remain
+    /// authoritative, so a failed persist only costs the next open a rescan.
+    fn persist_index_checkpoint_best_effort(&self) {
+        if let Err(e) = self.persist_index_checkpoint() {
+            eprintln!("mtxdb: failed to persist index checkpoint: {e}");
+        }
+    }
+
     /// Reads a persisted shard→collection directory directly off disk, with no
     /// `ShardPool`/`PackfileStorage` construction at all — the fast path
     /// for a `collections`-style CLI listing. Returns each collection's total record
@@ -1286,6 +1484,7 @@ impl PackfileStorage {
                     .store(new_gen);
             }
         }
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
     /// Forces a re-scan of a collection's shards from disk and atomically swaps in the new index.
@@ -2851,7 +3050,9 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn sync(&self) -> Result<(), StorageError> {
-        Ok(self.shards.sync_dirty()?)
+        self.shards.sync_dirty()?;
+        self.persist_index_checkpoint_best_effort();
+        Ok(())
     }
 
     fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -2871,6 +3072,7 @@ impl PackfileStorage {
     pub fn sync_all(&self) -> Result<(), StorageError> {
         self.shards.sync_all()?;
         self.persist_shard_collections_best_effort();
+        self.persist_index_checkpoint_best_effort();
         Ok(())
     }
 

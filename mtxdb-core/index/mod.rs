@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod format;
 
 /// Per-slot entry in the lossy fanout index.
