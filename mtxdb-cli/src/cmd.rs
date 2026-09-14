@@ -502,12 +502,12 @@ fn cmd_collections_in_dir(
     });
     if layout {
         println!(
-            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
             "slot", "collection", "nodes", "packs", "disk", "runs", "largest", "avoidable"
         );
     } else {
         println!(
-            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
+            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
             "slot", "collection", "nodes", "shards", "index", "disk"
         );
     }
@@ -550,14 +550,14 @@ fn cmd_collections_in_dir(
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
             let avoidable = avoidable_spread_bytes(stats);
             println!(
-                "  {i:>4}  0x{hex}  {nodes:>7}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
+                "  {i:>5}  0x{hex}  {nodes:>7}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
                 fmt_disk_megabytes(disk),
                 fmt_bytes(largest),
                 fmt_bytes(avoidable)
             );
         } else {
             println!(
-                "  {i:>4}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
+                "  {i:>5}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
                 fmt_index_kilobytes(*memory),
                 fmt_disk_megabytes(disk),
             );
@@ -566,7 +566,7 @@ fn cmd_collections_in_dir(
     println!();
     if layout {
         println!(
-            "  {:>4}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
             "",
             "total",
             total_nodes,
@@ -578,7 +578,7 @@ fn cmd_collections_in_dir(
         );
     } else {
         println!(
-            "  {:>4}  {:<34}  {total_nodes:>7}  {:>6}  {:>12}  {:>13}",
+            "  {:>5}  {:<34}  {total_nodes:>7}  {:>6}  {:>12}  {:>13}",
             "",
             "total",
             "",
