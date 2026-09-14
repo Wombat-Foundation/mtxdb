@@ -778,12 +778,19 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
     let total_collections = collection_counts
         .as_ref()
         .map(|_| PackfileStorage::collection_directory_from_disk(dir).len());
+    let index_requirement =
+        PackfileStorage::collection_summaries_from_disk(dir).and_then(|summaries| {
+            summaries
+                .into_iter()
+                .try_fold(0_usize, |total, (_, _, memory)| total.checked_add(memory))
+        });
     print_shard_table(
         &shard_entries,
         &stats_map,
         node_counts.as_ref(),
         collection_counts.as_ref(),
         total_collections,
+        index_requirement,
     );
     if let Some(physical) = physical {
         print_pack_physical_layout(&shard_entries, &physical);
@@ -903,14 +910,15 @@ fn print_shard_table(
     node_counts: Option<&std::collections::HashMap<u64, u64>>,
     collection_counts: Option<&std::collections::HashMap<u64, u64>>,
     total_collections: Option<usize>,
+    index_requirement: Option<usize>,
 ) {
     // `ShardPool::open_internal` restores the newest pack as its append
     // destination. Mirror that recovery rule here without opening a writer.
     let active_pack_id = shard_entries.iter().map(|(pack_id, _, _)| *pack_id).max();
 
     println!(
-        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
-        "pack id", "ver", "bytes", "nodes", "collections", "syncs",
+        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+        "pack id", "ver", "bytes", "nodes", "collections", "index req", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
@@ -924,7 +932,7 @@ fn print_shard_table(
             .and_then(|counts| counts.get(&pack_id))
             .map_or_else(|| "?".to_owned(), u64::to_string);
         println!(
-            "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
+            "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
             format!(
                 "0x{pack_id:016x}{}",
                 if active_pack_id == Some(pack_id) {
@@ -937,6 +945,7 @@ fn print_shard_table(
             fmt_bytes(file_bytes),
             nodes,
             collections,
+            "",
             sc,
         );
         total_bytes = total_bytes.saturating_add(file_bytes);
@@ -947,12 +956,13 @@ fn print_shard_table(
     }
     println!();
     println!(
-        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>6}",
+        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
         "total",
         "",
         fmt_bytes(total_bytes),
         total_nodes.map_or_else(|| "?".to_owned(), |count| count.to_string()),
         total_collections.map_or_else(|| "?".to_owned(), |count| count.to_string()),
+        index_requirement.map_or_else(|| "?".to_owned(), fmt_megabytes),
         total_syncs,
     );
 }
