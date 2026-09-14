@@ -668,7 +668,7 @@ impl PackfileStorage {
         if let Some(&(last_shard_id, _, _, _)) = records.last() {
             shards.set_collection_home(collection_id, last_shard_id);
         }
-        let mut index = LossyIndex::new(records.len().saturating_mul(2).max(16));
+        let index = LossyIndex::new(records.len().saturating_mul(2).max(16));
         for (shard_id, hash, offset, _pack_id) in records {
             check_index_offset(*shard_id, hash, *offset)?;
             let _ = index.insert(hash, *shard_id, *offset);
@@ -1049,7 +1049,7 @@ impl PackfileStorage {
     }
 
     fn build_index(offsets: &[([u8; 16], u16, u64)]) -> Result<LossyIndex, StorageError> {
-        let mut index = LossyIndex::new(offsets.len().saturating_mul(2).max(16));
+        let index = LossyIndex::new(offsets.len().saturating_mul(2).max(16));
         for (hash, shard_id, offset) in offsets {
             check_index_offset(*shard_id, hash, *offset)?;
             let _ = index.insert(hash, *shard_id, *offset);
@@ -1599,7 +1599,7 @@ impl PackfileStorage {
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
         let scanned = self.scan_collection_records(collection_id)?;
         let total: usize = scanned.iter().map(|(_, e)| e.len()).sum();
-        let mut index = LossyIndex::new(total.saturating_mul(2).max(16));
+        let index = LossyIndex::new(total.saturating_mul(2).max(16));
         for (shard_id, entries) in scanned {
             for (hash, offset) in entries {
                 // `IndexSlot` can only represent offsets up to
@@ -2984,6 +2984,27 @@ impl StorageEngine for PackfileStorage {
             data: data.bytes.clone(),
         };
         let (shard_id, offset) = self.shards.put_record(&record)?;
+        if let Some(gen) = self.generation(collection_id) {
+            if gen.index.insert(id, shard_id, offset).is_ok() {
+                let pack_id = self
+                    .shards
+                    .get_shard(shard_id)
+                    .map_or(u64::from(shard_id), |shard| shard.pack_id);
+                self.record_new_shard_collection(pack_id, collection_id);
+
+                let mut data_to_cache = data.clone();
+                for child in &mut data_to_cache.children {
+                    if let NodeRef::Lazy(child_id) = child {
+                        if let Some(child_data) = self.pinned.get(child_id) {
+                            *child = NodeRef::Resolved(*child_id, child_data);
+                        }
+                    }
+                }
+                gen.cache.insert(*id, Arc::new(data_to_cache));
+                self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
         let (index, cache) = {
             let old_gen = self.generation(collection_id);
             let mut index = match &old_gen {
@@ -2992,11 +3013,12 @@ impl StorageEngine for PackfileStorage {
             };
             let index_full = index.insert(id, shard_id, offset).is_err();
             if index_full {
-                if index.grow() {
+                if let Some(grown) = index.grow() {
                     // The failed insert did not mutate the table, so retry it
                     // after the in-memory rehash. This is the normal capacity
                     // path and must not turn into a full-pack scan.
-                    let _ = index.insert(id, shard_id, offset);
+                    let _ = grown.insert(id, shard_id, offset);
+                    index = grown;
                 } else {
                     index = self.rebuild_index(collection_id)?;
                     let _ = index.insert(id, shard_id, offset);
@@ -3074,11 +3096,13 @@ impl StorageEngine for PackfileStorage {
             if !index_needs_rebuild {
                 let inserted = if index.insert(id, shard_id, offset).is_ok() {
                     true
-                } else if index.grow() {
+                } else if let Some(grown) = index.grow() {
                     // `insert` leaves the table unchanged on TableFull, so
                     // retrying with the record's still-available location is
                     // sufficient; no pack scan is needed for pure growth.
-                    index.insert(id, shard_id, offset).is_ok()
+                    let inserted = grown.insert(id, shard_id, offset).is_ok();
+                    index = grown;
+                    inserted
                 } else {
                     index_needs_rebuild = true;
                     false

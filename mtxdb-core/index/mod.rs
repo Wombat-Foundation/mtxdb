@@ -91,7 +91,7 @@ impl IndexSlot {
 /// - Empty slot terminates probe (write-once, no tombstones needed).
 /// - Tag collisions surface as verification failures (`decode_v1_verified`).
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LossyIndex {
     /// Power-of-two capacity.
     capacity: u32,
@@ -100,17 +100,35 @@ pub struct LossyIndex {
     /// Shift to extract top bits from hash for bucket index.
     shift: u32,
     /// The flat slot array.
-    slots: Vec<IndexSlot>,
+    slots: Vec<AtomicU64>,
     /// The first 64 bits of each slot's hash. Index slots intentionally pack
     /// only a tag, shard, and offset; retaining the home hash separately lets
     /// a live writer grow the table without rescanning the packfiles.
-    homes: Vec<u64>,
+    homes: Mutex<Vec<u64>>,
     /// `deserialize` restores slots without their source hashes. Such an
     /// index remains readable, but must be rebuilt from packfiles if it ever
     /// needs to grow.
     can_grow: bool,
     /// Number of occupied slots.
-    len: u32,
+    len: AtomicU32,
+}
+
+impl Clone for LossyIndex {
+    fn clone(&self) -> Self {
+        Self {
+            capacity: self.capacity,
+            mask: self.mask,
+            shift: self.shift,
+            slots: self
+                .slots
+                .iter()
+                .map(|slot| AtomicU64::new(slot.load(Ordering::Acquire)))
+                .collect(),
+            homes: Mutex::new(self.homes.lock().clone()),
+            can_grow: self.can_grow,
+            len: AtomicU32::new(self.len.load(Ordering::Acquire)),
+        }
+    }
 }
 
 /// The slot plus its retained home-hash used by a live index generation.
@@ -131,10 +149,10 @@ impl LossyIndex {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
-            slots: vec![IndexSlot::empty(); capacity_usize],
-            homes: vec![0; capacity_usize],
+            slots: (0..capacity_usize).map(|_| AtomicU64::new(0)).collect(),
+            homes: Mutex::new(vec![0; capacity_usize]),
             can_grow: true,
-            len: 0,
+            len: AtomicU32::new(0),
         }
     }
 
@@ -171,12 +189,7 @@ impl LossyIndex {
     /// # Errors
     /// Returns `InsertError::TableFull` if the table has less than 25% free slots
     /// and the hash is not already present (overwrites are always allowed).
-    pub fn insert(
-        &mut self,
-        hash: &[u8; 16],
-        shard_id: u16,
-        offset: u64,
-    ) -> Result<(), InsertError> {
+    pub fn insert(&self, hash: &[u8; 16], shard_id: u16, offset: u64) -> Result<(), InsertError> {
         let tag = Self::tag(hash);
         let home = u64::from_be_bytes([
             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
@@ -184,23 +197,28 @@ impl LossyIndex {
         let mut bucket = self.bucket_for_home(home);
 
         loop {
-            let slot = self.slots[bucket];
+            let slot = IndexSlot(self.slots[bucket].load(Ordering::Acquire));
             if slot.is_empty() {
                 // Only reject when actually inserting into a new slot
                 let threshold = self.capacity.wrapping_mul(3) / 4;
-                if self.len >= threshold {
+                if self.len.load(Ordering::Relaxed) >= threshold {
                     return Err(InsertError::TableFull);
                 }
-                self.slots[bucket] = IndexSlot::new(tag, shard_id, offset);
-                self.homes[bucket] = home;
-                self.len = self.len.wrapping_add(1);
+                // Writers are serialized by the collection put lock. Publish
+                // the slot last so concurrent readers see either the prior
+                // empty slot or a complete record location.
+                self.homes.lock()[bucket] = home;
+                self.slots[bucket]
+                    .store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
+                self.len.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
             // If same tag already exists at this bucket, overwrite
             // (same hash, different offset after repack)
             if slot.tag() == tag {
-                self.slots[bucket] = IndexSlot::new(tag, shard_id, offset);
-                self.homes[bucket] = home;
+                self.homes.lock()[bucket] = home;
+                self.slots[bucket]
+                    .store(IndexSlot::new(tag, shard_id, offset).0, Ordering::Release);
                 return Ok(());
             }
             bucket = bucket.wrapping_add(1) & self.mask as usize;
@@ -213,25 +231,26 @@ impl LossyIndex {
     /// representation, whose original hashes are unavailable for rehashing.
     /// Callers should retain their existing packfile rebuild fallback in that
     /// case.
-    pub fn grow(&mut self) -> bool {
+    pub fn grow(&self) -> Option<Self> {
         if !self.can_grow || self.capacity > u32::MAX / 2 {
-            return false;
+            return None;
         }
-        let mut grown = Self::new(self.capacity as usize * 2);
-        for (slot, home) in self.slots.iter().copied().zip(self.homes.iter().copied()) {
+        let grown = Self::new(self.capacity as usize * 2);
+        let homes = self.homes.lock();
+        for (slot, home) in self.slots.iter().zip(homes.iter().copied()) {
+            let slot = IndexSlot(slot.load(Ordering::Acquire));
             if slot.is_empty() {
                 continue;
             }
             let mut bucket = grown.bucket_for_home(home);
-            while !grown.slots[bucket].is_empty() {
+            while !IndexSlot(grown.slots[bucket].load(Ordering::Relaxed)).is_empty() {
                 bucket = bucket.wrapping_add(1) & grown.mask as usize;
             }
-            grown.slots[bucket] = slot;
-            grown.homes[bucket] = home;
-            grown.len = grown.len.wrapping_add(1);
+            grown.homes.lock()[bucket] = home;
+            grown.slots[bucket].store(slot.0, Ordering::Relaxed);
+            grown.len.fetch_add(1, Ordering::Relaxed);
         }
-        *self = grown;
-        true
+        Some(grown)
     }
 
     /// Look up a hash in the index.
@@ -271,13 +290,13 @@ impl LossyIndex {
     /// Number of occupied slots.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.len as usize
+        self.len.load(Ordering::Acquire) as usize
     }
 
     /// Whether the index is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len.load(Ordering::Acquire) == 0
     }
 
     /// Estimated memory usage in bytes.
@@ -307,6 +326,7 @@ impl LossyIndex {
     pub fn referenced_shard_ids(&self) -> [bool; crate::shard::MAX_SHARDS] {
         let mut seen = [false; crate::shard::MAX_SHARDS];
         for slot in &self.slots {
+            let slot = IndexSlot(slot.load(Ordering::Acquire));
             if !slot.is_empty() {
                 let id = slot.shard_id() as usize;
                 if id < crate::shard::MAX_SHARDS {
@@ -328,6 +348,7 @@ impl LossyIndex {
     pub fn shard_counts(&self) -> std::collections::HashMap<u16, u64> {
         let mut counts = std::collections::HashMap::new();
         for slot in &self.slots {
+            let slot = IndexSlot(slot.load(Ordering::Acquire));
             if !slot.is_empty() {
                 let entry = counts.entry(slot.shard_id()).or_insert(0u64);
                 *entry = entry.saturating_add(1);
@@ -345,9 +366,10 @@ impl LossyIndex {
     /// past it.
     #[must_use]
     pub fn references_shard(&self, shard_id: u16) -> bool {
-        self.slots
-            .iter()
-            .any(|slot| !slot.is_empty() && slot.shard_id() == shard_id)
+        self.slots.iter().any(|slot| {
+            let slot = IndexSlot(slot.load(Ordering::Acquire));
+            !slot.is_empty() && slot.shard_id() == shard_id
+        })
     }
 
     /// Serialize the index to bytes for persistence.
@@ -357,6 +379,7 @@ impl LossyIndex {
         let mut buf = Vec::with_capacity(byte_len);
         buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
         for slot in &self.slots {
+            let slot = IndexSlot(slot.load(Ordering::Acquire));
             buf.extend_from_slice(&slot.0.to_le_bytes());
         }
         buf
@@ -398,7 +421,7 @@ impl LossyIndex {
             if !slot.is_empty() {
                 len = len.wrapping_add(1);
             }
-            slots.push(slot);
+            slots.push(AtomicU64::new(slot.0));
         }
 
         let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
@@ -408,9 +431,9 @@ impl LossyIndex {
             capacity,
             shift,
             slots,
-            homes: vec![0; capacity_usize],
+            homes: Mutex::new(vec![0; capacity_usize]),
             can_grow: false,
-            len,
+            len: AtomicU32::new(len),
         })
     }
 }
@@ -460,7 +483,7 @@ impl std::error::Error for DeserializationError {}
 /// Yields `(shard_id, offset)` for each slot whose 24-bit tag matches,
 /// terminating at the first empty slot or after the full capacity is probed.
 pub struct LookupIter<'a> {
-    slots: &'a [IndexSlot],
+    slots: &'a [AtomicU64],
     tag: u32,
     bucket: usize,
     mask: usize,
@@ -474,7 +497,7 @@ impl Iterator for LookupIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.remaining > 0 {
             self.remaining = self.remaining.wrapping_sub(1);
-            let slot = self.slots[self.bucket];
+            let slot = IndexSlot(self.slots[self.bucket].load(Ordering::Acquire));
             if slot.is_empty() {
                 return None;
             }
@@ -587,12 +610,12 @@ mod tests {
 
     #[test]
     fn test_grow_preserves_existing_lookups() {
-        let mut index = LossyIndex::new(16);
+        let index = LossyIndex::new(16);
         let hashes: Vec<_> = (0..12).map(splitmix_hash).collect();
         for (offset, hash) in hashes.iter().enumerate() {
             index.insert(hash, 0, offset as u64).unwrap();
         }
-        assert!(index.grow());
+        let index = index.grow().expect("live index can grow");
         assert_eq!(index.len(), hashes.len());
         for (offset, hash) in hashes.iter().enumerate() {
             assert_eq!(index.lookup(hash), Some((0, offset as u64)));
@@ -756,3 +779,5 @@ mod tests {
         assert_eq!(restored.lookup(&query), None);
     }
 }
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
