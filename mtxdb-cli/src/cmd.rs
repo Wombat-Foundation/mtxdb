@@ -1031,6 +1031,46 @@ fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     cmd_info_collection(cli, selector)
 }
 
+/// Print a pack's age (header `created_at`) and how long it stayed the
+/// active append target (span to its file's last-modified time), from the
+/// same header `mtxdb shards` already validates when discovering packs.
+fn print_pack_lifetime(path: &Path) {
+    let created_at = fs::File::open(path).ok().and_then(|file| {
+        mtxdb_core::packfile::read_header(&mut BufReader::new(file))
+            .ok()
+            .flatten()
+            .map(|header| header.created_at)
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let modified = fs::metadata(path).ok().and_then(|metadata| {
+        metadata.modified().ok().and_then(|modified| {
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        })
+    });
+    match (created_at, modified) {
+        (Some(created_at), Some(modified)) => {
+            println!(
+                "created: {} ago, last write: {} ago (active {} span)",
+                fmt_duration(now.saturating_sub(created_at)),
+                fmt_duration(now.saturating_sub(modified)),
+                fmt_duration(modified.saturating_sub(created_at))
+            );
+        }
+        (Some(created_at), None) => {
+            println!(
+                "created: {} ago",
+                fmt_duration(now.saturating_sub(created_at))
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Print the same per-pack summary row `mtxdb shards` would, for one pack ID.
 fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let pack_id = parse_pack_id_selector(selector)?;
@@ -1064,16 +1104,27 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     );
 
     println!();
-    println!(
-        "path: {}",
-        dir.join(format!("pack_{pack_id:016x}.pack")).display()
-    );
+    println!("type: {}", cli.shard_type.as_str());
+    println!("generation: {pack_id} (0x{pack_id:016x})");
+    let path = dir.join(format!("pack_{pack_id:016x}.pack"));
+    println!("path: {}", path.display());
+
+    print_pack_lifetime(&path);
+
     let (write_count, bytes_written, sync_count) =
         stats_map.get(&pack_id).copied().unwrap_or_default();
     println!(
         "writes: {write_count} ({} written), {sync_count} sync{}",
         fmt_bytes(bytes_written),
         if sync_count == 1 { "" } else { "s" }
+    );
+    println!(
+        "collections: {}",
+        collection_counts
+            .as_ref()
+            .and_then(|counts| counts.get(&pack_id))
+            .copied()
+            .unwrap_or(0)
     );
 
     let collection_shards = PackfileStorage::collection_shards_from_disk(&dir);
@@ -1085,25 +1136,31 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
             println!();
             println!("{:>34}  {:>10}", "collection", "bytes");
             for collection_id in collections {
-                let bytes = physical
-                    .collections
-                    .get(&collection_id)
+                let collection_layout = physical.collections.get(&collection_id);
+                let bytes = collection_layout
                     .and_then(|layout| layout.pack_bytes.get(&pack_id))
                     .copied()
                     .unwrap_or(0);
-                let spans_other_packs = collection_shards
+                let other_packs = collection_shards
                     .as_ref()
                     .and_then(|shards| shards.get(&collection_id))
-                    .is_some_and(|shards| shards.len() > 1);
+                    .map_or(0, |shards| shards.len().saturating_sub(1));
+                let note = if other_packs > 0 {
+                    let spread = collection_layout
+                        .map_or(0, CollectionPhysicalLayout::avoidable_spread_bytes);
+                    format!(
+                        "(also in {other_packs} other pack{}, {} avoidably spread)",
+                        if other_packs == 1 { "" } else { "s" },
+                        fmt_bytes(spread)
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
                     "{:>34}  {:>10}  {}",
                     hex_encode(&collection_id),
                     fmt_bytes(bytes),
-                    if spans_other_packs {
-                        "(spans other packs)"
-                    } else {
-                        ""
-                    }
+                    note
                 );
             }
         }
