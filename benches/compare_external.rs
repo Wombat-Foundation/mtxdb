@@ -909,6 +909,6 @@ fn main() {
 
     eprintln!();
     eprintln!("Interpretation (see DESIGN-open-and-index-persistence.md §1.2):");
-    eprintln!("  cold open is where mtxdb's full-scan index rebuild shows up; lookups");
-    eprintln!("  are where the resident LossyIndex should beat the B+tree walkers.");
+    eprintln!("  cold checkpoint open measures a persisted-index reopen after page-cache");
+    eprintln!("  eviction; lookups are where the resident LossyIndex should beat B+tree walkers.");
 }
