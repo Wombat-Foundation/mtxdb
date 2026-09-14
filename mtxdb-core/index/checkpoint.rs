@@ -51,6 +51,38 @@ pub const CHECKPOINT_VERSION: u32 = 2;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 
+/// Whether an opener verifies the checkpoint body's CRC32.
+///
+/// This policy is intentionally independent from [`crate::packfile::ChecksumPolicy`]:
+/// frame checksums, delta-log checksums, and checkpoint integrity protect
+/// different on-disk structures and must not be disabled together by accident.
+/// `WriteOnly` retains the CRC when writing a checkpoint for offline/recovery
+/// tooling, but trusts it during normal opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointChecksumPolicy {
+    /// Verify the persisted checkpoint CRC32 at every open (the default).
+    Full,
+    /// Retain the CRC32 on write but skip its read-time verification.
+    WriteOnly,
+}
+
+impl CheckpointChecksumPolicy {
+    /// Select the process-wide checkpoint policy from `MTXDB_CHECKPOINT_CHECKSUM`.
+    /// Unknown values intentionally retain the safe default.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("MTXDB_CHECKPOINT_CHECKSUM").as_deref() {
+            Ok("writeonly") => Self::WriteOnly,
+            Ok("full" | _) | Err(_) => Self::Full,
+        }
+    }
+
+    #[must_use]
+    fn verifies_reads(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// Disambiguates concurrent checkpoint tmp filenames within this process,
 /// paired with the process id for uniqueness across processes — same pattern
 /// as `SHARD_ROOMS_TMP_COUNTER` / `shard::STATS_TMP_COUNTER`.
@@ -235,6 +267,16 @@ pub fn write_checkpoint(
 /// checkpoint", and the caller falls back to rebuilding from the packs.
 #[must_use]
 pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
+    read_checkpoint_with_policy(path, CheckpointChecksumPolicy::from_env())
+}
+
+/// As [`read_checkpoint`], with an explicit integrity policy for callers that
+/// need deterministic configuration rather than the process environment.
+#[must_use]
+pub fn read_checkpoint_with_policy(
+    path: &Path,
+    checksum_policy: CheckpointChecksumPolicy,
+) -> Option<LoadedCheckpoint> {
     let file = fs::File::open(path).ok()?;
     let mmap = Arc::new(crate::packfile::map_pack(&file).ok()?);
     let buf: &[u8] = &mmap;
@@ -265,9 +307,11 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
     // themselves — which the walk never checked), and costs the same O(bytes)
     // as a single SIMD-accelerated hash instead of a manual scan-and-branch
     // loop over every slot of every collection.
-    let content_crc32 = crc32fast::hash(buf.get(CHECKPOINT_HEADER_LEN..)?);
-    if content_crc32 != header.content_crc32 {
-        return None;
+    if checksum_policy.verifies_reads() {
+        let content_crc32 = crc32fast::hash(buf.get(CHECKPOINT_HEADER_LEN..)?);
+        if content_crc32 != header.content_crc32 {
+            return None;
+        }
     }
 
     let mut collections = Vec::with_capacity(count);
@@ -547,6 +591,10 @@ mod tests {
         assert!(
             read_checkpoint(&path).is_none(),
             "a value-preserving bit flip inside an occupied slot must be rejected"
+        );
+        assert!(
+            read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::WriteOnly).is_some(),
+            "write-only mode deliberately trusts a structurally valid checkpoint"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
