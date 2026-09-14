@@ -1251,18 +1251,20 @@ fn run_repack_benchmark(total_events: usize, repack_interval: usize) {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Measures the write-stall the epoch-handoff protocol (see
-/// `PackfileStorage::persist_index_checkpoint`) removed: a full checkpoint
-/// rewrite's serialize + fsync + rename now runs unlocked, so a concurrent
-/// `put()` should complete in a small fraction of a full rewrite's own
-/// duration, not block for it. Reports both numbers so a regression (the
-/// lock scope creeping back to cover the unlocked window) shows up as
-/// `PUT_MAX_MS` approaching `REWRITE_MS` over time in tracked history,
-/// rather than only being caught by the deterministic
-/// `test_put_does_not_block_on_slow_checkpoint_rewrite` unit test (which
-/// proves the same property with an injected delay instead of real I/O, and
-/// runs on every `cargo test` since it's milliseconds; this bench is the
-/// real-disk-speed companion, run via `cargo bench`).
+/// Tracks real end-to-end latency around the epoch-handoff protocol (see
+/// `PackfileStorage::persist_index_checkpoint`): a full checkpoint rewrite's
+/// serialize + fsync + rename now runs unlocked, so a concurrent `put()` no
+/// longer waits on the rewrite's lock. This bench measures the *observed*
+/// latency at real disk speed, which also includes genuine device-level
+/// contention (`put()`'s own write/fsync queuing behind the rewrite's on the
+/// same disk) that the lock-scope fix neither causes nor removes — so
+/// `PUT_MAX_MS` approaching or exceeding `REWRITE_MS` here is expected at
+/// times and not on its own evidence of a regression. The actual lock-scope
+/// claim (put doesn't block on the *lock*) is proven deterministically,
+/// independent of disk speed, by the `test_put_does_not_block_on_slow_checkpoint_rewrite`
+/// unit test (uses an injected delay instead of real I/O, runs in
+/// milliseconds on every `cargo test`). This bench exists to track the real
+/// end-to-end number as a trend, not as a pass/fail gate.
 fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_collection: usize) {
     let dir = bench_root().join(format!(
         "mtxdb_bench_checkpoint_latency_{collections}x{records_per_collection}"
@@ -1378,8 +1380,25 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
         "  concurrent rewrites during put sampling: {}",
         rewrites_done.load(Ordering::Relaxed)
     );
-    eprintln!("  If PUT_MAX_MS approaches or exceeds REWRITE_MS, the lock scope in");
-    eprintln!("  persist_index_checkpoint has regressed to cover the serialize+fsync again.");
+    eprintln!(
+        "  Note: PUT_MAX_MS approaching or exceeding REWRITE_MS here does NOT by itself mean"
+    );
+    eprintln!("  the lock scope regressed — put() still does its own write/fsync, which can queue");
+    eprintln!(
+        "  behind the rewrite's write+fsync at the OS/disk level even though no lock is held."
+    );
+    eprintln!(
+        "  That's real, expected device contention, not a correctness bug. The lock-scope claim"
+    );
+    eprintln!(
+        "  itself (put does not wait ON THE LOCK for a slow rewrite) is proven deterministically,"
+    );
+    eprintln!(
+        "  independent of disk speed, by test_put_does_not_block_on_slow_checkpoint_rewrite."
+    );
+    eprintln!(
+        "  Use this bench to track real end-to-end latency trends, not as a pass/fail signal."
+    );
     eprintln!();
 
     drop(store);
