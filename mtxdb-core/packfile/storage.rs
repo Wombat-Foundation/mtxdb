@@ -1835,6 +1835,15 @@ impl PackfileStorage {
     /// second. A crash in between leaves a fingerprint mismatch that the next
     /// open resolves with a rescan; a crash after leaves a valid checkpoint.
     ///
+    /// The rewrite also re-bases the delta log: the checkpoint it just wrote
+    /// becomes the new log base fingerprint, each collection's generation is
+    /// recorded so the log's generation gate has something to check against,
+    /// and the stale on-disk log is truncated away (see
+    /// [`Self::reset_delta_log_after_rewrite`]). A crash between the
+    /// checkpoint rename and that truncation leaves a log whose base no longer
+    /// matches the checkpoint; the next open deletes it as stale — a rescan,
+    /// never a wrong replay.
+    ///
     /// Cheap no-op when no collection data has changed since the last write
     /// (`index_checkpoint_dirty` cleared on success), so a writer that syncs
     /// repeatedly without writes doesn't rewrite the acceleration file. The
@@ -1868,10 +1877,11 @@ impl PackfileStorage {
             else {
                 continue;
             };
-            // Collection generations are introduced for delta replay. Until
-            // the delta writer publishes a layout-changing generation, the
-            // checkpoint's initial generation is zero.
-            entries.push((*collection_id, 0, generation.index.serialize()));
+            entries.push((
+                *collection_id,
+                generation.generation,
+                generation.index.serialize(),
+            ));
         }
         let blobs: Vec<([u8; 16], u64, &[u8])> = entries
             .iter()
@@ -1884,6 +1894,7 @@ impl PackfileStorage {
         )
         .map_err(StorageError::Io)?;
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+        self.reset_delta_log_after_rewrite(fingerprint, &entries);
         // Keep the inspection directory gated to the same pack set the
         // checkpoint just became: ride the checkpoint rewrite (best-effort)
         // so the next open can rebuild per-shard counts from records instead
@@ -1893,6 +1904,73 @@ impl PackfileStorage {
         // the very reopen this sidecar exists to speed up. A failure here
         // leaves the previous directory stale; the fingerprint gate then
         // falls back to the slot walk until the next rewrite.
+        self.persist_shard_collections_best_effort();
+        Ok(())
+    }
+
+    /// Re-base the delta log onto a freshly written checkpoint: remember the
+    /// checkpoint's fingerprint and each collection's recorded generation as
+    /// the log's new origin, drop the accumulated frames of the pre-rewrite
+    /// session, and remove the on-disk log file so the next append starts at
+    /// byte zero with a fresh header. After this the log legitimately
+    /// continues `fingerprint`, so any file left on disk (a crash between
+    /// rename and truncate) has a base that no longer matches the checkpoint
+    /// and is rejected at open.
+    fn reset_delta_log_after_rewrite(
+        &self,
+        fingerprint: u64,
+        entries: &[([u8; 16], u64, Vec<u8>)],
+    ) {
+        let mut state = self.delta_state.lock();
+        state.base_fingerprint = Some(fingerprint);
+        state.base_generations = entries
+            .iter()
+            .map(|(collection_id, generation, _)| (*collection_id, *generation))
+            .collect();
+        state.pending.clear();
+        state.log_bytes = 0;
+        state.invalid = false;
+        drop(state);
+        let _ = fs::remove_file(Self::delta_path(&self.base_dir));
+    }
+
+    /// Append the pending delta frames as one framed, fsynced batch and clear
+    /// the dirty flag. `tail_fingerprint` is the fingerprint of the pack set
+    /// the frames were recorded against — computed by the caller after the
+    /// flush that made those bytes durable. The on-disk log, if any, is
+    /// continued; otherwise a fresh header pins `base_fingerprint` (the
+    /// checkpoint the frames extend) for the reopen replay gate.
+    fn append_index_delta(&self, tail_fingerprint: u64) -> Result<(), StorageError> {
+        let mut state = self.delta_state.lock();
+        let Some(base_fingerprint) = state.base_fingerprint else {
+            return Err(StorageError::Io(std::io::Error::other(
+                "delta append with no base fingerprint",
+            )));
+        };
+        if state.invalid {
+            return Err(StorageError::Io(std::io::Error::other(
+                "delta append while the log is invalidated",
+            )));
+        }
+        let pending = std::mem::take(&mut state.pending);
+        if pending.is_empty() {
+            return Err(StorageError::Io(std::io::Error::other(
+                "delta append with no pending frames",
+            )));
+        }
+        let write_header = state.log_bytes == 0;
+        let path = Self::delta_path(&self.base_dir);
+        let appended = delta::append_batch(
+            &path,
+            write_header,
+            base_fingerprint,
+            &pending,
+            tail_fingerprint,
+        )
+        .map_err(StorageError::Io)?;
+        state.log_bytes = state.log_bytes.saturating_add(appended as u64);
+        drop(state);
+        self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         self.persist_shard_collections_best_effort();
         Ok(())
     }
