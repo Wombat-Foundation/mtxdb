@@ -360,6 +360,19 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     //     single dirty-scoped sync() — the primitive Synapse's 1 s timer
     //     calls, NOT sync_all(). That pairs with MDBX's one txn/commit and
     //     SQLite's one tx/commit below.
+    //
+    // This is labeled "grow append"/"grow sync" in the printed table, but
+    // whether it actually exercises capacity growth depends entirely on how
+    // full each collection's index happened to land after the initial bulk
+    // build — a function of `nodes` vs. the 75%-load doubling threshold, not
+    // of anything this phase does. At small sizes every collection can cross
+    // the threshold on this very batch (all 32 growing in lockstep, since
+    // records are distributed round-robin and start from the same load);
+    // at larger sizes the same batch can land well under it and take the
+    // ordinary delta path instead. Same column, two different operations —
+    // read `stats().index_grow_count` below before trusting a cross-size
+    // comparison of this column.
+    let grow_count_before = store_rw.stats().index_grow_count;
     let append_puts_started = Instant::now();
     {
         for bucket in 0..COLLECTIONS {
@@ -384,6 +397,16 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     store_rw.sync().unwrap();
     let append_sync_ms = append_sync_started.elapsed().as_secs_f64() * 1e3;
     let append_ms = append_puts_ms + append_sync_ms;
+    let grow_count_after = store_rw.stats().index_grow_count;
+    eprintln!(
+        "    mtxdb grow append/sync: {} of {COLLECTIONS} collections grew capacity this batch{}",
+        grow_count_after - grow_count_before,
+        if grow_count_after > grow_count_before {
+            " (full checkpoint rewrite forced — this batch's sync cost is NOT comparable to a steady-state delta sync)"
+        } else {
+            " (no growth fired — this batch took the ordinary delta-log path)"
+        },
+    );
     if let Some(sync) = store_rw.sync_timings() {
         eprintln!(
             "    mtxdb sync: flush {:.2}ms + fsync {:.2}ms + delta {:.2}ms + checkpoint {:.2}ms = {:.2}ms",

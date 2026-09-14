@@ -6535,61 +6535,132 @@ mod tests {
     }
 
     #[test]
+    fn test_probe_reopen_first_append_sync_path_no_growth() {
+        // Discriminates reopen-materialization cost from real capacity-growth
+        // cost: build to a load well under the 75% grow threshold (so the
+        // post-reopen append batch cannot trigger `index_grow_count`), then
+        // reopen and append. If sync still takes the checkpoint path here,
+        // materialization alone invalidates the delta log and a re-base
+        // frame (which only helps the growth case) buys nothing.
+        let dir = test_dir("probe_reopen_sync_no_growth");
+        let total = 2000u32; // 2032 / 4096 is well under the 75% grow threshold.
+        build_reopen_probe_checkpoint(&dir, total);
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            let before = store.stats();
+            reopen_probe_put_range(&store, total..(total + 32), 32, |_| {
+                NodeData::new(bytes::Bytes::from_static(b"y"))
+            });
+            let after_put = store.stats();
+            let d = store.delta_state.lock();
+            let room = store.generation(&REOPEN_PROBE_COLLECTION).unwrap();
+            eprintln!(
+                "AFTER REOPEN PUT: cap={} len={} load={:.3} clones+={} grows+={} invalids+={} | pending={} invalid={}",
+                room.index.capacity(),
+                room.index.len(),
+                reopen_probe_load_factor(&room),
+                after_put.put_many_clone_path_calls - before.put_many_clone_path_calls,
+                after_put.index_grow_count - before.index_grow_count,
+                after_put.delta_invalidations - before.delta_invalidations,
+                d.pending.len(),
+                d.invalid,
+            );
+            assert_eq!(
+                after_put.index_grow_count - before.index_grow_count,
+                0,
+                "test setup invariant violated: this batch must not trigger real growth"
+            );
+            assert_eq!(
+                after_put.delta_invalidations - before.delta_invalidations,
+                0
+            );
+            assert!(!d.invalid);
+            drop(d);
+            store.sync().unwrap();
+            let st = store.stats();
+            let ts = store.sync_timings().unwrap();
+            eprintln!(
+                "REOPEN SYNC TIMINGS (no growth): checkpoint={:?} delta={:?} total={:?}",
+                ts.checkpoint, ts.delta_log, ts.total
+            );
+            eprintln!(
+                "REOPEN SYNC STATS (no growth): ckpt_writes+={} delta_appends+={}",
+                st.checkpoint_writes - before.checkpoint_writes,
+                st.delta_appends - before.delta_appends,
+            );
+            assert_eq!(st.checkpoint_writes - before.checkpoint_writes, 0);
+            assert_eq!(st.delta_appends - before.delta_appends, 1);
+            assert_eq!(ts.checkpoint, std::time::Duration::ZERO);
+            assert!(ts.delta_log > std::time::Duration::ZERO);
+        }
+    }
+
+    const REOPEN_PROBE_COLLECTION: [u8; 16] = [0x11; 16];
+
+    fn reopen_probe_id(i: u32) -> NodeId {
+        let mut id = [0u8; 16];
+        id[0..4].copy_from_slice(&i.to_le_bytes());
+        id[8..12].copy_from_slice(&(i ^ 0x9E37_79B9).to_le_bytes());
+        id
+    }
+
+    fn reopen_probe_payload(i: u32) -> NodeData {
+        let mut payload = vec![0u8; 1024];
+        let seed = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xDEAD_BEEF;
+        payload[..2].copy_from_slice(&seed.to_le_bytes()[..2]);
+        NodeData::new(bytes::Bytes::from(payload))
+    }
+
+    fn reopen_probe_put_range(
+        store: &PackfileStorage,
+        range: std::ops::Range<u32>,
+        batch_size: usize,
+        payload: impl Fn(u32) -> NodeData,
+    ) {
+        let mut batch = Vec::with_capacity(batch_size);
+        for i in range {
+            batch.push((reopen_probe_id(i), payload(i)));
+            if batch.len() == batch_size {
+                store.put_many(&REOPEN_PROBE_COLLECTION, &batch).unwrap();
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            store.put_many(&REOPEN_PROBE_COLLECTION, &batch).unwrap();
+        }
+    }
+
+    fn reopen_probe_load_factor(room: &RoomGeneration) -> f64 {
+        f64::from(u32::try_from(room.index.len()).expect("probe index length fits in u32"))
+            / f64::from(room.index.capacity())
+    }
+
+    fn build_reopen_probe_checkpoint(dir: &std::path::Path, total: u32) {
+        let store = PackfileStorage::open_with_cache_and_policies(
+            dir.to_path_buf(),
+            0,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
+        .unwrap()
+        .with_append_policy(shard::AppendPolicy::buffered());
+        reopen_probe_put_range(&store, 0..total, 256, reopen_probe_payload);
+        store.sync_all().unwrap();
+        let stats = store.stats();
+        let room = store.generation(&REOPEN_PROBE_COLLECTION).unwrap();
+        eprintln!(
+            "BUILD done: cap={} len={} load={:.3} gen={} | clones={} grows={} ckpt_writes={} delta_appends={}",
+            room.index.capacity(), room.index.len(), reopen_probe_load_factor(&room), room.generation,
+            stats.put_many_clone_path_calls, stats.index_grow_count, stats.checkpoint_writes,
+            stats.delta_appends,
+        );
+    }
+
+    #[test]
     fn test_probe_reopen_first_append_sync_path() {
         let dir = test_dir("probe_reopen_sync");
         let total = 3051u32;
-        const COLL: [u8; 16] = [0x11; 16];
-        let payload_bytes = move |i: u32| {
-            let mut payload = vec![0u8; 1024];
-            let seed = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xDEAD_BEEF;
-            payload[0] = seed as u8;
-            payload[1] = (seed >> 8) as u8;
-            payload
-        };
-        let id_for = move |i: u32| {
-            let mut id = [0u8; 16];
-            id[0..4].copy_from_slice(&i.to_le_bytes());
-            id[8..12].copy_from_slice(&(i ^ 0x9E37_79B9).to_le_bytes());
-            id
-        };
-        {
-            let store = PackfileStorage::open_with_cache_and_policies(
-                dir.clone(),
-                0,
-                true,
-                packfile::ChecksumPolicy::Full,
-            )
-            .unwrap()
-            .with_append_policy(shard::AppendPolicy::buffered());
-            let mut batch = Vec::new();
-            for i in 0..total {
-                batch.push((
-                    id_for(i),
-                    NodeData::new(bytes::Bytes::from(payload_bytes(i))),
-                ));
-                if batch.len() == 256 {
-                    store.put_many(&COLL, &batch).unwrap();
-                    batch.clear();
-                }
-            }
-            if !batch.is_empty() {
-                store.put_many(&COLL, &batch).unwrap();
-            }
-            store.sync_all().unwrap();
-            let st = store.stats();
-            let room = store.generation(&COLL).unwrap();
-            eprintln!(
-                "BUILD done: cap={} len={} load={:.3} gen={} | clones={} grows={} ckpt_writes={} delta_appends={}",
-                room.index.capacity(),
-                room.index.len(),
-                room.index.len() as f64 / room.index.capacity() as f64,
-                room.generation,
-                st.put_many_clone_path_calls,
-                st.index_grow_count,
-                st.checkpoint_writes,
-                st.delta_appends,
-            );
-        }
+        build_reopen_probe_checkpoint(&dir, total);
         {
             let store = PackfileStorage::open(dir.clone()).unwrap();
             let d = store.delta_state.lock();
@@ -6600,27 +6671,22 @@ mod tests {
                 d.pending.len(),
                 d.log_bytes
             );
-            let room = store.generation(&COLL).unwrap();
+            let room = store.generation(&REOPEN_PROBE_COLLECTION).unwrap();
             eprintln!(
                 "REOPEN room: cap={} len={} load={:.3} gen={} base_gen={:?}",
                 room.index.capacity(),
                 room.index.len(),
-                room.index.len() as f64 / room.index.capacity() as f64,
+                reopen_probe_load_factor(&room),
                 room.generation,
-                d.base_generations.get(&COLL),
+                d.base_generations.get(&REOPEN_PROBE_COLLECTION),
             );
             drop(d);
             drop(room);
 
             let before = store.stats();
-            let mut batch = Vec::new();
-            for i in 0..32u32 {
-                batch.push((
-                    id_for(total + i),
-                    NodeData::new(bytes::Bytes::from_static(b"y")),
-                ));
-            }
-            store.put_many(&COLL, &batch).unwrap();
+            reopen_probe_put_range(&store, total..(total + 32), 32, |_| {
+                NodeData::new(bytes::Bytes::from_static(b"y"))
+            });
             let after_put = store.stats();
             let d = store.delta_state.lock();
             eprintln!(
@@ -6631,6 +6697,16 @@ mod tests {
                 d.pending.len(),
                 d.invalid,
             );
+            assert_eq!(
+                after_put.put_many_clone_path_calls - before.put_many_clone_path_calls,
+                1
+            );
+            assert_eq!(after_put.index_grow_count - before.index_grow_count, 1);
+            assert_eq!(
+                after_put.delta_invalidations - before.delta_invalidations,
+                1
+            );
+            assert!(d.invalid);
             drop(d);
             store.sync().unwrap();
             let st = store.stats();
@@ -6644,21 +6720,22 @@ mod tests {
                 st.checkpoint_writes - before.checkpoint_writes,
                 st.delta_appends - before.delta_appends,
             );
+            assert_eq!(st.checkpoint_writes - before.checkpoint_writes, 1);
+            assert_eq!(st.delta_appends - before.delta_appends, 0);
+            assert!(ts.checkpoint > std::time::Duration::ZERO);
+            assert_eq!(ts.delta_log, std::time::Duration::ZERO);
 
-            let mut batch = Vec::new();
-            for i in 31..(31 + 256) {
-                batch.push((
-                    id_for(total + i),
-                    NodeData::new(bytes::Bytes::from_static(b"z")),
-                ));
-            }
-            store.put_many(&COLL, &batch).unwrap();
+            reopen_probe_put_range(&store, (total + 32)..(total + 288), 256, |_| {
+                NodeData::new(bytes::Bytes::from_static(b"z"))
+            });
             store.sync().unwrap();
             let ts = store.sync_timings().unwrap();
             eprintln!(
                 "SECOND SYNC TIMINGS: checkpoint={:?} delta={:?} total={:?}",
                 ts.checkpoint, ts.delta_log, ts.total
             );
+            assert_eq!(ts.checkpoint, std::time::Duration::ZERO);
+            assert!(ts.delta_log > std::time::Duration::ZERO);
         }
     }
 
