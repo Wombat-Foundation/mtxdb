@@ -1,13 +1,7 @@
-# mtxdb-ffi and mtxdb-wasm deliberately stay out: a workspace member's own
-# [profile.*] is ignored (only the workspace root's applies), and
-# mtxdb-wasm's release profile (opt-level "z", lto, panic="abort") is
-# load-bearing for wasm binary size — folding it in here silently
-# discards it. They stay standalone builds, each with their own
-# [workspace] table, depending on mtxdb-core via a path dependency.
 
 [package]
 name = "mtxdb"
-version = "0.1.0-beta.1"
+version.workspace = true
 edition = "2021"
 rust-version = "1.81"
 publish = false
@@ -15,6 +9,15 @@ publish = false
 [workspace]
 resolver = "2"
 members = ["mtxdb-cli", "mtxdb-core"]
+# mtxdb-ffi and mtxdb-wasm deliberately stay out: a workspace member's own
+# [profile.*] is ignored (only the workspace root's applies), and
+# mtxdb-wasm's release profile (opt-level "z", lto, panic="abort") is
+# load-bearing for wasm binary size — folding it in here silently
+# discards it. They stay standalone builds, each with their own
+# [workspace] table, depending on mtxdb-core via a path dependency.
+
+[workspace.package]
+version = "0.1.0-beta.1"
 
 # LINTS
 

@@ -1994,7 +1994,12 @@ impl PackfileStorage {
         let write_result = (|| -> std::io::Result<()> {
             let mut tmp = fs::File::create(&tmp_path)?;
             std::io::Write::write_all(&mut tmp, &buf)?;
-            tmp.sync_all()
+            // See the matching comment in `checkpoint::write_checkpoint`:
+            // this tmp file is renamed away immediately below and never
+            // reopened by this name, so only its data need survive —
+            // `sync_data` (fdatasync) skips the timestamp-only metadata
+            // flush `sync_all` (fsync) would also perform.
+            tmp.sync_data()
         })();
         if let Err(e) = write_result {
             let _ = fs::remove_file(&tmp_path);

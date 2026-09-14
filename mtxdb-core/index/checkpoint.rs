@@ -253,7 +253,17 @@ pub fn write_checkpoint(
     let write_result = (|| -> std::io::Result<()> {
         let mut tmp = fs::File::create(&tmp_path)?;
         tmp.write_all(&buf)?;
-        tmp.sync_all()
+        // `sync_data` (fdatasync), not `sync_all` (fsync): this temp file is
+        // renamed over `path` immediately below and never opened by its own
+        // name again, so its inode metadata (mtime, etc.) durably surviving
+        // is irrelevant — only the data bytes and the file length need to.
+        // fdatasync still flushes any metadata required to read that data
+        // back (e.g. the extended size), it just skips the timestamp-only
+        // metadata fsync would also flush. The caller
+        // (`persist_index_checkpoint`) separately fsyncs the base directory
+        // after the rename, which is what makes the rename itself durable;
+        // this only trims the tmp file's own write cost.
+        tmp.sync_data()
     })();
     if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp_path);
