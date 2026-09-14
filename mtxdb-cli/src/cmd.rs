@@ -311,13 +311,6 @@ fn cmd_get(
 /// Pretty-print a stream of JSON objects or arrays, returning `None` for a
 /// non-JSON payload so `get` can retain its binary-storage behaviour.
 fn pretty_json_stream(bytes: &[u8]) -> Option<Vec<u8>> {
-    // Typed records prefix their source JSON with a one-byte storage tag.
-    // Presentation must not leak that binary tag into a terminal or prevent
-    // JSON formatting; `get --raw` deliberately bypasses this helper.
-    let bytes = match bytes {
-        [1..=8, payload @ ..] => payload,
-        _ => bytes,
-    };
     let values = split_json_stream(bytes)?;
     let mut output = Vec::new();
     for value in values {
