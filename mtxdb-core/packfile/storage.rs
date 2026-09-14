@@ -385,7 +385,7 @@ struct RoomGeneration {
 /// checkpoint rewrite. A structurally unsafe transition sets `invalid` (see
 /// below), which forces the next sync back to a full rewrite.
 #[derive(Default)]
-struct DeltaState {
+struct DeltaLogState {
     /// Fingerprint of the checkpoint this session continues. `None` when the
     /// store opened via a full rescan and hasn't rewritten a checkpoint yet —
     /// every such open forces the next dirty sync to a full rewrite.
@@ -511,8 +511,8 @@ pub struct PackfileStorage {
     index_checkpoint_dirty: AtomicBool,
     /// Session state for the incremental index delta log: the base checkpoint
     /// fingerprint + generations the log continues, and the frames accumulated
-    /// since the last persist. See [`DeltaState`].
-    delta_state: parking_lot::Mutex<DeltaState>,
+    /// since the last persist. See [`DeltaLogState`].
+    delta_state: parking_lot::Mutex<DeltaLogState>,
 }
 
 /// Per-collection state for incremental repack.
@@ -888,9 +888,9 @@ impl PackfileStorage {
             // A full rescan re-cooks every index from scratch, so no delta log
             // can continue anything the checkpoint recorded; force the next
             // dirty sync into a full checkpoint rewrite that re-bases the log.
-            DeltaState {
+            DeltaLogState {
                 invalid: true,
-                ..DeltaState::default()
+                ..DeltaLogState::default()
             },
         );
         timings.total = started.elapsed();
@@ -970,7 +970,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         swizzle: Option<SwizzleFn>,
         cache_capacity: usize,
-        delta_state: DeltaState,
+        delta_state: DeltaLogState,
     ) -> Self {
         Self {
             shards,
@@ -1086,7 +1086,7 @@ impl PackfileStorage {
     /// state the previous session's last sync fsynced, so there can be no torn
     /// tail to recover.
     ///
-    /// On success, also returns the fresh [`DeltaState`] for the session: the
+    /// On success, also returns the fresh [`DeltaLogState`] for the session: the
     /// delta log's base fingerprint (the checkpoint's) and each collection's
     /// checkpoint generation, with `invalid` set only if a structural change
     /// (e.g. a grow) forced replay to bail into a rescan — in which case this
@@ -1102,7 +1102,7 @@ impl PackfileStorage {
         deleted_collections: &HashSet<[u8; 16]>,
         writable: bool,
         timings: &mut OpenTimings,
-    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaState)> {
+    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState)> {
         let decode_started = std::time::Instant::now();
         let checkpoint =
             crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir));
@@ -1117,7 +1117,7 @@ impl PackfileStorage {
         timings.fingerprint = fingerprint_started.elapsed();
 
         // Generations at the checkpoint, per collection — used both to seed the
-        // new session's `DeltaState` and to gate whether any delta frames may be
+        // new session's `DeltaLogState` and to gate whether any delta frames may be
         // applied (a frame's stamp must equal the checkpoint generation it
         // claims to continue, which also rules out the never-recorded ancestors
         // of collections created or structurally changed since the checkpoint).
@@ -1305,11 +1305,11 @@ impl PackfileStorage {
         // sidecar pair is consumed above either way.
         drop(sidecar_pack_entries);
 
-        let delta_state = DeltaState {
+        let delta_state = DeltaLogState {
             base_fingerprint: Some(checkpoint.fingerprint),
             base_generations: ckpt_generations,
             invalid: false,
-            ..DeltaState::default()
+            ..DeltaLogState::default()
         };
 
         Some((scan_out, collection_order, delta_state))
