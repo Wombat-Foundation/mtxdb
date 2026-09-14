@@ -1356,7 +1356,20 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
                 // Start barrier: don't begin sampling until the background
                 // rewrite thread has completed its first sync_all, so the
                 // sampled put()s actually run concurrently with rewrites.
+                // Bounded, not an unconditional spin: if the rewrite thread
+                // panics (e.g. an `.unwrap()` on setup/IO) before setting
+                // the flag, an unconditional wait here would spin forever,
+                // since `thread::scope` only surfaces that panic once every
+                // spawned thread returns. Time out instead, so this thread
+                // itself unwinds and the scope can join and propagate the
+                // real failure.
+                let barrier_deadline = Instant::now() + std::time::Duration::from_secs(30);
                 while !first_rewrite_done.load(Ordering::Relaxed) {
+                    assert!(
+                        Instant::now() < barrier_deadline,
+                        "background rewrite thread never completed its first sync_all \
+                         within 30s (it likely panicked before reaching that point)"
+                    );
                     std::thread::yield_now();
                 }
                 let mut collection = [0u8; 16];

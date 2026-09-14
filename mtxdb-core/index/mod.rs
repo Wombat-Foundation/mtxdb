@@ -215,6 +215,20 @@ impl LossyIndex {
         }
     }
 
+    /// This index's slot-table capacity (always a power of two).
+    ///
+    /// A plain accessor, not gated to test builds — capacity is a normal
+    /// property of the index, and the only reason nothing outside tests
+    /// calls it yet is that no caller has needed a load-factor figure. It
+    /// stays real `pub(crate)` API for whenever one does (e.g. a future
+    /// `collection_index_info` field); `allow` below just reflects that
+    /// its only *current* caller is a test.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
     /// Extract the bucket index from a 16-byte hash.
     #[inline]
     fn bucket(&self, hash: &[u8; 16]) -> usize {
@@ -370,6 +384,9 @@ impl LossyIndex {
         let SlotStorage::Owned(slots) = &self.slots else {
             return Err(DeltaReplayError::RequiresOwnedIndex);
         };
+        // Validate every frame before mutating any slot: the contract is
+        // wholesale rejection of a structurally inconsistent log, so a
+        // caller must never observe a partially replayed index.
         for frame in frames {
             let bucket = frame.bucket as usize;
             if bucket >= self.capacity as usize {
@@ -388,6 +405,9 @@ impl LossyIndex {
                     bucket: frame.bucket,
                 });
             }
+        }
+        for frame in frames {
+            let bucket = frame.bucket as usize;
             let previous = slots[bucket].load(Ordering::Acquire);
             if previous == 0 {
                 self.len.fetch_add(1, Ordering::Relaxed);

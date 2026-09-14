@@ -139,6 +139,12 @@ pub struct Shard {
     bytes_written: AtomicU64,
     /// Number of times this shard's file has been fsynced.
     sync_count: AtomicU64,
+    /// Set when a failed flush could not be rolled back (the tail-truncating
+    /// `set_len` itself failed), leaving torn, undeclared bytes past
+    /// `file_len` on disk. Once set, every further append/flush on this
+    /// shard is refused rather than risk writing on top of, or scanning
+    /// past, that corrupt physical tail.
+    poisoned: AtomicBool,
 }
 
 /// A byte range which keeps the mmap that backs it alive.  `Bytes::from_owner`
@@ -272,7 +278,15 @@ impl Shard {
             write_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             sync_count: AtomicU64::new(0),
+            poisoned: AtomicBool::new(false),
         }
+    }
+
+    /// Whether this shard has been poisoned by an unrecoverable rollback
+    /// failure and must no longer be appended to or flushed.
+    #[must_use]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
     }
 
     /// Snapshot this shard's IO/sync counters.
@@ -1355,6 +1369,12 @@ impl ShardPool {
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
         let mut shard = self.shard_for_collection(&record.collection_id);
         loop {
+            if shard.is_poisoned() {
+                return Err(io::Error::other(format!(
+                    "shard {} is poisoned after an unrecoverable rollback failure",
+                    shard.slot
+                )));
+            }
             // Uncompressed upper bound, used only for the pre-append
             // capacity check below — `write_record` may compress the
             // payload and write fewer bytes than this, but never more,
@@ -1436,10 +1456,30 @@ impl ShardPool {
                 let mut pending = shard.pending.lock();
                 let end = pending_start.saturating_add(frame_len);
                 if pending.len() >= end {
-                    pending.truncate(pending_start);
-                    shard.pending_records.fetch_sub(1, Ordering::Relaxed);
-                    drop(pending);
-                    let _ = shard.file.set_len(committed);
+                    // Only discard the frame once the tail truncation has
+                    // actually succeeded — otherwise the torn bytes stay on
+                    // disk past `committed` with no frame left to account
+                    // for them, and a restart's full scan (which reads real
+                    // file length, not our tracked `file_len`) can surface
+                    // them as phantom data. If truncation itself fails,
+                    // leave `pending` untouched and poison the shard so
+                    // nothing else appends past, or scans over, the corrupt
+                    // tail.
+                    match shard.file.set_len(committed) {
+                        Ok(()) => {
+                            pending.truncate(pending_start);
+                            shard.pending_records.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        Err(rollback_err) => {
+                            drop(pending);
+                            shard.poisoned.store(true, Ordering::Release);
+                            return Err(io::Error::other(format!(
+                                "flush failed ({e}) and rollback truncation also failed \
+                                 ({rollback_err}); shard {} poisoned",
+                                shard.slot
+                            )));
+                        }
+                    }
                 }
                 return Err(e);
             }
@@ -1465,6 +1505,12 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on flush failure.
     pub(crate) fn flush_shard(&self, shard: &Arc<Shard>) -> io::Result<()> {
+        if shard.is_poisoned() {
+            return Err(io::Error::other(format!(
+                "shard {} is poisoned after an unrecoverable rollback failure",
+                shard.slot
+            )));
+        }
         let guard = shard.append_lock.lock();
         self.flush_shard_with_guard(shard, &guard)
     }

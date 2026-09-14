@@ -2729,6 +2729,18 @@ impl PackfileStorage {
     pub fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
+        // A refresh that publishes a *newly discovered* collection must be
+        // excluded from a concurrent checkpoint's fingerprint→snapshot
+        // window, exactly like a new-collection `put`/`put_many` (see the
+        // comment on `put`). Otherwise its `rebuild_index` flush could land
+        // the refreshed records in a pack covered by the checkpoint's
+        // fingerprint while the collection itself is absent from the
+        // snapshot, and a reopen trusting that checkpoint would lose them.
+        let _create_guard = if self.generation(collection_id).is_none() {
+            Some(self.collection_creation.read())
+        } else {
+            None
+        };
         self.shards.discover_shards()?;
         let new_index = self.rebuild_index(collection_id)?;
         let existing_cache = self.generation(collection_id).map(|g| g.cache.clone());
@@ -4934,16 +4946,47 @@ mod tests {
         }
         drop(checkpoint_index);
 
-        // Exercise the actual put_many fallback too. It must publish a
-        // growable generation that contains both checkpoint and new entries.
-        let extra = [0xA5; 16];
-        reopened
-            .put_many(
-                &TEST_COLLECTION,
-                &[(extra, NodeData::new(bytes::Bytes::from_static(b"extra")))],
-            )
-            .unwrap();
-        assert!(reopened.get(&TEST_COLLECTION, &extra).unwrap().is_some());
+        // Exercise the actual put_many fallback too. `insert_index` fails
+        // closed once `len >= capacity * 3 / 4`, and the reopened generation
+        // is mmap-backed (so `LossyIndex::grow` — which needs the original
+        // homes — can't apply): crossing that threshold therefore always
+        // routes through `grow_checkpoint_index`, never a silent plain grow
+        // or a full pack rescan. Compute the threshold from the checkpoint's
+        // actual on-disk capacity and add enough unique post-reopen entries
+        // to be certain we cross it, instead of relying on one extra record
+        // that may land comfortably under it.
+        let checkpoint_capacity = u64::from(
+            reopened
+                .generation(&TEST_COLLECTION)
+                .expect("checkpoint collection exists")
+                .index
+                .capacity(),
+        );
+        let threshold = checkpoint_capacity * 3 / 4;
+        // Add enough unique entries to certainly cross the threshold,
+        // regardless of exactly how much headroom the checkpoint's
+        // persisted capacity happens to have.
+        let needed = threshold.saturating_sub(u64::try_from(ENTRIES).unwrap_or(0)) + 64;
+        let extra_entries: Vec<_> = (0..needed)
+            .map(|i| {
+                let mut id = [0xA5; 16];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                (id, NodeData::new(bytes::Bytes::from_static(b"extra")))
+            })
+            .collect();
+        reopened.put_many(&TEST_COLLECTION, &extra_entries).unwrap();
+        let grown_capacity = reopened
+            .generation(&TEST_COLLECTION)
+            .expect("collection still exists")
+            .index
+            .capacity();
+        assert!(
+            u64::from(grown_capacity) > checkpoint_capacity,
+            "put_many must have grown the index past its checkpoint capacity"
+        );
+        for (id, _) in &extra_entries {
+            assert!(reopened.get(&TEST_COLLECTION, id).unwrap().is_some());
+        }
         assert!(reopened
             .get(&TEST_COLLECTION, &entries[0].0)
             .unwrap()
