@@ -150,14 +150,28 @@ fn collection_for(node: usize) -> [u8; 16] {
     collection
 }
 
+fn checksum_policy_from_env() -> mtxdb_core::packfile::ChecksumPolicy {
+    // MTXDB_BENCH_CHECKSUM=writeonly|disabled lowers the per-frame checksum
+    // policy from the default Full (see ChecksumPolicy): writeonly still
+    // writes real CRCs but skips the hashing pass on point-lookup reads,
+    // disabled also stops computing them on writes.
+    match std::env::var("MTXDB_BENCH_CHECKSUM").as_deref() {
+        Ok("writeonly") => mtxdb_core::packfile::ChecksumPolicy::WriteOnly,
+        Ok("disabled") => mtxdb_core::packfile::ChecksumPolicy::Disabled,
+        _ => mtxdb_core::packfile::ChecksumPolicy::Full,
+    }
+}
+
 fn mtxdb_open(dir: &std::path::Path) -> PackfileStorage {
     // MTXDB_BENCH_COMPRESS=0 opens the store with per-record zstd disabled, to
     // measure the raw append path against mdbx/sqlite. The bench payload is
     // seeded-incompressible anyway, so compression only pure overhead here.
-    if std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0") {
-        PackfileStorage::open_with_compression(dir.to_path_buf(), false).unwrap()
+    let compress_off = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0");
+    let checksum = checksum_policy_from_env();
+    if compress_off {
+        PackfileStorage::open_with_policies(dir.to_path_buf(), false, checksum).unwrap()
     } else {
-        PackfileStorage::open(dir.to_path_buf()).unwrap()
+        PackfileStorage::open_with_policies(dir.to_path_buf(), true, checksum).unwrap()
     }
 }
 
@@ -183,7 +197,11 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // Resident index bytes, isolated from the mmap'd packfiles: sum of the
     // per-collection LossyIndex slot arrays (the checkpoint-size input).
     let (mem, mem_label) = {
-        let store = PackfileStorage::open_read_only(dir.to_path_buf()).unwrap();
+        let store = PackfileStorage::open_read_only_with_policies(
+            dir.to_path_buf(),
+            checksum_policy_from_env(),
+        )
+        .unwrap();
         let bytes: u64 = store
             .collection_summaries()
             .iter()
@@ -196,7 +214,11 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
 
     // ── Warm open + sampled point lookups ──
     let started = Instant::now();
-    let store = PackfileStorage::open_read_only(dir.to_path_buf()).unwrap();
+    let store = PackfileStorage::open_read_only_with_policies(
+        dir.to_path_buf(),
+        checksum_policy_from_env(),
+    )
+    .unwrap();
     let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
     let lookup_started = Instant::now();
     for node in 0..LOOKUP_SAMPLES.min(nodes) {
@@ -214,7 +236,11 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // ── Cold open + append ──
     let evicted = drop_caches_for_dir(dir);
     let started = Instant::now();
-    let store = PackfileStorage::open_read_only(dir.to_path_buf()).unwrap();
+    let store = PackfileStorage::open_read_only_with_policies(
+        dir.to_path_buf(),
+        checksum_policy_from_env(),
+    )
+    .unwrap();
     let cold_open_ms = started.elapsed().as_secs_f64() * 1e3;
     drop(store);
 

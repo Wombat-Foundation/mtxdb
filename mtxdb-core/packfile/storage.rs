@@ -332,7 +332,38 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `io::Error` if the base directory cannot be created or read.
     pub fn open(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true, None, true)
+        Self::open_with_options(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            true,
+            None,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
+    }
+
+    /// Open a packfile storage with explicit compression and checksum
+    /// policies — the advanced durability/performance entry point. See
+    /// [`crate::packfile::ChecksumPolicy`] for what giving up read-time
+    /// verification costs.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn open_with_policies(
+        base_dir: PathBuf,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            true,
+            None,
+            compress,
+            checksum_policy,
+        )
     }
 
     /// Open a packfile storage with `compress` controlling whether records
@@ -347,7 +378,15 @@ impl PackfileStorage {
         base_dir: PathBuf,
         compress: bool,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, true, None, compress)
+        Self::open_with_options(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            true,
+            None,
+            compress,
+            packfile::ChecksumPolicy::Full,
+        )
     }
 
     /// Open a packfile storage that rotates shards at `max_shard_bytes`
@@ -371,6 +410,7 @@ impl PackfileStorage {
             true,
             Some(max_shard_bytes),
             true,
+            packfile::ChecksumPolicy::Full,
         )
     }
 
@@ -387,7 +427,37 @@ impl PackfileStorage {
     /// Returns `io::Error` if the directory can't be read, has no shards
     /// yet, or a writer already holds the exclusive lock.
     pub fn open_read_only(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, DEFAULT_CACHE_CAPACITY, None, false, None, true)
+        Self::open_with_options(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            false,
+            None,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
+    }
+
+    /// Open a packfile storage as a read-only observer with an explicit
+    /// checksum policy, gating per-lookup CRC verification in `read_at`.
+    /// See [`crate::packfile::ChecksumPolicy`]. Matches a writer opened with
+    /// the same policy.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_read_only`].
+    pub fn open_read_only_with_policies(
+        base_dir: PathBuf,
+        checksum_policy: packfile::ChecksumPolicy,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            false,
+            None,
+            true,
+            checksum_policy,
+        )
     }
 
     /// Open a packfile storage with a custom per-collection cache capacity.
@@ -398,7 +468,15 @@ impl PackfileStorage {
         base_dir: PathBuf,
         cache_capacity: usize,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, None, true, None, true)
+        Self::open_with_options(
+            base_dir,
+            cache_capacity,
+            None,
+            true,
+            None,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
     }
 
     /// Open a packfile storage with a swizzle callback for in-cache pointer resolution.
@@ -410,9 +488,18 @@ impl PackfileStorage {
         cache_capacity: usize,
         swizzle: SwizzleFn,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options(base_dir, cache_capacity, Some(swizzle), true, None, true)
+        Self::open_with_options(
+            base_dir,
+            cache_capacity,
+            Some(swizzle),
+            true,
+            None,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_with_options(
         base_dir: PathBuf,
         cache_capacity: usize,
@@ -420,6 +507,7 @@ impl PackfileStorage {
         writable: bool,
         max_shard_bytes: Option<u64>,
         compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
     ) -> Result<Self, std::io::Error> {
         fs::create_dir_all(&base_dir)?;
 
@@ -428,14 +516,21 @@ impl PackfileStorage {
                 // Custom rotation thresholds are only used by benchmarks/
                 // tests today, none of which also need to disable
                 // compression, so this combination just keeps the default.
-                Some(max_shard_bytes) => {
-                    ShardPool::open_with_max_shard_bytes(base_dir.clone(), max_shard_bytes)?
-                }
-                None if compress => ShardPool::open(base_dir.clone())?,
-                None => ShardPool::open_with_compression(base_dir.clone(), false)?,
+                Some(max_shard_bytes) => ShardPool::open_with_policies(
+                    base_dir.clone(),
+                    compress,
+                    checksum_policy,
+                    Some(max_shard_bytes),
+                )?,
+                None => ShardPool::open_with_policies(
+                    base_dir.clone(),
+                    compress,
+                    checksum_policy,
+                    None,
+                )?,
             }
         } else {
-            ShardPool::open_read_only(base_dir.clone())?
+            ShardPool::open_read_only_with_policies(base_dir.clone(), checksum_policy)?
         };
 
         // Phase 1: accumulate all records per collection across every shard so
@@ -890,8 +985,8 @@ impl PackfileStorage {
         locks.entry(*collection_id).or_default().clone()
     }
 
-    fn read_at(shard: &Shard, offset: u64) -> Result<Record, StorageError> {
-        ShardPool::read_at(shard, offset)
+    fn read_at(shard: &Shard, offset: u64, verify: bool) -> Result<Record, StorageError> {
+        ShardPool::read_at(shard, offset, verify)
     }
 
     /// The record's actual on-disk byte length (see
@@ -1408,7 +1503,7 @@ impl PackfileStorage {
         let Some(old_shard) = pinned.get(&old_shard_id) else {
             return Ok(None);
         };
-        let record = Self::read_at(old_shard, old_offset)?;
+        let record = Self::read_at(old_shard, old_offset, true)?;
         let (new_shard_id, new_offset) = self.shards.put_record(&Record {
             collection_id: *collection_id,
             hash: record.hash,
@@ -1567,7 +1662,11 @@ impl PackfileStorage {
                 continue;
             };
 
-            match Self::read_at(&shard, *offset) {
+            match Self::read_at(
+                &shard,
+                *offset,
+                self.shards.checksum_policy().verifies_reads(),
+            ) {
                 Ok(record) => {
                     if record.hash != *id {
                         continue;
@@ -1630,7 +1729,7 @@ impl PackfileStorage {
             let Some(old_shard) = pinned.get(&shard_id) else {
                 continue;
             };
-            let record = Self::read_at(old_shard, offset)?;
+            let record = Self::read_at(old_shard, offset, true)?;
             let edges = extract_edges(&hash, &record.data);
             for edge in &edges {
                 if hash_to_shard_offset.contains_key(edge) && visited.insert(*edge) {
@@ -1761,7 +1860,7 @@ impl PackfileStorage {
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
         for (hash, &(shard_id, offset)) in hash_to_shard_offset {
             if let Some(shard) = pinned.get(&shard_id) {
-                let record = Self::read_at(shard, offset)?;
+                let record = Self::read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
             }
@@ -1948,7 +2047,7 @@ impl PackfileStorage {
             let Some(old_shard) = pinned.get(&shard_id) else {
                 continue;
             };
-            let record = Self::read_at(old_shard, offset)?;
+            let record = Self::read_at(old_shard, offset, true)?;
             let edges = extract_edges(&hash, &record.data);
             for edge in &edges {
                 if hash_to_shard_offset.contains_key(edge) && visited.insert(*edge) {
@@ -2001,7 +2100,7 @@ impl PackfileStorage {
             }
             // Slow path: new node, must read from disk.
             if let Some(shard) = pinned.get(&shard_id) {
-                let record = Self::read_at(shard, offset)?;
+                let record = Self::read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
             }
@@ -3261,6 +3360,74 @@ mod tests {
         fs::write(path, bytes).unwrap();
 
         assert!(PackfileStorage::open(dir).is_err());
+    }
+
+    /// Full and `WriteOnly` keep writing real CRCs, so a reopen scan still
+    /// verifies them: a physically tampered pack must fail to reopen.
+    /// `Disabled` frames carry no checksum, so a tampered pack reopens and
+    /// the engine serves the corrupted bytes as data.
+    #[test]
+    fn test_checksum_policy_gates_verification_on_reopen_scan() {
+        for (policy, expect_reopen_ok) in [
+            (crate::packfile::ChecksumPolicy::Full, false),
+            (crate::packfile::ChecksumPolicy::WriteOnly, false),
+            (crate::packfile::ChecksumPolicy::Disabled, true),
+        ] {
+            let dir = test_dir(&format!("checksum_policy_reopen_{policy:?}"));
+            {
+                let store = PackfileStorage::open_with_policies(dir.clone(), true, policy).unwrap();
+                let id = distinct_id(0x52);
+                store
+                    .put(
+                        &TEST_COLLECTION,
+                        &id,
+                        &NodeData::new(bytes::Bytes::from_static(b"tamper target")),
+                    )
+                    .unwrap();
+                let (shard_id, offset) = store
+                    .generation(&TEST_COLLECTION)
+                    .unwrap()
+                    .index
+                    .lookup(&id)
+                    .expect("just-written record must be indexed");
+                let path = store.shards.get_shard(shard_id).unwrap().path.clone();
+                drop(store);
+
+                let mut bytes = fs::read(&path).unwrap();
+                let payload_byte = usize::try_from(offset)
+                    .expect("u64 offset fits usize on any supported host")
+                    .saturating_add(4)
+                    .saturating_add(crate::packfile::FRAME_FIXED_LEN as usize);
+                assert!(payload_byte < bytes.len(), "tamper site must be in-file");
+                bytes[payload_byte] ^= 0xff;
+                bytes[payload_byte + 1] ^= 0x0f;
+                fs::write(path, bytes).unwrap();
+            }
+
+            if expect_reopen_ok {
+                let store = PackfileStorage::open_with_policies(dir, true, policy).unwrap();
+                let got = store
+                    .get(&TEST_COLLECTION, &distinct_id(0x52))
+                    .unwrap()
+                    .expect("Disabled reopen must serve the record");
+                assert_eq!(
+                    got.bytes.as_ref().len(),
+                    b"tamper target".len(),
+                    "payload frame must still decode"
+                );
+            } else {
+                let reopened = PackfileStorage::open_with_policies(dir, true, policy);
+                match reopened {
+                    Ok(_) => panic!("reopen scan must reject a tampered pack"),
+                    Err(err) => {
+                        assert!(
+                            matches!(err, std::io::Error { .. }),
+                            "expected I/O error from scan_and_recover, got {err:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4975,7 +5142,7 @@ mod tests {
         let pinned = store.pin_shards([shard_id, shard_id, shard_id].into_iter());
         assert_eq!(pinned.len(), 1);
 
-        let record = PackfileStorage::read_at(&pinned[&shard_id], offset)
+        let record = PackfileStorage::read_at(&pinned[&shard_id], offset, true)
             .expect("pinned shard must resolve the real on-disk record");
         assert_eq!(record.data.as_ref(), b"pin me");
     }

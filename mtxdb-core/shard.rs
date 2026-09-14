@@ -309,6 +309,11 @@ pub struct ShardPool {
     /// whose payloads never shrink under compression (e.g. HAMT nodes),
     /// to skip paying the compressor's cost on every write for no benefit.
     compress: bool,
+    /// How much of the per-frame CRC32 this pool writes and verifies (see
+    /// [`packfile::ChecksumPolicy`]). Controls both what
+    /// [`Self::put_record`] hashes when appending and what
+    /// [`Self::read_at`] verifies on point lookups.
+    checksum_policy: packfile::ChecksumPolicy,
     /// Present only for a writable pool — `open_read_only` takes no lock
     /// at all, since it never writes or truncates anything (that risk
     /// lives one layer up, in `PackfileStorage`'s collection-index rebuild, not
@@ -343,19 +348,53 @@ impl ShardPool {
     /// Returns `io::Error` on directory read failure, packfile open
     /// failure, or if another process already holds the writer lock.
     pub fn open(base_dir: PathBuf) -> io::Result<Self> {
-        Self::open_internal(base_dir, true, MAX_SHARD_BYTES, true)
+        Self::open_internal(
+            base_dir,
+            true,
+            MAX_SHARD_BYTES,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
+    }
+
+    /// Open or create a writable shard pool with explicit compression and
+    /// checksum policies — the advanced durability/performance entry point.
+    /// Pass `Some` for `max_shard_bytes` to rotate shards at a custom
+    /// threshold instead of [`MAX_SHARD_BYTES`].
+    ///
+    /// # Errors
+    /// Same as [`Self::open`], plus `InvalidInput` if `max_shard_bytes`
+    /// is zero or exceeds [`MAX_SHARD_BYTES`].
+    pub fn open_with_policies(
+        base_dir: PathBuf,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+        max_shard_bytes: Option<u64>,
+    ) -> io::Result<Self> {
+        let max_shard_bytes = match max_shard_bytes {
+            Some(threshold) => Self::validate_shard_size(threshold)?,
+            None => MAX_SHARD_BYTES,
+        };
+        Self::open_internal(base_dir, true, max_shard_bytes, compress, checksum_policy)
     }
 
     /// Open or create a shard pool as its exclusive writer, with `compress`
     /// controlling whether records are zstd-attempted on write (see
     /// [`crate::packfile::write_record_with_options`]) — pass `false` for a
     /// pool whose payloads (e.g. HAMT nodes/roots) never benefit, to skip
-    /// paying the compressor's cost on every put.
+    /// paying the compressor's cost on every put. Checksum policy stays
+    /// [`packfile::ChecksumPolicy::Full`].
     ///
     /// # Errors
     /// Same as [`Self::open`].
     pub fn open_with_compression(base_dir: PathBuf, compress: bool) -> io::Result<Self> {
-        Self::open_internal(base_dir, true, MAX_SHARD_BYTES, compress)
+        Self::open_internal(
+            base_dir,
+            true,
+            MAX_SHARD_BYTES,
+            compress,
+            packfile::ChecksumPolicy::Full,
+        )
     }
 
     /// Open or create a shard pool as its exclusive writer, rotating
@@ -367,6 +406,17 @@ impl ShardPool {
     /// Same as [`Self::open`], plus `InvalidInput` if `max_shard_bytes`
     /// is zero or exceeds [`MAX_SHARD_BYTES`].
     pub fn open_with_max_shard_bytes(base_dir: PathBuf, max_shard_bytes: u64) -> io::Result<Self> {
+        Self::open_internal(
+            base_dir,
+            true,
+            Self::validate_shard_size(max_shard_bytes)?,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
+    }
+
+    /// Reject rotation thresholds that can't ever hold one complete record.
+    fn validate_shard_size(max_shard_bytes: u64) -> io::Result<u64> {
         let min_required = (packfile::HEADER_LEN as u64)
             .saturating_add(4)
             .saturating_add(u64::from(packfile::FRAME_FIXED_LEN))
@@ -374,10 +424,12 @@ impl ShardPool {
         if max_shard_bytes < min_required || max_shard_bytes > MAX_SHARD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("max_shard_bytes must be in {min_required}..={MAX_SHARD_BYTES}, got {max_shard_bytes}"),
+                format!(
+                    "max_shard_bytes must be in {min_required}..={MAX_SHARD_BYTES}, got {max_shard_bytes}"
+                ),
             ));
         }
-        Self::open_internal(base_dir, true, max_shard_bytes, true)
+        Ok(max_shard_bytes)
     }
 
     /// Open a shard pool as a read-only observer, coexisting with a
@@ -397,7 +449,28 @@ impl ShardPool {
         // A read-only pool never writes, so the rotation threshold and
         // compression policy are never consulted — pass the defaults for
         // consistency.
-        Self::open_internal(base_dir, false, MAX_SHARD_BYTES, true)
+        Self::open_internal(
+            base_dir,
+            false,
+            MAX_SHARD_BYTES,
+            true,
+            packfile::ChecksumPolicy::Full,
+        )
+    }
+
+    /// Open a shard pool as a read-only observer with an explicit checksum
+    /// policy, gating per-lookup CRC verification in
+    /// [`Self::read_at`]. See [`packfile::ChecksumPolicy`].
+    ///
+    /// # Errors
+    /// Same as [`Self::open_read_only`].
+    pub fn open_read_only_with_policies(
+        base_dir: PathBuf,
+        checksum_policy: packfile::ChecksumPolicy,
+    ) -> io::Result<Self> {
+        // A read-only pool never writes, so the rotation threshold and
+        // compression policy are never consulted — pass the defaults.
+        Self::open_internal(base_dir, false, MAX_SHARD_BYTES, true, checksum_policy)
     }
 
     /// Discovers packfiles in the pool directory.
@@ -487,6 +560,7 @@ impl ShardPool {
         writable: bool,
         max_shard_bytes: u64,
         compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
     ) -> io::Result<Self> {
         if writable {
             fs::create_dir_all(&base_dir)?;
@@ -623,6 +697,7 @@ impl ShardPool {
             last_stats_flush: RwLock::new(None),
             writable,
             compress,
+            checksum_policy,
             #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         })
@@ -1115,6 +1190,13 @@ impl ShardPool {
             .expect("active write shard must exist")
     }
 
+    /// The pool's checksum policy (see [`packfile::ChecksumPolicy`]) —
+    /// which parts of the per-frame CRC32 this pool writes and verifies.
+    #[must_use]
+    pub fn checksum_policy(&self) -> packfile::ChecksumPolicy {
+        self.checksum_policy
+    }
+
     /// Append a record to its collection's home shard (see `collection_home`).
     /// Returns `(slot, offset)`. Rotates the collection to a new home shard
     /// if its current one is full.
@@ -1157,7 +1239,11 @@ impl ShardPool {
 
                 // The actual on-disk length — may be smaller than
                 // `max_record_len` when the payload compressed.
-                let frame = packfile::encode_record_with_options(record, self.compress)?;
+                let frame = packfile::encode_record_with_options(
+                    record,
+                    self.compress,
+                    self.checksum_policy.computes_checksum(),
+                )?;
                 #[cfg(unix)]
                 file.write_all_at(&frame, offset)?;
                 #[cfg(not(unix))]
@@ -1259,13 +1345,24 @@ impl ShardPool {
 
     /// Read a record from a specific shard at the given offset.
     ///
+    /// `verify` controls whether the frame's CRC32 is checked: pass the
+    /// pool's [`packfile::ChecksumPolicy::verifies_reads`] so `WriteOnly` and
+    /// Disabled stores skip the hashing pass on point lookups. Frames written
+    /// with [`packfile::FLAG_CRC_DISABLED`] are never verified regardless,
+    /// and each call still validates the frame's structural lengths.
+    ///
     /// # Errors
-    /// Returns `StorageError::Corrupt` on CRC mismatch or truncated frame,
-    /// `StorageError::Io` on I/O failure.
+    /// Returns `StorageError::Corrupt` on CRC mismatch (when `verify` and the
+    /// frame carries a checksum) or truncated frame, `StorageError::Io` on
+    /// I/O failure.
     ///
     /// # Panics
     /// Panics only on internal invariant violation (unreachable path).
-    pub fn read_at(shard: &Shard, offset: u64) -> Result<Record, crate::storage::StorageError> {
+    pub fn read_at(
+        shard: &Shard,
+        offset: u64,
+        verify: bool,
+    ) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
         for attempt in 0..2 {
@@ -1325,36 +1422,44 @@ impl ShardPool {
                 frame_len_bytes,
                 &mem[prefix_end..crc_pos],
                 mem[crc_pos..frame_end].try_into().unwrap(),
+                verify,
             );
         }
         unreachable!("read_at remap-retry is bounded to two iterations")
     }
 
     /// Verify and decode one complete v3 frame already bounded within an mmap.
+    /// When `verify` is false — or the frame carries
+    /// [`packfile::FLAG_CRC_DISABLED`] — the checksum is skipped, not
+    /// compared; structural validation (lengths, flags, node bytes) still runs.
     fn decode_record_frame(
         frame_len: [u8; 4],
         payload: &[u8],
         checksum: [u8; 4],
+        verify: bool,
     ) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&frame_len);
-        crc.update(payload);
-        let expected = crc.finalize();
-        let actual = u32::from_le_bytes(checksum);
-        if expected != actual {
-            return Err(StorageError::Corrupt(format!(
-                "CRC mismatch: expected {expected:08x}, got {actual:08x}"
-            )));
-        }
-
         let flags = payload[0];
-        if flags & !packfile::FLAG_COMPRESSED != 0 {
+        if flags & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED) != 0 {
             return Err(StorageError::Corrupt(format!(
                 "unsupported record flags: {flags:#04x}"
             )));
         }
+
+        if verify && flags & packfile::FLAG_CRC_DISABLED == 0 {
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&frame_len);
+            crc.update(payload);
+            let expected = crc.finalize();
+            let actual = u32::from_le_bytes(checksum);
+            if expected != actual {
+                return Err(StorageError::Corrupt(format!(
+                    "CRC mismatch: expected {expected:08x}, got {actual:08x}"
+                )));
+            }
+        }
+
         let uncompressed_len = u32::from_le_bytes(payload[1..5].try_into().unwrap());
         let mut collection_id = [0u8; 16];
         collection_id.copy_from_slice(&payload[5..21]);
@@ -1725,7 +1830,7 @@ mod tests {
         assert!(offset > 0);
 
         let shard = pool.get_shard(slot).unwrap();
-        let read = ShardPool::read_at(&shard, offset).unwrap();
+        let read = ShardPool::read_at(&shard, offset, true).unwrap();
         assert_eq!(read.collection_id[0], 0x01);
         assert_eq!(read.hash[0], 0xAA);
         assert_eq!(read.data.as_ref(), b"hello shard");
@@ -2217,14 +2322,14 @@ mod tests {
 
         let pool = ShardPool::open(dir).unwrap();
         let shard = pool.get_shard(slot).unwrap();
-        let read = ShardPool::read_at(&shard, offset).unwrap();
+        let read = ShardPool::read_at(&shard, offset, true).unwrap();
         assert_eq!(read.data.as_ref(), b"survives reopen");
 
         // Recovered shards must retain append access. Opening an existing
         // pack read-only here makes the next real import fail with EBADF.
         let appended = test_record(0x01, 0xBB, b"appends after reopen");
         let (_, appended_offset) = pool.put_record(&appended).unwrap();
-        let read = ShardPool::read_at(&shard, appended_offset).unwrap();
+        let read = ShardPool::read_at(&shard, appended_offset, true).unwrap();
         assert_eq!(read.data.as_ref(), b"appends after reopen");
     }
 
@@ -2567,7 +2672,7 @@ mod tests {
         assert_eq!(stats.bytes_written, record.serialized_len() as u64);
         assert_eq!(stats.sync_count, 0);
 
-        ShardPool::read_at(&shard, offset).unwrap();
+        ShardPool::read_at(&shard, offset, true).unwrap();
 
         pool.sync_dirty().unwrap();
         let stats = shard.stats();

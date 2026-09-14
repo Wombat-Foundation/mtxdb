@@ -63,10 +63,58 @@ pub const MAX_RECORD_LEN: u32 = 64 * 1024;
 /// Per-frame flag: `data` is zstd-compressed on disk; decompress to
 /// `uncompressed_len` bytes before returning it to the caller.
 ///
-/// `pub(crate)` so `shard.rs`'s `mmap`-based inline frame parser (which
-/// duplicates this module's frame layout for zero-copy reads) can share
+/// Public because inspection/recovery tooling needs to interpret the flag
+/// bits of arbitrary frames and `shard.rs`'s `mmap`-based inline frame parser
+/// (which duplicates this module's frame layout for zero-copy reads) shares
 /// the same flag bit instead of hardcoding it.
-pub(crate) const FLAG_COMPRESSED: u8 = 0x01;
+pub const FLAG_COMPRESSED: u8 = 0x01;
+
+/// Per-frame flag: the 4-byte checksum field holds zeros, not a real CRC32,
+/// and must not be verified by any reader. Written when the store was
+/// configured with [`ChecksumPolicy::Disabled`] — the flag, not the checksum
+/// value, is what signals "don't verify", because a real CRC32 can also
+/// legitimately be zero and a Full-mode reader must never treat a
+/// CRC-disabled frame as corrupt.
+pub const FLAG_CRC_DISABLED: u8 = 0x02;
+
+/// How much of the per-frame CRC32 this store writes and verifies.
+///
+/// Frames are always *formatted* with a 4-byte checksum field (the framing
+/// is fixed); the policy controls whether that field is a real checksum and
+/// whether readers check it:
+///
+/// * `Full` (default) — every written record gets a CRC32, every read
+///   verifies it. Catches torn writes mid-file and silent bit-rot per record.
+/// * `WriteOnly` — records keep their CRC32 (so scanning/recovery tooling
+///   can still verify them), but point-lookup reads skip the hashing pass. A
+///   corrupt-but-plausibly-framed record may be returned as data.
+/// * `Disabled` — records are written with a zero checksum and the
+///   [`FLAG_CRC_DISABLED`] flag; nothing is computed or verified anywhere.
+///   Every such frame is permanently unverifiable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChecksumPolicy {
+    /// Every written record gets a CRC32 and every read verifies it (default).
+    Full,
+    /// Records keep their CRC32, but point-lookup reads skip hashing them.
+    WriteOnly,
+    /// Records are written with a zero checksum and [`FLAG_CRC_DISABLED`];
+    /// nothing is computed or verified anywhere.
+    Disabled,
+}
+
+impl ChecksumPolicy {
+    /// Whether frames written under this policy carry a real CRC32.
+    #[must_use]
+    pub fn computes_checksum(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Whether point-lookup reads under this policy hash and compare the CRC.
+    #[must_use]
+    pub fn verifies_reads(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
 
 /// Byte length of the fixed part of a v3 frame's payload, i.e. everything
 /// between the length prefix and the node bytes: 1-byte flags + 4-byte
@@ -228,7 +276,7 @@ pub fn write_record_with_options(
     record: &Record,
     compress: bool,
 ) -> io::Result<u64> {
-    let buf = encode_record_with_options(record, compress)?;
+    let buf = encode_record_with_options(record, compress, true)?;
     writer.write_all(&buf)?;
     Ok(buf.len() as u64)
 }
@@ -237,8 +285,17 @@ pub fn write_record_with_options(
 ///
 /// Kept separate from [`write_record_with_options`] so appenders which use
 /// positioned writes can retain their file cursor and avoid an `lseek` per
-/// record. The result includes the length prefix and checksum.
-pub(crate) fn encode_record_with_options(record: &Record, compress: bool) -> io::Result<Vec<u8>> {
+/// record. The result includes the length prefix and checksum. When
+/// `write_checksum` is false the frame is emitted with a zero checksum and the
+/// [`FLAG_CRC_DISABLED`] flag, per [`ChecksumPolicy::Disabled`].
+///
+/// # Errors
+/// Returns `io::Error` if the payload is too large to frame.
+pub(crate) fn encode_record_with_options(
+    record: &Record,
+    compress: bool,
+    write_checksum: bool,
+) -> io::Result<Vec<u8>> {
     let uncompressed_len =
         u32::try_from(record.data.len()).expect("record payload exceeds u32::MAX");
     let plaintext_frame_len = FRAME_FIXED_LEN
@@ -254,9 +311,14 @@ pub(crate) fn encode_record_with_options(record: &Record, compress: bool) -> io:
     let compressed = compress
         .then(|| zstd::bulk::compress(&record.data, ZSTD_LEVEL).ok())
         .flatten();
-    let (flags, node_bytes): (u8, &[u8]) = match &compressed {
+    let (base_flags, node_bytes): (u8, &[u8]) = match &compressed {
         Some(c) if c.len() < record.data.len() => (FLAG_COMPRESSED, c.as_slice()),
         _ => (0, &record.data),
+    };
+    let flags = if write_checksum {
+        base_flags
+    } else {
+        base_flags | FLAG_CRC_DISABLED
     };
 
     let frame_len = FRAME_FIXED_LEN
@@ -283,10 +345,16 @@ pub(crate) fn encode_record_with_options(record: &Record, compress: bool) -> io:
     // i.e. the bytes as written to disk (compressed, when compressed) —
     // exactly `buf`'s contents so far, hashed in one pass since CRC32
     // over one contiguous buffer is identical to the same bytes hashed
-    // via several `update` calls.
-    let mut crc = crc32fast::Hasher::new();
-    crc.update(&buf);
-    let checksum = crc.finalize();
+    // via several `update` calls. Under a period of `write_checksum ==
+    // false` the field is written as zeros (with FLAG_CRC_DISABLED set
+    // above) and no hashing pass happens at all.
+    let checksum = if write_checksum {
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&buf);
+        crc.finalize()
+    } else {
+        0
+    };
     buf.extend_from_slice(&checksum.to_le_bytes());
 
     debug_assert_eq!(
@@ -327,28 +395,32 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     let mut crc_buf = [0u8; 4];
     reader.read_exact(&mut crc_buf)?;
 
-    // Verify CRC over the bytes as written (compressed, if compressed) —
-    // before any decompression is attempted, so a corrupt frame is never
-    // fed to the decompressor.
-    let mut crc = crc32fast::Hasher::new();
-    crc.update(&len_buf);
-    crc.update(&payload);
-    let expected = crc.finalize();
-    let actual = u32::from_le_bytes(crc_buf);
-    if expected != actual {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("CRC mismatch: expected {expected:08x}, got {actual:08x}"),
-        ));
-    }
-
     let flags = payload[0];
-    if flags & !FLAG_COMPRESSED != 0 {
+    if flags & !(FLAG_COMPRESSED | FLAG_CRC_DISABLED) != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported record flags: {flags:#04x}"),
         ));
     }
+
+    // Verify CRC over the bytes as written (compressed, if compressed) —
+    // before any decompression is attempted, so a corrupt frame is never
+    // fed to the decompressor. Frames carrying FLAG_CRC_DISABLED hold a
+    // zero checksum and are skipped, not compared.
+    if flags & FLAG_CRC_DISABLED == 0 {
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&len_buf);
+        crc.update(&payload);
+        let expected = crc.finalize();
+        let actual = u32::from_le_bytes(crc_buf);
+        if expected != actual {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CRC mismatch: expected {expected:08x}, got {actual:08x}"),
+            ));
+        }
+    }
+
     let uncompressed_len = u32::from_le_bytes(payload[1..5].try_into().unwrap());
     let mut collection_id = [0u8; 16];
     collection_id.copy_from_slice(&payload[5..21]);
@@ -460,7 +532,7 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
     reader.read_exact(&mut fixed)?;
 
     let flags = fixed[0];
-    if flags & !FLAG_COMPRESSED != 0 {
+    if flags & !(FLAG_COMPRESSED | FLAG_CRC_DISABLED) != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported record flags: {flags:#04x}"),
@@ -492,20 +564,31 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&fixed[21..37]);
 
-    let mut crc = crc32fast::Hasher::new();
-    crc.update(&len_buf);
-    crc.update(&fixed);
+    let mut crc = if flags & FLAG_CRC_DISABLED == 0 {
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&len_buf);
+        crc.update(&fixed);
+        Some(crc)
+    } else {
+        None
+    };
 
     // frame_len >= FRAME_FIXED_LEN is guaranteed by the range check above.
     let mut remaining: usize = frame_len
         .checked_sub(FRAME_FIXED_LEN)
         .expect("frame_len >= FRAME_FIXED_LEN, checked above")
         as usize;
+
+    // For a CRC-disabled frame the checksum field is zero and unused; the
+    // payload still must be consumed to advance the stream, just without the
+    // hashing pass.
     let mut discard = [0u8; SCAN_DISCARD_BUF_LEN];
     while remaining > 0 {
         let chunk_len = remaining.min(discard.len());
         reader.read_exact(&mut discard[..chunk_len])?;
-        crc.update(&discard[..chunk_len]);
+        if let Some(crc) = &mut crc {
+            crc.update(&discard[..chunk_len]);
+        }
         remaining = remaining
             .checked_sub(chunk_len)
             .expect("chunk_len <= remaining by construction (min above)");
@@ -513,13 +596,15 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
 
     let mut crc_buf = [0u8; 4];
     reader.read_exact(&mut crc_buf)?;
-    let expected = crc.finalize();
-    let actual = u32::from_le_bytes(crc_buf);
-    if expected != actual {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("CRC mismatch: expected {expected:08x}, got {actual:08x}"),
-        ));
+    if let Some(crc) = crc {
+        let expected = crc.finalize();
+        let actual = u32::from_le_bytes(crc_buf);
+        if expected != actual {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CRC mismatch: expected {expected:08x}, got {actual:08x}"),
+            ));
+        }
     }
 
     Ok(Some(RecordMetadata {
@@ -1110,6 +1195,68 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let result = read_record(&mut cursor);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_without_checksum_sets_flag_and_zeroes_checksum() {
+        let record = test_record_raw([0xbb; 16], b"unverified payload");
+        let buf = encode_record_with_options(&record, false, false).unwrap();
+
+        // flags byte sits right after the u32 length prefix.
+        let flags = buf[4];
+        assert_eq!(flags & FLAG_CRC_DISABLED, FLAG_CRC_DISABLED);
+        assert_eq!(flags & FLAG_COMPRESSED, 0);
+
+        // The 4 trailing bytes are the checksum field — must be zero.
+        let checksum = u32::from_le_bytes(buf[buf.len() - 4..].try_into().unwrap());
+        assert_eq!(checksum, 0);
+    }
+
+    #[test]
+    fn test_read_skips_crc_for_crc_disabled_frames() {
+        let record = test_record_raw([0xcc; 16], b"unverified payload");
+        let mut buf = encode_record_with_options(&record, false, false).unwrap();
+
+        // Corrupt the payload region of a CRC-disabled frame: the reader must
+        // not compare anything (the checksum field is zero), so the record
+        // still decodes — with the tampered bytes surfacing as data.
+        let node_bytes_start = 4 + FRAME_FIXED_LEN as usize;
+        let corrupt_at = node_bytes_start + 2;
+        let mut expected = b"unverified payload".to_vec();
+        expected[2] ^= 0xff;
+        buf[corrupt_at] ^= 0xff;
+
+        let mut cursor = Cursor::new(&buf);
+        let got = read_record(&mut cursor).unwrap().expect("must decode");
+        assert_eq!(got.data.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_read_still_verifies_when_only_the_checksum_flag_is_set_on_a_valid_frame() {
+        // A frame written WITHOUT the disabled flag must keep failing reads
+        // when its payload is still tampered with — verification must not be
+        // accidentally skipped just because `FLAG_CRC_DISABLED` exists.
+        let record = test_record_raw([0xdd; 16], b"verified payload");
+        let mut buf = encode_record_with_options(&record, false, true).unwrap();
+        buf[41] ^= 0xff;
+
+        let mut cursor = Cursor::new(&buf);
+        let result = read_record(&mut cursor);
+        assert!(result.is_err(), "valid frames must still be verified");
+    }
+
+    #[test]
+    fn test_write_record_with_options_keeps_full_checksums() {
+        // The public write path stays on Full policy: frames carry the flag
+        // clear and a real CRC, which `read_record` accepts.
+        let record = test_record_raw([0xee; 16], b"still verified");
+        let mut buf = Vec::new();
+        write_record_with_options(&mut buf, &record, false).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let got = read_record(&mut cursor).unwrap().expect("must decode");
+        assert_eq!(got.data.as_ref(), b"still verified");
+        assert_eq!(buf[4] & FLAG_CRC_DISABLED, 0);
     }
 
     #[test]
