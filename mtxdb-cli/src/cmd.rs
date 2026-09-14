@@ -115,9 +115,12 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             text,
             raw,
         } => cmd_get(cli, collection.as_deref(), id, *text, *raw),
-        Commands::Collections { all, layout, sort } => {
-            cmd_collections(cli, *all, *layout, sort.as_deref())
-        }
+        Commands::Collections {
+            all,
+            layout,
+            sort,
+            limit,
+        } => cmd_collections(cli, *all, *layout, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Info { collection } => cmd_info(cli, collection),
         Commands::Scan { selector } => cmd_scan(cli, selector),
@@ -366,7 +369,13 @@ fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
         .collect())
 }
 
-fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
+fn cmd_collections(
+    cli: &Cli,
+    all: bool,
+    layout: bool,
+    sort: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<()> {
     if all {
         let db_layout = open_layout(cli)?;
         for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
@@ -375,11 +384,11 @@ fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> an
                 println!();
             }
             print_section_header(shard_type);
-            cmd_collections_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort)?;
+            cmd_collections_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort, limit)?;
         }
         return Ok(());
     }
-    cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, sort)
+    cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, sort, limit)
 }
 
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
@@ -388,7 +397,12 @@ fn cmd_collections(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> an
     clippy::too_many_lines,
     reason = "the command intentionally keeps its table construction and summary together"
 )]
-fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
+fn cmd_collections_in_dir(
+    dir: &Path,
+    layout: bool,
+    sort: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<()> {
     // The persisted collection directory is a fast listing snapshot, not proof
     // that the shard files are readable by this binary. Validate the small
     // immutable header of every shard before trusting it, so a pre-cutover
@@ -477,7 +491,9 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
-    for (i, (collection_id, nodes, memory)) in ordered {
+    let total_rows = ordered.len();
+    let max_rows = usize::try_from(limit).unwrap_or(usize::MAX);
+    for (i, (collection_id, nodes, memory)) in ordered.into_iter().take(max_rows) {
         let hex = hex_encode(collection_id);
         let shards = collection_shards
             .as_ref()
@@ -551,6 +567,9 @@ fn cmd_collections_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyho
             .filter(|s| s.pack_bytes.len() > 1)
             .count();
         println!("physical layout: {spread} collection(s) span multiple packs; {total_segments} contiguous runs (includes superseded frames)");
+    }
+    if max_rows < total_rows {
+        println!("note: only showing top {max_rows}; use `-l 0` to show all");
     }
     Ok(())
 }

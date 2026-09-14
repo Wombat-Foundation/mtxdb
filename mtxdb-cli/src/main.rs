@@ -29,6 +29,7 @@ pub(crate) enum Commands {
         all: bool,
         layout: bool,
         sort: Option<String>,
+        limit: i64,
     },
     Shards {
         all: bool,
@@ -157,6 +158,7 @@ fn sub_collections() -> Command {
                 .help("List collections in every independent pool"),
         )
         .arg(layout_arg())
+        .arg(limit_arg())
         .arg(sort_arg("slot, collection, nodes, shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
 
@@ -165,6 +167,15 @@ fn layout_arg() -> Arg {
         .long("layout")
         .action(ArgAction::SetTrue)
         .help("Scan physical pack layout and show fragmentation columns and summary")
+}
+
+fn limit_arg() -> Arg {
+    Arg::new("limit")
+        .short('l')
+        .long("limit")
+        .default_value("50")
+        .value_parser(clap::value_parser!(i64))
+        .help("Maximum rows to show (default: 50; 0 or negative means unlimited)")
 }
 
 fn sort_arg(help: &'static str) -> Arg {
@@ -411,6 +422,9 @@ fn parse_cli() -> Cli {
             all: m.get_flag("all"),
             layout: m.get_flag("layout"),
             sort: m.get_one::<String>("sort").cloned(),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
         },
         Some(("shards", m)) => Commands::Shards {
             all: m.get_flag("all"),
