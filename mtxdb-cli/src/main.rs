@@ -233,7 +233,11 @@ fn sub_scan() -> Command {
             Arg::new("selector")
                 .required(true)
                 .value_name("PACK_ID|COLLECTION")
-                .help("Pack ID from `shards` (1–16 hex digits), or a 32-hex-digit collection ID"),
+                .help(
+                    "A 32-hex-digit collection ID (`0x`-prefix optional), or a pack ID from \
+                     `mtxdb shards` (1-16 hex digits, `0x`-prefix required) — e.g. `mtxdb scan \
+                     0102030405060708090a0b0c0d0e0f10` or `mtxdb scan 0x1`",
+                ),
         )
         .arg(
             Arg::new("verbose")

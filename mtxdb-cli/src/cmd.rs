@@ -1646,11 +1646,17 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
 }
 
 fn cmd_scan(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Result<()> {
-    if selector
+    // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
+    // it's `0x`-prefixed with something other than 32 hex digits after it —
+    // everything else (bare 32 hex digits, or `0x` + 32 hex digits) is a
+    // collection ID. `info` and `scan` used to disagree here (`scan`
+    // required the `0x` prefix on a collection ID; `info` didn't), which
+    // made the same selector work for one command and not the other.
+    let looks_like_pack_id = selector
         .strip_prefix("0x")
         .or_else(|| selector.strip_prefix("0X"))
-        .is_some_and(|hex| hex.len() == 32)
-    {
+        .is_some_and(|hex| hex.len() != 32);
+    if !looks_like_pack_id {
         return cmd_scan_collection(cli, selector, verbose, limit);
     }
     let pack_id = parse_pack_id_selector(selector)?;
