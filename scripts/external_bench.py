@@ -179,6 +179,8 @@ def print_table(rows: list[dict]) -> None:
             f"{engine:>7}  "
             + "  ".join(cell.rjust(widths[i]) for i, cell in enumerate(cells))
         )
+    print()
+    print("this is the default 0.1 GB run; rerun with MTXDB_BENCH_EXT_GB=0.2 for a bigger sample")
 
 
 def main() -> None:
