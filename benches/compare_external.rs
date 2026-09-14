@@ -539,14 +539,14 @@ fn run_backend(backend: Backend, target_gb: f64) {
     let label = label.trim_end_matches('0').trim_end_matches('.');
     let loop_part = run
         .append_loop_ms
-        .map_or(String::new(), |v| format!(" APPEND_LOOP_MS={v:.1}"));
+        .map_or(String::new(), |v| format!(" APPEND_LOOP_MS={v:.2}"));
     let sync_all_part = run
         .append_sync_all_ms
-        .map_or(String::new(), |v| format!(" APPEND_SYNC_ALL_MS={v:.1}"));
+        .map_or(String::new(), |v| format!(" APPEND_SYNC_ALL_MS={v:.2}"));
     println!(
-        "bench: external ENG={} L={label}gb N={nodes} WRITE_MS={:.1} WARM_OPEN_MS={:.1} \
-         COLD_OPEN_MS={:.1} LOOKUP_US={:.1} APPEND={APPEND_RECORDS} APPEND_MS={:.1} \
-         APPEND_PUTS_MS={:.1} APPEND_SYNC_MS={:.1}{loop_part}{sync_all_part} \
+        "bench: external ENG={} L={label}gb N={nodes} WRITE_MS={:.1} WARM_OPEN_MS={:.2} \
+         COLD_OPEN_MS={:.2} LOOKUP_US={:.2} APPEND={APPEND_RECORDS} APPEND_MS={:.2} \
+         APPEND_PUTS_MS={:.2} APPEND_SYNC_MS={:.2}{loop_part}{sync_all_part} \
          FILES={} MEM={} MEM_LABEL={}",
         backend.name(),
         run.write_ms,
