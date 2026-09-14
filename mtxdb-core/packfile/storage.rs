@@ -1145,8 +1145,7 @@ impl PackfileStorage {
             let delta_started = std::time::Instant::now();
             let log = delta::read_delta_log(&delta_path);
             let delta_meta = std::fs::metadata(&delta_path)
-                .map(|m| format!("len={}", m.len()))
-                .unwrap_or_else(|_| "absent".to_owned());
+                .map_or_else(|_| "absent".to_owned(), |m| format!("len={}", m.len()));
             let trusted = log.as_ref().is_some_and(|log| {
                 eprintln!(
                     "DBG replay gate ckpt={} local={} base={} tail={} frames={} ckpt_gens={} delta=[{}]",
@@ -1164,7 +1163,7 @@ impl PackfileStorage {
                         ckpt_generations.get(&frame.collection_id) == Some(&frame.generation)
                     })
             });
-            if !log.as_ref().is_some() {
+            if log.as_ref().is_none() {
                 eprintln!(
                     "DBG gate no-delta-file delta=[{delta_meta}] ckpt={} local={}",
                     checkpoint.fingerprint, local_fingerprint
@@ -3992,15 +3991,28 @@ impl PackfileStorage {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return;
         }
+        let decide = {
+            let s = self.delta_state.lock();
+            (s.invalid, s.base_fingerprint, s.pending.len(), s.log_bytes)
+        };
         if self.delta_state_needs_full_rewrite() {
+            eprintln!(
+                "DBG sync decide REWRITE invalid={} base={:?} pending={} log_bytes={}",
+                decide.0, decide.1, decide.2, decide.3
+            );
             let checkpoint_started = std::time::Instant::now();
             self.persist_index_checkpoint_best_effort();
             timings.checkpoint = checkpoint_started.elapsed();
             return;
         }
+        eprintln!(
+            "DBG sync decide APPEND invalid={} base={:?} pending={} log_bytes={}",
+            decide.0, decide.1, decide.2, decide.3
+        );
         // The frames were recorded against the pack set the preceding flush
         // made durable, so the tail fingerprint is computed after that flush.
         let tail_fingerprint = self.current_pack_fingerprint();
+        eprintln!("DBG sync append tail={tail_fingerprint}");
         let delta_started = std::time::Instant::now();
         if let Err(error) = self.append_index_delta(tail_fingerprint) {
             // An append failure took the frames with it, so the pending state
