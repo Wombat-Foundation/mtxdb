@@ -131,13 +131,16 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
     let mut tail_fingerprint: Option<u64> = None;
     let mut offset = DELTA_LOG_HEADER_LEN;
     while offset < buf.len() {
-        if buf.len() - offset < DELTA_BATCH_HEADER_LEN {
+        if buf.len().saturating_sub(offset) < DELTA_BATCH_HEADER_LEN {
             break;
         }
-        if &buf[offset..offset + 4] != DELTA_BATCH_MAGIC {
+        if &buf[offset..offset.saturating_add(4)] != DELTA_BATCH_MAGIC {
             break;
         }
-        let frame_count = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let Some(header_count) = buf.get(offset.saturating_add(4)..offset.saturating_add(8)) else {
+            break;
+        };
+        let frame_count = u32::from_le_bytes(header_count.try_into().ok()?) as usize;
         let Some(batch_len) = batch_len(frame_count) else {
             break;
         };
@@ -148,19 +151,17 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
             // Torn final batch: fewer bytes than frame_count frames + trailer.
             break;
         }
-        let frames_start = offset + DELTA_BATCH_HEADER_LEN;
-        let trailer_start = frames_start + frame_count * DELTA_FRAME_LEN;
-        if &buf[trailer_start..trailer_start + 4] != DELTA_LOG_TRAILER_MAGIC {
+        let frames_start = offset.saturating_add(DELTA_BATCH_HEADER_LEN);
+        let trailer_start = batch_end.saturating_sub(DELTA_LOG_TRAILER_LEN);
+        if &buf[trailer_start..trailer_start.saturating_add(4)] != DELTA_LOG_TRAILER_MAGIC {
             break;
         }
-        for index in 0..frame_count {
-            let frame_start = frames_start + index * DELTA_FRAME_LEN;
-            frames.push(DeltaFrame::decode(
-                &buf[frame_start..frame_start + DELTA_FRAME_LEN],
-            )?);
+        for frame_bytes in buf[frames_start..trailer_start].chunks_exact(DELTA_FRAME_LEN) {
+            frames.push(DeltaFrame::decode(frame_bytes)?);
         }
         tail_fingerprint = Some(u64::from_le_bytes(
-            buf[trailer_start + TRAILER_FINGERPRINT_OFFSET..trailer_start + 16]
+            buf[trailer_start.saturating_add(TRAILER_FINGERPRINT_OFFSET)
+                ..trailer_start.saturating_add(16)]
                 .try_into()
                 .ok()?,
         ));
@@ -196,16 +197,16 @@ pub fn append_batch(
         .open(path)?;
     if write_header {
         file.write_all(&encode_header(base_fingerprint))?;
-        appended += DELTA_LOG_HEADER_LEN;
+        appended = appended.saturating_add(DELTA_LOG_HEADER_LEN);
     }
     file.write_all(&encode_batch_header(frame_count))?;
-    appended += DELTA_BATCH_HEADER_LEN;
+    appended = appended.saturating_add(DELTA_BATCH_HEADER_LEN);
     for frame in frames {
         file.write_all(&frame.encode())?;
-        appended += DELTA_FRAME_LEN;
+        appended = appended.saturating_add(DELTA_FRAME_LEN);
     }
     file.write_all(&encode_trailer(tail_fingerprint))?;
-    appended += DELTA_LOG_TRAILER_LEN;
+    appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
     file.sync_all()?;
     Ok(appended)
 }
@@ -217,7 +218,12 @@ pub fn append_batch(
 #[derive(Debug, PartialEq, Eq)]
 pub enum DeltaReplayError {
     /// A frame targets a bucket outside the checkpoint index's capacity.
-    FrameOutOfBounds { bucket: u32, capacity: u32 },
+    FrameOutOfBounds {
+        /// The frame's target bucket.
+        bucket: u32,
+        /// The checkpoint index's capacity.
+        capacity: u32,
+    },
     /// Replay requires an owned (materialized) slot array.
     RequiresOwnedIndex,
 }

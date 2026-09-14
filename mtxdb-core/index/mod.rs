@@ -243,6 +243,9 @@ impl LossyIndex {
     /// # Errors
     /// Returns `InsertError::TableFull` under the same conditions as
     /// [`Self::insert`] (the table is left unmodified).
+    // `bucket` is always below `self.capacity`, which is capped at `u32::MAX`
+    // by construction, so the `as u32` narrowings below never truncate.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn insert_tracked(
         &self,
         hash: &[u8; 16],
