@@ -97,6 +97,17 @@ def run_bench() -> None:
     with LATEST.open("wb") as out:
         for engine in ENGINES:
             env = {**os.environ, "MTXDB_BENCH_EXT_ENGINE": engine}
+            # MTXDB_BENCH_CHECKSUM=disabled is this bench's own opt-out knob,
+            # named separately from the engine's MTXDB_CHECKPOINT_CHECKSUM so
+            # a benchmark run can ask for it explicitly without anyone having
+            # to know the engine's own env var name. It only ever relaxes
+            # mtxdb's read-time checkpoint CRC32 verification (WriteOnly:
+            # still written on every checkpoint, just not re-verified on
+            # open) — it can't be used to silently weaken the default, since
+            # it has no effect unless this script is invoked with it set.
+            # Meaningless for mdbx/sqlite; harmless to pass either way.
+            if os.environ.get("MTXDB_BENCH_CHECKSUM") == "disabled":
+                env["MTXDB_CHECKPOINT_CHECKSUM"] = "writeonly"
             proc = subprocess.run(
                 BENCH_CMD,
                 cwd=ROOT,
@@ -209,6 +220,12 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
             f"ran with MTXDB_BENCH_EXT_GB= {os.environ.get('MTXDB_BENCH_EXT_GB')} GB"
         )
     print(_footer)
+    if os.environ.get("MTXDB_BENCH_CHECKSUM") == "disabled":
+        print(
+            "MTXDB_BENCH_CHECKSUM=disabled: mtxdb's read-time checkpoint "
+            "CRC32 verification is off for this run (warm/cold open faster, "
+            "less safe) — the engine's own default stays on"
+        )
 
 
 def main() -> None:
