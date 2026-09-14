@@ -110,6 +110,11 @@ const PAYLOAD_BYTES: usize = 1024;
 const COLLECTIONS: usize = 32;
 const LOOKUP_SAMPLES: usize = 100_000;
 const APPEND_RECORDS: usize = 1_000;
+/// Small post-growth transactions used to measure the steady-state delta-log
+/// path separately from the first append, which may legitimately resize an
+/// index and therefore require a full checkpoint rewrite.
+const STEADY_APPEND_RECORDS: usize = 256;
+const STEADY_APPEND_BATCHES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -139,6 +144,8 @@ struct Run {
     append_sync_ms: f64,
     append_loop_ms: Option<f64>,
     append_sync_all_ms: Option<f64>,
+    steady_append_puts_ms: Option<f64>,
+    steady_append_sync_ms: Option<f64>,
     files: u64,
     mem: u64,
     mem_label: &'static str,
@@ -324,12 +331,49 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     store_rw.sync_all().unwrap();
     let append_sync_all_ms = append_sync_all_started.elapsed().as_secs_f64() * 1e3;
 
-    // (b) periodic durability on the real per-event path: 1k individual puts
+    // (b) The first append above can be the capacity-boundary transaction:
+    // report the ordinary append-only case separately, after that one-time
+    // grow has been checkpointed. Each small batch stays well below the new
+    // table's next 75%-load boundary and must take the delta path.
+    let mut steady_puts_ms = 0.0;
+    let mut steady_sync_ms = 0.0;
+    for batch in 0..STEADY_APPEND_BATCHES {
+        let puts_started = Instant::now();
+        for bucket in 0..COLLECTIONS {
+            let mut entries = Vec::with_capacity(STEADY_APPEND_RECORDS / COLLECTIONS + 1);
+            for i in 0..STEADY_APPEND_RECORDS {
+                let node = nodes + APPEND_RECORDS + batch * STEADY_APPEND_RECORDS + i;
+                if node % COLLECTIONS == bucket {
+                    entries.push((
+                        node_id(node),
+                        NodeData::new(bytes::Bytes::from(payload(node as u64))),
+                    ));
+                }
+            }
+            store_rw
+                .put_many(&collection_for(bucket), &entries)
+                .unwrap();
+        }
+        steady_puts_ms += puts_started.elapsed().as_secs_f64() * 1e3;
+        let sync_started = Instant::now();
+        store_rw.sync().unwrap();
+        let sync = store_rw.sync_timings().expect("sync must be timed");
+        assert!(
+            sync.delta_log > std::time::Duration::ZERO
+                && sync.checkpoint == std::time::Duration::ZERO,
+            "post-growth append must use the delta path"
+        );
+        steady_sync_ms += sync_started.elapsed().as_secs_f64() * 1e3;
+    }
+    let steady_append_puts_ms = Some(steady_puts_ms / STEADY_APPEND_BATCHES as f64);
+    let steady_append_sync_ms = Some(steady_sync_ms / STEADY_APPEND_BATCHES as f64);
+
+    // (c) periodic durability on the real per-event path: 1k individual puts
     //     with no sync in the window. The 1 s timer absorbs the fsync cost
     //     elsewhere, so this is the latency an append adds in production.
     let append_loop_started = Instant::now();
     for i in 0..APPEND_RECORDS {
-        let node = nodes + APPEND_RECORDS + i;
+        let node = nodes + APPEND_RECORDS + STEADY_APPEND_BATCHES * STEADY_APPEND_RECORDS + i;
         store_rw
             .put(
                 &collection_for(node),
@@ -355,6 +399,8 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         append_sync_ms,
         append_loop_ms: Some(append_loop_ms),
         append_sync_all_ms: Some(append_sync_all_ms),
+        steady_append_puts_ms,
+        steady_append_sync_ms,
         files,
         mem,
         mem_label,
@@ -429,6 +475,24 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
     txn.commit().unwrap();
     let append_sync_ms = append_sync_started.elapsed().as_secs_f64() * 1e3;
     let append_ms = append_puts_ms + append_sync_ms;
+
+    let mut steady_puts_ms = 0.0;
+    let mut steady_sync_ms = 0.0;
+    for batch in 0..STEADY_APPEND_BATCHES {
+        let puts_started = Instant::now();
+        let txn = db.begin_rw_txn().unwrap();
+        let table = txn.open_table(None).unwrap();
+        for i in 0..STEADY_APPEND_RECORDS {
+            let node = nodes + APPEND_RECORDS + batch * STEADY_APPEND_RECORDS + i;
+            let p = payload(node as u64);
+            txn.put(&table, node_id(node), &p, WriteFlags::empty())
+                .unwrap();
+        }
+        steady_puts_ms += puts_started.elapsed().as_secs_f64() * 1e3;
+        let sync_started = Instant::now();
+        txn.commit().unwrap();
+        steady_sync_ms += sync_started.elapsed().as_secs_f64() * 1e3;
+    }
     drop(db);
 
     if !evicted {
@@ -445,6 +509,8 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
         append_sync_ms,
         append_loop_ms: None,
         append_sync_all_ms: None,
+        steady_append_puts_ms: Some(steady_puts_ms / STEADY_APPEND_BATCHES as f64),
+        steady_append_sync_ms: Some(steady_sync_ms / STEADY_APPEND_BATCHES as f64),
         files,
         mem,
         mem_label,
@@ -525,6 +591,27 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
     tx.commit().unwrap();
     let append_sync_ms = append_sync_started.elapsed().as_secs_f64() * 1e3;
     let append_ms = append_puts_ms + append_sync_ms;
+
+    let mut steady_puts_ms = 0.0;
+    let mut steady_sync_ms = 0.0;
+    for batch in 0..STEADY_APPEND_BATCHES {
+        let puts_started = Instant::now();
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO nodes(pk, val) VALUES (?1, ?2)")
+                .unwrap();
+            for i in 0..STEADY_APPEND_RECORDS {
+                let node = nodes + APPEND_RECORDS + batch * STEADY_APPEND_RECORDS + i;
+                let p = payload(node as u64);
+                stmt.execute(params![node_id(node), p]).unwrap();
+            }
+        }
+        steady_puts_ms += puts_started.elapsed().as_secs_f64() * 1e3;
+        let sync_started = Instant::now();
+        tx.commit().unwrap();
+        steady_sync_ms += sync_started.elapsed().as_secs_f64() * 1e3;
+    }
     drop(conn);
 
     if !evicted {
@@ -541,6 +628,8 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
         append_sync_ms,
         append_loop_ms: None,
         append_sync_all_ms: None,
+        steady_append_puts_ms: Some(steady_puts_ms / STEADY_APPEND_BATCHES as f64),
+        steady_append_sync_ms: Some(steady_sync_ms / STEADY_APPEND_BATCHES as f64),
         files,
         mem,
         mem_label,
@@ -613,6 +702,12 @@ fn run_backend(backend: Backend, target_gb: f64) {
         eprintln!(
             "    ({} reports its on-disk file footprint, not an in-RAM index.)",
             backend.name()
+        );
+    }
+    if let (Some(puts), Some(sync)) = (run.steady_append_puts_ms, run.steady_append_sync_ms) {
+        eprintln!(
+            "    steady append ({STEADY_APPEND_BATCHES} × {STEADY_APPEND_RECORDS} records): puts {puts:.2}ms + sync {sync:.2}ms = {:.2}ms/batch",
+            puts + sync
         );
     }
 

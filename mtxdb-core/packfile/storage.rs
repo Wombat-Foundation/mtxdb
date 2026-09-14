@@ -10,10 +10,8 @@ use parking_lot::RwLock;
 
 use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
-use crate::index::delta::{
-    self, DELTA_BATCH_HEADER_LEN, DELTA_LOG_HEADER_LEN, DELTA_LOG_TRAILER_LEN, INDEX_DELTA_FILE,
-};
-use crate::index::format::{DeltaFrame, DELTA_FRAME_LEN};
+use crate::index::delta::{self, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
+use crate::index::format::DeltaFrame;
 use crate::index::LossyIndex;
 use crate::packfile::{self, Record};
 use crate::shard;
@@ -1932,7 +1930,16 @@ impl PackfileStorage {
         state.log_bytes = 0;
         state.invalid = false;
         drop(state);
-        let _ = fs::remove_file(Self::delta_path(&self.base_dir));
+        let path = Self::delta_path(&self.base_dir);
+        if fs::remove_file(&path).is_ok() {
+            // `write_checkpoint` has already atomically renamed the new
+            // checkpoint at this point. Sync the directory after retiring its
+            // predecessor log so the rename-then-retire ordering is durable
+            // too; a failure is still safe (the base-fingerprint gate rejects
+            // the leftover log), but a successful return need not rely on
+            // that recovery path.
+            let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        }
     }
 
     /// Append the pending delta frames as one framed, fsynced batch and clear
@@ -1953,14 +1960,60 @@ impl PackfileStorage {
                 "delta append while the log is invalidated",
             )));
         }
-        let pending = std::mem::take(&mut state.pending);
-        if pending.is_empty() {
+        if state.pending.is_empty() {
             return Err(StorageError::Io(std::io::Error::other(
                 "delta append with no pending frames",
             )));
         }
-        let write_header = state.log_bytes == 0;
         let path = Self::delta_path(&self.base_dir);
+        // A decoder deliberately stops at a torn or corrupt suffix and gives
+        // us the sealed frontier. Before extending the log, discard that
+        // suffix: appending after it would leave every new, valid batch behind
+        // bytes a future decoder correctly refuses to cross.
+        let on_disk_len = fs::metadata(&path)
+            .map_or_else(
+                |error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                },
+                |metadata| Ok(metadata.len()),
+            )
+            .map_err(StorageError::Io)?;
+        if on_disk_len < state.log_bytes {
+            return Err(StorageError::Io(std::io::Error::other(
+                "delta log shrank below its sealed frontier",
+            )));
+        }
+        if on_disk_len > state.log_bytes {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(state.log_bytes))
+                .map_err(StorageError::Io)?;
+        }
+        let write_header = state.log_bytes == 0;
+        // Do not charge a continuation for another header: the exact next
+        // physical write is either one batch, or a header plus one batch.
+        let batch_bytes = delta::batch_len(state.pending.len()).ok_or_else(|| {
+            StorageError::Io(std::io::Error::other("delta batch length overflow"))
+        })?;
+        let next_len = state
+            .log_bytes
+            .saturating_add(u64::try_from(batch_bytes).unwrap_or(u64::MAX))
+            .saturating_add(if write_header {
+                DELTA_LOG_HEADER_LEN as u64
+            } else {
+                0
+            });
+        if next_len > DELTA_LOG_CAP_BYTES {
+            return Err(StorageError::Io(std::io::Error::other(
+                "delta log cap reached",
+            )));
+        }
+        let pending = std::mem::take(&mut state.pending);
         let appended = delta::append_batch(
             &path,
             write_header,
@@ -3904,6 +3957,7 @@ impl StorageEngine for PackfileStorage {
         // does, so any pending delta frames are no longer replayable against
         // the checkpoint they were recorded against.
         self.invalidate_delta_log();
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         // Keep lock entries for the storage lifetime. Removing an entry while
         // a caller still owns its Arc permits a later put to obtain a second
         // mutex and bypass this deletion's serialization.
@@ -3968,13 +4022,17 @@ impl PackfileStorage {
         if state.invalid || state.base_fingerprint.is_none() || state.pending.is_empty() {
             return true;
         }
-        let pending_bytes = (state.pending.len() as u64).saturating_mul(DELTA_FRAME_LEN as u64);
+        let Some(batch_bytes) = delta::batch_len(state.pending.len()) else {
+            return true;
+        };
         state
             .log_bytes
-            .saturating_add(pending_bytes)
-            .saturating_add(DELTA_LOG_HEADER_LEN as u64)
-            .saturating_add(DELTA_BATCH_HEADER_LEN as u64)
-            .saturating_add(DELTA_LOG_TRAILER_LEN as u64)
+            .saturating_add(u64::try_from(batch_bytes).unwrap_or(u64::MAX))
+            .saturating_add(if state.log_bytes == 0 {
+                DELTA_LOG_HEADER_LEN as u64
+            } else {
+                0
+            })
             > DELTA_LOG_CAP_BYTES
     }
 
