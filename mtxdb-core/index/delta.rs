@@ -307,6 +307,16 @@ pub enum DeltaReplayError {
     },
     /// Replay requires an owned (materialized) slot array.
     RequiresOwnedIndex,
+    /// A frame carried the empty-slot sentinel (`0`). A legitimate insert
+    /// never produces one — `record_delta` only ever logs a freshly built,
+    /// non-empty `IndexSlot` — so this can only be log corruption or a
+    /// structurally invalid frame. Storing it as-is would silently erase
+    /// whatever live entry currently occupies that bucket and truncate the
+    /// probe chain past it, stranding any entries beyond it.
+    EmptySlot {
+        /// The frame's target bucket.
+        bucket: u32,
+    },
 }
 
 impl std::fmt::Display for DeltaReplayError {
@@ -319,6 +329,12 @@ impl std::fmt::Display for DeltaReplayError {
                 )
             }
             Self::RequiresOwnedIndex => write!(f, "delta replay requires an owned index"),
+            Self::EmptySlot { bucket } => {
+                write!(
+                    f,
+                    "delta frame at bucket {bucket} carries the empty-slot sentinel"
+                )
+            }
         }
     }
 }

@@ -363,8 +363,9 @@ impl LossyIndex {
     ///
     /// # Errors
     /// Returns `DeltaReplayError` if a frame targets a bucket outside this
-    /// index's capacity (a structurally inconsistent log, rejected wholesale)
-    /// or the index is still mmap-backed.
+    /// index's capacity, or carries the empty-slot sentinel (either is a
+    /// structurally inconsistent log, rejected wholesale), or the index is
+    /// still mmap-backed.
     pub fn replay_frames(&self, frames: &[DeltaFrame]) -> Result<(), DeltaReplayError> {
         let SlotStorage::Owned(slots) = &self.slots else {
             return Err(DeltaReplayError::RequiresOwnedIndex);
@@ -377,8 +378,18 @@ impl LossyIndex {
                     capacity: self.capacity,
                 });
             }
+            if frame.slot == 0 {
+                // A legitimate insert never logs the empty sentinel (see
+                // `record_delta`'s only caller). Storing it here would erase
+                // whatever live entry currently occupies this bucket and cut
+                // the probe chain short for anything beyond it — reject the
+                // whole log instead of silently losing data.
+                return Err(DeltaReplayError::EmptySlot {
+                    bucket: frame.bucket,
+                });
+            }
             let previous = slots[bucket].load(Ordering::Acquire);
-            if previous == 0 && frame.slot != 0 {
+            if previous == 0 {
                 self.len.fetch_add(1, Ordering::Relaxed);
             }
             slots[bucket].store(frame.slot, Ordering::Release);
@@ -963,6 +974,37 @@ mod tests {
             checkpoint.lookup_all(&first).collect::<Vec<_>>(),
             vec![(0, 100), (0, 200)]
         );
+    }
+
+    #[test]
+    fn replay_rejects_a_frame_carrying_the_empty_sentinel() {
+        let mut hash = [0u8; 16];
+        hash[15] = 1;
+
+        let checkpoint_source = LossyIndex::new(16);
+        let (bucket, _slot) = checkpoint_source.insert_tracked(&hash, 0, 100).unwrap();
+        let checkpoint = LossyIndex::deserialize(&checkpoint_source.serialize()).unwrap();
+        let occupied_before = checkpoint.len();
+
+        // A structurally-framed but invalid delta frame claiming the empty
+        // sentinel for an already-occupied bucket must be rejected wholesale,
+        // not silently applied — applying it would erase the live entry and
+        // truncate the probe chain past it.
+        let err = checkpoint
+            .replay_frames(&[DeltaFrame {
+                collection_id: [0; 16],
+                bucket,
+                generation: 0,
+                slot: 0,
+            }])
+            .unwrap_err();
+        assert!(matches!(err, DeltaReplayError::EmptySlot { bucket: b } if b == bucket));
+
+        // The index must be left untouched: an owned clone is made before
+        // replay, so this checks the caller's rescan fallback has a live
+        // checkpoint copy to fall back to, not a partially-erased one.
+        assert_eq!(checkpoint.len(), occupied_before);
+        assert_eq!(checkpoint.lookup(&hash), Some((0, 100)));
     }
 
     #[test]
