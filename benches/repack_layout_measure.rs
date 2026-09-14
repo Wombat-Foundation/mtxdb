@@ -2,7 +2,7 @@
 //! (`mtxdb shards --layout`'s runs / excess-runs metric) and verify that a
 //! batch repack consolidates each collection into a single contiguous run.
 //!
-//! Run with `cargo bench --bench repack_layout_measure`.
+//! Run with `cargo bench --package mtxdb-core --bench repack_layout_measure`.
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::pedantic,
@@ -103,6 +103,7 @@ fn report_interleave_vs_repack() {
         "POST-REPACK: runs={runs_post}  excess={excess_post}  largest_run={largest_post} bytes"
     );
 
+    drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

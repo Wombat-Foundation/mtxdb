@@ -24,24 +24,24 @@ CSV_DIR = ROOT / "benches" / "csv"
 LATEST = CSV_DIR / "latest-external.txt"
 
 METRICS = [
-    ("write_ms", "bulk write"),
-    ("warm_open_ms", "warm open"),
-    ("cold_open_ms", "cold open"),
-    ("lookup_us", "point lookup"),
-    ("append_ms", "grow append"),
-    ("append_sync_ms", "grow sync"),
-    ("steady_append_ms", "steady append"),
-    ("steady_append_sync_ms", "steady sync"),
-    ("files_bytes", "on-disk bytes"),
-    ("mem_bytes", "index size"),
+    ("write_ms", "bulk write (ms)"),
+    ("warm_open_ms", "warm open (ms)"),
+    ("cold_open_ms", "cold open (ms)"),
+    ("lookup_us", "point lookup (μs)"),
+    ("append_ms", "grow append (ms)"),
+    ("append_sync_ms", "grow sync (ms)"),
+    ("steady_append_ms", "steady append (ms)"),
+    ("steady_append_sync_ms", "steady sync (ms)"),
+    ("files_bytes", "on-disk bytes ~"),
+    ("mem_bytes", "index size ~"),
     # PSS (proportional set size, /proc/self/smaps_rollup) is the one memory
     # number captured identically for all three engines, so it is the
     # cross-engine-comparable column; "index size" above is not (see its
     # mem_label: resident index bytes for mtxdb, on-disk file bytes for
     # mdbx/sqlite). "mem open" is sampled right after the warm open, before
     # any lookups touch pages; "mem warm" after the sampled lookup pass.
-    ("pss_open_bytes", "mem open"),
-    ("pss_warm_bytes", "mem warm"),
+    ("pss_open_bytes", "mem open ~"),
+    ("pss_warm_bytes", "mem warm ~"),
 ]
 
 
@@ -52,7 +52,6 @@ def _human_bytes(value: int) -> str:
         if size < 1024 or unit == "GB":
             return f"{size:.1f}{unit}"
         size /= 1024
-    return f"{value}"
 
 
 BENCH_CMD = [
@@ -65,6 +64,20 @@ BENCH_CMD = [
 ]
 
 ENGINES = ("mtxdb", "mdbx", "sqlite")
+
+
+def validate_rows(rows: list[dict]) -> None:
+    """Reject partial captures instead of publishing an incomplete comparison."""
+    engines = {row["engine"] for row in rows}
+    if engines != set(ENGINES):
+        missing = ", ".join(sorted(set(ENGINES) - engines))
+        raise ValueError(f"external capture is incomplete; missing engines: {missing}")
+    labels = {row["label"] for row in rows}
+    if len(labels) != 1:
+        raise ValueError(
+            "external capture contains multiple sizes; "
+            "run one MTXDB_BENCH_EXT_GB size at a time"
+        )
 
 
 def run_bench() -> None:
@@ -128,14 +141,9 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
     engines = ["mtxdb", "mdbx", "sqlite"]
     columns = [m[1] for m in METRICS]
 
-    # Keep the terminal summary compact now that it shows both the structural
-    # grow cost and the ordinary steady-state append cost. Metric labels are
-    # intentionally two words at most, so render them as a two-line header
-    # without widening a column for the combined phrase.
-    header_rows = [
-        tuple(label.split(maxsplit=1)) if " " in label else ("", label)
-        for label in columns
-    ]
+    # Each space-separated word occupies its own header line, keeping units
+    # and approximation markers off the metric-name row.
+    header_rows = [tuple(label.split(" ")) for label in columns]
 
     def cell(engine: str, metric: str) -> str:
         value = latest[engine][metric]
@@ -178,6 +186,11 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
         + "  "
         + "  ".join(header_rows[i][1].rjust(widths[i]) for i in range(len(columns)))
     )
+    print(
+        "".rjust(7)
+        + "  "
+        + "  ".join(header_rows[i][2].rjust(widths[i]) for i in range(len(columns)))
+    )
     print()
     for engine, cells in zip(engines, values):
         print(
@@ -219,8 +232,11 @@ def main() -> None:
         raise SystemExit(f"{LATEST} missing; run without --no-run first")
     scenario = external_scenario(LATEST.read_text(encoding="utf-8"))
     if not scenario.rows:
-        print("warning: no `bench: external` rows parsed from the run", file=sys.stderr)
-        return
+        raise SystemExit("no `bench: external` rows parsed from the run")
+    try:
+        validate_rows(scenario.rows)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if args.append:
         append_rows(scenario)
     # `--no-run` reuses a capture from another invocation. Its size setting

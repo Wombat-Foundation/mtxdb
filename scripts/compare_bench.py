@@ -669,6 +669,18 @@ def parse_current(path: Path) -> list[Scenario]:
     ext = external_scenario(output)
     if ext.rows:
         engines = {row["engine"] for row in ext.rows}
+        expected_engines = {"mtxdb", "mdbx", "sqlite"}
+        if engines != expected_engines:
+            missing = sorted(expected_engines - engines)
+            unexpected = sorted(engines - expected_engines)
+            details = []
+            if missing:
+                details.append(f"missing: {', '.join(missing)}")
+            if unexpected:
+                details.append(f"unexpected: {', '.join(unexpected)}")
+            raise ValueError(
+                "incomplete external comparison output (" + "; ".join(details) + ")"
+            )
         for eng in engines:
             eng_labels = {row["label"] for row in ext.rows if row["engine"] == eng}
             missing = sorted(DEFAULT_EXT_LABELS - eng_labels)
@@ -877,9 +889,9 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
 
-    if args.machine:
-        for scenario in scenarios:
-            scenario.with_machine(args.machine)
+    machine = args.machine or get_git_sha()
+    for scenario in scenarios:
+        scenario.with_machine(machine)
 
     if args.csv_dir:
         for scenario in scenarios:
