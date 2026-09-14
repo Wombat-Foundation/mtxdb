@@ -355,26 +355,31 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
     // ── Warm open + sampled point lookups ──
     let started = Instant::now();
     let db: Database<NoWriteMap> = Database::open(dir).unwrap();
+    let txn = db.begin_ro_txn().unwrap();
+    let table = txn.open_table(None).unwrap();
     let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
     let lookup_started = Instant::now();
-    {
-        let txn = db.begin_ro_txn().unwrap();
-        let table = txn.open_table(None).unwrap();
-        for node in 0..LOOKUP_SAMPLES.min(nodes) {
-            let key = node_id(node);
-            assert!(
-                txn.get::<Cow<'_, [u8]>>(&table, &key).unwrap().is_some(),
-                "every written key must be readable back"
-            );
-        }
+    for node in 0..LOOKUP_SAMPLES.min(nodes) {
+        let key = node_id(node);
+        assert!(
+            txn.get::<Cow<'_, [u8]>>(&table, &key).unwrap().is_some(),
+            "every written key must be readable back"
+        );
     }
     let lookup_us = lookup_started.elapsed().as_secs_f64() * 1e6 / LOOKUP_SAMPLES.min(nodes) as f64;
+    drop(table);
+    drop(txn);
     drop(db);
 
     // ── Cold open + append ──
     let evicted = drop_caches_for_dir(dir);
     let started = Instant::now();
     let db: Database<NoWriteMap> = Database::open(dir).unwrap();
+    {
+        let txn = db.begin_ro_txn().unwrap();
+        let table = txn.open_table(None).unwrap();
+        drop(table);
+    }
     let cold_open_ms = started.elapsed().as_secs_f64() * 1e3;
 
     let append_puts_started = Instant::now();
@@ -450,24 +455,24 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
     // ── Warm open + sampled point lookups ──
     let started = Instant::now();
     let conn = Connection::open(&db_path).unwrap();
+    let mut stmt = conn.prepare("SELECT val FROM nodes WHERE pk=?1").unwrap();
     let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
     let lookup_started = Instant::now();
-    {
-        let mut stmt = conn.prepare("SELECT val FROM nodes WHERE pk=?1").unwrap();
-        for node in 0..LOOKUP_SAMPLES.min(nodes) {
-            let row: Vec<u8> = stmt
-                .query_row(params![node_id(node)], |row| row.get(0))
-                .unwrap();
-            assert!(!row.is_empty(), "every written value must be readable back");
-        }
+    for node in 0..LOOKUP_SAMPLES.min(nodes) {
+        let row: Vec<u8> = stmt
+            .query_row(params![node_id(node)], |row| row.get(0))
+            .unwrap();
+        assert!(!row.is_empty(), "every written value must be readable back");
     }
     let lookup_us = lookup_started.elapsed().as_secs_f64() * 1e6 / LOOKUP_SAMPLES.min(nodes) as f64;
+    drop(stmt);
     drop(conn);
 
     // ── Cold open + append ──
     let evicted = drop_caches_for_dir(dir);
     let started = Instant::now();
     let conn = Connection::open(&db_path).unwrap();
+    drop(conn.prepare("SELECT val FROM nodes WHERE pk=?1").unwrap());
     let cold_open_ms = started.elapsed().as_secs_f64() * 1e3;
 
     let append_puts_started = Instant::now();
