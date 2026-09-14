@@ -51,361 +51,488 @@
 <a href=#51 id=51 data-nosnippet>51</a><span class="doccomment">/// Bytes in one batch trailer: magic(4) + reserved(4) + tail fingerprint(8).
 <a href=#52 id=52 data-nosnippet>52</a></span><span class="kw">pub const </span>DELTA_LOG_TRAILER_LEN: usize = <span class="number">16</span>;
 <a href=#53 id=53 data-nosnippet>53</a>
-<a href=#54 id=54 data-nosnippet>54</a><span class="kw">const </span>DELTA_LOG_MAGIC: <span class="kw-2">&amp;</span>[u8; <span class="number">4</span>] = <span class="string">b"MDLG"</span>;
-<a href=#55 id=55 data-nosnippet>55</a><span class="doccomment">/// Current wire version (see the header's version byte).
-<a href=#56 id=56 data-nosnippet>56</a></span><span class="kw">const </span>DELTA_LOG_VERSION: u8 = <span class="number">1</span>;
-<a href=#57 id=57 data-nosnippet>57</a><span class="kw">const </span>DELTA_BATCH_MAGIC: <span class="kw-2">&amp;</span>[u8; <span class="number">4</span>] = <span class="string">b"MDLB"</span>;
-<a href=#58 id=58 data-nosnippet>58</a><span class="kw">const </span>DELTA_LOG_TRAILER_MAGIC: <span class="kw-2">&amp;</span>[u8; <span class="number">4</span>] = <span class="string">b"DLTR"</span>;
-<a href=#59 id=59 data-nosnippet>59</a>
-<a href=#60 id=60 data-nosnippet>60</a><span class="kw">const </span>BASE_FINGERPRINT_OFFSET: usize = <span class="number">8</span>;
-<a href=#61 id=61 data-nosnippet>61</a><span class="kw">const </span>TRAILER_FINGERPRINT_OFFSET: usize = <span class="number">8</span>;
-<a href=#62 id=62 data-nosnippet>62</a>
-<a href=#63 id=63 data-nosnippet>63</a><span class="doccomment">/// A decoded delta log that passed its structural gates.
-<a href=#64 id=64 data-nosnippet>64</a></span><span class="attr">#[derive(Debug)]
-<a href=#65 id=65 data-nosnippet>65</a></span><span class="kw">pub struct </span>DeltaLog {
-<a href=#66 id=66 data-nosnippet>66</a>    <span class="doccomment">/// The checkpoint fingerprint this log continues from.
-<a href=#67 id=67 data-nosnippet>67</a>    </span><span class="kw">pub </span>base_fingerprint: u64,
-<a href=#68 id=68 data-nosnippet>68</a>    <span class="doccomment">/// Every committed frame in file order (torn trailing batches are absent).
-<a href=#69 id=69 data-nosnippet>69</a>    </span><span class="kw">pub </span>frames: Vec&lt;DeltaFrame&gt;,
-<a href=#70 id=70 data-nosnippet>70</a>    <span class="doccomment">/// The pack fingerprint the final committed batch was written against.
-<a href=#71 id=71 data-nosnippet>71</a>    </span><span class="kw">pub </span>tail_fingerprint: u64,
-<a href=#72 id=72 data-nosnippet>72</a>    <span class="doccomment">/// Byte length of the committed region in the log file (through the last
-<a href=#73 id=73 data-nosnippet>73</a>    /// committed trailer). A session continuing this log appends at this
-<a href=#74 id=74 data-nosnippet>74</a>    /// boundary — it is the answer to "has a base header already been
-<a href=#75 id=75 data-nosnippet>75</a>    /// written", independent of any fresh-session default.
-<a href=#76 id=76 data-nosnippet>76</a>    </span><span class="kw">pub </span>file_len: u64,
-<a href=#77 id=77 data-nosnippet>77</a>}
-<a href=#78 id=78 data-nosnippet>78</a>
-<a href=#79 id=79 data-nosnippet>79</a><span class="doccomment">/// Encode the fixed-width log header for `base_fingerprint`.
-<a href=#80 id=80 data-nosnippet>80</a></span><span class="attr">#[must_use]
-<a href=#81 id=81 data-nosnippet>81</a></span><span class="kw">pub fn </span>encode_header(base_fingerprint: u64) -&gt; [u8; DELTA_LOG_HEADER_LEN] {
-<a href=#82 id=82 data-nosnippet>82</a>    <span class="kw">let </span><span class="kw-2">mut </span>bytes = [<span class="number">0u8</span>; DELTA_LOG_HEADER_LEN];
-<a href=#83 id=83 data-nosnippet>83</a>    bytes[..<span class="number">4</span>].copy_from_slice(DELTA_LOG_MAGIC);
-<a href=#84 id=84 data-nosnippet>84</a>    bytes[<span class="number">4</span>] = DELTA_LOG_VERSION;
-<a href=#85 id=85 data-nosnippet>85</a>    bytes[BASE_FINGERPRINT_OFFSET..<span class="number">16</span>].copy_from_slice(<span class="kw-2">&amp;</span>base_fingerprint.to_le_bytes());
-<a href=#86 id=86 data-nosnippet>86</a>    bytes
-<a href=#87 id=87 data-nosnippet>87</a>}
-<a href=#88 id=88 data-nosnippet>88</a>
-<a href=#89 id=89 data-nosnippet>89</a><span class="doccomment">/// Encode the fixed-width batch header for `frame_count`.
-<a href=#90 id=90 data-nosnippet>90</a></span><span class="attr">#[must_use]
-<a href=#91 id=91 data-nosnippet>91</a></span><span class="kw">pub fn </span>encode_batch_header(frame_count: u32) -&gt; [u8; DELTA_BATCH_HEADER_LEN] {
-<a href=#92 id=92 data-nosnippet>92</a>    <span class="kw">let </span><span class="kw-2">mut </span>bytes = [<span class="number">0u8</span>; DELTA_BATCH_HEADER_LEN];
-<a href=#93 id=93 data-nosnippet>93</a>    bytes[..<span class="number">4</span>].copy_from_slice(DELTA_BATCH_MAGIC);
-<a href=#94 id=94 data-nosnippet>94</a>    bytes[<span class="number">4</span>..<span class="number">8</span>].copy_from_slice(<span class="kw-2">&amp;</span>frame_count.to_le_bytes());
-<a href=#95 id=95 data-nosnippet>95</a>    bytes
-<a href=#96 id=96 data-nosnippet>96</a>}
-<a href=#97 id=97 data-nosnippet>97</a>
-<a href=#98 id=98 data-nosnippet>98</a><span class="doccomment">/// Encode the fixed-width batch trailer for `tail_fingerprint`.
-<a href=#99 id=99 data-nosnippet>99</a></span><span class="attr">#[must_use]
-<a href=#100 id=100 data-nosnippet>100</a></span><span class="kw">pub fn </span>encode_trailer(tail_fingerprint: u64) -&gt; [u8; DELTA_LOG_TRAILER_LEN] {
-<a href=#101 id=101 data-nosnippet>101</a>    <span class="kw">let </span><span class="kw-2">mut </span>bytes = [<span class="number">0u8</span>; DELTA_LOG_TRAILER_LEN];
-<a href=#102 id=102 data-nosnippet>102</a>    bytes[..<span class="number">4</span>].copy_from_slice(DELTA_LOG_TRAILER_MAGIC);
-<a href=#103 id=103 data-nosnippet>103</a>    bytes[TRAILER_FINGERPRINT_OFFSET..<span class="number">16</span>].copy_from_slice(<span class="kw-2">&amp;</span>tail_fingerprint.to_le_bytes());
-<a href=#104 id=104 data-nosnippet>104</a>    bytes
-<a href=#105 id=105 data-nosnippet>105</a>}
-<a href=#106 id=106 data-nosnippet>106</a>
-<a href=#107 id=107 data-nosnippet>107</a><span class="doccomment">/// Length in bytes of one fully framed batch carrying `frame_count` frames.
-<a href=#108 id=108 data-nosnippet>108</a></span><span class="attr">#[must_use]
-<a href=#109 id=109 data-nosnippet>109</a></span><span class="kw">pub fn </span>batch_len(frame_count: usize) -&gt; <span class="prelude-ty">Option</span>&lt;usize&gt; {
-<a href=#110 id=110 data-nosnippet>110</a>    DELTA_BATCH_HEADER_LEN
-<a href=#111 id=111 data-nosnippet>111</a>        .checked_add(frame_count.checked_mul(DELTA_FRAME_LEN)<span class="question-mark">?</span>)<span class="question-mark">?
-<a href=#112 id=112 data-nosnippet>112</a>        </span>.checked_add(DELTA_LOG_TRAILER_LEN)
-<a href=#113 id=113 data-nosnippet>113</a>}
-<a href=#114 id=114 data-nosnippet>114</a>
-<a href=#115 id=115 data-nosnippet>115</a><span class="doccomment">/// Read and structurally validate the delta log. Returns `None` for a missing
-<a href=#116 id=116 data-nosnippet>116</a>/// file, a bad header, a log with no complete committed batch (entirely torn),
-<a href=#117 id=117 data-nosnippet>117</a>/// or any other structural inconsistency — the caller treats that as "no
-<a href=#118 id=118 data-nosnippet>118</a>/// delta".
-<a href=#119 id=119 data-nosnippet>119</a>///
-<a href=#120 id=120 data-nosnippet>120</a>/// Batch boundaries come from each batch header's `frame_count`, never from
-<a href=#121 id=121 data-nosnippet>121</a>/// scanning for magic, so no frame payload can redirect the parse. A torn
-<a href=#122 id=122 data-nosnippet>122</a>/// trailing batch (fewer bytes than `frame_count` frames + a trailer) is
-<a href=#123 id=123 data-nosnippet>123</a>/// dropped; everything up to the last complete batch is returned.
-<a href=#124 id=124 data-nosnippet>124</a></span><span class="attr">#[must_use]
-<a href=#125 id=125 data-nosnippet>125</a></span><span class="kw">pub fn </span>read_delta_log(path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;DeltaLog&gt; {
-<a href=#126 id=126 data-nosnippet>126</a>    <span class="kw">let </span>buf = fs::read(path).ok()<span class="question-mark">?</span>;
-<a href=#127 id=127 data-nosnippet>127</a>    <span class="kw">if </span>buf.len() &lt; DELTA_LOG_HEADER_LEN {
-<a href=#128 id=128 data-nosnippet>128</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
-<a href=#129 id=129 data-nosnippet>129</a>    }
-<a href=#130 id=130 data-nosnippet>130</a>    <span class="kw">if </span><span class="kw-2">&amp;</span>buf[..<span class="number">4</span>] != DELTA_LOG_MAGIC || buf[<span class="number">4</span>] != DELTA_LOG_VERSION {
-<a href=#131 id=131 data-nosnippet>131</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
-<a href=#132 id=132 data-nosnippet>132</a>    }
-<a href=#133 id=133 data-nosnippet>133</a>    <span class="kw">let </span>base_fingerprint = u64::from_le_bytes(buf[BASE_FINGERPRINT_OFFSET..<span class="number">16</span>].try_into().ok()<span class="question-mark">?</span>);
-<a href=#134 id=134 data-nosnippet>134</a>
-<a href=#135 id=135 data-nosnippet>135</a>    <span class="kw">let </span><span class="kw-2">mut </span>frames: Vec&lt;DeltaFrame&gt; = Vec::new();
-<a href=#136 id=136 data-nosnippet>136</a>    <span class="kw">let </span><span class="kw-2">mut </span>tail_fingerprint: <span class="prelude-ty">Option</span>&lt;u64&gt; = <span class="prelude-val">None</span>;
-<a href=#137 id=137 data-nosnippet>137</a>    <span class="kw">let </span><span class="kw-2">mut </span>offset = DELTA_LOG_HEADER_LEN;
-<a href=#138 id=138 data-nosnippet>138</a>    <span class="kw">while </span>offset &lt; buf.len() {
-<a href=#139 id=139 data-nosnippet>139</a>        <span class="kw">if </span>buf.len().saturating_sub(offset) &lt; DELTA_BATCH_HEADER_LEN {
-<a href=#140 id=140 data-nosnippet>140</a>            <span class="kw">break</span>;
-<a href=#141 id=141 data-nosnippet>141</a>        }
-<a href=#142 id=142 data-nosnippet>142</a>        <span class="kw">if </span><span class="kw-2">&amp;</span>buf[offset..offset.saturating_add(<span class="number">4</span>)] != DELTA_BATCH_MAGIC {
-<a href=#143 id=143 data-nosnippet>143</a>            <span class="kw">break</span>;
-<a href=#144 id=144 data-nosnippet>144</a>        }
-<a href=#145 id=145 data-nosnippet>145</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(header_count) = buf.get(offset.saturating_add(<span class="number">4</span>)..offset.saturating_add(<span class="number">8</span>)) <span class="kw">else </span>{
-<a href=#146 id=146 data-nosnippet>146</a>            <span class="kw">break</span>;
-<a href=#147 id=147 data-nosnippet>147</a>        };
-<a href=#148 id=148 data-nosnippet>148</a>        <span class="kw">let </span>frame_count = u32::from_le_bytes(header_count.try_into().ok()<span class="question-mark">?</span>) <span class="kw">as </span>usize;
-<a href=#149 id=149 data-nosnippet>149</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(batch_len) = batch_len(frame_count) <span class="kw">else </span>{
-<a href=#150 id=150 data-nosnippet>150</a>            <span class="kw">break</span>;
-<a href=#151 id=151 data-nosnippet>151</a>        };
-<a href=#152 id=152 data-nosnippet>152</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(batch_end) = offset.checked_add(batch_len) <span class="kw">else </span>{
-<a href=#153 id=153 data-nosnippet>153</a>            <span class="kw">break</span>;
-<a href=#154 id=154 data-nosnippet>154</a>        };
-<a href=#155 id=155 data-nosnippet>155</a>        <span class="kw">if </span>batch_end &gt; buf.len() {
-<a href=#156 id=156 data-nosnippet>156</a>            <span class="comment">// Torn final batch: fewer bytes than frame_count frames + trailer.
-<a href=#157 id=157 data-nosnippet>157</a>            </span><span class="kw">break</span>;
-<a href=#158 id=158 data-nosnippet>158</a>        }
-<a href=#159 id=159 data-nosnippet>159</a>        <span class="kw">let </span>frames_start = offset.saturating_add(DELTA_BATCH_HEADER_LEN);
-<a href=#160 id=160 data-nosnippet>160</a>        <span class="kw">let </span>trailer_start = batch_end.saturating_sub(DELTA_LOG_TRAILER_LEN);
-<a href=#161 id=161 data-nosnippet>161</a>        <span class="kw">if </span><span class="kw-2">&amp;</span>buf[trailer_start..trailer_start.saturating_add(<span class="number">4</span>)] != DELTA_LOG_TRAILER_MAGIC {
-<a href=#162 id=162 data-nosnippet>162</a>            <span class="kw">break</span>;
-<a href=#163 id=163 data-nosnippet>163</a>        }
-<a href=#164 id=164 data-nosnippet>164</a>        <span class="kw">for </span>frame_bytes <span class="kw">in </span>buf[frames_start..trailer_start].chunks_exact(DELTA_FRAME_LEN) {
-<a href=#165 id=165 data-nosnippet>165</a>            frames.push(DeltaFrame::decode(frame_bytes)<span class="question-mark">?</span>);
-<a href=#166 id=166 data-nosnippet>166</a>        }
-<a href=#167 id=167 data-nosnippet>167</a>        tail_fingerprint = <span class="prelude-val">Some</span>(u64::from_le_bytes(
-<a href=#168 id=168 data-nosnippet>168</a>            buf[trailer_start.saturating_add(TRAILER_FINGERPRINT_OFFSET)
-<a href=#169 id=169 data-nosnippet>169</a>                ..trailer_start.saturating_add(<span class="number">16</span>)]
-<a href=#170 id=170 data-nosnippet>170</a>                .try_into()
-<a href=#171 id=171 data-nosnippet>171</a>                .ok()<span class="question-mark">?</span>,
-<a href=#172 id=172 data-nosnippet>172</a>        ));
-<a href=#173 id=173 data-nosnippet>173</a>        offset = batch_end;
-<a href=#174 id=174 data-nosnippet>174</a>    }
-<a href=#175 id=175 data-nosnippet>175</a>    <span class="prelude-val">Some</span>(DeltaLog {
-<a href=#176 id=176 data-nosnippet>176</a>        base_fingerprint,
-<a href=#177 id=177 data-nosnippet>177</a>        frames,
-<a href=#178 id=178 data-nosnippet>178</a>        tail_fingerprint: tail_fingerprint<span class="question-mark">?</span>,
-<a href=#179 id=179 data-nosnippet>179</a>        <span class="comment">// `offset` is the frontier of the last committed batch: the loop only
-<a href=#180 id=180 data-nosnippet>180</a>        // breaks past a committed trailer or before a torn/unparseable tail.
-<a href=#181 id=181 data-nosnippet>181</a>        </span>file_len: u64::try_from(offset).unwrap_or(u64::MAX),
-<a href=#182 id=182 data-nosnippet>182</a>    })
-<a href=#183 id=183 data-nosnippet>183</a>}
-<a href=#184 id=184 data-nosnippet>184</a>
-<a href=#185 id=185 data-nosnippet>185</a><span class="doccomment">/// Append one batch (optional header, then a count-framed batch) to the delta
-<a href=#186 id=186 data-nosnippet>186</a>/// log and fsync it. Returns the number of bytes appended. `write_header` must
-<a href=#187 id=187 data-nosnippet>187</a>/// be `true` when writing to a freshly created (or truncated) file that
-<a href=#188 id=188 data-nosnippet>188</a>/// doesn't yet carry the base header.
-<a href=#189 id=189 data-nosnippet>189</a>///
-<a href=#190 id=190 data-nosnippet>190</a>/// # Errors
-<a href=#191 id=191 data-nosnippet>191</a>/// Returns `io::Error` on any write or fsync failure.
-<a href=#192 id=192 data-nosnippet>192</a></span><span class="kw">pub fn </span>append_batch(
-<a href=#193 id=193 data-nosnippet>193</a>    path: <span class="kw-2">&amp;</span>Path,
-<a href=#194 id=194 data-nosnippet>194</a>    write_header: bool,
-<a href=#195 id=195 data-nosnippet>195</a>    base_fingerprint: u64,
-<a href=#196 id=196 data-nosnippet>196</a>    frames: <span class="kw-2">&amp;</span>[DeltaFrame],
-<a href=#197 id=197 data-nosnippet>197</a>    tail_fingerprint: u64,
-<a href=#198 id=198 data-nosnippet>198</a>) -&gt; std::io::Result&lt;usize&gt; {
-<a href=#199 id=199 data-nosnippet>199</a>    <span class="kw">let </span>frame_count = u32::try_from(frames.len())
-<a href=#200 id=200 data-nosnippet>200</a>        .map_err(|<span class="kw">_</span>| std::io::Error::other(<span class="string">"delta batch exceeds u32 frame count"</span>))<span class="question-mark">?</span>;
-<a href=#201 id=201 data-nosnippet>201</a>    <span class="kw">let </span><span class="kw-2">mut </span>appended = <span class="number">0usize</span>;
-<a href=#202 id=202 data-nosnippet>202</a>    <span class="kw">let </span><span class="kw-2">mut </span>file = fs::OpenOptions::new()
-<a href=#203 id=203 data-nosnippet>203</a>        .create(<span class="bool-val">true</span>)
-<a href=#204 id=204 data-nosnippet>204</a>        .append(<span class="bool-val">true</span>)
-<a href=#205 id=205 data-nosnippet>205</a>        .open(path)<span class="question-mark">?</span>;
-<a href=#206 id=206 data-nosnippet>206</a>    <span class="kw">if </span>write_header {
-<a href=#207 id=207 data-nosnippet>207</a>        file.write_all(<span class="kw-2">&amp;</span>encode_header(base_fingerprint))<span class="question-mark">?</span>;
-<a href=#208 id=208 data-nosnippet>208</a>        appended = appended.saturating_add(DELTA_LOG_HEADER_LEN);
-<a href=#209 id=209 data-nosnippet>209</a>    }
-<a href=#210 id=210 data-nosnippet>210</a>    file.write_all(<span class="kw-2">&amp;</span>encode_batch_header(frame_count))<span class="question-mark">?</span>;
-<a href=#211 id=211 data-nosnippet>211</a>    appended = appended.saturating_add(DELTA_BATCH_HEADER_LEN);
-<a href=#212 id=212 data-nosnippet>212</a>    <span class="kw">for </span>frame <span class="kw">in </span>frames {
-<a href=#213 id=213 data-nosnippet>213</a>        file.write_all(<span class="kw-2">&amp;</span>frame.encode())<span class="question-mark">?</span>;
-<a href=#214 id=214 data-nosnippet>214</a>        appended = appended.saturating_add(DELTA_FRAME_LEN);
-<a href=#215 id=215 data-nosnippet>215</a>    }
-<a href=#216 id=216 data-nosnippet>216</a>    file.write_all(<span class="kw-2">&amp;</span>encode_trailer(tail_fingerprint))<span class="question-mark">?</span>;
-<a href=#217 id=217 data-nosnippet>217</a>    appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
-<a href=#218 id=218 data-nosnippet>218</a>    file.sync_all()<span class="question-mark">?</span>;
-<a href=#219 id=219 data-nosnippet>219</a>    <span class="prelude-val">Ok</span>(appended)
-<a href=#220 id=220 data-nosnippet>220</a>}
-<a href=#221 id=221 data-nosnippet>221</a>
-<a href=#222 id=222 data-nosnippet>222</a><span class="doccomment">/// Errors that can arise while applying a replayed delta log to a
-<a href=#223 id=223 data-nosnippet>223</a>/// checkpoint-backed index. Any of these means the log is structurally
-<a href=#224 id=224 data-nosnippet>224</a>/// inconsistent with the checkpoint it claims to continue, and the whole log
-<a href=#225 id=225 data-nosnippet>225</a>/// must be rejected (opener falls back to a rescan).
-<a href=#226 id=226 data-nosnippet>226</a></span><span class="attr">#[derive(Debug, PartialEq, Eq)]
-<a href=#227 id=227 data-nosnippet>227</a></span><span class="kw">pub enum </span>DeltaReplayError {
-<a href=#228 id=228 data-nosnippet>228</a>    <span class="doccomment">/// A frame targets a bucket outside the checkpoint index's capacity.
-<a href=#229 id=229 data-nosnippet>229</a>    </span>FrameOutOfBounds {
-<a href=#230 id=230 data-nosnippet>230</a>        <span class="doccomment">/// The frame's target bucket.
-<a href=#231 id=231 data-nosnippet>231</a>        </span>bucket: u32,
-<a href=#232 id=232 data-nosnippet>232</a>        <span class="doccomment">/// The checkpoint index's capacity.
-<a href=#233 id=233 data-nosnippet>233</a>        </span>capacity: u32,
-<a href=#234 id=234 data-nosnippet>234</a>    },
-<a href=#235 id=235 data-nosnippet>235</a>    <span class="doccomment">/// Replay requires an owned (materialized) slot array.
-<a href=#236 id=236 data-nosnippet>236</a>    </span>RequiresOwnedIndex,
-<a href=#237 id=237 data-nosnippet>237</a>}
-<a href=#238 id=238 data-nosnippet>238</a>
-<a href=#239 id=239 data-nosnippet>239</a><span class="kw">impl </span>std::fmt::Display <span class="kw">for </span>DeltaReplayError {
-<a href=#240 id=240 data-nosnippet>240</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>std::fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; std::fmt::Result {
-<a href=#241 id=241 data-nosnippet>241</a>        <span class="kw">match </span><span class="self">self </span>{
-<a href=#242 id=242 data-nosnippet>242</a>            <span class="self">Self</span>::FrameOutOfBounds { bucket, capacity } =&gt; {
-<a href=#243 id=243 data-nosnippet>243</a>                <span class="macro">write!</span>(
-<a href=#244 id=244 data-nosnippet>244</a>                    f,
-<a href=#245 id=245 data-nosnippet>245</a>                    <span class="string">"delta frame bucket {bucket} exceeds index capacity {capacity}"
-<a href=#246 id=246 data-nosnippet>246</a>                </span>)
-<a href=#247 id=247 data-nosnippet>247</a>            }
-<a href=#248 id=248 data-nosnippet>248</a>            <span class="self">Self</span>::RequiresOwnedIndex =&gt; <span class="macro">write!</span>(f, <span class="string">"delta replay requires an owned index"</span>),
-<a href=#249 id=249 data-nosnippet>249</a>        }
-<a href=#250 id=250 data-nosnippet>250</a>    }
-<a href=#251 id=251 data-nosnippet>251</a>}
-<a href=#252 id=252 data-nosnippet>252</a>
-<a href=#253 id=253 data-nosnippet>253</a><span class="kw">impl </span>std::error::Error <span class="kw">for </span>DeltaReplayError {}
-<a href=#254 id=254 data-nosnippet>254</a>
-<a href=#255 id=255 data-nosnippet>255</a><span class="attr">#[cfg(test)]
-<a href=#256 id=256 data-nosnippet>256</a>#[cfg_attr(coverage_nightly, coverage(off))]
-<a href=#257 id=257 data-nosnippet>257</a></span><span class="kw">mod </span>tests {
-<a href=#258 id=258 data-nosnippet>258</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
-<a href=#259 id=259 data-nosnippet>259</a>
-<a href=#260 id=260 data-nosnippet>260</a>    <span class="kw">fn </span>test_frame(bucket: u32, generation: u64) -&gt; DeltaFrame {
-<a href=#261 id=261 data-nosnippet>261</a>        DeltaFrame {
-<a href=#262 id=262 data-nosnippet>262</a>            collection_id: [<span class="number">0x44</span>, <span class="number">0x4C</span>, <span class="number">0x54</span>, <span class="number">0x52</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>],
-<a href=#263 id=263 data-nosnippet>263</a>            bucket,
-<a href=#264 id=264 data-nosnippet>264</a>            generation,
-<a href=#265 id=265 data-nosnippet>265</a>            slot: u64::from(bucket).wrapping_mul(<span class="number">7</span>).wrapping_add(<span class="number">1</span>),
-<a href=#266 id=266 data-nosnippet>266</a>        }
-<a href=#267 id=267 data-nosnippet>267</a>    }
-<a href=#268 id=268 data-nosnippet>268</a>
-<a href=#269 id=269 data-nosnippet>269</a>    <span class="attr">#[test]
-<a href=#270 id=270 data-nosnippet>270</a>    </span><span class="kw">fn </span>header_and_batch_header_and_trailer_round_trip() {
-<a href=#271 id=271 data-nosnippet>271</a>        <span class="kw">let </span>header = encode_header(<span class="number">0xDEAD_BEEF</span>);
-<a href=#272 id=272 data-nosnippet>272</a>        <span class="macro">assert_eq!</span>(<span class="kw-2">&amp;</span>header[..<span class="number">4</span>], DELTA_LOG_MAGIC);
-<a href=#273 id=273 data-nosnippet>273</a>        <span class="macro">assert_eq!</span>(header[<span class="number">4</span>], DELTA_LOG_VERSION);
-<a href=#274 id=274 data-nosnippet>274</a>        <span class="macro">assert_eq!</span>(
-<a href=#275 id=275 data-nosnippet>275</a>            u64::from_le_bytes(header[BASE_FINGERPRINT_OFFSET..<span class="number">16</span>].try_into().unwrap()),
-<a href=#276 id=276 data-nosnippet>276</a>            <span class="number">0xDEAD_BEEF
-<a href=#277 id=277 data-nosnippet>277</a>        </span>);
-<a href=#278 id=278 data-nosnippet>278</a>
-<a href=#279 id=279 data-nosnippet>279</a>        <span class="kw">let </span>batch = encode_batch_header(<span class="number">12</span>);
-<a href=#280 id=280 data-nosnippet>280</a>        <span class="macro">assert_eq!</span>(<span class="kw-2">&amp;</span>batch[..<span class="number">4</span>], DELTA_BATCH_MAGIC);
-<a href=#281 id=281 data-nosnippet>281</a>        <span class="macro">assert_eq!</span>(u32::from_le_bytes(batch[<span class="number">4</span>..<span class="number">8</span>].try_into().unwrap()), <span class="number">12</span>);
-<a href=#282 id=282 data-nosnippet>282</a>
-<a href=#283 id=283 data-nosnippet>283</a>        <span class="kw">let </span>trailer = encode_trailer(<span class="number">0xCAFE_F00D</span>);
-<a href=#284 id=284 data-nosnippet>284</a>        <span class="macro">assert_eq!</span>(<span class="kw-2">&amp;</span>trailer[..<span class="number">4</span>], DELTA_LOG_TRAILER_MAGIC);
-<a href=#285 id=285 data-nosnippet>285</a>        <span class="macro">assert_eq!</span>(
-<a href=#286 id=286 data-nosnippet>286</a>            u64::from_le_bytes(trailer[TRAILER_FINGERPRINT_OFFSET..<span class="number">16</span>].try_into().unwrap()),
-<a href=#287 id=287 data-nosnippet>287</a>            <span class="number">0xCAFE_F00D
-<a href=#288 id=288 data-nosnippet>288</a>        </span>);
-<a href=#289 id=289 data-nosnippet>289</a>    }
-<a href=#290 id=290 data-nosnippet>290</a>
-<a href=#291 id=291 data-nosnippet>291</a>    <span class="attr">#[test]
-<a href=#292 id=292 data-nosnippet>292</a>    </span><span class="kw">fn </span>single_batch_round_trips_as_committed() {
-<a href=#293 id=293 data-nosnippet>293</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_single_{}"</span>, std::process::id()));
-<a href=#294 id=294 data-nosnippet>294</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
-<a href=#295 id=295 data-nosnippet>295</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#296 id=296 data-nosnippet>296</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
-<a href=#297 id=297 data-nosnippet>297</a>        <span class="kw">let </span>frames = <span class="macro">vec!</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>), test_frame(<span class="number">1</span>, <span class="number">3</span>), test_frame(<span class="number">2</span>, <span class="number">3</span>)];
-<a href=#298 id=298 data-nosnippet>298</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>frames, <span class="number">99</span>).unwrap();
-<a href=#299 id=299 data-nosnippet>299</a>
-<a href=#300 id=300 data-nosnippet>300</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"valid log reads"</span>);
-<a href=#301 id=301 data-nosnippet>301</a>        <span class="macro">assert_eq!</span>(log.base_fingerprint, <span class="number">7</span>);
-<a href=#302 id=302 data-nosnippet>302</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">99</span>);
-<a href=#303 id=303 data-nosnippet>303</a>        <span class="macro">assert_eq!</span>(log.frames, frames);
-<a href=#304 id=304 data-nosnippet>304</a>
-<a href=#305 id=305 data-nosnippet>305</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#306 id=306 data-nosnippet>306</a>    }
-<a href=#307 id=307 data-nosnippet>307</a>
-<a href=#308 id=308 data-nosnippet>308</a>    <span class="attr">#[test]
-<a href=#309 id=309 data-nosnippet>309</a>    </span><span class="kw">fn </span>multiple_batches_keep_every_committed_frame() {
-<a href=#310 id=310 data-nosnippet>310</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_multi_{}"</span>, std::process::id()));
-<a href=#311 id=311 data-nosnippet>311</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
-<a href=#312 id=312 data-nosnippet>312</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#313 id=313 data-nosnippet>313</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
-<a href=#314 id=314 data-nosnippet>314</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>), test_frame(<span class="number">1</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
-<a href=#315 id=315 data-nosnippet>315</a>        append_batch(
-<a href=#316 id=316 data-nosnippet>316</a>            <span class="kw-2">&amp;</span>path,
-<a href=#317 id=317 data-nosnippet>317</a>            <span class="bool-val">false</span>,
-<a href=#318 id=318 data-nosnippet>318</a>            <span class="number">7</span>,
-<a href=#319 id=319 data-nosnippet>319</a>            <span class="kw-2">&amp;</span>[test_frame(<span class="number">2</span>, <span class="number">3</span>), test_frame(<span class="number">3</span>, <span class="number">3</span>), test_frame(<span class="number">4</span>, <span class="number">3</span>)],
-<a href=#320 id=320 data-nosnippet>320</a>            <span class="number">22</span>,
-<a href=#321 id=321 data-nosnippet>321</a>        )
-<a href=#322 id=322 data-nosnippet>322</a>        .unwrap();
-<a href=#323 id=323 data-nosnippet>323</a>
-<a href=#324 id=324 data-nosnippet>324</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"multi-batch log reads"</span>);
-<a href=#325 id=325 data-nosnippet>325</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">22</span>, <span class="string">"the final trailer wins"</span>);
-<a href=#326 id=326 data-nosnippet>326</a>        <span class="macro">assert_eq!</span>(log.frames.len(), <span class="number">5</span>);
-<a href=#327 id=327 data-nosnippet>327</a>        <span class="macro">assert_eq!</span>(log.frames[<span class="number">4</span>], test_frame(<span class="number">4</span>, <span class="number">3</span>));
-<a href=#328 id=328 data-nosnippet>328</a>
-<a href=#329 id=329 data-nosnippet>329</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#330 id=330 data-nosnippet>330</a>    }
-<a href=#331 id=331 data-nosnippet>331</a>
-<a href=#332 id=332 data-nosnippet>332</a>    <span class="attr">#[test]
-<a href=#333 id=333 data-nosnippet>333</a>    </span><span class="kw">fn </span>torn_final_batch_is_dropped() {
-<a href=#334 id=334 data-nosnippet>334</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_torn_{}"</span>, std::process::id()));
-<a href=#335 id=335 data-nosnippet>335</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
-<a href=#336 id=336 data-nosnippet>336</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#337 id=337 data-nosnippet>337</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
-<a href=#338 id=338 data-nosnippet>338</a>        <span class="comment">// Two committed batches, then a third batch with a torn trailer.
-<a href=#339 id=339 data-nosnippet>339</a>        </span>append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>), test_frame(<span class="number">1</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
-<a href=#340 id=340 data-nosnippet>340</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">false</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">2</span>, <span class="number">3</span>), test_frame(<span class="number">3</span>, <span class="number">3</span>)], <span class="number">22</span>).unwrap();
-<a href=#341 id=341 data-nosnippet>341</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">false</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">4</span>, <span class="number">3</span>), test_frame(<span class="number">5</span>, <span class="number">3</span>)], <span class="number">33</span>).unwrap();
-<a href=#342 id=342 data-nosnippet>342</a>        <span class="kw">let </span>full = std::fs::read(<span class="kw-2">&amp;</span>path).unwrap();
-<a href=#343 id=343 data-nosnippet>343</a>        <span class="comment">// Cut 4 bytes off the shortest possible third batch (frames fully
-<a href=#344 id=344 data-nosnippet>344</a>        // written, trailer partial).
-<a href=#345 id=345 data-nosnippet>345</a>        </span><span class="kw">let </span>torn_len = full
-<a href=#346 id=346 data-nosnippet>346</a>            .len()
-<a href=#347 id=347 data-nosnippet>347</a>            .saturating_sub(DELTA_LOG_TRAILER_LEN.saturating_sub(<span class="number">4</span>));
-<a href=#348 id=348 data-nosnippet>348</a>        std::fs::write(<span class="kw-2">&amp;</span>path, <span class="kw-2">&amp;</span>full[..torn_len]).unwrap();
-<a href=#349 id=349 data-nosnippet>349</a>
-<a href=#350 id=350 data-nosnippet>350</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"torn tail must not fail the committed prefix"</span>);
-<a href=#351 id=351 data-nosnippet>351</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">22</span>);
-<a href=#352 id=352 data-nosnippet>352</a>        <span class="macro">assert_eq!</span>(
-<a href=#353 id=353 data-nosnippet>353</a>            log.frames.len(),
-<a href=#354 id=354 data-nosnippet>354</a>            <span class="number">4</span>,
-<a href=#355 id=355 data-nosnippet>355</a>            <span class="string">"frames of the unfinalized batch are dropped"
-<a href=#356 id=356 data-nosnippet>356</a>        </span>);
-<a href=#357 id=357 data-nosnippet>357</a>
-<a href=#358 id=358 data-nosnippet>358</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#359 id=359 data-nosnippet>359</a>    }
-<a href=#360 id=360 data-nosnippet>360</a>
-<a href=#361 id=361 data-nosnippet>361</a>    <span class="attr">#[test]
-<a href=#362 id=362 data-nosnippet>362</a>    </span><span class="kw">fn </span>unfinalized_frames_are_never_stranded() {
-<a href=#363 id=363 data-nosnippet>363</a>        <span class="comment">// A complete batch followed by a batch whose frames are fully written
-<a href=#364 id=364 data-nosnippet>364</a>        // but whose trailer is missing entirely must also drop that batch.
-<a href=#365 id=365 data-nosnippet>365</a>        </span><span class="kw">let </span>dir =
-<a href=#366 id=366 data-nosnippet>366</a>            std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_no_trailer_{}"</span>, std::process::id()));
-<a href=#367 id=367 data-nosnippet>367</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
-<a href=#368 id=368 data-nosnippet>368</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#369 id=369 data-nosnippet>369</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
-<a href=#370 id=370 data-nosnippet>370</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
-<a href=#371 id=371 data-nosnippet>371</a>
-<a href=#372 id=372 data-nosnippet>372</a>        <span class="comment">// Append a second batch's header + frames but no trailer.
-<a href=#373 id=373 data-nosnippet>373</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>file = fs::OpenOptions::new().append(<span class="bool-val">true</span>).open(<span class="kw-2">&amp;</span>path).unwrap();
-<a href=#374 id=374 data-nosnippet>374</a>        file.write_all(<span class="kw-2">&amp;</span>encode_batch_header(<span class="number">2</span>)).unwrap();
-<a href=#375 id=375 data-nosnippet>375</a>        file.write_all(<span class="kw-2">&amp;</span>test_frame(<span class="number">1</span>, <span class="number">3</span>).encode()).unwrap();
-<a href=#376 id=376 data-nosnippet>376</a>        file.write_all(<span class="kw-2">&amp;</span>test_frame(<span class="number">2</span>, <span class="number">3</span>).encode()).unwrap();
-<a href=#377 id=377 data-nosnippet>377</a>        <span class="kw">let _ </span>= file.sync_all();
-<a href=#378 id=378 data-nosnippet>378</a>
-<a href=#379 id=379 data-nosnippet>379</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"frame-without-trailer batch is dropped, not fatal"</span>);
-<a href=#380 id=380 data-nosnippet>380</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">11</span>);
-<a href=#381 id=381 data-nosnippet>381</a>        <span class="macro">assert_eq!</span>(log.frames.len(), <span class="number">1</span>);
-<a href=#382 id=382 data-nosnippet>382</a>
-<a href=#383 id=383 data-nosnippet>383</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#384 id=384 data-nosnippet>384</a>    }
-<a href=#385 id=385 data-nosnippet>385</a>
-<a href=#386 id=386 data-nosnippet>386</a>    <span class="attr">#[test]
-<a href=#387 id=387 data-nosnippet>387</a>    </span><span class="kw">fn </span>entirely_torn_or_missing_log_is_none() {
-<a href=#388 id=388 data-nosnippet>388</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_torn_all_{}"</span>, std::process::id()));
-<a href=#389 id=389 data-nosnippet>389</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
-<a href=#390 id=390 data-nosnippet>390</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#391 id=391 data-nosnippet>391</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#54 id=54 data-nosnippet>54</a><span class="doccomment">/// Hard ceiling on the delta log file size this reader will allocate for.
+<a href=#55 id=55 data-nosnippet>55</a>/// The writer (`storage.rs`) forces a full checkpoint rewrite well before
+<a href=#56 id=56 data-nosnippet>56</a>/// this — its own cap is 8 MiB — so a well-behaved log never approaches this
+<a href=#57 id=57 data-nosnippet>57</a>/// value; it exists purely so a corrupted or maliciously oversized
+<a href=#58 id=58 data-nosnippet>58</a>/// `index.delta` (e.g. a truncated-looking length field, or the file
+<a href=#59 id=59 data-nosnippet>59</a>/// replaced wholesale) can't make an opener allocate an unbounded buffer
+<a href=#60 id=60 data-nosnippet>60</a>/// before any structural validation runs. Generous relative to the writer's
+<a href=#61 id=61 data-nosnippet>61</a>/// own cap so it never rejects a real log.
+<a href=#62 id=62 data-nosnippet>62</a></span><span class="kw">const </span>MAX_DELTA_LOG_FILE_BYTES: u64 = <span class="number">64 </span>* <span class="number">1024 </span>* <span class="number">1024</span>;
+<a href=#63 id=63 data-nosnippet>63</a>
+<a href=#64 id=64 data-nosnippet>64</a><span class="kw">const </span>DELTA_LOG_MAGIC: <span class="kw-2">&amp;</span>[u8; <span class="number">4</span>] = <span class="string">b"MDLG"</span>;
+<a href=#65 id=65 data-nosnippet>65</a><span class="doccomment">/// Current wire version (see the header's version byte).
+<a href=#66 id=66 data-nosnippet>66</a>///
+<a href=#67 id=67 data-nosnippet>67</a>/// v2 repurposes the trailer's 4 reserved bytes as a CRC32 covering the
+<a href=#68 id=68 data-nosnippet>68</a>/// batch's frame bytes and its tail fingerprint, so a batch corrupted after
+<a href=#69 id=69 data-nosnippet>69</a>/// being written — whether in the frames or just the fingerprint — but which
+<a href=#70 id=70 data-nosnippet>70</a>/// still happens to pass the fingerprint/generation gates in `storage.rs` is
+<a href=#71 id=71 data-nosnippet>71</a>/// caught and dropped at read time instead of being replayed as valid index
+<a href=#72 id=72 data-nosnippet>72</a>/// state. A v1 log fails the version check below and falls back to a full
+<a href=#73 id=73 data-nosnippet>73</a>/// rescan, same as any other structurally rejected log.
+<a href=#74 id=74 data-nosnippet>74</a></span><span class="kw">const </span>DELTA_LOG_VERSION: u8 = <span class="number">2</span>;
+<a href=#75 id=75 data-nosnippet>75</a><span class="kw">const </span>DELTA_BATCH_MAGIC: <span class="kw-2">&amp;</span>[u8; <span class="number">4</span>] = <span class="string">b"MDLB"</span>;
+<a href=#76 id=76 data-nosnippet>76</a><span class="kw">const </span>DELTA_LOG_TRAILER_MAGIC: <span class="kw-2">&amp;</span>[u8; <span class="number">4</span>] = <span class="string">b"DLTR"</span>;
+<a href=#77 id=77 data-nosnippet>77</a>
+<a href=#78 id=78 data-nosnippet>78</a><span class="kw">const </span>BASE_FINGERPRINT_OFFSET: usize = <span class="number">8</span>;
+<a href=#79 id=79 data-nosnippet>79</a><span class="kw">const </span>TRAILER_FINGERPRINT_OFFSET: usize = <span class="number">8</span>;
+<a href=#80 id=80 data-nosnippet>80</a><span class="doccomment">/// Offset of the batch's frame-bytes CRC32 within the trailer's reserved
+<a href=#81 id=81 data-nosnippet>81</a>/// field (bytes 4..8, between the magic and the tail fingerprint).
+<a href=#82 id=82 data-nosnippet>82</a></span><span class="kw">const </span>TRAILER_CRC_OFFSET: usize = <span class="number">4</span>;
+<a href=#83 id=83 data-nosnippet>83</a>
+<a href=#84 id=84 data-nosnippet>84</a><span class="doccomment">/// A decoded delta log that passed its structural gates.
+<a href=#85 id=85 data-nosnippet>85</a></span><span class="attr">#[derive(Debug)]
+<a href=#86 id=86 data-nosnippet>86</a></span><span class="kw">pub struct </span>DeltaLog {
+<a href=#87 id=87 data-nosnippet>87</a>    <span class="doccomment">/// The checkpoint fingerprint this log continues from.
+<a href=#88 id=88 data-nosnippet>88</a>    </span><span class="kw">pub </span>base_fingerprint: u64,
+<a href=#89 id=89 data-nosnippet>89</a>    <span class="doccomment">/// Every committed frame in file order (torn trailing batches are absent).
+<a href=#90 id=90 data-nosnippet>90</a>    </span><span class="kw">pub </span>frames: Vec&lt;DeltaFrame&gt;,
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="doccomment">/// The pack fingerprint the final committed batch was written against.
+<a href=#92 id=92 data-nosnippet>92</a>    </span><span class="kw">pub </span>tail_fingerprint: u64,
+<a href=#93 id=93 data-nosnippet>93</a>    <span class="doccomment">/// Byte length of the committed region in the log file (through the last
+<a href=#94 id=94 data-nosnippet>94</a>    /// committed trailer). A session continuing this log appends at this
+<a href=#95 id=95 data-nosnippet>95</a>    /// boundary — it is the answer to "has a base header already been
+<a href=#96 id=96 data-nosnippet>96</a>    /// written", independent of any fresh-session default.
+<a href=#97 id=97 data-nosnippet>97</a>    </span><span class="kw">pub </span>file_len: u64,
+<a href=#98 id=98 data-nosnippet>98</a>}
+<a href=#99 id=99 data-nosnippet>99</a>
+<a href=#100 id=100 data-nosnippet>100</a><span class="doccomment">/// Encode the fixed-width log header for `base_fingerprint`.
+<a href=#101 id=101 data-nosnippet>101</a></span><span class="attr">#[must_use]
+<a href=#102 id=102 data-nosnippet>102</a></span><span class="kw">pub fn </span>encode_header(base_fingerprint: u64) -&gt; [u8; DELTA_LOG_HEADER_LEN] {
+<a href=#103 id=103 data-nosnippet>103</a>    <span class="kw">let </span><span class="kw-2">mut </span>bytes = [<span class="number">0u8</span>; DELTA_LOG_HEADER_LEN];
+<a href=#104 id=104 data-nosnippet>104</a>    bytes[..<span class="number">4</span>].copy_from_slice(DELTA_LOG_MAGIC);
+<a href=#105 id=105 data-nosnippet>105</a>    bytes[<span class="number">4</span>] = DELTA_LOG_VERSION;
+<a href=#106 id=106 data-nosnippet>106</a>    bytes[BASE_FINGERPRINT_OFFSET..<span class="number">16</span>].copy_from_slice(<span class="kw-2">&amp;</span>base_fingerprint.to_le_bytes());
+<a href=#107 id=107 data-nosnippet>107</a>    bytes
+<a href=#108 id=108 data-nosnippet>108</a>}
+<a href=#109 id=109 data-nosnippet>109</a>
+<a href=#110 id=110 data-nosnippet>110</a><span class="doccomment">/// Encode the fixed-width batch header for `frame_count`.
+<a href=#111 id=111 data-nosnippet>111</a></span><span class="attr">#[must_use]
+<a href=#112 id=112 data-nosnippet>112</a></span><span class="kw">pub fn </span>encode_batch_header(frame_count: u32) -&gt; [u8; DELTA_BATCH_HEADER_LEN] {
+<a href=#113 id=113 data-nosnippet>113</a>    <span class="kw">let </span><span class="kw-2">mut </span>bytes = [<span class="number">0u8</span>; DELTA_BATCH_HEADER_LEN];
+<a href=#114 id=114 data-nosnippet>114</a>    bytes[..<span class="number">4</span>].copy_from_slice(DELTA_BATCH_MAGIC);
+<a href=#115 id=115 data-nosnippet>115</a>    bytes[<span class="number">4</span>..<span class="number">8</span>].copy_from_slice(<span class="kw-2">&amp;</span>frame_count.to_le_bytes());
+<a href=#116 id=116 data-nosnippet>116</a>    bytes
+<a href=#117 id=117 data-nosnippet>117</a>}
+<a href=#118 id=118 data-nosnippet>118</a>
+<a href=#119 id=119 data-nosnippet>119</a><span class="doccomment">/// Encode the fixed-width batch trailer for `tail_fingerprint`, with `crc`
+<a href=#120 id=120 data-nosnippet>120</a>/// the CRC32 of the batch's frame bytes and `tail_fingerprint` together
+<a href=#121 id=121 data-nosnippet>121</a>/// (stored at byte offset 4 of the trailer's reserved field).
+<a href=#122 id=122 data-nosnippet>122</a></span><span class="attr">#[must_use]
+<a href=#123 id=123 data-nosnippet>123</a></span><span class="kw">pub fn </span>encode_trailer(tail_fingerprint: u64, crc: u32) -&gt; [u8; DELTA_LOG_TRAILER_LEN] {
+<a href=#124 id=124 data-nosnippet>124</a>    <span class="kw">let </span><span class="kw-2">mut </span>bytes = [<span class="number">0u8</span>; DELTA_LOG_TRAILER_LEN];
+<a href=#125 id=125 data-nosnippet>125</a>    bytes[..<span class="number">4</span>].copy_from_slice(DELTA_LOG_TRAILER_MAGIC);
+<a href=#126 id=126 data-nosnippet>126</a>    bytes[TRAILER_CRC_OFFSET..<span class="number">8</span>].copy_from_slice(<span class="kw-2">&amp;</span>crc.to_le_bytes());
+<a href=#127 id=127 data-nosnippet>127</a>    bytes[TRAILER_FINGERPRINT_OFFSET..<span class="number">16</span>].copy_from_slice(<span class="kw-2">&amp;</span>tail_fingerprint.to_le_bytes());
+<a href=#128 id=128 data-nosnippet>128</a>    bytes
+<a href=#129 id=129 data-nosnippet>129</a>}
+<a href=#130 id=130 data-nosnippet>130</a>
+<a href=#131 id=131 data-nosnippet>131</a><span class="doccomment">/// CRC32 covering one batch's frame bytes *and* its `tail_fingerprint`, as
+<a href=#132 id=132 data-nosnippet>132</a>/// stored in the trailer's reserved field. Folding the fingerprint into the
+<a href=#133 id=133 data-nosnippet>133</a>/// CRC means fingerprint-only corruption (the frame bytes untouched) is also
+<a href=#134 id=134 data-nosnippet>134</a>/// caught here, rather than relying solely on the fingerprint gate in
+<a href=#135 id=135 data-nosnippet>135</a>/// `storage.rs` matching it against the wrong thing.
+<a href=#136 id=136 data-nosnippet>136</a></span><span class="attr">#[must_use]
+<a href=#137 id=137 data-nosnippet>137</a></span><span class="kw">fn </span>batch_crc(frames_bytes: <span class="kw-2">&amp;</span>[u8], tail_fingerprint: u64) -&gt; u32 {
+<a href=#138 id=138 data-nosnippet>138</a>    <span class="kw">let </span><span class="kw-2">mut </span>hasher = crc32fast::Hasher::new();
+<a href=#139 id=139 data-nosnippet>139</a>    hasher.update(frames_bytes);
+<a href=#140 id=140 data-nosnippet>140</a>    hasher.update(<span class="kw-2">&amp;</span>tail_fingerprint.to_le_bytes());
+<a href=#141 id=141 data-nosnippet>141</a>    hasher.finalize()
+<a href=#142 id=142 data-nosnippet>142</a>}
+<a href=#143 id=143 data-nosnippet>143</a>
+<a href=#144 id=144 data-nosnippet>144</a><span class="doccomment">/// Length in bytes of one fully framed batch carrying `frame_count` frames.
+<a href=#145 id=145 data-nosnippet>145</a></span><span class="attr">#[must_use]
+<a href=#146 id=146 data-nosnippet>146</a></span><span class="kw">pub fn </span>batch_len(frame_count: usize) -&gt; <span class="prelude-ty">Option</span>&lt;usize&gt; {
+<a href=#147 id=147 data-nosnippet>147</a>    DELTA_BATCH_HEADER_LEN
+<a href=#148 id=148 data-nosnippet>148</a>        .checked_add(frame_count.checked_mul(DELTA_FRAME_LEN)<span class="question-mark">?</span>)<span class="question-mark">?
+<a href=#149 id=149 data-nosnippet>149</a>        </span>.checked_add(DELTA_LOG_TRAILER_LEN)
+<a href=#150 id=150 data-nosnippet>150</a>}
+<a href=#151 id=151 data-nosnippet>151</a>
+<a href=#152 id=152 data-nosnippet>152</a><span class="doccomment">/// Read and structurally validate the delta log. Returns `None` for a missing
+<a href=#153 id=153 data-nosnippet>153</a>/// file, a bad header, a log with no complete committed batch (entirely torn),
+<a href=#154 id=154 data-nosnippet>154</a>/// or any other structural inconsistency — the caller treats that as "no
+<a href=#155 id=155 data-nosnippet>155</a>/// delta".
+<a href=#156 id=156 data-nosnippet>156</a>///
+<a href=#157 id=157 data-nosnippet>157</a>/// Batch boundaries come from each batch header's `frame_count`, never from
+<a href=#158 id=158 data-nosnippet>158</a>/// scanning for magic, so no frame payload can redirect the parse. A torn
+<a href=#159 id=159 data-nosnippet>159</a>/// trailing batch (fewer bytes than `frame_count` frames + a trailer) is
+<a href=#160 id=160 data-nosnippet>160</a>/// dropped; everything up to the last complete batch is returned.
+<a href=#161 id=161 data-nosnippet>161</a></span><span class="attr">#[must_use]
+<a href=#162 id=162 data-nosnippet>162</a></span><span class="kw">pub fn </span>read_delta_log(path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;DeltaLog&gt; {
+<a href=#163 id=163 data-nosnippet>163</a>    <span class="comment">// Check the size before allocating: `fs::read` would otherwise size its
+<a href=#164 id=164 data-nosnippet>164</a>    // buffer off an unvalidated on-disk length, letting a corrupted or
+<a href=#165 id=165 data-nosnippet>165</a>    // oversized file exhaust memory before any structural check runs.
+<a href=#166 id=166 data-nosnippet>166</a>    </span><span class="kw">if </span>fs::metadata(path).ok()<span class="question-mark">?</span>.len() &gt; MAX_DELTA_LOG_FILE_BYTES {
+<a href=#167 id=167 data-nosnippet>167</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#168 id=168 data-nosnippet>168</a>    }
+<a href=#169 id=169 data-nosnippet>169</a>    <span class="kw">let </span>buf = fs::read(path).ok()<span class="question-mark">?</span>;
+<a href=#170 id=170 data-nosnippet>170</a>    <span class="kw">if </span>buf.len() &lt; DELTA_LOG_HEADER_LEN {
+<a href=#171 id=171 data-nosnippet>171</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#172 id=172 data-nosnippet>172</a>    }
+<a href=#173 id=173 data-nosnippet>173</a>    <span class="kw">if </span><span class="kw-2">&amp;</span>buf[..<span class="number">4</span>] != DELTA_LOG_MAGIC || buf[<span class="number">4</span>] != DELTA_LOG_VERSION {
+<a href=#174 id=174 data-nosnippet>174</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#175 id=175 data-nosnippet>175</a>    }
+<a href=#176 id=176 data-nosnippet>176</a>    <span class="kw">let </span>base_fingerprint = u64::from_le_bytes(buf[BASE_FINGERPRINT_OFFSET..<span class="number">16</span>].try_into().ok()<span class="question-mark">?</span>);
+<a href=#177 id=177 data-nosnippet>177</a>
+<a href=#178 id=178 data-nosnippet>178</a>    <span class="kw">let </span><span class="kw-2">mut </span>frames: Vec&lt;DeltaFrame&gt; = Vec::new();
+<a href=#179 id=179 data-nosnippet>179</a>    <span class="kw">let </span><span class="kw-2">mut </span>tail_fingerprint: <span class="prelude-ty">Option</span>&lt;u64&gt; = <span class="prelude-val">None</span>;
+<a href=#180 id=180 data-nosnippet>180</a>    <span class="kw">let </span><span class="kw-2">mut </span>offset = DELTA_LOG_HEADER_LEN;
+<a href=#181 id=181 data-nosnippet>181</a>    <span class="kw">while </span>offset &lt; buf.len() {
+<a href=#182 id=182 data-nosnippet>182</a>        <span class="kw">if </span>buf.len().saturating_sub(offset) &lt; DELTA_BATCH_HEADER_LEN {
+<a href=#183 id=183 data-nosnippet>183</a>            <span class="kw">break</span>;
+<a href=#184 id=184 data-nosnippet>184</a>        }
+<a href=#185 id=185 data-nosnippet>185</a>        <span class="kw">if </span><span class="kw-2">&amp;</span>buf[offset..offset.saturating_add(<span class="number">4</span>)] != DELTA_BATCH_MAGIC {
+<a href=#186 id=186 data-nosnippet>186</a>            <span class="kw">break</span>;
+<a href=#187 id=187 data-nosnippet>187</a>        }
+<a href=#188 id=188 data-nosnippet>188</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(header_count) = buf.get(offset.saturating_add(<span class="number">4</span>)..offset.saturating_add(<span class="number">8</span>)) <span class="kw">else </span>{
+<a href=#189 id=189 data-nosnippet>189</a>            <span class="kw">break</span>;
+<a href=#190 id=190 data-nosnippet>190</a>        };
+<a href=#191 id=191 data-nosnippet>191</a>        <span class="kw">let </span>frame_count = u32::from_le_bytes(header_count.try_into().ok()<span class="question-mark">?</span>) <span class="kw">as </span>usize;
+<a href=#192 id=192 data-nosnippet>192</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(batch_len) = batch_len(frame_count) <span class="kw">else </span>{
+<a href=#193 id=193 data-nosnippet>193</a>            <span class="kw">break</span>;
+<a href=#194 id=194 data-nosnippet>194</a>        };
+<a href=#195 id=195 data-nosnippet>195</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(batch_end) = offset.checked_add(batch_len) <span class="kw">else </span>{
+<a href=#196 id=196 data-nosnippet>196</a>            <span class="kw">break</span>;
+<a href=#197 id=197 data-nosnippet>197</a>        };
+<a href=#198 id=198 data-nosnippet>198</a>        <span class="kw">if </span>batch_end &gt; buf.len() {
+<a href=#199 id=199 data-nosnippet>199</a>            <span class="comment">// Torn final batch: fewer bytes than frame_count frames + trailer.
+<a href=#200 id=200 data-nosnippet>200</a>            </span><span class="kw">break</span>;
+<a href=#201 id=201 data-nosnippet>201</a>        }
+<a href=#202 id=202 data-nosnippet>202</a>        <span class="kw">let </span>frames_start = offset.saturating_add(DELTA_BATCH_HEADER_LEN);
+<a href=#203 id=203 data-nosnippet>203</a>        <span class="kw">let </span>trailer_start = batch_end.saturating_sub(DELTA_LOG_TRAILER_LEN);
+<a href=#204 id=204 data-nosnippet>204</a>        <span class="kw">if </span><span class="kw-2">&amp;</span>buf[trailer_start..trailer_start.saturating_add(<span class="number">4</span>)] != DELTA_LOG_TRAILER_MAGIC {
+<a href=#205 id=205 data-nosnippet>205</a>            <span class="kw">break</span>;
+<a href=#206 id=206 data-nosnippet>206</a>        }
+<a href=#207 id=207 data-nosnippet>207</a>        <span class="kw">let </span>frames_bytes = <span class="kw-2">&amp;</span>buf[frames_start..trailer_start];
+<a href=#208 id=208 data-nosnippet>208</a>        <span class="kw">let </span>stored_crc = u32::from_le_bytes(
+<a href=#209 id=209 data-nosnippet>209</a>            buf[trailer_start.saturating_add(TRAILER_CRC_OFFSET)..trailer_start.saturating_add(<span class="number">8</span>)]
+<a href=#210 id=210 data-nosnippet>210</a>                .try_into()
+<a href=#211 id=211 data-nosnippet>211</a>                .ok()<span class="question-mark">?</span>,
+<a href=#212 id=212 data-nosnippet>212</a>        );
+<a href=#213 id=213 data-nosnippet>213</a>        <span class="kw">let </span>batch_tail_fingerprint = u64::from_le_bytes(
+<a href=#214 id=214 data-nosnippet>214</a>            buf[trailer_start.saturating_add(TRAILER_FINGERPRINT_OFFSET)
+<a href=#215 id=215 data-nosnippet>215</a>                ..trailer_start.saturating_add(<span class="number">16</span>)]
+<a href=#216 id=216 data-nosnippet>216</a>                .try_into()
+<a href=#217 id=217 data-nosnippet>217</a>                .ok()<span class="question-mark">?</span>,
+<a href=#218 id=218 data-nosnippet>218</a>        );
+<a href=#219 id=219 data-nosnippet>219</a>        <span class="kw">if </span>batch_crc(frames_bytes, batch_tail_fingerprint) != stored_crc {
+<a href=#220 id=220 data-nosnippet>220</a>            <span class="comment">// The frame bytes or the tail fingerprint were corrupted after
+<a href=#221 id=221 data-nosnippet>221</a>            // being written (bit rot, torn/partial write not otherwise
+<a href=#222 id=222 data-nosnippet>222</a>            // caught by the length framing, etc). Trust nothing from this
+<a href=#223 id=223 data-nosnippet>223</a>            // batch onward — same as a torn trailer, everything already
+<a href=#224 id=224 data-nosnippet>224</a>            // accumulated from earlier committed batches is kept, but this
+<a href=#225 id=225 data-nosnippet>225</a>            // and any later batch are dropped rather than replayed as valid
+<a href=#226 id=226 data-nosnippet>226</a>            // index state.
+<a href=#227 id=227 data-nosnippet>227</a>            </span><span class="kw">break</span>;
+<a href=#228 id=228 data-nosnippet>228</a>        }
+<a href=#229 id=229 data-nosnippet>229</a>        <span class="kw">for </span>frame_bytes <span class="kw">in </span>frames_bytes.chunks_exact(DELTA_FRAME_LEN) {
+<a href=#230 id=230 data-nosnippet>230</a>            frames.push(DeltaFrame::decode(frame_bytes)<span class="question-mark">?</span>);
+<a href=#231 id=231 data-nosnippet>231</a>        }
+<a href=#232 id=232 data-nosnippet>232</a>        tail_fingerprint = <span class="prelude-val">Some</span>(batch_tail_fingerprint);
+<a href=#233 id=233 data-nosnippet>233</a>        offset = batch_end;
+<a href=#234 id=234 data-nosnippet>234</a>    }
+<a href=#235 id=235 data-nosnippet>235</a>    <span class="prelude-val">Some</span>(DeltaLog {
+<a href=#236 id=236 data-nosnippet>236</a>        base_fingerprint,
+<a href=#237 id=237 data-nosnippet>237</a>        frames,
+<a href=#238 id=238 data-nosnippet>238</a>        tail_fingerprint: tail_fingerprint<span class="question-mark">?</span>,
+<a href=#239 id=239 data-nosnippet>239</a>        <span class="comment">// `offset` is the frontier of the last committed batch: the loop only
+<a href=#240 id=240 data-nosnippet>240</a>        // breaks past a committed trailer or before a torn/unparseable tail.
+<a href=#241 id=241 data-nosnippet>241</a>        </span>file_len: u64::try_from(offset).unwrap_or(u64::MAX),
+<a href=#242 id=242 data-nosnippet>242</a>    })
+<a href=#243 id=243 data-nosnippet>243</a>}
+<a href=#244 id=244 data-nosnippet>244</a>
+<a href=#245 id=245 data-nosnippet>245</a><span class="doccomment">/// Append one batch (optional header, then a count-framed batch) to the delta
+<a href=#246 id=246 data-nosnippet>246</a>/// log and fsync it. Returns the number of bytes appended. `write_header` must
+<a href=#247 id=247 data-nosnippet>247</a>/// be `true` when writing to a freshly created (or truncated) file that
+<a href=#248 id=248 data-nosnippet>248</a>/// doesn't yet carry the base header.
+<a href=#249 id=249 data-nosnippet>249</a>///
+<a href=#250 id=250 data-nosnippet>250</a>/// # Errors
+<a href=#251 id=251 data-nosnippet>251</a>/// Returns `io::Error` on any write or fsync failure.
+<a href=#252 id=252 data-nosnippet>252</a></span><span class="kw">pub fn </span>append_batch(
+<a href=#253 id=253 data-nosnippet>253</a>    path: <span class="kw-2">&amp;</span>Path,
+<a href=#254 id=254 data-nosnippet>254</a>    write_header: bool,
+<a href=#255 id=255 data-nosnippet>255</a>    base_fingerprint: u64,
+<a href=#256 id=256 data-nosnippet>256</a>    frames: <span class="kw-2">&amp;</span>[DeltaFrame],
+<a href=#257 id=257 data-nosnippet>257</a>    tail_fingerprint: u64,
+<a href=#258 id=258 data-nosnippet>258</a>) -&gt; std::io::Result&lt;usize&gt; {
+<a href=#259 id=259 data-nosnippet>259</a>    <span class="kw">let </span>frame_count = u32::try_from(frames.len())
+<a href=#260 id=260 data-nosnippet>260</a>        .map_err(|<span class="kw">_</span>| std::io::Error::other(<span class="string">"delta batch exceeds u32 frame count"</span>))<span class="question-mark">?</span>;
+<a href=#261 id=261 data-nosnippet>261</a>    <span class="kw">let </span><span class="kw-2">mut </span>appended = <span class="number">0usize</span>;
+<a href=#262 id=262 data-nosnippet>262</a>    <span class="kw">let </span><span class="kw-2">mut </span>file = fs::OpenOptions::new()
+<a href=#263 id=263 data-nosnippet>263</a>        .create(<span class="bool-val">true</span>)
+<a href=#264 id=264 data-nosnippet>264</a>        .append(<span class="bool-val">true</span>)
+<a href=#265 id=265 data-nosnippet>265</a>        .open(path)<span class="question-mark">?</span>;
+<a href=#266 id=266 data-nosnippet>266</a>    <span class="kw">if </span>write_header {
+<a href=#267 id=267 data-nosnippet>267</a>        file.write_all(<span class="kw-2">&amp;</span>encode_header(base_fingerprint))<span class="question-mark">?</span>;
+<a href=#268 id=268 data-nosnippet>268</a>        appended = appended.saturating_add(DELTA_LOG_HEADER_LEN);
+<a href=#269 id=269 data-nosnippet>269</a>    }
+<a href=#270 id=270 data-nosnippet>270</a>    file.write_all(<span class="kw-2">&amp;</span>encode_batch_header(frame_count))<span class="question-mark">?</span>;
+<a href=#271 id=271 data-nosnippet>271</a>    appended = appended.saturating_add(DELTA_BATCH_HEADER_LEN);
+<a href=#272 id=272 data-nosnippet>272</a>    <span class="kw">let </span><span class="kw-2">mut </span>frames_bytes = Vec::with_capacity(frames.len().saturating_mul(DELTA_FRAME_LEN));
+<a href=#273 id=273 data-nosnippet>273</a>    <span class="kw">for </span>frame <span class="kw">in </span>frames {
+<a href=#274 id=274 data-nosnippet>274</a>        frames_bytes.extend_from_slice(<span class="kw-2">&amp;</span>frame.encode());
+<a href=#275 id=275 data-nosnippet>275</a>    }
+<a href=#276 id=276 data-nosnippet>276</a>    file.write_all(<span class="kw-2">&amp;</span>frames_bytes)<span class="question-mark">?</span>;
+<a href=#277 id=277 data-nosnippet>277</a>    appended = appended.saturating_add(frames_bytes.len());
+<a href=#278 id=278 data-nosnippet>278</a>    file.write_all(<span class="kw-2">&amp;</span>encode_trailer(
+<a href=#279 id=279 data-nosnippet>279</a>        tail_fingerprint,
+<a href=#280 id=280 data-nosnippet>280</a>        batch_crc(<span class="kw-2">&amp;</span>frames_bytes, tail_fingerprint),
+<a href=#281 id=281 data-nosnippet>281</a>    ))<span class="question-mark">?</span>;
+<a href=#282 id=282 data-nosnippet>282</a>    appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
+<a href=#283 id=283 data-nosnippet>283</a>    file.sync_all()<span class="question-mark">?</span>;
+<a href=#284 id=284 data-nosnippet>284</a>    <span class="prelude-val">Ok</span>(appended)
+<a href=#285 id=285 data-nosnippet>285</a>}
+<a href=#286 id=286 data-nosnippet>286</a>
+<a href=#287 id=287 data-nosnippet>287</a><span class="doccomment">/// Errors that can arise while applying a replayed delta log to a
+<a href=#288 id=288 data-nosnippet>288</a>/// checkpoint-backed index. Any of these means the log is structurally
+<a href=#289 id=289 data-nosnippet>289</a>/// inconsistent with the checkpoint it claims to continue, and the whole log
+<a href=#290 id=290 data-nosnippet>290</a>/// must be rejected (opener falls back to a rescan).
+<a href=#291 id=291 data-nosnippet>291</a></span><span class="attr">#[derive(Debug, PartialEq, Eq)]
+<a href=#292 id=292 data-nosnippet>292</a></span><span class="kw">pub enum </span>DeltaReplayError {
+<a href=#293 id=293 data-nosnippet>293</a>    <span class="doccomment">/// A frame targets a bucket outside the checkpoint index's capacity.
+<a href=#294 id=294 data-nosnippet>294</a>    </span>FrameOutOfBounds {
+<a href=#295 id=295 data-nosnippet>295</a>        <span class="doccomment">/// The frame's target bucket.
+<a href=#296 id=296 data-nosnippet>296</a>        </span>bucket: u32,
+<a href=#297 id=297 data-nosnippet>297</a>        <span class="doccomment">/// The checkpoint index's capacity.
+<a href=#298 id=298 data-nosnippet>298</a>        </span>capacity: u32,
+<a href=#299 id=299 data-nosnippet>299</a>    },
+<a href=#300 id=300 data-nosnippet>300</a>    <span class="doccomment">/// Replay requires an owned (materialized) slot array.
+<a href=#301 id=301 data-nosnippet>301</a>    </span>RequiresOwnedIndex,
+<a href=#302 id=302 data-nosnippet>302</a>}
+<a href=#303 id=303 data-nosnippet>303</a>
+<a href=#304 id=304 data-nosnippet>304</a><span class="kw">impl </span>std::fmt::Display <span class="kw">for </span>DeltaReplayError {
+<a href=#305 id=305 data-nosnippet>305</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>std::fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; std::fmt::Result {
+<a href=#306 id=306 data-nosnippet>306</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#307 id=307 data-nosnippet>307</a>            <span class="self">Self</span>::FrameOutOfBounds { bucket, capacity } =&gt; {
+<a href=#308 id=308 data-nosnippet>308</a>                <span class="macro">write!</span>(
+<a href=#309 id=309 data-nosnippet>309</a>                    f,
+<a href=#310 id=310 data-nosnippet>310</a>                    <span class="string">"delta frame bucket {bucket} exceeds index capacity {capacity}"
+<a href=#311 id=311 data-nosnippet>311</a>                </span>)
+<a href=#312 id=312 data-nosnippet>312</a>            }
+<a href=#313 id=313 data-nosnippet>313</a>            <span class="self">Self</span>::RequiresOwnedIndex =&gt; <span class="macro">write!</span>(f, <span class="string">"delta replay requires an owned index"</span>),
+<a href=#314 id=314 data-nosnippet>314</a>        }
+<a href=#315 id=315 data-nosnippet>315</a>    }
+<a href=#316 id=316 data-nosnippet>316</a>}
+<a href=#317 id=317 data-nosnippet>317</a>
+<a href=#318 id=318 data-nosnippet>318</a><span class="kw">impl </span>std::error::Error <span class="kw">for </span>DeltaReplayError {}
+<a href=#319 id=319 data-nosnippet>319</a>
+<a href=#320 id=320 data-nosnippet>320</a><span class="attr">#[cfg(test)]
+<a href=#321 id=321 data-nosnippet>321</a>#[cfg_attr(coverage_nightly, coverage(off))]
+<a href=#322 id=322 data-nosnippet>322</a></span><span class="kw">mod </span>tests {
+<a href=#323 id=323 data-nosnippet>323</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#324 id=324 data-nosnippet>324</a>
+<a href=#325 id=325 data-nosnippet>325</a>    <span class="kw">fn </span>test_frame(bucket: u32, generation: u64) -&gt; DeltaFrame {
+<a href=#326 id=326 data-nosnippet>326</a>        DeltaFrame {
+<a href=#327 id=327 data-nosnippet>327</a>            collection_id: [<span class="number">0x44</span>, <span class="number">0x4C</span>, <span class="number">0x54</span>, <span class="number">0x52</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>],
+<a href=#328 id=328 data-nosnippet>328</a>            bucket,
+<a href=#329 id=329 data-nosnippet>329</a>            generation,
+<a href=#330 id=330 data-nosnippet>330</a>            slot: u64::from(bucket).wrapping_mul(<span class="number">7</span>).wrapping_add(<span class="number">1</span>),
+<a href=#331 id=331 data-nosnippet>331</a>        }
+<a href=#332 id=332 data-nosnippet>332</a>    }
+<a href=#333 id=333 data-nosnippet>333</a>
+<a href=#334 id=334 data-nosnippet>334</a>    <span class="attr">#[test]
+<a href=#335 id=335 data-nosnippet>335</a>    </span><span class="kw">fn </span>header_and_batch_header_and_trailer_round_trip() {
+<a href=#336 id=336 data-nosnippet>336</a>        <span class="kw">let </span>header = encode_header(<span class="number">0xDEAD_BEEF</span>);
+<a href=#337 id=337 data-nosnippet>337</a>        <span class="macro">assert_eq!</span>(<span class="kw-2">&amp;</span>header[..<span class="number">4</span>], DELTA_LOG_MAGIC);
+<a href=#338 id=338 data-nosnippet>338</a>        <span class="macro">assert_eq!</span>(header[<span class="number">4</span>], DELTA_LOG_VERSION);
+<a href=#339 id=339 data-nosnippet>339</a>        <span class="macro">assert_eq!</span>(
+<a href=#340 id=340 data-nosnippet>340</a>            u64::from_le_bytes(header[BASE_FINGERPRINT_OFFSET..<span class="number">16</span>].try_into().unwrap()),
+<a href=#341 id=341 data-nosnippet>341</a>            <span class="number">0xDEAD_BEEF
+<a href=#342 id=342 data-nosnippet>342</a>        </span>);
+<a href=#343 id=343 data-nosnippet>343</a>
+<a href=#344 id=344 data-nosnippet>344</a>        <span class="kw">let </span>batch = encode_batch_header(<span class="number">12</span>);
+<a href=#345 id=345 data-nosnippet>345</a>        <span class="macro">assert_eq!</span>(<span class="kw-2">&amp;</span>batch[..<span class="number">4</span>], DELTA_BATCH_MAGIC);
+<a href=#346 id=346 data-nosnippet>346</a>        <span class="macro">assert_eq!</span>(u32::from_le_bytes(batch[<span class="number">4</span>..<span class="number">8</span>].try_into().unwrap()), <span class="number">12</span>);
+<a href=#347 id=347 data-nosnippet>347</a>
+<a href=#348 id=348 data-nosnippet>348</a>        <span class="kw">let </span>trailer = encode_trailer(<span class="number">0xCAFE_F00D</span>, <span class="number">0x1234_5678</span>);
+<a href=#349 id=349 data-nosnippet>349</a>        <span class="macro">assert_eq!</span>(<span class="kw-2">&amp;</span>trailer[..<span class="number">4</span>], DELTA_LOG_TRAILER_MAGIC);
+<a href=#350 id=350 data-nosnippet>350</a>        <span class="macro">assert_eq!</span>(
+<a href=#351 id=351 data-nosnippet>351</a>            u32::from_le_bytes(trailer[TRAILER_CRC_OFFSET..<span class="number">8</span>].try_into().unwrap()),
+<a href=#352 id=352 data-nosnippet>352</a>            <span class="number">0x1234_5678
+<a href=#353 id=353 data-nosnippet>353</a>        </span>);
+<a href=#354 id=354 data-nosnippet>354</a>        <span class="macro">assert_eq!</span>(
+<a href=#355 id=355 data-nosnippet>355</a>            u64::from_le_bytes(trailer[TRAILER_FINGERPRINT_OFFSET..<span class="number">16</span>].try_into().unwrap()),
+<a href=#356 id=356 data-nosnippet>356</a>            <span class="number">0xCAFE_F00D
+<a href=#357 id=357 data-nosnippet>357</a>        </span>);
+<a href=#358 id=358 data-nosnippet>358</a>    }
+<a href=#359 id=359 data-nosnippet>359</a>
+<a href=#360 id=360 data-nosnippet>360</a>    <span class="attr">#[test]
+<a href=#361 id=361 data-nosnippet>361</a>    </span><span class="kw">fn </span>single_batch_round_trips_as_committed() {
+<a href=#362 id=362 data-nosnippet>362</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_single_{}"</span>, std::process::id()));
+<a href=#363 id=363 data-nosnippet>363</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
+<a href=#364 id=364 data-nosnippet>364</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#365 id=365 data-nosnippet>365</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#366 id=366 data-nosnippet>366</a>        <span class="kw">let </span>frames = <span class="macro">vec!</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>), test_frame(<span class="number">1</span>, <span class="number">3</span>), test_frame(<span class="number">2</span>, <span class="number">3</span>)];
+<a href=#367 id=367 data-nosnippet>367</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>frames, <span class="number">99</span>).unwrap();
+<a href=#368 id=368 data-nosnippet>368</a>
+<a href=#369 id=369 data-nosnippet>369</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"valid log reads"</span>);
+<a href=#370 id=370 data-nosnippet>370</a>        <span class="macro">assert_eq!</span>(log.base_fingerprint, <span class="number">7</span>);
+<a href=#371 id=371 data-nosnippet>371</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">99</span>);
+<a href=#372 id=372 data-nosnippet>372</a>        <span class="macro">assert_eq!</span>(log.frames, frames);
+<a href=#373 id=373 data-nosnippet>373</a>
+<a href=#374 id=374 data-nosnippet>374</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#375 id=375 data-nosnippet>375</a>    }
+<a href=#376 id=376 data-nosnippet>376</a>
+<a href=#377 id=377 data-nosnippet>377</a>    <span class="attr">#[test]
+<a href=#378 id=378 data-nosnippet>378</a>    </span><span class="kw">fn </span>multiple_batches_keep_every_committed_frame() {
+<a href=#379 id=379 data-nosnippet>379</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_multi_{}"</span>, std::process::id()));
+<a href=#380 id=380 data-nosnippet>380</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
+<a href=#381 id=381 data-nosnippet>381</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#382 id=382 data-nosnippet>382</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#383 id=383 data-nosnippet>383</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>), test_frame(<span class="number">1</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
+<a href=#384 id=384 data-nosnippet>384</a>        append_batch(
+<a href=#385 id=385 data-nosnippet>385</a>            <span class="kw-2">&amp;</span>path,
+<a href=#386 id=386 data-nosnippet>386</a>            <span class="bool-val">false</span>,
+<a href=#387 id=387 data-nosnippet>387</a>            <span class="number">7</span>,
+<a href=#388 id=388 data-nosnippet>388</a>            <span class="kw-2">&amp;</span>[test_frame(<span class="number">2</span>, <span class="number">3</span>), test_frame(<span class="number">3</span>, <span class="number">3</span>), test_frame(<span class="number">4</span>, <span class="number">3</span>)],
+<a href=#389 id=389 data-nosnippet>389</a>            <span class="number">22</span>,
+<a href=#390 id=390 data-nosnippet>390</a>        )
+<a href=#391 id=391 data-nosnippet>391</a>        .unwrap();
 <a href=#392 id=392 data-nosnippet>392</a>
-<a href=#393 id=393 data-nosnippet>393</a>        <span class="comment">// Missing file.
-<a href=#394 id=394 data-nosnippet>394</a>        </span><span class="macro">assert!</span>(read_delta_log(<span class="kw-2">&amp;</span>path).is_none());
-<a href=#395 id=395 data-nosnippet>395</a>
-<a href=#396 id=396 data-nosnippet>396</a>        <span class="comment">// Header but no complete committed batch (header + frames, no trailer).
-<a href=#397 id=397 data-nosnippet>397</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>file = fs::File::create(<span class="kw-2">&amp;</span>path).unwrap();
-<a href=#398 id=398 data-nosnippet>398</a>        file.write_all(<span class="kw-2">&amp;</span>encode_header(<span class="number">7</span>)).unwrap();
-<a href=#399 id=399 data-nosnippet>399</a>        file.write_all(<span class="kw-2">&amp;</span>encode_batch_header(<span class="number">1</span>)).unwrap();
-<a href=#400 id=400 data-nosnippet>400</a>        file.write_all(<span class="kw-2">&amp;</span>test_frame(<span class="number">0</span>, <span class="number">3</span>).encode()).unwrap();
-<a href=#401 id=401 data-nosnippet>401</a>        <span class="kw">let _ </span>= file.sync_all();
-<a href=#402 id=402 data-nosnippet>402</a>        <span class="macro">assert!</span>(read_delta_log(<span class="kw-2">&amp;</span>path).is_none());
-<a href=#403 id=403 data-nosnippet>403</a>
-<a href=#404 id=404 data-nosnippet>404</a>        <span class="comment">// Bad magic.
-<a href=#405 id=405 data-nosnippet>405</a>        </span>std::fs::write(<span class="kw-2">&amp;</span>path, <span class="macro">vec!</span>[<span class="number">0xAB</span>; <span class="number">64</span>]).unwrap();
-<a href=#406 id=406 data-nosnippet>406</a>        <span class="macro">assert!</span>(read_delta_log(<span class="kw-2">&amp;</span>path).is_none());
-<a href=#407 id=407 data-nosnippet>407</a>
-<a href=#408 id=408 data-nosnippet>408</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
-<a href=#409 id=409 data-nosnippet>409</a>    }
-<a href=#410 id=410 data-nosnippet>410</a>}
+<a href=#393 id=393 data-nosnippet>393</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"multi-batch log reads"</span>);
+<a href=#394 id=394 data-nosnippet>394</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">22</span>, <span class="string">"the final trailer wins"</span>);
+<a href=#395 id=395 data-nosnippet>395</a>        <span class="macro">assert_eq!</span>(log.frames.len(), <span class="number">5</span>);
+<a href=#396 id=396 data-nosnippet>396</a>        <span class="macro">assert_eq!</span>(log.frames[<span class="number">4</span>], test_frame(<span class="number">4</span>, <span class="number">3</span>));
+<a href=#397 id=397 data-nosnippet>397</a>
+<a href=#398 id=398 data-nosnippet>398</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#399 id=399 data-nosnippet>399</a>    }
+<a href=#400 id=400 data-nosnippet>400</a>
+<a href=#401 id=401 data-nosnippet>401</a>    <span class="attr">#[test]
+<a href=#402 id=402 data-nosnippet>402</a>    </span><span class="kw">fn </span>torn_final_batch_is_dropped() {
+<a href=#403 id=403 data-nosnippet>403</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_torn_{}"</span>, std::process::id()));
+<a href=#404 id=404 data-nosnippet>404</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
+<a href=#405 id=405 data-nosnippet>405</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#406 id=406 data-nosnippet>406</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#407 id=407 data-nosnippet>407</a>        <span class="comment">// Two committed batches, then a third batch with a torn trailer.
+<a href=#408 id=408 data-nosnippet>408</a>        </span>append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>), test_frame(<span class="number">1</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
+<a href=#409 id=409 data-nosnippet>409</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">false</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">2</span>, <span class="number">3</span>), test_frame(<span class="number">3</span>, <span class="number">3</span>)], <span class="number">22</span>).unwrap();
+<a href=#410 id=410 data-nosnippet>410</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">false</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">4</span>, <span class="number">3</span>), test_frame(<span class="number">5</span>, <span class="number">3</span>)], <span class="number">33</span>).unwrap();
+<a href=#411 id=411 data-nosnippet>411</a>        <span class="kw">let </span>full = std::fs::read(<span class="kw-2">&amp;</span>path).unwrap();
+<a href=#412 id=412 data-nosnippet>412</a>        <span class="comment">// Cut 4 bytes off the shortest possible third batch (frames fully
+<a href=#413 id=413 data-nosnippet>413</a>        // written, trailer partial).
+<a href=#414 id=414 data-nosnippet>414</a>        </span><span class="kw">let </span>torn_len = full
+<a href=#415 id=415 data-nosnippet>415</a>            .len()
+<a href=#416 id=416 data-nosnippet>416</a>            .saturating_sub(DELTA_LOG_TRAILER_LEN.saturating_sub(<span class="number">4</span>));
+<a href=#417 id=417 data-nosnippet>417</a>        std::fs::write(<span class="kw-2">&amp;</span>path, <span class="kw-2">&amp;</span>full[..torn_len]).unwrap();
+<a href=#418 id=418 data-nosnippet>418</a>
+<a href=#419 id=419 data-nosnippet>419</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"torn tail must not fail the committed prefix"</span>);
+<a href=#420 id=420 data-nosnippet>420</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">22</span>);
+<a href=#421 id=421 data-nosnippet>421</a>        <span class="macro">assert_eq!</span>(
+<a href=#422 id=422 data-nosnippet>422</a>            log.frames.len(),
+<a href=#423 id=423 data-nosnippet>423</a>            <span class="number">4</span>,
+<a href=#424 id=424 data-nosnippet>424</a>            <span class="string">"frames of the unfinalized batch are dropped"
+<a href=#425 id=425 data-nosnippet>425</a>        </span>);
+<a href=#426 id=426 data-nosnippet>426</a>
+<a href=#427 id=427 data-nosnippet>427</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#428 id=428 data-nosnippet>428</a>    }
+<a href=#429 id=429 data-nosnippet>429</a>
+<a href=#430 id=430 data-nosnippet>430</a>    <span class="attr">#[test]
+<a href=#431 id=431 data-nosnippet>431</a>    </span><span class="kw">fn </span>unfinalized_frames_are_never_stranded() {
+<a href=#432 id=432 data-nosnippet>432</a>        <span class="comment">// A complete batch followed by a batch whose frames are fully written
+<a href=#433 id=433 data-nosnippet>433</a>        // but whose trailer is missing entirely must also drop that batch.
+<a href=#434 id=434 data-nosnippet>434</a>        </span><span class="kw">let </span>dir =
+<a href=#435 id=435 data-nosnippet>435</a>            std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_no_trailer_{}"</span>, std::process::id()));
+<a href=#436 id=436 data-nosnippet>436</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
+<a href=#437 id=437 data-nosnippet>437</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#438 id=438 data-nosnippet>438</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#439 id=439 data-nosnippet>439</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
+<a href=#440 id=440 data-nosnippet>440</a>
+<a href=#441 id=441 data-nosnippet>441</a>        <span class="comment">// Append a second batch's header + frames but no trailer.
+<a href=#442 id=442 data-nosnippet>442</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>file = fs::OpenOptions::new().append(<span class="bool-val">true</span>).open(<span class="kw-2">&amp;</span>path).unwrap();
+<a href=#443 id=443 data-nosnippet>443</a>        file.write_all(<span class="kw-2">&amp;</span>encode_batch_header(<span class="number">2</span>)).unwrap();
+<a href=#444 id=444 data-nosnippet>444</a>        file.write_all(<span class="kw-2">&amp;</span>test_frame(<span class="number">1</span>, <span class="number">3</span>).encode()).unwrap();
+<a href=#445 id=445 data-nosnippet>445</a>        file.write_all(<span class="kw-2">&amp;</span>test_frame(<span class="number">2</span>, <span class="number">3</span>).encode()).unwrap();
+<a href=#446 id=446 data-nosnippet>446</a>        <span class="kw">let _ </span>= file.sync_all();
+<a href=#447 id=447 data-nosnippet>447</a>
+<a href=#448 id=448 data-nosnippet>448</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"frame-without-trailer batch is dropped, not fatal"</span>);
+<a href=#449 id=449 data-nosnippet>449</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">11</span>);
+<a href=#450 id=450 data-nosnippet>450</a>        <span class="macro">assert_eq!</span>(log.frames.len(), <span class="number">1</span>);
+<a href=#451 id=451 data-nosnippet>451</a>
+<a href=#452 id=452 data-nosnippet>452</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#453 id=453 data-nosnippet>453</a>    }
+<a href=#454 id=454 data-nosnippet>454</a>
+<a href=#455 id=455 data-nosnippet>455</a>    <span class="attr">#[test]
+<a href=#456 id=456 data-nosnippet>456</a>    </span><span class="kw">fn </span>corrupted_frame_bytes_are_rejected_by_crc() {
+<a href=#457 id=457 data-nosnippet>457</a>        <span class="kw">let </span>dir =
+<a href=#458 id=458 data-nosnippet>458</a>            std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_crc_corrupt_{}"</span>, std::process::id()));
+<a href=#459 id=459 data-nosnippet>459</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
+<a href=#460 id=460 data-nosnippet>460</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#461 id=461 data-nosnippet>461</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#462 id=462 data-nosnippet>462</a>        <span class="comment">// A committed batch, then a second batch whose frame bytes are
+<a href=#463 id=463 data-nosnippet>463</a>        // corrupted after being fully written — the length framing alone
+<a href=#464 id=464 data-nosnippet>464</a>        // can't catch this; only the CRC can.
+<a href=#465 id=465 data-nosnippet>465</a>        </span>append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
+<a href=#466 id=466 data-nosnippet>466</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">false</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">1</span>, <span class="number">3</span>), test_frame(<span class="number">2</span>, <span class="number">3</span>)], <span class="number">22</span>).unwrap();
+<a href=#467 id=467 data-nosnippet>467</a>        <span class="kw">let </span><span class="kw-2">mut </span>full = std::fs::read(<span class="kw-2">&amp;</span>path).unwrap();
+<a href=#468 id=468 data-nosnippet>468</a>        <span class="comment">// Flip a byte inside the second batch's frame region (well past the
+<a href=#469 id=469 data-nosnippet>469</a>        // first batch's header+frame+trailer).
+<a href=#470 id=470 data-nosnippet>470</a>        </span><span class="kw">let </span>corrupt_at = full.len() - DELTA_LOG_TRAILER_LEN - <span class="number">1</span>;
+<a href=#471 id=471 data-nosnippet>471</a>        full[corrupt_at] ^= <span class="number">0xFF</span>;
+<a href=#472 id=472 data-nosnippet>472</a>        std::fs::write(<span class="kw-2">&amp;</span>path, <span class="kw-2">&amp;</span>full).unwrap();
+<a href=#473 id=473 data-nosnippet>473</a>
+<a href=#474 id=474 data-nosnippet>474</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"first committed batch must still be trusted"</span>);
+<a href=#475 id=475 data-nosnippet>475</a>        <span class="macro">assert_eq!</span>(log.tail_fingerprint, <span class="number">11</span>, <span class="string">"corrupted batch must be dropped"</span>);
+<a href=#476 id=476 data-nosnippet>476</a>        <span class="macro">assert_eq!</span>(log.frames.len(), <span class="number">1</span>);
+<a href=#477 id=477 data-nosnippet>477</a>        <span class="macro">assert_eq!</span>(log.frames[<span class="number">0</span>], test_frame(<span class="number">0</span>, <span class="number">3</span>));
+<a href=#478 id=478 data-nosnippet>478</a>
+<a href=#479 id=479 data-nosnippet>479</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#480 id=480 data-nosnippet>480</a>    }
+<a href=#481 id=481 data-nosnippet>481</a>
+<a href=#482 id=482 data-nosnippet>482</a>    <span class="attr">#[test]
+<a href=#483 id=483 data-nosnippet>483</a>    </span><span class="kw">fn </span>corrupted_tail_fingerprint_is_rejected_by_crc() {
+<a href=#484 id=484 data-nosnippet>484</a>        <span class="kw">let </span>dir =
+<a href=#485 id=485 data-nosnippet>485</a>            std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_fp_corrupt_{}"</span>, std::process::id()));
+<a href=#486 id=486 data-nosnippet>486</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
+<a href=#487 id=487 data-nosnippet>487</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#488 id=488 data-nosnippet>488</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#489 id=489 data-nosnippet>489</a>        <span class="comment">// A committed batch, then a second batch whose frame bytes are
+<a href=#490 id=490 data-nosnippet>490</a>        // untouched but whose trailer fingerprint is corrupted after being
+<a href=#491 id=491 data-nosnippet>491</a>        // written. The CRC covers the fingerprint too, so this must be
+<a href=#492 id=492 data-nosnippet>492</a>        // caught even though every frame decodes fine.
+<a href=#493 id=493 data-nosnippet>493</a>        </span>append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">true</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">0</span>, <span class="number">3</span>)], <span class="number">11</span>).unwrap();
+<a href=#494 id=494 data-nosnippet>494</a>        append_batch(<span class="kw-2">&amp;</span>path, <span class="bool-val">false</span>, <span class="number">7</span>, <span class="kw-2">&amp;</span>[test_frame(<span class="number">1</span>, <span class="number">3</span>), test_frame(<span class="number">2</span>, <span class="number">3</span>)], <span class="number">22</span>).unwrap();
+<a href=#495 id=495 data-nosnippet>495</a>        <span class="kw">let </span><span class="kw-2">mut </span>full = std::fs::read(<span class="kw-2">&amp;</span>path).unwrap();
+<a href=#496 id=496 data-nosnippet>496</a>        <span class="comment">// Flip the last byte of the file: the trailer's tail_fingerprint
+<a href=#497 id=497 data-nosnippet>497</a>        // field, not any frame byte.
+<a href=#498 id=498 data-nosnippet>498</a>        </span><span class="kw">let </span>last = full.len() - <span class="number">1</span>;
+<a href=#499 id=499 data-nosnippet>499</a>        full[last] ^= <span class="number">0xFF</span>;
+<a href=#500 id=500 data-nosnippet>500</a>        std::fs::write(<span class="kw-2">&amp;</span>path, <span class="kw-2">&amp;</span>full).unwrap();
+<a href=#501 id=501 data-nosnippet>501</a>
+<a href=#502 id=502 data-nosnippet>502</a>        <span class="kw">let </span>log = read_delta_log(<span class="kw-2">&amp;</span>path).expect(<span class="string">"first committed batch must still be trusted"</span>);
+<a href=#503 id=503 data-nosnippet>503</a>        <span class="macro">assert_eq!</span>(
+<a href=#504 id=504 data-nosnippet>504</a>            log.tail_fingerprint, <span class="number">11</span>,
+<a href=#505 id=505 data-nosnippet>505</a>            <span class="string">"batch with corrupted fingerprint must be dropped"
+<a href=#506 id=506 data-nosnippet>506</a>        </span>);
+<a href=#507 id=507 data-nosnippet>507</a>        <span class="macro">assert_eq!</span>(log.frames.len(), <span class="number">1</span>);
+<a href=#508 id=508 data-nosnippet>508</a>        <span class="macro">assert_eq!</span>(log.frames[<span class="number">0</span>], test_frame(<span class="number">0</span>, <span class="number">3</span>));
+<a href=#509 id=509 data-nosnippet>509</a>
+<a href=#510 id=510 data-nosnippet>510</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#511 id=511 data-nosnippet>511</a>    }
+<a href=#512 id=512 data-nosnippet>512</a>
+<a href=#513 id=513 data-nosnippet>513</a>    <span class="attr">#[test]
+<a href=#514 id=514 data-nosnippet>514</a>    </span><span class="kw">fn </span>entirely_torn_or_missing_log_is_none() {
+<a href=#515 id=515 data-nosnippet>515</a>        <span class="kw">let </span>dir = std::env::temp_dir().join(<span class="macro">format!</span>(<span class="string">"mtxdb_delta_torn_all_{}"</span>, std::process::id()));
+<a href=#516 id=516 data-nosnippet>516</a>        <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir);
+<a href=#517 id=517 data-nosnippet>517</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#518 id=518 data-nosnippet>518</a>        <span class="kw">let </span>path = dir.join(INDEX_DELTA_FILE);
+<a href=#519 id=519 data-nosnippet>519</a>
+<a href=#520 id=520 data-nosnippet>520</a>        <span class="comment">// Missing file.
+<a href=#521 id=521 data-nosnippet>521</a>        </span><span class="macro">assert!</span>(read_delta_log(<span class="kw-2">&amp;</span>path).is_none());
+<a href=#522 id=522 data-nosnippet>522</a>
+<a href=#523 id=523 data-nosnippet>523</a>        <span class="comment">// Header but no complete committed batch (header + frames, no trailer).
+<a href=#524 id=524 data-nosnippet>524</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>file = fs::File::create(<span class="kw-2">&amp;</span>path).unwrap();
+<a href=#525 id=525 data-nosnippet>525</a>        file.write_all(<span class="kw-2">&amp;</span>encode_header(<span class="number">7</span>)).unwrap();
+<a href=#526 id=526 data-nosnippet>526</a>        file.write_all(<span class="kw-2">&amp;</span>encode_batch_header(<span class="number">1</span>)).unwrap();
+<a href=#527 id=527 data-nosnippet>527</a>        file.write_all(<span class="kw-2">&amp;</span>test_frame(<span class="number">0</span>, <span class="number">3</span>).encode()).unwrap();
+<a href=#528 id=528 data-nosnippet>528</a>        <span class="kw">let _ </span>= file.sync_all();
+<a href=#529 id=529 data-nosnippet>529</a>        <span class="macro">assert!</span>(read_delta_log(<span class="kw-2">&amp;</span>path).is_none());
+<a href=#530 id=530 data-nosnippet>530</a>
+<a href=#531 id=531 data-nosnippet>531</a>        <span class="comment">// Bad magic.
+<a href=#532 id=532 data-nosnippet>532</a>        </span>std::fs::write(<span class="kw-2">&amp;</span>path, <span class="macro">vec!</span>[<span class="number">0xAB</span>; <span class="number">64</span>]).unwrap();
+<a href=#533 id=533 data-nosnippet>533</a>        <span class="macro">assert!</span>(read_delta_log(<span class="kw-2">&amp;</span>path).is_none());
+<a href=#534 id=534 data-nosnippet>534</a>
+<a href=#535 id=535 data-nosnippet>535</a>        std::fs::remove_dir_all(<span class="kw-2">&amp;</span>dir).unwrap();
+<a href=#536 id=536 data-nosnippet>536</a>    }
+<a href=#537 id=537 data-nosnippet>537</a>}
 </code></pre></div></section></main></body></html>
