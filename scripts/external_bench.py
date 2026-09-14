@@ -115,8 +115,13 @@ def append_rows(scenario: Scenario) -> int:
     return len(scenario.rows)
 
 
-def print_table(rows: list[dict]) -> None:
-    """Render the three engines side by side from a run's external rows."""
+def print_table(rows: list[dict], default_run: bool = True) -> None:
+    """Render the three engines side by side from a run's external rows.
+
+    `default_run` distinguishes a plain 0.1 GB run (no MTXDB_BENCH_EXT_GB in
+    the environment) from an explicit size, so the reminder only appears when
+    the note is accurate.
+    """
     latest: dict[str, dict] = {}
     for row in rows:
         latest[row["engine"]] = row
@@ -148,7 +153,7 @@ def print_table(rows: list[dict]) -> None:
             return f"{float(value):.2f}"
         label = latest[engine]["mem_label"]
         if label == "index_bytes":
-            return f"{_human_bytes(int(value))} idx"
+            return _human_bytes(int(value))
         # mdbx / sqlite keep their B-tree in the DB file's own mapping — the
         # "index" is not a separate resident structure.
         return "in-file"
@@ -180,7 +185,13 @@ def print_table(rows: list[dict]) -> None:
             + "  ".join(cell.rjust(widths[i]) for i, cell in enumerate(cells))
         )
     print()
-    print("this is the default 0.1 GB run; rerun with MTXDB_BENCH_EXT_GB=0.2 for a bigger sample")
+    _footer = ""
+    if default_run:
+        _footer = (
+            "this is the default 0.1 GB run; rerun with MTXDB_BENCH_EXT_GB=0.2 "
+            "for a bigger sample"
+        )
+    print(_footer)
 
 
 def main() -> None:
@@ -208,7 +219,7 @@ def main() -> None:
         return
     if args.append:
         append_rows(scenario)
-    print_table(scenario.rows)
+    print_table(scenario.rows, default_run="MTXDB_BENCH_EXT_GB" not in os.environ)
 
 
 if __name__ == "__main__":

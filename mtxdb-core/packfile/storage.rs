@@ -2087,12 +2087,21 @@ impl PackfileStorage {
         // target the new epoch (D1) by the time the locks drop next.
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         drop(guards);
-        // Publication lock released with every put mutex before the unlocked
-        // serialize/rename: new-collection puts may then proceed, and any
-        // record bytes they flush land after the fingerprint (recovered by
-        // the reopen's rescan on a crash, as with the pre-existing unlocked
-        // window for existing-collection puts).
-        drop(create_guard);
+        // `create_guard` is deliberately NOT dropped here, unlike the
+        // per-collection put mutexes above. An existing collection's
+        // concurrent put after this point is safe to let through: its frame
+        // lands after `fingerprint` and is recovered via the new delta epoch
+        // (D1) on reopen — see `rotate_delta_epoch`. A *newly discovered*
+        // collection (via `put`/`put_many` creating one, or `refresh_collection`
+        // publishing one from external writes) has no such fallback: it
+        // doesn't go through delta tracking, so if it publishes into
+        // `self.collections` during the unlocked serialize+write+rename
+        // below, its data can already be covered by `fingerprint` (the
+        // packs it lives in were flushed above) while being absent from
+        // `entries`/`blobs` (snapshotted just above, before it existed) —
+        // a crash after the rename makes reopen trust a checkpoint that
+        // silently omits it. Keep new-collection publication excluded until
+        // the checkpoint is durably renamed.
 
         let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
             .iter()
@@ -2125,6 +2134,12 @@ impl PackfileStorage {
         // passes) or doesn't (falls back to the still-valid predecessor
         // checkpoint) — never a torn or partially-visible rename.
         let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        // The checkpoint naming `fingerprint` is now durably in place, so a
+        // new collection publishing from here on lands after it — same
+        // recovery story a reopen already has for any other post-checkpoint
+        // write (full rescan on fingerprint mismatch, or a fresh delta
+        // epoch). Safe to let new-collection publication through now.
+        drop(create_guard);
         self.retire_delta_epoch(old_base_fingerprint);
         // The unlocked serialize/write window above let concurrent puts land
         // after the rotation. C1 was snapshotted before them, so such a put
@@ -2519,11 +2534,19 @@ impl PackfileStorage {
             .into_iter()
             .map(|(collection_id, nodes)| {
                 let nodes = usize::try_from(nodes).ok()?;
-                let capacity = u32::try_from(LossyIndex::capacity_for_entries(nodes)).ok()?;
+                // A live collection always starts at `NEW_COLLECTION_INDEX_FLOOR`
+                // (64), not `LossyIndex::new`'s own generic 16-slot floor — use
+                // the same starting point here or a small collection's
+                // capacity/memory estimate undershoots its real index.
+                let capacity = u32::try_from(LossyIndex::capacity_for_entries(
+                    nodes,
+                    NEW_COLLECTION_INDEX_FLOOR,
+                ))
+                .ok()?;
                 Some((
                     collection_id,
                     nodes,
-                    LossyIndex::memory_usage_for_entries(nodes),
+                    LossyIndex::memory_usage_for_entries(nodes, NEW_COLLECTION_INDEX_FLOOR),
                     capacity,
                 ))
             })
@@ -6919,6 +6942,47 @@ mod tests {
             "the persisted directory's per-collection totals must match the live index's own counts"
         );
         assert!(PackfileStorage::collection_directory_persisted_at(&dir).is_some());
+    }
+
+    #[test]
+    fn test_collection_summaries_from_disk_capacity_matches_new_collection_floor() {
+        // A one-node collection's live index starts at
+        // `NEW_COLLECTION_INDEX_FLOOR` (64), never `LossyIndex::new`'s own
+        // generic 16-slot floor. The disk-only estimate (no packfiles
+        // opened) must report the same capacity the live index actually
+        // has, or a load-factor figure derived from it is wrong.
+        let dir = test_dir("collection_summaries_from_disk_capacity_floor");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"x")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        let live_capacity = store
+            .collection_index_info(&TEST_COLLECTION)
+            .expect("collection exists")
+            .2;
+        assert_eq!(
+            live_capacity, 64,
+            "sanity check: a fresh one-node collection's live index capacity \
+             is NEW_COLLECTION_INDEX_FLOOR"
+        );
+
+        let from_disk = PackfileStorage::collection_summaries_from_disk(&dir)
+            .expect("directory sidecar was persisted by sync_all");
+        let (_, disk_nodes, _, disk_capacity) = from_disk
+            .into_iter()
+            .find(|(id, _, _, _)| *id == TEST_COLLECTION)
+            .expect("collection present in disk summary");
+        assert_eq!(disk_nodes, 1);
+        assert_eq!(
+            disk_capacity, live_capacity,
+            "disk-only capacity estimate must match the live index, not undershoot it"
+        );
     }
 
     #[test]

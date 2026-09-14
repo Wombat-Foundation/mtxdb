@@ -542,17 +542,24 @@ impl LossyIndex {
     /// Slot-table capacity an index holding `entries` records would have
     /// after the standard two-times-capacity allocation policy is applied —
     /// i.e. without opening the index, e.g. from a persisted node count.
+    ///
+    /// `min_capacity` is the caller's own actual starting floor (`Self::new`
+    /// always rounds up to at least 16, but a caller that always creates
+    /// indexes above that — e.g. `mtxdb-core`'s collections, which start at
+    /// `NEW_COLLECTION_INDEX_FLOOR` — must pass its own floor here, or this
+    /// underestimates a small collection's real capacity).
     #[must_use]
-    pub fn capacity_for_entries(entries: usize) -> usize {
-        let minimum = entries.saturating_mul(2).max(16);
+    pub fn capacity_for_entries(entries: usize, min_capacity: usize) -> usize {
+        let minimum = entries.saturating_mul(2).max(min_capacity.max(16));
         minimum.next_power_of_two()
     }
 
     /// Memory that an index holding `entries` records would use after the
-    /// standard two-times-capacity allocation policy is applied.
+    /// standard two-times-capacity allocation policy is applied. See
+    /// [`Self::capacity_for_entries`] for `min_capacity`.
     #[must_use]
-    pub fn memory_usage_for_entries(entries: usize) -> usize {
-        Self::capacity_for_entries(entries)
+    pub fn memory_usage_for_entries(entries: usize, min_capacity: usize) -> usize {
+        Self::capacity_for_entries(entries, min_capacity)
             .wrapping_mul(LIVE_SLOT_BYTES)
             .wrapping_add(std::mem::size_of::<Self>())
     }

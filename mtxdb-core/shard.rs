@@ -1394,6 +1394,17 @@ impl ShardPool {
             // is provably the tail when the failed flush needs to retract
             // it.
             let append_guard = shard.append_lock.lock();
+            // Re-check poison after acquiring the lock: the check above is
+            // only a fast-path skip for the common case. A concurrent
+            // put/flush can poison the shard between that check and here —
+            // `append_lock` is what actually excludes further appends, so
+            // it's the only place this check is load-bearing.
+            if shard.is_poisoned() {
+                return Err(io::Error::other(format!(
+                    "shard {} is poisoned after an unrecoverable rollback failure",
+                    shard.slot
+                )));
+            }
             // `file_len` is updated at flush time, making the virtual end
             // (committed length plus already-buffered frames) the
             // authoritative next offset. No syscalls happen per append.
@@ -1524,6 +1535,18 @@ impl ShardPool {
         shard: &Arc<Shard>,
         _guard: &parking_lot::MutexGuard<'_, ()>,
     ) -> io::Result<()> {
+        // The guard proves `append_lock` is held, so this is the single
+        // point every flush path — direct, via `flush_shard`, or inline
+        // from `put_record`'s own automatic flush — actually funnels
+        // through under lock. Enforcing the poison check here, not just at
+        // each call site, means correctness never depends on every current
+        // and future caller remembering to check first.
+        if shard.is_poisoned() {
+            return Err(io::Error::other(format!(
+                "shard {} is poisoned after an unrecoverable rollback failure",
+                shard.slot
+            )));
+        }
         {
             let mut pending_guard = shard.pending.lock();
             if pending_guard.is_empty() {
@@ -2338,6 +2361,31 @@ mod tests {
         assert_eq!(read.collection_id[0], 0x01);
         assert_eq!(read.hash[0], 0xAA);
         assert_eq!(read.data.as_ref(), b"hello shard");
+    }
+
+    #[test]
+    fn poisoned_shard_refuses_append_and_flush() {
+        let dir = test_dir("poisoned_shard_refuses_writes");
+        let pool = ShardPool::open(dir).unwrap();
+        let record = test_record(0x01, 0xAA, b"before poison");
+        pool.put_record(&record).unwrap();
+        let shard = pool.get_shard(0).unwrap();
+
+        // Simulate the state left behind by an unrecoverable rollback
+        // failure (see `put_record`'s failed-flush path) directly, rather
+        // than engineering an actual `set_len` failure.
+        shard.poisoned.store(true, Ordering::Release);
+
+        let after = test_record(0x02, 0xBB, b"after poison");
+        let put_err = pool
+            .put_record(&after)
+            .expect_err("a poisoned shard must refuse further appends");
+        assert!(put_err.to_string().contains("poisoned"));
+
+        let flush_err = pool
+            .flush_shard(&shard)
+            .expect_err("a poisoned shard must refuse flush too");
+        assert!(flush_err.to_string().contains("poisoned"));
     }
 
     #[test]

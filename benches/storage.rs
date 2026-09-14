@@ -1365,11 +1365,23 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
                 // real failure.
                 let barrier_deadline = Instant::now() + std::time::Duration::from_secs(30);
                 while !first_rewrite_done.load(Ordering::Relaxed) {
-                    assert!(
-                        Instant::now() < barrier_deadline,
-                        "background rewrite thread never completed its first sync_all \
-                         within 30s (it likely panicked before reaching that point)"
-                    );
+                    if Instant::now() >= barrier_deadline {
+                        // Signal the rewrite thread's `while !done` loop
+                        // before panicking, whether it's dead (a panic) or
+                        // just slow (a genuinely large first full rewrite on
+                        // a mechanical drive, which this project targets, can
+                        // plausibly exceed 30s) — either way, panicking here
+                        // without this would leave that loop spinning
+                        // forever with nothing left to ever set `done`,
+                        // hanging the process instead of surfacing a
+                        // failure.
+                        done.store(true, Ordering::Relaxed);
+                        panic!(
+                            "background rewrite thread never completed its first sync_all \
+                             within 30s (it may have panicked before reaching that point, \
+                             or simply be slower than this timeout on this disk)"
+                        );
+                    }
                     std::thread::yield_now();
                 }
                 let mut collection = [0u8; 16];
