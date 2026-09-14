@@ -1652,19 +1652,18 @@ impl PackfileStorage {
 
     fn resolve_from_candidates(
         &self,
-        gen: Option<&Arc<RoomGeneration>>,
         id: &NodeId,
-        candidates: &[(u16, u64)],
+        candidates: impl IntoIterator<Item = (u16, u64)>,
     ) -> Result<Option<NodeData>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for (shard_id, offset) in candidates {
-            let Some(shard) = self.shards.get_shard(*shard_id) else {
+            let Some(shard) = self.shards.get_shard(shard_id) else {
                 continue;
             };
 
             match Self::read_at(
                 &shard,
-                *offset,
+                offset,
                 self.shards.checksum_policy().verifies_reads(),
             ) {
                 Ok(record) => {
@@ -1676,9 +1675,12 @@ impl PackfileStorage {
                         bytes: record.data,
                         children: Vec::new(),
                     };
-                    if let Some(g) = gen {
-                        g.cache.insert(*id, Arc::new(data.clone()));
-                    }
+                    // A raw mmap-backed `Bytes` is already cheap to retain
+                    // in the caller. Do not turn every cold lookup into an
+                    // LRU write (hash probe, lock, and eviction bookkeeping).
+                    // The cache remains populated by writes and swizzling,
+                    // where it stores work that cannot be recovered by a
+                    // simple mmap range.
                     return Ok(Some(data));
                 }
                 Err(e) => {
@@ -1834,14 +1836,10 @@ impl PackfileStorage {
         gen: &Arc<RoomGeneration>,
         id: &NodeId,
     ) -> Result<Option<NodeData>, StorageError> {
-        let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
-        if candidates.is_empty() {
-            return Ok(None);
-        }
         if let Some(data) = gen.cache.get(id) {
             return Ok(Some((*data).clone()));
         }
-        self.resolve_from_candidates(Some(gen), id, &candidates)
+        self.resolve_from_candidates(id, gen.index.lookup_all(id))
     }
 
     /// Read every record's edges, with no reachability filtering.
@@ -2926,22 +2924,13 @@ impl StorageEngine for PackfileStorage {
         let gen_guard = self.generation(collection_id);
         let gen = gen_guard.as_deref();
 
-        let candidates: Vec<(u16, u64)> = match gen {
-            Some(g) => g.index.lookup_all(id).collect(),
-            None => return Ok(None),
-        };
-
-        if candidates.is_empty() {
+        let Some(gen) = gen else {
             return Ok(None);
+        };
+        if let Some(data) = gen.cache.get(id) {
+            return Ok(Some((*data).clone()));
         }
-
-        if let Some(g) = gen {
-            if let Some(data) = g.cache.get(id) {
-                return Ok(Some((*data).clone()));
-            }
-        }
-
-        self.resolve_from_candidates(gen, id, &candidates)
+        self.resolve_from_candidates(id, gen.index.lookup_all(id))
     }
 
     fn get_many(
@@ -2957,13 +2946,16 @@ impl StorageEngine for PackfileStorage {
         let mut to_fetch: Vec<(usize, Vec<(u16, u64)>)> = Vec::new();
         if let Some(g) = gen {
             for (i, id) in ids.iter().enumerate() {
+                // The generation-local cache only contains records from this
+                // generation, so it is authoritative for hits. Avoid an
+                // otherwise redundant index probe for the common warm case.
+                if let Some(data) = g.cache.get(id) {
+                    results[i] = Some((*data).clone());
+                    continue;
+                }
                 let candidates: Vec<(u16, u64)> = g.index.lookup_all(id).collect();
                 if !candidates.is_empty() {
-                    if let Some(data) = g.cache.get(id) {
-                        results[i] = Some((*data).clone());
-                    } else {
-                        to_fetch.push((i, candidates));
-                    }
+                    to_fetch.push((i, candidates));
                 }
             }
         }
@@ -2971,7 +2963,7 @@ impl StorageEngine for PackfileStorage {
         to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
 
         for (i, candidates) in &to_fetch {
-            results[*i] = self.resolve_from_candidates(gen, &ids[*i], candidates)?;
+            results[*i] = self.resolve_from_candidates(&ids[*i], candidates.iter().copied())?;
         }
 
         Ok(results)
@@ -3480,6 +3472,25 @@ mod tests {
 
         let _ = store.get(&TEST_COLLECTION, &id).unwrap();
         assert_eq!(gen.cache.hits(), 2);
+    }
+
+    #[test]
+    fn test_cold_get_does_not_populate_lru() {
+        let dir = test_dir("cold_get_no_lru_insert");
+        let store = PackfileStorage::open(dir).unwrap();
+        let id = [0x01u8; 16];
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"mmap-backed")),
+            )
+            .unwrap();
+
+        let gen = store.generation(&TEST_COLLECTION).unwrap();
+        gen.cache.clear();
+        assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
+        assert_eq!(gen.cache.len(), 0);
     }
 
     #[test]

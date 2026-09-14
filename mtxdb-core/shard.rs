@@ -46,7 +46,11 @@ pub struct Shard {
     /// Filesystem path to this shard's file.
     pub path: PathBuf,
     /// Lazily-created mmap. Remapped when the file grows.
-    pub(crate) mmap: RwLock<Option<Mmap>>,
+    // Keep mappings reference-counted: a raw, uncompressed `Bytes` returned
+    // from `read_at` owns an `Arc` to the mapping it points into.  A later
+    // remap can therefore replace this slot without invalidating an already
+    // returned node.
+    pub(crate) mmap: RwLock<Option<Arc<Mmap>>>,
     /// Serializes appends to this shard.
     pub(crate) append_lock: parking_lot::Mutex<()>,
     /// Whether this shard is still in active use. Set to `false` when
@@ -62,6 +66,20 @@ pub struct Shard {
     bytes_written: AtomicU64,
     /// Number of times this shard's file has been fsynced.
     sync_count: AtomicU64,
+}
+
+/// A byte range which keeps the mmap that backs it alive.  `Bytes::from_owner`
+/// turns this into a cheap, cloneable `Bytes` without copying the range.
+struct MmapRange {
+    mmap: Arc<Mmap>,
+    start: usize,
+    end: usize,
+}
+
+impl AsRef<[u8]> for MmapRange {
+    fn as_ref(&self) -> &[u8] {
+        &self.mmap[self.start..self.end]
+    }
 }
 
 /// Point-in-time snapshot of a shard's IO/sync counters.
@@ -208,7 +226,7 @@ impl Shard {
     ///
     /// # Errors
     /// Returns `io::Error` if the packfile cannot be mapped.
-    pub fn mmap(&self) -> io::Result<parking_lot::RwLockReadGuard<'_, Option<Mmap>>> {
+    pub fn mmap(&self) -> io::Result<parking_lot::RwLockReadGuard<'_, Option<Arc<Mmap>>>> {
         let guard = self.mmap.read();
         if guard.is_some() {
             return Ok(guard);
@@ -216,7 +234,7 @@ impl Shard {
         drop(guard);
         let mut guard = self.mmap.write();
         if guard.is_none() {
-            *guard = Some(packfile::map_pack(&self.file)?);
+            *guard = Some(Arc::new(packfile::map_pack(&self.file)?));
         }
         drop(guard);
         Ok(self.mmap.read())
@@ -1292,12 +1310,14 @@ impl ShardPool {
 
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
-            let Some(mem) = guard.as_deref() else {
+            let Some(mapping) = guard.as_ref().cloned() else {
                 return Err(StorageError::Io(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "shard could not be mapped",
                 )));
             };
+            drop(guard);
+            let mem = mapping.as_ref();
 
             let offset_usize = usize::try_from(offset)
                 .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
@@ -1309,7 +1329,6 @@ impl ShardPool {
                 .map_or(true, |end| end > file_len_usize || end > mem.len())
             {
                 if attempt == 0 {
-                    drop(guard);
                     Self::remap_shard(shard)?;
                     continue;
                 }
@@ -1331,7 +1350,6 @@ impl ShardPool {
                 .and_then(|end| end.checked_add(4));
             if frame_end.map_or(true, |end| end > file_len_usize || end > mem.len()) {
                 if attempt == 0 {
-                    drop(guard);
                     Self::remap_shard(shard)?;
                     continue;
                 }
@@ -1367,12 +1385,14 @@ impl ShardPool {
 
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
-            let Some(mem) = guard.as_deref() else {
+            let Some(mapping) = guard.as_ref().cloned() else {
                 return Err(StorageError::Io(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "shard could not be mapped",
                 )));
             };
+            drop(guard);
+            let mem = mapping.as_ref();
 
             let offset = usize::try_from(offset)
                 .map_err(|_| StorageError::Corrupt(format!("offset too large: {offset}")))?;
@@ -1384,7 +1404,6 @@ impl ShardPool {
                 .map_or(true, |end| end > file_len_usize || end > mem.len())
             {
                 if attempt == 0 {
-                    drop(guard);
                     Self::remap_shard(shard)?;
                     continue;
                 }
@@ -1411,7 +1430,6 @@ impl ShardPool {
 
             if frame_end > file_len_usize || frame_end > mem.len() {
                 if attempt == 0 {
-                    drop(guard);
                     Self::remap_shard(shard)?;
                     continue;
                 }
@@ -1423,6 +1441,15 @@ impl ShardPool {
                 &mem[prefix_end..crc_pos],
                 mem[crc_pos..frame_end].try_into().unwrap(),
                 verify,
+                MmapRange {
+                    mmap: Arc::clone(&mapping),
+                    // `frame_len >= FRAME_FIXED_LEN` was checked above, so
+                    // the fixed 37-byte metadata prefix fits in the frame.
+                    start: prefix_end
+                        .checked_add(37)
+                        .expect("validated frame metadata prefix fits in usize"),
+                    end: crc_pos,
+                },
             );
         }
         unreachable!("read_at remap-retry is bounded to two iterations")
@@ -1437,6 +1464,7 @@ impl ShardPool {
         payload: &[u8],
         checksum: [u8; 4],
         verify: bool,
+        node_bytes_owner: MmapRange,
     ) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
@@ -1465,7 +1493,8 @@ impl ShardPool {
         collection_id.copy_from_slice(&payload[5..21]);
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&payload[21..37]);
-        let data = Self::decode_node_bytes(flags, uncompressed_len, &payload[37..])?;
+        let data =
+            Self::decode_node_bytes(flags, uncompressed_len, &payload[37..], node_bytes_owner)?;
 
         Ok(Record {
             collection_id,
@@ -1479,13 +1508,14 @@ impl ShardPool {
         flags: u8,
         uncompressed_len: u32,
         node_bytes: &[u8],
+        node_bytes_owner: MmapRange,
     ) -> Result<bytes::Bytes, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
         let expected_len = usize::try_from(uncompressed_len).expect("u32 always fits in usize");
         if flags & packfile::FLAG_COMPRESSED == 0 {
             return (expected_len == node_bytes.len())
-                .then(|| bytes::Bytes::copy_from_slice(node_bytes))
+                .then(|| bytes::Bytes::from_owner(node_bytes_owner))
                 .ok_or_else(|| {
                     StorageError::Corrupt(
                         "raw node length differs from framed uncompressed_len".into(),
@@ -1518,8 +1548,9 @@ impl ShardPool {
             .len();
         let mut guard = shard.mmap.write();
         if guard.as_ref().map_or(true, |m| (m.len() as u64) < file_len) {
-            *guard =
-                Some(packfile::map_pack(&shard.file).map_err(crate::storage::StorageError::Io)?);
+            *guard = Some(Arc::new(
+                packfile::map_pack(&shard.file).map_err(crate::storage::StorageError::Io)?,
+            ));
         }
         // A read-only pool can observe an append made by another process. Its
         // local atomic is only a steady-state fast-path cache, so publish the
@@ -1834,6 +1865,38 @@ mod tests {
         assert_eq!(read.collection_id[0], 0x01);
         assert_eq!(read.hash[0], 0xAA);
         assert_eq!(read.data.as_ref(), b"hello shard");
+    }
+
+    #[test]
+    fn raw_reads_borrow_the_mmap_and_survive_a_remap() {
+        let dir = test_dir("raw_read_mmap_owner");
+        let pool = ShardPool::open(dir).unwrap();
+        let first = test_record(1, 1, b"first raw payload");
+        let (slot, first_offset) = pool.put_record(&first).unwrap();
+        let shard = pool.get_shard(slot).unwrap();
+
+        // Establish the initial mapping and retain it only for checking the
+        // returned Bytes pointer. The read itself must hold its own owner.
+        let initial_mapping = shard.mmap().unwrap().as_ref().unwrap().clone();
+        let read_first = ShardPool::read_at(&shard, first_offset, true).unwrap();
+        let first_offset = usize::try_from(first_offset).unwrap();
+        let node_offset = first_offset
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(37))
+            .unwrap();
+        assert_eq!(
+            read_first.data.as_ptr(),
+            initial_mapping[node_offset..].as_ptr(),
+            "raw payload must be backed directly by the mmap"
+        );
+
+        // Grow the file, then read the new record. This replaces the pool's
+        // current mapping; `read_first` must retain the old one safely.
+        let second = test_record(1, 2, b"second raw payload");
+        let (_, second_offset) = pool.put_record(&second).unwrap();
+        let read_second = ShardPool::read_at(&shard, second_offset, true).unwrap();
+        assert_eq!(read_first.data.as_ref(), b"first raw payload");
+        assert_eq!(read_second.data.as_ref(), b"second raw payload");
     }
 
     #[test]
