@@ -113,6 +113,7 @@ mod tests {
         // Read-only reopen (the lookup-heavy inspection path) likewise.
         let read_only = PackfileStorage::open_read_only(dir.clone()).unwrap();
         assert_all_records(&read_only);
+        drop(read_only);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -88,7 +88,6 @@ fn build_cli() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print version"),
         )
-        .arg(limit_arg())
         .arg(
             Arg::new("version_upper")
                 .short('V')
@@ -402,6 +401,7 @@ fn sub_get() -> Command {
             Arg::new("raw")
                 .long("raw")
                 .action(ArgAction::SetTrue)
+                .conflicts_with("text")
                 .help("Emit payload bytes verbatim instead of pretty-printing JSON"),
         )
 }

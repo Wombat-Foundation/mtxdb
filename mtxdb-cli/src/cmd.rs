@@ -343,7 +343,7 @@ fn cmd_get(
             // Never decorate payload bytes: binary records can decode as
             // valid UTF-8, so only append a trailing newline when the caller
             // explicitly opted into `--text`.
-            if text && !data.bytes.ends_with(b"\n") {
+            if text && output.is_none() && !data.bytes.ends_with(b"\n") {
                 io::stdout().write_all(b"\n")?;
             }
         }
@@ -383,6 +383,9 @@ fn split_json_stream(bytes: &[u8]) -> Option<Vec<&[u8]>> {
     while start < bytes.len() {
         while start < bytes.len() && bytes[start].is_ascii_whitespace() {
             start = start.saturating_add(1);
+        }
+        if start == bytes.len() {
+            break;
         }
         let opener = *bytes.get(start)?;
         if !matches!(opener, b'{' | b'[') {

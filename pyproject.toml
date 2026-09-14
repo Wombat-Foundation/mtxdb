@@ -3,14 +3,12 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 dev = [
-    "black",
     "isort",
     "flake8",
-    "pylint",
     "ruff",
 ]
 
-[tool.pylint.main]
+[tool.pylint."messages control"]
 disable = [
     "too-many-branches",
     "too-many-locals",
