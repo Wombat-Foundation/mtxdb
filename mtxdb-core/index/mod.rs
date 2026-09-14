@@ -98,7 +98,8 @@ impl IndexSlot {
 /// Design decisions (from docs):
 /// - Partition by collection: ~8KB per 1000-node collection, 100 active collections < 1MB.
 /// - Empty slot terminates probe (write-once, no tombstones needed).
-/// - Tag collisions surface as verification failures (`decode_v1_verified`).
+/// - Tag collisions coexist in the probe chain; a tag is only a candidate
+///   filter and never an overwrite/equality proof.
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
 #[derive(Debug)]
 pub struct LossyIndex {
@@ -116,6 +117,11 @@ pub struct LossyIndex {
     /// only a tag, shard, and offset; retaining the home hash separately lets
     /// a live writer grow the table without rescanning the packfiles.
     homes: Mutex<Vec<u64>>,
+    /// The remaining 40 bits of each live slot's hash, plus a high-bit
+    /// marker that says the identity is known. Together with `homes` and the
+    /// packed 24-bit tag this makes overwrite equality exact without putting
+    /// full hashes in the checkpoint.
+    tails: Mutex<Vec<u64>>,
     /// `deserialize` restores slots without their source hashes. Such an
     /// index remains readable, but must be rebuilt from packfiles if it ever
     /// needs to grow.
@@ -168,6 +174,11 @@ impl Clone for LossyIndex {
             } else {
                 self.homes.lock().clone()
             }),
+            tails: Mutex::new(if self.is_mmap_backed() {
+                vec![0; self.capacity as usize]
+            } else {
+                self.tails.lock().clone()
+            }),
             can_grow: self.can_grow,
             len: AtomicU32::new(self.len.load(Ordering::Acquire)),
         }
@@ -175,7 +186,7 @@ impl Clone for LossyIndex {
 }
 
 /// The slot plus its retained home-hash used by a live index generation.
-const LIVE_SLOT_BYTES: usize = std::mem::size_of::<IndexSlot>() + std::mem::size_of::<u64>();
+const LIVE_SLOT_BYTES: usize = std::mem::size_of::<IndexSlot>() + 2 * std::mem::size_of::<u64>();
 
 impl LossyIndex {
     /// Create a new index with at least `min_capacity` slots.
@@ -194,6 +205,7 @@ impl LossyIndex {
             shift,
             slots: SlotStorage::Owned((0..capacity_usize).map(|_| AtomicU64::new(0)).collect()),
             homes: Mutex::new(vec![0; capacity_usize]),
+            tails: Mutex::new(vec![0; capacity_usize]),
             can_grow: true,
             len: AtomicU32::new(0),
         }
@@ -232,6 +244,14 @@ impl LossyIndex {
     #[inline]
     pub(crate) fn tag_for_hash(hash: &[u8; 16]) -> u32 {
         Self::tag(hash)
+    }
+
+    #[inline]
+    fn tail(hash: &[u8; 16]) -> u64 {
+        const KNOWN: u64 = 1_u64 << 63;
+        let mut bytes = [0; 8];
+        bytes[3..].copy_from_slice(&hash[11..]);
+        KNOWN | u64::from_be_bytes(bytes)
     }
 
     /// Insert a (hash → `shard_id`, offset) mapping.
@@ -280,21 +300,50 @@ impl LossyIndex {
                 // the slot last so concurrent readers see either the prior
                 // empty slot or a complete record location.
                 self.homes.lock()[bucket] = home;
+                self.tails.lock()[bucket] = Self::tail(hash);
                 let value = IndexSlot::new(tag, shard_id, offset).0;
                 slots[bucket].store(value, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
                 return Ok((bucket as u32, value));
             }
-            // If same tag already exists at this bucket, overwrite
-            // (same hash, different offset after repack)
+            // A tag only filters candidates; it never proves key equality.
+            // Checkpoint-derived slots initially lack their 40-bit tail and
+            // ask storage to hydrate it from the frame before deciding.
             if slot.tag() == tag {
-                self.homes.lock()[bucket] = home;
-                let value = IndexSlot::new(tag, shard_id, offset).0;
-                slots[bucket].store(value, Ordering::Release);
-                return Ok((bucket as u32, value));
+                let tail = self.tails.lock()[bucket];
+                if tail == 0 {
+                    return Err(InsertError::NeedsIdentity {
+                        bucket: bucket as u32,
+                        shard_id: slot.shard_id(),
+                        offset: slot.offset(),
+                    });
+                }
+                if self.homes.lock()[bucket] == home && tail == Self::tail(hash) {
+                    let value = IndexSlot::new(tag, shard_id, offset).0;
+                    slots[bucket].store(value, Ordering::Release);
+                    return Ok((bucket as u32, value));
+                }
             }
             bucket = bucket.wrapping_add(1) & self.mask as usize;
         }
+    }
+
+    /// Mark a checkpoint-derived slot with the full identity recovered from
+    /// its authoritative frame. Returns `false` if the slot changed or the
+    /// supplied hash cannot describe that slot.
+    pub(crate) fn hydrate_slot_identity(&self, bucket: u32, hash: &[u8; 16]) -> bool {
+        let bucket = bucket as usize;
+        if bucket >= self.capacity as usize {
+            return false;
+        }
+        let slot = IndexSlot(self.slot_at(bucket));
+        if slot.is_empty() || slot.tag() != Self::tag(hash) {
+            return false;
+        }
+        let home = u64::from_be_bytes(hash[..8].try_into().expect("16-byte hash"));
+        self.homes.lock()[bucket] = home;
+        self.tails.lock()[bucket] = Self::tail(hash);
+        true
     }
 
     /// Apply recorded delta frames on top of a checkpoint-backed index,
@@ -345,6 +394,7 @@ impl LossyIndex {
         }
         let grown = Self::new(self.capacity as usize * 2);
         let homes = self.homes.lock();
+        let tails = self.tails.lock();
         for (index, home) in homes.iter().copied().enumerate() {
             let slot = IndexSlot(self.slots.get(index));
             if slot.is_empty() {
@@ -355,6 +405,7 @@ impl LossyIndex {
                 bucket = bucket.wrapping_add(1) & grown.mask as usize;
             }
             grown.homes.lock()[bucket] = home;
+            grown.tails.lock()[bucket] = tails[index];
             let SlotStorage::Owned(slots) = &grown.slots else {
                 unreachable!("new index is owned")
             };
@@ -586,6 +637,7 @@ impl LossyIndex {
             shift,
             slots: SlotStorage::Owned(slots),
             homes: Mutex::new(vec![0; capacity_usize]),
+            tails: Mutex::new(vec![0; capacity_usize]),
             can_grow: false,
             len: AtomicU32::new(len),
         })
@@ -601,6 +653,7 @@ impl LossyIndex {
             shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
             slots: SlotStorage::Mmap { mmap, offset },
             homes: Mutex::new(Vec::new()),
+            tails: Mutex::new(Vec::new()),
             can_grow: false,
             len: AtomicU32::new(len),
         }
@@ -624,12 +677,23 @@ pub enum InsertError {
     /// The table has reached 75% occupancy.
     /// Returned when the table reaches 75% occupancy to keep probe sequences short.
     TableFull,
+    /// A checkpoint-derived same-tag slot needs its frame identity restored
+    /// before insertion can determine whether it is an overwrite.
+    NeedsIdentity {
+        /// Probe bucket holding the candidate slot.
+        bucket: u32,
+        /// Candidate frame's shard.
+        shard_id: u16,
+        /// Candidate frame's offset.
+        offset: u64,
+    },
 }
 
 impl std::fmt::Display for InsertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TableFull => write!(f, "index table too full"),
+            Self::NeedsIdentity { .. } => write!(f, "index slot needs frame identity"),
         }
     }
 }
@@ -840,6 +904,25 @@ mod tests {
         index.insert(&h, 1, 200).unwrap(); // overwrite
         assert_eq!(index.len(), 1);
         assert_eq!(index.lookup(&h), Some((1, 200)));
+    }
+
+    #[test]
+    fn same_tag_and_home_but_distinct_hashes_both_remain_indexed() {
+        let index = LossyIndex::new(16);
+        let mut first = [0u8; 16];
+        first[8] = 0x42;
+        first[15] = 1;
+        let mut second = first;
+        second[15] = 2;
+
+        index.insert(&first, 0, 100).unwrap();
+        index.insert(&second, 0, 200).unwrap();
+
+        assert_eq!(index.len(), 2, "a tag is not an overwrite proof");
+        assert_eq!(
+            index.lookup_all(&first).collect::<Vec<_>>(),
+            vec![(0, 100), (0, 200)]
+        );
     }
 
     #[test]

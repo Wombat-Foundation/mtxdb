@@ -12,7 +12,7 @@ use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
 use crate::index::delta::{self, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
-use crate::index::LossyIndex;
+use crate::index::{InsertError, LossyIndex};
 use crate::packfile::{self, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -2426,6 +2426,48 @@ impl PackfileStorage {
         })
     }
 
+    /// Insert with exact identity checks for checkpoint-derived slots.
+    ///
+    /// A compact checkpoint retains a slot's tag and location but not the
+    /// remaining hash bits. On the rare same-tag probe, recover that frame's
+    /// metadata, hydrate the in-memory slot, and retry. Active indexes carry
+    /// their identities already, so their ordinary inserts take no I/O path.
+    fn insert_index(
+        &self,
+        collection_id: &[u8; 16],
+        index: &LossyIndex,
+        hash: &NodeId,
+        shard_id: u16,
+        offset: u64,
+    ) -> Result<Result<(u32, u64), InsertError>, StorageError> {
+        loop {
+            match index.insert_tracked(hash, shard_id, offset) {
+                Ok(written) => return Ok(Ok(written)),
+                Err(InsertError::TableFull) => return Ok(Err(InsertError::TableFull)),
+                Err(InsertError::NeedsIdentity {
+                    bucket,
+                    shard_id,
+                    offset,
+                }) => {
+                    let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
+                        StorageError::Corrupt(format!(
+                            "index refers to missing shard {shard_id} while resolving a tag collision"
+                        ))
+                    })?;
+                    let (found_collection, found_hash) =
+                        self.shards.record_identity_at(&shard, offset)?;
+                    if &found_collection != collection_id
+                        || !index.hydrate_slot_identity(bucket, &found_hash)
+                    {
+                        return Err(StorageError::Corrupt(format!(
+                            "index tag candidate at offset {offset} in shard {shard_id} is inconsistent"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
     ///
     /// # Errors
@@ -3850,7 +3892,9 @@ impl StorageEngine for PackfileStorage {
         let (shard_id, offset) = self.shards.put_record(&record)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
-                if let Ok((bucket, slot)) = gen.index.insert_tracked(id, shard_id, offset) {
+                if let Ok((bucket, slot)) =
+                    self.insert_index(collection_id, &gen.index, id, shard_id, offset)?
+                {
                     self.record_delta(collection_id, gen.generation, bucket, slot);
                     let pack_id = self
                         .shards
@@ -3878,7 +3922,7 @@ impl StorageEngine for PackfileStorage {
                 Some(g) => g.index.clone(),
                 None => LossyIndex::new(4096),
             };
-            let inserted = index.insert_tracked(id, shard_id, offset);
+            let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
             if let Ok((bucket, slot)) = inserted {
                 let generation = old_gen.as_ref().map_or(1, |g| g.generation);
                 self.record_delta(collection_id, generation, bucket, slot);
@@ -3975,7 +4019,7 @@ impl StorageEngine for PackfileStorage {
 
             if !index_needs_rebuild {
                 let inserted = if let Ok((bucket, slot)) =
-                    index.insert_tracked(id, shard_id, offset)
+                    self.insert_index(collection_id, &index, id, shard_id, offset)?
                 {
                     self.record_delta(collection_id, generation, bucket, slot);
                     true
@@ -4396,6 +4440,41 @@ mod tests {
         store.put(&TEST_COLLECTION, &id, &data).unwrap();
         let got = store.get(&TEST_COLLECTION, &id).unwrap().unwrap();
         assert_eq!(got.bytes, data.bytes);
+    }
+
+    #[test]
+    fn reopened_index_keeps_distinct_same_tag_entries() {
+        let dir = test_dir("reopen_same_tag");
+        let mut first = [0u8; 16];
+        first[8] = 0x42;
+        first[15] = 1;
+        let mut second = first;
+        second[15] = 2;
+
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &first,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // The checkpoint has only slots, no retained full identities. The
+        // second write must hydrate the same-tag candidate and continue its
+        // probe, rather than replacing the first record's only location.
+        let reopened = PackfileStorage::open(dir).unwrap();
+        reopened
+            .put(
+                &TEST_COLLECTION,
+                &second,
+                &NodeData::new(bytes::Bytes::from_static(b"second")),
+            )
+            .unwrap();
+        assert!(reopened.get(&TEST_COLLECTION, &first).unwrap().is_some());
+        assert!(reopened.get(&TEST_COLLECTION, &second).unwrap().is_some());
     }
 
     #[test]
