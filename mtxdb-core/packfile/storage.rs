@@ -985,8 +985,13 @@ impl PackfileStorage {
         locks.entry(*collection_id).or_default().clone()
     }
 
-    fn read_at(shard: &Shard, offset: u64, verify: bool) -> Result<Record, StorageError> {
-        ShardPool::read_at(shard, offset, verify)
+    fn read_at(
+        &self,
+        shard: &Arc<Shard>,
+        offset: u64,
+        verify: bool,
+    ) -> Result<Record, StorageError> {
+        self.shards.read_at(shard, offset, verify)
     }
 
     /// The record's actual on-disk byte length (see
@@ -1299,6 +1304,12 @@ impl PackfileStorage {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // Commit any buffered frames first: the fingerprint below pins each
+        // shard to its committed on-disk length, and the serialized index
+        // offsets must be readable against exactly that length on the next
+        // open. Writing the checkpoint while records are still buffered
+        // would persist virtual offsets the fingerprint can't describe.
+        self.shards.flush_all()?;
         let packs: Vec<(u64, u64)> = self
             .shards
             .all_shards()
@@ -1503,7 +1514,7 @@ impl PackfileStorage {
         let Some(old_shard) = pinned.get(&old_shard_id) else {
             return Ok(None);
         };
-        let record = Self::read_at(old_shard, old_offset, true)?;
+        let record = self.read_at(old_shard, old_offset, true)?;
         let (new_shard_id, new_offset) = self.shards.put_record(&Record {
             collection_id: *collection_id,
             hash: record.hash,
@@ -1597,6 +1608,13 @@ impl PackfileStorage {
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
+        // `scan_collection_records` traverses packfiles; any buffered frames
+        // (this collection's or any other's) are invisible to it, so a fresh
+        // flush guarantees the rebuilt index reflects every record that has
+        // actually been put. Callers only reach this path while holding the
+        // collection's put mutex, so nothing new can buffer for this
+        // collection between the flush and the scan.
+        self.shards.flush_all()?;
         let scanned = self.scan_collection_records(collection_id)?;
         let total: usize = scanned.iter().map(|(_, e)| e.len()).sum();
         let index = LossyIndex::new(total.saturating_mul(2).max(16));
@@ -1661,7 +1679,7 @@ impl PackfileStorage {
                 continue;
             };
 
-            match Self::read_at(
+            match self.read_at(
                 &shard,
                 offset,
                 self.shards.checksum_policy().verifies_reads(),
@@ -1709,6 +1727,7 @@ impl PackfileStorage {
     /// actually reached. Returns the sorted, deduplicated live hash set and
     /// the adjacency discovered along the way.
     fn bfs_live_set(
+        pool: &ShardPool,
         roots: &[[u8; 16]],
         hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
         pinned: &HashMap<u16, Arc<Shard>>,
@@ -1731,7 +1750,7 @@ impl PackfileStorage {
             let Some(old_shard) = pinned.get(&shard_id) else {
                 continue;
             };
-            let record = Self::read_at(old_shard, offset, true)?;
+            let record = pool.read_at(old_shard, offset, true)?;
             let edges = extract_edges(&hash, &record.data);
             for edge in &edges {
                 if hash_to_shard_offset.contains_key(edge) && visited.insert(*edge) {
@@ -1849,6 +1868,7 @@ impl PackfileStorage {
     /// repack (where the map was built by merging new entries into a
     /// previous state rather than scanning every packfile from byte zero).
     fn scan_full_adjacency(
+        pool: &ShardPool,
         hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
         pinned: &HashMap<u16, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
@@ -1858,7 +1878,7 @@ impl PackfileStorage {
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
         for (hash, &(shard_id, offset)) in hash_to_shard_offset {
             if let Some(shard) = pinned.get(&shard_id) {
-                let record = Self::read_at(shard, offset, true)?;
+                let record = pool.read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
             }
@@ -2004,6 +2024,7 @@ impl PackfileStorage {
     /// is the cost of eliminating the O(live) disk reads per repack call —
     /// callers should be aware for large collections.
     fn bfs_live_set_incremental(
+        pool: &ShardPool,
         roots: &[[u8; 16]],
         hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
         prev: &RepackIncrementalState,
@@ -2045,7 +2066,7 @@ impl PackfileStorage {
             let Some(old_shard) = pinned.get(&shard_id) else {
                 continue;
             };
-            let record = Self::read_at(old_shard, offset, true)?;
+            let record = pool.read_at(old_shard, offset, true)?;
             let edges = extract_edges(&hash, &record.data);
             for edge in &edges {
                 if hash_to_shard_offset.contains_key(edge) && visited.insert(*edge) {
@@ -2080,6 +2101,7 @@ impl PackfileStorage {
     ///
     /// **Memory:** same as [`Self::bfs_live_set_incremental`] — see that doc.
     fn scan_full_adjacency_incremental(
+        pool: &ShardPool,
         hash_to_shard_offset: &HashMap<[u8; 16], (u16, u64)>,
         prev: &RepackIncrementalState,
         pinned: &HashMap<u16, Arc<Shard>>,
@@ -2098,7 +2120,7 @@ impl PackfileStorage {
             }
             // Slow path: new node, must read from disk.
             if let Some(shard) = pinned.get(&shard_id) {
-                let record = Self::read_at(shard, offset, true)?;
+                let record = pool.read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
             }
@@ -2171,6 +2193,9 @@ impl PackfileStorage {
         // race a real repack while temporarily doing so.
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
+        // Make buffered frames visible to the packfile scan so the plan
+        // reflects records that have actually been put (not yet flushed).
+        self.shards.flush_all()?;
         let saved_state = self.repack_incremental.read().get(collection_id).cloned();
         let result = self
             .repack_scan_incremental(collection_id)
@@ -2196,10 +2221,19 @@ impl PackfileStorage {
 
         let roots = self.live_roots.read().get(collection_id).cloned();
         let (live_hashes, _adjacency) = match roots {
-            Some(roots) if !roots.is_empty() => {
-                Self::bfs_live_set(&roots, hash_to_shard_offset, &pinned, &extract_edges)?
-            }
-            _ => Self::scan_full_adjacency(hash_to_shard_offset, &pinned, &extract_edges)?,
+            Some(roots) if !roots.is_empty() => Self::bfs_live_set(
+                &self.shards,
+                &roots,
+                hash_to_shard_offset,
+                &pinned,
+                &extract_edges,
+            )?,
+            _ => Self::scan_full_adjacency(
+                &self.shards,
+                hash_to_shard_offset,
+                &pinned,
+                &extract_edges,
+            )?,
         };
         let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
 
@@ -2247,6 +2281,9 @@ impl PackfileStorage {
         collection_ids: &[[u8; 16]],
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<RepackPlan>, StorageError> {
+        // Planning reads packfiles directly; flush first so buffered records
+        // are part of the plan.
+        self.shards.flush_all()?;
         let maps = self.scan_collection_record_maps(collection_ids)?;
         collection_ids
             .iter()
@@ -2374,6 +2411,14 @@ impl PackfileStorage {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
+        // The scan below reads packfiles directly, so any records still
+        // sitting in a shard's append buffer would be invisible to it and
+        // get silently dropped by this repack. Flush first so the whole
+        // collection's committed bytes are scan-visible. Holding this
+        // collection's put mutex means nothing can buffer behind it for this
+        // collection between the flush and the scan.
+        self.shards.flush_all()?;
+
         let (hash_to_shard_offset, prev_state) = self.repack_scan_incremental(collection_id)?;
 
         // Pin every shard this call could possibly read from before any
@@ -2406,6 +2451,7 @@ impl PackfileStorage {
                 // Incremental BFS: only expand from roots not already in the
                 // cached live set; reuse cached edge lists for everything else.
                 Self::bfs_live_set_incremental(
+                    &self.shards,
                     roots,
                     &hash_to_shard_offset,
                     prev_state.as_ref().expect("use_incremental implies Some"),
@@ -2415,11 +2461,18 @@ impl PackfileStorage {
             }
             (Some(roots), false) if !roots.is_empty() => {
                 // Cold-start BFS: root set shrank or first repack — full walk.
-                Self::bfs_live_set(roots, &hash_to_shard_offset, &pinned, &extract_edges)?
+                Self::bfs_live_set(
+                    &self.shards,
+                    roots,
+                    &hash_to_shard_offset,
+                    &pinned,
+                    &extract_edges,
+                )?
             }
             (_, true) => {
                 // No live roots, incremental path: only read disk for new nodes.
                 Self::scan_full_adjacency_incremental(
+                    &self.shards,
                     &hash_to_shard_offset,
                     prev_state.as_ref().expect("use_incremental implies Some"),
                     &pinned,
@@ -2428,7 +2481,12 @@ impl PackfileStorage {
             }
             _ => {
                 // No live roots, cold-start: preserve everything, read all.
-                Self::scan_full_adjacency(&hash_to_shard_offset, &pinned, &extract_edges)?
+                Self::scan_full_adjacency(
+                    &self.shards,
+                    &hash_to_shard_offset,
+                    &pinned,
+                    &extract_edges,
+                )?
             }
         };
 
@@ -2601,10 +2659,19 @@ impl PackfileStorage {
     ) -> Result<(RepackOffsets, usize), StorageError> {
         let roots = self.live_roots.read().get(collection_id).cloned();
         let (live_hashes, adjacency) = match roots {
-            Some(roots) if !roots.is_empty() => {
-                Self::bfs_live_set(&roots, hash_to_shard_offset, pinned, extract_edges)?
-            }
-            _ => Self::scan_full_adjacency(hash_to_shard_offset, pinned, extract_edges)?,
+            Some(roots) if !roots.is_empty() => Self::bfs_live_set(
+                &self.shards,
+                &roots,
+                hash_to_shard_offset,
+                pinned,
+                extract_edges,
+            )?,
+            _ => Self::scan_full_adjacency(
+                &self.shards,
+                hash_to_shard_offset,
+                pinned,
+                extract_edges,
+            )?,
         };
         let dropped = hash_to_shard_offset.len().saturating_sub(live_hashes.len());
 
@@ -2689,6 +2756,12 @@ impl PackfileStorage {
         // be missed by the scan or revive an old source after the swap.
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let collection_guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
+
+        // Same scan visibility requirement as the single-collection repack:
+        // every selected collection's buffered frames must be on disk before
+        // `scan_collection_record_maps` reads packfiles, or those records
+        // would be dropped as if never written.
+        self.shards.flush_all()?;
 
         let maps = self.scan_collection_record_maps(&collection_ids)?;
         let source_shards: HashSet<u16> = maps
@@ -3191,6 +3264,21 @@ impl PackfileStorage {
         Ok(())
     }
 
+    /// Commit every open shard's buffered frames to the page cache without
+    /// fsyncing (see [`ShardPool::flush_all`]).
+    ///
+    /// With the append buffer, a put's bytes live only in process memory until
+    /// a flush, and only in the page cache until a `sync_all`. This is the
+    /// explicit way to advance that boundary for all shards. A flushed store
+    /// also means a subsequent `PackfileStorage::open`/`open_read_only`
+    /// against the same directory sees the data.
+    ///
+    /// # Errors
+    /// Returns `StorageError` on I/O failure.
+    pub fn flush_all(&self) -> Result<(), StorageError> {
+        Ok(self.shards.flush_all()?)
+    }
+
     /// Best-effort, rate-limited flush of the shard→collection directory for a
     /// writer's own periodic tick — same contract as
     /// `ShardPool::maybe_persist_stats`: a no-op if called again before
@@ -3366,6 +3454,9 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"payload")),
             )
             .unwrap();
+        // Commit the buffered frame so the tamper below actually overwrites
+        // on-disk bytes (the record is otherwise only in the append buffer).
+        store.sync_all().unwrap();
         let path = store.shards.active_shard().path.clone();
         drop(store);
 
@@ -3406,6 +3497,9 @@ mod tests {
                     .index
                     .lookup(&id)
                     .expect("just-written record must be indexed");
+                // Tampering happens on-disk: commit the buffered frame so the
+                // tamper site computed from `offset` actually lands in the file.
+                store.sync_all().unwrap();
                 let path = store.shards.get_shard(shard_id).unwrap().path.clone();
                 drop(store);
 
@@ -4710,6 +4804,10 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"hello")),
             )
             .unwrap();
+        // Reads through a second (read-only) process open against the same
+        // directory only observe committed bytes, so make the write durable
+        // before opening the reader — buffered bytes are RAM-only.
+        writer.sync_all().unwrap();
 
         // Open read-only while the writer is still alive — must succeed
         // (no lock conflict) and see the write above.
@@ -5177,7 +5275,8 @@ mod tests {
         let pinned = store.pin_shards([shard_id, shard_id, shard_id].into_iter());
         assert_eq!(pinned.len(), 1);
 
-        let record = PackfileStorage::read_at(&pinned[&shard_id], offset, true)
+        let record = store
+            .read_at(&pinned[&shard_id], offset, true)
             .expect("pinned shard must resolve the real on-disk record");
         assert_eq!(record.data.as_ref(), b"pin me");
     }

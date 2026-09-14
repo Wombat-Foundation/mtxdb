@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::packfile::{self, Record};
 
@@ -28,6 +28,21 @@ pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 /// to a clean `256 * 1024 * 1024`: that's one byte over the ceiling and
 /// lets a shard produce an offset `IndexSlot::new` panics on.
 pub const MAX_SHARD_BYTES: u64 = (1u64 << 28) - 1;
+
+/// Records buffered in memory before a shard is flushed to disk as one
+/// positioned write. Keeps bulk writes from paying a `pwrite` (plus the
+/// per-record `try_clone` and file-length store) for every single record —
+/// the whole remaining bulk-write gap vs the bench's mdbx (which writes a
+/// memory-mapped in-memory transaction and pays persistence once at commit).
+///
+/// The trade: a buffered record is indexed and cache-resident but NOT yet
+/// on disk. It is made durable by the same contracts as before — nothing is
+/// durable until `sync_*` fsyncs — but `read_at`/`resolve_from_candidates`
+/// must not serve a virtual offset from the mmap, so reads of an offset
+/// `>= file_len` (the flush boundary) first flush that shard (one positioned
+/// write, then a normal mmap read). Sync, rotation, retirement, repack,
+/// checkpoint persistence, and deletion all flush first as well.
+pub(crate) const PENDING_FLUSH_BYTES: usize = 1 << 20;
 
 /// Scanned `(collection_id, hash, offset)` entry from a shard file.
 pub type ShardEntry = ([u8; 16], [u8; 16], u64);
@@ -58,8 +73,22 @@ pub struct Shard {
     /// deletes the file only when retired.
     pub(crate) is_current: AtomicBool,
     /// Current file length, tracked atomically for rotation decisions
-    /// without a `metadata()` syscall on every put.
+    /// without a `metadata()` syscall on every put. This is the *committed*
+    /// on-disk length — buffered records occupy `[file_len, file_len +
+    /// pending.len())` and are not yet on disk (see [`PENDING_FLUSH_BYTES`]).
     pub(crate) file_len: AtomicU64,
+    /// Encoded frame bytes buffered since the last flush of this shard,
+    /// waiting to be written as one positioned `pwrite`. Guarded by
+    /// `append_lock` (writers) up to the inner `Mutex` that provides the
+    /// interior mutability everything else accesses via `Arc<Shard>`.
+    /// Index offsets returned by `put_record` point into the virtual
+    /// `[file_len, file_len + pending.len())` region.
+    pub(crate) pending: Mutex<Vec<u8>>,
+    /// Number of records represented by the buffered frames (every frame
+    /// carries a variable-length body, so this cannot be derived from
+    /// `pending.len()`). Guarded by `append_lock` and the `pending` mutex;
+    /// credited to `write_count` at flush time.
+    pub(crate) pending_records: AtomicU64,
     /// Number of records appended to this shard.
     write_count: AtomicU64,
     /// Total payload bytes appended to this shard (serialized record length).
@@ -194,6 +223,8 @@ impl Shard {
             append_lock: parking_lot::Mutex::new(()),
             is_current: AtomicBool::new(true),
             file_len: AtomicU64::new(file_len),
+            pending: Mutex::new(Vec::new()),
+            pending_records: AtomicU64::new(0),
             write_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             sync_count: AtomicU64::new(0),
@@ -1226,12 +1257,19 @@ impl ShardPool {
     /// Returns `(slot, offset)`. Rotates the collection to a new home shard
     /// if its current one is full.
     ///
+    /// The record is *buffered*, not necessarily on disk: offsets are handed
+    /// out into the shard's virtual `[file_len, file_len + pending)` region
+    /// and the matching frame bytes are committed to the page cache by
+    /// [`Self::flush_shard`]. Reads of a virtual offset first flush (see
+    /// [`Self::read_at`]), so callers observing the returned offset always
+    /// see the record.
+    ///
     /// # Errors
-    /// Returns `io::Error` on write or rotation failure.
+    /// Returns `io::Error` on write, flush, or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
         let mut shard = self.shard_for_collection(&record.collection_id);
         loop {
-            // Uncompressed upper bound, used only for the pre-write
+            // Uncompressed upper bound, used only for the pre-append
             // capacity check below — `write_record` may compress the
             // payload and write fewer bytes than this, but never more,
             // so checking against this bound never lets a shard overflow
@@ -1239,57 +1277,123 @@ impl ShardPool {
             // strictly necessary when compression would have made it fit.
             let max_record_len = record.serialized_len() as u64;
 
-            let (offset, record_len) = {
+            let offset = {
                 let guard = shard.append_lock.lock();
-                let file = shard.file.try_clone()?;
                 // `append_lock` serializes writers and `file_len` is updated
-                // before that lock is released, making it the authoritative
-                // next offset. A positioned write avoids seeking this cloned
-                // descriptor to EOF for every record.
-                let offset = shard.file_len.load(Ordering::Acquire);
+                // at flush time, making the virtual end (committed length
+                // plus already-buffered frames) the authoritative next
+                // offset. No syscalls happen per append.
+                let committed = shard.file_len.load(Ordering::Acquire);
+                let buffered = shard.pending.lock().len() as u64;
+                let virtual_end = committed.checked_add(buffered).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "file_len + pending overflow")
+                })?;
 
-                // Check capacity while holding the append lock and after
-                // seeking to the true end — avoids TOCTOU race where two
-                // threads both pass the check then one exceeds the limit.
-                let current_len = shard.file_len.load(Ordering::Acquire);
-                let fits = current_len
+                // Check capacity while holding the append lock and against
+                // the virtual end — avoids a TOCTOU race where two threads
+                // both pass the check then one exceeds the limit.
+                let fits = virtual_end
                     .checked_add(max_record_len)
                     .is_some_and(|sum| sum <= self.max_shard_bytes);
-                if !fits && current_len > packfile::HEADER_LEN as u64 {
+                if !fits && committed > packfile::HEADER_LEN as u64 {
                     drop(guard);
-                    drop(file);
+                    // First make room: push the buffered bytes to disk so
+                    // the capacity check is measured against real length.
+                    self.flush_shard(&shard)?;
                     shard = self.rotate_collection_full_home(&record.collection_id, shard.slot)?;
                     continue;
                 }
 
-                // The actual on-disk length — may be smaller than
-                // `max_record_len` when the payload compressed.
                 let frame = packfile::encode_record_with_options(
                     record,
                     self.compress,
                     self.checksum_policy.computes_checksum(),
                 )?;
-                #[cfg(unix)]
-                file.write_all_at(&frame, offset)?;
-                #[cfg(not(unix))]
-                {
-                    let mut file = file;
-                    file.seek(io::SeekFrom::Start(offset))?;
-                    file.write_all(&frame)?;
-                }
-                let record_len = frame.len() as u64;
-                let new_len = offset.checked_add(record_len).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "offset + record_len overflow")
-                })?;
-                shard.file_len.store(new_len, Ordering::Release);
-                (offset, record_len)
+                shard.pending.lock().extend_from_slice(&frame);
+                shard.pending_records.fetch_add(1, Ordering::Relaxed);
+                virtual_end
             };
 
-            shard.write_count.fetch_add(1, Ordering::Relaxed);
-            shard.bytes_written.fetch_add(record_len, Ordering::Relaxed);
-            self.dirty.lock().insert(shard.slot);
+            if shard.pending.lock().len() >= PENDING_FLUSH_BYTES {
+                self.flush_shard(&shard)?;
+            }
             return Ok((shard.slot, offset));
         }
+    }
+
+    /// Commit one shard's buffered frames to disk as a single positioned
+    /// write. No-op if the shard has nothing buffered. Updates `file_len`,
+    /// IO/sync counters, and the dirty set only after a successful write,
+    /// so a partial failure defers rather than loses the accounting.
+    ///
+    /// Safe to call concurrently with writers and other flushers: the
+    /// additional buffered bytes are simply rolled into this (or the next)
+    /// write, keeping `file_len` monotonic and offsets stable.
+    ///
+    /// Note: the shard→collection count bookkeeping is deliberately NOT
+    /// here — it stays per-record in `PackfileStorage::put`/`put_many`
+    /// (via `record_new_shard_collection`), entirely unchanged by
+    /// buffering, so no flush-time aggregation or recompute can drift from
+    /// its current semantics.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on flush failure.
+    pub(crate) fn flush_shard(&self, shard: &Arc<Shard>) -> io::Result<()> {
+        {
+            let guard = shard.append_lock.lock();
+            let mut pending_guard = shard.pending.lock();
+            if pending_guard.is_empty() {
+                // Nothing buffered: nothing to commit or dirty.
+                return Ok(());
+            }
+            let committed = shard.file_len.load(Ordering::Acquire);
+            let bytes = std::mem::take(&mut *pending_guard);
+            drop(pending_guard);
+            let file = shard.file.try_clone()?;
+            #[cfg(unix)]
+            file.write_all_at(&bytes, committed)?;
+            #[cfg(not(unix))]
+            {
+                let mut file = file;
+                file.seek(io::SeekFrom::Start(committed))?;
+                file.write_all(&bytes)?;
+            }
+            let new_len = bytes.len() as u64;
+            let file_len = committed.checked_add(new_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "committed + buffered len overflow",
+                )
+            })?;
+            shard.file_len.store(file_len, Ordering::Release);
+            shard.write_count.fetch_add(
+                shard.pending_records.swap(0, Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            shard.bytes_written.fetch_add(new_len, Ordering::Relaxed);
+            // Hold `append_lock` for the whole commit (snapshot → write →
+            // length/accounting update) so no put can observe a file_len
+            // that hasn't caught up with bytes already handed out.
+            drop(guard);
+        }
+        self.dirty.lock().insert(shard.slot);
+        Ok(())
+    }
+
+    /// Commit every open shard's buffered frames to the page cache. No-op when
+    /// nothing is buffered. This is the durability boundary the append buffer
+    /// introduces: a put's bytes live only in process memory until a flush,
+    /// and only in the page cache until a sync. Callers that must observe a
+    /// shard's bytes exactly match the index (sync, checkpoint, repack,
+    /// delete, scan) flush by this.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if any shard's flush fails.
+    pub fn flush_all(&self) -> io::Result<()> {
+        for (_, shard) in self.all_shards() {
+            self.flush_shard(&shard)?;
+        }
+        Ok(())
     }
 
     /// The actual on-disk byte length of the frame at `offset` — length
@@ -1370,6 +1474,11 @@ impl ShardPool {
 
     /// Read a record from a specific shard at the given offset.
     ///
+    /// If `offset` lies in the shard's buffered-but-unflushed region
+    /// (`>= file_len`), the shard is flushed first (one positioned write)
+    /// so the record is always observable — a buffered record is indexed
+    /// and cache-resident, but not on disk until then.
+    ///
     /// `verify` controls whether the frame's CRC32 is checked: pass the
     /// pool's [`packfile::ChecksumPolicy::verifies_reads`] so `WriteOnly` and
     /// Disabled stores skip the hashing pass on point lookups. Frames written
@@ -1379,12 +1488,40 @@ impl ShardPool {
     /// # Errors
     /// Returns `StorageError::Corrupt` on CRC mismatch (when `verify` and the
     /// frame carries a checksum) or truncated frame, `StorageError::Io` on
-    /// I/O failure.
+    /// I/O failure (including flush failure for a pending offset).
     ///
     /// # Panics
     /// Panics only on internal invariant violation (unreachable path).
     pub fn read_at(
-        shard: &Shard,
+        &self,
+        shard: &Arc<Shard>,
+        offset: u64,
+        verify: bool,
+    ) -> Result<Record, crate::storage::StorageError> {
+        use crate::storage::StorageError;
+        if offset >= shard.file_len() {
+            // The offset is virtual — still inside the append buffer. Write
+            // the pending frames so the mmap can serve it.
+            self.flush_shard(shard).map_err(StorageError::Io)?;
+        }
+        Self::read_at_committed(shard, offset, verify)
+    }
+
+    /// Read a record whose offset is already committed to disk (e.g. from
+    /// `scan_packfile`, whose offsets are by construction within the file).
+    /// Unlike [`Self::read_at`] this does not flush anything: a virtual
+    /// (buffered) offset would fail the bounds checks. Intended for the
+    /// offline inspection paths that only ever touch committed frames.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Corrupt` on CRC mismatch (when `verify` and the
+    /// frame carries a checksum) or truncated frame, `StorageError::Io` on
+    /// I/O failure.
+    ///
+    /// # Panics
+    /// Panics only on internal invariant violation (unreachable path).
+    pub fn read_at_committed(
+        shard: &Arc<Shard>,
         offset: u64,
         verify: bool,
     ) -> Result<Record, crate::storage::StorageError> {
@@ -1719,9 +1856,13 @@ impl ShardPool {
 
     /// Sync all shards to disk.
     ///
+    /// Commits any buffered frames first, so fsync covers everything a
+    /// caller believes it has put.
+    ///
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
+        self.flush_all()?;
         {
             let shards = self.shards.read();
             for shard in shards.iter().flatten() {
@@ -1739,9 +1880,13 @@ impl ShardPool {
     /// so a partial failure leaves the untried shards marked dirty for
     /// the next call.
     ///
+    /// Commits any buffered frames first, so the fsync covers everything a
+    /// caller believes it has put.
+    ///
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_dirty(&self) -> io::Result<()> {
+        self.flush_all()?;
         let shards = self.shards.read();
         let mut dirty_set = self.dirty.lock();
         let dirty: Vec<u16> = dirty_set.iter().copied().collect();
@@ -1768,6 +1913,12 @@ impl ShardPool {
     ///
     /// Does nothing if the slot is already empty or is the active write shard.
     pub fn retire_slot(&self, slot: u16) {
+        // Commit any buffered frames first: records are only ever retired
+        // after their bytes are on disk, so a retire can never strand data
+        // that an index still references.
+        if let Some(shard) = self.get_shard(slot) {
+            let _ = self.flush_shard(&shard);
+        }
         let mut shards = self.shards.write();
         let mut dirty = self.dirty.lock();
 
@@ -1868,7 +2019,7 @@ mod tests {
         assert!(offset > 0);
 
         let shard = pool.get_shard(slot).unwrap();
-        let read = ShardPool::read_at(&shard, offset, true).unwrap();
+        let read = pool.read_at(&shard, offset, true).unwrap();
         assert_eq!(read.collection_id[0], 0x01);
         assert_eq!(read.hash[0], 0xAA);
         assert_eq!(read.data.as_ref(), b"hello shard");
@@ -1881,11 +2032,15 @@ mod tests {
         let first = test_record(1, 1, b"first raw payload");
         let (slot, first_offset) = pool.put_record(&first).unwrap();
         let shard = pool.get_shard(slot).unwrap();
+        // Buffered records are not on disk until flushed; the pointer
+        // invariant below is about the mmap backing, which only exists for
+        // committed bytes, so commit before establishing the mapping.
+        pool.flush_all().unwrap();
 
         // Establish the initial mapping and retain it only for checking the
         // returned Bytes pointer. The read itself must hold its own owner.
         let initial_mapping = shard.mmap().unwrap().as_ref().unwrap().clone();
-        let read_first = ShardPool::read_at(&shard, first_offset, true).unwrap();
+        let read_first = pool.read_at(&shard, first_offset, true).unwrap();
         let first_offset = usize::try_from(first_offset).unwrap();
         let node_offset = first_offset
             .checked_add(4)
@@ -1901,7 +2056,7 @@ mod tests {
         // current mapping; `read_first` must retain the old one safely.
         let second = test_record(1, 2, b"second raw payload");
         let (_, second_offset) = pool.put_record(&second).unwrap();
-        let read_second = ShardPool::read_at(&shard, second_offset, true).unwrap();
+        let read_second = pool.read_at(&shard, second_offset, true).unwrap();
         assert_eq!(read_first.data.as_ref(), b"first raw payload");
         assert_eq!(read_second.data.as_ref(), b"second raw payload");
     }
@@ -1914,6 +2069,7 @@ mod tests {
             .put_record(&test_record(0x01, 0xAA, b"truncated frame"))
             .unwrap();
         let shard = pool.get_shard(slot).unwrap();
+        pool.flush_all().unwrap();
 
         let len = shard.file.metadata().unwrap().len();
         shard.file.set_len(len - 1).unwrap();
@@ -2046,7 +2202,9 @@ mod tests {
 
         let record = test_record(0x01, 0xCC, b"needs sync");
         let (slot, _offset) = pool.put_record(&record).unwrap();
-        assert!(pool.dirty.lock().contains(&slot));
+        // The dirty bit is set at flush time, so a buffered put alone is
+        // not yet tracked — sync_dirty flushes first, then syncs and clears.
+        assert!(!pool.dirty.lock().contains(&slot));
 
         pool.sync_dirty().unwrap();
         assert!(
@@ -2369,6 +2527,8 @@ mod tests {
         pool.put_record(&r1).unwrap();
         pool.put_record(&r2).unwrap();
         pool.put_record(&r3).unwrap();
+        // The file scan only sees committed bytes, so flush before scanning.
+        pool.flush_all().unwrap();
 
         let entries = ShardPool::scan_shard(&pool.get_shard(0).unwrap().path).unwrap();
         assert_eq!(entries.len(), 3);
@@ -2388,18 +2548,22 @@ mod tests {
         let pool = ShardPool::open(dir.clone()).unwrap();
         let record = test_record(0x01, 0xAA, b"survives reopen");
         let (slot, offset) = pool.put_record(&record).unwrap();
+        // Durability is the sync boundary: buffered records are RAM-only
+        // until flushed, so make this reopen test's record actually durable
+        // before the pool drops.
+        pool.sync_all().unwrap();
         drop(pool);
 
         let pool = ShardPool::open(dir).unwrap();
         let shard = pool.get_shard(slot).unwrap();
-        let read = ShardPool::read_at(&shard, offset, true).unwrap();
+        let read = pool.read_at(&shard, offset, true).unwrap();
         assert_eq!(read.data.as_ref(), b"survives reopen");
 
         // Recovered shards must retain append access. Opening an existing
         // pack read-only here makes the next real import fail with EBADF.
         let appended = test_record(0x01, 0xBB, b"appends after reopen");
         let (_, appended_offset) = pool.put_record(&appended).unwrap();
-        let read = ShardPool::read_at(&shard, appended_offset, true).unwrap();
+        let read = pool.read_at(&shard, appended_offset, true).unwrap();
         assert_eq!(read.data.as_ref(), b"appends after reopen");
     }
 
@@ -2737,12 +2901,16 @@ mod tests {
         let (slot, offset) = pool.put_record(&record).unwrap();
 
         let shard = pool.get_shard(slot).unwrap();
+        // Buffered records are counted at flush time, not append time.
+        assert_eq!(shard.stats(), ShardStats::default());
+
+        // The read of the still-buffered offset flushes the shard, which is
+        // what credits the write counters.
+        pool.read_at(&shard, offset, true).unwrap();
         let stats = shard.stats();
         assert_eq!(stats.write_count, 1);
         assert_eq!(stats.bytes_written, record.serialized_len() as u64);
         assert_eq!(stats.sync_count, 0);
-
-        ShardPool::read_at(&shard, offset, true).unwrap();
 
         pool.sync_dirty().unwrap();
         let stats = shard.stats();
@@ -2838,12 +3006,14 @@ mod tests {
         let dir = test_dir("retire_preserves_dirty");
         let pool = ShardPool::open(dir).unwrap();
 
-        // Put a record so the active shard is dirty.
+        // Put a record so the active shard is dirty. The dirty bit tracks
+        // committed bytes, so flush to cross the buffered→committed boundary.
         let record = test_record(1, 1, b"payload");
         let (slot, _offset) = pool.put_record(&record).unwrap();
+        pool.flush_all().unwrap();
         assert!(
             pool.dirty.lock().contains(&slot),
-            "active shard should be dirty after put"
+            "active shard should be dirty after a flush of written data"
         );
 
         // Attempting to retire the active shard should be a no-op.

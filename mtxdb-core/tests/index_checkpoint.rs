@@ -152,6 +152,13 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
             .unwrap();
+        // Commit the appended frames to the page cache WITHOUT syncing: the
+        // packs on disk change but the checkpoint does not (and buffered
+        // bytes would be invisible to a fresh process entirely), so the next
+        // open must notice the fingerprint mismatch and rescan rather than
+        // trusting the stale index. The appended records survive because
+        // they were flushed, not because they were synced.
+        store.flush_all().unwrap();
         drop(store);
 
         let reopened = PackfileStorage::open(dir.clone()).unwrap();

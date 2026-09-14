@@ -1433,7 +1433,7 @@ fn cmd_scan(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> anyhow::Res
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
         let data = verbose
-            .then(|| ShardPool::read_at(&shard, *offset, true))
+            .then(|| ShardPool::read_at_committed(&shard, *offset, true))
             .transpose()?;
         let suffix = data
             .as_ref()
@@ -1472,7 +1472,7 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, verbose: bool, limit: i64) -> 
                 frames = frames.saturating_add(1);
                 if frames <= max_rows {
                     let data = verbose
-                        .then(|| ShardPool::read_at(&shard, offset, true))
+                        .then(|| ShardPool::read_at_committed(&shard, offset, true))
                         .transpose()?;
                     let suffix = data
                         .as_ref()
