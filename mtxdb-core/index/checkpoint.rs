@@ -213,7 +213,8 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
     let file = fs::File::open(path).ok()?;
     let mmap = Arc::new(crate::packfile::map_pack(&file).ok()?);
     let buf: &[u8] = &mmap;
-    let header_bytes: [u8; CHECKPOINT_HEADER_LEN] = buf[..CHECKPOINT_HEADER_LEN].try_into().ok()?;
+    let header_bytes: [u8; CHECKPOINT_HEADER_LEN] =
+        buf.get(..CHECKPOINT_HEADER_LEN)?.try_into().ok()?;
     let header = CheckpointHeader::decode(&header_bytes)?;
     if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
         return None;
@@ -242,6 +243,14 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
             .ok()?;
         let entry = CollectionDirEntry::decode(&entry_bytes)?;
         if entry.capacity < 16 || !entry.capacity.is_power_of_two() {
+            return None;
+        }
+        // A corrupt or malicious directory entry could otherwise claim more
+        // occupied slots than the table has room for; a downstream consumer
+        // sizing an allocation off `slot_count` (e.g. a post-restart grow)
+        // would then trust a value with no upper bound instead of the
+        // checkpoint being rejected here.
+        if entry.slot_count > entry.capacity {
             return None;
         }
         let slots_len = (entry.capacity as usize).checked_mul(8)?;

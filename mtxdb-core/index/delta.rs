@@ -51,14 +51,35 @@ pub const DELTA_BATCH_HEADER_LEN: usize = 8;
 /// Bytes in one batch trailer: magic(4) + reserved(4) + tail fingerprint(8).
 pub const DELTA_LOG_TRAILER_LEN: usize = 16;
 
+/// Hard ceiling on the delta log file size this reader will allocate for.
+/// The writer (`storage.rs`) forces a full checkpoint rewrite well before
+/// this — its own cap is 8 MiB — so a well-behaved log never approaches this
+/// value; it exists purely so a corrupted or maliciously oversized
+/// `index.delta` (e.g. a truncated-looking length field, or the file
+/// replaced wholesale) can't make an opener allocate an unbounded buffer
+/// before any structural validation runs. Generous relative to the writer's
+/// own cap so it never rejects a real log.
+const MAX_DELTA_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
 /// Current wire version (see the header's version byte).
-const DELTA_LOG_VERSION: u8 = 1;
+///
+/// v2 repurposes the trailer's 4 reserved bytes as a CRC32 of the batch's
+/// frame bytes, so a batch whose frames were
+/// corrupted after being written — but which still happens to pass the
+/// fingerprint/generation gates in `storage.rs` — is caught and dropped at
+/// read time instead of being replayed as valid index state. A v1 log fails
+/// the version check below and falls back to a full rescan, same as any
+/// other structurally rejected log.
+const DELTA_LOG_VERSION: u8 = 2;
 const DELTA_BATCH_MAGIC: &[u8; 4] = b"MDLB";
 const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"DLTR";
 
 const BASE_FINGERPRINT_OFFSET: usize = 8;
 const TRAILER_FINGERPRINT_OFFSET: usize = 8;
+/// Offset of the batch's frame-bytes CRC32 within the trailer's reserved
+/// field (bytes 4..8, between the magic and the tail fingerprint).
+const TRAILER_CRC_OFFSET: usize = 4;
 
 /// A decoded delta log that passed its structural gates.
 #[derive(Debug)]
@@ -95,13 +116,23 @@ pub fn encode_batch_header(frame_count: u32) -> [u8; DELTA_BATCH_HEADER_LEN] {
     bytes
 }
 
-/// Encode the fixed-width batch trailer for `tail_fingerprint`.
+/// Encode the fixed-width batch trailer for `tail_fingerprint`, with `crc`
+/// the CRC32 of the batch's frame bytes (stored at byte offset 4 of the
+/// trailer's reserved field).
 #[must_use]
-pub fn encode_trailer(tail_fingerprint: u64) -> [u8; DELTA_LOG_TRAILER_LEN] {
+pub fn encode_trailer(tail_fingerprint: u64, crc: u32) -> [u8; DELTA_LOG_TRAILER_LEN] {
     let mut bytes = [0u8; DELTA_LOG_TRAILER_LEN];
     bytes[..4].copy_from_slice(DELTA_LOG_TRAILER_MAGIC);
+    bytes[TRAILER_CRC_OFFSET..8].copy_from_slice(&crc.to_le_bytes());
     bytes[TRAILER_FINGERPRINT_OFFSET..16].copy_from_slice(&tail_fingerprint.to_le_bytes());
     bytes
+}
+
+/// CRC32 of one batch's frame bytes (the payload between the batch header
+/// and trailer), as stored in the trailer's reserved field.
+#[must_use]
+fn frames_crc(frames_bytes: &[u8]) -> u32 {
+    crc32fast::hash(frames_bytes)
 }
 
 /// Length in bytes of one fully framed batch carrying `frame_count` frames.
@@ -123,6 +154,12 @@ pub fn batch_len(frame_count: usize) -> Option<usize> {
 /// dropped; everything up to the last complete batch is returned.
 #[must_use]
 pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
+    // Check the size before allocating: `fs::read` would otherwise size its
+    // buffer off an unvalidated on-disk length, letting a corrupted or
+    // oversized file exhaust memory before any structural check runs.
+    if fs::metadata(path).ok()?.len() > MAX_DELTA_LOG_FILE_BYTES {
+        return None;
+    }
     let buf = fs::read(path).ok()?;
     if buf.len() < DELTA_LOG_HEADER_LEN {
         return None;
@@ -161,7 +198,22 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
         if &buf[trailer_start..trailer_start.saturating_add(4)] != DELTA_LOG_TRAILER_MAGIC {
             break;
         }
-        for frame_bytes in buf[frames_start..trailer_start].chunks_exact(DELTA_FRAME_LEN) {
+        let frames_bytes = &buf[frames_start..trailer_start];
+        let stored_crc = u32::from_le_bytes(
+            buf[trailer_start.saturating_add(TRAILER_CRC_OFFSET)..trailer_start.saturating_add(8)]
+                .try_into()
+                .ok()?,
+        );
+        if frames_crc(frames_bytes) != stored_crc {
+            // The frame bytes were corrupted after being written (bit rot,
+            // torn/partial write not otherwise caught by the length framing,
+            // etc). Trust nothing from this batch onward — same as a torn
+            // trailer, everything already accumulated from earlier committed
+            // batches is kept, but this and any later batch are dropped
+            // rather than replayed as valid index state.
+            break;
+        }
+        for frame_bytes in frames_bytes.chunks_exact(DELTA_FRAME_LEN) {
             frames.push(DeltaFrame::decode(frame_bytes)?);
         }
         tail_fingerprint = Some(u64::from_le_bytes(
@@ -209,11 +261,13 @@ pub fn append_batch(
     }
     file.write_all(&encode_batch_header(frame_count))?;
     appended = appended.saturating_add(DELTA_BATCH_HEADER_LEN);
+    let mut frames_bytes = Vec::with_capacity(frames.len().saturating_mul(DELTA_FRAME_LEN));
     for frame in frames {
-        file.write_all(&frame.encode())?;
-        appended = appended.saturating_add(DELTA_FRAME_LEN);
+        frames_bytes.extend_from_slice(&frame.encode());
     }
-    file.write_all(&encode_trailer(tail_fingerprint))?;
+    file.write_all(&frames_bytes)?;
+    appended = appended.saturating_add(frames_bytes.len());
+    file.write_all(&encode_trailer(tail_fingerprint, frames_crc(&frames_bytes)))?;
     appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
     file.sync_all()?;
     Ok(appended)
@@ -280,8 +334,12 @@ mod tests {
         assert_eq!(&batch[..4], DELTA_BATCH_MAGIC);
         assert_eq!(u32::from_le_bytes(batch[4..8].try_into().unwrap()), 12);
 
-        let trailer = encode_trailer(0xCAFE_F00D);
+        let trailer = encode_trailer(0xCAFE_F00D, 0x1234_5678);
         assert_eq!(&trailer[..4], DELTA_LOG_TRAILER_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(trailer[TRAILER_CRC_OFFSET..8].try_into().unwrap()),
+            0x1234_5678
+        );
         assert_eq!(
             u64::from_le_bytes(trailer[TRAILER_FINGERPRINT_OFFSET..16].try_into().unwrap()),
             0xCAFE_F00D
@@ -379,6 +437,33 @@ mod tests {
         let log = read_delta_log(&path).expect("frame-without-trailer batch is dropped, not fatal");
         assert_eq!(log.tail_fingerprint, 11);
         assert_eq!(log.frames.len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn corrupted_frame_bytes_are_rejected_by_crc() {
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_delta_crc_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_DELTA_FILE);
+        // A committed batch, then a second batch whose frame bytes are
+        // corrupted after being fully written — the length framing alone
+        // can't catch this; only the CRC can.
+        append_batch(&path, true, 7, &[test_frame(0, 3)], 11).unwrap();
+        append_batch(&path, false, 7, &[test_frame(1, 3), test_frame(2, 3)], 22).unwrap();
+        let mut full = std::fs::read(&path).unwrap();
+        // Flip a byte inside the second batch's frame region (well past the
+        // first batch's header+frame+trailer).
+        let corrupt_at = full.len() - DELTA_LOG_TRAILER_LEN - 1;
+        full[corrupt_at] ^= 0xFF;
+        std::fs::write(&path, &full).unwrap();
+
+        let log = read_delta_log(&path).expect("first committed batch must still be trusted");
+        assert_eq!(log.tail_fingerprint, 11, "corrupted batch must be dropped");
+        assert_eq!(log.frames.len(), 1);
+        assert_eq!(log.frames[0], test_frame(0, 3));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

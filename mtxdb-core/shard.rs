@@ -1438,24 +1438,32 @@ impl ShardPool {
                 return Ok(());
             }
             let committed = shard.file_len.load(Ordering::Acquire);
-            let bytes = std::mem::take(&mut *pending_guard);
-            drop(pending_guard);
+            // Write directly from the still-buffered bytes rather than
+            // draining them first: `append_lock` is held for this whole
+            // block, so nothing else can append to `pending` meanwhile,
+            // and keeping the bytes in place until the write actually
+            // succeeds means a failed write leaves them buffered for the
+            // next flush attempt instead of silently discarding already
+            // "successful" puts whose offsets the index has already
+            // handed out.
             let file = shard.file.try_clone()?;
             #[cfg(unix)]
-            file.write_all_at(&bytes, committed)?;
+            file.write_all_at(&pending_guard, committed)?;
             #[cfg(not(unix))]
             {
                 let mut file = file;
                 file.seek(io::SeekFrom::Start(committed))?;
-                file.write_all(&bytes)?;
+                file.write_all(&pending_guard)?;
             }
-            let new_len = bytes.len() as u64;
+            let new_len = pending_guard.len() as u64;
             let file_len = committed.checked_add(new_len).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "committed + buffered len overflow",
                 )
             })?;
+            pending_guard.clear();
+            drop(pending_guard);
             shard.file_len.store(file_len, Ordering::Release);
             shard.write_count.fetch_add(
                 shard.pending_records.swap(0, Ordering::Relaxed),
@@ -2119,12 +2127,20 @@ impl ShardPool {
     /// `None` allows `rotate()` to reuse it.
     ///
     /// Does nothing if the slot is already empty or is the active write shard.
+    ///
+    /// Also does nothing if the shard has buffered frames that fail to
+    /// flush: retiring anyway would mark the shard for deletion (via
+    /// `Shard::drop`) while data an index still references is only in
+    /// memory, destroying it. Leaving the slot occupied means the next
+    /// flush attempt (or another retire) gets another chance.
     pub fn retire_slot(&self, slot: u16) {
         // Commit any buffered frames first: records are only ever retired
         // after their bytes are on disk, so a retire can never strand data
         // that an index still references.
         if let Some(shard) = self.get_shard(slot) {
-            let _ = self.flush_shard(&shard);
+            if self.flush_shard(&shard).is_err() {
+                return;
+            }
         }
         let mut shards = self.shards.write();
         let mut dirty = self.dirty.lock();

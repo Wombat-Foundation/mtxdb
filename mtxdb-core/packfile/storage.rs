@@ -1901,6 +1901,22 @@ impl PackfileStorage {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // Hold every collection's put_mutex across the fingerprint snapshot
+        // and the index serialization below (same sorted-lock pattern as
+        // `retire_empty_shards_after_batch`). Without this, a concurrent
+        // `put` can straddle the two: it lands its record between the pack
+        // fingerprint being captured and that collection's index generation
+        // being loaded, so the checkpoint pins a fingerprint that already
+        // includes the new bytes together with an index snapshot taken
+        // before the record's slot was published — a checkpoint that reopens
+        // cleanly (fingerprint matches, rescan skipped) but is silently
+        // missing that record, with the delta that would have covered it
+        // dropped by the rewrite below.
+        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        collection_ids.sort_unstable();
+        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+
         // Commit any buffered frames first: the fingerprint below pins each
         // shard to its committed on-disk length, and the serialized index
         // offsets must be readable against exactly that length on the next
