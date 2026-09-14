@@ -367,7 +367,6 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
         );
     }
     let lookup_us = lookup_started.elapsed().as_secs_f64() * 1e6 / LOOKUP_SAMPLES.min(nodes) as f64;
-    drop(table);
     drop(txn);
     drop(db);
 
@@ -377,8 +376,7 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
     let db: Database<NoWriteMap> = Database::open(dir).unwrap();
     {
         let txn = db.begin_ro_txn().unwrap();
-        let table = txn.open_table(None).unwrap();
-        drop(table);
+        let _ = txn.open_table(None).unwrap();
     }
     let cold_open_ms = started.elapsed().as_secs_f64() * 1e3;
 

@@ -98,7 +98,9 @@ def print_table() -> None:
 
     def cell(engine: str, metric: str) -> str:
         value = latest[engine][metric]
-        if metric not in {"files_bytes", "mem_bytes"}:
+        if metric == "files_bytes":
+            return _human_bytes(int(value))
+        if metric != "mem_bytes":
             # `csv` parsing normalizes `6.80` to `6.8`; restore the benchmark
             # display contract here. Bulk write intentionally remains one
             # decimal, while all other time measurements use two.
