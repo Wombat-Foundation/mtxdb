@@ -69,6 +69,7 @@ pub(crate) enum Commands {
     Sync {
         all: bool,
     },
+    Init,
 }
 
 fn build_cli() -> Command {
@@ -107,6 +108,7 @@ fn build_cli() -> Command {
         .subcommand(sub_delete())
         .subcommand(sub_put())
         .subcommand(sub_get())
+        .subcommand(sub_init())
 }
 
 /// The two flags shared by every subcommand (`--dir`, `--shard-type`).
@@ -188,6 +190,14 @@ fn sort_arg(help: &'static str) -> Arg {
         .long("sort")
         .value_name("COLUMN")
         .help(help)
+}
+
+fn sub_init() -> Command {
+    Command::new("init").about(
+        "Create a new mtxdb database root (db.meta + a directory per shard pool). \
+         The only command that creates a store -- every other command errors \
+         if it doesn't already exist.",
+    )
 }
 
 fn sub_sync() -> Command {
@@ -498,6 +508,7 @@ fn parse_cli() -> Cli {
         Some(("sync", m)) => Commands::Sync {
             all: m.get_flag("all"),
         },
+        Some(("init", _)) => Commands::Init,
         _ => {
             build_cli().print_help().unwrap();
             std::process::exit(0);

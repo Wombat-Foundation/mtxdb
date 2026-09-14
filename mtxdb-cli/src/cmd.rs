@@ -163,7 +163,32 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Delete { collections, yes } => cmd_delete(cli, collections, *yes),
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync { all } => cmd_sync(cli, *all),
+        Commands::Init => cmd_init(cli),
     }
+}
+
+/// Create a new mtxdb database root: `db.meta` plus an empty directory for
+/// every independent shard pool. The only command allowed to bring a store
+/// into existence -- every other command resolves the root read-only (see
+/// `open_layout`) and errors instead of creating one on the fly.
+fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
+    let root = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    let already_initialized = root.join("db.meta").is_file();
+    DatabaseLayout::open(root.into()).with_context(|| {
+        format!(
+            "failed to initialize mtxdb database root `{}`",
+            root.display()
+        )
+    })?;
+    if already_initialized {
+        println!("mtxdb database already initialized at `{}`", root.display());
+    } else {
+        println!("initialized mtxdb database at `{}`", root.display());
+        for shard_type in ShardType::ALL {
+            println!("  pools/{}", shard_type.as_str());
+        }
+    }
+    Ok(())
 }
 
 fn parse_collection_id(hex: &str) -> anyhow::Result<[u8; 16]> {
@@ -224,15 +249,24 @@ fn open_store_read_only(cli: &Cli) -> anyhow::Result<PackfileStorage> {
 ///
 /// The CLI deliberately never opens a root directory as a raw packfile pool:
 /// doing so would recreate the flat layout and mix unrelated lifecycles.
+///
+/// Every command except `init` resolves the database root read-only: this
+/// never creates `db.meta` or any pool directory as a side effect of simply
+/// pointing the CLI at a path (see `cmd_init`). A missing root is a clear
+/// error pointing at `mtxdb init`, not silent on-disk state.
 fn open_layout(cli: &Cli) -> anyhow::Result<DatabaseLayout> {
     let root = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
-    DatabaseLayout::open(root.into())
-        .with_context(|| format!("failed to open mtxdb database root `{}`", root.display()))
+    DatabaseLayout::open_read_only(root.into()).with_context(|| {
+        format!(
+            "no mtxdb database at `{}` -- run `mtxdb init` first",
+            root.display()
+        )
+    })
 }
 
 fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<PathBuf> {
     layout
-        .pool_dir(shard_type)
+        .pool_dir_read_only(shard_type)
         .with_context(|| format!("failed to open {} shard pool", shard_type.as_str()))
 }
 
