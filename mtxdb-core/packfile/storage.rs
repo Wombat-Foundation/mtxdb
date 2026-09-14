@@ -1144,13 +1144,32 @@ impl PackfileStorage {
         if replay_needed {
             let delta_started = std::time::Instant::now();
             let log = delta::read_delta_log(&delta_path);
+            let delta_meta = std::fs::metadata(&delta_path)
+                .map(|m| format!("len={}", m.len()))
+                .unwrap_or_else(|_| "absent".to_owned());
             let trusted = log.as_ref().is_some_and(|log| {
+                eprintln!(
+                    "DBG replay gate ckpt={} local={} base={} tail={} frames={} ckpt_gens={} delta=[{}]",
+                    checkpoint.fingerprint,
+                    local_fingerprint,
+                    log.base_fingerprint,
+                    log.tail_fingerprint,
+                    log.frames.len(),
+                    ckpt_generations.len(),
+                    delta_meta
+                );
                 log.base_fingerprint == checkpoint.fingerprint
                     && log.tail_fingerprint == local_fingerprint
                     && log.frames.iter().all(|frame| {
                         ckpt_generations.get(&frame.collection_id) == Some(&frame.generation)
                     })
             });
+            if !log.as_ref().is_some() {
+                eprintln!(
+                    "DBG gate no-delta-file delta=[{delta_meta}] ckpt={} local={}",
+                    checkpoint.fingerprint, local_fingerprint
+                );
+            }
             if trusted {
                 replay_frames = log.map_or(Vec::new(), |log| log.frames);
             } else {
