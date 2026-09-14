@@ -1363,6 +1363,12 @@ impl ShardPool {
             // strictly necessary when compression would have made it fit.
             let max_record_len = record.serialized_len() as u64;
 
+            // Byte range this put occupies in `pending`, captured so the
+            // failed-flush rollback below can remove exactly this record's
+            // frame.
+            let mut pending_start = 0usize;
+            let mut frame_len = 0usize;
+
             let offset = {
                 let guard = shard.append_lock.lock();
                 // `append_lock` serializes writers and `file_len` is updated
@@ -1395,18 +1401,41 @@ impl ShardPool {
                     self.compress,
                     self.checksum_policy.computes_checksum(),
                 )?;
-                shard.pending.lock().extend_from_slice(&frame);
+                let mut pending = shard.pending.lock();
+                pending_start = pending.len();
+                frame_len = frame.len();
+                pending.extend_from_slice(&frame);
                 shard.pending_records.fetch_add(1, Ordering::Relaxed);
                 virtual_end
             };
 
-            match self.append_policy {
-                AppendPolicy::Eager => self.flush_shard(&shard)?,
+            let flush_result = match self.append_policy {
+                AppendPolicy::Eager => self.flush_shard(&shard),
                 AppendPolicy::Buffered { max_pending_bytes } => {
                     if shard.pending.lock().len() >= max_pending_bytes {
-                        self.flush_shard(&shard)?;
+                        self.flush_shard(&shard)
+                    } else {
+                        Ok(())
                     }
                 }
+            };
+            if let Err(e) = flush_result {
+                // The caller sees `Err` and has not indexed this record, yet
+                // its frame is still in `pending` — a later flush would
+                // silently make a "failed" put durable, surfacing it as
+                // stored data on restart's full scan. Roll it back. Only a
+                // tail truncation is safe (frames are contiguous, and this
+                // shard's puts are serialized by the collection put_mutex,
+                // so no other put can have appended after ours); if a
+                // concurrent flusher already committed the buffer, the range
+                // is gone and the rollback is a no-op.
+                let guard = shard.append_lock.lock();
+                let mut pending = shard.pending.lock();
+                if pending.len() == pending_start.saturating_add(frame_len) {
+                    pending.truncate(pending_start);
+                    shard.pending_records.fetch_sub(1, Ordering::Relaxed);
+                }
+                return Err(e);
             }
             return Ok((shard.slot, offset));
         }

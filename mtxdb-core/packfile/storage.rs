@@ -456,6 +456,15 @@ pub struct PackfileStorage {
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
     put_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
+    /// Serializes the *publication* of a brand-new collection against a
+    /// checkpoint rewrite (see `persist_index_checkpoint`). Creates take this
+    /// lock shared for the whole put; the checkpoint holds it exclusive for
+    /// the fingerprint→snapshot window, so a record whose bytes land on disk
+    /// mid-rewrite can never be fingerprinted without its collection being
+    /// snapshotted in the same checkpoint. Existing-collection puts never
+    /// touch it (their `put_mutex` already gates them), so the shrink-latency
+    /// property the epoch-handoff window exists to protect is untouched.
+    collection_creation: parking_lot::RwLock<()>,
     /// In-memory cache of the `deleted.collections` file, seeded once at
     /// `open()` from disk. Guards both the set and the read-modify-write of
     /// the backing file, so a plain membership check (the common case: most
@@ -1031,6 +1040,7 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
+            collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
@@ -1986,8 +1996,37 @@ impl PackfileStorage {
         // good a snapshot as the live one for serialization purposes.
         let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
         collection_ids.sort_unstable();
-        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
-        let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+        // The guards borrow these `Arc`s, so the handles must outlive the
+        // guards; this vector is also re-used for the end-of-function
+        // dirty-check re-lock so late-added collections stay pinned too.
+        let mut lock_arcs: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+
+        // Exclude new-collection publication from the fingerprint→snapshot
+        // window. A put *to* an existing collection is already gated by that
+        // collection's `put_mutex`, but a put that is about to *create* a
+        // collection holds no mutex this function acquired, so its record
+        // frame could be Eager-flushed into a pack between our `flush_all` and
+        // our fingerprint read — the fingerprint would then name a record
+        // whose collection never made it into the snapshot, and a reopen that
+        // trusts C1 would silently drop it. Publishing puts hold this lock
+        // shared across the entire put; acquiring it exclusive here (before
+        // the fingerprint, held through the rotation) means no such put can
+        // interleave its flush with our capture: it either finished
+        // beforehand (its collection is in the snapshot) or runs entirely
+        // afterwards (its bytes land post-fingerprint, and the fingerprint
+        // mismatch on reopen routes to the full rescan).
+        let create_guard = self.collection_creation.write();
+        // A collection created between the initial scan above and this lock
+        // wasn't in the locked set and must be now — otherwise a put to one
+        // serially dispatched by the engine could still squeeze under the
+        // fingerprint while its publication was snapshotted.
+        let ids_now: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
+            lock_arcs.push(self.put_mutex(id));
+        }
+        // Now build the lock guards: the arcs must outlive them (collected
+        // in `lock_arcs` above and reused below for the dirty-check).
+        let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
 
         // Commit any buffered frames first: the fingerprint below pins each
         // shard to its committed on-disk length, and the serialized index
@@ -2023,6 +2062,12 @@ impl PackfileStorage {
         // target the new epoch (D1) by the time the locks drop next.
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         drop(guards);
+        // Publication lock released with every put mutex before the unlocked
+        // serialize/rename: new-collection puts may then proceed, and any
+        // record bytes they flush land after the fingerprint (recovered by
+        // the reopen's rescan on a crash, as with the pre-existing unlocked
+        // window for existing-collection puts).
+        drop(create_guard);
 
         let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
             .iter()
@@ -2064,7 +2109,16 @@ impl PackfileStorage {
         // memory. Briefly re-acquire every put_mutex (no I/O under them) so
         // this decision can't interleave with a put's own frame-push +
         // dirty-set (see `put_many`; the frame goes in before the flag).
-        let guards = mutexes.iter().map(|m| m.lock()).collect::<Vec<_>>();
+        // Re-lock the *extended* set (`ids_now`, which includes anything
+        // published during the initial scan), so a put to a collection that
+        // entered the locked window late is still pinned for this check.
+        let guards = ids_now
+            .iter()
+            .map(|id| {
+                let lock = self.put_mutex(id);
+                lock.lock()
+            })
+            .collect::<Vec<_>>();
         let has_unfinished_work = {
             let state = self.delta_state.lock();
             !state.pending.is_empty() || state.invalid
@@ -2132,6 +2186,12 @@ impl PackfileStorage {
         collection_ids.sort_unstable();
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+        let create_guard = self.collection_creation.write();
+        let ids_now: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
+            let lock = self.put_mutex(id);
+            guards.push(lock.lock());
+        }
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
         let order = self.collection_order.read().clone();
@@ -2149,6 +2209,7 @@ impl PackfileStorage {
         };
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         drop(guards);
+        drop(create_guard);
 
         std::thread::sleep(delay);
 
@@ -4180,6 +4241,18 @@ impl StorageEngine for PackfileStorage {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
+        // New-collection puts must not interleave their record flush with a
+        // concurrent checkpoint's fingerprint→snapshot window (see
+        // `persist_index_checkpoint`). Existing collections are already gated
+        // by their `put_mutex`; a brand-new one isn't in that set yet, so we
+        // hold the publication lock shared for the whole put instead — the
+        // checkpoint holds it exclusive, excluding this put from the window.
+        let _create_guard = if self.generation(collection_id).is_none() {
+            Some(self.collection_creation.read())
+        } else {
+            None
+        };
+
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
@@ -4290,6 +4363,14 @@ impl StorageEngine for PackfileStorage {
 
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
+
+        // Same comment as in `put`: a brand-new collection must be excluded
+        // from a concurrent checkpoint's fingerprint→snapshot window.
+        let _create_guard = if self.generation(collection_id).is_none() {
+            Some(self.collection_creation.read())
+        } else {
+            None
+        };
 
         let old_gen = self.generation(collection_id);
         let mut index = match &old_gen {

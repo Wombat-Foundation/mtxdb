@@ -160,13 +160,21 @@ pub fn batch_len(frame_count: usize) -> Option<usize> {
 /// dropped; everything up to the last complete batch is returned.
 #[must_use]
 pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
-    // Check the size before allocating: `fs::read` would otherwise size its
-    // buffer off an unvalidated on-disk length, letting a corrupted or
-    // oversized file exhaust memory before any structural check runs.
-    if fs::metadata(path).ok()?.len() > MAX_DELTA_LOG_FILE_BYTES {
+    // Check the size before allocating and then read from the *same* handle:
+    // `metadata` + a separate `fs::read` would size the buffer off the
+    // metadata call, letting the file be swapped or grown between the two so
+    // the allocation exceeds the limit. Opening once pins the inode and make
+    // the measured length and the bytes read describe the same file; a
+    // bounded read from that handle then cannot allocate past
+    // `MAX_DELTA_LOG_FILE_BYTES`.
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > MAX_DELTA_LOG_FILE_BYTES {
         return None;
     }
-    let buf = fs::read(path).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    use std::io::Read;
+    file.read_exact(&mut buf).ok()?;
     if buf.len() < DELTA_LOG_HEADER_LEN {
         return None;
     }

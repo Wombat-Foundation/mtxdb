@@ -39,6 +39,9 @@ zstd = { version = "0.13", default-features = false }
 # input bytes, not on what's installed on whichever machine built the binary.
 zstd-sys = { version = "2.1", features = ["vendored"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bench]]
 name = "storage"
 path = "../benches/storage.rs"

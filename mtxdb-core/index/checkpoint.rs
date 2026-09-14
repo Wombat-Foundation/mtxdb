@@ -266,7 +266,33 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
         }
         let slots_len = (entry.capacity as usize).checked_mul(8)?;
         let region = slot_base.checked_add(usize::try_from(entry.slots_offset).ok()?)?;
-        buf.get(region..region.checked_add(slots_len)?)?;
+        let slots = &buf.get(region..region.checked_add(slots_len)?)?[..];
+        // The dual direction of the count check: an *understated* count (fewer
+        // non-empty slots than the region actually holds) passes the
+        // `slot_count <= capacity` bound above but seeds a post-restart
+        // index's `len` below its real occupancy. A writer resuming on such an
+        // index trusts the short `len` for its table-full accounting and can
+        // overfill an already-full probe table, looping forever on insert.
+        // Recover the true occupancy from the region — the same non-`0u64`
+        // slot criterion used at write time (`blob_slot_count`) — and require
+        // it to agree exactly. The scan bails as soon as the count exceeds the
+        // declared one, so an overstated region is rejected in O(slot_count)
+        // instead of O(capacity); an equal count still costs a full scan of
+        // the region, which is proportional to the bytes the checkpoint
+        // already carries.
+        let declared = entry.slot_count;
+        let mut occupied: u32 = 0;
+        for slot in slots.chunks_exact(8) {
+            if slot != [0u8; 8] {
+                occupied = occupied.checked_add(1).map_or(u32::MAX, |n| n);
+                if occupied > declared {
+                    return None;
+                }
+            }
+        }
+        if occupied != declared {
+            return None;
+        }
         collections.push(LoadedCollection {
             collection_id: entry.collection_id,
             generation: entry.generation,
