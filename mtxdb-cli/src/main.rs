@@ -36,6 +36,9 @@ pub(crate) enum Commands {
         layout: bool,
         sort: Option<String>,
     },
+    Stats {
+        json: bool,
+    },
     Info {
         collection: String,
     },
@@ -96,6 +99,7 @@ fn build_cli() -> Command {
         )
         .about("CLI for the mtxdb content-addressed storage engine")
         .subcommand(sub_shards())
+        .subcommand(sub_stats())
         .subcommand(sub_collections())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
@@ -149,6 +153,17 @@ fn sub_shards() -> Command {
         .arg(sort_arg(
             "pack, bytes, nodes, collections, syncs, segments, interleaving",
         ))
+}
+
+fn sub_stats() -> Command {
+    Command::new("stats")
+        .about("Runtime, open, and persisted pool statistics")
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Emit machine-readable JSON instead of a table"),
+        )
 }
 
 fn sub_collections() -> Command {
@@ -458,6 +473,9 @@ fn parse_cli() -> Cli {
             all: m.get_flag("all"),
             layout: m.get_flag("layout"),
             sort: m.get_one::<String>("sort").cloned(),
+        },
+        Some(("stats", m)) => Commands::Stats {
+            json: m.get_flag("json"),
         },
         Some(("info", m)) => Commands::Info {
             collection: m.get_one::<String>("collection").unwrap().clone(),

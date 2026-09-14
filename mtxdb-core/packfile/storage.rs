@@ -513,6 +513,65 @@ pub struct PackfileStorage {
     last_open_timings: parking_lot::Mutex<Option<OpenTimings>>,
     /// Wall-clock breakdown of the most recent `sync_all`, by phase.
     last_sync_timings: parking_lot::Mutex<Option<SyncTimings>>,
+    /// Gates the logical read-path counters (`get`/`get_many` below). Off by
+    /// default so a store doing no reads-of-record pays one relaxed load per
+    /// logical read at most, and the write/batch/sync counters are the only
+    /// always-on instrumentation (each is a single batch-granular `fetch_add`
+    /// on a write-locked or per-call path, never per-record on the hot read
+    /// path). See [`Self::set_stats_enabled`].
+    stats_enabled: AtomicBool,
+    /// Number of times this class of store was assembled in this process — 1
+    /// for a fresh open. Not reset by `reset_stats` (it counts stores, not work).
+    open_count: AtomicU64,
+
+    // Logical read-path counters. Only incremented while `stats_enabled` is
+    // true; otherwise the read path touches none of these.
+    /// Logical `get` calls (including cache hits and any collection's absence).
+    get_calls: AtomicU64,
+    /// Logical `get` calls that resolved to no record (unknown collection,
+    /// empty index probe, or unresolved candidate).
+    get_misses: AtomicU64,
+    /// Logical `get_many` calls.
+    get_many_calls: AtomicU64,
+    /// Records requested across `get_many` calls.
+    get_many_records: AtomicU64,
+    /// `get_many` results that resolved to no record.
+    get_many_misses: AtomicU64,
+
+    // Always-on write-path counters (per-record `fetch_add` only on the
+    // single-record `put`, whose hot cost is dominated by the write itself).
+    /// Single-record `put` attempts.
+    put_calls: AtomicU64,
+    /// Bytes accepted by single-record `put` attempts.
+    put_bytes: AtomicU64,
+    /// `put_many` calls (batches).
+    put_many_calls: AtomicU64,
+    /// Records written across `put_many` calls.
+    put_many_records: AtomicU64,
+    /// Bytes written across `put_many` calls.
+    put_many_bytes: AtomicU64,
+    /// `put_many` calls that started on the owned, no-clone fast path.
+    put_many_fast_path_calls: AtomicU64,
+    /// `put_many` calls that had to materialize an owned index up front
+    /// (mmap-backed first write, or a brand-new collection).
+    put_many_clone_path_calls: AtomicU64,
+    /// Cumulative nanoseconds spent materializing or growing an owned index in
+    /// `put_many` (batch-granular; drives the steady-append scaler's
+    /// resume-from-checkpoint cost).
+    index_clone_time_ns: AtomicU64,
+    /// Index grow/rebuild events in `put_many` (each invalidates the delta log).
+    index_grow_count: AtomicU64,
+    /// Fallback `rebuild_index` calls (full pack scan).
+    index_rebuild_count: AtomicU64,
+    /// `invalidate_delta_log` calls — structural changes that force the next
+    /// dirty sync onto a full checkpoint rewrite + log re-base.
+    delta_invalidations: AtomicU64,
+    /// `sync`/`sync_all` calls.
+    sync_calls: AtomicU64,
+    /// Syncs that rewrote the index checkpoint in full.
+    checkpoint_writes: AtomicU64,
+    /// Syncs that appended the incremental delta log instead.
+    delta_appends: AtomicU64,
     /// Whether any collection data changed since the last `index.checkpoint`
     /// write. Set by every generation swap (`put`/`put_many`/`repack`/`refresh`);
     /// cleared only by a successful [`Self::persist_index_checkpoint`], so a
@@ -1078,6 +1137,27 @@ impl PackfileStorage {
             index_checkpoint_dirty: AtomicBool::new(false),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
+            stats_enabled: AtomicBool::new(false),
+            open_count: AtomicU64::new(1),
+            get_calls: AtomicU64::new(0),
+            get_misses: AtomicU64::new(0),
+            get_many_calls: AtomicU64::new(0),
+            get_many_records: AtomicU64::new(0),
+            get_many_misses: AtomicU64::new(0),
+            put_calls: AtomicU64::new(0),
+            put_bytes: AtomicU64::new(0),
+            put_many_calls: AtomicU64::new(0),
+            put_many_records: AtomicU64::new(0),
+            put_many_bytes: AtomicU64::new(0),
+            put_many_fast_path_calls: AtomicU64::new(0),
+            put_many_clone_path_calls: AtomicU64::new(0),
+            index_clone_time_ns: AtomicU64::new(0),
+            index_grow_count: AtomicU64::new(0),
+            index_rebuild_count: AtomicU64::new(0),
+            delta_invalidations: AtomicU64::new(0),
+            sync_calls: AtomicU64::new(0),
+            checkpoint_writes: AtomicU64::new(0),
+            delta_appends: AtomicU64::new(0),
             delta_state: parking_lot::Mutex::new(delta_state),
         }
     }
@@ -1941,6 +2021,7 @@ impl PackfileStorage {
     /// reconstruct the new state, so the next sync must do a full checkpoint
     /// rewrite (which re-bases the log) instead of an append.
     fn invalidate_delta_log(&self) {
+        self.delta_invalidations.fetch_add(1, Ordering::Relaxed);
         self.delta_state.lock().invalid = true;
     }
 
@@ -2793,6 +2874,9 @@ impl PackfileStorage {
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
+        // Full-fallback path: a batch that exhausted growth re-scans the
+        // packfiles. Tracked so a heavy rebuild is visible in `stats()`.
+        self.index_rebuild_count.fetch_add(1, Ordering::Relaxed);
         // `scan_collection_records` traverses packfiles; any buffered frames
         // (this collection's or any other's) are invisible to it, so a fresh
         // flush guarantees the rebuilt index reflects every record that has
@@ -4256,16 +4340,31 @@ impl PackfileStorage {
 
 impl StorageEngine for PackfileStorage {
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        let track = self.stats_enabled.load(Ordering::Relaxed);
         let gen_guard = self.generation(collection_id);
         let gen = gen_guard.as_deref();
 
         let Some(gen) = gen else {
+            if track {
+                self.get_calls.fetch_add(1, Ordering::Relaxed);
+                self.get_misses.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(None);
         };
         if let Some(data) = gen.cache.get(id) {
+            if track {
+                self.get_calls.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(Some((*data).clone()));
         }
-        self.resolve_from_candidates(id, gen.index.lookup_all(id))
+        let result = self.resolve_from_candidates(id, gen.index.lookup_all(id));
+        if track {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            if result.as_ref().is_ok_and(Option::is_none) {
+                self.get_misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     fn get_many(
@@ -4273,6 +4372,7 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        let track = self.stats_enabled.load(Ordering::Relaxed);
         let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
 
         let gen_guard = self.generation(collection_id);
@@ -4301,6 +4401,16 @@ impl StorageEngine for PackfileStorage {
             results[*i] = self.resolve_from_candidates(&ids[*i], candidates.iter().copied())?;
         }
 
+        if track {
+            self.get_many_calls.fetch_add(1, Ordering::Relaxed);
+            self.get_many_records
+                .fetch_add(ids.len() as u64, Ordering::Relaxed);
+            self.get_many_misses.fetch_add(
+                results.iter().filter(|r| r.is_none()).count() as u64,
+                Ordering::Relaxed,
+            );
+        }
+
         Ok(results)
     }
 
@@ -4310,6 +4420,9 @@ impl StorageEngine for PackfileStorage {
         id: &NodeId,
         data: &NodeData,
     ) -> Result<(), StorageError> {
+        self.put_calls.fetch_add(1, Ordering::Relaxed);
+        self.put_bytes
+            .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
@@ -4452,6 +4565,17 @@ impl StorageEngine for PackfileStorage {
             return Ok(());
         }
 
+        self.put_many_calls.fetch_add(1, Ordering::Relaxed);
+        self.put_many_records
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.put_many_bytes.fetch_add(
+            entries
+                .iter()
+                .map(|(_, data)| data.bytes.len() as u64)
+                .sum::<u64>(),
+            Ordering::Relaxed,
+        );
+
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
@@ -4484,6 +4608,7 @@ impl StorageEngine for PackfileStorage {
         // partway through the batch (a mid-batch grow) still captures every
         // record already applied via the live path, since those mutations
         // landed on the very object being cloned.
+        let materialize_started = std::time::Instant::now();
         let mut owned_index: Option<LossyIndex> = match &old_gen {
             Some(g) if !g.index.is_mmap_backed() => None,
             Some(g) => Some(g.index.clone()),
@@ -4504,6 +4629,22 @@ impl StorageEngine for PackfileStorage {
                     .max(NEW_COLLECTION_INDEX_FLOOR),
             )),
         };
+        // Batch-granular clone accounting: a call that materialized an owned
+        // index up front (first write since a checkpoint reopen, or a
+        // brand-new collection) pays the O(capacity) copy here; one that
+        // starts on the live no-clone path does not. `stats()` reports both
+        // counts and the cumulative `index_clone_time`.
+        if owned_index.is_some() {
+            self.put_many_clone_path_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.index_clone_time_ns.fetch_add(
+                u64::try_from(materialize_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        } else {
+            self.put_many_fast_path_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // Whether this call must publish a new generation at all. Starts
         // true exactly when `owned_index` already had to be materialized
         // above; flips true the moment a mid-batch grow/rebuild happens.
@@ -4542,32 +4683,43 @@ impl StorageEngine for PackfileStorage {
             {
                 self.record_delta(collection_id, generation, bucket, slot);
                 true
-            } else if let Some(grown) = live.grow() {
-                // `insert_tracked` leaves the table unchanged on TableFull,
-                // so retrying with the record's still-available location is
-                // sufficient; no pack scan is needed for pure growth. The
-                // grow changes the collection's shape, so the delta log is
-                // invalidated and no frame is recorded for this (or any
-                // later) overwrite in the batch.
-                self.invalidate_delta_log();
-                structural_change = true;
-                let inserted = grown.insert(id, shard_id, offset).is_ok();
-                owned_index = Some(grown);
-                inserted
-            } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, live) {
-                // The checkpoint does not retain homes, but its slots
-                // retain locations. Recover only those identities and
-                // retry; do not scan every pack in the store.
-                self.invalidate_delta_log();
-                structural_change = true;
-                let inserted = grown.insert(id, shard_id, offset).is_ok();
-                owned_index = Some(grown);
-                inserted
             } else {
-                index_needs_rebuild = true;
-                structural_change = true;
-                self.invalidate_delta_log();
-                false
+                // Growth (either flavor) materializes a fresh owned index; the
+                // O(n) copy is exactly what the steady-append scaler tracks,
+                // so bag its time alongside the up-front materialization.
+                let grow_started = std::time::Instant::now();
+                let grown = if let Some(grown) = live.grow() {
+                    // `insert_tracked` leaves the table unchanged on
+                    // TableFull, so retrying with the record's
+                    // still-available location is sufficient; no pack scan is
+                    // needed for pure growth. The grow changes the
+                    // collection's shape, so the delta log is invalidated and
+                    // no frame is recorded for this (or any later)
+                    // overwrite in the batch.
+                    self.invalidate_delta_log();
+                    structural_change = true;
+                    grown
+                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, live) {
+                    // The checkpoint does not retain homes, but its slots
+                    // retain locations. Recover only those identities and
+                    // retry; do not scan every pack in the store.
+                    self.invalidate_delta_log();
+                    structural_change = true;
+                    grown
+                } else {
+                    index_needs_rebuild = true;
+                    structural_change = true;
+                    self.invalidate_delta_log();
+                    continue;
+                };
+                self.index_grow_count.fetch_add(1, Ordering::Relaxed);
+                self.index_clone_time_ns.fetch_add(
+                    u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                let inserted = grown.insert(id, shard_id, offset).is_ok();
+                owned_index = Some(grown);
+                inserted
             };
             if inserted {
                 let pack_id = self
@@ -4650,6 +4802,7 @@ impl StorageEngine for PackfileStorage {
         }
         self.persist_index_checkpoint_or_delta(&mut timings);
         timings.total = started.elapsed();
+        self.count_sync_persistence(&timings);
         *self.last_sync_timings.lock() = Some(timings);
         Ok(())
     }
@@ -4681,10 +4834,23 @@ impl PackfileStorage {
         timings.sidecar = sidecar_started.elapsed();
         self.persist_index_checkpoint_or_delta(&mut timings);
         timings.total = started.elapsed();
+        self.count_sync_persistence(&timings);
         *self.last_sync_timings.lock() = Some(timings);
         Ok(())
     }
 
+    /// Batch-granular sync accounting: every sync counts once, and the
+    /// checkpoint-vs-delta discriminator comes from which phase
+    /// `persist_index_checkpoint_or_delta` actually ran (a non-dirty sync runs
+    /// neither). `sync` (dirty-scoped) and `sync_all` both funnel through here.
+    fn count_sync_persistence(&self, timings: &SyncTimings) {
+        self.sync_calls.fetch_add(1, Ordering::Relaxed);
+        if !timings.checkpoint.is_zero() {
+            self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+        } else if !timings.delta_log.is_zero() {
+            self.delta_appends.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     /// Whether the pending mutation set must be persisted as a full index
     /// checkpoint rather than a delta append. A delta append can only cover a
     /// log that has been continued continuously from the last checkpoint: any
@@ -4872,6 +5038,119 @@ impl PackfileStorage {
         }
     }
 
+    /// Opt in to the logical read-path counters (`get`/`get_many`). Read
+    /// counters are off by default so the read hot path pays a single relaxed
+    /// load per logical read at most (never a per-record `fetch_add`); write,
+    /// batch, and sync counters are always on regardless.
+    ///
+    /// Changing the flag is safe at any point and affects only subsequent
+    /// reads; counters are monotone, so reads disabled by a false-to-true
+    /// transition are reflected as fewer `get_*` calls, not as zeros.
+    pub fn set_stats_enabled(&self, enabled: bool) {
+        self.stats_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Point-in-time snapshot of this store's runtime counters, plus the
+    /// always-persisted pool stats embedded alongside them ([`RepackStats`],
+    /// aggregate [`CacheStats`], per-shard `ShardStats`, index bytes).
+    ///
+    /// The logical read counters reflect only reads performed while stats were
+    /// enabled ([`Self::set_stats_enabled`]); all other counters are lifetime
+    /// totals since the store was assembled. See [`Self::reset_stats`] for the
+    /// reset semantics — `shards`/`cache`/`repack` reflect persisted state and
+    /// are deliberately excluded from the reset.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a hit-rate is inherently an approximate floating-point presentation; counters retain their exact u64 values"
+    )]
+    pub fn stats(&self) -> RuntimeStats {
+        let mut cache = CacheStats::default();
+        let mut index_bytes: u64 = 0;
+        let summaries = self.collection_summaries();
+        for summary in &summaries {
+            index_bytes = index_bytes.saturating_add(u64::try_from(summary.2).unwrap_or(u64::MAX));
+            if let Some(stats) = self.cache_stats_for(&summary.0) {
+                cache.hits = cache.hits.saturating_add(stats.hits);
+                cache.misses = cache.misses.saturating_add(stats.misses);
+            }
+        }
+        let cache_accesses = cache.hits.saturating_add(cache.misses);
+        cache.hit_rate = if cache_accesses > 0 {
+            cache.hits as f64 / cache_accesses as f64
+        } else {
+            0.0
+        };
+        RuntimeStats {
+            open_count: self.open_count.load(Ordering::Relaxed),
+            get_calls: self.get_calls.load(Ordering::Relaxed),
+            get_misses: self.get_misses.load(Ordering::Relaxed),
+            get_many_calls: self.get_many_calls.load(Ordering::Relaxed),
+            get_many_records: self.get_many_records.load(Ordering::Relaxed),
+            get_many_misses: self.get_many_misses.load(Ordering::Relaxed),
+            put_calls: self.put_calls.load(Ordering::Relaxed),
+            put_bytes: self.put_bytes.load(Ordering::Relaxed),
+            put_many_calls: self.put_many_calls.load(Ordering::Relaxed),
+            put_many_records: self.put_many_records.load(Ordering::Relaxed),
+            put_many_bytes: self.put_many_bytes.load(Ordering::Relaxed),
+            put_many_fast_path_calls: self.put_many_fast_path_calls.load(Ordering::Relaxed),
+            put_many_clone_path_calls: self.put_many_clone_path_calls.load(Ordering::Relaxed),
+            index_clone_time: std::time::Duration::from_nanos(
+                self.index_clone_time_ns.load(Ordering::Relaxed),
+            ),
+            index_grow_count: self.index_grow_count.load(Ordering::Relaxed),
+            index_rebuild_count: self.index_rebuild_count.load(Ordering::Relaxed),
+            delta_invalidations: self.delta_invalidations.load(Ordering::Relaxed),
+            checkpoint_writes: self.checkpoint_writes.load(Ordering::Relaxed),
+            delta_appends: self.delta_appends.load(Ordering::Relaxed),
+            sync_calls: self.sync_calls.load(Ordering::Relaxed),
+            last_open_timings: self.open_timings(),
+            last_sync_timings: self.sync_timings(),
+            repack: self.repack_stats(),
+            cache,
+            shards: self.shard_stats(),
+            index_bytes,
+            collection_count: summaries.len(),
+        }
+    }
+
+    /// Zero every runtime counter except `open_count` (counts stores
+    /// assembled, not work) and the persisted pool stats — `shards`,
+    /// `cache`, `repack`, `index_bytes`, and the collection count reflect
+    /// on-disk state plus this process's decoded-cache and repack history and
+    /// are kept as-is so a reset means "restart the runtime accounting," not
+    /// "lie about the database."
+    ///
+    /// Also clears the retained `last_open_timings`/`last_sync_timings`
+    /// breakdowns and leaves the `stats_enabled` flag untouched.
+    pub fn reset_stats(&self) {
+        for counter in [
+            &self.get_calls,
+            &self.get_misses,
+            &self.get_many_calls,
+            &self.get_many_records,
+            &self.get_many_misses,
+            &self.put_calls,
+            &self.put_bytes,
+            &self.put_many_calls,
+            &self.put_many_records,
+            &self.put_many_bytes,
+            &self.put_many_fast_path_calls,
+            &self.put_many_clone_path_calls,
+            &self.index_clone_time_ns,
+            &self.index_grow_count,
+            &self.index_rebuild_count,
+            &self.delta_invalidations,
+            &self.checkpoint_writes,
+            &self.delta_appends,
+            &self.sync_calls,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        *self.last_open_timings.lock() = None;
+        *self.last_sync_timings.lock() = None;
+    }
+
     /// Number of times a specific collection has been repacked. 0 if it has
     /// never been repacked (or doesn't exist).
     #[must_use]
@@ -4918,12 +5197,113 @@ pub struct CacheStats {
     pub hit_rate: f64,
 }
 
+/// Point-in-time snapshot of a store's runtime counters and the persisted
+/// pool stats embedded alongside them — see [`PackfileStorage::stats`].
+///
+/// All fields are relaxed reads of independent atomics (no shared snapshot
+/// lock), so a snapshot is a consistent-enough picture, not a single instant
+/// in time. The read-path counters (`get_*`) are only meaningful while
+/// [`PackfileStorage::set_stats_enabled`] was true.
+#[derive(Debug, Clone)]
+pub struct RuntimeStats {
+    /// Stores assembled in this process against this directory (1 for a fresh
+    /// open; not reset by `reset_stats`).
+    pub open_count: u64,
+    /// Logical `get` calls (while stats enabled).
+    pub get_calls: u64,
+    /// Logical `get` calls that resolved to no record.
+    pub get_misses: u64,
+    /// Logical `get_many` calls (while stats enabled).
+    pub get_many_calls: u64,
+    /// Records requested across `get_many` calls.
+    pub get_many_records: u64,
+    /// `get_many` results that resolved to no record.
+    pub get_many_misses: u64,
+    /// Single-record `put` attempts.
+    pub put_calls: u64,
+    /// Bytes accepted across single-record `put` attempts.
+    pub put_bytes: u64,
+    /// `put_many` calls (batches).
+    pub put_many_calls: u64,
+    /// Records written across `put_many` calls.
+    pub put_many_records: u64,
+    /// Bytes written across `put_many` calls.
+    pub put_many_bytes: u64,
+    /// `put_many` calls on the owned no-clone fast path.
+    pub put_many_fast_path_calls: u64,
+    /// `put_many` calls that materialized an owned index up front.
+    pub put_many_clone_path_calls: u64,
+    /// Cumulative time spent materializing/growing owned indexes in `put_many`.
+    pub index_clone_time: std::time::Duration,
+    /// Index grow events in `put_many`.
+    pub index_grow_count: u64,
+    /// Fallback full-scan `rebuild_index` calls.
+    pub index_rebuild_count: u64,
+    /// Structural `invalidate_delta_log` calls.
+    pub delta_invalidations: u64,
+    /// Syncs that rewrote the index checkpoint in full.
+    pub checkpoint_writes: u64,
+    /// Syncs that appended the incremental delta log instead.
+    pub delta_appends: u64,
+    /// `sync`/`sync_all` calls.
+    pub sync_calls: u64,
+    /// Per-phase breakdown of the most recent open.
+    pub last_open_timings: Option<OpenTimings>,
+    /// Per-phase breakdown of the most recent sync.
+    pub last_sync_timings: Option<SyncTimings>,
+    /// Cumulative repack activity (persisted across opens).
+    pub repack: RepackStats,
+    /// Aggregate decoded-node cache hit/miss across loaded collections.
+    pub cache: CacheStats,
+    /// Persisted per-shard write/sync counters.
+    pub shards: Vec<(u16, crate::shard::ShardStats)>,
+    /// Total live index bytes across collections.
+    pub index_bytes: u64,
+    /// Number of live collections.
+    pub collection_count: usize,
+}
+
+impl Default for RuntimeStats {
+    fn default() -> Self {
+        Self {
+            open_count: 0,
+            get_calls: 0,
+            get_misses: 0,
+            get_many_calls: 0,
+            get_many_records: 0,
+            get_many_misses: 0,
+            put_calls: 0,
+            put_bytes: 0,
+            put_many_calls: 0,
+            put_many_records: 0,
+            put_many_bytes: 0,
+            put_many_fast_path_calls: 0,
+            put_many_clone_path_calls: 0,
+            index_clone_time: std::time::Duration::ZERO,
+            index_grow_count: 0,
+            index_rebuild_count: 0,
+            delta_invalidations: 0,
+            checkpoint_writes: 0,
+            delta_appends: 0,
+            sync_calls: 0,
+            last_open_timings: None,
+            last_sync_timings: None,
+            repack: RepackStats::default(),
+            cache: CacheStats::default(),
+            shards: Vec::new(),
+            index_bytes: 0,
+            collection_count: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
     const TEST_COLLECTION: [u8; 16] = [0x01; 16];
+    const SECOND_COLLECTION: [u8; 16] = [0x02; 16];
 
     /// A node id distinct across both the bucket bytes (0..8) and tag bytes
     /// (8..12) the lossy index actually reads — an id that only varies byte
@@ -6224,6 +6604,108 @@ mod tests {
                 assert_eq!(got.bytes, bytes::Bytes::from(format!("v{batch}-{i}")));
             }
         }
+    }
+
+    #[test]
+    fn test_runtime_stats_counters_round_trip() {
+        let dir = test_dir("runtime_stats_counters");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Fresh store: every counter starts at zero (open_count counts the
+        // one store assembled, not work).
+        let snapshot = store.stats();
+        assert_eq!(snapshot.open_count, 1);
+        assert_eq!(snapshot.put_calls, 0);
+        assert_eq!(snapshot.put_many_calls, 0);
+        assert_eq!(snapshot.sync_calls, 0);
+        assert_eq!(snapshot.get_calls, 0);
+
+        // Read counters are opt-in: with stats disabled a get is invisible.
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0u8; 16],
+                &NodeData::new(bytes::Bytes::from("solo")),
+            )
+            .unwrap();
+        assert_eq!(store.stats().put_calls, 1);
+        assert!(store.get(&TEST_COLLECTION, &[0u8; 16]).unwrap().is_some());
+        assert_eq!(store.stats().get_calls, 0);
+        assert_eq!(store.stats().get_misses, 0);
+
+        // Enable read tracking, then a hit and a miss both count.
+        store.set_stats_enabled(true);
+        assert!(store.get(&TEST_COLLECTION, &[0u8; 16]).unwrap().is_some());
+        assert!(store
+            .get(&TEST_COLLECTION, &[0xFFu8; 16])
+            .unwrap()
+            .is_none());
+        let snapshot = store.stats();
+        assert_eq!(snapshot.get_calls, 2);
+        assert_eq!(snapshot.get_misses, 1);
+
+        // Batched writes: the first put_many for a brand-new second collection
+        // materializes up front (clone path), later batches ride the owned
+        // no-clone fast path until a grow forces a fresh materialization;
+        // every call is classified as exactly one of the two.
+        let batches: Vec<Vec<(NodeId, NodeData)>> = (0..8u32)
+            .map(|batch| {
+                (0..8u32)
+                    .map(|i| {
+                        let mut id = [2u8; 16];
+                        id[0..4].copy_from_slice(&batch.to_le_bytes());
+                        id[4..8].copy_from_slice(&i.to_le_bytes());
+                        (
+                            id,
+                            NodeData::new(bytes::Bytes::from(format!("b{batch}-{i}"))),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        for entries in &batches {
+            store.put_many(&SECOND_COLLECTION, entries).unwrap();
+        }
+        let snapshot = store.stats();
+        assert_eq!(snapshot.put_many_calls, 8);
+        assert_eq!(snapshot.put_many_records, 64);
+        assert!(snapshot.put_many_bytes > 0);
+        let classified = snapshot.put_many_fast_path_calls + snapshot.put_many_clone_path_calls;
+        assert_eq!(classified, 8, "every put_many call is one of the two paths");
+        assert!(snapshot.put_many_clone_path_calls >= 1);
+        assert!(snapshot.put_many_fast_path_calls >= 1);
+        // 64 distinct records into a floor-sized 64-slot index must cross the
+        // grow threshold at least once.
+        assert!(snapshot.index_grow_count >= 1);
+        assert!(snapshot.index_clone_time > std::time::Duration::ZERO);
+
+        // Every put_many byte is the sum of entry payloads.
+        let expected_bytes: u64 = batches
+            .iter()
+            .flatten()
+            .map(|(_, data)| data.bytes.len() as u64)
+            .sum();
+        assert_eq!(snapshot.put_many_bytes, expected_bytes);
+
+        // reset_stats zeroes the runtime counters but not open_count.
+        store.reset_stats();
+        let snapshot = store.stats();
+        assert_eq!(snapshot.open_count, 1);
+        assert_eq!(snapshot.put_many_calls, 0);
+        assert_eq!(snapshot.get_calls, 0);
+        assert_eq!(snapshot.get_misses, 0);
+
+        // Sync accounting: the first (structurally invalidated) sync rewrites
+        // the checkpoint; a later clean batch sync appends the delta log.
+        store.sync().unwrap();
+        assert_eq!(store.stats().sync_calls, 1);
+        assert_eq!(store.stats().checkpoint_writes, 1);
+        assert_eq!(store.stats().delta_appends, 0);
+        store.put_many(&SECOND_COLLECTION, &batches[0]).unwrap();
+        store.sync().unwrap();
+        let snapshot = store.stats();
+        assert_eq!(snapshot.sync_calls, 2);
+        assert_eq!(snapshot.delta_appends, 1);
     }
 
     #[test]

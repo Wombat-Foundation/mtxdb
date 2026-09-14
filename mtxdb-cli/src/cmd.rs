@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context};
 use mtxdb_core::packfile::layout::{
     avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout,
 };
+use mtxdb_core::packfile::storage::{OpenPath, RuntimeStats};
 use mtxdb_core::shard::ShardPool;
 use mtxdb_core::storage::{NodeData, StorageEngine};
 use mtxdb_core::{
@@ -158,6 +159,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             limit,
         } => cmd_collections(cli, *all, *layout, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
+        Commands::Stats { json } => cmd_stats(cli, *json),
         Commands::Info { collection } => cmd_info(cli, collection),
         Commands::Scan {
             selector,
@@ -836,6 +838,278 @@ fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow:
         return Ok(());
     }
     cmd_shards_in_dir(&selected_pool_dir(cli)?, layout, sort)
+}
+
+/// Print runtime, open, and persisted pool statistics.
+///
+/// A read-only open has no live read/write history of its own, so the runtime
+/// counters shown are those of *this* open (a fresh process): the meaningful
+/// numbers are the open-phase breakdown (a real cold-open measurement against
+/// the persisted checkpoint) and the persisted per-shard IO/sync counters
+/// restored from `shard_stats.bin`. In-process embedders get the full live
+/// picture from `PackfileStorage::stats()` instead — this command is the
+/// on-disk + cold-open view.
+fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let store = open_store_read_only(cli)?;
+    let stats = store.stats();
+    let dir = selected_pool_dir(cli)?;
+
+    if json {
+        print_stats_json(&dir, &stats, &store);
+    } else {
+        print_stats_table(&dir, &stats, &store.shard_summaries());
+    }
+    Ok(())
+}
+
+/// Milliseconds with two decimals (`2.12 ms`).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only rounding to 2 decimals; at typical durations this is exact to ~10µs"
+)]
+fn fmt_ms(duration: std::time::Duration) -> String {
+    format!("{:.2} ms", duration.as_secs_f64() * 1000.0)
+}
+
+fn open_path_label(path: OpenPath) -> &'static str {
+    match path {
+        OpenPath::Checkpoint => "checkpoint",
+        OpenPath::FullScan => "full-scan (no usable checkpoint; cold rebuild)",
+    }
+}
+
+fn print_stats_table(
+    dir: &Path,
+    stats: &RuntimeStats,
+    summaries: &[mtxdb_core::shard::ShardSummary],
+) {
+    println!("mtxdb stats: {}", dir.display());
+    println!();
+    println!("  open");
+    match &stats.last_open_timings {
+        Some(timings) => {
+            println!("    path             {}", open_path_label(timings.path));
+            println!(
+                "    shard open       {}   metadata {}",
+                fmt_ms(timings.shard_open),
+                fmt_ms(timings.metadata_load)
+            );
+            println!(
+                "    checkpoint       {}   materialize {}   delta replay {}",
+                fmt_ms(timings.checkpoint_decode),
+                fmt_ms(timings.index_materialization),
+                fmt_ms(timings.delta_replay)
+            );
+            println!("    total            {}", fmt_ms(timings.total));
+        }
+        None => println!("    (none recorded)"),
+    }
+    println!(
+        "  collections        {}    index bytes {}",
+        stats.collection_count,
+        fmt_bytes(stats.index_bytes)
+    );
+    println!();
+    println!("  runtime (this process)");
+    println!(
+        "    put (single)     {} calls    {}",
+        stats.put_calls,
+        fmt_bytes(stats.put_bytes)
+    );
+    println!(
+        "    put (batch)      {} batches / {} records / {}",
+        stats.put_many_calls,
+        stats.put_many_records,
+        fmt_bytes(stats.put_many_bytes)
+    );
+    println!(
+        "    put fast path    {} calls   materialized   {} calls",
+        stats.put_many_fast_path_calls, stats.put_many_clone_path_calls
+    );
+    println!(
+        "    index clone      {}   grows {}   rebuilds {}",
+        fmt_ms(stats.index_clone_time),
+        stats.index_grow_count,
+        stats.index_rebuild_count
+    );
+    println!(
+        "    delta            {} invalidations   {} checkpoint writes   {} delta appends",
+        stats.delta_invalidations, stats.checkpoint_writes, stats.delta_appends
+    );
+    println!("    sync             {} calls", stats.sync_calls);
+    println!(
+        "    get (read ctrs)  {} calls / {} misses   get_many {} batches / {} records / {} misses",
+        stats.get_calls,
+        stats.get_misses,
+        stats.get_many_calls,
+        stats.get_many_records,
+        stats.get_many_misses
+    );
+    println!(
+        "    repack           {} reps / {} kept / {} dropped",
+        stats.repack.repack_count, stats.repack.kept_total, stats.repack.dropped_total
+    );
+    println!(
+        "    cache            {} hits / {} misses ({:.1}%)",
+        stats.cache.hits,
+        stats.cache.misses,
+        stats.cache.hit_rate * 100.0
+    );
+    println!();
+    println!("  per-shard (persisted through `shard_stats.bin`):");
+    println!("    pack    bytes      writes   syncs");
+    for summary in summaries {
+        println!(
+            "    {:>4}   {:>10}   {:>7}   {:>5}",
+            summary.pack_id,
+            fmt_bytes(summary.stats.bytes_written),
+            summary.stats.write_count,
+            summary.stats.sync_count
+        );
+    }
+}
+
+/// JSON variant of `mtxdb stats`: open breakdown, runtime counters, and
+/// per-shard persisted counters as nested objects. Built by hand (no serde
+/// dependency) — every value is a plain number or a path string.
+fn print_stats_json(dir: &Path, stats: &RuntimeStats, store: &PackfileStorage) {
+    let open_path = stats
+        .last_open_timings
+        .as_ref()
+        .map_or("null".to_owned(), |t| match t.path {
+            OpenPath::Checkpoint => json_string_raw("checkpoint"),
+            OpenPath::FullScan => json_string_raw("full-scan"),
+        });
+    let open_timings = stats.last_open_timings.as_ref().map_or_else(
+        || "null".to_owned(),
+        |t| {
+            json_object(
+                &[
+                    ("shard_open", ms_json(t.shard_open)),
+                    ("metadata_load", ms_json(t.metadata_load)),
+                    ("checkpoint_decode", ms_json(t.checkpoint_decode)),
+                    ("fingerprint", ms_json(t.fingerprint)),
+                    ("index_materialization", ms_json(t.index_materialization)),
+                    ("delta_replay", ms_json(t.delta_replay)),
+                    ("full_scan", ms_json(t.full_scan)),
+                    ("total", ms_json(t.total)),
+                ],
+                "  ",
+            )
+        },
+    );
+    let runtime = json_object(
+        &[
+            ("put_calls", stats.put_calls.to_string()),
+            ("put_bytes", stats.put_bytes.to_string()),
+            ("put_many_calls", stats.put_many_calls.to_string()),
+            ("put_many_records", stats.put_many_records.to_string()),
+            ("put_many_bytes", stats.put_many_bytes.to_string()),
+            (
+                "put_many_fast_path_calls",
+                stats.put_many_fast_path_calls.to_string(),
+            ),
+            (
+                "put_many_clone_path_calls",
+                stats.put_many_clone_path_calls.to_string(),
+            ),
+            (
+                "index_clone_time_ns",
+                stats.index_clone_time.as_nanos().to_string(),
+            ),
+            ("index_grow_count", stats.index_grow_count.to_string()),
+            ("index_rebuild_count", stats.index_rebuild_count.to_string()),
+            ("delta_invalidations", stats.delta_invalidations.to_string()),
+            ("checkpoint_writes", stats.checkpoint_writes.to_string()),
+            ("delta_appends", stats.delta_appends.to_string()),
+            ("sync_calls", stats.sync_calls.to_string()),
+            ("get_calls", stats.get_calls.to_string()),
+            ("get_misses", stats.get_misses.to_string()),
+            ("get_many_calls", stats.get_many_calls.to_string()),
+            ("get_many_records", stats.get_many_records.to_string()),
+            ("get_many_misses", stats.get_many_misses.to_string()),
+        ],
+        "  ",
+    );
+
+    let summaries = store.shard_summaries();
+    let mut shards = String::from("[\n");
+    for (index, summary) in summaries.iter().enumerate() {
+        let comma = if index == summaries.len().saturating_sub(1) {
+            ""
+        } else {
+            ","
+        };
+        let _ = writeln!(
+            shards,
+            "    {{\"pack_id\":{},\"bytes\":{},\"writes\":{},\"syncs\":{}}}{comma}",
+            summary.pack_id,
+            summary.stats.bytes_written,
+            summary.stats.write_count,
+            summary.stats.sync_count
+        );
+    }
+    shards.push_str("  ]");
+
+    let top = vec![
+        ("dir", json_string(&dir.to_string_lossy())),
+        ("open_path", open_path),
+        ("open_count", stats.open_count.to_string()),
+        ("collections", stats.collection_count.to_string()),
+        ("index_bytes", stats.index_bytes.to_string()),
+        ("open_timings_ms", open_timings),
+        ("runtime", runtime),
+        ("shards", shards),
+    ];
+    println!("{}", json_object(&top, ""));
+}
+
+/// A complete `{ ... }` JSON object from pre-rendered fields, with
+/// comma/indent bookkeeping so no trailing commas ever appear.
+fn json_object(fields: &[(&str, String)], indent: &str) -> String {
+    let mut out = String::from("{\n");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        let comma = if index == fields.len().saturating_sub(1) {
+            ""
+        } else {
+            ","
+        };
+        let _ = writeln!(out, "{indent}    \"{key}\": {value}{comma}");
+    }
+    let _ = writeln!(out, "{indent}}}");
+    out
+}
+
+/// Milliseconds as a JSON number with 3 decimals (`2.120`).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only; sub-ns precision is meaningless in a JSON stats dump"
+)]
+fn ms_json(duration: std::time::Duration) -> String {
+    format!("{:.3}", duration.as_secs_f64() * 1000.0)
+}
+
+/// A JSON string literal (no quotes added — callers pass raw text).
+fn json_string_raw(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len().saturating_add(2));
+    escaped.push('"');
+    for byte in text.bytes() {
+        match byte {
+            b'"' => escaped.push_str("\\\""),
+            b'\\' => escaped.push_str("\\\\"),
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            byte => escaped.push(byte as char),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+/// A JSON string value including surrounding quotes.
+fn json_string(text: &str) -> String {
+    json_string_raw(text)
 }
 
 /// List shard metadata from one pool only. This reads directory entries and
