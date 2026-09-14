@@ -1134,6 +1134,12 @@ impl PackfileStorage {
         if !replay_needed && writable {
             let _ = std::fs::remove_file(&delta_path);
         }
+        // The new session continues whatever log is genuinely on disk — its
+        // byte length must be inherited, not zeroed: a later append decides
+        // whether to write a fresh base header from `log_bytes == 0`, and
+        // re-headering an existing log would corrupt the batch framing the
+        // next reader depends on. Zero only when the open removed the file.
+        let log_bytes_on_disk = std::fs::metadata(&delta_path).map_or(0, |m| m.len());
 
         // Gate the log (case B only): it must start at this checkpoint and end
         // at the exact pack set now on disk, and every committed frame must
@@ -1315,6 +1321,7 @@ impl PackfileStorage {
         let delta_state = DeltaLogState {
             base_fingerprint: Some(checkpoint.fingerprint),
             base_generations: ckpt_generations,
+            log_bytes: log_bytes_on_disk,
             invalid: false,
             ..DeltaLogState::default()
         };
