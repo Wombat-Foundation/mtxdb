@@ -98,8 +98,13 @@ def print_table() -> None:
 
     def cell(engine: str, metric: str) -> str:
         value = latest[engine][metric]
-        if metric != "mem_bytes":
-            return value
+        if metric not in {"files_bytes", "mem_bytes"}:
+            # `csv` parsing normalizes `6.80` to `6.8`; restore the benchmark
+            # display contract here. Bulk write intentionally remains one
+            # decimal, while all other time measurements use two.
+            return (
+                f"{float(value):.1f}" if metric == "write_ms" else f"{float(value):.2f}"
+            )
         label = latest[engine]["mem_label"]
         if label == "index_bytes":
             return f"{_human_bytes(int(value))} idx"
