@@ -82,11 +82,21 @@ def print_table() -> None:
     for row in rows:
         latest[row["engine"]] = row
     engines = ["mtxdb", "mdbx", "sqlite"]
-    width = max(len(m[0]) for m in METRICS)
-    for engine in engines:
+    columns = [m[1] for m in METRICS]
+    values = [[latest[engine][m[0]] for m in METRICS] for engine in engines]
+    widths = [
+        max(len(columns[i]) + 2, *(len(r[i]) for r in values))
+        for i in range(len(columns))
+    ]
+    print(
+        "engine".rjust(7)
+        + "  "
+        + "  ".join(label.rjust(widths[i]) for i, label in enumerate(columns))
+    )
+    for engine, cells in zip(engines, values):
         print(
             f"{engine:>7}  "
-            + "  ".join(f"{m[1]:>{width}}: {latest[engine][m[0]]}" for m in METRICS)
+            + "  ".join(cell.rjust(widths[i]) for i, cell in enumerate(cells))
         )
 
 
@@ -107,7 +117,6 @@ def main() -> None:
     appended = append_rows()
     if appended:
         print_table()
-    print(f"Appended {appended} rows to {CSV_DIR / 'external.csv'}.")
 
 
 if __name__ == "__main__":

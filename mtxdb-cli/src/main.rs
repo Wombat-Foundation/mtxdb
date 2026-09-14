@@ -169,6 +169,7 @@ fn layout_arg() -> Arg {
 
 fn sort_arg(help: &'static str) -> Arg {
     Arg::new("sort")
+        .short('s')
         .long("sort")
         .value_name("COLUMN")
         .help(help)

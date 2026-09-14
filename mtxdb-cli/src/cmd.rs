@@ -290,7 +290,7 @@ fn pretty_json_stream(bytes: &[u8]) -> Option<Vec<u8>> {
     for value in values {
         let mut value = value.to_vec();
         let json = simd_json::to_owned_value(&mut value).ok()?;
-        let formatted = simd_json::to_string_pretty(&json).ok()?;
+        let formatted = json.encode_pp();
         output.extend_from_slice(formatted.as_bytes());
         output.push(b'\n');
     }
