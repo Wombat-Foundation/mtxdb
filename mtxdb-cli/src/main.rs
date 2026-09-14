@@ -42,6 +42,7 @@ pub(crate) enum Commands {
     Scan {
         selector: String,
         verbose: bool,
+        limit: i64,
     },
     Import {
         paths: Vec<PathBuf>,
@@ -86,6 +87,7 @@ fn build_cli() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print version"),
         )
+        .arg(limit_arg())
         .arg(
             Arg::new("version_upper")
                 .short('V')
@@ -230,6 +232,7 @@ fn sub_scan() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print each frame's JSON payload when available"),
         )
+        .arg(limit_arg())
 }
 
 fn sub_info() -> Command {
@@ -446,6 +449,9 @@ fn parse_cli() -> Cli {
         Some(("scan", m)) => Commands::Scan {
             selector: m.get_one::<String>("selector").unwrap().clone(),
             verbose: m.get_flag("verbose"),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
         },
         Some(("import", m)) => Commands::Import {
             paths: m
