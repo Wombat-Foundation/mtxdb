@@ -5309,22 +5309,24 @@ mod tests {
         assert_eq!(record.data.as_ref(), b"pin me");
     }
 
-    /// KNOWN-FLAKY (by construction, not a regression): this test asserts a
-    /// linearizability guarantee (every `put` is visible afterward) that the
-    /// concurrent put+reachable-repack contract does not actually provide.
-    /// `repack_collection_reachable` snapshots a scan boundary per shard and
-    /// swaps in a new generation from the frames up to that boundary; a
-    /// `put` that commits (returns) *after* the repack fixed its boundary
-    /// but *before* the generation swap lands in a newer generation that the
-    /// repack then overwrites — so the assertion occasionally sees
-    /// `found < total`. Whether that window hits depends entirely on the
-    /// scheduler's interleaving (`thread::sleep(50µs)` between repacks only
-    /// perturbs it), so the test flakes on timing, not on buffering or any
-    /// data-loss bug in the durability/checkpoint machinery. It has flaked
-    /// at HEAD both before and after the append-buffer work. Closing it is a
-    /// real (separate) piece of work: either serialize put against the
-    /// repack's boundary snapshot (per-collection lock spanning scan+swap),
-    /// or have the repack re-scan appends past its boundary before swapping.
+    /// NOTE: this test asserts a stronger property than the concurrent
+    /// put+reachable-repack contract provides: every `put` that has returned
+    /// remains present in a later repack output. A failure implies no
+    /// data-loss or buffering bug — the durability/checkpoint machinery is
+    /// not exercised here.
+    ///
+    /// An earlier revision of this comment documented a specific race (a put
+    /// landing between the repack's scan boundary and its generation swap)
+    /// and labelled the test KNOWN-FLAKY. That mechanism does not hold: both
+    /// `put` and `repack_collection_reachable` hold the same
+    /// `put_mutex(collection_id)` for their entire body, so a put cannot
+    /// observe an in-progress repack at all. Re-investigation (55 runs,
+    /// plain and under artificial CPU load) reproduced zero failures, and no
+    /// panic output survives from the original reports, so the flakiness
+    /// claim, its mechanism, and the "known-flaky" label are retracted as
+    /// unconfirmed. If this test ever fails, the cause is the unchecked
+    /// linearizability assumption above — investigate from that assertion,
+    /// not from a presumed put/repack interleaving.
     #[test]
     fn test_concurrent_put_repack_reachable_no_lost_writes() {
         use std::thread;
