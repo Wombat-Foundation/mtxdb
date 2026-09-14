@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CHECKPOINT_MAGIC","CHECKPOINT_VERSION","INDEX_CHECKPOINT_FILE"],"fn":["pack_fingerprint","read_checkpoint","write_checkpoint"],"struct":["LoadedCheckpoint","LoadedCollection"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CHECKPOINT_HEADER_LEN","COLLECTION_DIR_ENTRY_LEN","DELTA_FRAME_LEN"],"struct":["CheckpointHeader","CollectionDirEntry","DeltaFrame"]};

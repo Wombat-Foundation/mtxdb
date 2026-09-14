@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"constant":["MAX_SHARDS","MAX_SHARD_BYTES"],"struct":["Shard","ShardPool","ShardStats","ShardSummary"],"type":["ShardEntry"]};
+window.SIDEBAR_ITEMS = {"constant":["MAX_SHARDS","MAX_SHARD_BYTES"],"enum":["AppendPolicy"],"struct":["Shard","ShardPool","ShardStats","ShardSummary"],"type":["ShardEntry"]};

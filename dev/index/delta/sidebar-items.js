@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DELTA_BATCH_HEADER_LEN","DELTA_LOG_HEADER_LEN","DELTA_LOG_TRAILER_LEN","INDEX_DELTA_FILE"],"enum":["DeltaReplayError"],"fn":["append_batch","batch_len","encode_batch_header","encode_header","encode_trailer","read_delta_log"],"struct":["DeltaLog"]};
