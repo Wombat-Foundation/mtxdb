@@ -1062,8 +1062,51 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         index_requirement,
         index_requirements_by_shard.as_ref(),
     );
+
+    println!();
+    println!(
+        "path: {}",
+        dir.join(format!("pack_{pack_id:016x}.pack")).display()
+    );
+    let (write_count, bytes_written, sync_count) =
+        stats_map.get(&pack_id).copied().unwrap_or_default();
+    println!(
+        "writes: {write_count} ({} written), {sync_count} sync{}",
+        fmt_bytes(bytes_written),
+        if sync_count == 1 { "" } else { "s" }
+    );
+
+    let collection_shards = PackfileStorage::collection_shards_from_disk(&dir);
     if let Ok(physical) = physical_layout(&dir) {
         print_pack_physical_layout(&shard_entries, &physical);
+        if let Some(pack_layout) = physical.packs.get(&pack_id) {
+            let mut collections: Vec<[u8; 16]> = pack_layout.collections.iter().copied().collect();
+            collections.sort_unstable();
+            println!();
+            println!("{:>34}  {:>10}", "collection", "bytes");
+            for collection_id in collections {
+                let bytes = physical
+                    .collections
+                    .get(&collection_id)
+                    .and_then(|layout| layout.pack_bytes.get(&pack_id))
+                    .copied()
+                    .unwrap_or(0);
+                let spans_other_packs = collection_shards
+                    .as_ref()
+                    .and_then(|shards| shards.get(&collection_id))
+                    .is_some_and(|shards| shards.len() > 1);
+                println!(
+                    "{:>34}  {:>10}  {}",
+                    hex_encode(&collection_id),
+                    fmt_bytes(bytes),
+                    if spans_other_packs {
+                        "(spans other packs)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
     }
     Ok(())
 }
