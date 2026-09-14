@@ -12,6 +12,20 @@ mod tests {
     use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
     use mtxdb_core::PackfileStorage;
 
+    /// Locate the current delta-log epoch file, if any. The on-disk name is
+    /// now `index.delta.<hex fingerprint>` (see `PackfileStorage::delta_path`)
+    /// rather than a fixed name, so tests that need to see the file directly
+    /// have to search for it rather than joining a constant.
+    fn current_delta_path(dir: &Path) -> Option<PathBuf> {
+        use mtxdb_core::index::delta::INDEX_DELTA_FILE;
+        let prefix = format!("{INDEX_DELTA_FILE}.");
+        std::fs::read_dir(dir).ok()?.find_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            name.starts_with(&prefix).then_some(path)
+        })
+    }
+
     fn collection_id(seed: u8) -> [u8; 16] {
         let mut id = [0u8; 16];
         id[15] = seed;
@@ -490,7 +504,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn clean_sync_writes_nothing_but_a_write_appends_delta_and_structural_change_rewrites() {
-        use mtxdb_core::index::delta::INDEX_DELTA_FILE;
         use mtxdb_core::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
@@ -499,13 +512,11 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let delta_path = dir.join(INDEX_DELTA_FILE);
-
         let store = make_store(&dir);
         store.sync_all().unwrap();
         let first_checkpoint = std::fs::read(checkpoint_path(&dir)).unwrap();
         assert!(
-            !delta_path.exists(),
+            current_delta_path(&dir).is_none(),
             "the initial sync rewrites and re-bases, leaving no delta log"
         );
 
@@ -518,7 +529,7 @@ mod tests {
             "a clean sync must not rewrite the checkpoint"
         );
         assert!(
-            !delta_path.exists(),
+            current_delta_path(&dir).is_none(),
             "a clean sync must not create a delta log"
         );
         drop(store);
@@ -550,7 +561,7 @@ mod tests {
             "a delta append leaves the checkpoint byte-identical"
         );
         assert!(
-            delta_path.exists(),
+            current_delta_path(&dir).is_some(),
             "a plain write's sync must leave a delta log"
         );
         drop(store);
@@ -602,7 +613,7 @@ mod tests {
             "a structural change must not try to append"
         );
         assert!(
-            !delta_path.exists(),
+            current_delta_path(&dir).is_none(),
             "the rewrite re-bases the log and truncates its file"
         );
         assert_ne!(
@@ -639,7 +650,7 @@ mod tests {
     /// rejecting the whole log on the next open.
     #[test]
     fn reopened_session_continues_an_inherited_delta_log() {
-        use mtxdb_core::index::delta::{self, INDEX_DELTA_FILE};
+        use mtxdb_core::index::delta;
         use mtxdb_core::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
@@ -647,8 +658,6 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-
-        let delta_path = dir.join(INDEX_DELTA_FILE);
 
         let store = make_store(&dir);
         store.sync_all().unwrap();
@@ -666,6 +675,8 @@ mod tests {
             .unwrap();
         store.sync_all().unwrap();
         drop(store);
+        let delta_path =
+            current_delta_path(&dir).expect("session 1's append must leave a delta log epoch");
         assert_eq!(
             delta::read_delta_log(&delta_path)
                 .expect("session 1 must leave a decodable log")

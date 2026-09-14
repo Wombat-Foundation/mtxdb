@@ -860,7 +860,7 @@ impl PackfileStorage {
         // open can delete it outright (read-only opens leave the file alone
         // but will re-rescan, since the damaged bases can never trust it).
         if writable {
-            let _ = std::fs::remove_file(base_dir.join(INDEX_DELTA_FILE));
+            Self::sweep_orphan_delta_logs(&base_dir, None);
         }
 
         let scan_started = std::time::Instant::now();
@@ -1055,9 +1055,49 @@ impl PackfileStorage {
         base_dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE)
     }
 
-    /// Path of this store's incremental index delta log.
-    fn delta_path(base_dir: &std::path::Path) -> PathBuf {
-        base_dir.join(INDEX_DELTA_FILE)
+    /// Path of one *epoch* of this store's incremental index delta log.
+    ///
+    /// Named by the checkpoint fingerprint it continues (`index.delta.<hex
+    /// fingerprint>`) rather than a single fixed name: the epoch-handoff
+    /// protocol (see `persist_index_checkpoint`) needs the about-to-be-retired
+    /// epoch (D0, continuing the old checkpoint) and the freshly rotated one
+    /// (D1, continuing the new one) to coexist on disk as distinct files
+    /// while the new checkpoint is serialized and fsynced unlocked. Naming by
+    /// fingerprint also *is* the reopen gate: a loader only ever looks at the
+    /// epoch whose name matches the checkpoint's own `pack_fingerprint`, so
+    /// a leftover D0 (crash before retirement) or an orphaned D1 (crash
+    /// before the checkpoint that would have validated it) are both
+    /// automatically ignored without any extra bookkeeping.
+    fn delta_path(base_dir: &std::path::Path, fingerprint: u64) -> PathBuf {
+        base_dir.join(format!("{INDEX_DELTA_FILE}.{fingerprint:016x}"))
+    }
+
+    /// Remove every on-disk delta-log epoch file except `keep` (pass `None`
+    /// to remove all of them, e.g. after a full rescan with no checkpoint to
+    /// continue). Best-effort and silent on failure — an orphaned epoch file
+    /// left behind is always safe: it is either identical to the kept one
+    /// (redundant) or has a fingerprint that can never match the current
+    /// checkpoint again (inert). Also opportunistically removes the single
+    /// fixed-name log from before epoch-named logs existed; it is never read
+    /// by this version, so leaving it around would just be clutter.
+    fn sweep_orphan_delta_logs(base_dir: &std::path::Path, keep: Option<&std::path::Path>) {
+        let _ = fs::remove_file(base_dir.join(INDEX_DELTA_FILE));
+        let Ok(read_dir) = fs::read_dir(base_dir) else {
+            return;
+        };
+        let prefix = format!("{INDEX_DELTA_FILE}.");
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if keep.is_some_and(|keep| keep == path) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with(&prefix) {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 
     /// Attempt to recover the per-shard/collection bookkeeping from the
@@ -1170,7 +1210,16 @@ impl PackfileStorage {
             .map(|loaded| (loaded.collection_id, loaded.generation))
             .collect();
 
-        let delta_path = base_dir.join(INDEX_DELTA_FILE);
+        let delta_path = Self::delta_path(base_dir, checkpoint.fingerprint);
+        // Only the epoch named for this exact checkpoint can ever be trusted
+        // (see `delta_path`); anything else on disk — a stale predecessor
+        // epoch left by a crash between checkpoint rename and retirement, or
+        // an orphaned successor epoch from a rewrite that never completed —
+        // is inert by construction, but sweep it now on a writable open so
+        // it doesn't accumulate across sessions.
+        if writable {
+            Self::sweep_orphan_delta_logs(base_dir, Some(&delta_path));
+        }
         // A delta log can only continue a checkpoint whose packs have advanced
         // (every append accompanies a flush that grows a pack, changing the
         // fingerprint). When the packs still match the checkpoint exactly,
@@ -1901,33 +1950,40 @@ impl PackfileStorage {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
-        // Hold every collection's put_mutex across the fingerprint snapshot,
-        // the index serialization, and the delta-log rebase in
-        // `reset_delta_log_after_rewrite` below (same sorted-lock pattern as
-        // `retire_empty_shards_after_batch`). Without this, a concurrent
-        // `put` can straddle any pair of those steps: e.g. land its record
-        // between the pack fingerprint being captured and that collection's
-        // index generation being loaded, so the checkpoint pins a
-        // fingerprint that already includes the new bytes together with an
-        // index snapshot taken before the record's slot was published — a
-        // checkpoint that reopens cleanly (fingerprint matches, rescan
-        // skipped) but is silently missing that record. Releasing the locks
-        // any earlier than the rebase re-opens the same class of race one
-        // step later: a put that lands after the snapshot but before
-        // `reset_delta_log_after_rewrite` would have its delta frame
-        // recorded against the *old* base, then silently discarded when the
-        // rebase drops the pre-rewrite session's frames — losing the write
-        // outright rather than just costing a rescan. So the whole
-        // snapshot-serialize-write-rebase sequence has to be one critical
-        // section; the tradeoff is that a full checkpoint rewrite serializes
-        // with all collection writers for its duration, including the disk
-        // write. Bounded by the writer's own periodic-rewrite policy, and
-        // dirty `sync()` prefers the cheap delta-append path over this full
-        // rewrite whenever the log is still valid.
+        // Epoch-handoff protocol: hold every collection's put_mutex only
+        // across the snapshot + epoch rotation below (same sorted-lock
+        // pattern as `retire_empty_shards_after_batch`), then release it
+        // before the comparatively slow serialize + fsync + rename. This is
+        // safe — where releasing right after the fingerprint snapshot alone
+        // was *not* (see git history on this function) — because rotation
+        // switches every future `put`'s delta frames onto a fresh epoch
+        // (named for the fingerprint captured here) before the locks drop,
+        // rather than leaving them targeting an epoch that's about to be
+        // silently discarded:
+        //
+        //   - Every put after this point is recorded, if at all, against the
+        //     *new* epoch (D1), never the old one (D0) — `rotate_delta_epoch`
+        //     runs inside the same locked section as the fingerprint/index
+        //     snapshot, so there is no window where a put's frame could still
+        //     land on D0 after D0's corresponding checkpoint state has
+        //     already been captured for D1's own checkpoint.
+        //   - D0's on-disk file is left completely untouched by the rotation
+        //     — only retired (deleted) after the new checkpoint (C1) is
+        //     durably renamed, below. So a crash before C1 exists leaves the
+        //     old checkpoint (C0) still correctly paired with D0.
+        //   - D1 is only ever trusted by a reopen if it names the exact
+        //     fingerprint of the checkpoint that reopen loads (see
+        //     `delta_path`) — so a crash after rotation but before C1 is
+        //     durable leaves D1 orphaned (no checkpoint names its
+        //     fingerprint) and correctly ignored; the reopen uses C0 + D0.
+        //
+        // `RoomGeneration` is immutable once published (COW, swapped
+        // atomically), so an owned `Arc` clone taken under the lock is as
+        // good a snapshot as the live one for serialization purposes.
         let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
         collection_ids.sort_unstable();
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
-        let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
+        let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
 
         // Commit any buffered frames first: the fingerprint below pins each
         // shard to its committed on-disk length, and the serialized index
@@ -1944,21 +2000,32 @@ impl PackfileStorage {
         let fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
 
         let order = self.collection_order.read().clone();
-        let collections = self.collections.read();
-        let mut entries: Vec<([u8; 16], u64, Vec<u8>)> = Vec::with_capacity(order.len());
-        for collection_id in &order {
-            let Some(generation) = collections
-                .get(collection_id)
-                .map(arc_swap::ArcSwapAny::load)
-            else {
-                continue;
-            };
-            entries.push((
-                *collection_id,
-                generation.generation,
-                generation.index.serialize(),
-            ));
-        }
+        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
+            let collections = self.collections.read();
+            order
+                .iter()
+                .filter_map(|collection_id| {
+                    collections.get(collection_id).map(|g| {
+                        let generation = arc_swap::ArcSwapAny::load_full(g);
+                        (*collection_id, generation.generation, generation)
+                    })
+                })
+                .collect()
+        };
+
+        // Rotate the delta epoch while still locked: `old_base_fingerprint`
+        // (D0's name, if any) is retired below only after `fingerprint`'s
+        // checkpoint (C1) is durable; every collection's writers already
+        // target the new epoch (D1) by the time the locks drop next.
+        let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        drop(guards);
+
+        let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
+            .iter()
+            .map(|(collection_id, generation, room)| {
+                (*collection_id, *generation, room.index.serialize())
+            })
+            .collect();
         let blobs: Vec<([u8; 16], u64, &[u8])> = entries
             .iter()
             .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
@@ -1970,7 +2037,7 @@ impl PackfileStorage {
         )
         .map_err(StorageError::Io)?;
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
-        self.reset_delta_log_after_rewrite(fingerprint, &entries);
+        self.retire_delta_epoch(old_base_fingerprint);
         // Keep the inspection directory gated to the same pack set the
         // checkpoint just became: ride the checkpoint rewrite (best-effort)
         // so the next open can rebuild per-shard counts from records instead
@@ -1984,30 +2051,42 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Re-base the delta log onto a freshly written checkpoint: remember the
-    /// checkpoint's fingerprint and each collection's recorded generation as
-    /// the log's new origin, drop the accumulated frames of the pre-rewrite
-    /// session, and remove the on-disk log file so the next append starts at
-    /// byte zero with a fresh header. After this the log legitimately
-    /// continues `fingerprint`, so any file left on disk (a crash between
-    /// rename and truncate) has a base that no longer matches the checkpoint
-    /// and is rejected at open.
-    fn reset_delta_log_after_rewrite(
+    /// Switch the live delta-log state onto a fresh epoch named for
+    /// `fingerprint`, the checkpoint about to be written. Must be called
+    /// while every collection's `put_mutex` is held (see
+    /// `persist_index_checkpoint`), so every `put` from here on is recorded,
+    /// if at all, against the new epoch — never the one this call is
+    /// replacing. Returns the *previous* base fingerprint (the epoch to
+    /// retire once the new checkpoint is durable), or `None` if this session
+    /// had no prior epoch (opened via a full rescan).
+    fn rotate_delta_epoch(
         &self,
         fingerprint: u64,
-        entries: &[([u8; 16], u64, Vec<u8>)],
-    ) {
+        snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
+    ) -> Option<u64> {
         let mut state = self.delta_state.lock();
+        let old_base_fingerprint = state.base_fingerprint;
         state.base_fingerprint = Some(fingerprint);
-        state.base_generations = entries
+        state.base_generations = snapshots
             .iter()
             .map(|(collection_id, generation, _)| (*collection_id, *generation))
             .collect();
         state.pending.clear();
         state.log_bytes = 0;
         state.invalid = false;
-        drop(state);
-        let path = Self::delta_path(&self.base_dir);
+        old_base_fingerprint
+    }
+
+    /// Remove the now-superseded delta-log epoch, once the checkpoint that
+    /// makes it safe to discard is durably renamed. A no-op if this session
+    /// had no prior epoch. Best-effort: a failure here leaves the retired
+    /// epoch's file on disk, which is always safe (see `delta_path`) — it
+    /// simply names a fingerprint no future checkpoint will ever carry again.
+    fn retire_delta_epoch(&self, old_base_fingerprint: Option<u64>) {
+        let Some(old_base_fingerprint) = old_base_fingerprint else {
+            return;
+        };
+        let path = Self::delta_path(&self.base_dir, old_base_fingerprint);
         if fs::remove_file(&path).is_ok() {
             // `write_checkpoint` has already atomically renamed the new
             // checkpoint at this point. Sync the directory after retiring its
@@ -2042,7 +2121,7 @@ impl PackfileStorage {
                 "delta append with no pending frames",
             )));
         }
-        let path = Self::delta_path(&self.base_dir);
+        let path = Self::delta_path(&self.base_dir, base_fingerprint);
         // A decoder deliberately stops at a torn or corrupt suffix and gives
         // us the sealed frontier. Before extending the log, discard that
         // suffix: appending after it would leave every new, valid batch behind
@@ -5227,6 +5306,100 @@ mod tests {
         assert!(
             lost.is_empty(),
             "{} of {} records lost: {lost:?}",
+            lost.len(),
+            written.len()
+        );
+    }
+
+    /// Regression for the epoch-handoff protocol in `persist_index_checkpoint`:
+    /// full checkpoint rewrites now hold every collection's `put_mutex` only
+    /// across the fingerprint/index snapshot and delta-epoch rotation, not
+    /// across the (unlocked) serialize + fsync + rename. Concurrent `put`s
+    /// landing in that unlocked window must all still be durable after the
+    /// next sync and a reopen — none may be silently dropped by the epoch
+    /// rotation, and none may be lost to a torn straddle between the pack
+    /// fingerprint and the index snapshot.
+    #[test]
+    fn test_concurrent_put_survives_checkpoint_rewrites() {
+        use std::sync::Mutex;
+        use std::thread;
+
+        const NUM_WRITERS: usize = 6;
+        const PUTS_PER_WRITER: usize = 300;
+        // Force many full rewrites during the run: each rewrite thread
+        // iteration invalidates the delta log (via a collection delete on an
+        // otherwise-untouched collection) then rewrites, so persistence keeps
+        // taking the epoch-rotation path instead of the cheap delta append.
+        const REWRITES: usize = 40;
+
+        let dir = test_dir("concurrent_put_checkpoint_rewrite");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        // Seed one throwaway collection per rewrite so each rewrite iteration
+        // has a fresh structural invalidation to force (deleting an
+        // already-deleted collection is a no-op and wouldn't force a rewrite).
+        for r in 0..REWRITES {
+            let mut collection = [0u8; 16];
+            collection[0] = 0xEE;
+            collection[1..9].copy_from_slice(&(r as u64).to_le_bytes());
+            let mut id = [0u8; 16];
+            id[15] = 1;
+            store
+                .put(&collection, &id, &NodeData::new(bytes::Bytes::from("seed")))
+                .unwrap();
+        }
+        store.sync_all().unwrap();
+
+        let written: Mutex<Vec<([u8; 16], NodeId, bytes::Bytes)>> = Mutex::new(Vec::new());
+
+        thread::scope(|scope| {
+            for w in 0..NUM_WRITERS {
+                let store = &store;
+                let written = &written;
+                scope.spawn(move || {
+                    let mut collection = [0u8; 16];
+                    collection[0] = 0xAA;
+                    collection[1] = u8::try_from(w).unwrap();
+                    for i in 0..PUTS_PER_WRITER {
+                        let mut id = [0u8; 16];
+                        id[0] = u8::try_from(w).unwrap();
+                        id[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+                        let bytes = bytes::Bytes::from(format!("writer {w} put {i}"));
+                        let data = NodeData::new(bytes.clone());
+                        store.put(&collection, &id, &data).unwrap();
+                        written.lock().unwrap().push((collection, id, bytes));
+                    }
+                });
+            }
+
+            scope.spawn(|| {
+                for r in 0..REWRITES {
+                    let mut throwaway = [0u8; 16];
+                    throwaway[0] = 0xEE;
+                    throwaway[1..9].copy_from_slice(&(r as u64).to_le_bytes());
+                    store.delete_collection(&throwaway).unwrap();
+                    store.persist_index_checkpoint_best_effort();
+                }
+            });
+        });
+
+        store.sync_all().unwrap();
+        drop(store);
+
+        let reopened = PackfileStorage::open(dir).unwrap();
+        let written = written.into_inner().unwrap();
+        assert_eq!(written.len(), NUM_WRITERS * PUTS_PER_WRITER);
+
+        let mut lost = Vec::new();
+        for (collection, id, expected_bytes) in &written {
+            match reopened.get(collection, id).unwrap() {
+                Some(data) => assert_eq!(data.bytes, *expected_bytes),
+                None => lost.push(*id),
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "{} of {} records lost to a concurrent checkpoint rewrite: {lost:?}",
             lost.len(),
             written.len()
         );
