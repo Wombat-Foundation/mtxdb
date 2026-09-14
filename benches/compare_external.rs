@@ -144,8 +144,9 @@ struct Run {
     append_sync_ms: f64,
     append_loop_ms: Option<f64>,
     append_sync_all_ms: Option<f64>,
-    steady_append_puts_ms: Option<f64>,
-    steady_append_sync_ms: Option<f64>,
+    steady_append_ms: f64,
+    steady_append_puts_ms: f64,
+    steady_append_sync_ms: f64,
     files: u64,
     mem: u64,
     mem_label: &'static str,
@@ -365,8 +366,9 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         );
         steady_sync_ms += sync_started.elapsed().as_secs_f64() * 1e3;
     }
-    let steady_append_puts_ms = Some(steady_puts_ms / STEADY_APPEND_BATCHES as f64);
-    let steady_append_sync_ms = Some(steady_sync_ms / STEADY_APPEND_BATCHES as f64);
+    let steady_append_puts_ms = steady_puts_ms / STEADY_APPEND_BATCHES as f64;
+    let steady_append_sync_ms = steady_sync_ms / STEADY_APPEND_BATCHES as f64;
+    let steady_append_ms = steady_append_puts_ms + steady_append_sync_ms;
 
     // (c) periodic durability on the real per-event path: 1k individual puts
     //     with no sync in the window. The 1 s timer absorbs the fsync cost
@@ -399,6 +401,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         append_sync_ms,
         append_loop_ms: Some(append_loop_ms),
         append_sync_all_ms: Some(append_sync_all_ms),
+        steady_append_ms,
         steady_append_puts_ms,
         steady_append_sync_ms,
         files,
@@ -509,8 +512,9 @@ fn run_mdbx(dir: &std::path::Path, nodes: usize) -> Run {
         append_sync_ms,
         append_loop_ms: None,
         append_sync_all_ms: None,
-        steady_append_puts_ms: Some(steady_puts_ms / STEADY_APPEND_BATCHES as f64),
-        steady_append_sync_ms: Some(steady_sync_ms / STEADY_APPEND_BATCHES as f64),
+        steady_append_ms: (steady_puts_ms + steady_sync_ms) / STEADY_APPEND_BATCHES as f64,
+        steady_append_puts_ms: steady_puts_ms / STEADY_APPEND_BATCHES as f64,
+        steady_append_sync_ms: steady_sync_ms / STEADY_APPEND_BATCHES as f64,
         files,
         mem,
         mem_label,
@@ -628,8 +632,9 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
         append_sync_ms,
         append_loop_ms: None,
         append_sync_all_ms: None,
-        steady_append_puts_ms: Some(steady_puts_ms / STEADY_APPEND_BATCHES as f64),
-        steady_append_sync_ms: Some(steady_sync_ms / STEADY_APPEND_BATCHES as f64),
+        steady_append_ms: (steady_puts_ms + steady_sync_ms) / STEADY_APPEND_BATCHES as f64,
+        steady_append_puts_ms: steady_puts_ms / STEADY_APPEND_BATCHES as f64,
+        steady_append_sync_ms: steady_sync_ms / STEADY_APPEND_BATCHES as f64,
         files,
         mem,
         mem_label,
@@ -674,6 +679,8 @@ fn run_backend(backend: Backend, target_gb: f64) {
         "bench: external ENG={} L={label}gb N={nodes} WRITE_MS={:.1} WARM_OPEN_MS={:.2} \
          COLD_OPEN_MS={:.2} LOOKUP_US={:.2} APPEND={APPEND_RECORDS} APPEND_MS={:.2} \
          APPEND_PUTS_MS={:.2} APPEND_SYNC_MS={:.2}{loop_part}{sync_all_part} \
+         STEADY_APPEND={STEADY_APPEND_RECORDS} STEADY_APPEND_MS={:.2} \
+         STEADY_APPEND_PUTS_MS={:.2} STEADY_APPEND_SYNC_MS={:.2} \
          FILES={} MEM={} MEM_LABEL={}",
         backend.name(),
         run.write_ms,
@@ -683,6 +690,9 @@ fn run_backend(backend: Backend, target_gb: f64) {
         run.append_ms,
         run.append_puts_ms,
         run.append_sync_ms,
+        run.steady_append_ms,
+        run.steady_append_puts_ms,
+        run.steady_append_sync_ms,
         run.files,
         run.mem,
         run.mem_label,
@@ -704,12 +714,10 @@ fn run_backend(backend: Backend, target_gb: f64) {
             backend.name()
         );
     }
-    if let (Some(puts), Some(sync)) = (run.steady_append_puts_ms, run.steady_append_sync_ms) {
-        eprintln!(
-            "    steady append ({STEADY_APPEND_BATCHES} × {STEADY_APPEND_RECORDS} records): puts {puts:.2}ms + sync {sync:.2}ms = {:.2}ms/batch",
-            puts + sync
-        );
-    }
+    eprintln!(
+        "    steady append ({STEADY_APPEND_BATCHES} × {STEADY_APPEND_RECORDS} records): puts {:.2}ms + sync {:.2}ms = {:.2}ms/batch",
+        run.steady_append_puts_ms, run.steady_append_sync_ms, run.steady_append_ms
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

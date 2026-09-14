@@ -63,6 +63,9 @@ ROW_EXT = re.compile(
     r"APPEND_SYNC_MS=(?P<append_sync>[\d.]+)"
     r"(?: APPEND_LOOP_MS=(?P<append_loop>[\d.]+))?"
     r"(?: APPEND_SYNC_ALL_MS=(?P<append_sync_all>[\d.]+))?"
+    r" STEADY_APPEND=\d+ STEADY_APPEND_MS=(?P<steady_append>[\d.]+) "
+    r"STEADY_APPEND_PUTS_MS=(?P<steady_append_puts>[\d.]+) "
+    r"STEADY_APPEND_SYNC_MS=(?P<steady_append_sync>[\d.]+)"
     r" FILES=(?P<files>\d+) "
     r"MEM=(?P<mem>\d+) MEM_LABEL=(?P<mem_label>\w+)",
     re.MULTILINE,
@@ -285,6 +288,9 @@ def external_scenario(output: str) -> Scenario:
             "append_sync_ms",
             "append_loop_ms",
             "append_sync_all_ms",
+            "steady_append_ms",
+            "steady_append_puts_ms",
+            "steady_append_sync_ms",
             "files_bytes",
             "mem_bytes",
             "mem_label",
@@ -303,6 +309,9 @@ def external_scenario(output: str) -> Scenario:
             "append_sync_ms": float(m["append_sync"]),
             "append_loop_ms": _optional_float(m["append_loop"]),
             "append_sync_all_ms": _optional_float(m["append_sync_all"]),
+            "steady_append_ms": float(m["steady_append"]),
+            "steady_append_puts_ms": float(m["steady_append_puts"]),
+            "steady_append_sync_ms": float(m["steady_append_sync"]),
             "files_bytes": int(m["files"]),
             "mem_bytes": int(m["mem"]),
             "mem_label": m["mem_label"],
@@ -318,6 +327,9 @@ def external_scenario(output: str) -> Scenario:
             "append_sync_ms",
             "append_loop_ms",
             "append_sync_all_ms",
+            "steady_append_ms",
+            "steady_append_puts_ms",
+            "steady_append_sync_ms",
             "files_bytes",
         ):
             if row[metric] is not None:
@@ -746,11 +758,26 @@ def append_scenario_csv(directory: Path, scenario: Scenario) -> None:
         return
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / scenario.filename
-    is_new = not path.exists()
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     sha = get_git_sha()
     header = ["timestamp", "git_sha", "machine", *scenario.columns]
 
+    # Scenario schemas evolve. Preserve prior benchmark history when a new
+    # metric is added by rewriting the header once and leaving the new cells
+    # empty in historical rows, rather than appending rows whose columns no
+    # longer line up with the header.
+    if path.exists():
+        with open(path, encoding="utf-8", newline="") as handle:
+            existing_rows = list(csv.DictReader(handle))
+            existing_header = handle.seek(0) or next(csv.reader(handle), [])
+        if existing_header != header:
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle, lineterminator="\n")
+                writer.writerow(header)
+                for row in existing_rows:
+                    writer.writerow([row.get(column, "") for column in header])
+
+    is_new = not path.exists()
     with open(path, "a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         if is_new:

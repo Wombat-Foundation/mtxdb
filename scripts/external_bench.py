@@ -26,8 +26,10 @@ METRICS = [
     ("warm_open_ms", "warm open"),
     ("cold_open_ms", "cold open"),
     ("lookup_us", "point lookup"),
-    ("append_ms", "batch append"),
-    ("append_sync_ms", "append sync"),
+    ("append_ms", "grow append"),
+    ("append_sync_ms", "grow sync"),
+    ("steady_append_ms", "steady append"),
+    ("steady_append_sync_ms", "steady sync"),
     ("files_bytes", "on-disk bytes"),
     ("mem_bytes", "index size"),
 ]
