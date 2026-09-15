@@ -39,25 +39,8 @@ zstd = { version = "0.13", default-features = false }
 # input bytes, not on what's installed on whichever machine built the binary.
 zstd-sys = { version = "2.1", features = ["vendored"] }
 
-[[bench]]
-name = "storage"
-path = "../benches/storage.rs"
-harness = false
-
-[[bench]]
-name = "locality"
-path = "../benches/locality.rs"
-harness = false
-
-[[bench]]
-name = "compression"
-path = "../benches/compression.rs"
-harness = false
-
-[[bench]]
-name = "repack_layout_measure"
-path = "../benches/repack_layout_measure.rs"
-harness = false
+# BENCHES live in `../benches/`, a standalone crate outside this workspace
+# (see its Cargo.toml) -- `cd ../benches` to build/lint/run them.
 
 [lints]
 workspace = true

@@ -2,7 +2,8 @@
 //! (`mtxdb shards --layout`'s runs / excess-runs metric) and verify that a
 //! batch repack consolidates each collection into a single contiguous run.
 //!
-//! Run with `cargo bench --package mtxdb-core --bench repack_layout_measure`.
+//! Run with `cargo bench --manifest-path benches/Cargo.toml --bench repack_layout_measure`
+//! (or `cd benches && cargo bench --bench repack_layout_measure`).
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::pedantic,

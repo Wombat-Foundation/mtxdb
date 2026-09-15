@@ -4,10 +4,12 @@
 //! `DESIGN-open-and-index-persistence.md` is measured against the real
 //! baselines, not argued.
 //!
-//! Opt-in, never built or shipped by default:
+//! Opt-in, never built or shipped by default. `benches/` is its own
+//! standalone crate outside the main workspace (see its Cargo.toml), so run
+//! from there directly, or point `--manifest-path` at it from the repo root:
 //!
 //! ```text
-//! cargo bench --features compare-external --bench compare_external
+//! cd benches && cargo bench --features compare-external --bench compare_external
 //! MTXDB_BENCH_EXT_GB=1,10 cargo bench --features compare-external --bench compare_external
 //! ```
 //!

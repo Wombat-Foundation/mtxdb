@@ -64,6 +64,8 @@ def _human_bytes(value: int) -> str:
 BENCH_CMD = [
     "cargo",
     "bench",
+    "--manifest-path",
+    "benches/Cargo.toml",
     "--bench",
     "compare_external",
     "--features",
