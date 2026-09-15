@@ -554,36 +554,32 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Decode a rezzy-format CHAMP HAMT node and pretty-print its structure.
 ///
-/// Wire format (v2, 32-byte structural hashes):
+/// Wire format (32-byte structural hashes):
 /// ```text
-/// [0]       wire version (0x02)
+/// [0]       wire version (0x01)
 /// [1..5]    datamap (u32 LE) -- bitmap of leaf slots
 /// [5..9]    nodemap (u32 LE) -- bitmap of child slots
 /// [9..13]   leaf_count (u32 LE)
 /// [13..17]  child_count (u32 LE)
-/// [17..]    inline leaves (K,V pairs in datamap bit order)
-///           K = (EventType, StateKey) as two length-prefixed strings
-///           V = EventId as a length-prefixed string
+/// [17..]    inline leaves (K,V triples in datamap bit order)
+///           Each leaf: three length-prefixed UTF-8 strings
+///           K = (EventType, StateKey), V = EventId
 /// [...]     child hashes (child_count x 32 bytes in nodemap bit order)
 /// ```
 ///
 /// Returns `None` when the bytes don't match this layout.
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
-    const WIRE_V2: u8 = 0x02;
-    const WIRE_V1_LEGACY: u8 = 0x01;
+    const WIRE_V1: u8 = 0x01;
     const HEADER_LEN: usize = 17;
     const HASH_LEN: usize = 32;
 
+    // Only accept the current wire version.  Older layouts (0x01 with 16-byte
+    // structural hashes) are not deployed; any other version byte means this
+    // isn't a HAMT node.
     let &version = bytes.first()?;
-    match version {
-        WIRE_V2 => {}
-        WIRE_V1_LEGACY => {
-            let mut out = b"// HAMT node: legacy v1 (16-byte hashes, pre-e349d0f)\n".to_vec();
-            out.extend_from_slice(b"// Cannot decode inline -- re-persist or migrate\n");
-            return Some(out);
-        }
-        _ => return None,
+    if version != WIRE_V1 {
+        return None;
     }
     if bytes.len() < HEADER_LEN {
         return None;
@@ -602,29 +598,35 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Validate total size: leaves consume variable bytes, children are fixed.
-    // We can't validate leaf sizes without decoding, but we can check the
-    // child hash region fits exactly.
+    // Walk leaves to find where the child hash region starts.
     let child_region_len = child_count * HASH_LEN;
-    // Walk leaves to find where the child region starts.
     let mut cursor = HEADER_LEN;
     for _ in 0..leaf_count {
-        // Each leaf is: K encoding + V encoding. We don't know the types,
-        // but K is typically (u32_len + string, u32_len + string) for
-        // (EventType, StateKey). Walk the length-prefixed strings to skip.
-        // If decoding fails, fall back to treating the rest as one leaf blob.
         if !skip_hamt_leaf_value(bytes, &mut cursor) {
             return None;
         }
     }
     let leaf_end = cursor;
-    let total_expected = leaf_end + child_region_len;
-    if bytes.len() != total_expected {
+    if bytes.len() != leaf_end + child_region_len {
         return None;
     }
 
+    // Validation passed.  Now decode for display -- if any leaf fails to
+    // decode as the expected three-string triple, reject the entire node
+    // rather than returning a partial rendering.
+    let mut leaves = Vec::with_capacity(leaf_count);
+    let mut leaf_cursor = HEADER_LEN;
+    for slot in 0..32u32 {
+        if datamap & (1 << slot) == 0 {
+            continue;
+        }
+        let triple = decode_hamt_leaf_triple(bytes, &mut leaf_cursor)?;
+        leaves.push((slot, triple));
+    }
+
+    // All leaves decoded.  Build output.
     let mut out = Vec::new();
-    writeln!(out, "// HAMT CHAMP node (rezzy wire v2)").unwrap();
+    writeln!(out, "// HAMT CHAMP node (rezzy wire v1)").unwrap();
     writeln!(
         out,
         "// datamap: {datamap:#010x} ({} leaves), nodemap: {nodemap:#010x} ({} children)",
@@ -634,49 +636,14 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     .unwrap();
     writeln!(out, "// total payload: {} bytes", bytes.len()).unwrap();
 
-    // Decode and display each leaf.
-    let mut leaf_cursor = HEADER_LEN;
-    let mut leaf_index = 0;
-    for slot in 0..32u32 {
-        if datamap & (1 << slot) == 0 {
-            continue;
-        }
-        let start = leaf_cursor;
-        // Try to decode as (EventType, StateKey, EventId) triple.
-        if let Some((event_type, state_key, event_id)) =
-            decode_hamt_leaf_triple(bytes, &mut leaf_cursor)
-        {
-            writeln!(
-                out,
-                "  leaf[{leaf_index}] slot={slot}: ({event_type:?}, {state_key:?}) = {event_id:?}"
-            )
-            .unwrap();
-        } else {
-            // Couldn't decode as strings -- show hex.
-            let remaining = &bytes[start..leaf_end];
-            writeln!(
-                out,
-                "  leaf[{leaf_index}] slot={slot}: {} bytes",
-                remaining.len()
-            )
-            .unwrap();
-            if !remaining.is_empty() {
-                writeln!(
-                    out,
-                    "    hex: {}",
-                    hex::encode(&remaining[..remaining.len().min(64)])
-                )
-                .unwrap();
-                if remaining.len() > 64 {
-                    writeln!(out, "    ... ({} more bytes)", remaining.len() - 64).unwrap();
-                }
-            }
-            break;
-        }
-        leaf_index += 1;
+    for (leaf_index, (slot, (event_type, state_key, event_id))) in leaves.iter().enumerate() {
+        writeln!(
+            out,
+            "  leaf[{leaf_index}] slot={slot}: ({event_type:?}, {state_key:?}) = {event_id:?}"
+        )
+        .unwrap();
     }
 
-    // Display child hashes.
     let mut child_index = 0;
     for slot in 0..32u32 {
         if nodemap & (1 << slot) == 0 {
@@ -684,7 +651,6 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         let start = leaf_end + child_index * HASH_LEN;
         let hash = &bytes[start..start + HASH_LEN];
-        // Show first 8 bytes as a truncated hash for readability.
         writeln!(
             out,
             "  child[{child_index}] slot={slot}: {}...",
@@ -3899,7 +3865,7 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cmd_sync, compile_import_template, decode_event_json_record,
+        cmd_sync, compile_import_template, decode_event_json_record, decode_hamt_node,
         default_matrix_import_template, event_room_id, extract_pointer_string, fmt_disk_megabytes,
         fmt_megabytes, glob_pack_files, interleaving_worth_noting, matrix_batch_has_create,
         matrix_create_details, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
@@ -4405,4 +4371,165 @@ mod tests {
     // `physical_layout`/`avoidable_spread_bytes` coverage now lives with
     // their implementation in `mtxdb_core::packfile::layout::tests` —
     // this crate just imports and displays them, nothing left to test here.
+
+    // ---- HAMT decoder tests ----
+
+    /// Encode a length-prefixed UTF-8 string (u32 LE length + bytes).
+    fn encode_lps(s: &str) -> Vec<u8> {
+        let len = u32::try_from(s.len()).unwrap();
+        let cap = usize::try_from(len).unwrap().checked_add(s.len()).unwrap();
+        let mut out = Vec::with_capacity(cap);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    /// Build a rezzy wire-v1 HAMT node from leaf triples and child hashes.
+    fn build_hamt_node(leaves: &[(&str, &str, &str)], child_hashes: &[[u8; 32]]) -> Vec<u8> {
+        let mut datamap: u32 = 0;
+        let mut nodemap: u32 = 0;
+        for i in 0..leaves.len() {
+            datamap |= 1u32.checked_shl(u32::try_from(i).unwrap()).unwrap_or(0);
+        }
+        let leaf_count = u32::try_from(leaves.len()).unwrap();
+        let child_count = u32::try_from(child_hashes.len()).unwrap();
+        for i in 0..child_hashes.len() {
+            let slot = leaf_count.checked_add(u32::try_from(i).unwrap()).unwrap();
+            nodemap |= 1u32.checked_shl(slot).unwrap_or(0);
+        }
+
+        let mut buf = Vec::new();
+        buf.push(0x01);
+        buf.extend_from_slice(&datamap.to_le_bytes());
+        buf.extend_from_slice(&nodemap.to_le_bytes());
+        buf.extend_from_slice(&leaf_count.to_le_bytes());
+        buf.extend_from_slice(&child_count.to_le_bytes());
+        for (et, sk, eid) in leaves {
+            buf.extend_from_slice(&encode_lps(et));
+            buf.extend_from_slice(&encode_lps(sk));
+            buf.extend_from_slice(&encode_lps(eid));
+        }
+        for hash in child_hashes {
+            buf.extend_from_slice(hash);
+        }
+        buf
+    }
+
+    #[test]
+    fn hamt_single_leaf_no_children() {
+        let node = build_hamt_node(&[("m.room.name", "", "$abc:server")], &[]);
+        let out = decode_hamt_node(&node).expect("should decode");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("m.room.name"));
+        assert!(text.contains("$abc:server"));
+        assert!(text.contains("1 leaves"));
+        assert!(text.contains("0 children"));
+    }
+
+    #[test]
+    fn hamt_multiple_leaves_with_children() {
+        let h1 = [0x42u8; 32];
+        let h2 = [0x99u8; 32];
+        let node = build_hamt_node(
+            &[
+                ("m.room.member", "@a:b", "$ev1:server"),
+                ("m.room.create", "", "$ev2:server"),
+            ],
+            &[h1, h2],
+        );
+        let out = decode_hamt_node(&node).expect("should decode");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("@a:b"));
+        assert!(text.contains("$ev1:server"));
+        assert!(text.contains("$ev2:server"));
+        assert!(text.contains(&hex::encode(&h1[..8])));
+        assert!(text.contains(&hex::encode(&h2[..8])));
+    }
+
+    #[test]
+    fn hamt_empty_strings() {
+        let node = build_hamt_node(&[("", "", "")], &[]);
+        let out = decode_hamt_node(&node).expect("should decode");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("leaf[0]"));
+    }
+
+    #[test]
+    fn hamt_empty_node() {
+        let node = build_hamt_node(&[], &[]);
+        let out = decode_hamt_node(&node).expect("should decode");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("0 leaves"));
+        assert!(text.contains("0 children"));
+    }
+
+    #[test]
+    fn hamt_invalid_utf8_rejected() {
+        let mut node = build_hamt_node(&[("m.room.name", "", "$ok")], &[]);
+        // Corrupt the event type string: write an invalid UTF-8 sequence.
+        // The length prefix says 10 bytes, but we fill with 0xFF.
+        let invalid = b"\x0a\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff";
+        // Find where the first leaf's event type starts (after 17-byte header).
+        node[17..17 + invalid.len()].copy_from_slice(invalid);
+        assert!(decode_hamt_node(&node).is_none());
+    }
+
+    #[test]
+    fn hamt_wrong_version_rejected() {
+        let mut node = build_hamt_node(&[("m.room.name", "", "$ok")], &[]);
+        node[0] = 0x00;
+        assert!(decode_hamt_node(&node).is_none());
+    }
+
+    #[test]
+    fn hamt_random_binary_not_hamt() {
+        // Arbitrary payload starting with 0x02 should not decode (0x01 is valid).
+        let data = vec![0x02, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
+        assert!(decode_hamt_node(&data).is_none());
+    }
+
+    #[test]
+    fn hamt_truncated_payload_rejected() {
+        let full = build_hamt_node(&[("m.room.name", "", "$ok")], &[]);
+        // Truncate after header -- leaf data missing.
+        let trunc: Vec<u8> = full[..20].to_vec();
+        assert!(decode_hamt_node(&trunc).is_none());
+    }
+
+    #[test]
+    fn hamt_overlong_payload_rejected() {
+        let mut node = build_hamt_node(&[("m.room.name", "", "$ok")], &[]);
+        node.extend_from_slice(&[0u8; 16]);
+        assert!(decode_hamt_node(&node).is_none());
+    }
+
+    #[test]
+    fn hamt_pretty_print_returns_hamt() {
+        let node = build_hamt_node(&[("m.room.topic", "room", "$t:server")], &[]);
+        let out = pretty_print_payload(&node).expect("should recognize HAMT");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("HAMT CHAMP"));
+    }
+
+    #[test]
+    fn hamt_datamap_nodemap_overlap_rejected() {
+        // Both bitmaps claim slot 0.
+        let mut buf = vec![0x01u8];
+        buf.extend_from_slice(&1u32.to_le_bytes()); // datamap: slot 0
+        buf.extend_from_slice(&1u32.to_le_bytes()); // nodemap: slot 0 (overlap)
+        buf.extend_from_slice(&1u32.to_le_bytes()); // leaf_count
+        buf.extend_from_slice(&1u32.to_le_bytes()); // child_count
+        assert!(decode_hamt_node(&buf).is_none());
+    }
+
+    #[test]
+    fn hamt_leaf_count_mismatch_rejected() {
+        // datamap says 1 leaf, but leaf_count says 0.
+        let mut buf = vec![0x01u8];
+        buf.extend_from_slice(&1u32.to_le_bytes()); // datamap
+        buf.extend_from_slice(&0u32.to_le_bytes()); // nodemap
+        buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count (wrong)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // child_count
+        assert!(decode_hamt_node(&buf).is_none());
+    }
 }
