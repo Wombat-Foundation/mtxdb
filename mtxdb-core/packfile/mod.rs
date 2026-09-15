@@ -493,29 +493,24 @@ pub struct RecordMetadata {
 /// stay a stack buffer.
 const SCAN_DISCARD_BUF_LEN: usize = 8192;
 
-/// Read one frame's metadata (`collection_id`, `hash`) without allocating,
-/// decompressing, or otherwise materializing its node payload — the scan
-/// path's counterpart to [`read_record`], which fully decodes a frame for
-/// callers that actually need its data.
+/// Shared header fields parsed from the fixed portion of a frame.
 ///
-/// Node bytes are streamed through a small fixed buffer and fed into the
-/// running CRC as they're read, then discarded — this still detects
-/// corruption in the payload region (the CRC covers the same bytes
-/// [`read_record`] verifies), it just never buffers or decompresses them.
-/// Deliberately a streaming *read*, not a `Seek` past the payload: seeking
-/// would skip CRC verification of the region entirely (silently defeating
-/// [`scan_and_recover_packfile`]'s whole purpose) and, on non-SSD media,
-/// replace one sequential scan with many small seeks.
-///
-/// # Errors
-/// Same conditions as [`read_record`] (invalid length, unsupported flags,
-/// CRC mismatch, invalid `uncompressed_len`).
-///
-/// # Panics
-/// Never in practice: the only internal `checked_sub`/`expect` pair
-/// subtracts `FRAME_FIXED_LEN` from `frame_len`, which the preceding
-/// range check already guarantees is `>= FRAME_FIXED_LEN`.
-pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordMetadata>> {
+/// Extracted once by [`read_frame_header`] and consumed by either
+/// [`read_record_metadata`] (CRC-verified) or
+/// [`read_record_metadata_skip_payload`] (seek-past).
+struct FrameHeader {
+    len_buf: [u8; 4],
+    frame_len: u32,
+    flags: u8,
+    fixed: [u8; FRAME_FIXED_LEN as usize],
+    collection_id: [u8; 16],
+    hash: [u8; 16],
+}
+
+/// Read and validate the frame length prefix and fixed header, returning the
+/// parsed fields. The caller is responsible for consuming the payload and CRC
+/// (or seeking past them).
+fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> {
     let Some(len_buf) = read_frame_len_prefix(reader)? else {
         return Ok(None);
     };
@@ -559,22 +554,61 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
             ));
         }
     }
+
     let mut collection_id = [0u8; 16];
     collection_id.copy_from_slice(&fixed[5..21]);
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&fixed[21..37]);
 
-    let mut crc = if flags & FLAG_CRC_DISABLED == 0 {
+    Ok(Some(FrameHeader {
+        len_buf,
+        frame_len,
+        flags,
+        fixed,
+        collection_id,
+        hash,
+    }))
+}
+
+/// Read one frame's metadata (`collection_id`, `hash`) without allocating,
+/// decompressing, or otherwise materializing its node payload — the scan
+/// path's counterpart to [`read_record`], which fully decodes a frame for
+/// callers that actually need its data.
+///
+/// Node bytes are streamed through a small fixed buffer and fed into the
+/// running CRC as they're read, then discarded — this still detects
+/// corruption in the payload region (the CRC covers the same bytes
+/// [`read_record`] verifies), but never buffers or decompresses them.
+/// Deliberately a streaming read, rather than seeking past the payload,
+/// because seeking would skip CRC verification of the region.
+///
+/// Node bytes are streamed through a small fixed buffer and fed into the
+/// running CRC as they're read, then discarded.
+///
+/// # Errors
+/// Returns an I/O error for invalid length, unsupported flags, truncated
+/// payload/CRC data, or a CRC mismatch.
+///
+/// # Panics
+/// Never in practice: `read_frame_header` validates that `frame_len` is at
+/// least `FRAME_FIXED_LEN` before the checked subtraction below.
+pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordMetadata>> {
+    let Some(header) = read_frame_header(reader)? else {
+        return Ok(None);
+    };
+
+    let mut crc = if header.flags & FLAG_CRC_DISABLED == 0 {
         let mut crc = crc32fast::Hasher::new();
-        crc.update(&len_buf);
-        crc.update(&fixed);
+        crc.update(&header.len_buf);
+        crc.update(&header.fixed);
         Some(crc)
     } else {
         None
     };
 
     // frame_len >= FRAME_FIXED_LEN is guaranteed by the range check above.
-    let mut remaining: usize = frame_len
+    let mut remaining: usize = header
+        .frame_len
         .checked_sub(FRAME_FIXED_LEN)
         .expect("frame_len >= FRAME_FIXED_LEN, checked above")
         as usize;
@@ -608,8 +642,8 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
     }
 
     Ok(Some(RecordMetadata {
-        collection_id,
-        hash,
+        collection_id: header.collection_id,
+        hash: header.hash,
     }))
 }
 
