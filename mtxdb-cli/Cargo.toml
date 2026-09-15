@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.23.1"
+blake2 = { version = "0.10", default-features = false }
 blake3 = "1"
 bytes = "1.5"
 clap = { version = "=4.6.6", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
@@ -30,7 +31,7 @@ simd-json = { version = "0.18", default-features = false, features = ["runtime-d
 
 [dev-dependencies]
 # rezzy = { path = "../../rezzy" }
-rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", rev = "82c9078f69297fe81cecf12516af71236e398712" }
+rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "dev" }
 
 [lints]
 workspace = true

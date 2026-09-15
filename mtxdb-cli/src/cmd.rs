@@ -5,6 +5,8 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 
 use mtxdb_core::packfile::layout::{
     avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout,
@@ -550,12 +552,13 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Wire format (32-byte structural hashes):
 /// ```text
-/// [0]       wire version (0x01)
-/// [1..5]    datamap (u32 LE) -- bitmap of leaf slots
-/// [5..9]    nodemap (u32 LE) -- bitmap of child slots
-/// [9..13]   leaf_count (u32 LE)
-/// [13..17]  child_count (u32 LE)
-/// [17..]    inline leaves (K,V pairs in datamap bit order)
+/// [0..4]    magic (`MTHN`)
+/// [4]       wire version (0x01)
+/// [5..9]    datamap (u32 LE) -- bitmap of leaf slots
+/// [9..13]   nodemap (u32 LE) -- bitmap of child slots
+/// [13..17]  leaf_count (u32 LE)
+/// [17..21]  child_count (u32 LE)
+/// [21..]    inline leaves (K,V pairs in datamap bit order)
 ///           Each leaf: two length-prefixed UTF-8 strings
 ///           K = serde_json::to_string(&(EventType, StateKey))
 ///               (a JSON 2-element array, e.g. `["m.room.member","@a:b"]`)
@@ -565,15 +568,19 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Returns `None` when the bytes don't match this layout.
 fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
-    const VERSION: u8 = 0x01;
+    const MAGIC: &[u8; 4] = b"MTHR";
     const ROOT_HASH_LEN: usize = 32;
     const LATTICE_LEN: usize = 2048;
 
-    if bytes.first().copied()? != VERSION || bytes.len() < 5 {
+    if bytes.get(..MAGIC.len())? != MAGIC.as_slice() || bytes.len() < 7 {
         return None;
     }
-    let prefix_len = u16::from_be_bytes(bytes[1..3].try_into().ok()?) as usize;
-    let room_id_len_offset = 3usize.checked_add(prefix_len)?;
+    if bytes.get(MAGIC.len()).copied()? != 0x01 {
+        return None;
+    }
+    let prefix_len = u16::from_be_bytes(bytes[5..7].try_into().ok()?) as usize;
+    let prefix_start = 7usize;
+    let room_id_len_offset = prefix_start.checked_add(prefix_len)?;
     let room_id_len_end = room_id_len_offset.checked_add(2)?;
     let room_id_len = u16::from_be_bytes(
         bytes
@@ -589,8 +596,11 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let room_id = core::str::from_utf8(bytes.get(room_id_start..root_hash_start)?).ok()?;
-    let room_prefix = bytes.get(3..room_id_len_offset)?;
+    let room_prefix = bytes.get(prefix_start..room_id_len_offset)?;
     let root_hash = bytes.get(root_hash_start..lattice_start)?;
+    let mut lattice_hasher = Blake2b::<U32>::new();
+    lattice_hasher.update(bytes.get(lattice_start..end)?);
+    let lattice_digest = lattice_hasher.finalize();
 
     let mut out = Vec::new();
     writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
@@ -598,6 +608,12 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     writeln!(out, "// room ID: {room_id:?}").unwrap();
     writeln!(out, "// root hash: {}...", hex::encode(&root_hash[..8])).unwrap();
     writeln!(out, "// lattice: {LATTICE_LEN} bytes (1024 u16 lanes)").unwrap();
+    writeln!(
+        out,
+        "// lattice digest (BLAKE2b-256): {}",
+        hex::encode(lattice_digest)
+    )
+    .unwrap();
     writeln!(out, "// total payload: {} bytes", bytes.len()).unwrap();
     Some(out)
 }
@@ -605,28 +621,27 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
 /// Returns `None` when the bytes don't match this layout.
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
+    const MAGIC: &[u8; 4] = b"MTHN";
     const WIRE_V1: u8 = 0x01;
-    const HEADER_LEN: usize = 17;
+    const HEADER_LEN: usize = 21;
     const HASH_LEN: usize = 32;
 
     // Synapse currently persists rezzy's wire-v1 layout. Its structural
-    // hashes are 32 bytes; 0x01 is the node codec version, not a generic-KV
-    // marker.
-    let &version = bytes.first()?;
-    if version != WIRE_V1 {
+    // hashes are 32 bytes; the record kind and codec version are separate.
+    if bytes.get(..MAGIC.len())? != MAGIC.as_slice() || bytes.get(4).copied()? != WIRE_V1 {
         return None;
     }
     if bytes.len() < HEADER_LEN {
         return None;
     }
 
-    let datamap = u32::from_le_bytes(bytes[1..5].try_into().ok()?);
-    let nodemap = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
+    let datamap = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
+    let nodemap = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
     if (datamap & nodemap) != 0 {
         return None;
     }
-    let leaf_count = u32::from_le_bytes(bytes[9..13].try_into().ok()?) as usize;
-    let child_count = u32::from_le_bytes(bytes[13..17].try_into().ok()?) as usize;
+    let leaf_count = u32::from_le_bytes(bytes[13..17].try_into().ok()?) as usize;
+    let child_count = u32::from_le_bytes(bytes[17..21].try_into().ok()?) as usize;
     let expected_leaves = datamap.count_ones() as usize;
     let expected_children = nodemap.count_ones() as usize;
     if leaf_count != expected_leaves || child_count != expected_children {
@@ -4468,7 +4483,8 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        buf.push(0x01);
+        buf.extend_from_slice(b"MTHN");
+        buf.push(0x01); // codec version
         buf.extend_from_slice(&datamap.to_le_bytes());
         buf.extend_from_slice(&nodemap.to_le_bytes());
         buf.extend_from_slice(&leaf_count.to_le_bytes());
@@ -4538,13 +4554,14 @@ mod tests {
         let room_id = "owusNddwskNpuHuitQ:test";
         let root_hash = [0xAB; 32];
         let lattice = [0xCD; 2048];
-        let mut encoded = vec![0x01];
+        let mut encoded = b"MTHR\x01".to_vec();
         encoded.extend_from_slice(&u16::try_from(room_prefix.len()).unwrap().to_be_bytes());
         encoded.extend_from_slice(&room_prefix);
         encoded.extend_from_slice(&u16::try_from(room_id.len()).unwrap().to_be_bytes());
         encoded.extend_from_slice(room_id.as_bytes());
         encoded.extend_from_slice(&root_hash);
         encoded.extend_from_slice(&lattice);
+        assert_eq!(encoded.len(), 2120);
 
         let out = decode_hamt_root(&encoded).expect("should decode root");
         let text = String::from_utf8(out).unwrap();
@@ -4552,6 +4569,7 @@ mod tests {
         assert!(text.contains(room_id));
         assert!(text.contains("abababababababab"));
         assert!(text.contains("2048 bytes"));
+        assert!(text.contains("lattice digest (BLAKE2b-256): "));
     }
 
     #[test]
@@ -4560,8 +4578,8 @@ mod tests {
         // Corrupt the event type string: write an invalid UTF-8 sequence.
         // The length prefix says 10 bytes, but we fill with 0xFF.
         let invalid = b"\x0a\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff";
-        // Find where the first leaf's event type starts (after 17-byte header).
-        node[17..17 + invalid.len()].copy_from_slice(invalid);
+        // Find where the first leaf's key starts (after the 21-byte header).
+        node[21..21 + invalid.len()].copy_from_slice(invalid);
         assert!(decode_hamt_node(&node).is_none());
     }
 
@@ -4606,7 +4624,7 @@ mod tests {
     #[test]
     fn hamt_datamap_nodemap_overlap_rejected() {
         // Both bitmaps claim slot 0.
-        let mut buf = vec![0x02u8];
+        let mut buf = b"MTHN\x01".to_vec();
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap: slot 0
         buf.extend_from_slice(&1u32.to_le_bytes()); // nodemap: slot 0 (overlap)
         buf.extend_from_slice(&1u32.to_le_bytes()); // leaf_count
@@ -4617,7 +4635,7 @@ mod tests {
     #[test]
     fn hamt_leaf_count_mismatch_rejected() {
         // datamap says 1 leaf, but leaf_count says 0.
-        let mut buf = vec![0x02u8];
+        let mut buf = b"MTHN\x01".to_vec();
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap
         buf.extend_from_slice(&0u32.to_le_bytes()); // nodemap
         buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count (wrong)
