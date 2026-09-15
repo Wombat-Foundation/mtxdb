@@ -302,12 +302,12 @@ def external_scenario(output: str) -> Scenario:
             "pss_open_bytes",
             "rss_warm_bytes",
             "pss_warm_bytes",
-            # "full" (default, verified every open), "writeonly" (verified
-            # only when written; MTXDB_CHECKPOINT_CHECKSUM=writeonly), or
-            # "na" for engines with no equivalent read-time check (mdbx,
-            # sqlite) -- recorded per row so a warm/cold-open comparison
-            # across history never has to guess which policy produced it.
-            # Captures before this column existed leave it blank.
+            # mtxdb's frame-level ChecksumPolicy actually in effect:
+            # "full"/"writeonly"/"none" (MTXDB_BENCH_CHECKSUM), or "na" for
+            # engines with no equivalent read-time check (mdbx, sqlite) --
+            # recorded per row so a comparison across history never has to
+            # guess which policy produced it. Captures before this column
+            # existed leave it blank.
             "checksum",
         ],
     )

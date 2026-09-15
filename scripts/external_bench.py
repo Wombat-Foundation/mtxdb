@@ -42,12 +42,12 @@ METRICS = [
     # any lookups touch pages; "mem warm" after the sampled lookup pass.
     ("pss_open_bytes", "mem open ~"),
     ("pss_warm_bytes", "mem warm ~"),
-    # "full" (default, safe) or "writeonly" (MTXDB_CHECKPOINT_CHECKSUM=
-    # writeonly / MTXDB_BENCH_CHECKSUM=disabled: faster warm/cold open, less
-    # safe) for mtxdb; "na" for mdbx/sqlite, which have no equivalent
-    # read-time integrity check to disable. Printed so a fast mtxdb open
-    # never has to be taken on faith -- see the CRC32-regression writeup
-    # earlier this session.
+    # The frame-level ChecksumPolicy actually in effect: "full"/"writeonly"/
+    # "none" for mtxdb (matching its row -- see INVOCATIONS), "na" for
+    # mdbx/sqlite, which have no equivalent read-time integrity check.
+    # Deliberately the frame policy, not the checkpoint's own (checkpoints
+    # have no fully-off tier, so that would read "writeonly" for both the
+    # "no crc" and "writeonly" rows and the column couldn't tell them apart).
     ("checksum", "crc check mode"),
 ]
 

@@ -859,17 +859,19 @@ fn run_backend(backend: Backend, target_gb: f64) {
         },
         Backend::Mdbx | Backend::Sqlite => backend.name(),
     };
-    // Only meaningful for mtxdb (the only engine with a read-time checkpoint
-    // integrity check to disable); recorded for every engine anyway so the
-    // CSV column is never absent and a comparison across engines/rows never
-    // has to guess whether a fast mtxdb open paid for its own CRC32 check.
+    // The frame-level policy (checksum_policy_from_env, same one that names
+    // the row above): "full"/"writeonly"/"none" for mtxdb, "na" for engines
+    // with nothing equivalent. Deliberately NOT the checkpoint's own
+    // CheckpointChecksumPolicy (only "full"/"writeonly" -- a checkpoint has
+    // no fully-off tier), which would make the "no crc" and "writeonly" rows
+    // read identically here despite being genuinely different postures;
+    // this field is the one that actually distinguishes all three.
     let checksum_policy = match backend {
-        Backend::Mtxdb => {
-            match mtxdb_core::index::checkpoint::CheckpointChecksumPolicy::from_env() {
-                mtxdb_core::index::checkpoint::CheckpointChecksumPolicy::Full => "full",
-                mtxdb_core::index::checkpoint::CheckpointChecksumPolicy::WriteOnly => "writeonly",
-            }
-        }
+        Backend::Mtxdb => match checksum_policy_from_env() {
+            mtxdb_core::packfile::ChecksumPolicy::Full => "full",
+            mtxdb_core::packfile::ChecksumPolicy::WriteOnly => "writeonly",
+            mtxdb_core::packfile::ChecksumPolicy::Disabled => "none",
+        },
         Backend::Mdbx | Backend::Sqlite => "na",
     };
     println!(
