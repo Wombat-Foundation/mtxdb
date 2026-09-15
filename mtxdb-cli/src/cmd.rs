@@ -1712,23 +1712,19 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     // A store predating the inspection sidecar has no cheap authoritative
     // summary. Preserve the old full-scan fallback until `mtxdb sync` can
     // create the sidecar.
-    let store = match open_store_read_only(cli) {
+    let store = match PackfileStorage::open_read_only(selected_pool_dir(cli)?) {
         Ok(store) => store,
         // Same reasoning as `cmd_scan_collection`: an empty pool (e.g. the
         // default `-t event-dag` pool when the collection actually lives
         // under `-t state`) just means "not found here", not a real error.
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
-        {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             eprintln!(
                 "collection {hex}: not found{}",
                 other_shard_type_hint(cli, &collection_id)
             );
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error).context("failed to open store"),
     };
     match store.collection_index_info(&collection_id) {
         Some((len, mem, capacity)) => {
