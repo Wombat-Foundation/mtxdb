@@ -220,25 +220,44 @@ struct IoStats {
 }
 
 impl IoStats {
-    fn read_now() -> Self {
-        let content = fs::read_to_string("/proc/self/io").unwrap_or_default();
-        let mut stats = Self::default();
+    /// Capture the kernel counters when they are available.
+    ///
+    /// Returning `None` is materially different from reporting zero: a zero
+    /// is a valid measurement, while `/proc` may be absent outside Linux (or
+    /// in a restricted container).  The machine-readable benchmark rows keep
+    /// that distinction as `n/a` so CSV history never records an unavailable
+    /// counter as a real zero-I/O result.
+    fn read_now() -> Option<Self> {
+        let content = fs::read_to_string("/proc/self/io").ok()?;
+        let mut rchar = None;
+        let mut read_bytes = None;
+        let mut syscr = None;
+        let mut write_bytes = 0;
         for line in content.lines() {
             if let Some(v) = line.strip_prefix("rchar: ") {
-                stats.rchar = v.trim().parse().unwrap_or(0);
+                rchar = v.trim().parse().ok();
             }
             if let Some(v) = line.strip_prefix("read_bytes: ") {
-                stats.read_bytes = v.trim().parse().unwrap_or(0);
+                read_bytes = v.trim().parse().ok();
             }
             if let Some(v) = line.strip_prefix("write_bytes: ") {
-                stats.write_bytes = v.trim().parse().unwrap_or(0);
+                write_bytes = v.trim().parse().unwrap_or(0);
             }
             if let Some(v) = line.strip_prefix("syscr: ") {
-                stats.syscr = v.trim().parse().unwrap_or(0);
+                syscr = v.trim().parse().ok();
             }
         }
-        stats
+        Some(Self {
+            rchar: rchar?,
+            read_bytes: read_bytes?,
+            write_bytes,
+            syscr: syscr?,
+        })
     }
+}
+
+fn format_io_metric(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| value.to_string())
 }
 
 // jscpd:ignore-start
@@ -294,7 +313,7 @@ fn bench_root() -> std::path::PathBuf {
 /// Measured results from one scenario run, used to drive the decision
 /// matrix on real signals instead of structurally-fixed ones.
 struct BenchResult {
-    read_syscalls: u64,
+    read_syscalls: Option<u64>,
     index_loss_rate: f64,
     warm_hit_rate: f64,
     cold_gets_per_sec: f64,
@@ -350,9 +369,11 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
 
     let read_elapsed = t_read.elapsed();
     let io_after = IoStats::read_now();
-    let logical_reads = io_after.rchar.saturating_sub(io_before.rchar);
-    let disk_reads = io_after.read_bytes.saturating_sub(io_before.read_bytes);
-    let read_syscalls = io_after.syscr.saturating_sub(io_before.syscr);
+    let io_delta = io_before.zip(io_after);
+    let logical_reads = io_delta.map(|(before, after)| after.rchar.saturating_sub(before.rchar));
+    let disk_reads =
+        io_delta.map(|(before, after)| after.read_bytes.saturating_sub(before.read_bytes));
+    let read_syscalls = io_delta.map(|(before, after)| after.syscr.saturating_sub(before.syscr));
 
     let cold_total = cold_hits + cold_misses;
     let cold_hit_rate = if cold_total > 0 {
@@ -410,11 +431,13 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
 
     println!(
         "bench: locality L={label} N={total_events} CACHE={cache_entries} \
-         PACK_BYTES={pack_size} WRITE_EVENTS_PER_SEC={:.0} READ_SYSCALLS={read_syscalls} \
-         DISK_READ_BYTES={disk_reads} INDEX_LOSS_PCT={index_loss_rate:.4} \
+         PACK_BYTES={pack_size} WRITE_EVENTS_PER_SEC={:.0} READ_SYSCALLS={} \
+         DISK_READ_BYTES={} INDEX_LOSS_PCT={index_loss_rate:.4} \
          COLD_GETS_PER_SEC={cold_gets_per_sec:.0} WARM_HIT_PCT={warm_hit_rate:.4} \
          WARM_GETS_PER_SEC={warm_gets_per_sec:.0}",
         total_events as f64 / write_elapsed.as_secs_f64(),
+        format_io_metric(read_syscalls),
+        format_io_metric(disk_reads),
     );
 
     eprintln!("═══════════════════════════════════════════════════════════════");
@@ -432,9 +455,18 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     eprintln!("  Total edge refs:         {}", dag.total_edge_refs());
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric A: I/O (cold: cache cleared, packfile re-reads from disk)");
-    eprintln!("    rchar (logical):       {logical_reads} bytes");
-    eprintln!("    read_bytes (disk):     {disk_reads} bytes");
-    eprintln!("    read syscalls:         {read_syscalls}");
+    eprintln!(
+        "    rchar (logical):       {} bytes",
+        format_io_metric(logical_reads)
+    );
+    eprintln!(
+        "    read_bytes (disk):     {} bytes",
+        format_io_metric(disk_reads)
+    );
+    eprintln!(
+        "    read syscalls:         {}",
+        format_io_metric(read_syscalls)
+    );
     eprintln!("  ───────────────────────────────────────────────────────────");
     eprintln!("  Metric B: Cache efficiency");
     eprintln!("    Cold hit rate:         {cold_hit_rate:.1}% (0% on purpose/cache clear)");
@@ -1054,8 +1086,8 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
         found: usize,
         total: usize,
         elapsed: std::time::Duration,
-        syscalls: u64,
-        disk_read_bytes: u64,
+        syscalls: Option<u64>,
+        disk_read_bytes: Option<u64>,
         evicted: bool,
     }
 
@@ -1082,8 +1114,12 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
             found,
             total: targets.len(),
             elapsed,
-            syscalls: io_after.syscr.saturating_sub(io_before.syscr),
-            disk_read_bytes: io_after.read_bytes.saturating_sub(io_before.read_bytes),
+            syscalls: io_before
+                .zip(io_after)
+                .map(|(before, after)| after.syscr.saturating_sub(before.syscr)),
+            disk_read_bytes: io_before
+                .zip(io_after)
+                .map(|(before, after)| after.read_bytes.saturating_sub(before.read_bytes)),
             evicted,
         }
     };
@@ -1126,8 +1162,8 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
             r.found,
             r.total,
             r.elapsed.as_secs_f64() * 1e6,
-            r.syscalls,
-            r.disk_read_bytes,
+            format_io_metric(r.syscalls),
+            format_io_metric(r.disk_read_bytes),
             r.evicted,
         );
     }
@@ -1141,13 +1177,13 @@ fn run_reaction_swarm_benchmark(history_len: usize, swarm_size: usize) {
     );
     for r in &rows {
         eprintln!(
-            "  {:<10} {:<12} {:>10} {:>12.2?} {:>10} {:>11} B",
+            "  {:<10} {:<12} {:>10} {:>12.2?} {:>10} {:>12}",
             r.mode,
             r.target,
             format!("{}/{}", r.found, r.total),
             r.elapsed,
-            r.syscalls,
-            r.disk_read_bytes
+            format_io_metric(r.syscalls),
+            format_io_metric(r.disk_read_bytes),
         );
     }
     eprintln!("  ───────────────────────────────────────────────────────────");
@@ -1487,7 +1523,10 @@ fn main() {
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!("  DECISION MATRIX ('large' scenario, measured signals only)");
     eprintln!("═══════════════════════════════════════════════════════════════");
-    eprintln!("  read syscalls (cold):  {}", large.read_syscalls);
+    eprintln!(
+        "  read syscalls (cold):  {}",
+        format_io_metric(large.read_syscalls)
+    );
     eprintln!("  index loss rate:       {:.4}%", large.index_loss_rate);
     eprintln!("  warm cache hit rate:   {:.4}%", large.warm_hit_rate);
     eprintln!(

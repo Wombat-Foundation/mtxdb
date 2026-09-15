@@ -342,12 +342,15 @@ fn cmd_get(
     match matches.as_slice() {
         [] => bail!("not found"),
         [(_, data)] => {
-            let output = (!raw).then(|| pretty_print_payload(&data.bytes)).flatten();
-            io::stdout().write_all(output.as_deref().unwrap_or(&data.bytes))?;
+            let rendered = (!raw).then(|| pretty_print_payload(&data.bytes)).flatten();
+            let emitted = rendered.as_deref().unwrap_or(&data.bytes);
+            io::stdout().write_all(emitted)?;
             // Never decorate payload bytes: binary records can decode as
             // valid UTF-8, so only append a trailing newline when the caller
-            // explicitly opted into `--text`.
-            if text && output.is_none() && !data.bytes.ends_with(b"\n") {
+            // explicitly opted into `--text`. Decide from the actual bytes
+            // just written: JSON rendering always supplies its own newline,
+            // even when the stored JSON did not have one.
+            if text && !emitted.ends_with(b"\n") {
                 io::stdout().write_all(b"\n")?;
             }
         }
@@ -3425,8 +3428,16 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
     if all {
         let db_layout = open_layout(cli)?;
         for shard_type in ShardType::ALL {
-            let store = PackfileStorage::open(pool_dir(&db_layout, shard_type)?)
-                .context("failed to open store")?;
+            let dir = pool_dir(&db_layout, shard_type)?;
+            // The database layout creates every named pool eagerly, but a
+            // writer open creates its first empty pack. `sync --all` is
+            // metadata maintenance, not an instruction to materialize every
+            // possible pool, so leave unused pools untouched.
+            if glob_pack_files(&dir)?.is_empty() {
+                eprintln!("{}: skipped (no packfiles)", shard_type.as_str());
+                continue;
+            }
+            let store = PackfileStorage::open(dir).context("failed to open store")?;
             store.sync_all()?;
             eprintln!(
                 "{}: synced: persisted shard IO stats and shard\u{2192}collection directory",
@@ -3444,12 +3455,14 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_import_template, decode_event_json_record, default_matrix_import_template,
-        event_room_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
-        interleaving_worth_noting, matrix_batch_has_create, matrix_create_details,
-        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        cmd_sync, compile_import_template, decode_event_json_record,
+        default_matrix_import_template, event_room_id, extract_pointer_string, fmt_disk_megabytes,
+        fmt_megabytes, glob_pack_files, interleaving_worth_noting, matrix_batch_has_create,
+        matrix_create_details, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
         resolve_import_collection, template_collection_id, CollectionTemplate,
     };
+    use crate::{Cli, Commands};
+    use mtxdb_core::{DatabaseLayout, ShardType};
     use simd_json::OwnedValue;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -3507,6 +3520,30 @@ mod tests {
     fn disk_megabytes_uses_three_fractional_digits() {
         assert_eq!(fmt_disk_megabytes(42_280), "0.042 MB");
         assert_eq!(fmt_disk_megabytes(999_999), "1.000 MB");
+    }
+
+    #[test]
+    fn sync_all_does_not_materialize_empty_pools() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: ShardType::State,
+            command: Commands::Sync { all: true },
+        };
+
+        cmd_sync(&cli, true).unwrap();
+
+        for shard_type in ShardType::ALL {
+            let pool = layout.pool_dir_read_only(shard_type).unwrap();
+            assert!(
+                glob_pack_files(&pool).unwrap().is_empty(),
+                "sync --all must not create a pack in the empty {} pool",
+                shard_type.as_str()
+            );
+        }
+        drop(layout);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
