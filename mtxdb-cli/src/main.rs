@@ -269,8 +269,8 @@ fn sub_scan() -> Command {
                 .help("Restrict the physical scan to one node ID"),
         )
         .arg(Arg::new("raw").long("raw").action(ArgAction::SetTrue).help(
-            "Write one physical frame's payload bytes verbatim to stdout (the match must \
-                     be unambiguous: exactly one frame, or restrict with --id). With --verbose, a \
+            "Write matching frames' payload bytes verbatim, concatenated, to stdout (all \
+                     matches, or up to --limit; use -l 0 for no cap). With --verbose, a per-frame \
                      context line goes to stderr so stdout stays a clean byte stream",
         ))
         .arg(limit_arg())

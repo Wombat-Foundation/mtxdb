@@ -1999,10 +1999,10 @@ fn cmd_scan(
     id: Option<&str>,
     raw: bool,
 ) -> anyhow::Result<()> {
-    // No unconditional `--id` requirement: both scan paths below already
-    // enforce that `--raw` emits exactly one frame (bailing with a hint to
-    // use `--id` when a selector is ambiguous), so an unambiguous
-    // single-frame collection can dump without ceremony.
+    // No `--id` requirement: `--raw` dumps every matching frame's payload
+    // (concatenated, in scan order), capped by `--limit` like the normal
+    // listing, so a bare selector with several matches still "just works"
+    // instead of erroring.
     let node_id = id.map(parse_node_id).transpose()?;
     // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
     // it's `0x`-prefixed with something other than 32 hex digits after it —
@@ -2034,21 +2034,21 @@ fn cmd_scan(
             None => true,
         })
         .collect();
+    let max_rows = scan_limit(limit);
     if raw {
-        let [(.., offset)] = records.as_slice() else {
-            bail!(
-                "--raw requires exactly one matching frame; found {} (use a pack selector and/or --id to disambiguate)",
-                records.len()
-            );
-        };
-        let data = ShardPool::read_at_committed(&shard, *offset, true)?;
-        if verbose {
-            eprintln!(
-                "pack 0x{pack_id:016x}: raw frame @ {offset} ({} bytes, checksum verified)",
-                data.data.len()
-            );
+        for (.., offset) in records.iter().take(max_rows) {
+            let data = ShardPool::read_at_committed(&shard, *offset, true)?;
+            if verbose {
+                eprintln!(
+                    "pack 0x{pack_id:016x}: raw frame @ {offset} ({} bytes, checksum verified)",
+                    data.data.len()
+                );
+            }
+            io::stdout().write_all(&data.data)?;
         }
-        io::stdout().write_all(&data.data)?;
+        if verbose {
+            print_scan_limit_note(records.len(), max_rows);
+        }
         return Ok(());
     }
     println!(
@@ -2056,7 +2056,6 @@ fn cmd_scan(
         std::fs::metadata(path)?.len(),
         records.len()
     );
-    let max_rows = scan_limit(limit);
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
@@ -2142,20 +2141,20 @@ fn cmd_scan_collection(
         bail!("no matching physical record found in collection {selector}");
     }
     if raw {
-        let [(shard, offset)] = raw_matches.as_slice() else {
-            bail!(
-                "--raw requires exactly one matching frame; found {frames} (use --id NODE_ID to disambiguate)"
-            );
-        };
-        let data = ShardPool::read_at_committed(shard, *offset, true)?;
-        if verbose {
-            eprintln!(
-                "collection {}: raw frame @ {offset} ({} bytes, checksum verified)",
-                hex_encode(&collection_id),
-                data.data.len()
-            );
+        for (shard, offset) in raw_matches.iter().take(max_rows) {
+            let data = ShardPool::read_at_committed(shard, *offset, true)?;
+            if verbose {
+                eprintln!(
+                    "collection {}: raw frame @ {offset} ({} bytes, checksum verified)",
+                    hex_encode(&collection_id),
+                    data.data.len()
+                );
+            }
+            io::stdout().write_all(&data.data)?;
         }
-        io::stdout().write_all(&data.data)?;
+        if verbose {
+            print_scan_limit_note(frames, max_rows);
+        }
         return Ok(());
     }
     println!(
