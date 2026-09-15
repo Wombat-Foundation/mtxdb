@@ -369,6 +369,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     fs::create_dir_all(&dir).unwrap();
 
     let dag = DagGenerator::generate(total_events, 0.15, 10);
+    let generated_events = dag.len();
     let traversal = dag.traversal_order();
     let node_ids: Vec<NodeId> = traversal
         .iter()
@@ -470,21 +471,21 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     };
     let warm_gets_per_sec = warm_found as f64 / warm_elapsed.as_secs_f64();
 
-    let avg_edges = dag.total_edge_refs() as f64 / total_events as f64;
+    let avg_edges = dag.total_edge_refs() as f64 / generated_events as f64;
 
     println!(
-        "bench: locality L={label} N={total_events} CACHE={cache_entries} \
+        "bench: locality L={label} N={generated_events} CACHE={cache_entries} \
          PACK_BYTES={pack_size} WRITE_EVENTS_PER_SEC={:.0} READ_SYSCALLS={} \
          DISK_READ_BYTES={} INDEX_LOSS_PCT={index_loss_rate:.4} \
          COLD_GETS_PER_SEC={cold_gets_per_sec:.0} WARM_HIT_PCT={warm_hit_rate:.4} \
          WARM_GETS_PER_SEC={warm_gets_per_sec:.0}",
-        total_events as f64 / write_elapsed.as_secs_f64(),
+        generated_events as f64 / write_elapsed.as_secs_f64(),
         format_io_metric(read_syscalls),
         format_io_metric(disk_reads),
     );
 
     eprintln!("═══════════════════════════════════════════════════════════════");
-    eprintln!("  {label}: {total_events} events, cache={cache_entries} entries");
+    eprintln!("  {label}: {generated_events} generated events ({total_events} requested), cache={cache_entries} entries");
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!(
         "  Pack size:               {:.2} MB",
@@ -492,7 +493,7 @@ fn run_benchmark(label: &str, total_events: usize, cache_entries: usize) -> Benc
     );
     eprintln!(
         "  Write throughput:        {:.0} events/sec",
-        total_events as f64 / write_elapsed.as_secs_f64()
+        generated_events as f64 / write_elapsed.as_secs_f64()
     );
     eprintln!("  Avg edges/event:         {avg_edges:.2}");
     eprintln!("  Total edge refs:         {}", dag.total_edge_refs());
@@ -916,6 +917,7 @@ fn run_intent_benchmark(total_events: usize) {
     // divergent tips to reconcile — that's the workload this scenario
     // exists to exercise.
     let dag = DagGenerator::generate(total_events, 0.3, 5);
+    let generated_events = dag.len();
 
     let store = PackfileStorage::open_with_cache(dir.clone(), 2000).unwrap();
 
@@ -1017,7 +1019,7 @@ fn run_intent_benchmark(total_events: usize) {
     };
 
     println!(
-        "bench: intent EVENTS={total_events} GRAPH_CALLS={graph_calls} \
+        "bench: intent EVENTS={generated_events} GRAPH_CALLS={graph_calls} \
          STATE_CALLS={state_calls} TIMELINE_CALLS={timeline_calls} \
          GRAPH_BYTES={graph_bytes} STATE_BYTES={state_bytes} \
          TIMELINE_BYTES={timeline_bytes}",
@@ -1025,7 +1027,7 @@ fn run_intent_benchmark(total_events: usize) {
 
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!(
-        "  READ-INTENT BREAKDOWN ({total_events} events, {} tips)",
+        "  READ-INTENT BREAKDOWN ({generated_events} events ({total_events} requested), {} tips)",
         tips.len()
     );
     eprintln!("═══════════════════════════════════════════════════════════════");

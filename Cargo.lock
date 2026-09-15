@@ -583,7 +583,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=dev#acff39d752ac7363015e866d800722a8271ac34c"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?rev=acff39d752ac7363015e866d800722a8271ac34c#acff39d752ac7363015e866d800722a8271ac34c"
 dependencies = [
  "base64 0.22.1",
  "blake2",

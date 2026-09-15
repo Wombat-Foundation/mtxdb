@@ -1433,20 +1433,6 @@ impl ShardPool {
     /// [`Self::read_at`]), so callers observing the returned offset always
     /// see the record either way.
     ///
-    /// Validate a record using this pool's compression and checksum policy.
-    ///
-    /// # Errors
-    /// Returns `io::Error` if the record cannot be encoded within the frame
-    /// limits.
-    pub(crate) fn validate_record(&self, record: &Record) -> io::Result<()> {
-        packfile::encode_record_with_options(
-            record,
-            self.compress,
-            self.checksum_policy.computes_checksum(),
-        )
-        .map(|_| ())
-    }
-
     /// # Errors
     /// Returns `io::Error` on write, flush, or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
@@ -1579,6 +1565,35 @@ impl ShardPool {
             }
             return Ok((shard.slot, virtual_end));
         }
+    }
+
+    /// Validate a record's plaintext size against the packfile frame limit.
+    ///
+    /// This intentionally does not compress or allocate the frame. The append
+    /// path performs the actual encoding exactly once.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the record cannot fit within the frame limits.
+    pub(crate) fn validate_record(record: &Record) -> io::Result<()> {
+        let payload_len = u32::try_from(record.data.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record payload exceeds u32::MAX",
+            )
+        })?;
+        let frame_len = packfile::FRAME_FIXED_LEN
+            .checked_add(payload_len)
+            .expect("fixed frame length plus u32 payload cannot overflow u32");
+        if frame_len > packfile::MAX_RECORD_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "record payload too large: {frame_len} > {}",
+                    packfile::MAX_RECORD_LEN
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Commit one shard's buffered frames to disk as a single positioned

@@ -4588,7 +4588,7 @@ impl StorageEngine for PackfileStorage {
         // earlier prefix physically present for crash recovery to rediscover.
         // I/O failures still use the append-only storage's dirty/recovery path.
         for (id, data) in entries {
-            self.shards.validate_record(&Record {
+            ShardPool::validate_record(&Record {
                 collection_id: *collection_id,
                 hash: *id,
                 data: data.bytes.clone(),
@@ -4607,11 +4607,11 @@ impl StorageEngine for PackfileStorage {
         );
 
         let collection_arc = self.put_mutex(collection_id);
-        let _collection_guard = collection_arc.lock();
+        let collection_guard = collection_arc.lock();
 
         // Same comment as in `put`: a brand-new collection must be excluded
         // from a concurrent checkpoint's fingerprint→snapshot window.
-        let _create_guard = if self.generation(collection_id).is_none() {
+        let create_guard = if self.generation(collection_id).is_none() {
             Some(self.collection_creation.read())
         } else {
             None
@@ -4686,8 +4686,9 @@ impl StorageEngine for PackfileStorage {
                     // a checkpoint for the old generation before returning,
                     // so a crash after this error cannot make a restart's
                     // fingerprint-matched scan publish the failed prefix.
-                    self.persist_failed_batch_boundary();
-                    return Err(error.into());
+                    drop(create_guard);
+                    drop(collection_guard);
+                    return Err(self.persist_failed_batch_boundary(error.into()));
                 }
             };
 
@@ -4712,8 +4713,9 @@ impl StorageEngine for PackfileStorage {
             let insert_result = match self.insert_index(collection_id, live, id, shard_id, offset) {
                 Ok(result) => result,
                 Err(error) => {
-                    self.persist_failed_batch_boundary();
-                    return Err(error);
+                    drop(create_guard);
+                    drop(collection_guard);
+                    return Err(self.persist_failed_batch_boundary(error));
                 }
             };
             let inserted = if let Ok((bucket, slot)) = insert_result {
@@ -4770,8 +4772,9 @@ impl StorageEngine for PackfileStorage {
             let rebuilt = match self.rebuild_index(collection_id) {
                 Ok(index) => index,
                 Err(error) => {
-                    self.persist_failed_batch_boundary();
-                    return Err(error);
+                    drop(create_guard);
+                    drop(collection_guard);
+                    return Err(self.persist_failed_batch_boundary(error));
                 }
             };
             // rebuild_index automatically discovers all the records we just appended
@@ -4815,8 +4818,9 @@ impl StorageEngine for PackfileStorage {
             let index = owned_index
                 .expect("structural_change is only set once owned_index is materialized");
             if let Err(error) = self.store_generation(collection_id, index, Some(cache), false) {
-                self.persist_failed_batch_boundary();
-                return Err(error);
+                drop(create_guard);
+                drop(collection_guard);
+                return Err(self.persist_failed_batch_boundary(error));
             }
         } else {
             // Every record landed on the live, already-published index in
@@ -4875,9 +4879,17 @@ impl PackfileStorage {
     /// appends. The append-only frames remain as unreachable bytes, but the
     /// checkpoint's matching pack fingerprint makes that exclusion durable
     /// across a crash before the caller can run a later sync.
-    fn persist_failed_batch_boundary(&self) {
+    fn persist_failed_batch_boundary(&self, error: StorageError) -> StorageError {
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-        let _ = self.sync();
+        match self
+            .shards
+            .sync_dirty()
+            .map_err(StorageError::Io)
+            .and_then(|()| self.persist_index_checkpoint())
+        {
+            Ok(()) => error,
+            Err(boundary_error) => boundary_error,
+        }
     }
 
     /// Sync all open shards to disk (full pool, not just dirty).

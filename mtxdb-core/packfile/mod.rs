@@ -663,6 +663,16 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
 pub fn read_record_metadata_skip_payload(
     reader: &mut (impl Read + Seek),
 ) -> io::Result<Option<RecordMetadata>> {
+    let payload_start = reader.stream_position()?;
+    let file_end = reader.seek(io::SeekFrom::End(0))?;
+    reader.seek(io::SeekFrom::Start(payload_start))?;
+    read_record_metadata_skip_payload_with_end(reader, file_end)
+}
+
+fn read_record_metadata_skip_payload_with_end(
+    reader: &mut (impl Read + Seek),
+    file_end: u64,
+) -> io::Result<Option<RecordMetadata>> {
     let Some(header) = read_frame_header(reader)? else {
         return Ok(None);
     };
@@ -679,8 +689,6 @@ pub fn read_record_metadata_skip_payload(
     let frame_end = payload_start
         .checked_add(skip)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record end overflows u64"))?;
-    let file_end = reader.seek(io::SeekFrom::End(0))?;
-    reader.seek(io::SeekFrom::Start(payload_start))?;
     if frame_end > file_end {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -999,9 +1007,10 @@ pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
     if read_header(&mut reader)?.is_none() {
         return Ok(entries);
     }
+    let file_end = reader.get_ref().metadata()?.len();
     loop {
         let offset = reader.stream_position()?;
-        match read_record_metadata_skip_payload(&mut reader) {
+        match read_record_metadata_skip_payload_with_end(&mut reader, file_end) {
             Ok(Some(meta)) => entries.push((meta.collection_id, meta.hash, offset)),
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
