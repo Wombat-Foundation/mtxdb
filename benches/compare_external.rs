@@ -372,7 +372,8 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     // ordinary delta path instead. Same column, two different operations —
     // read `stats().index_grow_count` below before trusting a cross-size
     // comparison of this column.
-    let grow_count_before = store_rw.stats().index_grow_count;
+    let stats_before = store_rw.stats();
+    let grow_count_before = stats_before.index_grow_count;
     let append_puts_started = Instant::now();
     {
         for bucket in 0..COLLECTIONS {
@@ -397,7 +398,8 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     store_rw.sync().unwrap();
     let append_sync_ms = append_sync_started.elapsed().as_secs_f64() * 1e3;
     let append_ms = append_puts_ms + append_sync_ms;
-    let grow_count_after = store_rw.stats().index_grow_count;
+    let stats_after = store_rw.stats();
+    let grow_count_after = stats_after.index_grow_count;
     eprintln!(
         "    mtxdb grow append/sync: {} of {COLLECTIONS} collections grew capacity this batch{}",
         grow_count_after - grow_count_before,
@@ -406,6 +408,19 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
         } else {
             " (no growth fired — this batch took the ordinary delta-log path)"
         },
+    );
+    // Decompose append_puts_ms itself: how much of it is index
+    // materialization/growth (`index_clone_time`, cumulative across all 32
+    // collections' put_many calls this batch) vs. a full pack-scan fallback
+    // (`index_rebuild_count`, O(all records) per collection — firing here
+    // would be a bug, not a calibration artifact, and would explain both the
+    // magnitude and any run-to-run variance in append_puts_ms).
+    eprintln!(
+        "    mtxdb append puts breakdown: index_clone_time={:?} across {} clone-path calls, \
+         index_rebuild_count+={}",
+        stats_after.index_clone_time - stats_before.index_clone_time,
+        stats_after.put_many_clone_path_calls - stats_before.put_many_clone_path_calls,
+        stats_after.index_rebuild_count - stats_before.index_rebuild_count,
     );
     if let Some(sync) = store_rw.sync_timings() {
         eprintln!(

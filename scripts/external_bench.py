@@ -180,9 +180,9 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
     # key. Falls back to the raw key for any row this table doesn't know
     # about (an older/newer capture), so it degrades instead of crashing.
     display_names = {
-        "mtxdb_none": "mtxdb (no crc)",
-        "mtxdb_writeonly": "mtxdb (writeonly)",
-        "mtxdb_full": "mtxdb (full crc32)",
+        "mtxdb_none": "mtxdb",
+        "mtxdb_writeonly": "mtxdb",
+        "mtxdb_full": "mtxdb",
         "mdbx": "mdbx",
         "sqlite": "sqlite",
     }
