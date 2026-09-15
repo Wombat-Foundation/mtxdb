@@ -1,0 +1,107 @@
+[package]
+name = "mtxdb-benches"
+version = "0.1.0-beta.1"
+edition = "2021"
+rust-version = "1.81"
+publish = false
+
+# Deliberately outside the root [workspace]'s `members` — same reasoning as
+# mtxdb-ffi/mtxdb-wasm (see the root Cargo.toml's [workspace] comment): a
+# standalone `[workspace]` table here stops Cargo's upward search, so this
+# crate is its own workspace root. That means `cargo build/check/clippy
+# --workspace --all-targets --all-features` from the repo root never touches
+# benches/ (and never pulls in libmdbx/rusqlite/fjall) -- passing
+# `--all-features` there is no longer enough to reach these targets. To
+# build, check, or lint the benches, `cd benches` (or pass
+# `--manifest-path benches/Cargo.toml`) explicitly.
+[workspace]
+
+[features]
+# Opt-in external comparison benchmarks (MDBX + SQLite + fjall), see
+# DESIGN-open-and-index-persistence.md §2.3. Gated behind a feature so a
+# plain `cargo bench` here never builds or ships any of them; all three are
+# comparison-only dependencies.
+#   libmdbx:   wrapped library Apache-2.0 (since v0.13), wrapper crate MPL-2.0
+#   rusqlite:  MIT (links the system libsqlite3, itself public domain)
+#   fjall:     MIT/Apache-2.0 dual-licensed (an embedded LSM-tree, unlike
+#              MDBX/SQLite's B-trees -- included to show what a
+#              write-optimized engine trades off against mtxdb/mdbx/sqlite)
+compare-external = ["dep:libmdbx", "dep:rusqlite", "dep:fjall"]
+
+[dependencies]
+# rusqlite deliberately omits `bundled`: bundling compiles SQLite's C
+# amalgamation from source on every build needing the feature, on top of
+# libsqlite3-sys's own bindgen run. Linking the system libsqlite3 (found via
+# pkg-config) skips that compile step; it costs requiring sqlite3 dev headers
+# to be installed wherever `--features compare-external` is actually used,
+# which is fine for an opt-in comparison bench that never ships.
+bytes = "1.5"
+crc32fast = "1.4"
+fjall = { version = "2.11.2", optional = true }
+libmdbx = { version = "0.6", optional = true }
+mtxdb-core = { path = "../mtxdb-core" }
+rusqlite = { version = "0.32", optional = true }
+
+# LINTS — mirrors the root workspace's [workspace.lints]; this crate no
+# longer shares that table since it's its own workspace root.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(coverage)",
+    "cfg(coverage_nightly)",
+    "cfg(tarpaulin)",
+] }
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+get_unwrap = "warn"
+mutex_atomic = "warn"
+missing_assert_message = "warn"
+str_to_string = "warn"
+tests_outside_test_module = "warn"
+verbose_file_reads = "warn"
+
+[[bench]]
+name = "storage"
+path = "storage.rs"
+harness = false
+
+[[bench]]
+name = "locality"
+path = "locality.rs"
+harness = false
+
+[[bench]]
+name = "compression"
+path = "compression.rs"
+harness = false
+
+[[bench]]
+name = "repack_layout_measure"
+path = "repack_layout_measure.rs"
+harness = false
+
+# Four-way MDBX / SQLite / fjall / mtxdb comparison. Opt-in via
+# `--features compare-external`; `required-features` means a plain
+# `cargo bench` here skips it -- and never builds libmdbx/rusqlite/fjall --
+# unless requested.
+[[bench]]
+name = "compare_external"
+path = "compare_external.rs"
+harness = false
+required-features = ["compare-external"]

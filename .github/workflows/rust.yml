@@ -1,0 +1,225 @@
+---
+name: Rust
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  toolchain-checks:
+    name: Rust ${{ matrix.rust }} ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: "1.81.0"
+            label: "MSRV (default features)"
+          # `cli` is tested at the same 1.81.0 MSRV as the default build.
+          # This used to be pinned higher (1.82.0, briefly investigated as
+          # possibly needing 1.85.0) because of a transitive `zeroize` 1.9.0
+          # (declares `rust-version = "1.85"`) that had crept into
+          # Cargo.lock. That zeroize edge turned out to come from
+          # `ed25519-consensus` (a *dev*-dependency used for differential
+          # signing tests, unrelated to `cli`/ureq), not from ureq/rustls,
+          # and it broke even the plain 1.81.0 default-features job once
+          # `cargo clippy --all-targets` pulled dev-deps in. Fixed by
+          # pinning zeroize back to 1.8.1 (`rust-version = "1.60"`) via
+          # `cargo update -p zeroize --precise 1.8.1`. With that pin,
+          # `cargo metadata --features cli` shows the highest declared
+          # `rust-version` in the whole `cli` dependency tree is `clap` at
+          # 1.74, below the crate's own 1.81 -- so 1.81.0 is the verified
+          # real floor for `cli`, not just a re-labeling. Re-run
+          # `cargo metadata --format-version=1 --features cli` and check
+          # each package's `rust_version` before loosening the zeroize pin
+          # or changing this bound.
+          - rust: "1.81.0"
+            label: "cli feature"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-${{ matrix.rust }}-${{ matrix.label }}
+
+      - name: Toolchain Versions
+        run: |
+          rustc --version
+          cargo --version
+
+      # rustc 1.81.0 is the library's MSRV (enables core::error::Error), and
+      # (as of the zeroize 1.8.1 pin above) also the verified floor for the
+      # `cli` feature -- so both matrix rows share this toolchain and are
+      # distinguished by `matrix.label`, not `matrix.rust`.
+      - name: Lint (default features)
+        if: matrix.label == 'MSRV (default features)'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test (default features)
+        if: matrix.label == 'MSRV (default features)'
+        run: cargo test --locked --workspace --lib --tests
+
+      - name: Lint (cli feature)
+        if: matrix.label == 'cli feature'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test (cli feature)
+        if: matrix.label == 'cli feature'
+        run: cargo test --locked --workspace --lib --tests
+
+      - name: Build CLI
+        if: matrix.label == 'cli feature'
+        run: cargo build --release --manifest-path mtxdb-cli/Cargo.toml
+
+  all-features:
+    name: Rust ${{ matrix.rust }} all features
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.92.0", "stable", "beta", "nightly"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-${{ matrix.rust }}-all-features
+
+      - name: Toolchain Versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Lint
+        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-features --workspace --lib --tests
+
+  checks:
+    name: Format, Coverage, and Summary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-stable-summary
+
+      - name: Install dependencies
+        run: |
+          pip install pre-commit
+          npm install -g prettier@3.6.2 markdownlint-cli@0.43.0
+          cargo install cargo-sort
+
+      - name: Format Check
+        run: make format && git diff --exit-code
+
+      - name: Lint (Clippy)
+        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
+
+      - name: Install nightly toolchain (for llvm-cov)
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Test Suite
+        run: set -o pipefail; cargo test --locked --all-features --workspace --lib --tests 2>&1 | tee test-results.txt
+
+      - name: Code Coverage
+        run: make cov
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.txt
+
+      - name: Test Summary
+        if: always()
+        run: |
+          PASSED=$(grep -oE '[0-9]+ passed' test-results.txt | awk '{s+=$1} END {print s}' || true)
+          FAILED=$(grep -oE '[0-9]+ failed' test-results.txt | awk '{s+=$1} END {print s}' || true)
+          IGNORED=$(grep -oE '[0-9]+ ignored' test-results.txt | awk '{s+=$1} END {print s}' || true)
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| [v] Passed | ${PASSED:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| [x] Failed | ${FAILED:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| [~] Skipped | ${IGNORED:-0} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: .coverage/codecov.json
+          fail_ci_if_error: false
+
+  publish-badge:
+    needs: [checks, toolchain-checks, all-features]
+    if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Test Results
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+
+      - name: Generate and Publish Badge
+        run: |
+          PASSED=$(grep -oE '[0-9]+ passed' test-results.txt | awk '{s+=$1} END {print s}' || true)
+          FAILED=$(grep -oE '[0-9]+ failed' test-results.txt | awk '{s+=$1} END {print s}' || true)
+          IGNORED=$(grep -oE '[0-9]+ ignored' test-results.txt | awk '{s+=$1} END {print s}' || true)
+
+          python3 ./scripts/generate_badge.py "${PASSED:-0}" "${FAILED:-0}" "${IGNORED:-0}"
+
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git checkout --orphan badges
+          git rm -rf .
+          git add tests.svg
+          git commit -m "Update test badge"
+          git push -f origin badges --force
