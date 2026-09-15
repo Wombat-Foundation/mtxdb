@@ -2666,6 +2666,14 @@ impl PackfileStorage {
         let records = read_persisted_shard_collections(base_dir)?.records;
         let mut shards: HashMap<[u8; 16], Vec<u64>> = HashMap::new();
         for record in records {
+            // A zero count means this (pack, collection) pair has no live
+            // records anymore (e.g. the collection was deleted): the sidecar
+            // still carries the entry, but reporting it here would give
+            // callers like the CLI's "found in -t <other>" hint a false
+            // positive pointing at a shard that no longer holds the data.
+            if record.count == 0 {
+                continue;
+            }
             shards
                 .entry(record.collection_id)
                 .or_default()
@@ -4659,7 +4667,20 @@ impl StorageEngine for PackfileStorage {
                 data: data.bytes.clone(),
             };
 
-            let (shard_id, offset) = self.shards.put_record(&record)?;
+            let (shard_id, offset) = self.shards.put_record(&record).inspect_err(|_| {
+                // The append-only pack cannot un-write records already
+                // flushed by earlier iterations of this loop: on failure
+                // this batch's index/delta/cache updates are correctly
+                // discarded below (never published), but the physical
+                // bytes for any earlier entries in this batch remain on
+                // disk, unreachable through the index until the next
+                // `rebuild_index` rediscovers them from a full pack scan.
+                // Mark the checkpoint dirty so that reconciliation is
+                // forced at the next sync instead of the checkpoint being
+                // considered clean while it disagrees with what a full
+                // scan would find.
+                self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+            })?;
 
             if index_needs_rebuild {
                 continue;

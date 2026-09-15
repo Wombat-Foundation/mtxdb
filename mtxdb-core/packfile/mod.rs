@@ -613,6 +613,83 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
     }))
 }
 
+/// Read one frame's metadata and seek over its payload and CRC without
+/// reading them. This is intended for diagnostic scans where payload
+/// integrity is not being checked. The frame length, flags, and raw payload
+/// length invariants are still validated.
+///
+/// # Errors
+/// Returns an I/O error if the frame prefix or metadata cannot be read, if
+/// the frame metadata is invalid, or if seeking past the payload fails.
+///
+/// # Panics
+/// Never in practice: the fixed-size metadata buffer makes all internal
+/// conversions and the frame-length subtraction provably valid after the
+/// preceding bounds checks.
+pub fn read_record_metadata_skip_payload(
+    reader: &mut (impl Read + Seek),
+) -> io::Result<Option<RecordMetadata>> {
+    let Some(len_buf) = read_frame_len_prefix(reader)? else {
+        return Ok(None);
+    };
+    let frame_len = u32::from_le_bytes(len_buf);
+    if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid record length: {frame_len}"),
+        ));
+    }
+
+    let mut fixed = [0u8; FRAME_FIXED_LEN as usize];
+    reader.read_exact(&mut fixed)?;
+    let flags = fixed[0];
+    if flags & !(FLAG_COMPRESSED | FLAG_CRC_DISABLED) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported record flags: {flags:#04x}"),
+        ));
+    }
+    let uncompressed_len = u32::from_le_bytes(fixed[1..5].try_into().unwrap());
+    if flags & FLAG_COMPRESSED != 0 {
+        if uncompressed_len > MAX_DATA_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
+            ));
+        }
+    } else {
+        let payload_len = frame_len
+            .checked_sub(FRAME_FIXED_LEN)
+            .expect("frame_len >= FRAME_FIXED_LEN, checked above");
+        if uncompressed_len != payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "raw node length {payload_len} != framed uncompressed_len {uncompressed_len}"
+                ),
+            ));
+        }
+    }
+
+    let mut collection_id = [0u8; 16];
+    collection_id.copy_from_slice(&fixed[5..21]);
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&fixed[21..37]);
+
+    // The frame length excludes the four-byte CRC, while the fixed portion
+    // includes the metadata and flags but not the payload.
+    let skip = u64::from(
+        frame_len
+            .checked_sub(FRAME_FIXED_LEN)
+            .expect("frame_len >= FRAME_FIXED_LEN, checked above"),
+    ) + 4;
+    reader.seek(io::SeekFrom::Current(i64::try_from(skip).unwrap()))?;
+    Ok(Some(RecordMetadata {
+        collection_id,
+        hash,
+    }))
+}
+
 /// Write a new pack file's [`HEADER_LEN`]-byte reserved header: magic,
 /// version, header length, `pack_id`, creation time, and a CRC over all
 /// of the above — zero-padded to fill `HEADER_LEN`. Written once, at
@@ -901,6 +978,32 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
         }
     }
 
+    Ok(entries)
+}
+
+/// Scan a packfile's metadata without reading frame payloads or CRCs.
+/// Intended for diagnostic listing, not recovery or integrity verification.
+///
+/// # Errors
+/// Returns an I/O error on failure to open, read, seek, or validate the
+/// packfile.
+pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+
+    if read_header(&mut reader)?.is_none() {
+        return Ok(entries);
+    }
+    loop {
+        let offset = reader.stream_position()?;
+        match read_record_metadata_skip_payload(&mut reader) {
+            Ok(Some(meta)) => entries.push((meta.collection_id, meta.hash, offset)),
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
     Ok(entries)
 }
 
@@ -1614,5 +1717,45 @@ mod tests {
         assert_eq!(entries[0].1, [0xAA; 16]);
         assert_eq!(entries[1].0, collection2);
         assert_eq!(entries[1].1, [0xBB; 16]);
+    }
+
+    /// `scan_packfile_skip_payload` must agree with `scan_packfile` on every
+    /// `(collection_id, hash, offset)` triple, for both a compressed and a
+    /// raw-fallback frame, without reading the payload it seeks over.
+    #[test]
+    fn test_scan_packfile_skip_payload_matches_scan_packfile() {
+        let dir = test_dir("scan_skip_payload");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard_00.pack");
+        let collection1 = [0x01; 16];
+        let collection2 = [0x02; 16];
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        write_record(
+            &mut buf,
+            &test_record(collection1, [0xAA; 16], b"short raw payload"),
+        )
+        .unwrap();
+        write_record(
+            &mut buf,
+            &test_record(collection2, [0xBB; 16], &vec![0x42u8; 8192]),
+        )
+        .unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let full = scan_packfile(&path).unwrap();
+        let skipped = scan_packfile_skip_payload(&path).unwrap();
+        assert_eq!(full, skipped);
+        assert_eq!(skipped.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_packfile_skip_payload_empty_file() {
+        let dir = test_dir("scan_skip_payload_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard_00.pack");
+        std::fs::write(&path, b"").unwrap();
+        let entries = scan_packfile_skip_payload(&path).unwrap();
+        assert_eq!(entries, vec![]);
     }
 }

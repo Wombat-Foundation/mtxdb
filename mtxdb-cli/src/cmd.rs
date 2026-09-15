@@ -2150,7 +2150,11 @@ fn cmd_scan(
         .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
         .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
     let path = &shard.path;
-    let records = mtxdb_core::packfile::scan_packfile(path)?;
+    let records = if verbose || raw {
+        mtxdb_core::packfile::scan_packfile(path)?
+    } else {
+        mtxdb_core::packfile::scan_packfile_skip_payload(path)?
+    };
     let records: Vec<_> = records
         .into_iter()
         .filter(|(record_collection, record_id, _)| {
@@ -2263,11 +2267,13 @@ fn cmd_scan_collection(
     let mut packs = 0_usize;
     let max_rows = scan_limit(limit);
     let mut raw_matches = Vec::new();
-    if !raw {
-        print_scan_table_header("PACK");
-    }
+    let mut header_printed = false;
     for (_, shard) in shards {
-        let records = mtxdb_core::packfile::scan_packfile(&shard.path)?;
+        let records = if verbose || raw {
+            mtxdb_core::packfile::scan_packfile(&shard.path)?
+        } else {
+            mtxdb_core::packfile::scan_packfile_skip_payload(&shard.path)?
+        };
         let mut matched_pack = false;
         for (record_collection_id, record_id, offset) in records {
             let id_matches = match node_id {
@@ -2282,6 +2288,10 @@ fn cmd_scan_collection(
                     continue;
                 }
                 if frames <= max_rows {
+                    if !raw && !header_printed {
+                        print_scan_table_header("PACK");
+                        header_printed = true;
+                    }
                     let data = verbose
                         .then(|| ShardPool::read_at_committed(&shard, offset, true))
                         .transpose()?;

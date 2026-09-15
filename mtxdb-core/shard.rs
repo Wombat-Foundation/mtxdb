@@ -845,8 +845,14 @@ impl ShardPool {
             // Record which mtxdb-core version created this store. Best
             // effort and diagnostic-only (see `persist_store_meta`), so it
             // doesn't need the same before-the-pack-file ordering as
-            // pool.meta below.
-            persist_store_meta(&base_dir);
+            // pool.meta below. Only write it the first time: this branch
+            // also runs when every pack file has since been removed but
+            // `store.meta` survives, and overwriting it there would make
+            // stats attribute store creation to whichever binary happens to
+            // reopen an emptied pool.
+            if !base_dir.join(STORE_META_FILENAME).exists() {
+                persist_store_meta(&base_dir);
+            }
             // Persist the high-water mark BEFORE creating the pack file.
             // A crash after pack creation but before next persist would
             // leave a pack_id in use with no pool.meta reservation — so

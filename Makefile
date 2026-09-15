@@ -84,7 +84,7 @@ cov: ##H Run code coverage and generate HTML report
 
 .PHONY: bench
 bench: ##H Run benchmarks and append results to the CSV history in benches/csv/
-	set -o pipefail; $(CARGO) bench --manifest-path benches/Cargo.toml --benches --all-targets --all-features | tee benches/csv/latest.txt
+	set -o pipefail; $(CARGO) bench --manifest-path benches/Cargo.toml --benches --all-targets | tee benches/csv/latest.txt
 	python3 scripts/compare_bench.py --current benches/csv/latest.txt \
 		--best benches/csv/best.json --out benches/csv/best.json \
 		--machine "$$(cat benches/csv/machine.txt 2>/dev/null || hostname)" \

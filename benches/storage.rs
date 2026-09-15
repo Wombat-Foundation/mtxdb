@@ -306,8 +306,18 @@ fn drop_caches_for_dir(dir: &std::path::Path) -> bool {
 /// Root for benchmark scratch data: `MTXDB_BENCH_ROOT` env override, else
 /// the session temp dir. GB-scale sweeps (1–1000 GB) must not run on a
 /// RAM-backed tmpfs; point this at a real disk with headroom.
+///
+/// Suffixed with this process's PID: every scratch path built under this
+/// root is otherwise a deterministic function of the scenario label (see
+/// the `mtxdb_bench_*` join sites below), so two benchmark processes
+/// running concurrently against the same root — e.g. overlapping `cargo
+/// bench` invocations, or CI jobs sharing `MTXDB_BENCH_ROOT` — would each
+/// `remove_dir_all` and recreate the other's active scratch directory,
+/// corrupting or crashing both runs.
 fn bench_root() -> std::path::PathBuf {
-    std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+    let base =
+        std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    base.join(format!("mtxdb_bench_pid_{}", std::process::id()))
 }
 
 /// Measured results from one scenario run, used to drive the decision

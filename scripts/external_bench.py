@@ -198,9 +198,9 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
     # read "writeonly" there), so the row label is the only thing that
     # actually tells those two apart.
     display_names = {
-        "mtxdb_none": "mtxdb",
-        "mtxdb_writeonly": "mtxdb",
-        "mtxdb_full": "mtxdb",
+        "mtxdb_none": "mtxdb (no crc)",
+        "mtxdb_writeonly": "mtxdb (writeonly)",
+        "mtxdb_full": "mtxdb (full)",
         "mdbx": "mdbx",
         "fjall": "fjall (lsm)",
         "sqlite": "sqlite",

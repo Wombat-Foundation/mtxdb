@@ -866,15 +866,24 @@ fn run_fjall(dir: &std::path::Path, nodes: usize) -> Run {
     }
 
     // ── Build ──
+    // Committed in bounded batches rather than one batch spanning the whole
+    // dataset: at the 100/1000 GB targets this benchmark advertises, holding
+    // every record's key+payload in one uncommitted `fjall::Batch` risks OOM
+    // well before the run completes.
     let started = Instant::now();
     {
         let (keyspace, partition) = open(dir);
-        let mut batch = keyspace.batch();
-        for node in 0..nodes {
-            let p = payload(node as u64);
-            batch.insert(&partition, node_id(node).to_vec(), p);
+        let mut node = 0;
+        while node < nodes {
+            let mut batch = keyspace.batch();
+            let chunk_end = (node + SUSTAINED_BATCH_RECORDS).min(nodes);
+            for node in node..chunk_end {
+                let p = payload(node as u64);
+                batch.insert(&partition, node_id(node).to_vec(), p);
+            }
+            batch.commit().unwrap();
+            node = chunk_end;
         }
-        batch.commit().unwrap();
         keyspace.persist(PersistMode::SyncAll).unwrap();
     }
     let write_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -1003,7 +1012,11 @@ fn sustained_target_records() -> usize {
                 .trim()
                 .parse()
                 .expect("MTXDB_BENCH_SUSTAINED_MB must be a number");
-            ((mb * 1e6) / PAYLOAD_BYTES as f64) as usize
+            assert!(
+                mb.is_finite() && mb > 0.0,
+                "MTXDB_BENCH_SUSTAINED_MB must be a finite, positive number of megabytes, got {mb}"
+            );
+            (((mb * 1e6) / PAYLOAD_BYTES as f64) as usize).max(1)
         }
         Err(std::env::VarError::NotPresent) => 64_000, // ~64 MB of 1 KiB records
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -1190,9 +1203,13 @@ fn run_sustained_sqlite(dir: &std::path::Path, target_records: usize) -> Sustain
     use rusqlite::{params, Connection};
 
     let db_path = dir.join("nodes.sqlite");
+    // `synchronous=FULL` fsyncs on every commit, matching mtxdb's fsync-backed
+    // `sync` and fjall's `SyncAll` durability semantics per batch — `NORMAL`
+    // only fsyncs at checkpoints, which would understate SQLite's per-batch
+    // commit latency relative to the other engines in this comparison.
     fn open(path: &std::path::Path) -> Connection {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")
             .unwrap();
         conn
     }

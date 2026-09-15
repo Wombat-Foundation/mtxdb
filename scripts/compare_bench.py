@@ -145,14 +145,14 @@ ROW_ELEPHANT = re.compile(
     r"QUERY_PRE_US=(?P<query_pre>[\d.]+) QUERY_POST_US=(?P<query_post>[\d.]+) "
     r"PACKS_REF_PRE=(?P<packs_ref_pre>\d+) PACKS_REF_POST=(?P<packs_ref_post>\d+) "
     r"SEGMENTS_PRE=(?P<segments_pre>\d+) SEGMENTS_POST=(?P<segments_post>\d+) "
-    r"OPEN_DISK_PRE=(?P<open_disk_pre>\d+) "
-    r"OPEN_DISK_POST=(?P<open_disk_post>\d+) "
-    r"OPEN_SYSCALLS_PRE=(?P<open_syscalls_pre>\d+) "
-    r"OPEN_SYSCALLS_POST=(?P<open_syscalls_post>\d+) "
-    r"QUERY_DISK_PRE=(?P<query_disk_pre>\d+) "
-    r"QUERY_DISK_POST=(?P<query_disk_post>\d+) "
-    r"QUERY_SYSCALLS_PRE=(?P<query_syscalls_pre>\d+) "
-    r"QUERY_SYSCALLS_POST=(?P<query_syscalls_post>\d+) "
+    r"OPEN_DISK_PRE=(?P<open_disk_pre>\d+|n/a) "
+    r"OPEN_DISK_POST=(?P<open_disk_post>\d+|n/a) "
+    r"OPEN_SYSCALLS_PRE=(?P<open_syscalls_pre>\d+|n/a) "
+    r"OPEN_SYSCALLS_POST=(?P<open_syscalls_post>\d+|n/a) "
+    r"QUERY_DISK_PRE=(?P<query_disk_pre>\d+|n/a) "
+    r"QUERY_DISK_POST=(?P<query_disk_post>\d+|n/a) "
+    r"QUERY_SYSCALLS_PRE=(?P<query_syscalls_pre>\d+|n/a) "
+    r"QUERY_SYSCALLS_POST=(?P<query_syscalls_post>\d+|n/a) "
     r"FOUND_PRE=(?P<found_pre>\d+) FOUND_POST=(?P<found_post>\d+) "
     r"REPACK_MS=(?P<repack_ms>[\d.]+) SPEEDUP_X=(?P<speedup>[\d.]+)",
     re.MULTILINE,
@@ -568,14 +568,14 @@ def elephant_scenarios(output: str) -> list[Scenario]:
             "packs_ref_post": int(m["packs_ref_post"]),
             "segments_pre": int(m["segments_pre"]),
             "segments_post": int(m["segments_post"]),
-            "open_disk_pre": int(m["open_disk_pre"]),
-            "open_disk_post": int(m["open_disk_post"]),
-            "open_syscalls_pre": int(m["open_syscalls_pre"]),
-            "open_syscalls_post": int(m["open_syscalls_post"]),
-            "query_disk_pre": int(m["query_disk_pre"]),
-            "query_disk_post": int(m["query_disk_post"]),
-            "query_syscalls_pre": int(m["query_syscalls_pre"]),
-            "query_syscalls_post": int(m["query_syscalls_post"]),
+            "open_disk_pre": _optional_u64(m["open_disk_pre"]),
+            "open_disk_post": _optional_u64(m["open_disk_post"]),
+            "open_syscalls_pre": _optional_u64(m["open_syscalls_pre"]),
+            "open_syscalls_post": _optional_u64(m["open_syscalls_post"]),
+            "query_disk_pre": _optional_u64(m["query_disk_pre"]),
+            "query_disk_post": _optional_u64(m["query_disk_post"]),
+            "query_syscalls_pre": _optional_u64(m["query_syscalls_pre"]),
+            "query_syscalls_post": _optional_u64(m["query_syscalls_post"]),
             "found_pre": int(m["found_pre"]),
             "found_post": int(m["found_post"]),
             "repack_ms": float(m["repack_ms"]),
@@ -601,7 +601,8 @@ def elephant_scenarios(output: str) -> list[Scenario]:
             "query_syscalls_post",
             "repack_ms",
         ):
-            elephant.tracked[base + metric] = float(row[metric])
+            if row[metric] is not None:
+                elephant.tracked[base + metric] = float(row[metric])
         elephant.rows.append(row)
 
     compact = Scenario(

@@ -256,6 +256,15 @@ fn subrow(label: &str, value: impl std::fmt::Display) {
 
 /// Prints one I/O snapshot delta as indented sub-rows under whichever
 /// timed window (Open or Query) the caller just printed a `row` for.
+/// Renders one `IoSnapshot` delta field for the `bench:` output line: an
+/// unavailable snapshot (non-Linux, or `/proc` missing) prints as the
+/// explicit `n/a` sentinel `compare_bench.py` already parses for the PSS
+/// fields, rather than `0`, which is indistinguishable from a genuine
+/// zero-activity measurement and would corrupt the regression history.
+fn io_field(delta: Option<IoSnapshot>, field: impl FnOnce(IoSnapshot) -> u64) -> String {
+    delta.map_or_else(|| "n/a".to_owned(), |d| field(d).to_string())
+}
+
 fn print_io_delta(delta: Option<IoSnapshot>) {
     match delta {
         Some(d) => {
@@ -832,14 +841,14 @@ pub fn run_stage1_locality_benchmark(
         post_packs_touched,
         pre_segments,
         post_segments,
-        pre_open_io_delta.map_or(0, |delta| delta.disk_read_bytes),
-        post_open_io_delta.map_or(0, |delta| delta.disk_read_bytes),
-        pre_open_io_delta.map_or(0, |delta| delta.read_syscalls),
-        post_open_io_delta.map_or(0, |delta| delta.read_syscalls),
-        pre_io_delta.map_or(0, |delta| delta.disk_read_bytes),
-        post_io_delta.map_or(0, |delta| delta.disk_read_bytes),
-        pre_io_delta.map_or(0, |delta| delta.read_syscalls),
-        post_io_delta.map_or(0, |delta| delta.read_syscalls),
+        io_field(pre_open_io_delta, |delta| delta.disk_read_bytes),
+        io_field(post_open_io_delta, |delta| delta.disk_read_bytes),
+        io_field(pre_open_io_delta, |delta| delta.read_syscalls),
+        io_field(post_open_io_delta, |delta| delta.read_syscalls),
+        io_field(pre_io_delta, |delta| delta.disk_read_bytes),
+        io_field(post_io_delta, |delta| delta.disk_read_bytes),
+        io_field(pre_io_delta, |delta| delta.read_syscalls),
+        io_field(post_io_delta, |delta| delta.read_syscalls),
         pre_found,
         post_found,
         repack_time.as_secs_f64() * 1_000.0,
