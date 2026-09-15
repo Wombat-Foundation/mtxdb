@@ -331,6 +331,30 @@ fn other_shard_type_hint(cli: &Cli, collection_id: &[u8; 16]) -> String {
     }
 }
 
+/// Open the selected pool read-only for a collection lookup, treating an
+/// empty pool (e.g. the default `-t event-dag` when the collection actually
+/// lives under `-t state`) as "not found" rather than an error: prints the
+/// same message a populated-but-non-matching pool would give, with the
+/// other-shard-type hint, and returns `Ok(None)` so the caller can bail via
+/// `let-else` instead of repeating this match.
+fn open_pool_for_collection_lookup(
+    cli: &Cli,
+    collection_id: &[u8; 16],
+    not_found_message: &str,
+) -> anyhow::Result<Option<PackfileStorage>> {
+    match PackfileStorage::open_read_only(selected_pool_dir(cli)?) {
+        Ok(store) => Ok(Some(store)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "{not_found_message}{}",
+                other_shard_type_hint(cli, collection_id)
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error).context("failed to open store"),
+    }
+}
+
 fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(collection)?;
     let node_id = parse_node_id(id)?;
@@ -1712,19 +1736,13 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     // A store predating the inspection sidecar has no cheap authoritative
     // summary. Preserve the old full-scan fallback until `mtxdb sync` can
     // create the sidecar.
-    let store = match PackfileStorage::open_read_only(selected_pool_dir(cli)?) {
-        Ok(store) => store,
-        // Same reasoning as `cmd_scan_collection`: an empty pool (e.g. the
-        // default `-t event-dag` pool when the collection actually lives
-        // under `-t state`) just means "not found here", not a real error.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            eprintln!(
-                "collection {hex}: not found{}",
-                other_shard_type_hint(cli, &collection_id)
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error).context("failed to open store"),
+    let Some(store) = open_pool_for_collection_lookup(
+        cli,
+        &collection_id,
+        &format!("collection {hex}: not found"),
+    )?
+    else {
+        return Ok(());
     };
     match store.collection_index_info(&collection_id) {
         Some((len, mem, capacity)) => {
