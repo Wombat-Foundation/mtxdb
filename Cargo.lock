@@ -582,8 +582,8 @@ dependencies = [
 
 [[package]]
 name = "rezzy"
-version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?rev=acff39d752ac7363015e866d800722a8271ac34c#acff39d752ac7363015e866d800722a8271ac34c"
+version = "0.6.0"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?rev=82c9078f69297fe81cecf12516af71236e398712#82c9078f69297fe81cecf12516af71236e398712"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -594,6 +594,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -781,6 +782,12 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ced3678a2879b30306d323f4542626697a464a97c0a07c9aebf7ebca65cd4dde"
 
 [[package]]
 name = "zmij"

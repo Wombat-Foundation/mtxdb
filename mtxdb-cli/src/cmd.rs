@@ -550,7 +550,7 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Wire format (32-byte structural hashes):
 /// ```text
-/// [0]       wire version (0x02)
+/// [0]       wire version (0x01)
 /// [1..5]    datamap (u32 LE) -- bitmap of leaf slots
 /// [5..9]    nodemap (u32 LE) -- bitmap of child slots
 /// [9..13]   leaf_count (u32 LE)
@@ -566,13 +566,13 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 /// Returns `None` when the bytes don't match this layout.
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
-    const WIRE_V1: u8 = 0x02;
+    const WIRE_V1: u8 = 0x01;
     const HEADER_LEN: usize = 17;
     const HASH_LEN: usize = 32;
 
-    // Only accept the current wire version (0x02, matching rezzy's
-    // HAMT_WIRE_VERSION).  The legacy 0x01 layout (16-byte structural
-    // hashes) is confirmed gone from all live data.
+    // Synapse currently persists rezzy's wire-v1 layout. Its structural
+    // hashes are 32 bytes; 0x01 is the node codec version, not a generic-KV
+    // marker.
     let &version = bytes.first()?;
     if version != WIRE_V1 {
         return None;
@@ -4425,7 +4425,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        buf.push(0x02);
+        buf.push(0x01);
         buf.extend_from_slice(&datamap.to_le_bytes());
         buf.extend_from_slice(&nodemap.to_le_bytes());
         buf.extend_from_slice(&leaf_count.to_le_bytes());
@@ -4509,7 +4509,8 @@ mod tests {
 
     #[test]
     fn hamt_random_binary_not_hamt() {
-        // Arbitrary payload starting with 0x01 (legacy) should not decode.
+        // Arbitrary payload starting with 0x01 should not decode merely from
+        // the version byte; the complete header and body must also validate.
         let data = vec![0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
         assert!(decode_hamt_node(&data).is_none());
     }

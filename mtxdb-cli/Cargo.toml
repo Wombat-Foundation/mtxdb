@@ -30,7 +30,7 @@ simd-json = { version = "0.18", default-features = false, features = ["runtime-d
 
 [dev-dependencies]
 # rezzy = { path = "../../rezzy" }
-rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", rev = "acff39d752ac7363015e866d800722a8271ac34c" }
+rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", rev = "82c9078f69297fe81cecf12516af71236e398712" }
 
 [lints]
 workspace = true
