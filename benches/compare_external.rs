@@ -13,6 +13,14 @@
 //! MTXDB_BENCH_EXT_GB=1,10 cargo bench --features compare-external --bench compare_external
 //! ```
 //!
+//! `MTXDB_BENCH_SUSTAINED=1` additionally runs a sustained-write phase after
+//! the sweep above: many small fully-durable batches back-to-back (long
+//! enough, by default, to put several memtable flushes/compactions through
+//! an LSM engine), tracking aggregate throughput and p50/p95/p99 per-batch
+//! latency, then a reopen + sampled-key verify pass timed separately. See
+//! the "Sustained-write comparison" section below for the mtxdb
+//! 32-collection-fan-out vs. single-keyspace topology asymmetry it reports.
+//!
 //! Same synthetic dataset on every engine (16-byte keys, 1 KB incompressible
 //! values, deterministic, same RNG), so the numbers are directly comparable:
 //! batch write, warm/cold open, sampled point lookups, small batch append,
@@ -960,6 +968,433 @@ fn run_fjall(dir: &std::path::Path, nodes: usize) -> Run {
     }
 }
 
+// ── Sustained-write comparison ───────────────────────────────────────
+//
+// The short-batch columns above (`first append`/`steady append`) measure a
+// handful of durable batches immediately after a bulk build — enough to
+// characterize per-op latency, but not enough to force an LSM engine like
+// fjall through multiple memtable flushes/compactions, or a B-tree engine
+// through page-split churn at volume. This phase instead writes many small
+// durable batches back-to-back until a substantial volume has landed, so
+// flush/compaction stalls (if any) show up in the batch-latency tail
+// (p95/p99) instead of being averaged away or missed entirely. It is opt-in
+// (`MTXDB_BENCH_SUSTAINED=1`) and additive: it never replaces or perturbs the
+// existing per-size columns above, which keep their own directories/timing.
+//
+// IMPORTANT ASYMMETRY, kept deliberately visible in the printed header
+// rather than buried in a doc comment: mtxdb's batches fan out across
+// `COLLECTIONS` (32) independent collections, matching the topology used
+// throughout this file and reflecting mtxdb's real multi-collection use
+// case. MDBX/SQLite/fjall write into a single table/partition/keyspace, so
+// this is NOT a generic "single-keyspace write ceiling" comparison for
+// mtxdb — it is mtxdb's realistic fan-out cost against the other three
+// engines' single-keyspace cost.
+const SUSTAINED_BATCH_RECORDS: usize = 4096; // ~4 MiB/batch at 1 KiB payload
+const SUSTAINED_VERIFY_SAMPLES: usize = 1_000;
+
+/// Target record count for the sustained phase: `MTXDB_BENCH_SUSTAINED_MB`
+/// (megabytes) if set, else a default large enough to put a handful of
+/// memtable flushes/compactions (fjall) or page-split growth (MDBX/SQLite)
+/// inside the run, without making the default `cargo bench` invocation slow.
+fn sustained_target_records() -> usize {
+    match std::env::var("MTXDB_BENCH_SUSTAINED_MB") {
+        Ok(raw) => {
+            let mb: f64 = raw
+                .trim()
+                .parse()
+                .expect("MTXDB_BENCH_SUSTAINED_MB must be a number");
+            ((mb * 1e6) / PAYLOAD_BYTES as f64) as usize
+        }
+        Err(std::env::VarError::NotPresent) => 64_000, // ~64 MB of 1 KiB records
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("MTXDB_BENCH_SUSTAINED_MB must be valid UTF-8")
+        }
+    }
+}
+
+fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
+    if sorted_ms.is_empty() {
+        return 0.0;
+    }
+    let idx = ((p / 100.0) * (sorted_ms.len() - 1) as f64).round() as usize;
+    sorted_ms[idx.min(sorted_ms.len() - 1)]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SustainedRun {
+    records: usize,
+    batches: usize,
+    total_ms: f64,
+    throughput_rec_s: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    reopen_ms: f64,
+    verify_us: f64,
+    verify_ok: bool,
+}
+
+fn summarize_batches(batch_ms: &mut [f64], total_ms: f64, records: usize) -> (f64, f64, f64, f64) {
+    batch_ms.sort_by(|a, b| a.partial_cmp(b).expect("batch latency must not be NaN"));
+    (
+        percentile(batch_ms, 50.0),
+        percentile(batch_ms, 95.0),
+        percentile(batch_ms, 99.0),
+        records as f64 / (total_ms / 1e3),
+    )
+}
+
+fn run_sustained_mtxdb(dir: &std::path::Path, target_records: usize) -> SustainedRun {
+    let store = mtxdb_open(dir);
+    let mut batch_ms = Vec::new();
+    let mut written = 0usize;
+    let overall_started = Instant::now();
+    while written < target_records {
+        let batch_len = SUSTAINED_BATCH_RECORDS.min(target_records - written);
+        let batch_started = Instant::now();
+        for bucket in 0..COLLECTIONS {
+            let entries: Vec<_> = (0..batch_len)
+                .map(|i| written + i)
+                .filter(|node| node % COLLECTIONS == bucket)
+                .map(|node| {
+                    (
+                        node_id(node),
+                        NodeData::new(bytes::Bytes::from(payload(node as u64))),
+                    )
+                })
+                .collect();
+            if !entries.is_empty() {
+                store.put_many(&collection_for(bucket), &entries).unwrap();
+            }
+        }
+        store.sync().unwrap(); // one fsync-durable batch, matches the other engines' per-batch commit
+        batch_ms.push(batch_started.elapsed().as_secs_f64() * 1e3);
+        written += batch_len;
+    }
+    let total_ms = overall_started.elapsed().as_secs_f64() * 1e3;
+    drop(store);
+
+    let (p50_ms, p95_ms, p99_ms, throughput_rec_s) =
+        summarize_batches(&mut batch_ms, total_ms, written);
+
+    let reopen_started = Instant::now();
+    let store = mtxdb_open_read_only(dir);
+    let reopen_ms = reopen_started.elapsed().as_secs_f64() * 1e3;
+    let (verify_us, verify_ok) = verify_sample_mtxdb(&store, written);
+    drop(store);
+
+    SustainedRun {
+        records: written,
+        batches: batch_ms.len(),
+        total_ms,
+        throughput_rec_s,
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        reopen_ms,
+        verify_us,
+        verify_ok,
+    }
+}
+
+fn verify_sample_mtxdb(store: &PackfileStorage, written: usize) -> (f64, bool) {
+    let sample_n = SUSTAINED_VERIFY_SAMPLES.min(written).max(1);
+    let mut rng = Rng::new(0xC0FF_EE00 ^ written as u64);
+    let started = Instant::now();
+    let mut ok = true;
+    for _ in 0..sample_n {
+        let node = rng.next_u64() as usize % written;
+        if store
+            .get(&collection_for(node), &node_id(node))
+            .unwrap()
+            .is_none()
+        {
+            ok = false;
+        }
+    }
+    (started.elapsed().as_secs_f64() * 1e6 / sample_n as f64, ok)
+}
+
+#[allow(clippy::used_underscore_binding)]
+fn run_sustained_mdbx(dir: &std::path::Path, target_records: usize) -> SustainedRun {
+    use libmdbx::{Database, NoWriteMap, TableFlags, WriteFlags};
+
+    let db: Database<NoWriteMap> = Database::open(dir).unwrap();
+    {
+        let txn = db.begin_rw_txn().unwrap();
+        txn.create_table(None, TableFlags::empty()).unwrap();
+        txn.commit().unwrap();
+    }
+
+    let mut batch_ms = Vec::new();
+    let mut written = 0usize;
+    let overall_started = Instant::now();
+    while written < target_records {
+        let batch_len = SUSTAINED_BATCH_RECORDS.min(target_records - written);
+        let batch_started = Instant::now();
+        let txn = db.begin_rw_txn().unwrap();
+        let table = txn.open_table(None).unwrap();
+        for i in 0..batch_len {
+            let node = written + i;
+            let p = payload(node as u64);
+            txn.put(&table, node_id(node), &p, WriteFlags::empty())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        batch_ms.push(batch_started.elapsed().as_secs_f64() * 1e3);
+        written += batch_len;
+    }
+    let total_ms = overall_started.elapsed().as_secs_f64() * 1e3;
+    drop(db);
+
+    let (p50_ms, p95_ms, p99_ms, throughput_rec_s) =
+        summarize_batches(&mut batch_ms, total_ms, written);
+
+    let reopen_started = Instant::now();
+    let db: Database<NoWriteMap> = Database::open(dir).unwrap();
+    let txn = db.begin_ro_txn().unwrap();
+    let table = txn.open_table(None).unwrap();
+    let reopen_ms = reopen_started.elapsed().as_secs_f64() * 1e3;
+
+    let sample_n = SUSTAINED_VERIFY_SAMPLES.min(written).max(1);
+    let mut rng = Rng::new(0xC0FF_EE00 ^ written as u64);
+    let verify_started = Instant::now();
+    let mut verify_ok = true;
+    for _ in 0..sample_n {
+        let node = rng.next_u64() as usize % written;
+        let key = node_id(node);
+        if txn.get::<Cow<'_, [u8]>>(&table, &key).unwrap().is_none() {
+            verify_ok = false;
+        }
+    }
+    let verify_us = verify_started.elapsed().as_secs_f64() * 1e6 / sample_n as f64;
+    drop(txn);
+    drop(db);
+
+    SustainedRun {
+        records: written,
+        batches: batch_ms.len(),
+        total_ms,
+        throughput_rec_s,
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        reopen_ms,
+        verify_us,
+        verify_ok,
+    }
+}
+
+#[allow(clippy::used_underscore_binding)]
+fn run_sustained_sqlite(dir: &std::path::Path, target_records: usize) -> SustainedRun {
+    use rusqlite::{params, Connection};
+
+    let db_path = dir.join("nodes.sqlite");
+    fn open(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        conn
+    }
+
+    let conn = open(&db_path);
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS nodes(pk BLOB PRIMARY KEY, val BLOB) WITHOUT ROWID;",
+    )
+    .unwrap();
+
+    let mut batch_ms = Vec::new();
+    let mut written = 0usize;
+    let overall_started = Instant::now();
+    while written < target_records {
+        let batch_len = SUSTAINED_BATCH_RECORDS.min(target_records - written);
+        let batch_started = Instant::now();
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO nodes(pk, val) VALUES (?1, ?2)")
+                .unwrap();
+            for i in 0..batch_len {
+                let node = written + i;
+                let p = payload(node as u64);
+                stmt.execute(params![node_id(node), p]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        batch_ms.push(batch_started.elapsed().as_secs_f64() * 1e3);
+        written += batch_len;
+    }
+    let total_ms = overall_started.elapsed().as_secs_f64() * 1e3;
+    drop(conn);
+
+    let (p50_ms, p95_ms, p99_ms, throughput_rec_s) =
+        summarize_batches(&mut batch_ms, total_ms, written);
+
+    let reopen_started = Instant::now();
+    let conn = open(&db_path);
+    let mut stmt = conn.prepare("SELECT val FROM nodes WHERE pk=?1").unwrap();
+    let reopen_ms = reopen_started.elapsed().as_secs_f64() * 1e3;
+
+    let sample_n = SUSTAINED_VERIFY_SAMPLES.min(written).max(1);
+    let mut rng = Rng::new(0xC0FF_EE00 ^ written as u64);
+    let verify_started = Instant::now();
+    let mut verify_ok = true;
+    for _ in 0..sample_n {
+        let node = rng.next_u64() as usize % written;
+        let row: Option<Vec<u8>> = stmt
+            .query_row(params![node_id(node)], |row| row.get(0))
+            .ok();
+        if row.is_none() {
+            verify_ok = false;
+        }
+    }
+    let verify_us = verify_started.elapsed().as_secs_f64() * 1e6 / sample_n as f64;
+    drop(stmt);
+    drop(conn);
+
+    SustainedRun {
+        records: written,
+        batches: batch_ms.len(),
+        total_ms,
+        throughput_rec_s,
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        reopen_ms,
+        verify_us,
+        verify_ok,
+    }
+}
+
+#[allow(clippy::used_underscore_binding)]
+fn run_sustained_fjall(dir: &std::path::Path, target_records: usize) -> SustainedRun {
+    use fjall::{Config, PartitionCreateOptions, PersistMode};
+
+    fn open(dir: &std::path::Path) -> (fjall::Keyspace, fjall::PartitionHandle) {
+        let keyspace = Config::new(dir).open().unwrap();
+        let partition = keyspace
+            .open_partition("nodes", PartitionCreateOptions::default())
+            .unwrap();
+        (keyspace, partition)
+    }
+
+    let (keyspace, partition) = open(dir);
+    let mut batch_ms = Vec::new();
+    let mut written = 0usize;
+    let overall_started = Instant::now();
+    while written < target_records {
+        let batch_len = SUSTAINED_BATCH_RECORDS.min(target_records - written);
+        let batch_started = Instant::now();
+        let mut batch = keyspace.batch();
+        for i in 0..batch_len {
+            let node = written + i;
+            let p = payload(node as u64);
+            batch.insert(&partition, node_id(node).to_vec(), p);
+        }
+        batch.commit().unwrap();
+        keyspace.persist(PersistMode::SyncAll).unwrap();
+        batch_ms.push(batch_started.elapsed().as_secs_f64() * 1e3);
+        written += batch_len;
+    }
+    let total_ms = overall_started.elapsed().as_secs_f64() * 1e3;
+    drop(partition);
+    drop(keyspace);
+
+    let (p50_ms, p95_ms, p99_ms, throughput_rec_s) =
+        summarize_batches(&mut batch_ms, total_ms, written);
+
+    let reopen_started = Instant::now();
+    let (keyspace, partition) = open(dir);
+    let reopen_ms = reopen_started.elapsed().as_secs_f64() * 1e3;
+
+    let sample_n = SUSTAINED_VERIFY_SAMPLES.min(written).max(1);
+    let mut rng = Rng::new(0xC0FF_EE00 ^ written as u64);
+    let verify_started = Instant::now();
+    let mut verify_ok = true;
+    for _ in 0..sample_n {
+        let node = rng.next_u64() as usize % written;
+        let key = node_id(node);
+        if partition.get(key).unwrap().is_none() {
+            verify_ok = false;
+        }
+    }
+    let verify_us = verify_started.elapsed().as_secs_f64() * 1e6 / sample_n as f64;
+    drop(partition);
+    drop(keyspace);
+
+    SustainedRun {
+        records: written,
+        batches: batch_ms.len(),
+        total_ms,
+        throughput_rec_s,
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        reopen_ms,
+        verify_us,
+        verify_ok,
+    }
+}
+
+fn run_sustained(backend: Backend, target_records: usize) {
+    let dir = bench_root().join(format!("mtxdb_bench_sustained_{}", backend.name()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let run = match backend {
+        Backend::Mtxdb => run_sustained_mtxdb(&dir, target_records),
+        Backend::Mdbx => run_sustained_mdbx(&dir, target_records),
+        Backend::Sqlite => run_sustained_sqlite(&dir, target_records),
+        Backend::Fjall => run_sustained_fjall(&dir, target_records),
+    };
+
+    let topology = if backend == Backend::Mtxdb {
+        format!("{COLLECTIONS}-collection fan-out")
+    } else {
+        "single keyspace".to_owned()
+    };
+    println!(
+        "sustained: ENG={} RECORDS={} BATCHES={} BATCH_RECORDS={SUSTAINED_BATCH_RECORDS} \
+         TOTAL_MS={:.1} THROUGHPUT_REC_S={:.0} P50_MS={:.3} P95_MS={:.3} P99_MS={:.3} \
+         REOPEN_MS={:.3} VERIFY_US={:.2} VERIFY_OK={} TOPOLOGY=\"{topology}\"",
+        backend.name(),
+        run.records,
+        run.batches,
+        run.total_ms,
+        run.throughput_rec_s,
+        run.p50_ms,
+        run.p95_ms,
+        run.p99_ms,
+        run.reopen_ms,
+        run.verify_us,
+        run.verify_ok,
+    );
+    eprintln!(
+        "  [sustained] {:>6} ({topology}): {} records in {} batches, {:.1}s total, {:.0} rec/s -- \
+         batch latency p50 {:.2}ms / p95 {:.2}ms / p99 {:.2}ms -- reopen {:.2}ms, verify {} sampled keys \
+         @ {:.2}us/key ({})",
+        backend.name(),
+        run.records,
+        run.batches,
+        run.total_ms / 1e3,
+        run.throughput_rec_s,
+        run.p50_ms,
+        run.p95_ms,
+        run.p99_ms,
+        run.reopen_ms,
+        SUSTAINED_VERIFY_SAMPLES.min(run.records),
+        run.verify_us,
+        if run.verify_ok { "all found" } else { "MISSING KEYS -- DATA LOSS" },
+    );
+    assert!(
+        run.verify_ok,
+        "sustained-write verification found missing keys after reopen for {} -- durability regression",
+        backend.name()
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── Driver ──────────────────────────────────────────────────────────
 
 /// Root for benchmark scratch data: `MTXDB_BENCH_ROOT` env override, else
@@ -1166,4 +1601,26 @@ fn main() {
     eprintln!("Interpretation (see DESIGN-open-and-index-persistence.md §1.2):");
     eprintln!("  cold checkpoint open measures a persisted-index reopen after page-cache");
     eprintln!("  eviction; lookups are where the resident LossyIndex should beat B+tree walkers.");
+
+    // Opt-in sustained-write phase: many small durable batches back-to-back,
+    // long enough to surface flush/compaction-stall tails that the short
+    // first/steady-append columns above are too brief to catch. See the
+    // "── Sustained-write comparison ──" section comment for the mtxdb
+    // 32-collection-fan-out vs. single-keyspace topology asymmetry.
+    if std::env::var("MTXDB_BENCH_SUSTAINED").as_deref() == Ok("1") {
+        let target_records = sustained_target_records();
+        eprintln!();
+        eprintln!(
+            "sustained-write phase: {target_records} records ({SUSTAINED_BATCH_RECORDS}/batch, \
+             fully durable per batch), reopen + {SUSTAINED_VERIFY_SAMPLES}-key verify after"
+        );
+        eprintln!(
+            "  NOTE: mtxdb writes across a {COLLECTIONS}-collection fan-out (its real topology); \
+             mdbx/sqlite/fjall write into one keyspace/table/partition -- not a like-for-like \
+             single-keyspace ceiling for mtxdb, see the row's TOPOLOGY field"
+        );
+        for backend in &engines {
+            run_sustained(*backend, target_records);
+        }
+    }
 }
