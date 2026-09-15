@@ -85,8 +85,8 @@ INVOCATIONS = (
     ("mtxdb", "writeonly", "mtxdb_writeonly"),
     ("mtxdb", "full", "mtxdb_full"),
     ("mdbx", None, "mdbx"),
-    ("sqlite", None, "sqlite"),
     ("fjall", None, "fjall"),
+    ("sqlite", None, "sqlite"),
 )
 EXPECTED_ENGINES = tuple(row_name for _, _, row_name in INVOCATIONS)
 
@@ -198,12 +198,12 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
     # read "writeonly" there), so the row label is the only thing that
     # actually tells those two apart.
     display_names = {
-        "mtxdb_none": "mtxdb (no crc)",
-        "mtxdb_writeonly": "mtxdb (writeonly)",
-        "mtxdb_full": "mtxdb (full crc32)",
+        "mtxdb_none": "mtxdb",
+        "mtxdb_writeonly": "mtxdb",
+        "mtxdb_full": "mtxdb",
         "mdbx": "mdbx",
-        "sqlite": "sqlite",
         "fjall": "fjall (lsm)",
+        "sqlite": "sqlite",
     }
     engines = [e for e in EXPECTED_ENGINES if e in latest] or list(latest)
     columns = [m[1] for m in METRICS]
