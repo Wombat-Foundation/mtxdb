@@ -970,15 +970,20 @@ impl PackfileStorage {
                     )
                 })?
             } else {
-                match packfile::scan_packfile(&path) {
-                    Ok(e) => e,
-                    Err(scan_err) => {
-                        eprintln!(
-                            "warning: read-only scan of shard {shard_id:02x} skipped: {scan_err}"
-                        );
-                        continue;
-                    }
-                }
+                // Read-only mode must not truncate a possibly in-flight tail,
+                // but it also cannot safely omit a shard.  Publishing a
+                // partial index after an I/O or corruption failure makes real
+                // records look deleted.  Surface the error and let the caller
+                // retry after the writer has finished or repair the pack.
+                packfile::scan_packfile(&path).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "read-only scan failed for shard {shard_id:02x} ({}): {error}",
+                            path.display()
+                        ),
+                    )
+                })?
             };
             for (collection_id, hash, offset) in entries {
                 if known_collections.insert(collection_id) {
@@ -5569,7 +5574,7 @@ mod tests {
                     "payload frame must still decode"
                 );
             } else {
-                let reopened = PackfileStorage::open_with_policies(dir, true, policy);
+                let reopened = PackfileStorage::open_with_policies(dir.clone(), true, policy);
                 match reopened {
                     Ok(_) => panic!("reopen scan must reject a tampered pack"),
                     Err(err) => {
@@ -5579,6 +5584,15 @@ mod tests {
                         );
                     }
                 }
+                // Remove the trusted checkpoint to exercise the read-only
+                // full-scan fallback. A valid checkpoint deliberately avoids
+                // scanning frames and verifies them lazily on lookup.
+                fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+                let read_only = PackfileStorage::open_read_only_with_policies(dir, policy);
+                assert!(
+                    read_only.is_err(),
+                    "read-only recovery must fail closed instead of omitting a corrupt shard"
+                );
             }
         }
     }

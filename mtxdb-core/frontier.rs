@@ -1,6 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::storage::{NodeData, NodeId, StorageEngine};
+use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Represents a batch of independent node hashes to fetch at one BFS level.
 ///
@@ -38,11 +43,10 @@ impl FrontierBatch {
 
 /// Batch-fetch all nodes in a frontier batch.
 ///
-/// Currently performs sequential reads via `get_many`. The `FrontierBatch`
-/// data structure is designed for future concurrent I/O (pre-resolved
-/// offsets enable `io_uring` or thread-pool dispatch), but this
-/// implementation issues reads in sorted-offset order for sequential
-/// disk access rather than true concurrency.
+/// Uses a bounded worker set so independent frontier nodes can be fetched
+/// concurrently. Results retain input order. Backends whose native batched
+/// path can improve physical ordering may use [`fetch_frontier_sequential`]
+/// instead.
 ///
 /// # Arguments
 /// * `engine` - The storage engine to read from.
@@ -59,23 +63,68 @@ pub fn fetch_frontier_batch<S: StorageEngine>(
     collection_id: &[u8; 16],
     batch: &FrontierBatch,
 ) -> Result<Vec<(NodeId, Option<NodeData>)>, crate::storage::StorageError> {
-    let results = engine.get_many(collection_id, &batch.hashes)?;
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    Ok(batch
-        .hashes
-        .iter()
-        .zip(results)
-        .map(|(&id, data)| (id, data))
-        .collect())
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(batch.len());
+    let pending = Mutex::new(
+        batch
+            .hashes
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<VecDeque<_>>(),
+    );
+    let results = Mutex::new(vec![None; batch.len()]);
+    let failure = Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if lock_unpoisoned(&failure).is_some() {
+                    return;
+                }
+                let Some((position, id)) = lock_unpoisoned(&pending).pop_front() else {
+                    return;
+                };
+                match engine.get(collection_id, &id) {
+                    Ok(data) => {
+                        lock_unpoisoned(&results)[position] = Some(data);
+                    }
+                    Err(error) => {
+                        let mut recorded = lock_unpoisoned(&failure);
+                        if recorded.is_none() {
+                            *recorded = Some(error);
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(error) = failure.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        return Err(error);
+    }
+    let results = results.into_inner().unwrap_or_else(PoisonError::into_inner);
+
+    let mut output = Vec::with_capacity(batch.len());
+    for (&id, data) in batch.hashes.iter().zip(results) {
+        let data = data.ok_or_else(|| {
+            StorageError::Internal("frontier worker exited without producing a result".to_owned())
+        })?;
+        output.push((id, data));
+    }
+    Ok(output)
 }
 
 /// Fetch all nodes in a frontier batch.
 ///
-/// Performs sequential I/O via [`fetch_frontier_batch`]. The sorted physical
+/// Performs a backend-native sequential/batched read. The sorted physical
 /// offset ordering is usually preferable for packfile/HDD reads.
-///
-/// A true concurrent implementation (`io_uring`, thread pool) is planned but
-/// not yet implemented. Callers should not assume parallelism here.
 ///
 /// # Errors
 /// Returns `StorageError::Io` on I/O failure from the storage engine.
@@ -84,7 +133,13 @@ pub fn fetch_frontier_sequential<S: StorageEngine>(
     collection_id: &[u8; 16],
     batch: &FrontierBatch,
 ) -> Result<Vec<(NodeId, Option<NodeData>)>, crate::storage::StorageError> {
-    fetch_frontier_batch(engine, collection_id, batch)
+    let results = engine.get_many(collection_id, &batch.hashes)?;
+    Ok(batch
+        .hashes
+        .iter()
+        .zip(results)
+        .map(|(&id, data)| (id, data))
+        .collect())
 }
 
 /// A BFS layer of the HAMT trie traversal.
