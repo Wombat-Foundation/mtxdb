@@ -683,7 +683,19 @@ pub fn read_record_metadata_skip_payload(
             .checked_sub(FRAME_FIXED_LEN)
             .expect("frame_len >= FRAME_FIXED_LEN, checked above"),
     ) + 4;
-    reader.seek(io::SeekFrom::Current(i64::try_from(skip).unwrap()))?;
+    let payload_start = reader.stream_position()?;
+    let frame_end = payload_start
+        .checked_add(skip)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record end overflows u64"))?;
+    let file_end = reader.seek(io::SeekFrom::End(0))?;
+    reader.seek(io::SeekFrom::Start(payload_start))?;
+    if frame_end > file_end {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "record payload or CRC is truncated",
+        ));
+    }
+    reader.seek(io::SeekFrom::Start(frame_end))?;
     Ok(Some(RecordMetadata {
         collection_id,
         hash,
@@ -1757,5 +1769,24 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let entries = scan_packfile_skip_payload(&path).unwrap();
         assert_eq!(entries, vec![]);
+    }
+
+    #[test]
+    fn test_scan_packfile_skip_payload_stops_at_truncated_crc() {
+        let dir = test_dir("scan_skip_payload_truncated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard_00.pack");
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        write_record(&mut buf, &test_record([0x01; 16], [0xAA; 16], b"complete")).unwrap();
+        let complete_len = buf.len();
+        write_record(&mut buf, &test_record([0x02; 16], [0xBB; 16], b"torn")).unwrap();
+        buf.truncate(buf.len() - 2);
+        std::fs::write(&path, &buf).unwrap();
+
+        let entries = scan_packfile_skip_payload(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, HEADER_LEN as u64);
+        assert!(buf.len() > complete_len);
     }
 }

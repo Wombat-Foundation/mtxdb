@@ -4583,6 +4583,18 @@ impl StorageEngine for PackfileStorage {
             return Ok(());
         }
 
+        // Validate every frame before appending the first one. In particular,
+        // an oversized or otherwise unencodable later entry must not leave an
+        // earlier prefix physically present for crash recovery to rediscover.
+        // I/O failures still use the append-only storage's dirty/recovery path.
+        for (id, data) in entries {
+            self.shards.validate_record(&Record {
+                collection_id: *collection_id,
+                hash: *id,
+                data: data.bytes.clone(),
+            })?;
+        }
+
         self.put_many_calls.fetch_add(1, Ordering::Relaxed);
         self.put_many_records
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
@@ -4667,20 +4679,17 @@ impl StorageEngine for PackfileStorage {
                 data: data.bytes.clone(),
             };
 
-            let (shard_id, offset) = self.shards.put_record(&record).inspect_err(|_| {
-                // The append-only pack cannot un-write records already
-                // flushed by earlier iterations of this loop: on failure
-                // this batch's index/delta/cache updates are correctly
-                // discarded below (never published), but the physical
-                // bytes for any earlier entries in this batch remain on
-                // disk, unreachable through the index until the next
-                // `rebuild_index` rediscovers them from a full pack scan.
-                // Mark the checkpoint dirty so that reconciliation is
-                // forced at the next sync instead of the checkpoint being
-                // considered clean while it disagrees with what a full
-                // scan would find.
-                self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-            })?;
+            let (shard_id, offset) = match self.shards.put_record(&record) {
+                Ok(location) => location,
+                Err(error) => {
+                    // Earlier entries may already be complete on disk. Write
+                    // a checkpoint for the old generation before returning,
+                    // so a crash after this error cannot make a restart's
+                    // fingerprint-matched scan publish the failed prefix.
+                    self.persist_failed_batch_boundary();
+                    return Err(error.into());
+                }
+            };
 
             if index_needs_rebuild {
                 continue;
@@ -4700,16 +4709,13 @@ impl StorageEngine for PackfileStorage {
                 }
             };
 
-            let insert_result = self
-                .insert_index(collection_id, live, id, shard_id, offset)
-                .inspect_err(|_| {
-                    // Earlier entries in this batch may already have been
-                    // appended.  An index hydration/read failure must not
-                    // leave a clean checkpoint describing only the old
-                    // generation; force the next sync to reconcile the
-                    // append-only packs with a full rebuild.
-                    self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-                })?;
+            let insert_result = match self.insert_index(collection_id, live, id, shard_id, offset) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.persist_failed_batch_boundary();
+                    return Err(error);
+                }
+            };
             let inserted = if let Ok((bucket, slot)) = insert_result {
                 pending_deltas.push((bucket, slot));
                 true
@@ -4761,13 +4767,13 @@ impl StorageEngine for PackfileStorage {
         }
 
         if index_needs_rebuild {
-            let rebuilt = self.rebuild_index(collection_id).inspect_err(|_| {
-                // The batch has already appended physical frames.  Preserve
-                // the dirty marker if rebuilding the in-memory index fails so
-                // a later sync cannot mistake the old checkpoint for a
-                // complete view of the packs.
-                self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-            })?;
+            let rebuilt = match self.rebuild_index(collection_id) {
+                Ok(index) => index,
+                Err(error) => {
+                    self.persist_failed_batch_boundary();
+                    return Err(error);
+                }
+            };
             // rebuild_index automatically discovers all the records we just appended
             self.replace_collection_shard_counts(
                 collection_id,
@@ -4808,7 +4814,10 @@ impl StorageEngine for PackfileStorage {
         if structural_change {
             let index = owned_index
                 .expect("structural_change is only set once owned_index is materialized");
-            self.store_generation(collection_id, index, Some(cache), false)?;
+            if let Err(error) = self.store_generation(collection_id, index, Some(cache), false) {
+                self.persist_failed_batch_boundary();
+                return Err(error);
+            }
         } else {
             // Every record landed on the live, already-published index in
             // place -- no new generation to publish, matching `put`'s
@@ -4862,6 +4871,15 @@ impl StorageEngine for PackfileStorage {
 }
 
 impl PackfileStorage {
+    /// Persist the pre-batch generation after a batch failed after physical
+    /// appends. The append-only frames remain as unreachable bytes, but the
+    /// checkpoint's matching pack fingerprint makes that exclusion durable
+    /// across a crash before the caller can run a later sync.
+    fn persist_failed_batch_boundary(&self) {
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        let _ = self.sync();
+    }
+
     /// Sync all open shards to disk (full pool, not just dirty).
     ///
     /// Also persists the shard→collection directory as a side effect, same as

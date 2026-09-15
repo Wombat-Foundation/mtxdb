@@ -1433,6 +1433,20 @@ impl ShardPool {
     /// [`Self::read_at`]), so callers observing the returned offset always
     /// see the record either way.
     ///
+    /// Validate a record using this pool's compression and checksum policy.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the record cannot be encoded within the frame
+    /// limits.
+    pub(crate) fn validate_record(&self, record: &Record) -> io::Result<()> {
+        packfile::encode_record_with_options(
+            record,
+            self.compress,
+            self.checksum_policy.computes_checksum(),
+        )
+        .map(|_| ())
+    }
+
     /// # Errors
     /// Returns `io::Error` on write, flush, or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {

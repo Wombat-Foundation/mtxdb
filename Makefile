@@ -17,14 +17,20 @@ _help:
 .PHONY: all
 all: format lint doc test install
 
-.PHONY: format
-format: ##H Format code
+.PHONY: format check-cargo-sort
+format: check-cargo-sort ##H Format code
 	prettier -w $$(git ls-files '*.md' '*.y*ml' '*.json')
 	pre-commit run --all-files
 	-isort $$(git ls-files '*.py')
 	-ruff format $$(git ls-files '*.py')
 	-ruff check --fix $$(git ls-files '*.py')
 	$(CARGO) sort --workspace --grouped
+
+check-cargo-sort:
+	@$(CARGO) sort --version >/dev/null 2>&1 || { \
+		echo "error: cargo-sort is required; install it with 'cargo install cargo-sort'" >&2; \
+		exit 1; \
+	}
 
 .PHONY: check
 check: ##H Cargo check (core) and code dupe

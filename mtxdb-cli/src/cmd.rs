@@ -326,6 +326,12 @@ fn other_shard_type_hint(cli: &Cli, collection_id: &[u8; 16]) -> String {
         .filter(|(_, dir)| {
             PackfileStorage::collection_shards_from_disk(dir)
                 .is_some_and(|shards| shards.contains_key(collection_id))
+                && PackfileStorage::open_read_only(dir.clone()).is_ok_and(|store| {
+                    store
+                        .collection_summaries()
+                        .into_iter()
+                        .any(|(id, _, _, _)| id == *collection_id)
+                })
         })
         .map(|(shard_type, _)| shard_type.as_str())
         .collect();

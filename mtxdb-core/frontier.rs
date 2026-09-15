@@ -1,17 +1,12 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::collections::HashMap;
 
-use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
+use crate::storage::{NodeData, NodeId, StorageEngine};
 
 /// Represents a batch of independent node hashes to fetch at one BFS level.
 ///
-/// This is the data structure that enables concurrent frontier submission:
-/// resolve all hashes to pack offsets in RAM, then issue all reads
-/// concurrently via `io_uring` or a thread pool.
+/// This is the data structure that enables batched frontier submission:
+/// resolve all hashes against one collection generation, then issue one
+/// backend-native read operation for the whole level.
 #[derive(Debug, Clone)]
 pub struct FrontierBatch {
     /// The hashes to fetch.
@@ -43,10 +38,8 @@ impl FrontierBatch {
 
 /// Batch-fetch all nodes in a frontier batch.
 ///
-/// Uses a bounded worker set so independent frontier nodes can be fetched
-/// concurrently. Results retain input order. Backends whose native batched
-/// path can improve physical ordering may use [`fetch_frontier_sequential`]
-/// instead.
+/// Uses the storage engine's native batch operation so all nodes observe one
+/// collection generation. Results retain input order.
 ///
 /// # Arguments
 /// * `engine` - The storage engine to read from.
@@ -67,58 +60,12 @@ pub fn fetch_frontier_batch<S: StorageEngine>(
         return Ok(Vec::new());
     }
 
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(batch.len());
-    let pending = Mutex::new(
-        batch
-            .hashes
-            .iter()
-            .copied()
-            .enumerate()
-            .collect::<VecDeque<_>>(),
-    );
-    let results = Mutex::new(vec![None; batch.len()]);
-    let failure = Mutex::new(None);
-
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                if lock_unpoisoned(&failure).is_some() {
-                    return;
-                }
-                let Some((position, id)) = lock_unpoisoned(&pending).pop_front() else {
-                    return;
-                };
-                match engine.get(collection_id, &id) {
-                    Ok(data) => {
-                        lock_unpoisoned(&results)[position] = Some(data);
-                    }
-                    Err(error) => {
-                        let mut recorded = lock_unpoisoned(&failure);
-                        if recorded.is_none() {
-                            *recorded = Some(error);
-                        }
-                        return;
-                    }
-                }
-            });
-        }
-    });
-
-    if let Some(error) = failure.into_inner().unwrap_or_else(PoisonError::into_inner) {
-        return Err(error);
-    }
-    let results = results.into_inner().unwrap_or_else(PoisonError::into_inner);
-
-    let mut output = Vec::with_capacity(batch.len());
-    for (&id, data) in batch.hashes.iter().zip(results) {
-        let data = data.ok_or_else(|| {
-            StorageError::Internal("frontier worker exited without producing a result".to_owned())
-        })?;
-        output.push((id, data));
-    }
-    Ok(output)
+    // A single backend batch call pins one collection generation for engines
+    // whose indexes are copy-on-write. Per-node worker calls can otherwise
+    // observe different generations if deletion or repacking swaps the
+    // collection while this frontier is being resolved.
+    let results = engine.get_many(collection_id, &batch.hashes)?;
+    Ok(batch.hashes.iter().copied().zip(results).collect())
 }
 
 /// Fetch all nodes in a frontier batch.

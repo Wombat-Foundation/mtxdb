@@ -14,6 +14,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use mtxdb_core::storage::{NodeData, NodeId, NodeRef, StorageEngine};
@@ -325,9 +326,31 @@ fn drop_caches_for_dir(dir: &std::path::Path) -> bool {
 /// `remove_dir_all` and recreate the other's active scratch directory,
 /// corrupting or crashing both runs.
 fn bench_root() -> std::path::PathBuf {
-    let base =
-        std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
-    base.join(format!("mtxdb_bench_pid_{}", std::process::id()))
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    static RUN: AtomicU64 = AtomicU64::new(0);
+    ROOT.get_or_init(|| {
+        let base = std::env::var_os("MTXDB_BENCH_ROOT")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        fs::create_dir_all(&base).unwrap();
+        loop {
+            let token = RUN.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!(
+                "mtxdb_bench_run_{}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                token
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create benchmark root {}: {error}", candidate.display()),
+            }
+        }
+    })
+    .clone()
 }
 
 /// Measured results from one scenario run, used to drive the decision
