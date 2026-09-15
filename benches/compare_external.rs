@@ -282,6 +282,32 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     }
     store_rw.sync_all().unwrap();
     let write_ms = started.elapsed().as_secs_f64() * 1e3;
+    // Forward-looking prediction, not a retrospective one: the post-build
+    // load factor already determines whether the *next* append batch will
+    // trigger capacity growth (>75% load) on some/all collections, well
+    // before that batch runs. This is the exact mechanism behind the
+    // "grow append/sync" line below and the 0.1GB-vs-1GB "first append"
+    // contrast documented in DESIGN-open-and-index-persistence.md §5-6 —
+    // printed here so a chosen MTXDB_BENCH_EXT_GB's behavior is legible
+    // up front instead of only after the fact.
+    {
+        let summaries = store_rw.collection_summaries();
+        let loads: Vec<f64> = summaries
+            .iter()
+            .map(|&(_, len, _, capacity)| len as f64 / f64::from(capacity))
+            .collect();
+        let min_load = loads.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_load = loads.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        eprintln!(
+            "    mtxdb post-build load factor: {:.1}%-{:.1}% across {} collections \
+             ({} collection(s) already above 70% — expect growth, and its full \
+             checkpoint rewrite, on the very next append to those)",
+            min_load * 100.0,
+            max_load * 100.0,
+            summaries.len(),
+            loads.iter().filter(|&&l| l > 0.70).count(),
+        );
+    }
     if let Some(sync) = store_rw.sync_timings() {
         eprintln!(
             "    mtxdb sync_all: flush {:.2}ms + fsync {:.2}ms + sidecar {:.2}ms + delta {:.2}ms + checkpoint {:.2}ms = {:.2}ms",

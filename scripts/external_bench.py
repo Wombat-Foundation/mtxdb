@@ -179,10 +179,15 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
     # variants (see INVOCATIONS) get a human label instead of their engine
     # key. Falls back to the raw key for any row this table doesn't know
     # about (an older/newer capture), so it degrades instead of crashing.
+    # Collapsing all three to plain "mtxdb" would make two of the five rows
+    # indistinguishable: the "crc check mode" column only has two states
+    # (checkpoints have no fully-off tier -- "no crc" and "writeonly" both
+    # read "writeonly" there), so the row label is the only thing that
+    # actually tells those two apart.
     display_names = {
-        "mtxdb_none": "mtxdb",
-        "mtxdb_writeonly": "mtxdb",
-        "mtxdb_full": "mtxdb",
+        "mtxdb_none": "mtxdb (no crc)",
+        "mtxdb_writeonly": "mtxdb (writeonly)",
+        "mtxdb_full": "mtxdb (full crc32)",
         "mdbx": "mdbx",
         "sqlite": "sqlite",
     }
