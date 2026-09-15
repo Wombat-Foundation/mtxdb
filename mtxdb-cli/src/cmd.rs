@@ -564,6 +564,45 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 /// ```
 ///
 /// Returns `None` when the bytes don't match this layout.
+fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
+    const VERSION: u8 = 0x01;
+    const ROOT_HASH_LEN: usize = 32;
+    const LATTICE_LEN: usize = 2048;
+
+    if bytes.first().copied()? != VERSION || bytes.len() < 5 {
+        return None;
+    }
+    let prefix_len = u16::from_be_bytes(bytes[1..3].try_into().ok()?) as usize;
+    let room_id_len_offset = 3usize.checked_add(prefix_len)?;
+    let room_id_len_end = room_id_len_offset.checked_add(2)?;
+    let room_id_len = u16::from_be_bytes(
+        bytes
+            .get(room_id_len_offset..room_id_len_end)?
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let room_id_start = room_id_len_end;
+    let root_hash_start = room_id_start.checked_add(room_id_len)?;
+    let lattice_start = root_hash_start.checked_add(ROOT_HASH_LEN)?;
+    let end = lattice_start.checked_add(LATTICE_LEN)?;
+    if bytes.len() != end {
+        return None;
+    }
+    let room_id = core::str::from_utf8(bytes.get(room_id_start..root_hash_start)?).ok()?;
+    let room_prefix = bytes.get(3..room_id_len_offset)?;
+    let root_hash = bytes.get(root_hash_start..lattice_start)?;
+
+    let mut out = Vec::new();
+    writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
+    writeln!(out, "// room prefix: 0x{}", hex::encode(room_prefix)).unwrap();
+    writeln!(out, "// room ID: {room_id:?}").unwrap();
+    writeln!(out, "// root hash: {}...", hex::encode(&root_hash[..8])).unwrap();
+    writeln!(out, "// lattice: {LATTICE_LEN} bytes (1024 u16 lanes)").unwrap();
+    writeln!(out, "// total payload: {} bytes", bytes.len()).unwrap();
+    Some(out)
+}
+
+/// Returns `None` when the bytes don't match this layout.
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     const WIRE_V1: u8 = 0x01;
@@ -752,6 +791,9 @@ fn decode_length_prefixed_string(bytes: &[u8], cursor: &mut usize) -> Option<Str
 fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
     if let Some(plain) = pretty_json_stream(bytes) {
         return Some(plain);
+    }
+    if let Some(root) = decode_hamt_root(bytes) {
+        return Some(root);
     }
     if let Some(hamt) = decode_hamt_node(bytes) {
         return Some(hamt);
@@ -3875,10 +3917,11 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 mod tests {
     use super::{
         cmd_sync, compile_import_template, decode_event_json_record, decode_hamt_node,
-        default_matrix_import_template, event_room_id, extract_pointer_string, fmt_disk_megabytes,
-        fmt_megabytes, glob_pack_files, interleaving_worth_noting, matrix_batch_has_create,
-        matrix_create_details, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        resolve_import_collection, template_collection_id, CollectionTemplate,
+        decode_hamt_root, default_matrix_import_template, event_room_id, extract_pointer_string,
+        fmt_disk_megabytes, fmt_megabytes, glob_pack_files, interleaving_worth_noting,
+        matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
+        parse_pack_selectors, pretty_print_payload, resolve_import_collection,
+        template_collection_id, CollectionTemplate,
     };
     use crate::{Cli, Commands};
     use mtxdb_core::{DatabaseLayout, ShardType};
@@ -4487,6 +4530,28 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("0 leaves"));
         assert!(text.contains("0 children"));
+    }
+
+    #[test]
+    fn hamt_state_group_root() {
+        let room_prefix = [0xB2, 0xA2, 0xFD, 0xEA, 0xB7, 0x14, 0xDE, 0x6D];
+        let room_id = "owusNddwskNpuHuitQ:test";
+        let root_hash = [0xAB; 32];
+        let lattice = [0xCD; 2048];
+        let mut encoded = vec![0x01];
+        encoded.extend_from_slice(&u16::try_from(room_prefix.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(&room_prefix);
+        encoded.extend_from_slice(&u16::try_from(room_id.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(room_id.as_bytes());
+        encoded.extend_from_slice(&root_hash);
+        encoded.extend_from_slice(&lattice);
+
+        let out = decode_hamt_root(&encoded).expect("should decode root");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("b2a2fdeab714de6d"));
+        assert!(text.contains(room_id));
+        assert!(text.contains("abababababababab"));
+        assert!(text.contains("2048 bytes"));
     }
 
     #[test]
