@@ -4700,9 +4700,17 @@ impl StorageEngine for PackfileStorage {
                 }
             };
 
-            let inserted = if let Ok((bucket, slot)) =
-                self.insert_index(collection_id, live, id, shard_id, offset)?
-            {
+            let insert_result = self
+                .insert_index(collection_id, live, id, shard_id, offset)
+                .inspect_err(|_| {
+                    // Earlier entries in this batch may already have been
+                    // appended.  An index hydration/read failure must not
+                    // leave a clean checkpoint describing only the old
+                    // generation; force the next sync to reconcile the
+                    // append-only packs with a full rebuild.
+                    self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+                })?;
+            let inserted = if let Ok((bucket, slot)) = insert_result {
                 pending_deltas.push((bucket, slot));
                 true
             } else {
@@ -4753,7 +4761,13 @@ impl StorageEngine for PackfileStorage {
         }
 
         if index_needs_rebuild {
-            let rebuilt = self.rebuild_index(collection_id)?;
+            let rebuilt = self.rebuild_index(collection_id).inspect_err(|_| {
+                // The batch has already appended physical frames.  Preserve
+                // the dirty marker if rebuilding the in-memory index fails so
+                // a later sync cannot mistake the old checkpoint for a
+                // complete view of the packs.
+                self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+            })?;
             // rebuild_index automatically discovers all the records we just appended
             self.replace_collection_shard_counts(
                 collection_id,
