@@ -59,13 +59,16 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [features]
-# Opt-in external comparison benchmarks (MDBX + SQLite), see
+# Opt-in external comparison benchmarks (MDBX + SQLite + fjall), see
 # DESIGN-open-and-index-persistence.md §2.3. Gated behind a feature so the
-# default `cargo bench` / CI never builds or ships either engine; both are
+# default `cargo bench` / CI never builds or ships any of them; all three are
 # comparison-only dev dependencies.
 #   libmdbx:   wrapped library Apache-2.0 (since v0.13), wrapper crate MPL-2.0
 #   rusqlite:  MIT (links the system libsqlite3, itself public domain)
-compare-external = ["dep:libmdbx", "dep:rusqlite"]
+#   fjall:     MIT/Apache-2.0 dual-licensed (an embedded LSM-tree, unlike
+#              MDBX/SQLite's B-trees -- included to show what a
+#              write-optimized engine trades off against mtxdb/mdbx/sqlite)
+compare-external = ["dep:libmdbx", "dep:rusqlite", "dep:fjall"]
 
 [dependencies]
 # External comparison backends for `benches/compare_external.rs`, optional so
@@ -78,6 +81,7 @@ compare-external = ["dep:libmdbx", "dep:rusqlite"]
 # pkg-config) skips that compile step; it costs requiring sqlite3 dev headers
 # to be installed wherever `--features compare-external` is actually used,
 # which is fine for an opt-in comparison bench that never ships.
+fjall = { version = "2.11.2", optional = true }
 libmdbx = { version = "0.6", optional = true }
 mtxdb-core = { path = "mtxdb-core" }
 rusqlite = { version = "0.32", optional = true }

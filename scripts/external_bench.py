@@ -1,4 +1,4 @@
-"""Run the mtxdb / mdbx / sqlite comparison bench and print the summary table.
+"""Run the mtxdb / mdbx / sqlite / fjall comparison bench and print the summary table.
 
 Running the script directly only prints the table; it never touches the
 committed `benches/csv/external.csv` history. Pass `--append` (as
@@ -38,13 +38,13 @@ METRICS = [
     # number captured identically for all three engines, so it is the
     # cross-engine-comparable column; "index size" above is not (see its
     # mem_label: resident index bytes for mtxdb, on-disk file bytes for
-    # mdbx/sqlite). "mem open" is sampled right after the warm open, before
+    # mdbx/sqlite/fjall). "mem open" is sampled right after the warm open, before
     # any lookups touch pages; "mem warm" after the sampled lookup pass.
     ("pss_open_bytes", "mem open ~"),
     ("pss_warm_bytes", "mem warm ~"),
     # The frame-level ChecksumPolicy actually in effect: "full"/"writeonly"/
     # "none" for mtxdb (matching its row -- see INVOCATIONS), "na" for
-    # mdbx/sqlite, which have no equivalent read-time integrity check.
+    # mdbx/sqlite/fjall, which have no equivalent read-time integrity check.
     # Deliberately the frame policy, not the checkpoint's own (checkpoints
     # have no fully-off tier, so that would read "writeonly" for both the
     # "no crc" and "writeonly" rows and the column couldn't tell them apart).
@@ -70,7 +70,7 @@ BENCH_CMD = [
     "compare-external",
 ]
 
-# mtxdb is swept across its three checksum postures (mdbx/sqlite have no
+# mtxdb is swept across its three checksum postures (mdbx/sqlite/fjall have no
 # equivalent knob -- see checksum_policy_from_env in compare_external.rs --
 # so they run once each). Each tuple is
 # (MTXDB_BENCH_EXT_ENGINE value, MTXDB_BENCH_CHECKSUM override or None, the
@@ -84,6 +84,7 @@ INVOCATIONS = (
     ("mtxdb", "full", "mtxdb_full"),
     ("mdbx", None, "mdbx"),
     ("sqlite", None, "sqlite"),
+    ("fjall", None, "fjall"),
 )
 EXPECTED_ENGINES = tuple(row_name for _, _, row_name in INVOCATIONS)
 
@@ -103,17 +104,17 @@ def validate_rows(rows: list[dict]) -> None:
 
 
 def run_bench() -> None:
-    """Run the comparison bench once per engine, each its own process.
+    """Run the comparison bench once per invocation, each its own process.
 
     `/proc/self/smaps_rollup`-based RSS/PSS sampling (see
     `compare_external.rs::smaps_rollup`) reports the whole process, so
-    running all three engines in one `cargo bench` invocation would let
+    running every engine in one `cargo bench` invocation would let
     allocator retention and a prior engine's still-resident pages bias
     later engines' numbers. `MTXDB_BENCH_EXT_ENGINE` restricts a run to a
-    single backend; running it three times, once per engine, gives each
-    one a fresh address space for that measurement. Output from all three
-    processes is concatenated into LATEST so `append_rows` parses it the
-    same as a single combined run.
+    single backend; running it once per row in INVOCATIONS gives each one a
+    fresh address space for that measurement. Output from every process is
+    concatenated into LATEST so `append_rows` parses it the same as a
+    single combined run.
     """
     CSV_DIR.mkdir(parents=True, exist_ok=True)
     with LATEST.open("wb") as out:
@@ -166,7 +167,7 @@ def append_rows(scenario: Scenario) -> int:
 
 
 def print_table(rows: list[dict], default_run: bool | None = True) -> None:
-    """Render the three engines side by side from a run's external rows.
+    """Render every engine side by side from a run's external rows.
 
     `default_run` distinguishes a plain 0.1 GB run (``True``) from an explicit
     size (``False``). ``None`` means the raw capture came from an earlier run,
@@ -190,6 +191,7 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
         "mtxdb_full": "mtxdb (full crc32)",
         "mdbx": "mdbx",
         "sqlite": "sqlite",
+        "fjall": "fjall (lsm)",
     }
     engines = [e for e in EXPECTED_ENGINES if e in latest] or list(latest)
     columns = [m[1] for m in METRICS]
@@ -202,6 +204,11 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
         value = latest[engine][metric]
         if metric == "checksum":
             return str(value) or "?"
+        if metric in ("pss_open_bytes", "pss_warm_bytes") and value is None:
+            # `compare_external` emits zero as an unavailable `/proc` PSS
+            # sentinel. `external_scenario` turns that into None so it is not
+            # rendered or written to history as a bogus 0.0B measurement.
+            return "n/a"
         if metric in ("files_bytes", "pss_open_bytes", "pss_warm_bytes"):
             return _human_bytes(int(value))
         if metric != "mem_bytes":
@@ -271,7 +278,7 @@ def print_table(rows: list[dict], default_run: bool | None = True) -> None:
             "mtxdb (no crc): both frame and checkpoint CRC32 off (fastest, "
             "least safe) — mtxdb (writeonly): CRCs written but not "
             "re-verified on read — mtxdb (full crc32): the engine's actual "
-            "default, verified on every read. mdbx/sqlite have no "
+            "default, verified on every read. mdbx/sqlite/fjall have no "
             "equivalent read-time checksum of their own to sweep."
         )
 

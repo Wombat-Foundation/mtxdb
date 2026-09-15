@@ -1,5 +1,6 @@
-//! Three-way synthetic comparison — mtxdb (`PackfileStorage`) vs MDBX vs
-//! SQLite — so the "is mtxdb actually faster at moderate inputs?" claim from
+//! Four-way synthetic comparison — mtxdb (`PackfileStorage`) vs MDBX vs
+//! SQLite vs fjall (an LSM-tree, unlike the other two B-trees) — so the
+//! "is mtxdb actually faster at moderate inputs?" claim from
 //! `DESIGN-open-and-index-persistence.md` is measured against the real
 //! baselines, not argued.
 //!
@@ -13,7 +14,7 @@
 //! Same synthetic dataset on every engine (16-byte keys, 1 KB incompressible
 //! values, deterministic, same RNG), so the numbers are directly comparable:
 //! batch write, warm/cold open, sampled point lookups, small batch append,
-//! plus resident-index memory for mtxdb and on-disk file bytes for MDBX/SQLite
+//! plus resident-index memory for mtxdb and on-disk file bytes for MDBX/SQLite/fjall
 //! (reported under distinct labels — the two are *not* the same quantity).
 //!
 //! Not part of the public crate API. Lints are relaxed here for the same
@@ -92,6 +93,26 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Total bytes of regular files under `dir`, recursing into subdirectories.
+/// Unlike `dir_bytes` (top-level only, sufficient for MDBX/SQLite's flat
+/// single-file layout), fjall spreads segments/journal/manifest across
+/// nested directories, so a top-level scan would undercount it.
+fn dir_bytes_recursive(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total += dir_bytes_recursive(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 /// Process-wide (RSS, PSS) in bytes from `/proc/self/smaps_rollup`, best
 /// effort. PSS apportions shared file-backed pages (mmap'd packfiles, the
 /// mmap-backed MDBX/SQLite files) across mappings, so it is the honest
@@ -162,6 +183,7 @@ enum Backend {
     Mtxdb,
     Mdbx,
     Sqlite,
+    Fjall,
 }
 
 impl Backend {
@@ -170,6 +192,7 @@ impl Backend {
             Self::Mtxdb => "mtxdb",
             Self::Mdbx => "mdbx",
             Self::Sqlite => "sqlite",
+            Self::Fjall => "fjall",
         }
     }
 }
@@ -232,7 +255,7 @@ fn cache_capacity_from_env() -> usize {
 
 fn mtxdb_open(dir: &std::path::Path) -> PackfileStorage {
     // MTXDB_BENCH_COMPRESS=0 opens the store with per-record zstd disabled, to
-    // measure the raw append path against mdbx/sqlite. The bench payload is
+    // measure the raw append path against mdbx/sqlite/fjall. The bench payload is
     // seeded-incompressible anyway, so compression only pure overhead here.
     let compress_off = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0");
     let checksum = checksum_policy_from_env();
@@ -810,6 +833,126 @@ fn run_sqlite(dir: &std::path::Path, nodes: usize) -> Run {
     }
 }
 
+/// LSM-tree comparison point: unlike MDBX/SQLite (both B-trees), fjall
+/// writes through a memtable + append-only journal and compacts sorted runs
+/// in the background, so it trades read/space amplification for write
+/// amplification differently than the B-tree engines above -- this is the
+/// row that shows what a write-optimized engine does differently.
+#[allow(clippy::used_underscore_binding)]
+fn run_fjall(dir: &std::path::Path, nodes: usize) -> Run {
+    use fjall::{Config, PartitionCreateOptions, PersistMode};
+
+    fn open(dir: &std::path::Path) -> (fjall::Keyspace, fjall::PartitionHandle) {
+        let keyspace = Config::new(dir).open().unwrap();
+        let partition = keyspace
+            .open_partition("nodes", PartitionCreateOptions::default())
+            .unwrap();
+        (keyspace, partition)
+    }
+
+    // ── Build ──
+    let started = Instant::now();
+    {
+        let (keyspace, partition) = open(dir);
+        let mut batch = keyspace.batch();
+        for node in 0..nodes {
+            let p = payload(node as u64);
+            batch.insert(&partition, node_id(node).to_vec(), p);
+        }
+        batch.commit().unwrap();
+        keyspace.persist(PersistMode::SyncAll).unwrap();
+    }
+    let write_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    let files = dir_bytes_recursive(dir);
+    // fjall's data lives across memtable + sorted segment files on disk (no
+    // single mmap'd file like MDBX), so on-disk bytes is the honest
+    // footprint, same rationale as the MDBX/SQLite rows above.
+    let mem = files;
+    let mem_label = "file_bytes";
+
+    // ── Warm open + sampled point lookups ──
+    let started = Instant::now();
+    let (keyspace, partition) = open(dir);
+    let warm_open_ms = started.elapsed().as_secs_f64() * 1e3;
+    let rss_pss_open = smaps_rollup();
+    let lookup_started = Instant::now();
+    for node in 0..LOOKUP_SAMPLES.min(nodes) {
+        let key = node_id(node);
+        assert!(
+            partition.get(key).unwrap().is_some(),
+            "every written key must be readable back"
+        );
+    }
+    let lookup_us = lookup_started.elapsed().as_secs_f64() * 1e6 / LOOKUP_SAMPLES.min(nodes) as f64;
+    let rss_pss_warm = smaps_rollup();
+    drop(partition);
+    drop(keyspace);
+
+    // ── Cold open + append ──
+    let evicted = drop_caches_for_dir(dir);
+    let started = Instant::now();
+    let (keyspace, partition) = open(dir);
+    let cold_open_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    let append_puts_started = Instant::now();
+    let mut batch = keyspace.batch();
+    for i in 0..APPEND_RECORDS {
+        let node = nodes + i;
+        let p = payload(node as u64);
+        batch.insert(&partition, node_id(node).to_vec(), p);
+    }
+    let append_puts_ms = append_puts_started.elapsed().as_secs_f64() * 1e3;
+    let append_sync_started = Instant::now();
+    batch.commit().unwrap();
+    keyspace.persist(PersistMode::SyncAll).unwrap();
+    let append_sync_ms = append_sync_started.elapsed().as_secs_f64() * 1e3;
+    let append_ms = append_puts_ms + append_sync_ms;
+
+    let mut steady_puts_ms = 0.0;
+    let mut steady_sync_ms = 0.0;
+    for batch_idx in 0..STEADY_APPEND_BATCHES {
+        let puts_started = Instant::now();
+        let mut batch = keyspace.batch();
+        for i in 0..STEADY_APPEND_RECORDS {
+            let node = nodes + APPEND_RECORDS + batch_idx * STEADY_APPEND_RECORDS + i;
+            let p = payload(node as u64);
+            batch.insert(&partition, node_id(node).to_vec(), p);
+        }
+        steady_puts_ms += puts_started.elapsed().as_secs_f64() * 1e3;
+        let sync_started = Instant::now();
+        batch.commit().unwrap();
+        keyspace.persist(PersistMode::SyncAll).unwrap();
+        steady_sync_ms += sync_started.elapsed().as_secs_f64() * 1e3;
+    }
+    drop(partition);
+    drop(keyspace);
+
+    if !evicted {
+        eprintln!("  Note: vmtouch unavailable or failed; no disk-cold claim is made (fjall).");
+    }
+
+    Run {
+        write_ms,
+        warm_open_ms,
+        cold_open_ms,
+        lookup_us,
+        append_ms,
+        append_puts_ms,
+        append_sync_ms,
+        append_loop_ms: None,
+        append_sync_all_ms: None,
+        steady_append_ms: (steady_puts_ms + steady_sync_ms) / STEADY_APPEND_BATCHES as f64,
+        steady_append_puts_ms: steady_puts_ms / STEADY_APPEND_BATCHES as f64,
+        steady_append_sync_ms: steady_sync_ms / STEADY_APPEND_BATCHES as f64,
+        files,
+        mem,
+        mem_label,
+        rss_pss_open,
+        rss_pss_warm,
+    }
+}
+
 // ── Driver ──────────────────────────────────────────────────────────
 
 /// Root for benchmark scratch data: `MTXDB_BENCH_ROOT` env override, else
@@ -834,6 +977,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
         Backend::Mtxdb => run_mtxdb(&dir, nodes),
         Backend::Mdbx => run_mdbx(&dir, nodes),
         Backend::Sqlite => run_sqlite(&dir, nodes),
+        Backend::Fjall => run_fjall(&dir, nodes),
     };
 
     let label = format!("{target_gb:.3}");
@@ -849,7 +993,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
     // (`checksum_policy_from_env`, set explicitly per invocation by
     // `scripts/external_bench.py`) rather than always reporting plain
     // "mtxdb" — three separate rows (no checksum / writeonly / full crc32)
-    // would otherwise collide on the same engine name. mdbx/sqlite have no
+    // would otherwise collide on the same engine name. mdbx/sqlite/fjall have no
     // equivalent knob, so they keep their plain name.
     let engine_label = match backend {
         Backend::Mtxdb => match checksum_policy_from_env() {
@@ -857,7 +1001,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
             mtxdb_core::packfile::ChecksumPolicy::WriteOnly => "mtxdb_writeonly",
             mtxdb_core::packfile::ChecksumPolicy::Disabled => "mtxdb_none",
         },
-        Backend::Mdbx | Backend::Sqlite => backend.name(),
+        Backend::Mdbx | Backend::Sqlite | Backend::Fjall => backend.name(),
     };
     // The frame-level policy (checksum_policy_from_env, same one that names
     // the row above): "full"/"writeonly"/"none" for mtxdb, "na" for engines
@@ -872,7 +1016,7 @@ fn run_backend(backend: Backend, target_gb: f64) {
             mtxdb_core::packfile::ChecksumPolicy::WriteOnly => "writeonly",
             mtxdb_core::packfile::ChecksumPolicy::Disabled => "none",
         },
-        Backend::Mdbx | Backend::Sqlite => "na",
+        Backend::Mdbx | Backend::Sqlite | Backend::Fjall => "na",
     };
     println!(
         "bench: external ENG={} L={label}gb N={nodes} WRITE_MS={:.1} WARM_OPEN_MS={:.3} \
@@ -938,12 +1082,13 @@ fn run_backend(backend: Backend, target_gb: f64) {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Parse `MTXDB_BENCH_EXT_ENGINE` (unset -> run all three in one process,
-/// the historical default; `mtxdb`/`mdbx`/`sqlite` -> run only that one).
+/// Parse `MTXDB_BENCH_EXT_ENGINE` (unset -> run all four in one process,
+/// the historical default; `mtxdb`/`mdbx`/`sqlite`/`fjall` -> run only that
+/// one).
 ///
 /// Single-engine mode exists for `scripts/external_bench.py`, which invokes
-/// this binary three times, once per engine, so each backend gets its own
-/// fresh process for the RSS/PSS sampling in `run_backend`. Sequential
+/// this binary once per engine, so each backend gets its own fresh process
+/// for the RSS/PSS sampling in `run_backend`. Sequential
 /// in-process runs share one address space: allocator retention and a prior
 /// engine's still-resident pages would bias later engines' PSS/RSS, since
 /// `/proc/self/smaps_rollup` reports the whole process, not per-backend.
@@ -953,10 +1098,16 @@ fn engines_from_env() -> Vec<Backend> {
             "mtxdb" => vec![Backend::Mtxdb],
             "mdbx" => vec![Backend::Mdbx],
             "sqlite" => vec![Backend::Sqlite],
+            "fjall" => vec![Backend::Fjall],
             other => panic!("invalid MTXDB_BENCH_EXT_ENGINE: {other:?}"),
         },
         Err(std::env::VarError::NotPresent) => {
-            vec![Backend::Mtxdb, Backend::Mdbx, Backend::Sqlite]
+            vec![
+                Backend::Mtxdb,
+                Backend::Mdbx,
+                Backend::Sqlite,
+                Backend::Fjall,
+            ]
         }
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!("MTXDB_BENCH_EXT_ENGINE must be valid UTF-8")
@@ -966,7 +1117,9 @@ fn engines_from_env() -> Vec<Backend> {
 
 fn main() {
     let engines = engines_from_env();
-    eprintln!("external comparison bench — mtxdb vs MDBX vs SQLite (default 0.1 GB per engine)");
+    eprintln!(
+        "external comparison bench — mtxdb vs MDBX vs SQLite vs fjall (default 0.1 GB per engine)"
+    );
     eprintln!("set MTXDB_BENCH_EXT_GB=1,100,1000 (comma-separated GB targets) for the real curve");
     if engines.len() == 1 {
         eprintln!(

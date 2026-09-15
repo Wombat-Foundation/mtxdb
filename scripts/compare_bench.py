@@ -8,6 +8,7 @@ storage, elephant) is lenient and only appears when its `bench:` rows do.
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import re
@@ -41,7 +42,7 @@ EXPECTED_METRICS = {
 # present when the family is, and any extra sizes are compared leniently.
 DEFAULT_OPEN_LABELS = {"0.1"}
 
-# Three-way comparison bench (`benches/compare_external.rs`), same default
+# Four-way comparison bench (`benches/compare_external.rs`), same default
 # size, gated behind the `compare-external` feature (absent -> family absent).
 DEFAULT_EXT_LABELS = {"0.1"}
 
@@ -103,7 +104,7 @@ DEFAULT_ELEPHANT_MODES = {
 ROW_LOCALITY = re.compile(
     r"^bench: locality L=(?P<label>\w+) N=\d+ CACHE=\d+ "
     r"PACK_BYTES=(?P<pack>\d+) WRITE_EVENTS_PER_SEC=(?P<write_eps>[\d.]+) "
-    r"READ_SYSCALLS=(?P<read_syscalls>\d+) DISK_READ_BYTES=(?P<disk_reads>\d+) "
+    r"READ_SYSCALLS=(?P<read_syscalls>\d+|n/a) DISK_READ_BYTES=(?P<disk_reads>\d+|n/a) "
     r"INDEX_LOSS_PCT=(?P<index_loss>[\d.]+) COLD_GETS_PER_SEC=(?P<cold_gets>[\d.]+) "
     r"WARM_HIT_PCT=(?P<warm_hit>[\d.]+) WARM_GETS_PER_SEC=(?P<warm_gets>[\d.]+)",
     re.MULTILINE,
@@ -120,8 +121,8 @@ ROW_INTENT = re.compile(
 ROW_SWARM = re.compile(
     r"^bench: swarm HISTORY=(?P<history>\d+) SWARM=(?P<swarm>\d+) "
     r"MODE=(?P<mode>\w+) TARGET=(?P<target>\w+) FOUND=(?P<found>\d+)/(?P<total>\d+) "
-    r"ELAPSED_US=(?P<elapsed>[\d.]+) SYSCALLS=(?P<syscalls>\d+) "
-    r"DISK_READ_BYTES=(?P<disk>\d+) EVICTED=(?P<evicted>\w+)",
+    r"ELAPSED_US=(?P<elapsed>[\d.]+) SYSCALLS=(?P<syscalls>\d+|n/a) "
+    r"DISK_READ_BYTES=(?P<disk>\d+|n/a) EVICTED=(?P<evicted>\w+)",
     re.MULTILINE,
 )
 
@@ -185,9 +186,15 @@ class Scenario:
     machine: str = ""
 
     def with_machine(self, machine: str) -> "Scenario":
-        """Return a copy carrying this run's machine/spec fingerprint, so the
-        CSV history can tell machines apart without a schema change."""
-        self.machine = machine
+        """Attach a compact, stable machine key to this scenario.
+
+        The full descriptor remains in ``benches/csv/machine.txt``.  Repeating
+        it in every CSV row makes the history mostly hardware prose and makes
+        a one-character hardware update require editing every file.
+        """
+        normalized = " ".join(machine.split())
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+        self.machine = f"machine-{digest}"
         return self
 
 
@@ -304,7 +311,7 @@ def external_scenario(output: str) -> Scenario:
             "pss_warm_bytes",
             # mtxdb's frame-level ChecksumPolicy actually in effect:
             # "full"/"writeonly"/"none" (MTXDB_BENCH_CHECKSUM), or "na" for
-            # engines with no equivalent read-time check (mdbx, sqlite) --
+            # engines with no equivalent read-time check (mdbx, sqlite, fjall) --
             # recorded per row so a comparison across history never has to
             # guess which policy produced it. Captures before this column
             # existed leave it blank.
@@ -331,9 +338,14 @@ def external_scenario(output: str) -> Scenario:
             "mem_bytes": int(m["mem"]),
             "mem_label": m["mem_label"],
             "rss_open_bytes": int(m["rss_open"]),
-            "pss_open_bytes": int(m["pss_open"]),
+            # `compare_external` uses zero only as its explicit sentinel when
+            # `/proc/self/smaps_rollup` cannot be sampled.  A live benchmark
+            # process cannot have a real zero PSS, so preserve that distinction
+            # as a missing CSV value rather than publishing a false 0-byte
+            # memory measurement or tracking it as a performance datapoint.
+            "pss_open_bytes": _optional_pss_bytes(m["pss_open"]),
             "rss_warm_bytes": int(m["rss_warm"]),
-            "pss_warm_bytes": int(m["pss_warm"]),
+            "pss_warm_bytes": _optional_pss_bytes(m["pss_warm"]),
             "checksum": m["checksum"] or "",
         }
         base = f"ext/{m['eng']}/{m['label']}gb/"
@@ -388,8 +400,8 @@ def storage_scenarios(output: str) -> list[Scenario]:
             "label": m["label"],
             "pack_bytes": int(m["pack"]),
             "write_events_per_sec": float(m["write_eps"]),
-            "read_syscalls": int(m["read_syscalls"]),
-            "disk_read_bytes": int(m["disk_reads"]),
+            "read_syscalls": _optional_u64(m["read_syscalls"]),
+            "disk_read_bytes": _optional_u64(m["disk_reads"]),
             "index_loss_pct": float(m["index_loss"]),
             "cold_gets_per_sec": float(m["cold_gets"]),
             "warm_hit_pct": float(m["warm_hit"]),
@@ -406,7 +418,8 @@ def storage_scenarios(output: str) -> list[Scenario]:
             "warm_hit_pct",
             "warm_gets_per_sec",
         ):
-            locality.tracked[base + metric] = float(row[metric])
+            if row[metric] is not None:
+                locality.tracked[base + metric] = float(row[metric])
         locality.rows.append(row)
     scenarios.append(locality)
 
@@ -466,8 +479,8 @@ def storage_scenarios(output: str) -> list[Scenario]:
             "found": int(m["found"]),
             "total": int(m["total"]),
             "elapsed_us": float(m["elapsed"]),
-            "syscalls": int(m["syscalls"]),
-            "disk_read_bytes": int(m["disk"]),
+            "syscalls": _optional_u64(m["syscalls"]),
+            "disk_read_bytes": _optional_u64(m["disk"]),
         }
         base = f"swarm/{m['history']}/{m['mode']}/{m['target']}/"
         for metric in (
@@ -477,7 +490,8 @@ def storage_scenarios(output: str) -> list[Scenario]:
             "syscalls",
             "disk_read_bytes",
         ):
-            swarm.tracked[base + metric] = float(row[metric])
+            if row[metric] is not None:
+                swarm.tracked[base + metric] = float(row[metric])
         swarm.rows.append(row)
     scenarios.append(swarm)
 
@@ -637,6 +651,17 @@ def _optional_float(value) -> float | None:
     return None if value is None else float(value)
 
 
+def _optional_u64(value: str) -> int | None:
+    """Decode an explicit unavailable kernel-counter sentinel."""
+    return None if value == "n/a" else int(value)
+
+
+def _optional_pss_bytes(value: str) -> int | None:
+    """Decode compare_external's explicit unavailable-PSS sentinel."""
+    parsed = int(value)
+    return None if parsed == 0 else parsed
+
+
 def parse_current(path: Path) -> list[Scenario]:
     """Parse `path`, requiring the full compression gate first, then every
     scenario family whose rows are present."""
@@ -679,7 +704,18 @@ def parse_current(path: Path) -> list[Scenario]:
     ext = external_scenario(output)
     if ext.rows:
         engines = {row["engine"] for row in ext.rows}
-        expected_engines = {"mtxdb", "mdbx", "sqlite"}
+        # The external wrapper deliberately runs mtxdb under all three frame
+        # checksum postures.  Treating that sweep as one plain `mtxdb` row
+        # would let a truncated capture publish a partial comparison and
+        # would also make the checksum-policy baselines collide.
+        expected_engines = {
+            "mtxdb_none",
+            "mtxdb_writeonly",
+            "mtxdb_full",
+            "mdbx",
+            "sqlite",
+            "fjall",
+        }
         if engines != expected_engines:
             missing = sorted(expected_engines - engines)
             unexpected = sorted(engines - expected_engines)
