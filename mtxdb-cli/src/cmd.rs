@@ -4624,7 +4624,7 @@ mod tests {
     #[test]
     fn hamt_datamap_nodemap_overlap_rejected() {
         // Both bitmaps claim slot 0.
-        let mut buf = b"MTHN\x01".to_vec();
+        let mut buf = b"MTHN\x02".to_vec();
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap: slot 0
         buf.extend_from_slice(&1u32.to_le_bytes()); // nodemap: slot 0 (overlap)
         buf.extend_from_slice(&1u32.to_le_bytes()); // leaf_count
@@ -4635,7 +4635,7 @@ mod tests {
     #[test]
     fn hamt_leaf_count_mismatch_rejected() {
         // datamap says 1 leaf, but leaf_count says 0.
-        let mut buf = b"MTHN\x01".to_vec();
+        let mut buf = b"MTHN\x02".to_vec();
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap
         buf.extend_from_slice(&0u32.to_le_bytes()); // nodemap
         buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count (wrong)
