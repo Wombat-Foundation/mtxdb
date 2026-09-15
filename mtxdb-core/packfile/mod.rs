@@ -663,57 +663,15 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
 pub fn read_record_metadata_skip_payload(
     reader: &mut (impl Read + Seek),
 ) -> io::Result<Option<RecordMetadata>> {
-    let Some(len_buf) = read_frame_len_prefix(reader)? else {
+    let Some(header) = read_frame_header(reader)? else {
         return Ok(None);
     };
-    let frame_len = u32::from_le_bytes(len_buf);
-    if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid record length: {frame_len}"),
-        ));
-    }
-
-    let mut fixed = [0u8; FRAME_FIXED_LEN as usize];
-    reader.read_exact(&mut fixed)?;
-    let flags = fixed[0];
-    if flags & !(FLAG_COMPRESSED | FLAG_CRC_DISABLED) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported record flags: {flags:#04x}"),
-        ));
-    }
-    let uncompressed_len = u32::from_le_bytes(fixed[1..5].try_into().unwrap());
-    if flags & FLAG_COMPRESSED != 0 {
-        if uncompressed_len > MAX_DATA_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
-            ));
-        }
-    } else {
-        let payload_len = frame_len
-            .checked_sub(FRAME_FIXED_LEN)
-            .expect("frame_len >= FRAME_FIXED_LEN, checked above");
-        if uncompressed_len != payload_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "raw node length {payload_len} != framed uncompressed_len {uncompressed_len}"
-                ),
-            ));
-        }
-    }
-
-    let mut collection_id = [0u8; 16];
-    collection_id.copy_from_slice(&fixed[5..21]);
-    let mut hash = [0u8; 16];
-    hash.copy_from_slice(&fixed[21..37]);
 
     // The frame length excludes the four-byte CRC, while the fixed portion
     // includes the metadata and flags but not the payload.
     let skip = u64::from(
-        frame_len
+        header
+            .frame_len
             .checked_sub(FRAME_FIXED_LEN)
             .expect("frame_len >= FRAME_FIXED_LEN, checked above"),
     ) + 4;
@@ -731,8 +689,8 @@ pub fn read_record_metadata_skip_payload(
     }
     reader.seek(io::SeekFrom::Start(frame_end))?;
     Ok(Some(RecordMetadata {
-        collection_id,
-        hash,
+        collection_id: header.collection_id,
+        hash: header.hash,
     }))
 }
 
