@@ -562,6 +562,8 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 /// [9..13]   leaf_count (u32 LE)
 /// [13..17]  child_count (u32 LE)
 /// [17..]    inline leaves (K,V pairs in datamap bit order)
+///           K = (EventType, StateKey) as two length-prefixed strings
+///           V = EventId as a length-prefixed string
 /// [...]     child hashes (child_count x 32 bytes in nodemap bit order)
 /// ```
 ///
@@ -640,11 +642,13 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
         let start = leaf_cursor;
-        // Try to decode as (EventType, StateKey) string pair.
-        if let Some((event_type, state_key)) = decode_hamt_string_pair(bytes, &mut leaf_cursor) {
+        // Try to decode as (EventType, StateKey, EventId) triple.
+        if let Some((event_type, state_key, event_id)) =
+            decode_hamt_leaf_triple(bytes, &mut leaf_cursor)
+        {
             writeln!(
                 out,
-                "  leaf[{leaf_index}] slot={slot}: ({event_type:?}, {state_key:?})"
+                "  leaf[{leaf_index}] slot={slot}: ({event_type:?}, {state_key:?}) = {event_id:?}"
             )
             .unwrap();
         } else {
@@ -693,13 +697,13 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Try to skip a HAMT leaf value pair (K, V) encoded as length-prefixed
-/// strings. Advances `cursor` past the pair on success. This is a heuristic
-/// for the common rezzy state HAMT layout: K = `(u32_len + str, u32_len + str)`.
+/// Try to skip a HAMT leaf encoded as three length-prefixed strings
+/// (`EventType`, `StateKey`, `EventId`). Advances `cursor` past the leaf on
+/// success. This matches rezzy's state HAMT layout where K = `(EventType, String)`
+/// and V = `String`.
 #[allow(clippy::arithmetic_side_effects)]
 fn skip_hamt_leaf_value(bytes: &[u8], cursor: &mut usize) -> bool {
     let start = *cursor;
-    // Try two length-prefixed strings (EventType, StateKey).
     if !skip_length_prefixed_string(bytes, cursor) {
         return false;
     }
@@ -707,11 +711,11 @@ fn skip_hamt_leaf_value(bytes: &[u8], cursor: &mut usize) -> bool {
         *cursor = start;
         return false;
     }
-    // V is opaque — we can't skip it without knowing the type. For the
-    // common case of a short ID (u64), try an 8-byte skip. If it would
-    // overshoot, treat the rest of the leaf region as the V payload.
-    // Since we validate total size later, just advance past a reasonable V.
-    // The leaf_end check in the caller catches mismatches.
+    // V = String (event_id): length-prefixed UTF-8.
+    if !skip_length_prefixed_string(bytes, cursor) {
+        *cursor = start;
+        return false;
+    }
     true
 }
 
@@ -731,17 +735,21 @@ fn skip_length_prefixed_string(bytes: &[u8], cursor: &mut usize) -> bool {
     true
 }
 
-/// Try to decode a `(EventType, StateKey)` string pair from the leaf bytes.
-/// Restores the cursor if decoding fails partway through.
-fn decode_hamt_string_pair(bytes: &[u8], cursor: &mut usize) -> Option<(String, String)> {
+/// Decode a `(EventType, StateKey, EventId)` triple from leaf bytes.
+/// All three are length-prefixed UTF-8 strings. Restores the cursor if
+/// decoding fails partway through.
+fn decode_hamt_leaf_triple(bytes: &[u8], cursor: &mut usize) -> Option<(String, String, String)> {
     let start = *cursor;
-    let s1 = decode_length_prefixed_string(bytes, cursor)?;
-    if let Some(s2) = decode_length_prefixed_string(bytes, cursor) {
-        Some((s1, s2))
-    } else {
+    let event_type = decode_length_prefixed_string(bytes, cursor)?;
+    let Some(state_key) = decode_length_prefixed_string(bytes, cursor) else {
         *cursor = start;
-        None
-    }
+        return None;
+    };
+    let Some(event_id) = decode_length_prefixed_string(bytes, cursor) else {
+        *cursor = start;
+        return None;
+    };
+    Some((event_type, state_key, event_id))
 }
 
 /// Decode a `u32 LE length` + `length bytes` UTF-8 string.
