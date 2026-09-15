@@ -7,7 +7,7 @@ CARGO ?= cargo
 
 .PHONY: _help
 _help:
-	@grep -E '^[a-zA-Z_/%-]+:.*?##H' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?##H "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_/%-]+:.*?##H' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?##H "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -37,7 +37,7 @@ lint: ##H Run clippy lints (only core, not full workspace)
 	@if command -v flake8 >/dev/null 2>&1; then flake8 --max-line-length 88 $$(git ls-files '*.py'); fi
 
 .PHONY: fix
-fix: ##H Apply auto-fixes with clippy (only core)
+fix: ##H Apply auto-fixes with clippy across workspace crates
 	$(CARGO) clippy --fix  --workspace --allow-dirty --allow-staged --allow-no-vcs --all-targets --all-features
 
 
@@ -91,7 +91,7 @@ bench: ##H Run benchmarks and append results to the CSV history in benches/csv/
 		--csv-dir benches/csv
 
 .PHONY: _bench/external
-_bench/external: ##H Comparison bench (mtxdb vs mdbx vs sqlite) -> benches/csv/external.csv + table
+_bench/external:
 	python3 scripts/external_bench.py --append
 
 

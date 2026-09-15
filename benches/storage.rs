@@ -114,17 +114,27 @@ impl DagGenerator {
             }
         }
 
-        // Absorb remaining orphan chains into the last event's prev_events,
-        // but cap the total to stay under the 64KB record payload limit
-        // (each prev_event is 16 bytes, header+auth ~46 bytes).
+        // Absorb remaining orphan chains into bounded synthetic events rather
+        // than dropping them when the final event reaches the record-size
+        // limit.  Every generated node must remain reachable from a tip: the
+        // benchmark's connectivity check is also its guard against silently
+        // measuring only a subset of the data it wrote.
         let max_prevs = 4000;
-        if let Some(last) = prev_events.last_mut() {
-            for orphan_chain in pending_joins {
-                if last.len() >= max_prevs {
-                    break;
-                }
-                last.extend(orphan_chain);
-            }
+        let remaining: Vec<usize> = pending_joins.into_iter().flatten().collect();
+        for chunk in remaining.chunks(max_prevs) {
+            let absorb_id = prev_events.len();
+            prev_events.push(chunk.to_vec());
+            auth_events.push(vec![auth_pool[0]]);
+            tips.push(absorb_id);
+        }
+
+        // The final synthetic nodes are themselves tips, so the original
+        // orphan chains are reachable without putting an oversized prev list
+        // on the last ordinary event.
+        if remaining.is_empty() {
+            debug_assert_eq!(prev_events.len(), total_events);
+        } else {
+            debug_assert!(prev_events.len() > total_events);
         }
 
         Self {
