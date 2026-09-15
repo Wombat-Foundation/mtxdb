@@ -2389,6 +2389,7 @@ fn cmd_import(
         }
         if let Err(error) = cmd_import_file(
             &store,
+            &pool_dir,
             path,
             collection_override,
             &import_template,
@@ -2786,6 +2787,7 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
 
 fn cmd_import_file(
     store: &PackfileStorage,
+    dir: &Path,
     path: &Path,
     collection_override: Option<&str>,
     template: &CollectionTemplate,
@@ -2865,6 +2867,14 @@ fn cmd_import_file(
 
     if batch_has_create {
         established_collections.insert(collection_id);
+        // Populate the Matrix room-details sidecar right now, for free: the
+        // events are already parsed in memory, so there is no need to make
+        // the first `info`/`scan` on this collection pay for a shard scan to
+        // rediscover what this import already knows.
+        let details = matrix_room_details_from_events(&events);
+        if let Err(error) = persist_matrix_room_details(dir, &collection_id, &details) {
+            eprintln!("warning: unable to cache Matrix room metadata: {error}");
+        }
     }
 
     eprintln!("imported {event_count} events to collection {collection_hex}");
@@ -3100,6 +3110,27 @@ fn nested_event_string_field<'a>(
         },
         _ => None,
     }
+}
+
+/// Build `MatrixRoomDetails` directly from a parsed import batch, with no
+/// disk access: the caller already knows the batch establishes the room
+/// (`matrix_batch_has_create`), so both fields can be read out of the events
+/// already sitting in memory instead of round-tripping through a shard scan
+/// the way `matrix_room_details_from_shards` has to for pre-existing data.
+fn matrix_room_details_from_events(events: &[OwnedValue]) -> MatrixRoomDetails {
+    let mut details = MatrixRoomDetails::default();
+    for event in events {
+        if details.matrix_room_id.is_none() {
+            details.matrix_room_id = event_room_id(event).map(str::to_owned);
+        }
+        if details.create.is_none() {
+            details.create = matrix_create_details(event);
+        }
+        if details.matrix_room_id.is_some() && details.create.is_some() {
+            break;
+        }
+    }
+    details
 }
 
 fn matrix_create_details(event: &OwnedValue) -> Option<String> {
