@@ -556,27 +556,29 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Wire format (32-byte structural hashes):
 /// ```text
-/// [0]       wire version (0x01)
+/// [0]       wire version (0x02)
 /// [1..5]    datamap (u32 LE) -- bitmap of leaf slots
 /// [5..9]    nodemap (u32 LE) -- bitmap of child slots
 /// [9..13]   leaf_count (u32 LE)
 /// [13..17]  child_count (u32 LE)
-/// [17..]    inline leaves (K,V triples in datamap bit order)
-///           Each leaf: three length-prefixed UTF-8 strings
-///           K = (EventType, StateKey), V = EventId
+/// [17..]    inline leaves (K,V pairs in datamap bit order)
+///           Each leaf: two length-prefixed UTF-8 strings
+///           K = serde_json::to_string(&(EventType, StateKey))
+///               (a JSON 2-element array, e.g. `["m.room.member","@a:b"]`)
+///           V = EventId, as a plain string
 /// [...]     child hashes (child_count x 32 bytes in nodemap bit order)
 /// ```
 ///
 /// Returns `None` when the bytes don't match this layout.
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
-    const WIRE_V1: u8 = 0x01;
+    const WIRE_V1: u8 = 0x02;
     const HEADER_LEN: usize = 17;
     const HASH_LEN: usize = 32;
 
-    // Only accept the current wire version.  Older layouts (0x01 with 16-byte
-    // structural hashes) are not deployed; any other version byte means this
-    // isn't a HAMT node.
+    // Only accept the current wire version (0x02, matching rezzy's
+    // HAMT_WIRE_VERSION).  The legacy 0x01 layout (16-byte structural
+    // hashes) is confirmed gone from all live data.
     let &version = bytes.first()?;
     if version != WIRE_V1 {
         return None;
@@ -612,7 +614,7 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 
     // Validation passed.  Now decode for display -- if any leaf fails to
-    // decode as the expected three-string triple, reject the entire node
+    // decode as the expected two-string pair, reject the entire node
     // rather than returning a partial rendering.
     let mut leaves = Vec::with_capacity(leaf_count);
     let mut leaf_cursor = HEADER_LEN;
@@ -620,8 +622,8 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
         if datamap & (1 << slot) == 0 {
             continue;
         }
-        let triple = decode_hamt_leaf_triple(bytes, &mut leaf_cursor)?;
-        leaves.push((slot, triple));
+        let pair = decode_hamt_leaf_pair(bytes, &mut leaf_cursor)?;
+        leaves.push((slot, pair));
     }
 
     // All leaves decoded.  Build output.
@@ -663,21 +665,20 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Try to skip a HAMT leaf encoded as three length-prefixed strings
-/// (`EventType`, `StateKey`, `EventId`). Advances `cursor` past the leaf on
-/// success. This matches rezzy's state HAMT layout where K = `(EventType, String)`
-/// and V = `String`.
+/// Try to skip a HAMT leaf encoded as two length-prefixed strings: K (a
+/// JSON-encoded `(EventType, StateKey)` array) and V (`EventId`). Advances
+/// `cursor` past the leaf on success. This matches
+/// `synapse/rust/src/state_hamt.rs`'s `HamtNode<String, String>`, where K is
+/// `serde_json::to_string(&(event_type, state_key))`, not a raw tuple
+/// codec -- there are exactly two length-prefixed strings per leaf on disk.
 #[allow(clippy::arithmetic_side_effects)]
 fn skip_hamt_leaf_value(bytes: &[u8], cursor: &mut usize) -> bool {
     let start = *cursor;
+    // K: JSON-encoded (EventType, StateKey), as one length-prefixed string.
     if !skip_length_prefixed_string(bytes, cursor) {
         return false;
     }
-    if !skip_length_prefixed_string(bytes, cursor) {
-        *cursor = start;
-        return false;
-    }
-    // V = String (event_id): length-prefixed UTF-8.
+    // V = EventId: length-prefixed UTF-8.
     if !skip_length_prefixed_string(bytes, cursor) {
         *cursor = start;
         return false;
@@ -701,21 +702,35 @@ fn skip_length_prefixed_string(bytes: &[u8], cursor: &mut usize) -> bool {
     true
 }
 
-/// Decode a `(EventType, StateKey, EventId)` triple from leaf bytes.
-/// All three are length-prefixed UTF-8 strings. Restores the cursor if
-/// decoding fails partway through.
-fn decode_hamt_leaf_triple(bytes: &[u8], cursor: &mut usize) -> Option<(String, String, String)> {
+/// Decode a HAMT leaf's `(EventType, StateKey, EventId)` from its on-disk
+/// two-string encoding: K is a length-prefixed JSON 2-element array
+/// (`["event.type","state key"]`), V is a length-prefixed plain string
+/// (`EventId`). Restores the cursor if decoding fails partway through.
+fn decode_hamt_leaf_pair(bytes: &[u8], cursor: &mut usize) -> Option<(String, String, String)> {
     let start = *cursor;
-    let event_type = decode_length_prefixed_string(bytes, cursor)?;
-    let Some(state_key) = decode_length_prefixed_string(bytes, cursor) else {
-        *cursor = start;
-        return None;
-    };
+    let key_json = decode_length_prefixed_string(bytes, cursor)?;
     let Some(event_id) = decode_length_prefixed_string(bytes, cursor) else {
         *cursor = start;
         return None;
     };
-    Some((event_type, state_key, event_id))
+    let mut key_bytes = key_json.into_bytes();
+    let Ok(value) = simd_json::to_owned_value(&mut key_bytes) else {
+        *cursor = start;
+        return None;
+    };
+    let simd_json::OwnedValue::Array(elements) = value else {
+        *cursor = start;
+        return None;
+    };
+    let [event_type, state_key] = elements.as_slice() else {
+        *cursor = start;
+        return None;
+    };
+    let (Some(event_type), Some(state_key)) = (event_type.as_str(), state_key.as_str()) else {
+        *cursor = start;
+        return None;
+    };
+    Some((event_type.to_owned(), state_key.to_owned(), event_id))
 }
 
 /// Decode a `u32 LE length` + `length bytes` UTF-8 string.
@@ -4384,7 +4399,24 @@ mod tests {
         out
     }
 
+    /// Matches `synapse/rust/src/state_hamt.rs`'s
+    /// `serde_json::to_string(&(event_type, state_key))` -- the real K
+    /// encoding is a single JSON 2-element array string, not a raw tuple
+    /// codec.
+    fn hamt_leaf_key_json(event_type: &str, state_key: &str) -> String {
+        use simd_json::prelude::Writable;
+        simd_json::OwnedValue::Array(Box::new(vec![
+            simd_json::OwnedValue::from(event_type),
+            simd_json::OwnedValue::from(state_key),
+        ]))
+        .encode()
+    }
+
     /// Build a rezzy wire-v1 HAMT node from leaf triples and child hashes.
+    ///
+    /// Each leaf is encoded as two length-prefixed strings matching the real
+    /// Synapse format: K = `serde_json::to_string((event_type, state_key))`,
+    /// V = `event_id`.
     fn build_hamt_node(leaves: &[(&str, &str, &str)], child_hashes: &[[u8; 32]]) -> Vec<u8> {
         let mut datamap: u32 = 0;
         let mut nodemap: u32 = 0;
@@ -4399,14 +4431,14 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        buf.push(0x01);
+        buf.push(0x02);
         buf.extend_from_slice(&datamap.to_le_bytes());
         buf.extend_from_slice(&nodemap.to_le_bytes());
         buf.extend_from_slice(&leaf_count.to_le_bytes());
         buf.extend_from_slice(&child_count.to_le_bytes());
         for (et, sk, eid) in leaves {
-            buf.extend_from_slice(&encode_lps(et));
-            buf.extend_from_slice(&encode_lps(sk));
+            let key_json = hamt_leaf_key_json(et, sk);
+            buf.extend_from_slice(&encode_lps(&key_json));
             buf.extend_from_slice(&encode_lps(eid));
         }
         for hash in child_hashes {
@@ -4483,8 +4515,8 @@ mod tests {
 
     #[test]
     fn hamt_random_binary_not_hamt() {
-        // Arbitrary payload starting with 0x02 should not decode (0x01 is valid).
-        let data = vec![0x02, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
+        // Arbitrary payload starting with 0x01 (legacy) should not decode.
+        let data = vec![0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
         assert!(decode_hamt_node(&data).is_none());
     }
 
@@ -4514,7 +4546,7 @@ mod tests {
     #[test]
     fn hamt_datamap_nodemap_overlap_rejected() {
         // Both bitmaps claim slot 0.
-        let mut buf = vec![0x01u8];
+        let mut buf = vec![0x02u8];
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap: slot 0
         buf.extend_from_slice(&1u32.to_le_bytes()); // nodemap: slot 0 (overlap)
         buf.extend_from_slice(&1u32.to_le_bytes()); // leaf_count
@@ -4525,11 +4557,70 @@ mod tests {
     #[test]
     fn hamt_leaf_count_mismatch_rejected() {
         // datamap says 1 leaf, but leaf_count says 0.
-        let mut buf = vec![0x01u8];
+        let mut buf = vec![0x02u8];
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap
         buf.extend_from_slice(&0u32.to_le_bytes()); // nodemap
         buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count (wrong)
         buf.extend_from_slice(&0u32.to_le_bytes()); // child_count
         assert!(decode_hamt_node(&buf).is_none());
+    }
+
+    #[test]
+    fn hamt_rezzy_encoded_fixture() {
+        use rezzy::hamt::PersistedInternalNode;
+
+        // Build a node using rezzy's own encoder -- this is the ground
+        // truth. K = String (JSON key), V = String (event_id), matching
+        // the actual `HamtNode<String, String>` instantiation Synapse uses.
+        let leaves = vec![
+            (
+                hamt_leaf_key_json("m.room.member", "@alice:example.org"),
+                "$ev1:example.org".to_owned(),
+            ),
+            (
+                hamt_leaf_key_json("m.room.name", ""),
+                "$ev2:example.org".to_owned(),
+            ),
+        ];
+        let child_hash = [0xABu8; 32];
+        let node = PersistedInternalNode {
+            datamap: 0b0011, // slots 0 and 1
+            nodemap: 0b0100, // slot 2
+            leaves,
+            child_hashes: vec![child_hash],
+        };
+        let encoded = node.encode_v1();
+
+        // Our decoder must accept these exact bytes.
+        let out = decode_hamt_node(&encoded).expect("rezzy-encoded node must decode");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("@alice:example.org"));
+        assert!(text.contains("$ev1:example.org"));
+        assert!(text.contains("$ev2:example.org"));
+        assert!(text.contains("m.room.member"));
+        assert!(text.contains("m.room.name"));
+        assert!(text.contains(&hex::encode(&child_hash[..8])));
+    }
+
+    #[test]
+    fn hamt_rezzy_roundtrip_single_leaf() {
+        use rezzy::hamt::PersistedInternalNode;
+
+        let node = PersistedInternalNode {
+            datamap: 0x01,
+            nodemap: 0x00,
+            leaves: vec![(
+                hamt_leaf_key_json("m.room.create", ""),
+                "$create:server".to_owned(),
+            )],
+            child_hashes: vec![],
+        };
+        let encoded = node.encode_v1();
+        let out = decode_hamt_node(&encoded).expect("must decode");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("m.room.create"));
+        assert!(text.contains("$create:server"));
+        assert!(text.contains("1 leaves"));
+        assert!(text.contains("0 children"));
     }
 }

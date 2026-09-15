@@ -28,5 +28,9 @@ hex = "0.4"
 mtxdb-core = { path = "../mtxdb-core" }
 simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
+[dev-dependencies]
+# git@gitlab.com:gamesguru/rezzy.git (branch: dev)
+rezzy = { path = "../../rezzy" }
+
 [lints]
 workspace = true
