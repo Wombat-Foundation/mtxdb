@@ -47,6 +47,7 @@ pub(crate) enum Commands {
         verbose: bool,
         limit: i64,
         id: Option<String>,
+        collection: Option<String>,
         raw: bool,
     },
     Import {
@@ -267,6 +268,12 @@ fn sub_scan() -> Command {
                 .long("id")
                 .value_name("NODE_ID")
                 .help("Restrict the physical scan to one node ID"),
+        )
+        .arg(
+            Arg::new("collection")
+                .long("collection")
+                .value_name("COLLECTION")
+                .help("With a pack selector, restrict the scan to this collection"),
         )
         .arg(Arg::new("raw").long("raw").action(ArgAction::SetTrue).help(
             "Write matching frames' payload bytes verbatim, concatenated, to stdout (all \
@@ -497,6 +504,7 @@ fn parse_cli() -> Cli {
             selector: m.get_one::<String>("selector").unwrap().clone(),
             verbose: m.get_flag("verbose"),
             id: m.get_one::<String>("id").cloned(),
+            collection: m.get_one::<String>("collection").cloned(),
             raw: m.get_flag("raw"),
             limit: *m
                 .get_one::<i64>("limit")

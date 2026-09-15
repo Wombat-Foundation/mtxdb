@@ -166,8 +166,17 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             verbose,
             limit,
             id,
+            collection,
             raw,
-        } => cmd_scan(cli, selector, *verbose, *limit, id.as_deref(), *raw),
+        } => cmd_scan(
+            cli,
+            selector,
+            *verbose,
+            *limit,
+            id.as_deref(),
+            collection.as_deref(),
+            *raw,
+        ),
         Commands::Import {
             paths,
             collection,
@@ -2107,6 +2116,7 @@ fn cmd_scan(
     verbose: bool,
     limit: i64,
     id: Option<&str>,
+    collection: Option<&str>,
     raw: bool,
 ) -> anyhow::Result<()> {
     // No `--id` requirement: `--raw` dumps every matching frame's payload
@@ -2114,6 +2124,7 @@ fn cmd_scan(
     // listing, so a bare selector with several matches still "just works"
     // instead of erroring.
     let node_id = id.map(parse_node_id).transpose()?;
+    let collection_filter = collection.map(parse_collection_id).transpose()?;
     // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
     // it's `0x`-prefixed with something other than 32 hex digits after it —
     // everything else (bare 32 hex digits, or `0x` + 32 hex digits) is a
@@ -2125,6 +2136,9 @@ fn cmd_scan(
         .or_else(|| selector.strip_prefix("0X"))
         .is_some_and(|hex| hex.len() != 32);
     if !looks_like_pack_id {
+        if collection_filter.is_some() {
+            bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
+        }
         return cmd_scan_collection(cli, selector, verbose, limit, node_id, raw);
     }
     let pack_id = parse_pack_id_selector(selector)?;
@@ -2139,9 +2153,11 @@ fn cmd_scan(
     let records = mtxdb_core::packfile::scan_packfile(path)?;
     let records: Vec<_> = records
         .into_iter()
-        .filter(|(_, record_id, _)| match node_id {
-            Some(wanted) => *record_id == wanted,
-            None => true,
+        .filter(|(record_collection, record_id, _)| {
+            // TODO: tied to MSRV 1.81.0 — replace with .is_none_or() once the
+            // minimum is bumped to 1.82+.
+            collection_filter.map_or(true, |wanted| *record_collection == wanted)
+                && node_id.map_or(true, |wanted| *record_id == wanted)
         })
         .collect();
     let max_rows = scan_limit(limit);
