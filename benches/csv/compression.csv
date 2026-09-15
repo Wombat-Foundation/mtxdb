@@ -47,3 +47,15 @@ timestamp,git_sha,machine,kind,payload_len,raw_us,zstd_us,slowdown,stored_pct
 2026-09-15T01:39:13+00:00,467d0eb,machine-ede6a86d2a83,incompressible,256,0.06,1.93,34.49,100.0
 2026-09-15T01:39:13+00:00,467d0eb,machine-ede6a86d2a83,incompressible,1024,0.18,3.71,20.57,100.0
 2026-09-15T01:39:13+00:00,467d0eb,machine-ede6a86d2a83,incompressible,4096,0.54,6.71,12.35,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,HAMT-shaped,64,0.06,1.04,16.14,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,HAMT-shaped,256,0.07,1.84,28.04,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,HAMT-shaped,1024,0.23,3.77,16.46,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,HAMT-shaped,4096,0.52,6.68,12.76,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,Matrix-JSON-like,64,0.05,2.43,49.62,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,Matrix-JSON-like,256,0.07,3.8,53.93,64.5
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,Matrix-JSON-like,1024,0.24,4.11,16.88,17.9
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,Matrix-JSON-like,4096,0.55,5.22,9.53,4.6
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,incompressible,64,0.04,0.98,22.13,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,incompressible,256,0.06,1.92,31.19,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,incompressible,1024,0.19,3.7,19.63,100.0
+2026-09-15T02:24:18+00:00,a31c78a,machine-ede6a86d2a83,incompressible,4096,0.52,6.64,12.77,100.0
