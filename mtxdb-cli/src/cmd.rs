@@ -2046,9 +2046,7 @@ fn cmd_scan(
             }
             io::stdout().write_all(&data.data)?;
         }
-        if verbose {
-            print_scan_limit_note(records.len(), max_rows);
-        }
+        eprint_scan_limit_note(records.len(), max_rows);
         return Ok(());
     }
     println!(
@@ -2056,18 +2054,17 @@ fn cmd_scan(
         std::fs::metadata(path)?.len(),
         records.len()
     );
+    print_scan_table_header("COLLECTION");
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
         let data = verbose
             .then(|| ShardPool::read_at_committed(&shard, *offset, true))
             .transpose()?;
-        let suffix = data
-            .as_ref()
-            .and_then(|data| scan_payload_suffix(&data.data));
+        let payload = data.as_ref().map(|data| scan_payload_cell(&data.data));
         println!(
-            "  collection={collection_hex} id={id_hex} @ {offset}{suffix}",
-            suffix = suffix.as_deref().unwrap_or("")
+            "{}",
+            scan_table_row(&collection_hex, &id_hex, *offset, payload.as_deref())
         );
         if let Some(data) = data.filter(|data| scan_payload_suffix(&data.data).is_none()) {
             print_scan_payload(&data.data);
@@ -2075,6 +2072,32 @@ fn cmd_scan(
     }
     print_scan_limit_note(records.len(), max_rows);
     Ok(())
+}
+
+/// Header for the scan table's aligned columns. `location_label` names the
+/// first column ("COLLECTION" for a pack scan, "PACK" for a collection
+/// scan) — the other column is whichever of the two identifies each row.
+fn print_scan_table_header(location_label: &str) {
+    println!(
+        "  {:<34} {:<34} {:>10}  PAYLOAD",
+        location_label, "ID", "OFFSET"
+    );
+}
+
+/// One aligned row: `location` is a collection or pack ID (hex), `id` the
+/// node ID (hex). `payload` is `None` for a non-`--verbose` scan (no frame
+/// data was read).
+fn scan_table_row(location: &str, id: &str, offset: u64, payload: Option<&str>) -> String {
+    format!(
+        "  {location:<34} {id:<34} {offset:>10}  {}",
+        payload.unwrap_or("-")
+    )
+}
+
+/// The PAYLOAD cell for one row: a decodable payload prints below the row
+/// instead (its formatted form spans lines), so the cell just says so.
+fn scan_payload_cell(data: &[u8]) -> String {
+    scan_payload_suffix(data).unwrap_or_else(|| "(decoded below)".to_owned())
 }
 
 /// Print every physical frame for a collection across all packs. This is a
@@ -2098,6 +2121,9 @@ fn cmd_scan_collection(
     let mut packs = 0_usize;
     let max_rows = scan_limit(limit);
     let mut raw_matches = Vec::new();
+    if !raw {
+        print_scan_table_header("PACK");
+    }
     for (_, shard) in shards {
         let records = mtxdb_core::packfile::scan_packfile(&shard.path)?;
         let mut matched_pack = false;
@@ -2117,14 +2143,15 @@ fn cmd_scan_collection(
                     let data = verbose
                         .then(|| ShardPool::read_at_committed(&shard, offset, true))
                         .transpose()?;
-                    let suffix = data
-                        .as_ref()
-                        .and_then(|data| scan_payload_suffix(&data.data));
+                    let payload = data.as_ref().map(|data| scan_payload_cell(&data.data));
                     println!(
-                        "  pack: 0x{:016x} id: {} @ {offset}{suffix}",
-                        shard.pack_id,
-                        hex_encode(&record_id),
-                        suffix = suffix.as_deref().unwrap_or(""),
+                        "{}",
+                        scan_table_row(
+                            &format!("0x{:016x}", shard.pack_id),
+                            &hex_encode(&record_id),
+                            offset,
+                            payload.as_deref(),
+                        )
                     );
                     if let Some(data) =
                         data.filter(|data| scan_payload_suffix(&data.data).is_none())
@@ -2152,9 +2179,7 @@ fn cmd_scan_collection(
             }
             io::stdout().write_all(&data.data)?;
         }
-        if verbose {
-            print_scan_limit_note(frames, max_rows);
-        }
+        eprint_scan_limit_note(frames, max_rows);
         return Ok(());
     }
     println!(
@@ -2181,6 +2206,14 @@ fn print_scan_limit_note(total: usize, limit: usize) {
     }
 }
 
+/// Same as [`print_scan_limit_note`] but to stderr -- for use after `--raw`
+/// output, where stdout must stay a clean byte stream (see `--raw`'s help).
+fn eprint_scan_limit_note(total: usize, limit: usize) {
+    if limit < total {
+        eprintln!("note: only showing top {limit}; use `-l 0` to show all");
+    }
+}
+
 /// Print a readable payload for `scan --verbose` without ever treating an
 /// arbitrary binary record as terminal text.
 fn print_scan_payload(data: &[u8]) {
@@ -2197,7 +2230,7 @@ fn print_scan_payload(data: &[u8]) {
 fn scan_payload_suffix(data: &[u8]) -> Option<String> {
     pretty_print_payload(data)
         .is_none()
-        .then(|| format!(" payload: {} bytes (undecodable)", data.len()))
+        .then(|| format!("{} bytes (undecodable)", data.len()))
 }
 
 fn cmd_import(
