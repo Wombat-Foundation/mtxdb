@@ -229,6 +229,64 @@ const POOL_META_FILENAME: &str = "pool.meta";
 /// Pool metadata format version.
 const POOL_META_VERSION: u8 = 1;
 
+/// Filename for the one-time store-creation marker: records which
+/// `mtxdb-core` version created this store. Written once, when the very
+/// first shard is created, and never rewritten — unlike `pool.meta`, it
+/// has no in-place-updated field, so it needs no version-preservation
+/// dance across later opens.
+const STORE_META_FILENAME: &str = "store.meta";
+
+/// Store metadata format version.
+const STORE_META_VERSION: u8 = 1;
+
+/// Write the one-time store-creation marker, recording the `mtxdb-core`
+/// version (`CARGO_PKG_VERSION`) that created this store. Best-effort: a
+/// failure here doesn't fail store creation, since this is diagnostic
+/// metadata, not data the engine depends on to operate correctly.
+fn persist_store_meta(base_dir: &Path) {
+    let version = env!("CARGO_PKG_VERSION").as_bytes();
+    let Ok(version_len) = u8::try_from(version.len()) else {
+        return; // never true for a real semver string; just don't write garbage
+    };
+    let mut buf = Vec::with_capacity(6usize.saturating_add(version.len()));
+    buf.extend_from_slice(b"SMeta");
+    buf.push(STORE_META_VERSION);
+    buf.push(version_len);
+    buf.extend_from_slice(version);
+
+    let final_path = base_dir.join(STORE_META_FILENAME);
+    let tmp_path = final_path.with_extension(format!("meta.tmp.{}", std::process::id()));
+    let result = (|| -> io::Result<()> {
+        let mut tmp = File::create(&tmp_path)?;
+        tmp.write_all(&buf)?;
+        tmp.sync_all()?;
+        drop(tmp);
+        fs::rename(&tmp_path, &final_path)?;
+        let dir = File::open(base_dir)?;
+        dir.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+/// Read back the `mtxdb-core` version that created this store, if the
+/// store was created by a build new enough to record it (`store.meta`
+/// predates this feature, so an older store — or one with an unreadable
+/// or corrupt marker — returns `None` rather than erroring: this is
+/// diagnostic-only information).
+#[must_use]
+pub fn store_created_by_version(base_dir: &Path) -> Option<String> {
+    let data = fs::read(base_dir.join(STORE_META_FILENAME)).ok()?;
+    if data.len() < 7 || &data[0..5] != b"SMeta" || data[5] != STORE_META_VERSION {
+        return None;
+    }
+    let version_len = usize::from(data[6]);
+    let version_bytes = data.get(7..7 + version_len)?;
+    String::from_utf8(version_bytes.to_vec()).ok()
+}
+
 /// Disambiguates concurrent `persist_stats` tmp filenames within this
 /// process (paired with the process id, which disambiguates across
 /// processes sharing the same `base_dir`).
@@ -784,6 +842,11 @@ impl ShardPool {
                 ));
             }
             let pack_id = next_pack_id;
+            // Record which mtxdb-core version created this store. Best
+            // effort and diagnostic-only (see `persist_store_meta`), so it
+            // doesn't need the same before-the-pack-file ordering as
+            // pool.meta below.
+            persist_store_meta(&base_dir);
             // Persist the high-water mark BEFORE creating the pack file.
             // A crash after pack creation but before next persist would
             // leave a pack_id in use with no pool.meta reservation — so

@@ -295,6 +295,42 @@ fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
     pool_dir(&open_layout(cli)?, cli.shard_type)
 }
 
+/// A collection ID not found under `cli.shard_type` is often just in one of
+/// the *other* independent shard-type pools (`-t`/`--shard-type` defaults
+/// to `event-dag`, so a `state`-only collection ID "not found" there is the
+/// single most common `scan`/`info` support question). Cheaply checks each
+/// other pool's persisted sidecar (no full-scan fallback, no index rebuild)
+/// and, if any has it, returns a one-line hint naming them; `String::new()`
+/// otherwise, so callers can append it to a "not found" message unconditionally.
+fn other_shard_type_hint(cli: &Cli, collection_id: &[u8; 16]) -> String {
+    let Ok(layout) = open_layout(cli) else {
+        return String::new();
+    };
+    let found: Vec<&str> = ShardType::ALL
+        .into_iter()
+        .filter(|&shard_type| shard_type != cli.shard_type)
+        .filter_map(|shard_type| {
+            pool_dir(&layout, shard_type)
+                .ok()
+                .map(|dir| (shard_type, dir))
+        })
+        .filter(|(_, dir)| {
+            PackfileStorage::collection_shards_from_disk(dir)
+                .is_some_and(|shards| shards.contains_key(collection_id))
+        })
+        .map(|(shard_type, _)| shard_type.as_str())
+        .collect();
+    if found.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (not in -t {}; found in -t {})",
+            cli.shard_type.as_str(),
+            found.join(", -t ")
+        )
+    }
+}
+
 fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(collection)?;
     let node_id = parse_node_id(id)?;
@@ -889,6 +925,12 @@ fn print_stats_table(
     summaries: &[mtxdb_core::shard::ShardSummary],
 ) {
     println!("mtxdb stats: {}", dir.display());
+    println!(
+        "  created by     mtxdb-core {}",
+        mtxdb_core::shard::store_created_by_version(dir)
+            .as_deref()
+            .unwrap_or("unknown (created before version tracking, or marker unreadable)")
+    );
     println!();
     println!("  open");
     match &stats.last_open_timings {
@@ -1056,8 +1098,11 @@ fn print_stats_json(dir: &Path, stats: &RuntimeStats, store: &PackfileStorage) {
     }
     shards.push_str("  ]");
 
+    let created_by = mtxdb_core::shard::store_created_by_version(dir)
+        .map_or("null".to_owned(), |v| json_string(&v));
     let top = vec![
         ("dir", json_string(&dir.to_string_lossy())),
+        ("created_by_mtxdb_core_version", created_by),
         ("open_path", open_path),
         ("open_count", stats.open_count.to_string()),
         ("collections", stats.collection_count.to_string()),
@@ -1657,14 +1702,34 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        eprintln!("collection {hex}: not found");
+        eprintln!(
+            "collection {hex}: not found{}",
+            other_shard_type_hint(cli, &collection_id)
+        );
         return Ok(());
     }
 
     // A store predating the inspection sidecar has no cheap authoritative
     // summary. Preserve the old full-scan fallback until `mtxdb sync` can
     // create the sidecar.
-    let store = open_store_read_only(cli)?;
+    let store = match open_store_read_only(cli) {
+        Ok(store) => store,
+        // Same reasoning as `cmd_scan_collection`: an empty pool (e.g. the
+        // default `-t event-dag` pool when the collection actually lives
+        // under `-t state`) just means "not found here", not a real error.
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            eprintln!(
+                "collection {hex}: not found{}",
+                other_shard_type_hint(cli, &collection_id)
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     match store.collection_index_info(&collection_id) {
         Some((len, mem, capacity)) => {
             println!(
@@ -1676,7 +1741,10 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
             print_collection_shards(&shards);
             print_matrix_room_details(matrix_room_details(&store, &dir, &collection_id)?, None);
         }
-        None => eprintln!("collection {hex}: not found"),
+        None => eprintln!(
+            "collection {hex}: not found{}",
+            other_shard_type_hint(cli, &collection_id)
+        ),
     }
     Ok(())
 }
@@ -2113,7 +2181,23 @@ fn cmd_scan_collection(
 ) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
-    let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
+    let pool = match ShardPool::open_read_only(pool_dir) {
+        Ok(pool) => pool,
+        // An empty pool (e.g. the default `-t event-dag` when nothing was
+        // ever written to that shard type) isn't a real error here -- it
+        // just means this collection can't be in it. Report the same
+        // "not found" a populated-but-non-matching pool would give,
+        // complete with the other-shard-type hint, instead of a raw
+        // low-level "no shards found" error.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "no matching physical record found in collection {selector}{}",
+                other_shard_type_hint(cli, &collection_id)
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("failed to open shard store"),
+    };
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
 
@@ -2165,7 +2249,10 @@ fn cmd_scan_collection(
     }
 
     if frames == 0 {
-        bail!("no matching physical record found in collection {selector}");
+        bail!(
+            "no matching physical record found in collection {selector}{}",
+            other_shard_type_hint(cli, &collection_id)
+        );
     }
     if raw {
         for (shard, offset) in raw_matches.iter().take(max_rows) {
