@@ -4604,23 +4604,16 @@ impl StorageEngine for PackfileStorage {
             None => Arc::new(NodeCache::new(self.cache_capacity)),
         };
 
-        // Fast path, mirroring `put`'s single-record optimization (see its
-        // comment): as long as the collection already has an owned,
-        // materialized index — not the very first write since a checkpoint
-        // reopen — every record in this batch that fits without growth
-        // mutates that live, already-published index directly. `owned_index`
-        // stays `None` for as long as that holds, so the O(capacity) clone
-        // below never runs and no new generation ever gets published —
-        // exactly `put`'s in-place success path, just looped over the
-        // batch. It is materialized, once, only when a structural change is
-        // actually required: growth, the first write since a checkpoint
-        // reopen (mmap-backed), or a brand-new collection. A clone taken
-        // partway through the batch (a mid-batch grow) still captures every
-        // record already applied via the live path, since those mutations
-        // landed on the very object being cloned.
+        // Batches use copy-on-write even when their current index is already
+        // materialized. That is deliberately unlike `put`: a batch can fail
+        // after an earlier record append, so its index changes must remain
+        // private until every fallible operation has succeeded.
         let materialize_started = std::time::Instant::now();
+        // A batch is published as one generation. In particular, never
+        // insert directly into the currently published index: a later shard
+        // append can fail, and callers must not observe the successful prefix
+        // of that failed batch.
         let mut owned_index: Option<LossyIndex> = match &old_gen {
-            Some(g) if !g.index.is_mmap_backed() => None,
             Some(g) => Some(g.index.clone()),
             // Unlike `put`'s single-record path, we know exactly how many
             // records this brand-new collection is about to receive -- size
@@ -4639,11 +4632,8 @@ impl StorageEngine for PackfileStorage {
                     .max(NEW_COLLECTION_INDEX_FLOOR),
             )),
         };
-        // Batch-granular clone accounting: a call that materialized an owned
-        // index up front (first write since a checkpoint reopen, or a
-        // brand-new collection) pays the O(capacity) copy here; one that
-        // starts on the live no-clone path does not. `stats()` reports both
-        // counts and the cumulative `index_clone_time`.
+        // Every non-empty batch materializes an owned index up front so its
+        // contents can be published atomically.
         if owned_index.is_some() {
             self.put_many_clone_path_calls
                 .fetch_add(1, Ordering::Relaxed);
@@ -4655,11 +4645,12 @@ impl StorageEngine for PackfileStorage {
             self.put_many_fast_path_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
-        // Whether this call must publish a new generation at all. Starts
-        // true exactly when `owned_index` already had to be materialized
-        // above; flips true the moment a mid-batch grow/rebuild happens.
+        // The owned index is always published after a successful batch.
         let mut structural_change = owned_index.is_some();
         let mut index_needs_rebuild = false;
+        let mut pending_deltas = Vec::with_capacity(entries.len());
+        let mut pending_shard_collections = Vec::with_capacity(entries.len());
+        let mut invalidate_delta = false;
 
         for (id, data) in entries {
             let record = Record {
@@ -4691,7 +4682,7 @@ impl StorageEngine for PackfileStorage {
             let inserted = if let Ok((bucket, slot)) =
                 self.insert_index(collection_id, live, id, shard_id, offset)?
             {
-                self.record_delta(collection_id, generation, bucket, slot);
+                pending_deltas.push((bucket, slot));
                 true
             } else {
                 // Growth (either flavor) materializes a fresh owned index; the
@@ -4706,20 +4697,20 @@ impl StorageEngine for PackfileStorage {
                     // collection's shape, so the delta log is invalidated and
                     // no frame is recorded for this (or any later)
                     // overwrite in the batch.
-                    self.invalidate_delta_log();
+                    invalidate_delta = true;
                     structural_change = true;
                     grown
                 } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, live) {
                     // The checkpoint does not retain homes, but its slots
                     // retain locations. Recover only those identities and
                     // retry; do not scan every pack in the store.
-                    self.invalidate_delta_log();
+                    invalidate_delta = true;
                     structural_change = true;
                     grown
                 } else {
                     index_needs_rebuild = true;
                     structural_change = true;
-                    self.invalidate_delta_log();
+                    invalidate_delta = true;
                     continue;
                 };
                 self.index_grow_count.fetch_add(1, Ordering::Relaxed);
@@ -4736,7 +4727,7 @@ impl StorageEngine for PackfileStorage {
                     .shards
                     .get_shard(shard_id)
                     .map_or(u64::from(shard_id), |s| s.pack_id);
-                self.record_new_shard_collection(pack_id, collection_id);
+                pending_shard_collections.push(pack_id);
             }
         }
 
@@ -4748,6 +4739,19 @@ impl StorageEngine for PackfileStorage {
                 &self.slot_counts_to_pack_id_counts(&rebuilt.shard_counts()),
             );
             owned_index = Some(rebuilt);
+        }
+
+        // All fallible work is complete. Only now make the batch visible to
+        // the shared index, delta state, and shard bookkeeping.
+        if invalidate_delta {
+            self.invalidate_delta_log();
+        } else {
+            for (bucket, slot) in pending_deltas {
+                self.record_delta(collection_id, generation, bucket, slot);
+            }
+        }
+        for pack_id in pending_shard_collections {
+            self.record_new_shard_collection(pack_id, collection_id);
         }
 
         // Apply cache mutations only after all disk writes succeed, so a
@@ -6793,17 +6797,13 @@ mod tests {
     }
 
     #[test]
-    fn test_put_many_fast_path_mutates_live_index_without_cloning() {
-        // Regression coverage for put_many's live-index fast path: prove it
-        // through observable behavior (every record readable, across
-        // several separate put_many calls to the same collection, none of
-        // which needs to grow) rather than asserting the clone didn't
-        // happen internally.
-        let dir = test_dir("put_many_fast_path_live_mutation");
+    fn test_put_many_publishes_successive_batches() {
+        // Regression coverage for successful copy-on-write batch publication:
+        // every record remains readable across several batches that need no
+        // index growth.
+        let dir = test_dir("put_many_successive_batches");
         let store = PackfileStorage::open(dir).unwrap();
 
-        // First call materializes the collection (no live index to reuse
-        // yet); every call after it should take the fast path.
         for batch in 0..8u32 {
             let entries: Vec<_> = (0..20u32)
                 .map(|i| {
@@ -6868,10 +6868,9 @@ mod tests {
         assert_eq!(snapshot.get_calls, 2);
         assert_eq!(snapshot.get_misses, 1);
 
-        // Batched writes: the first put_many for a brand-new second collection
-        // materializes up front (clone path), later batches ride the owned
-        // no-clone fast path until a grow forces a fresh materialization;
-        // every call is classified as exactly one of the two.
+        // Batched writes use copy-on-write so a failed later append cannot
+        // expose an earlier record from the same batch. Every call is thus
+        // charged to the clone path.
         let batches: Vec<Vec<(NodeId, NodeData)>> = (0..8u32)
             .map(|batch| {
                 (0..8u32)
@@ -6894,10 +6893,8 @@ mod tests {
         assert_eq!(snapshot.put_many_calls, 8);
         assert_eq!(snapshot.put_many_records, 64);
         assert!(snapshot.put_many_bytes > 0);
-        let classified = snapshot.put_many_fast_path_calls + snapshot.put_many_clone_path_calls;
-        assert_eq!(classified, 8, "every put_many call is one of the two paths");
-        assert!(snapshot.put_many_clone_path_calls >= 1);
-        assert!(snapshot.put_many_fast_path_calls >= 1);
+        assert_eq!(snapshot.put_many_clone_path_calls, 8);
+        assert_eq!(snapshot.put_many_fast_path_calls, 0);
         // 64 distinct records into a floor-sized 64-slot index must cross the
         // grow threshold at least once.
         assert!(snapshot.index_grow_count >= 1);

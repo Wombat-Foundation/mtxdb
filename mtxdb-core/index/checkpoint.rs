@@ -196,10 +196,11 @@ pub fn write_checkpoint(
     let total_len = CHECKPOINT_HEADER_LEN
         .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
         .saturating_add(usize::try_from(slots_bytes).unwrap_or(usize::MAX));
-    // Build the directory+slots body first (everything after the header) so
-    // its CRC can be computed before the header — which carries that CRC —
-    // is itself encoded.
-    let mut body = Vec::with_capacity(total_len.saturating_sub(CHECKPOINT_HEADER_LEN));
+    // Reserve the header first, then build the body directly into the final
+    // buffer. This avoids retaining a second checkpoint-sized body merely to
+    // calculate the CRC carried by the header.
+    let mut buf = Vec::with_capacity(total_len);
+    buf.resize(CHECKPOINT_HEADER_LEN, 0);
 
     let mut slots_offset: u64 = 0;
     let mut dir_entries = Vec::with_capacity(collections.len());
@@ -224,12 +225,12 @@ pub fn write_checkpoint(
             .ok_or_else(|| std::io::Error::other("checkpoint slots offset overflow"))?;
     }
     for entry in &dir_entries {
-        body.extend_from_slice(&entry.encode());
+        buf.extend_from_slice(&entry.encode());
     }
     for (_, _, blob) in collections {
-        body.extend_from_slice(&blob[8..]);
+        buf.extend_from_slice(&blob[8..]);
     }
-    let content_crc32 = crc32fast::hash(&body);
+    let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
 
     let header = CheckpointHeader {
         magic: CHECKPOINT_MAGIC,
@@ -240,9 +241,7 @@ pub fn write_checkpoint(
         pack_fingerprint: fingerprint,
         content_crc32,
     };
-    let mut buf = Vec::with_capacity(total_len);
-    buf.extend_from_slice(&header.encode());
-    buf.extend_from_slice(&body);
+    buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
     let unique = CHECKPOINT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = PathBuf::from(format!(
@@ -604,7 +603,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         assert!(
-            read_checkpoint(&path).is_none(),
+            read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none(),
             "a value-preserving bit flip inside an occupied slot must be rejected"
         );
         assert!(

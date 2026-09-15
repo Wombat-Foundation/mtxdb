@@ -7,15 +7,3 @@ dev = [
     "flake8",
     "ruff",
 ]
-
-[tool.pylint."messages control"]
-disable = [
-    "too-many-branches",
-    "too-many-locals",
-    "too-many-statements",
-]
-# `external_bench.py` imports its sibling `compare_bench` as a bare module,
-# which only resolves when executed directly (its own dir on `sys.path`).
-# Add `scripts/` to the analysis path so `pylint .` from the repo root sees
-# it too, without muddying the script with runtime path handling.
-init-hook = "import sys, os; sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))"

@@ -915,12 +915,25 @@ fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow:
 /// picture from `PackfileStorage::stats()` instead — this command is the
 /// on-disk + cold-open view.
 fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let dir = selected_pool_dir(cli)?;
+    // A newly initialized pool has no pack to open yet. It is still a valid
+    // database, and stats should describe its zero state rather than failing
+    // through the storage opener.
+    if glob_pack_files(&dir)?.is_empty() {
+        let stats = RuntimeStats::default();
+        if json {
+            print_stats_json(&dir, &stats, &[]);
+        } else {
+            print_stats_table(&dir, &stats, &[]);
+        }
+        return Ok(());
+    }
+
     let store = open_store_read_only(cli)?;
     let stats = store.stats();
-    let dir = selected_pool_dir(cli)?;
 
     if json {
-        print_stats_json(&dir, &stats, &store);
+        print_stats_json(&dir, &stats, &store.shard_summaries());
     } else {
         print_stats_table(&dir, &stats, &store.shard_summaries());
     }
@@ -1043,7 +1056,11 @@ fn print_stats_table(
 /// JSON variant of `mtxdb stats`: open breakdown, runtime counters, and
 /// per-shard persisted counters as nested objects. Built by hand (no serde
 /// dependency) — every value is a plain number or a path string.
-fn print_stats_json(dir: &Path, stats: &RuntimeStats, store: &PackfileStorage) {
+fn print_stats_json(
+    dir: &Path,
+    stats: &RuntimeStats,
+    summaries: &[mtxdb_core::shard::ShardSummary],
+) {
     let open_path = stats
         .last_open_timings
         .as_ref()
@@ -1099,11 +1116,19 @@ fn print_stats_json(dir: &Path, stats: &RuntimeStats, store: &PackfileStorage) {
             ("get_many_calls", stats.get_many_calls.to_string()),
             ("get_many_records", stats.get_many_records.to_string()),
             ("get_many_misses", stats.get_many_misses.to_string()),
+            ("repack_count", stats.repack.repack_count.to_string()),
+            ("repack_kept_total", stats.repack.kept_total.to_string()),
+            (
+                "repack_dropped_total",
+                stats.repack.dropped_total.to_string(),
+            ),
+            ("cache_hits", stats.cache.hits.to_string()),
+            ("cache_misses", stats.cache.misses.to_string()),
+            ("cache_hit_rate", stats.cache.hit_rate.to_string()),
         ],
         "  ",
     );
 
-    let summaries = store.shard_summaries();
     let mut shards = String::from("[\n");
     for (index, summary) in summaries.iter().enumerate() {
         let comma = if index == summaries.len().saturating_sub(1) {
@@ -1167,14 +1192,17 @@ fn ms_json(duration: std::time::Duration) -> String {
 fn json_string_raw(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len().saturating_add(2));
     escaped.push('"');
-    for byte in text.bytes() {
-        match byte {
-            b'"' => escaped.push_str("\\\""),
-            b'\\' => escaped.push_str("\\\\"),
-            b'\n' => escaped.push_str("\\n"),
-            b'\r' => escaped.push_str("\\r"),
-            b'\t' => escaped.push_str("\\t"),
-            byte => escaped.push(byte as char),
+    for character in text.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
         }
     }
     escaped.push('"');

@@ -118,6 +118,16 @@ def run_bench() -> None:
     concatenated into LATEST so `append_rows` parses it the same as a
     single combined run.
     """
+    # compare_external supports a comma-separated curve, but this wrapper
+    # publishes one complete engine sweep as one comparison row set. Refuse a
+    # multi-size request before doing the expensive work rather than rejecting
+    # its output afterwards.
+    sizes = os.environ.get("MTXDB_BENCH_EXT_GB", "").split(",")
+    if len(sizes) > 1:
+        raise SystemExit(
+            "MTXDB_BENCH_EXT_GB must specify one size when using "
+            "scripts/external_bench.py"
+        )
     CSV_DIR.mkdir(parents=True, exist_ok=True)
     with LATEST.open("wb") as out:
         for ext_engine, checksum, row_name in INVOCATIONS:
