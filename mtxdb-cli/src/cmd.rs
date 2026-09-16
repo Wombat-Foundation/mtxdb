@@ -2524,6 +2524,7 @@ fn cmd_scan_collection(
     let mut frames = 0_usize;
     let mut packs = 0_usize;
     let max_rows = scan_limit(limit);
+    let bounded = max_rows != usize::MAX;
     let mut raw_matches = Vec::new();
     let mut header_printed = false;
     for (_, shard) in shards {
@@ -2569,9 +2570,15 @@ fn cmd_scan_collection(
                         print_scan_payload(&data.data);
                     }
                 }
+                if bounded && frames >= max_rows {
+                    break;
+                }
             }
         }
         packs = packs.saturating_add(usize::from(matched_pack));
+        if bounded && frames >= max_rows {
+            break;
+        }
     }
 
     if frames == 0 {
@@ -2592,16 +2599,28 @@ fn cmd_scan_collection(
             }
             io::stdout().write_all(&data.data)?;
         }
-        eprint_scan_limit_note(frames, max_rows);
+        if bounded && frames >= max_rows {
+            eprintln!("note: showing first {max_rows} matching records; use -l 0 to scan all");
+        } else {
+            eprint_scan_limit_note(frames, max_rows);
+        }
         return Ok(());
     }
-    println!(
-        "collection {}: {frames} physical record{} across {packs} pack{}",
-        hex_encode(&collection_id),
-        if frames == 1 { "" } else { "s" },
-        if packs == 1 { "" } else { "s" },
-    );
-    print_scan_limit_note(frames, max_rows);
+    if bounded && frames >= max_rows {
+        println!(
+            "collection {}: showing first {frames} physical records (at least {packs} pack{})",
+            hex_encode(&collection_id),
+            if packs == 1 { "" } else { "s" },
+        );
+    } else {
+        println!(
+            "collection {}: {frames} physical record{} across {packs} pack{}",
+            hex_encode(&collection_id),
+            if frames == 1 { "" } else { "s" },
+            if packs == 1 { "" } else { "s" },
+        );
+        print_scan_limit_note(frames, max_rows);
+    }
     Ok(())
 }
 
