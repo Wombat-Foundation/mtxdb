@@ -197,7 +197,52 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync { all } => cmd_sync(cli, *all),
         Commands::Init => cmd_init(cli),
+        Commands::SubprocessWriter { path } | Commands::SubprocessWriterAppend { path } => {
+            cmd_subprocess_writer(path, true, false)
+        }
+        Commands::SubprocessWriterUnsynced { path } => cmd_subprocess_writer(path, false, false),
+        Commands::SubprocessWriterSeed { path } => cmd_subprocess_writer(path, true, true),
+        Commands::SubprocessReader { path } => cmd_subprocess_reader(path),
     }
+}
+
+const SUBPROCESS_COLLECTION: [u8; 16] = [0x01; 16];
+const SUBPROCESS_RECORD: [u8; 16] = [0xD0; 16];
+const SUBPROCESS_SEED: [u8; 16] = [0xC0; 16];
+
+fn cmd_subprocess_writer(path: &str, sync: bool, seed: bool) -> anyhow::Result<()> {
+    let store = PackfileStorage::open(PathBuf::from(path)).context("failed to open test store")?;
+    let id = if seed {
+        SUBPROCESS_SEED
+    } else {
+        SUBPROCESS_RECORD
+    };
+    let payload: &[u8] = if seed { b"seed" } else { b"synced" };
+    let data = NodeData::new(bytes::Bytes::from_static(payload));
+    store
+        .put(&SUBPROCESS_COLLECTION, &id, &data)
+        .context("failed to write test record")?;
+    if sync {
+        store.sync().context("failed to sync test record")?;
+    }
+    Ok(())
+}
+
+fn cmd_subprocess_reader(path: &str) -> anyhow::Result<()> {
+    let store = PackfileStorage::open_read_only(PathBuf::from(path))
+        .context("failed to open test store read-only")?;
+    store.reset_stats();
+    let result = store
+        .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
+        .context("failed to read test record")?;
+    let stats = store.stats();
+    if result.first().and_then(Option::as_ref).is_some() {
+        println!("RECOVERED");
+    } else {
+        println!("NOT_FOUND");
+    }
+    println!("miss_refreshes={}", stats.miss_refreshes);
+    Ok(())
 }
 
 /// Create a new mtxdb database root: `db.meta` plus an empty directory for

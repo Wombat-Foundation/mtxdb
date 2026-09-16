@@ -76,6 +76,26 @@ pub(crate) enum Commands {
         all: bool,
     },
     Init,
+    /// Internal: write a test record and sync (for subprocess tests).
+    SubprocessWriter {
+        path: String,
+    },
+    /// Internal: write a test record without sync (for subprocess tests).
+    SubprocessWriterUnsynced {
+        path: String,
+    },
+    /// Internal: seed test data and sync (for subprocess tests).
+    SubprocessWriterSeed {
+        path: String,
+    },
+    /// Internal: append and sync test data (for subprocess tests).
+    SubprocessWriterAppend {
+        path: String,
+    },
+    /// Internal: read with refresh (for subprocess tests).
+    SubprocessReader {
+        path: String,
+    },
 }
 
 fn build_cli() -> Command {
@@ -115,6 +135,11 @@ fn build_cli() -> Command {
         .subcommand(sub_put())
         .subcommand(sub_get())
         .subcommand(sub_init())
+        .subcommand(sub_subprocess_writer())
+        .subcommand(sub_subprocess_writer_unsynced())
+        .subcommand(sub_subprocess_writer_seed())
+        .subcommand(sub_subprocess_writer_append())
+        .subcommand(sub_subprocess_reader())
 }
 
 /// The two flags shared by every subcommand (`--dir`, `--shard-type`).
@@ -215,6 +240,41 @@ fn sub_init() -> Command {
          The only command that creates a store -- every other command errors \
          if it doesn't already exist.",
     )
+}
+
+fn sub_subprocess_writer() -> Command {
+    Command::new("subprocess-writer")
+        .about("Internal: write a test record and sync")
+        .hide(true)
+        .arg(Arg::new("path").required(true).index(1))
+}
+
+fn sub_subprocess_writer_unsynced() -> Command {
+    Command::new("subprocess-writer-unsynced")
+        .about("Internal: write a test record without sync")
+        .hide(true)
+        .arg(Arg::new("path").required(true).index(1))
+}
+
+fn sub_subprocess_writer_seed() -> Command {
+    Command::new("subprocess-writer-seed")
+        .about("Internal: seed test data and sync")
+        .hide(true)
+        .arg(Arg::new("path").required(true).index(1))
+}
+
+fn sub_subprocess_writer_append() -> Command {
+    Command::new("subprocess-writer-append")
+        .about("Internal: append and sync test data")
+        .hide(true)
+        .arg(Arg::new("path").required(true).index(1))
+}
+
+fn sub_subprocess_reader() -> Command {
+    Command::new("subprocess-reader")
+        .about("Internal: read with refresh")
+        .hide(true)
+        .arg(Arg::new("path").required(true).index(1))
 }
 
 fn sub_sync() -> Command {
@@ -549,6 +609,21 @@ fn parse_cli() -> Cli {
             all: m.get_flag("all"),
         },
         Some(("init", _)) => Commands::Init,
+        Some(("subprocess-writer", m)) => Commands::SubprocessWriter {
+            path: m.get_one::<String>("path").unwrap().clone(),
+        },
+        Some(("subprocess-writer-unsynced", m)) => Commands::SubprocessWriterUnsynced {
+            path: m.get_one::<String>("path").unwrap().clone(),
+        },
+        Some(("subprocess-writer-seed", m)) => Commands::SubprocessWriterSeed {
+            path: m.get_one::<String>("path").unwrap().clone(),
+        },
+        Some(("subprocess-writer-append", m)) => Commands::SubprocessWriterAppend {
+            path: m.get_one::<String>("path").unwrap().clone(),
+        },
+        Some(("subprocess-reader", m)) => Commands::SubprocessReader {
+            path: m.get_one::<String>("path").unwrap().clone(),
+        },
         _ => {
             build_cli().print_help().unwrap();
             std::process::exit(0);

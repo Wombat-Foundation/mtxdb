@@ -661,7 +661,7 @@ impl PackfileStorage {
 
     fn post_refresh_fingerprint(&self) -> Option<u64> {
         match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir) {
-            Ok(Some(fp)) => Some(fp),
+            Ok(Some(fp)) => Some(fp.fingerprint),
             Ok(None) => Some(0),
             Err(error) => {
                 let previous = self.miss_refresh_fp_errors.fetch_add(1, Ordering::Relaxed);
@@ -687,6 +687,7 @@ impl PackfileStorage {
         results: &mut [Option<NodeData>],
     ) -> Result<(), StorageError> {
         self.refresh_collection(collection_id)?;
+        // Reread the fingerprint after refresh to handle a concurrent sync.
         if let Some(fp) = self.post_refresh_fingerprint() {
             self.last_refresh_fingerprint
                 .lock()
@@ -1205,7 +1206,7 @@ impl PackfileStorage {
         // skip refresh when nothing durable changed.
         let initial_durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&base_dir)
         {
-            Ok(Some(fp)) => fp,
+            Ok(Some(dfp)) => dfp.fingerprint,
             Ok(None) | Err(_) => 0,
         };
         let initial_fingerprints: HashMap<[u8; 16], u64> = collection_order
@@ -4505,11 +4506,15 @@ impl PackfileStorage {
         }
 
         let durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir) {
-            Ok(Some(fp)) => fp,
-            Ok(None) => 0, // no checkpoint = fresh store, valid zero
-            Err(_) => {
-                self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
-                return Ok(results);
+            Ok(Some(dfp)) => dfp,
+            Ok(None) => crate::index::checkpoint::DurableFingerprint {
+                fingerprint: 0,
+                torn_tail: false,
+            },
+            Err(e) => {
+                return Err(StorageError::Corrupt(format!(
+                    "failed to read durable fingerprint: {e}"
+                )));
             }
         };
 
@@ -4518,10 +4523,10 @@ impl PackfileStorage {
             let baseline = fingerprints
                 .entry(*collection_id)
                 .or_insert(self.initial_durable_fingerprint);
-            *baseline == durable_fp
+            *baseline == durable_fp.fingerprint
         };
 
-        if dominated {
+        if dominated && !durable_fp.torn_tail {
             self.miss_refresh_skips.fetch_add(1, Ordering::Relaxed);
             return Ok(results);
         }

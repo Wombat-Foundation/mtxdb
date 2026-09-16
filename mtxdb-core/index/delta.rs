@@ -96,6 +96,8 @@ pub struct DeltaLog {
     /// boundary — it is the answer to "has a base header already been
     /// written", independent of any fresh-session default.
     pub file_len: u64,
+    /// Whether a torn tail was encountered after the last committed batch.
+    pub torn_tail: bool,
 }
 
 /// Encode the fixed-width log header for `base_fingerprint`.
@@ -150,6 +152,10 @@ pub struct DeltaTailFingerprint {
     pub base_fingerprint: u64,
     /// The last committed `tail_fingerprint` from the validated batches.
     pub tail_fingerprint: u64,
+    /// Whether a torn tail was encountered after the last committed batch.
+    /// `true` means the file ended mid-batch (expected if writer crashed);
+    /// `false` means we read to EOF cleanly after a complete batch.
+    pub torn_tail: bool,
 }
 
 /// Failure while inspecting a delta log's durable fingerprint.
@@ -307,6 +313,7 @@ pub fn read_delta_tail_fingerprint(
                 Some(tail_fingerprint) => Ok(Some(DeltaTailFingerprint {
                     base_fingerprint: base_fp,
                     tail_fingerprint,
+                    torn_tail: pos < len,
                 })),
                 None => Err(invalid(
                     path,
@@ -330,6 +337,7 @@ pub fn read_delta_tail_fingerprint(
             .ok_or_else(|| invalid(path, "trailer boundary overflow"))?
             > len
         {
+            // Torn tail: not enough bytes for complete batch + trailer
             break;
         }
         // --- trailer ---
@@ -371,10 +379,14 @@ pub fn read_delta_tail_fingerprint(
             .checked_add(trailer_len)
             .ok_or_else(|| invalid(path, "next batch offset overflow"))?;
     }
+    // Determine if we stopped due to a torn tail (insufficient bytes for next batch)
+    // or because we reached EOF cleanly after a complete batch.
+    let torn_tail = pos < len;
     match tail_fingerprint {
         Some(tail_fingerprint) => Ok(Some(DeltaTailFingerprint {
             base_fingerprint: base_fp,
             tail_fingerprint,
+            torn_tail,
         })),
         None => Err(invalid(path, "no committed delta batch")),
     }
@@ -479,6 +491,7 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
         tail_fingerprint = Some(batch_tail_fingerprint);
         offset = batch_end;
     }
+    let torn_tail = offset < buf.len();
     Some(DeltaLog {
         base_fingerprint,
         frames,
@@ -486,6 +499,7 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
         // `offset` is the frontier of the last committed batch: the loop only
         // breaks past a committed trailer or before a torn/unparseable tail.
         file_len: u64::try_from(offset).unwrap_or(u64::MAX),
+        torn_tail,
     })
 }
 
