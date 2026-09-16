@@ -78,10 +78,10 @@ cov: ##H Run code coverage and generate HTML report
 	# Print per-file summary to the terminal (functions/lines only)
 	@echo ''
 	@echo '══════════════ COVERAGE SUMMARY ══════════════'
-	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report \
+	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report -p mtxdb-core \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Process report to codecov-compatible JSON
-	$(CARGO) llvm-cov report \
+	$(CARGO) llvm-cov report -p mtxdb-core \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*' \
 		--codecov --output-path .coverage/codecov.json
 	@echo DONE. You may open it with:
