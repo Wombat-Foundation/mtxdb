@@ -289,6 +289,25 @@ impl LossyIndex {
         shard_id: u16,
         offset: u64,
     ) -> Result<(u32, u64), InsertError> {
+        self.insert_undoable(hash, shard_id, offset)
+            .map(|(bucket, value, _undo)| (bucket, value))
+    }
+
+    /// Like [`Self::insert_tracked`], but also returns a [`SlotUndo`]
+    /// capturing the slot's prior contents, so a caller that needs to
+    /// mutate the live (not cloned) index for a multi-record batch can
+    /// undo this one write if a later entry in the batch fails.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::insert_tracked`] and leaves the
+    /// table unmodified in every error case.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn insert_undoable(
+        &self,
+        hash: &[u8; 16],
+        shard_id: u16,
+        offset: u64,
+    ) -> Result<(u32, u64, SlotUndo), InsertError> {
         let tag = Self::tag(hash);
         let home = u64::from_be_bytes([
             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
@@ -306,6 +325,8 @@ impl LossyIndex {
                 if self.len.load(Ordering::Relaxed) >= threshold {
                     return Err(InsertError::TableFull);
                 }
+                let old_home = self.homes.lock()[bucket];
+                let old_tail = self.tails.lock()[bucket];
                 // Writers are serialized by the collection put lock. Publish
                 // the slot last so concurrent readers see either the prior
                 // empty slot or a complete record location.
@@ -314,7 +335,14 @@ impl LossyIndex {
                 let value = IndexSlot::new(tag, shard_id, offset).0;
                 slots[bucket].store(value, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
-                return Ok((bucket as u32, value));
+                let undo = SlotUndo {
+                    bucket: bucket as u32,
+                    old_slot: 0,
+                    old_home,
+                    old_tail,
+                    was_empty: true,
+                };
+                return Ok((bucket as u32, value, undo));
             }
             // A tag only filters candidates; it never proves key equality.
             // Checkpoint-derived slots initially lack their 40-bit tail and
@@ -329,12 +357,43 @@ impl LossyIndex {
                     });
                 }
                 if self.homes.lock()[bucket] == home && tail == Self::tail(hash) {
+                    let old_slot = slot.0;
+                    let old_home = self.homes.lock()[bucket];
                     let value = IndexSlot::new(tag, shard_id, offset).0;
                     slots[bucket].store(value, Ordering::Release);
-                    return Ok((bucket as u32, value));
+                    let undo = SlotUndo {
+                        bucket: bucket as u32,
+                        old_slot,
+                        old_home,
+                        old_tail: tail,
+                        was_empty: false,
+                    };
+                    return Ok((bucket as u32, value, undo));
                 }
             }
             bucket = bucket.wrapping_add(1) & self.mask as usize;
+        }
+    }
+
+    /// Reverse a write reported by [`Self::insert_undoable`]. Callers must
+    /// replay a batch's undo entries in the reverse order they were
+    /// produced, and only against the same live index that produced them
+    /// (never a cloned/owned index materialized after the fact).
+    ///
+    /// # Panics
+    /// Never panics; a no-op if called against a checkpoint-mmap-backed
+    /// index, since [`Self::insert_undoable`] cannot have produced an undo
+    /// entry against one (it errors with `TableFull` first).
+    pub fn rollback_slot(&self, undo: &SlotUndo) {
+        let SlotStorage::Owned(slots) = &self.slots else {
+            return;
+        };
+        let bucket = undo.bucket as usize;
+        self.homes.lock()[bucket] = undo.old_home;
+        self.tails.lock()[bucket] = undo.old_tail;
+        slots[bucket].store(undo.old_slot, Ordering::Release);
+        if undo.was_empty {
+            self.len.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -712,6 +771,18 @@ impl LossyIndex {
     }
 }
 
+/// Captures a single slot's prior contents so a live (uncloned) index write
+/// made by [`LossyIndex::insert_undoable`] can be reversed by
+/// [`LossyIndex::rollback_slot`] if a later entry in the same batch fails.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotUndo {
+    bucket: u32,
+    old_slot: u64,
+    old_home: u64,
+    old_tail: u64,
+    was_empty: bool,
+}
+
 /// Errors that can occur while inserting into a [`LossyIndex`].
 #[derive(Debug)]
 pub enum InsertError {
@@ -935,6 +1006,59 @@ mod tests {
             assert_eq!(index.lookup(hash), Some((0, offset as u64)));
         }
         index.insert(&splitmix_hash(12), 0, 12).unwrap();
+    }
+
+    #[test]
+    fn test_rollback_slot_undoes_fresh_insert() {
+        let index = LossyIndex::new(128);
+        let h1 = test_hash(0x01);
+        let h2 = test_hash(0x02);
+        index.insert(&h1, 0, 100).unwrap();
+        assert_eq!(index.len(), 1);
+
+        let (_, _, undo) = index.insert_undoable(&h2, 1, 200).unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.lookup(&h2), Some((1, 200)));
+
+        index.rollback_slot(&undo);
+        assert_eq!(
+            index.len(),
+            1,
+            "rollback of a fresh-slot insert must restore len"
+        );
+        assert_eq!(
+            index.lookup(&h2),
+            None,
+            "rolled-back entry must not be findable"
+        );
+        assert_eq!(
+            index.lookup(&h1),
+            Some((0, 100)),
+            "rollback must not disturb an unrelated slot"
+        );
+    }
+
+    #[test]
+    fn test_rollback_slot_undoes_overwrite() {
+        let index = LossyIndex::new(128);
+        let h = test_hash(0x01);
+        index.insert(&h, 0, 100).unwrap();
+        assert_eq!(index.len(), 1);
+
+        let (_, _, undo) = index.insert_undoable(&h, 1, 200).unwrap();
+        assert_eq!(index.lookup(&h), Some((1, 200)));
+
+        index.rollback_slot(&undo);
+        assert_eq!(
+            index.len(),
+            1,
+            "rollback of an overwrite must not change len"
+        );
+        assert_eq!(
+            index.lookup(&h),
+            Some((0, 100)),
+            "rollback of an overwrite must restore the prior location"
+        );
     }
 
     #[test]

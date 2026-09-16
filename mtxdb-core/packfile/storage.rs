@@ -12,7 +12,7 @@ use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
 use crate::index::delta::{self, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
-use crate::index::{InsertError, LossyIndex};
+use crate::index::{InsertError, LossyIndex, SlotUndo};
 use crate::packfile::{self, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -3074,8 +3074,24 @@ impl PackfileStorage {
         shard_id: u16,
         offset: u64,
     ) -> Result<Result<(u32, u64), InsertError>, StorageError> {
+        Ok(self
+            .insert_index_undoable(collection_id, index, hash, shard_id, offset)?
+            .map(|(bucket, slot, _undo)| (bucket, slot)))
+    }
+
+    /// Like [`Self::insert_index`], but also returns the [`SlotUndo`]
+    /// needed to reverse this one write, for callers mutating a still-live
+    /// (not cloned) index across a multi-record batch.
+    fn insert_index_undoable(
+        &self,
+        collection_id: &[u8; 16],
+        index: &LossyIndex,
+        hash: &NodeId,
+        shard_id: u16,
+        offset: u64,
+    ) -> Result<Result<(u32, u64, SlotUndo), InsertError>, StorageError> {
         loop {
-            match index.insert_tracked(hash, shard_id, offset) {
+            match index.insert_undoable(hash, shard_id, offset) {
                 Ok(written) => return Ok(Ok(written)),
                 Err(InsertError::TableFull) => return Ok(Err(InsertError::TableFull)),
                 Err(InsertError::NeedsIdentity {
@@ -4814,6 +4830,12 @@ impl StorageEngine for PackfileStorage {
         // append can fail, and callers must not observe the successful prefix
         // of that failed batch.
         let mut owned_index: Option<LossyIndex> = match &old_gen {
+            // A batch against an already-materialized (non-mmap) index can
+            // mutate it in place instead of paying a full clone: each write
+            // is captured in `undo_log` below and rolled back in reverse if
+            // a later entry's shard append fails, so the live index never
+            // ends up observably holding a failed batch's partial prefix.
+            Some(g) if !g.index.is_mmap_backed() => None,
             Some(g) => Some(g.index.clone()),
             // Unlike `put`'s single-record path, we know exactly how many
             // records this brand-new collection is about to receive -- size
@@ -4851,6 +4873,25 @@ impl StorageEngine for PackfileStorage {
         let mut pending_deltas = Vec::with_capacity(entries.len());
         let mut pending_shard_collections = Vec::with_capacity(entries.len());
         let mut invalidate_delta = false;
+        // Undo entries for writes made directly to `old_gen`'s live index
+        // (only populated while `owned_index` is still `None`). Replayed in
+        // reverse on any later failure so the live index never ends up
+        // observably holding a failed batch's partial prefix -- the
+        // property the unconditional clone used to provide for free.
+        let mut undo_log: Vec<SlotUndo> = Vec::new();
+
+        macro_rules! rollback_and_fail {
+            ($error:expr) => {{
+                if let Some(g) = &old_gen {
+                    for undo in undo_log.iter().rev() {
+                        g.index.rollback_slot(undo);
+                    }
+                }
+                drop(create_guard);
+                drop(collection_guard);
+                return Err(self.persist_failed_batch_boundary($error));
+            }};
+        }
 
         for (id, data) in entries {
             let record = Record {
@@ -4861,15 +4902,11 @@ impl StorageEngine for PackfileStorage {
 
             let (shard_id, offset) = match self.shards.put_record(&record) {
                 Ok(location) => location,
-                Err(error) => {
-                    // Earlier entries may already be complete on disk. Write
-                    // a checkpoint for the old generation before returning,
-                    // so a crash after this error cannot make a restart's
-                    // fingerprint-matched scan publish the failed prefix.
-                    drop(create_guard);
-                    drop(collection_guard);
-                    return Err(self.persist_failed_batch_boundary(error.into()));
-                }
+                // Earlier entries may already be complete on disk. Write a
+                // checkpoint for the old generation before returning, so a
+                // crash after this error cannot make a restart's
+                // fingerprint-matched scan publish the failed prefix.
+                Err(error) => rollback_and_fail!(error.into()),
             };
 
             if index_needs_rebuild {
@@ -4890,16 +4927,19 @@ impl StorageEngine for PackfileStorage {
                 }
             };
 
-            let insert_result = match self.insert_index(collection_id, live, id, shard_id, offset) {
-                Ok(result) => result,
-                Err(error) => {
-                    drop(create_guard);
-                    drop(collection_guard);
-                    return Err(self.persist_failed_batch_boundary(error));
-                }
-            };
-            let inserted = if let Ok((bucket, slot)) = insert_result {
+            let insert_result =
+                match self.insert_index_undoable(collection_id, live, id, shard_id, offset) {
+                    Ok(result) => result,
+                    Err(error) => rollback_and_fail!(error),
+                };
+            let inserted = if let Ok((bucket, slot, undo)) = insert_result {
                 pending_deltas.push((bucket, slot));
+                // Only writes against the still-live (uncloned) index need
+                // an undo entry -- once `owned_index` exists, a failure
+                // just discards that private clone, same as before.
+                if owned_index.is_none() {
+                    undo_log.push(undo);
+                }
                 true
             } else {
                 // Growth (either flavor) materializes a fresh owned index; the
@@ -4951,11 +4991,7 @@ impl StorageEngine for PackfileStorage {
         if index_needs_rebuild {
             let rebuilt = match self.rebuild_index(collection_id) {
                 Ok(index) => index,
-                Err(error) => {
-                    drop(create_guard);
-                    drop(collection_guard);
-                    return Err(self.persist_failed_batch_boundary(error));
-                }
+                Err(error) => rollback_and_fail!(error),
             };
             // rebuild_index automatically discovers all the records we just appended
             self.replace_collection_shard_counts(
@@ -4998,9 +5034,7 @@ impl StorageEngine for PackfileStorage {
             let index = owned_index
                 .expect("structural_change is only set once owned_index is materialized");
             if let Err(error) = self.store_generation(collection_id, index, Some(cache), false) {
-                drop(create_guard);
-                drop(collection_guard);
-                return Err(self.persist_failed_batch_boundary(error));
+                rollback_and_fail!(error);
             }
         } else {
             // Every record landed on the live, already-published index in
@@ -7138,9 +7172,10 @@ mod tests {
         assert_eq!(snapshot.get_calls, 2);
         assert_eq!(snapshot.get_misses, 1);
 
-        // Batched writes use copy-on-write so a failed later append cannot
-        // expose an earlier record from the same batch. Every call is thus
-        // charged to the clone path.
+        // Batched writes against an already-materialized (non-mmap) index
+        // mutate it in place and roll back via an undo log on failure,
+        // rather than cloning -- so only the very first batch (which
+        // creates the collection) pays the clone/materialize cost.
         let batches: Vec<Vec<(NodeId, NodeData)>> = (0..8u32)
             .map(|batch| {
                 (0..8u32)
@@ -7163,8 +7198,11 @@ mod tests {
         assert_eq!(snapshot.put_many_calls, 8);
         assert_eq!(snapshot.put_many_records, 64);
         assert!(snapshot.put_many_bytes > 0);
-        assert_eq!(snapshot.put_many_clone_path_calls, 8);
-        assert_eq!(snapshot.put_many_fast_path_calls, 0);
+        // Only the first batch creates `SECOND_COLLECTION` (the `None` arm,
+        // which always materializes); every later batch finds an
+        // already-owned, non-mmap index and takes the in-place fast path.
+        assert_eq!(snapshot.put_many_clone_path_calls, 1);
+        assert_eq!(snapshot.put_many_fast_path_calls, 7);
         // 64 distinct records into a floor-sized 64-slot index must cross the
         // grow threshold at least once.
         assert!(snapshot.index_grow_count >= 1);
