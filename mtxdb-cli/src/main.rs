@@ -276,9 +276,9 @@ fn sub_scan() -> Command {
                 .help("With a pack selector, restrict the scan to this collection"),
         )
         .arg(Arg::new("raw").long("raw").action(ArgAction::SetTrue).help(
-            "Write matching frames' payload bytes verbatim, concatenated, to stdout (all \
-                     matches, or up to --limit; use -l 0 for no cap). With --verbose, a per-frame \
-                     context line goes to stderr so stdout stays a clean byte stream",
+            "Write matching frames' payload bytes to stdout, each preceded by a self-describing \
+                     JSONL header (collection, node, offset, length). With --verbose, a per-frame \
+                     context line also goes to stderr",
         ))
         .arg(sort_arg("payload"))
         .arg(limit_arg())

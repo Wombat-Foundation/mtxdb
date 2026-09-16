@@ -2523,16 +2523,19 @@ fn scan_pack(
         truncated = records.len() > max_rows;
     }
     if raw {
-        for (.., offset) in records.iter().take(max_rows) {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for (_, _, offset) in records.iter().take(max_rows) {
             let data = ShardPool::read_at_committed(shard, *offset, true)?;
+            out.write_all(&data.data)?;
             if verbose {
                 eprintln!(
                     "pack 0x{pack_id:016x}: raw frame @ {offset} ({} bytes, checksum verified)",
                     data.data.len()
                 );
             }
-            io::stdout().write_all(&data.data)?;
         }
+        out.flush()?;
         if truncated {
             eprintln!("note: only showing top {max_rows}; use `-l 0` to show all");
         }
@@ -2687,8 +2690,11 @@ fn cmd_scan_collection(
     }
     sort_collection_records(&mut context);
     if context.mode.is_raw() {
-        for (shard, offset) in context.raw_matches.iter().take(max_rows) {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for (shard, _, offset) in context.raw_matches.iter().take(max_rows) {
             let data = ShardPool::read_at_committed(shard, *offset, true)?;
+            out.write_all(&data.data)?;
             if verbose {
                 eprintln!(
                     "collection {}: raw frame @ {offset} ({} bytes, checksum verified)",
@@ -2696,8 +2702,8 @@ fn cmd_scan_collection(
                     data.data.len()
                 );
             }
-            io::stdout().write_all(&data.data)?;
         }
+        out.flush()?;
         if bounded && frames >= max_rows {
             eprintln!("note: showing first {max_rows} matching records; use -l 0 to scan all");
         } else {
@@ -2747,7 +2753,7 @@ struct CollectionScanContext {
     mode: CollectionScanMode,
     max_rows: usize,
     frames: usize,
-    raw_matches: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, u64)>,
+    raw_matches: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, [u8; 16], u64)>,
     header_printed: bool,
     shard_type: ShardType,
     sorted_records: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, [u8; 16], u64)>,
@@ -2804,7 +2810,7 @@ fn scan_collection_shard(
         matched_pack = true;
         context.frames = context.frames.saturating_add(1);
         if context.mode.is_raw() {
-            context.raw_matches.push((shard.clone(), offset));
+            context.raw_matches.push((shard.clone(), record_id, offset));
         } else if context.mode.sorts_payload() {
             context
                 .sorted_records
@@ -3337,34 +3343,143 @@ fn cmd_import_file(
     let is_jsonl = path
         .extension()
         .is_some_and(|extension| extension == "jsonl");
-    let (events, detected_collection) = if is_jsonl {
-        match parse_jsonl_events(&content) {
-            Ok(events) => events,
-            Err(jsonl_error) => match parse_federation_events(&content) {
+
+    if is_jsonl {
+        let (events, detected_collection) =
+            parse_jsonl_events(&content).or_else(|jsonl_error| {
                 // Some existing DAG exports carry a `.jsonl` suffix despite
                 // being a pretty-printed federation JSON document.
-                Ok(events) => events,
-                Err(_) => return Err(jsonl_error),
-            },
+                parse_federation_events(&content).map_err(|_| jsonl_error)
+            })?;
+        if events.is_empty() {
+            bail!("no events found in {}", path.display());
         }
+        import_pdu_events(
+            store,
+            dir,
+            path,
+            &events,
+            detected_collection.as_deref(),
+            collection_override,
+            template,
+            established_collections,
+        )
     } else {
-        parse_federation_events(&content)?
-    };
+        let federation = parse_federation_input(&content)?;
+        let detected_collection = federation
+            .pdus
+            .iter()
+            .chain(federation.auth_chain.iter())
+            .find_map(event_room_id)
+            .map(str::to_owned);
+        if federation.pdus.is_empty() && federation.auth_chain.is_empty() {
+            bail!("no events found in {}", path.display());
+        }
 
+        // Verify auth chain edges: every auth_events reference must point
+        // to a known event_id in either pdus or auth_chain.
+        let dangling = verify_auth_chain_edges(&federation.pdus, &federation.auth_chain);
+        if !dangling.is_empty() {
+            for (source, target) in &dangling {
+                eprintln!("warning: auth_events dangling reference: {source} -> {target}");
+            }
+        }
+
+        // Import PDUs through the normal event-DAG path.
+        let pdu_count = if federation.pdus.is_empty() {
+            0
+        } else {
+            import_pdu_events(
+                store,
+                dir,
+                path,
+                &federation.pdus,
+                detected_collection.as_deref(),
+                collection_override,
+                template,
+                established_collections,
+            )?;
+            // Re-count: import_pdu_events already printed its summary.
+            // We just need the count for the auth chain summary below.
+            federation
+                .pdus
+                .iter()
+                .filter(|ev| event_id(ev).is_some())
+                .count() as u64
+        };
+
+        // Import auth chain events into the auth-chain shard pool.
+        if !federation.auth_chain.is_empty() {
+            // Derive the auth-chain pool dir from the event-dag pool dir.
+            // pool_dir is {root}/pools/event-dag; auth-chain is {root}/pools/auth-chain.
+            let auth_chain_dir = dir
+                .parent()
+                .map(|p| p.join("auth-chain"))
+                .context("deriving auth-chain pool path")?;
+            fs::create_dir_all(&auth_chain_dir)?;
+            let auth_store =
+                PackfileStorage::open(auth_chain_dir).context("opening auth-chain store")?;
+            let mut auth_count = 0u64;
+            let mut auth_skipped = 0u64;
+            for ev in &federation.auth_chain {
+                let Some(_incoming_event_id) = event_id(ev) else {
+                    auth_skipped = auth_skipped.saturating_add(1);
+                    continue;
+                };
+                let Some(id_bytes) = template_node_id(template, ev)? else {
+                    auth_skipped = auth_skipped.saturating_add(1);
+                    continue;
+                };
+                let collection_id = event_room_id(ev)
+                    .map(|room_id| template_collection_id(template, room_id))
+                    .transpose()?
+                    .unwrap_or([0u8; 16]);
+                let event_bytes = ev.encode().into_bytes();
+                let data = NodeData::new(bytes::Bytes::from(event_bytes));
+                auth_store.put(&collection_id, &id_bytes, &data)?;
+                auth_count = auth_count.saturating_add(1);
+            }
+            auth_store.sync_all()?;
+            eprintln!(
+                "imported {auth_count} auth-chain events ({} dangling references)",
+                dangling.len()
+            );
+            if auth_skipped > 0 {
+                eprintln!("skipped {auth_skipped} auth-chain events (missing event_id)");
+            }
+        }
+
+        let _ = pdu_count;
+        Ok(())
+    }
+}
+
+/// Import PDU events through the normal event-DAG path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all parameters are necessary for the import flow"
+)]
+fn import_pdu_events(
+    store: &PackfileStorage,
+    dir: &Path,
+    path: &Path,
+    events: &[OwnedValue],
+    detected_collection: Option<&str>,
+    collection_override: Option<&str>,
+    template: &CollectionTemplate,
+    established_collections: &mut HashSet<[u8; 16]>,
+) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
     }
     let mut event_count = 0u64;
     let mut skipped = 0u64;
     let mut already_present = 0u64;
-    // Successful imports are the nominal case and need no event-ID noise.
-    // Keep a small sample only for the duplicate case, where it helps an
-    // operator identify which input/store overlap caused the no-op.
     let mut already_present_ids = Vec::with_capacity(3);
 
     let (collection_id, batch_has_create) = resolve_import_collection(
-        &events,
-        detected_collection.as_deref(),
+        events,
+        detected_collection,
         collection_override,
         template,
         established_collections,
@@ -3372,7 +3487,7 @@ fn cmd_import_file(
 
     let collection_hex = hex_encode(&collection_id);
 
-    for ev in &events {
+    for ev in events {
         let Some(incoming_event_id) = event_id(ev) else {
             skipped = skipped.saturating_add(1);
             continue;
@@ -3407,17 +3522,32 @@ fn cmd_import_file(
 
     if batch_has_create {
         established_collections.insert(collection_id);
-        // Populate the Matrix room-details sidecar right now, for free: the
-        // events are already parsed in memory, so there is no need to make
-        // the first `info`/`scan` on this collection pay for a shard scan to
-        // rediscover what this import already knows.
-        let details = matrix_room_details_from_events(&events);
+        let details = matrix_room_details_from_events(events);
         if let Err(error) = persist_matrix_room_details(dir, &collection_id, &details) {
             eprintln!("warning: unable to cache Matrix room metadata: {error}");
         }
     }
 
-    if let Some(room_id) = detected_collection.as_deref() {
+    // Compute state groups from the event DAG and persist the mappings.
+    let state_groups = compute_state_groups(events);
+    if !state_groups.is_empty() {
+        use mtxdb_core::auxiliary::AuxiliaryIndex;
+        let aux = AuxiliaryIndex::open(store, "matrix-state-groups");
+        let mut state_count = 0u64;
+        for (event_id, state_group_id) in &state_groups {
+            // Key: event_id, Value: state_group_id (base64url).
+            if let Err(error) = aux.put(event_id.as_bytes(), state_group_id.as_bytes()) {
+                eprintln!("warning: unable to persist state group for {event_id}: {error}");
+            } else {
+                state_count = state_count.saturating_add(1);
+            }
+        }
+        if state_count > 0 {
+            eprintln!("computed {state_count} state groups for collection {collection_hex}");
+        }
+    }
+
+    if let Some(room_id) = detected_collection {
         eprintln!("imported {event_count} events to collection {collection_hex} (room {room_id})");
     } else {
         eprintln!("imported {event_count} events to collection {collection_hex}");
@@ -3550,20 +3680,294 @@ fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option
 }
 
 fn parse_federation_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
-    let mut bytes = content.to_vec();
-    let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
-    let pdus = val.get("pdus").and_then(|v| v.as_array());
-    let auth_chain = val.get("auth_chain").and_then(|v| v.as_array());
-    if pdus.is_none() && auth_chain.is_none() {
-        bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array, or a .jsonl file containing one event per line");
-    }
-    let events: Vec<OwnedValue> = [pdus, auth_chain]
+    let federation = parse_federation_input(content)?;
+    let events: Vec<OwnedValue> = federation
+        .pdus
         .into_iter()
-        .flatten()
-        .flat_map(|events| events.iter().cloned())
+        .chain(federation.auth_chain)
         .collect();
     let detected_collection = events.iter().find_map(event_room_id).map(str::to_owned);
     Ok((events, detected_collection))
+}
+
+/// Parsed Matrix federation response with PDUs and auth chain kept separate.
+struct FederationInput {
+    pdus: Vec<OwnedValue>,
+    auth_chain: Vec<OwnedValue>,
+}
+
+fn parse_federation_input(content: &[u8]) -> anyhow::Result<FederationInput> {
+    let mut bytes = content.to_vec();
+    let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
+    let pdus: Vec<_> = val
+        .get("pdus")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let auth_chain: Vec<_> = val
+        .get("auth_chain")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if pdus.is_empty() && auth_chain.is_empty() {
+        bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array, or a .jsonl file containing one event per line");
+    }
+    Ok(FederationInput { pdus, auth_chain })
+}
+
+/// Verify that every `auth_events` reference in a batch points to a known
+/// `event_id` (present in either pdus or `auth_chain`). Returns the list of
+/// dangling references for the caller to decide how to handle.
+fn verify_auth_chain_edges(
+    pdus: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+) -> Vec<(String, String)> {
+    let mut known = HashSet::new();
+    for ev in pdus.iter().chain(auth_chain.iter()) {
+        if let Some(eid) = event_id(ev) {
+            known.insert(eid.to_owned());
+        }
+    }
+    let mut dangling = Vec::new();
+    for ev in pdus.iter().chain(auth_chain.iter()) {
+        let Some(eid) = event_id(ev) else {
+            continue;
+        };
+        let OwnedValue::Object(fields) = ev else {
+            continue;
+        };
+        let Some(OwnedValue::Array(auth_events)) = fields.get("auth_events") else {
+            continue;
+        };
+        for reference in auth_events.iter() {
+            let target = match reference {
+                OwnedValue::String(s) => Some(s.as_str()),
+                OwnedValue::Array(parts) => parts.first().and_then(|v| v.as_str()),
+                _ => None,
+            };
+            if let Some(target) = target {
+                if !known.contains(target) {
+                    dangling.push((eid.to_owned(), target.to_owned()));
+                }
+            }
+        }
+    }
+    dangling
+}
+
+/// Build an in-memory event DAG from a set of PDU events.
+///
+/// Each event is hashed to a `u64` `short_id` via BLAKE3-128 of its `event_id`,
+/// then inserted into an [`ActiveRoomFrontier`] with its `prev_events` and
+/// `auth_events` edges resolved to the same `short_id` space.
+fn build_event_dag(events: &[OwnedValue]) -> mtxdb_core::dag::ActiveRoomFrontier {
+    use mtxdb_core::dag::ActiveRoomFrontier;
+
+    let mut frontier = ActiveRoomFrontier::new();
+    // Pre-register all event IDs so edges can resolve to resident nodes.
+    let mut id_map: HashMap<String, u64> = HashMap::new();
+    for ev in events {
+        if let Some(eid) = event_id(ev) {
+            let hash = blake3::hash(eid.as_bytes());
+            let mut short_id_bytes = [0u8; 8];
+            short_id_bytes.copy_from_slice(&hash.as_bytes()[..8]);
+            let short_id = u64::from_le_bytes(short_id_bytes);
+            id_map.insert(eid.to_owned(), short_id);
+        }
+    }
+    for ev in events {
+        let Some(eid) = event_id(ev) else {
+            continue;
+        };
+        let Some(&short_id) = id_map.get(eid) else {
+            continue;
+        };
+        let raw_prevs = extract_event_edge_ids(ev, "prev_events", &id_map);
+        let raw_auths = extract_event_edge_ids(ev, "auth_events", &id_map);
+        frontier.insert_event(short_id, &raw_prevs, &raw_auths);
+    }
+    frontier
+}
+
+/// Extract the short IDs for an edge array (`prev_events` or `auth_events`).
+fn extract_event_edge_ids(
+    event: &OwnedValue,
+    field: &str,
+    id_map: &HashMap<String, u64>,
+) -> Vec<u64> {
+    let OwnedValue::Object(fields) = event else {
+        return Vec::new();
+    };
+    let Some(OwnedValue::Array(arr)) = fields.get(field) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let eid = match item {
+                OwnedValue::String(s) => Some(s.as_str()),
+                OwnedValue::Array(parts) => parts.first().and_then(|v| v.as_str()),
+                _ => None,
+            };
+            eid.and_then(|eid| id_map.get(eid).copied())
+        })
+        .collect()
+}
+
+/// Compute state groups for a set of PDU events by walking the event DAG.
+///
+/// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
+/// `LtHash` digest). State groups are derived incrementally: each event
+/// inherits the state from its `prev_events` and applies its own state
+/// change (if it is a state event with `state_key`).
+fn compute_state_groups(events: &[OwnedValue]) -> HashMap<String, String> {
+    let frontier = build_event_dag(events);
+    if frontier.is_empty() {
+        return HashMap::new();
+    }
+
+    // Pre-register short IDs for all events.
+    let mut id_map: HashMap<String, u64> = HashMap::new();
+    for ev in events {
+        if let Some(eid) = event_id(ev) {
+            let hash = blake3::hash(eid.as_bytes());
+            let mut short_id_bytes = [0u8; 8];
+            short_id_bytes.copy_from_slice(&hash.as_bytes()[..8]);
+            id_map.insert(eid.to_owned(), u64::from_le_bytes(short_id_bytes));
+        }
+    }
+    // Reverse map: short_id -> event_id
+    let reverse_map: HashMap<u64, String> = id_map
+        .iter()
+        .map(|(eid, &sid)| (sid, eid.clone()))
+        .collect();
+
+    // Topological order via the frontier's node list.
+    let mut state_at: HashMap<u64, StateSet> = HashMap::new();
+    let mut result: HashMap<String, String> = HashMap::new();
+
+    for node in &frontier.nodes {
+        let short_id = node.short_id;
+
+        // Merge state from all prev_events.
+        let mut merged = StateSet::new();
+        for edge in frontier.prev_edges(frontier.resident[&short_id] as usize) {
+            let parent_id = if edge.is_resident() {
+                frontier.nodes[edge.arena_index()].short_id
+            } else {
+                // Disk-resident: look up by local_id
+                frontier
+                    .id_remap
+                    .iter()
+                    .find(|(_, &local)| local == edge.local_id())
+                    .map_or(0, |(&sid, _)| sid)
+            };
+            if let Some(parent_state) = state_at.get(&parent_id) {
+                merged.merge(parent_state);
+            }
+        }
+
+        // If this is a state event, apply the state change.
+        if let Some(eid) = reverse_map.get(&short_id) {
+            if let Some(ev) = events.iter().find(|e| event_id(e) == Some(eid.as_str())) {
+                if is_state_event(ev) {
+                    let key = state_key(ev);
+                    let state_type = event_string_field(ev, "type").unwrap_or("");
+                    merged.set(state_type, &key, eid.clone());
+                }
+            }
+        }
+
+        // Derive state group ID from the state set.
+        let state_group_id = merged.digest_base64url();
+        if let Some(eid) = reverse_map.get(&short_id) {
+            result.insert(eid.clone(), state_group_id);
+        }
+        state_at.insert(short_id, merged);
+    }
+
+    result
+}
+
+/// A set of state events keyed by (type, `state_key`).
+#[derive(Debug, Clone, Default)]
+struct StateSet {
+    /// (type, `state_key`) -> `event_id`
+    entries: HashMap<(String, String), String>,
+}
+
+impl StateSet {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn set(&mut self, event_type: &str, state_key: &str, event_id: String) {
+        self.entries
+            .insert((event_type.to_owned(), state_key.to_owned()), event_id);
+    }
+
+    fn merge(&mut self, other: &StateSet) {
+        for (key, eid) in &other.entries {
+            self.entries
+                .entry(key.clone())
+                .or_insert_with(|| eid.clone());
+        }
+    }
+
+    /// Compute the `LtHash` digest of the state set and encode as unpadded base64url.
+    ///
+    /// `LtHash` is an additive hash: for each (type, `state_key`, `event_id`) triple,
+    /// we feed `type || \0 || state_key || \0 || event_id` into the hash.
+    /// The digest is the byte-wise XOR of all such contributions.
+    fn digest_base64url(&self) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        // Sort for determinism.
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort();
+
+        // LtHash: XOR-based additive hash over 256-bit blocks.
+        let mut hash = [0u8; 32];
+        for ((event_type, state_key), event_id) in &entries {
+            let mut contribution = [0u8; 32];
+            // Hash the contribution using BLAKE3-256.
+            let mut input = Vec::new();
+            input.extend_from_slice(event_type.as_bytes());
+            input.push(0);
+            input.extend_from_slice(state_key.as_bytes());
+            input.push(0);
+            input.extend_from_slice(event_id.as_bytes());
+            let h = blake3::hash(&input);
+            contribution.copy_from_slice(h.as_bytes());
+            // XOR into the running hash.
+            for (a, b) in hash.iter_mut().zip(contribution.iter()) {
+                *a ^= *b;
+            }
+        }
+        // Encode as unpadded base64url.
+        URL_SAFE_NO_PAD.encode(hash)
+    }
+}
+
+/// Check if an event is a state event (has a `state_key` field).
+fn is_state_event(event: &OwnedValue) -> bool {
+    let OwnedValue::Object(fields) = event else {
+        return false;
+    };
+    matches!(fields.get("state_key"), Some(OwnedValue::String(_)))
+}
+
+/// Extract the `state_key` from a state event.
+fn state_key(event: &OwnedValue) -> String {
+    let OwnedValue::Object(fields) = event else {
+        return String::new();
+    };
+    match fields.get("state_key") {
+        Some(OwnedValue::String(s)) => s.clone(),
+        _ => String::new(),
+    }
 }
 
 fn event_room_id(value: &OwnedValue) -> Option<&str> {
@@ -4191,12 +4595,14 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cmd_sync, compile_import_template, decode_event_json_record, decode_hamt_node,
-        decode_hamt_root, default_matrix_import_template, event_room_id, extract_pointer_string,
+        build_event_dag, cmd_sync, compile_import_template, compute_state_groups,
+        decode_event_json_record, decode_hamt_node, decode_hamt_root,
+        default_matrix_import_template, event_id, event_room_id, extract_pointer_string,
         fmt_disk_megabytes, fmt_megabytes, glob_pack_files, interleaving_worth_noting,
-        matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
-        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
-        template_collection_id, CollectionTemplate,
+        matrix_batch_has_create, matrix_create_details, parse_federation_input,
+        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        resolve_import_collection, scan_payload_suffix, template_collection_id,
+        verify_auth_chain_edges, CollectionTemplate, StateSet,
     };
     use crate::{Cli, Commands};
     use mtxdb_core::{DatabaseLayout, ShardType};
@@ -4204,6 +4610,8 @@ mod tests {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use base64::Engine;
 
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
@@ -4972,5 +5380,173 @@ mod tests {
         assert!(text.contains("$create:server"));
         assert!(text.contains("1 leaves"));
         assert!(text.contains("0 children"));
+    }
+
+    // ── Import → event DAG → auth chain → state group integration tests ──
+
+    #[test]
+    fn build_event_dag_resolves_prev_and_auth_edges() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{"creator":"@a:x"}}"#,
+        );
+        let member = owned_value(
+            r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{"membership":"join"}}"#,
+        );
+        let msg = owned_value(
+            r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join","$create"],"content":{"body":"hi"}}"#,
+        );
+        let frontier = build_event_dag(&[create, member, msg]);
+        assert_eq!(frontier.len(), 3);
+        // $msg should have 2 prev edges and 2 auth edges
+        let msg_node = &frontier.nodes[2];
+        assert_eq!(msg_node.prev.1, 1); // 1 prev_events
+        assert_eq!(msg_node.auth.1, 2); // 2 auth_events
+    }
+
+    #[test]
+    fn compute_state_groups_assigns_groups_per_event() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{"creator":"@a:x"}}"#,
+        );
+        let member = owned_value(
+            r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{"membership":"join"}}"#,
+        );
+        let msg = owned_value(
+            r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join"],"content":{"body":"hi"}}"#,
+        );
+        let groups = compute_state_groups(&[create, member, msg]);
+        // All three events should have a state group.
+        assert!(groups.contains_key("$create"));
+        assert!(groups.contains_key("$join"));
+        assert!(groups.contains_key("$msg"));
+        // State group IDs are valid unpadded base64url.
+        for sg in groups.values() {
+            assert_ne!(sg, "");
+            assert!(sg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        }
+    }
+
+    #[test]
+    fn compute_state_groups_empty_input() {
+        let groups = compute_state_groups(&[]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn compute_state_groups_deterministic() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
+        );
+        let member = owned_value(
+            r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
+        );
+        let g1 = compute_state_groups(&[create.clone(), member.clone()]);
+        let g2 = compute_state_groups(&[create, member]);
+        assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn verify_auth_chain_edges_detects_dangling() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","sender":"@a:x","content":{}}"#,
+        );
+        let member = owned_value(
+            r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","sender":"@a:x","auth_events":["$create"],"content":{}}"#,
+        );
+        // All edges resolve.
+        let dangling = verify_auth_chain_edges(&[create.clone(), member.clone()], &[]);
+        assert_eq!(
+            dangling,
+            [] as [(std::string::String, std::string::String); 0]
+        );
+
+        // $missing is not in either set.
+        let bad = owned_value(
+            r#"{"event_id":"$bad","room_id":"!r:x","type":"m.room.message","sender":"@a:x","auth_events":["$missing"],"content":{}}"#,
+        );
+        let dangling = verify_auth_chain_edges(&[create, member, bad], &[]);
+        assert_eq!(dangling.len(), 1);
+        assert_eq!(dangling[0].0, "$bad");
+        assert_eq!(dangling[0].1, "$missing");
+    }
+
+    #[test]
+    fn verify_auth_chain_edges_auth_chain_as_known_set() {
+        // An auth_events reference to an event only in the auth_chain
+        // (not in pdus) should still resolve.
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","sender":"@a:x","content":{}}"#,
+        );
+        let member = owned_value(
+            r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","sender":"@a:x","auth_events":["$create"],"content":{}}"#,
+        );
+        let dangling = verify_auth_chain_edges(&[member], &[create]);
+        assert_eq!(
+            dangling,
+            [] as [(std::string::String, std::string::String); 0]
+        );
+    }
+
+    #[test]
+    fn parse_federation_input_separates_pdus_and_auth_chain() {
+        let json = r#"{
+            "pdus": [{"event_id": "$p1", "room_id": "!r:x", "type": "m.room.message"}],
+            "auth_chain": [{"event_id": "$a1", "room_id": "!r:x", "type": "m.room.create"}]
+        }"#;
+        let input = parse_federation_input(json.as_bytes()).unwrap();
+        assert_eq!(input.pdus.len(), 1);
+        assert_eq!(input.auth_chain.len(), 1);
+        assert_eq!(event_id(&input.pdus[0]), Some("$p1"));
+        assert_eq!(event_id(&input.auth_chain[0]), Some("$a1"));
+    }
+
+    #[test]
+    fn parse_federation_input_empty_rejected() {
+        let json = r#"{"unrelated": true}"#;
+        assert!(parse_federation_input(json.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn state_set_digest_is_deterministic() {
+        let mut s1 = StateSet::new();
+        s1.set("m.room.create", "", "$create".into());
+        s1.set("m.room.member", "@a:x", "$join".into());
+        let mut s2 = StateSet::new();
+        s2.set("m.room.create", "", "$create".into());
+        s2.set("m.room.member", "@a:x", "$join".into());
+        assert_eq!(s1.digest_base64url(), s2.digest_base64url());
+    }
+
+    #[test]
+    fn state_set_merge_takes_first_wins() {
+        let mut base = StateSet::new();
+        base.set("m.room.name", "", "$old".into());
+        let mut override_ = StateSet::new();
+        override_.set("m.room.name", "", "$new".into());
+        override_.set("m.room.topic", "", "$topic".into());
+        base.merge(&override_);
+        // First-wins: $old should survive because base already had the key.
+        assert_eq!(
+            &base.entries[&("m.room.name".into(), String::new())],
+            "$old"
+        );
+        // New key should be added.
+        assert_eq!(
+            &base.entries[&("m.room.topic".into(), String::new())],
+            "$topic"
+        );
+    }
+
+    #[test]
+    fn state_set_empty_digest_is_empty_base64url() {
+        let s = StateSet::new();
+        let digest = s.digest_base64url();
+        // XOR of nothing is all zeros.
+        assert_eq!(
+            digest,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32])
+        );
     }
 }
