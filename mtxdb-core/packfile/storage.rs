@@ -4487,9 +4487,17 @@ impl PackfileStorage {
         }
 
         self.refresh_collection(collection_id)?;
+        // Reread the durable fingerprint after refresh to handle the race
+        // where the writer synced more data during the refresh.
+        let refreshed_fp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir)
+        {
+            Ok(Some(fp)) => fp,
+            Ok(None) => 0,
+            Err(_) => durable_fp, // Fall back to pre-refresh value on error
+        };
         self.last_refresh_fingerprint
             .lock()
-            .insert(*collection_id, durable_fp);
+            .insert(*collection_id, refreshed_fp);
         self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
 
         let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
