@@ -468,6 +468,12 @@ pub struct PackfileStorage {
     /// Durable pool fingerprint observed when this handle was opened. This is
     /// the baseline for collections that did not yet exist at open time.
     initial_durable_fingerprint: u64,
+    /// Cached durable fingerprint (global across all collections) to avoid
+    /// rescanning the delta log on every miss. Updated after each refresh
+    /// and periodically re-read. Protected by its own mutex to avoid
+    /// contention with per-collection refresh locks.
+    cached_durable_fingerprint:
+        parking_lot::Mutex<Option<crate::index::checkpoint::DurableFingerprint>>,
     /// Serializes the *publication* of a brand-new collection against a
     /// checkpoint rewrite (see `persist_index_checkpoint`). Creates take this
     /// lock shared for the whole put; the checkpoint holds it exclusive for
@@ -661,7 +667,7 @@ impl PackfileStorage {
 
     fn post_refresh_fingerprint(&self) -> Option<u64> {
         match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir) {
-            Ok(Some(fp)) => Some(fp),
+            Ok(Some(fp)) => Some(fp.fingerprint),
             Ok(None) => Some(0),
             Err(error) => {
                 let previous = self.miss_refresh_fp_errors.fetch_add(1, Ordering::Relaxed);
@@ -687,10 +693,33 @@ impl PackfileStorage {
         results: &mut [Option<NodeData>],
     ) -> Result<(), StorageError> {
         self.refresh_collection(collection_id)?;
-        if let Some(fp) = self.post_refresh_fingerprint() {
+        // Reread the fingerprint after refresh to handle the race
+        // where the writer synced more data during the refresh.
+        let refreshed_fp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir)
+        {
+            Ok(Some(dfp)) => Some(dfp),
+            Ok(None) => Some(crate::index::checkpoint::DurableFingerprint {
+                fingerprint: 0,
+                torn_tail: false,
+            }),
+            Err(error) => {
+                let previous = self.miss_refresh_fp_errors.fetch_add(1, Ordering::Relaxed);
+                let count = previous.saturating_add(1);
+                let periodic = count
+                    .checked_rem(100)
+                    .is_some_and(|remainder| remainder == 0);
+                if previous == 0 || periodic {
+                    eprintln!(
+                        "warning: unable to observe post-refresh fingerprint (count={count}): {error}"
+                    );
+                }
+                None
+            }
+        };
+        if let Some(fp) = refreshed_fp {
             self.last_refresh_fingerprint
                 .lock()
-                .insert(*collection_id, fp);
+                .insert(*collection_id, fp.fingerprint);
         }
         self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
 
@@ -1205,7 +1234,7 @@ impl PackfileStorage {
         // skip refresh when nothing durable changed.
         let initial_durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&base_dir)
         {
-            Ok(Some(fp)) => fp,
+            Ok(Some(dfp)) => dfp.fingerprint,
             Ok(None) | Err(_) => 0,
         };
         let initial_fingerprints: HashMap<[u8; 16], u64> = collection_order
@@ -4505,11 +4534,20 @@ impl PackfileStorage {
         }
 
         let durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir) {
-            Ok(Some(fp)) => fp,
-            Ok(None) => 0, // no checkpoint = fresh store, valid zero
-            Err(_) => {
-                self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
-                return Ok(results);
+            Ok(Some(dfp)) => dfp,
+            Ok(None) => {
+                // No checkpoint = fresh store, valid zero
+                crate::index::checkpoint::DurableFingerprint {
+                    fingerprint: 0,
+                    torn_tail: false,
+                }
+            }
+            Err(e) => {
+                // Propagate delta read errors instead of silently forcing refresh.
+                // Convert to StorageError so caller sees it's a fingerprint read failure.
+                return Err(StorageError::Corrupt(format!(
+                    "failed to read durable fingerprint: {e}"
+                )));
             }
         };
 
@@ -4518,10 +4556,10 @@ impl PackfileStorage {
             let baseline = fingerprints
                 .entry(*collection_id)
                 .or_insert(self.initial_durable_fingerprint);
-            *baseline == durable_fp
+            *baseline == durable_fp.fingerprint
         };
 
-        if dominated {
+        if dominated && !durable_fp.torn_tail {
             self.miss_refresh_skips.fetch_add(1, Ordering::Relaxed);
             return Ok(results);
         }

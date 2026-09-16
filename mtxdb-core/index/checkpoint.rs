@@ -407,6 +407,16 @@ pub fn read_pack_fingerprint(
     Ok(Some(header.pack_fingerprint))
 }
 
+/// Result of reading the durable fingerprint.
+#[derive(Debug, Clone, Copy)]
+pub struct DurableFingerprint {
+    /// The durable pack fingerprint (checkpoint fp advanced by delta log tail).
+    pub fingerprint: u64,
+    /// Whether the delta log ended with a torn tail (expected if writer crashed mid-append).
+    /// If true, a refresh may still be needed to pick up the incomplete batch.
+    pub torn_tail: bool,
+}
+
 /// Read the durable pack fingerprint for a store directory.
 ///
 /// The durable fingerprint is the checkpoint's `pack_fingerprint`, advanced
@@ -425,7 +435,7 @@ pub fn read_pack_fingerprint(
 /// log exists but cannot be validated or read reliably.
 pub fn read_durable_fingerprint(
     base_dir: &Path,
-) -> Result<Option<u64>, crate::index::delta::DeltaFingerprintError> {
+) -> Result<Option<DurableFingerprint>, crate::index::delta::DeltaFingerprintError> {
     let ckpt_path = base_dir.join(INDEX_CHECKPOINT_FILE);
     let Some(ckpt_fp) = read_pack_fingerprint(&ckpt_path)? else {
         return Ok(None);
@@ -437,10 +447,14 @@ pub fn read_durable_fingerprint(
     ));
     // Use the lightweight forward parser to avoid decoding every DeltaFrame.
     match crate::index::delta::read_delta_tail_fingerprint(&delta_path) {
-        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp => {
-            Ok(Some(tail_fp.tail_fingerprint))
-        }
-        Ok(Some(_) | None) => Ok(Some(ckpt_fp)),
+        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp => Ok(Some(DurableFingerprint {
+            fingerprint: tail_fp.tail_fingerprint,
+            torn_tail: tail_fp.torn_tail,
+        })),
+        Ok(Some(_) | None) => Ok(Some(DurableFingerprint {
+            fingerprint: ckpt_fp,
+            torn_tail: false,
+        })),
         Err(e) => Err(e),
     }
 }
@@ -783,7 +797,11 @@ mod tests {
         std::fs::write(&path, header.encode()).unwrap();
 
         let fp = read_durable_fingerprint(&dir).expect("read should succeed");
-        assert_eq!(fp, Some(0x42), "without a delta, durable = checkpoint fp");
+        assert_eq!(
+            fp.map(|durable| durable.fingerprint),
+            Some(0x42),
+            "without a delta, durable = checkpoint fp"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
