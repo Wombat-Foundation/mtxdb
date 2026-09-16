@@ -1,0 +1,23 @@
+[package]
+name = "mtxdb-ffi"
+version = "0.1.0-beta.1"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+repository = "https://github.com/Wombat-Foundation/mtxdb"
+description = "mtxdb: C FFI bindings"
+license = "MIT OR Apache-2.0"
+authors = ["Shane Jaroch <chown_tee@proton.me>"]
+keywords = ["matrix", "ffi", "packfile", "storage"]
+categories = ["database-implementations", "external-ffi-bindings"]
+readme = "../README.md"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+bytes = "1.5"
+mtxdb-core = { path = "../mtxdb-core" }

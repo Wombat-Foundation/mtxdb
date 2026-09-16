@@ -1,0 +1,47 @@
+[package]
+name = "mtxdb-core"
+version = "0.1.0-beta.1"
+edition = "2021"
+rust-version = "1.81"
+publish = false
+
+repository = "https://github.com/Wombat-Foundation/mtxdb"
+description = "mtxdb: core components and methods"
+license = "MIT OR Apache-2.0"
+authors = ["Shane Jaroch <chown_tee@proton.me>"]
+keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
+categories = ["database-implementations", "storage"]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+arc-swap = "1"
+bytes = "1.5"
+crc32fast = "1.4"
+memmap2 = "0.9.11"
+parking_lot = "0.12"
+sha2 = "0.10"
+zstd = { version = "0.13", default-features = false }
+
+# Native builds link the system libzstd via pkg-config (already installed
+# at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
+# `zstd`/`zstd-safe` don't forward a "pkg-config" feature of their own, so
+# this reaches it by depending on `zstd-sys` directly at the same version
+# zstd-safe resolves to — Cargo unifies the two into one build.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zstd-sys = { version = "2.1", features = ["pkg-config"] }
+
+# wasm targets have no libzstd to pkg-config against. `zstd-sys` ships a
+# "vendored" feature that forces its bundled C sources to be compiled from
+# source instead (overriding "pkg-config" outright, whichever target
+# enabled it) using its own `wasm-shim` — minimal libc stubs — so `cc`
+# can target wasm32 directly without a full WASI sysroot.
+[target.'cfg(target_family = "wasm")'.dependencies]
+zstd-sys = { version = "2.1", features = ["vendored"] }
+
+# BENCHES live in `../benches/`, a standalone crate outside this workspace
+# (see its Cargo.toml) -- `cd ../benches` to build/lint/run them.
+
+[lints]
+workspace = true
