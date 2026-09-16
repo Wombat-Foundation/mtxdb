@@ -1232,15 +1232,19 @@ impl PackfileStorage {
         // Seed the per-collection refresh fingerprint from the persisted
         // checkpoint/delta state so the first miss for each collection can
         // skip refresh when nothing durable changed.
-        let initial_durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&base_dir)
-        {
-            Ok(Some(dfp)) => dfp.fingerprint,
-            Ok(None) | Err(_) => 0,
-        };
+        let (initial_durable_fp, cached_durable_fingerprint) =
+            match crate::index::checkpoint::read_durable_fingerprint(&base_dir) {
+                Ok(Some(dfp)) => (dfp.fingerprint, Some(dfp)),
+                Ok(None) | Err(_) => (0, None),
+            };
         let initial_fingerprints: HashMap<[u8; 16], u64> = collection_order
             .iter()
             .map(|&cid| (cid, initial_durable_fp))
             .collect();
+        let initial_durable = match crate::index::checkpoint::read_durable_fingerprint(&base_dir) {
+            Ok(Some(dfp)) => Some(dfp),
+            Ok(None) | Err(_) => None,
+        };
         Self {
             shards,
             collections: RwLock::new(scan_out.collections),
@@ -1252,6 +1256,7 @@ impl PackfileStorage {
             refresh_locks: parking_lot::Mutex::new(HashMap::new()),
             last_refresh_fingerprint: parking_lot::Mutex::new(initial_fingerprints),
             initial_durable_fingerprint: initial_durable_fp,
+            cached_durable_fingerprint: parking_lot::Mutex::new(initial_durable),
             collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
@@ -4533,21 +4538,29 @@ impl PackfileStorage {
             return Ok(results);
         }
 
-        let durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir) {
-            Ok(Some(dfp)) => dfp,
-            Ok(None) => {
-                // No checkpoint = fresh store, valid zero
-                crate::index::checkpoint::DurableFingerprint {
-                    fingerprint: 0,
-                    torn_tail: false,
-                }
-            }
-            Err(e) => {
-                // Propagate delta read errors instead of silently forcing refresh.
-                // Convert to StorageError so caller sees it's a fingerprint read failure.
-                return Err(StorageError::Corrupt(format!(
-                    "failed to read durable fingerprint: {e}"
-                )));
+        // Use cached durable fingerprint to avoid rescanning delta log on every miss.
+        // Only re-read if cache is empty (first miss after open) or after a refresh.
+        let durable_fp = {
+            let mut cache = self.cached_durable_fingerprint.lock();
+            if let Some(cached) = *cache {
+                cached
+            } else {
+                let dfp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir) {
+                    Ok(Some(dfp)) => dfp,
+                    Ok(None) => crate::index::checkpoint::DurableFingerprint {
+                        fingerprint: 0,
+                        torn_tail: false,
+                    },
+                    Err(e) => {
+                        // Propagate delta read errors instead of silently forcing refresh.
+                        // Convert to StorageError so caller sees it's a fingerprint read failure.
+                        return Err(StorageError::Corrupt(format!(
+                            "failed to read durable fingerprint: {e}"
+                        )));
+                    }
+                };
+                *cache = Some(dfp);
+                dfp
             }
         };
 
