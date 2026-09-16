@@ -27,7 +27,7 @@
 //! changes it and forces a rescan.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -371,6 +371,48 @@ pub fn read_checkpoint_with_policy(
         collections,
         mmap,
     })
+}
+
+/// Lightweight read of the persisted checkpoint's `pack_fingerprint`.
+///
+/// Returns `None` if the file is missing, too short, or has an
+/// unrecognized magic/version — identical to the "no checkpoint" fallback
+/// that `read_checkpoint` uses, but at a fraction of the cost (a single
+/// 64-byte read instead of a full mmap + CRC pass).
+#[must_use]
+pub fn read_pack_fingerprint(path: &Path) -> Option<u64> {
+    let file = fs::File::open(path).ok()?;
+    let mut buf = [0u8; CHECKPOINT_HEADER_LEN];
+    let mut handle = file.take(CHECKPOINT_HEADER_LEN as u64);
+    handle.read_exact(&mut buf).ok()?;
+    let header = CheckpointHeader::decode(&buf)?;
+    if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
+        return None;
+    }
+    Some(header.pack_fingerprint)
+}
+
+/// Read the durable pack fingerprint for a store directory.
+///
+/// The durable fingerprint is the checkpoint's `pack_fingerprint`, advanced
+/// by the validated delta log's `tail_fingerprint` when one exists and its
+/// `base_fingerprint` matches the checkpoint.  This detects synced appends
+/// that only wrote to the delta log without rewriting the checkpoint.
+///
+/// Returns `None` only when the checkpoint itself is missing or corrupt —
+/// the caller falls back to a full rescan in that case.
+#[must_use]
+pub fn read_durable_fingerprint(base_dir: &Path) -> Option<u64> {
+    let ckpt_path = base_dir.join(INDEX_CHECKPOINT_FILE);
+    let ckpt_fp = read_pack_fingerprint(&ckpt_path)?;
+    let delta_path = base_dir.join(format!(
+        "{}.{ckpt_fp:016x}",
+        crate::index::delta::INDEX_DELTA_FILE,
+    ));
+    match crate::index::delta::read_delta_log(&delta_path) {
+        Some(log) if log.base_fingerprint == ckpt_fp => Some(log.tail_fingerprint),
+        _ => Some(ckpt_fp),
+    }
 }
 
 #[cfg(test)]

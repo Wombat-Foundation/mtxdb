@@ -550,6 +550,9 @@ pub struct PackfileStorage {
     miss_refresh_skips: AtomicU64,
     /// Missing keys recovered by a read-miss refresh.
     miss_refresh_recovered: AtomicU64,
+    /// IDs submitted in the retry request after a refresh. Proves that only
+    /// missing keys are retried: `miss_refresh_retry_ids == count(missing)`.
+    miss_refresh_retry_ids: AtomicU64,
 
     // Always-on write-path counters (per-record `fetch_add` only on the
     // single-record `put`, whose hot cost is dominated by the write itself).
@@ -1167,6 +1170,7 @@ impl PackfileStorage {
             miss_refreshes: AtomicU64::new(0),
             miss_refresh_skips: AtomicU64::new(0),
             miss_refresh_recovered: AtomicU64::new(0),
+            miss_refresh_retry_ids: AtomicU64::new(0),
             put_calls: AtomicU64::new(0),
             put_bytes: AtomicU64::new(0),
             put_many_calls: AtomicU64::new(0),
@@ -4460,6 +4464,10 @@ impl PackfileStorage {
         self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
 
         let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
+        self.miss_refresh_retry_ids.fetch_add(
+            u64::try_from(retry_ids.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let retry = self.get_many(collection_id, &retry_ids)?;
         let mut recovered = 0u64;
         for (index, value) in missing.into_iter().zip(retry) {
@@ -5288,6 +5296,7 @@ impl PackfileStorage {
             miss_refreshes: self.miss_refreshes.load(Ordering::Relaxed),
             miss_refresh_skips: self.miss_refresh_skips.load(Ordering::Relaxed),
             miss_refresh_recovered: self.miss_refresh_recovered.load(Ordering::Relaxed),
+            miss_refresh_retry_ids: self.miss_refresh_retry_ids.load(Ordering::Relaxed),
             put_calls: self.put_calls.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             put_many_calls: self.put_many_calls.load(Ordering::Relaxed),
@@ -5333,6 +5342,7 @@ impl PackfileStorage {
             &self.miss_refreshes,
             &self.miss_refresh_skips,
             &self.miss_refresh_recovered,
+            &self.miss_refresh_retry_ids,
             &self.put_calls,
             &self.put_bytes,
             &self.put_many_calls,
@@ -5428,6 +5438,8 @@ pub struct RuntimeStats {
     pub miss_refresh_skips: u64,
     /// Missing keys recovered after a read-miss refresh.
     pub miss_refresh_recovered: u64,
+    /// IDs submitted in retry requests after read-miss refreshes.
+    pub miss_refresh_retry_ids: u64,
     /// Single-record `put` attempts.
     pub put_calls: u64,
     /// Bytes accepted across single-record `put` attempts.
@@ -5484,6 +5496,7 @@ impl Default for RuntimeStats {
             miss_refreshes: 0,
             miss_refresh_skips: 0,
             miss_refresh_recovered: 0,
+            miss_refresh_retry_ids: 0,
             put_calls: 0,
             put_bytes: 0,
             put_many_calls: 0,
