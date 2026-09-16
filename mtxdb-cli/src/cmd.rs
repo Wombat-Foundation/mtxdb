@@ -470,13 +470,11 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
 }
 
 /// Render arbitrary payload bytes safely for terminal output. Raw bytes stay
-/// available through `get --raw`; the default uses spaced hexadecimal bytes.
+/// available through `get --raw`; the default uses a single hexadecimal token.
 fn hex_bytes(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
-    for (index, byte) in bytes.iter().enumerate() {
-        if index != 0 {
-            output.push(' ');
-        }
+    let mut output = String::with_capacity(2usize.saturating_add(bytes.len().saturating_mul(2)));
+    output.push_str("0x");
+    for byte in bytes {
         write!(output, "{byte:02x}").expect("writing to a String cannot fail");
     }
     output
