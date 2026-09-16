@@ -9,8 +9,8 @@
 //! from there directly, or point `--manifest-path` at it from the repo root:
 //!
 //! ```text
-//! cd benches && cargo bench --features compare-external --bench compare_external
-//! MTXDB_BENCH_EXT_GB=1,10 cargo bench --features compare-external --bench compare_external
+//! cd benches && cargo bench --bench compare_external
+//! MTXDB_BENCH_EXT_GB=1,10 cargo bench --bench compare_external
 //! ```
 //!
 //! `MTXDB_BENCH_SUSTAINED=1` additionally runs a sustained-write phase after

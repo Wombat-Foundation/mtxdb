@@ -68,8 +68,6 @@ BENCH_CMD = [
     "benches/Cargo.toml",
     "--bench",
     "compare_external",
-    "--features",
-    "compare-external",
 ]
 
 # mtxdb is swept across its three checksum postures (mdbx/sqlite/fjall have no
