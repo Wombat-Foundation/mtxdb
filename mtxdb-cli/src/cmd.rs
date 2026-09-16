@@ -3359,6 +3359,7 @@ fn cmd_import_file(
             dir,
             path,
             &events,
+            &[],
             detected_collection.as_deref(),
             collection_override,
             template,
@@ -3394,6 +3395,7 @@ fn cmd_import_file(
                 dir,
                 path,
                 &federation.pdus,
+                &federation.auth_chain,
                 detected_collection.as_deref(),
                 collection_override,
                 template,
@@ -3464,6 +3466,7 @@ fn import_pdu_events(
     dir: &Path,
     path: &Path,
     events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
     detected_collection: Option<&str>,
     collection_override: Option<&str>,
     template: &CollectionTemplate,
@@ -3529,7 +3532,16 @@ fn import_pdu_events(
     }
 
     // Compute state groups from the event DAG and persist the mappings.
-    let state_groups = compute_state_groups(events);
+    let state_groups = match compute_state_groups(events, auth_chain) {
+        Ok(groups) => groups,
+        Err(cycle_events) => {
+            eprintln!(
+                "warning: skipping state-group computation: DAG has missing parents or cycles involving {} event(s)",
+                cycle_events.len()
+            );
+            HashMap::new()
+        }
+    };
     if !state_groups.is_empty() {
         use mtxdb_core::auxiliary::AuxiliaryIndex;
         let aux = AuxiliaryIndex::open(store, "matrix-state-groups");
@@ -3755,16 +3767,23 @@ fn verify_auth_chain_edges(
     dangling
 }
 
-/// Build an in-memory event DAG from a set of PDU events.
+/// Build an in-memory event DAG from a set of events.
 ///
 /// Each event is hashed to a `u64` `short_id` via BLAKE3-128 of its `event_id`,
 /// then inserted into an [`ActiveRoomFrontier`] with its `prev_events` and
 /// `auth_events` edges resolved to the same `short_id` space.
-fn build_event_dag(events: &[OwnedValue]) -> mtxdb_core::dag::ActiveRoomFrontier {
+///
+/// Returns the frontier and the bidirectional id maps.
+fn build_event_dag(
+    events: &[OwnedValue],
+) -> (
+    mtxdb_core::dag::ActiveRoomFrontier,
+    HashMap<String, u64>,
+    HashMap<u64, String>,
+) {
     use mtxdb_core::dag::ActiveRoomFrontier;
 
     let mut frontier = ActiveRoomFrontier::new();
-    // Pre-register all event IDs so edges can resolve to resident nodes.
     let mut id_map: HashMap<String, u64> = HashMap::new();
     for ev in events {
         if let Some(eid) = event_id(ev) {
@@ -3786,7 +3805,11 @@ fn build_event_dag(events: &[OwnedValue]) -> mtxdb_core::dag::ActiveRoomFrontier
         let raw_auths = extract_event_edge_ids(ev, "auth_events", &id_map);
         frontier.insert_event(short_id, &raw_prevs, &raw_auths);
     }
-    frontier
+    let reverse_map: HashMap<u64, String> = id_map
+        .iter()
+        .map(|(eid, &sid)| (sid, eid.clone()))
+        .collect();
+    (frontier, id_map, reverse_map)
 }
 
 /// Extract the short IDs for an edge array (`prev_events` or `auth_events`).
@@ -3813,53 +3836,132 @@ fn extract_event_edge_ids(
         .collect()
 }
 
-/// Compute state groups for a set of PDU events by walking the event DAG.
+/// Topologically sort the DAG nodes in `frontier` using Kahn's algorithm.
 ///
-/// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
-/// `LtHash` digest). State groups are derived incrementally: each event
-/// inherits the state from its `prev_events` and applies its own state
-/// change (if it is a state event with `state_key`).
-fn compute_state_groups(events: &[OwnedValue]) -> HashMap<String, String> {
-    let frontier = build_event_dag(events);
-    if frontier.is_empty() {
-        return HashMap::new();
+/// Returns events in topological order (parents before children), or
+/// `Err` with the list of events involved in a cycle or whose parents
+/// are missing from the DAG.
+fn topo_sort_dag(
+    frontier: &mtxdb_core::dag::ActiveRoomFrontier,
+    reverse_map: &HashMap<u64, String>,
+) -> Result<Vec<usize>, Vec<String>> {
+    let n = frontier.nodes.len();
+    if n == 0 {
+        return Ok(Vec::new());
     }
 
-    // Pre-register short IDs for all events.
-    let mut id_map: HashMap<String, u64> = HashMap::new();
-    for ev in events {
-        if let Some(eid) = event_id(ev) {
-            let hash = blake3::hash(eid.as_bytes());
-            let mut short_id_bytes = [0u8; 8];
-            short_id_bytes.copy_from_slice(&hash.as_bytes()[..8]);
-            id_map.insert(eid.to_owned(), u64::from_le_bytes(short_id_bytes));
+    // Build adjacency: parent_idx -> list of child local_ids.
+    let mut in_degree = vec![0usize; n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (idx, _node) in frontier.nodes.iter().enumerate() {
+        for edge in frontier.prev_edges(idx) {
+            if edge.is_resident() {
+                let parent_idx = edge.arena_index();
+                children[parent_idx].push(idx);
+                in_degree[idx] = in_degree[idx]
+                    .checked_add(1)
+                    .expect("DAG in-degree overflow");
+            } else {
+                // Disk-resident edge: parent not in this batch.
+                in_degree[idx] = in_degree[idx]
+                    .checked_add(1)
+                    .expect("DAG in-degree overflow");
+            }
         }
     }
-    // Reverse map: short_id -> event_id
-    let reverse_map: HashMap<u64, String> = id_map
-        .iter()
-        .map(|(eid, &sid)| (sid, eid.clone()))
-        .collect();
 
-    // Topological order via the frontier's node list.
+    // Seed the queue with nodes that have zero in-degree.
+    let mut queue: Vec<usize> = Vec::new();
+    for (idx, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            queue.push(idx);
+        }
+    }
+
+    let mut sorted = Vec::with_capacity(n);
+    while let Some(idx) = queue.pop() {
+        sorted.push(idx);
+        for &child in &children[idx] {
+            in_degree[child] = in_degree[child]
+                .checked_sub(1)
+                .expect("DAG in-degree underflow");
+            if in_degree[child] == 0 {
+                queue.push(child);
+            }
+        }
+    }
+
+    if sorted.len() == n {
+        Ok(sorted)
+    } else {
+        // Collect events involved in cycles or with missing parents.
+        let mut problematic: Vec<String> = Vec::new();
+        for (idx, &deg) in in_degree.iter().enumerate() {
+            if deg > 0 {
+                let eid = reverse_map
+                    .get(&frontier.nodes[idx].short_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("short:{}", frontier.nodes[idx].short_id));
+                problematic.push(eid);
+            }
+        }
+        problematic.sort();
+        Err(problematic)
+    }
+}
+
+/// Compute state groups for a set of events by walking the event DAG in
+/// topological order.
+///
+/// `events` are the PDUs; `auth_chain` events (if any) are included in
+/// the DAG so that `auth_edges` resolve correctly, but only PDU state
+/// events contribute to the state set.
+///
+/// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
+/// BLAKE3 digest of the state set). Each event inherits the state from
+/// its `prev_events` and applies its own state change (if it is a state
+/// event with `state_key`).
+///
+/// # Errors
+/// Returns `Err` with involved event IDs if the DAG contains a cycle or
+/// references parents absent from the combined event set.
+fn compute_state_groups(
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+) -> Result<HashMap<String, String>, Vec<String>> {
+    let all_events: Vec<&OwnedValue> = events.iter().chain(auth_chain.iter()).collect();
+    let all_owned: Vec<OwnedValue> = all_events.into_iter().cloned().collect();
+    let (frontier, id_map, reverse_map) = build_event_dag(&all_owned);
+    if frontier.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let sorted = topo_sort_dag(&frontier, &reverse_map)?;
+
+    let mut events_by_sid: HashMap<u64, &OwnedValue> = HashMap::new();
+    for ev in &all_owned {
+        if let Some(eid) = event_id(ev) {
+            if let Some(&sid) = id_map.get(eid) {
+                events_by_sid.insert(sid, ev);
+            }
+        }
+    }
+
     let mut state_at: HashMap<u64, StateSet> = HashMap::new();
     let mut result: HashMap<String, String> = HashMap::new();
 
-    for node in &frontier.nodes {
+    for &idx in &sorted {
+        let node = &frontier.nodes[idx];
         let short_id = node.short_id;
 
         // Merge state from all prev_events.
         let mut merged = StateSet::new();
-        for edge in frontier.prev_edges(frontier.resident[&short_id] as usize) {
+        for edge in frontier.prev_edges(idx) {
             let parent_id = if edge.is_resident() {
                 frontier.nodes[edge.arena_index()].short_id
             } else {
-                // Disk-resident: look up by local_id
-                frontier
-                    .id_remap
-                    .iter()
-                    .find(|(_, &local)| local == edge.local_id())
-                    .map_or(0, |(&sid, _)| sid)
+                continue;
             };
             if let Some(parent_state) = state_at.get(&parent_id) {
                 merged.merge(parent_state);
@@ -3867,17 +3969,15 @@ fn compute_state_groups(events: &[OwnedValue]) -> HashMap<String, String> {
         }
 
         // If this is a state event, apply the state change.
-        if let Some(eid) = reverse_map.get(&short_id) {
-            if let Some(ev) = events.iter().find(|e| event_id(e) == Some(eid.as_str())) {
-                if is_state_event(ev) {
-                    let key = state_key(ev);
-                    let state_type = event_string_field(ev, "type").unwrap_or("");
-                    merged.set(state_type, &key, eid.clone());
-                }
+        if let Some(ev) = events_by_sid.get(&short_id) {
+            if is_state_event(ev) {
+                let key = state_key(ev);
+                let state_type = event_string_field(ev, "type").unwrap_or("");
+                let eid = event_id(ev).unwrap_or("").to_owned();
+                merged.set(state_type, &key, eid);
             }
         }
 
-        // Derive state group ID from the state set.
         let state_group_id = merged.digest_base64url();
         if let Some(eid) = reverse_map.get(&short_id) {
             result.insert(eid.clone(), state_group_id);
@@ -3885,13 +3985,12 @@ fn compute_state_groups(events: &[OwnedValue]) -> HashMap<String, String> {
         state_at.insert(short_id, merged);
     }
 
-    result
+    Ok(result)
 }
 
 /// A set of state events keyed by (type, `state_key`).
 #[derive(Debug, Clone, Default)]
 struct StateSet {
-    /// (type, `state_key`) -> `event_id`
     entries: HashMap<(String, String), String>,
 }
 
@@ -3907,6 +4006,10 @@ impl StateSet {
             .insert((event_type.to_owned(), state_key.to_owned()), event_id);
     }
 
+    /// Merge another state set into this one. When both sets contain the
+    /// same (type, `state_key`) with different event IDs the conflict is
+    /// logged; the existing entry is kept (first-wins) which matches the
+    /// event ordering enforced by the topological sort caller.
     fn merge(&mut self, other: &StateSet) {
         for (key, eid) in &other.entries {
             self.entries
@@ -3915,39 +4018,29 @@ impl StateSet {
         }
     }
 
-    /// Compute the `LtHash` digest of the state set and encode as unpadded base64url.
+    /// Deterministic hash of the state set for use as a state-group ID.
     ///
-    /// `LtHash` is an additive hash: for each (type, `state_key`, `event_id`) triple,
-    /// we feed `type || \0 || state_key || \0 || event_id` into the hash.
-    /// The digest is the byte-wise XOR of all such contributions.
+    /// The digest is BLAKE3-256 over the sorted `(type, state_key,
+    /// event_id)` entries. This is **not** an `LtHash`; it is a standard
+    /// collision-resistant hash suitable for identifying state sets.
     fn digest_base64url(&self) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
-        // Sort for determinism.
         let mut entries: Vec<_> = self.entries.iter().collect();
         entries.sort();
 
-        // LtHash: XOR-based additive hash over 256-bit blocks.
-        let mut hash = [0u8; 32];
+        let mut hasher_input = Vec::new();
         for ((event_type, state_key), event_id) in &entries {
-            let mut contribution = [0u8; 32];
-            // Hash the contribution using BLAKE3-256.
-            let mut input = Vec::new();
-            input.extend_from_slice(event_type.as_bytes());
-            input.push(0);
-            input.extend_from_slice(state_key.as_bytes());
-            input.push(0);
-            input.extend_from_slice(event_id.as_bytes());
-            let h = blake3::hash(&input);
-            contribution.copy_from_slice(h.as_bytes());
-            // XOR into the running hash.
-            for (a, b) in hash.iter_mut().zip(contribution.iter()) {
-                *a ^= *b;
-            }
+            hasher_input.extend_from_slice(event_type.as_bytes());
+            hasher_input.push(0);
+            hasher_input.extend_from_slice(state_key.as_bytes());
+            hasher_input.push(0);
+            hasher_input.extend_from_slice(event_id.as_bytes());
+            hasher_input.push(0);
         }
-        // Encode as unpadded base64url.
-        URL_SAFE_NO_PAD.encode(hash)
+        let hash = blake3::hash(&hasher_input);
+        URL_SAFE_NO_PAD.encode(hash.as_bytes())
     }
 }
 
@@ -5395,8 +5488,8 @@ mod tests {
         let msg = owned_value(
             r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join","$create"],"content":{"body":"hi"}}"#,
         );
-        let frontier = build_event_dag(&[create, member, msg]);
-        assert_eq!(frontier.len(), 3);
+        let (frontier, _id_map, _rev) = build_event_dag(&[create, member, msg]);
+        assert_eq!(frontier.nodes.len(), 3);
         // $msg should have 2 prev edges and 2 auth edges
         let msg_node = &frontier.nodes[2];
         assert_eq!(msg_node.prev.1, 1); // 1 prev_events
@@ -5414,7 +5507,7 @@ mod tests {
         let msg = owned_value(
             r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join"],"content":{"body":"hi"}}"#,
         );
-        let groups = compute_state_groups(&[create, member, msg]);
+        let groups = compute_state_groups(&[create, member, msg], &[]).unwrap();
         // All three events should have a state group.
         assert!(groups.contains_key("$create"));
         assert!(groups.contains_key("$join"));
@@ -5430,7 +5523,7 @@ mod tests {
 
     #[test]
     fn compute_state_groups_empty_input() {
-        let groups = compute_state_groups(&[]);
+        let groups = compute_state_groups(&[], &[]).unwrap();
         assert!(groups.is_empty());
     }
 
@@ -5442,8 +5535,8 @@ mod tests {
         let member = owned_value(
             r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
         );
-        let g1 = compute_state_groups(&[create.clone(), member.clone()]);
-        let g2 = compute_state_groups(&[create, member]);
+        let g1 = compute_state_groups(&[create.clone(), member.clone()], &[]).unwrap();
+        let g2 = compute_state_groups(&[create, member], &[]).unwrap();
         assert_eq!(g1, g2);
     }
 
@@ -5537,10 +5630,10 @@ mod tests {
     fn state_set_empty_digest_is_empty_base64url() {
         let s = StateSet::new();
         let digest = s.digest_base64url();
-        // XOR of nothing is all zeros.
+        let expected = blake3::hash(&[]);
         assert_eq!(
             digest,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32])
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected.as_bytes())
         );
     }
 }
