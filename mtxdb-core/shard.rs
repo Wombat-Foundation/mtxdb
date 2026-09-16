@@ -531,11 +531,13 @@ pub struct ShardOpenTimings {
     pub pool_meta_restore: Duration,
     /// Reading and restoring persisted snapshot counters from `shard_stats.bin`.
     pub persisted_stats_restore: Duration,
-    /// Writing store.meta version marker and syncing directory (fresh pool only; ZERO on existing pool).
+    /// Writing store.meta version marker via best-effort atomic write (fresh pool only; ZERO on existing pool).
     pub store_meta_write: Duration,
-    /// Persisting pool.meta reservation and syncing directory (fresh pool only; ZERO on existing pool).
+    /// Persisting pool.meta reservation and syncing file contents (fresh pool only; ZERO on existing pool).
     pub pool_meta_persist: Duration,
-    /// Creating initial packfile atomically, writing header, syncing and renaming (fresh pool only; ZERO on existing pool).
+    /// Creating the initial packfile atomically, writing its header, syncing,
+    /// renaming, and performing the final directory sync (fresh pool only;
+    /// ZERO on existing pool).
     pub initial_pack_create: Duration,
     /// Unattributed time inside the `metadata_restore` span.
     pub metadata_unattributed: Duration,
@@ -920,9 +922,10 @@ impl ShardPool {
             // leave a pack_id in use with no pool.meta reservation — so
             // we write pool.meta first, guaranteeing the ID is reserved.
             let t_pool_meta_persist = Instant::now();
-            Self::persist_pool_meta_at(
+            Self::persist_pool_meta_at_sync_dir(
                 &base_dir,
                 pack_id.checked_add(1).expect("pack_id overflow"),
+                false,
             )?;
             pool_meta_persist_time = t_pool_meta_persist.elapsed();
             let t_initial_pack = Instant::now();
@@ -930,6 +933,12 @@ impl ShardPool {
             let file_len = file.metadata()?.len();
             shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
             next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
+
+            // Fsync the containing directory so both the pool.meta rename and the
+            // initial packfile rename are durable across power loss, coalescing
+            // directory synchronization into a single barrier.
+            let dir = File::open(&base_dir)?;
+            dir.sync_all()?;
             initial_pack_create_time = t_initial_pack.elapsed();
         }
 
@@ -1241,6 +1250,13 @@ impl ShardPool {
     /// that has *not* yet been allocated. The caller must ensure this
     /// is written before creating any pack file that uses IDs below it.
     fn persist_pool_meta_at(base_dir: &Path, next: u64) -> io::Result<()> {
+        Self::persist_pool_meta_at_sync_dir(base_dir, next, true)
+    }
+
+    /// Internal form of [`Self::persist_pool_meta_at`] allowing callers that
+    /// create multiple files (such as fresh pool open) to defer directory
+    /// synchronization until all renames have completed.
+    fn persist_pool_meta_at_sync_dir(base_dir: &Path, next: u64, sync_dir: bool) -> io::Result<()> {
         let mut buf = Vec::with_capacity(14);
         buf.extend_from_slice(b"PMeta");
         buf.push(POOL_META_VERSION);
@@ -1254,11 +1270,13 @@ impl ShardPool {
             tmp.sync_all()?;
             drop(tmp);
             fs::rename(&tmp_path, &final_path)?;
-            // Fsync the containing directory so the rename is durable
-            // across power loss — without this, a crash could leave the
-            // old pool.meta (or no file) in place, allowing pack_id reuse.
-            let dir = File::open(base_dir)?;
-            dir.sync_all()?;
+            if sync_dir {
+                // Fsync the containing directory so the rename is durable
+                // across power loss — without this, a crash could leave the
+                // old pool.meta (or no file) in place, allowing pack_id reuse.
+                let dir = File::open(base_dir)?;
+                dir.sync_all()?;
+            }
             Ok(())
         })();
         if let Err(e) = write_result {
@@ -3391,6 +3409,84 @@ mod tests {
             "new shard should have pack_id 2, got: {:?}",
             summaries.iter().map(|s| s.pack_id).collect::<Vec<_>>()
         );
+    }
+
+    /// Simulated intermediate recovery states during fresh pool initialization.
+    /// Exercises recovery from synthetic intermediate directory states representing
+    /// crashes or interruptions before or between filesystem operations, verifying that:
+    /// 1. Stale temporary files from an aborted open are ignored safely.
+    /// 2. If pool.meta was renamed (`next_pack_id` = 1) but the packfile creation
+    ///    aborted before pack rename, reopen discovers 0 shards, respects the
+    ///    persisted pool.meta high-water mark, and allocates `pack_id` = 1,
+    ///    never reusing `pack_id` = 0.
+    /// 3. Normal clean initialization produces durable pool.meta = 1 and pack 0.
+    #[test]
+    fn test_fresh_pool_recovery_states() {
+        // State 1: interruption before any rename (only tmp files exist)
+        {
+            let dir = test_dir("interruption_state_1");
+            // Place fake orphaned .tmp files
+            fs::write(
+                dir.join("pool.meta.tmp.1234"),
+                b"PMeta\x01\x01\x00\x00\x00\x00\x00\x00\x00",
+            )
+            .unwrap();
+            fs::write(dir.join("pack_0000000000000000.tmp.1234.0"), b"PACK\x02...").unwrap();
+
+            let pool = ShardPool::open(dir.clone()).unwrap();
+            assert_eq!(pool.all_shards().len(), 1);
+            let summaries = pool.summaries();
+            assert_eq!(
+                summaries[0].pack_id, 0,
+                "fresh allocation after tmp crash gets pack_id 0"
+            );
+            let restored = ShardPool::restore_pool_meta(&dir).unwrap();
+            assert_eq!(restored, Some(1), "pool.meta must have next_pack_id = 1");
+        }
+
+        // State 2: Crash after pool.meta rename, but before initial pack rename
+        {
+            let dir = test_dir("interruption_state_2");
+            // Simulate pool.meta was renamed with next_pack_id = 1, but
+            // before the deferred directory sync.
+            ShardPool::persist_pool_meta_at_sync_dir(&dir, 1, false).unwrap();
+            // Stale pack tmp left behind
+            fs::write(
+                dir.join("pack_0000000000000000.tmp.1234.0"),
+                b"fake pack tmp",
+            )
+            .unwrap();
+
+            // Reopen must succeed, see 0 canonical shards, read pool.meta (next_pack_id = 1),
+            // and allocate pack_id = 1 (preventing reuse of pack_id 0).
+            let pool = ShardPool::open(dir.clone()).unwrap();
+            let summaries = pool.summaries();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(
+                summaries[0].pack_id, 1,
+                "must assign pack_id 1 to prevent reuse of 0"
+            );
+            let restored = ShardPool::restore_pool_meta(&dir).unwrap();
+            assert_eq!(restored, Some(2), "pool.meta must now be advanced to 2");
+        }
+
+        // State 3: Clean fresh initialization
+        {
+            let dir = test_dir("interruption_state_3");
+            let pool = ShardPool::open(dir.clone()).unwrap();
+            let summaries = pool.summaries();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].pack_id, 0);
+            assert_eq!(ShardPool::restore_pool_meta(&dir).unwrap(), Some(1));
+            drop(pool);
+
+            // Reopen sees existing pack 0
+            let pool2 = ShardPool::open(dir.clone()).unwrap();
+            let summaries2 = pool2.summaries();
+            assert_eq!(summaries2.len(), 1);
+            assert_eq!(summaries2[0].pack_id, 0);
+            assert_eq!(ShardPool::restore_pool_meta(&dir).unwrap(), Some(1));
+        }
     }
 
     /// A retired shard's file must survive as long as any `Arc<Shard>`

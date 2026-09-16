@@ -93,11 +93,13 @@ pub struct OpenTimings {
     pub pool_meta_restore: std::time::Duration,
     /// Reading and restoring persisted snapshot counters from `shard_stats.bin`.
     pub persisted_stats_restore: std::time::Duration,
-    /// Writing store.meta version marker and syncing directory (fresh pool only; ZERO on existing pool).
+    /// Writing store.meta version marker via best-effort atomic write (fresh pool only; ZERO on existing pool).
     pub store_meta_write: std::time::Duration,
-    /// Persisting pool.meta reservation and syncing directory (fresh pool only; ZERO on existing pool).
+    /// Persisting pool.meta reservation and syncing file contents (fresh pool only; ZERO on existing pool).
     pub pool_meta_persist: std::time::Duration,
-    /// Creating initial packfile atomically, writing header, syncing and renaming (fresh pool only; ZERO on existing pool).
+    /// Creating the initial packfile atomically, writing its header, syncing,
+    /// renaming, and performing the final directory sync (fresh pool only;
+    /// ZERO on existing pool).
     pub initial_pack_create: std::time::Duration,
     /// Unattributed time inside the `metadata_restore` span.
     pub metadata_unattributed: std::time::Duration,
