@@ -2637,7 +2637,7 @@ fn print_scan_table_header(location_label: &str, payload_label: &str) {
 
 fn scan_payload_label(shard_type: ShardType) -> &'static str {
     if shard_type == ShardType::State {
-        "STATE GROUP"
+        "PAYLOAD / POINTER"
     } else {
         "PAYLOAD"
     }
