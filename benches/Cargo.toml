@@ -101,6 +101,11 @@ harness = false
 # `cargo bench` here skips it -- and never builds libmdbx/rusqlite/fjall --
 # unless requested.
 [[bench]]
+name = "scan"
+path = "scan.rs"
+harness = false
+
+[[bench]]
 name = "compare_external"
 path = "compare_external.rs"
 harness = false
