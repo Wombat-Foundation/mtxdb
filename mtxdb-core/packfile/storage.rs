@@ -72,8 +72,25 @@ pub enum BookkeepingSource {
 /// missing or stale checkpoint) before the scan had to run.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenTimings {
-    /// Directory scan + shard file open/validation, plus writer-lock take.
+    /// Total time spent opening the shard pool, including discovery, locking,
+    /// packfile recovery, and metadata restoration.
     pub shard_open: std::time::Duration,
+    /// Directory and pack-file discovery.
+    pub shard_discovery: std::time::Duration,
+    /// Acquiring the writable pool lock.
+    pub writer_lock: std::time::Duration,
+    /// Cumulative packfile recovery/validation scan time in the shard pool.
+    pub packfile_recovery: std::time::Duration,
+    /// Number of packfiles passed through recovery/validation.
+    pub packfile_recovery_calls: u64,
+    /// Time spent opening packfiles and validating their headers.
+    pub packfile_open: std::time::Duration,
+    /// Number of packfiles successfully opened.
+    pub packfile_open_calls: u64,
+    /// Restoring pool metadata and persisted shard statistics.
+    pub metadata_restore: std::time::Duration,
+    /// Shard-open time not covered by the named shard phases.
+    pub shard_open_unattributed: std::time::Duration,
     /// Reading the collection-order and deleted-collections sidecars.
     pub metadata_load: std::time::Duration,
     /// Reading + decoding the persisted index checkpoint.
@@ -104,6 +121,14 @@ impl Default for OpenTimings {
     fn default() -> Self {
         Self {
             shard_open: std::time::Duration::ZERO,
+            shard_discovery: std::time::Duration::ZERO,
+            writer_lock: std::time::Duration::ZERO,
+            packfile_recovery: std::time::Duration::ZERO,
+            packfile_recovery_calls: 0,
+            packfile_open: std::time::Duration::ZERO,
+            packfile_open_calls: 0,
+            metadata_restore: std::time::Duration::ZERO,
+            shard_open_unattributed: std::time::Duration::ZERO,
             metadata_load: std::time::Duration::ZERO,
             checkpoint_decode: std::time::Duration::ZERO,
             fingerprint: std::time::Duration::ZERO,
@@ -971,7 +996,19 @@ impl PackfileStorage {
         } else {
             ShardPool::open_read_only_with_policies(base_dir.clone(), checksum_policy)?
         };
-        timings.shard_open = shard_open_started.elapsed();
+        let shard_open_time = shard_open_started.elapsed();
+        timings.shard_open = shard_open_time;
+        if let Some(shard_timings) = shards.open_timings() {
+            timings.shard_open = shard_timings.total;
+            timings.shard_discovery = shard_timings.discovery;
+            timings.writer_lock = shard_timings.writer_lock;
+            timings.packfile_recovery = shard_timings.packfile_recovery;
+            timings.packfile_recovery_calls = shard_timings.packfile_recovery_calls;
+            timings.packfile_open = shard_timings.packfile_open;
+            timings.packfile_open_calls = shard_timings.packfile_open_calls;
+            timings.metadata_restore = shard_timings.metadata_restore;
+            timings.shard_open_unattributed = shard_timings.unattributed;
+        }
 
         // Phase 1: accumulate all records per collection across every shard so
         // the index can be sized once for the true total.
@@ -5619,6 +5656,7 @@ impl Default for RuntimeStats {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const TEST_COLLECTION: [u8; 16] = [0x01; 16];
     const SECOND_COLLECTION: [u8; 16] = [0x02; 16];
@@ -6706,6 +6744,10 @@ mod tests {
 
         let reopened = PackfileStorage::open(dir).unwrap();
         let open = reopened.open_timings().expect("open must record timings");
+        assert!(open.total > Duration::ZERO);
+        assert!(open.packfile_recovery_calls >= 1);
+        assert!(open.packfile_open_calls >= 1);
+        assert!(open.packfile_recovery + open.packfile_open <= open.shard_open);
         assert_eq!(
             open.path,
             OpenPath::FullScan,

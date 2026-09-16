@@ -475,6 +475,7 @@ pub struct ShardPool {
     /// attribute sync cost between buffered frame write-out and the fsync
     /// calls themselves. `None` until the first sync.
     last_sync_split: Mutex<Option<(Duration, Duration)>>,
+    last_open_timings: Mutex<Option<ShardOpenTimings>>,
     /// Whether this pool holds the writer lock on `base_dir` (see `open`
     /// vs `open_read_only`). Gates `persist_stats`: a read-only pool
     /// never writes anything, including its own (always-zero) stats
@@ -510,6 +511,31 @@ pub struct ShardPool {
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(dead_code)]
     writer_lock: Option<WriterLock>,
+}
+
+/// Wall-clock breakdown of opening a shard pool.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShardOpenTimings {
+    /// Time spent enumerating packfiles in the pool directory.
+    pub discovery: Duration,
+    /// Time spent acquiring the exclusive writer lock.
+    pub writer_lock: Duration,
+    /// Cumulative time spent scanning and recovering writable packfiles.
+    pub packfile_recovery: Duration,
+    /// Number of writable packfiles passed through recovery.
+    pub packfile_recovery_calls: u64,
+    /// Cumulative time spent opening packfiles and validating their headers.
+    pub packfile_open: Duration,
+    /// Number of packfiles successfully opened.
+    pub packfile_open_calls: u64,
+    /// Time spent restoring pool metadata and persisted shard statistics.
+    pub metadata_restore: Duration,
+    /// Time not covered by the named phases (sorting, allocation, and other
+    /// small bookkeeping). This makes the phase accounting explicit instead
+    /// of inviting callers to assume the named fields sum to `total`.
+    pub unattributed: Duration,
+    /// Total wall-clock time spent in the shard-pool open path.
+    pub total: Duration,
 }
 
 impl ShardPool {
@@ -744,6 +770,7 @@ impl ShardPool {
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
     ) -> io::Result<Self> {
+        let open_started = Instant::now();
         if writable {
             fs::create_dir_all(&base_dir)?;
         } else if !base_dir.is_dir() {
@@ -756,16 +783,23 @@ impl ShardPool {
             ));
         }
 
+        let writer_lock_started = Instant::now();
         #[cfg(not(target_arch = "wasm32"))]
         let writer_lock = writable
             .then(|| Self::acquire_writer_lock(&base_dir))
             .transpose()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let writer_lock_time = writer_lock_started.elapsed();
+        #[cfg(target_arch = "wasm32")]
+        let writer_lock_time = Duration::ZERO;
 
         let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
         let mut next_slot: u16 = 0;
         let mut max_pack_id: u64 = 0;
 
+        let discovery_started = Instant::now();
         let mut pack_files = Self::discover_pack_files(&base_dir)?;
+        let discovery_time = discovery_started.elapsed();
 
         // Enforce capacity: more pack files than available slots is an
         // error — we can't open them all, and silently ignoring extras
@@ -784,8 +818,13 @@ impl ShardPool {
         // Process in pack_id order for deterministic recovery.
         pack_files.sort_unstable_by_key(|(pack_id, _)| *pack_id);
 
+        let mut recovery_time = Duration::ZERO;
+        let mut recovery_calls: u64 = 0;
+        let mut packfile_open_time = Duration::ZERO;
+        let mut packfile_open_calls: u64 = 0;
         for (pack_id, path) in pack_files {
             if writable {
+                let recovery_started = Instant::now();
                 let _ = packfile::scan_and_recover_packfile(&path).map_err(|error| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -795,18 +834,23 @@ impl ShardPool {
                         ),
                     )
                 })?;
+                recovery_time = recovery_time.saturating_add(recovery_started.elapsed());
+                recovery_calls = recovery_calls.saturating_add(1);
             }
 
             // Validate the file before accepting it. A valid v4 file
             // must have the right magic, version, and CRC. If it
             // doesn't, the pool is corrupt — fail open rather than
             // silently deleting data.
+            let packfile_open_started = Instant::now();
             let file = packfile::open_packfile(&path, writable, pack_id).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("corrupt pack {}; failed to open: {error}", path.display()),
                 )
             })?;
+            packfile_open_time = packfile_open_time.saturating_add(packfile_open_started.elapsed());
+            packfile_open_calls = packfile_open_calls.saturating_add(1);
 
             let file_len = file.metadata()?.len();
             let slot = next_slot;
@@ -825,6 +869,7 @@ impl ShardPool {
         // survives retired-and-deleted shards, so it's strictly more
         // conservative than the file scan. A corrupt pool.meta is a hard
         // error — it means pack_ids could be reused, which is data corruption.
+        let metadata_started = Instant::now();
         let mut next_pack_id = Self::restore_pool_meta(&base_dir)?
             .map_or(max_pack_id, |persisted| persisted.max(max_pack_id));
 
@@ -875,6 +920,14 @@ impl ShardPool {
         // persisted — that's the entire point of a `shards`-style
         // inspection tool being able to see real numbers at all.
         let stats_persisted_at = Self::restore_persisted_stats(&base_dir, &shards);
+        let metadata_restore_time = metadata_started.elapsed();
+
+        let total = open_started.elapsed();
+        let named_phases = discovery_time
+            .saturating_add(writer_lock_time)
+            .saturating_add(recovery_time)
+            .saturating_add(packfile_open_time)
+            .saturating_add(metadata_restore_time);
 
         Ok(Self {
             shards: RwLock::new(shards),
@@ -889,6 +942,17 @@ impl ShardPool {
             stats_persisted_at: RwLock::new(stats_persisted_at),
             last_stats_flush: RwLock::new(None),
             last_sync_split: Mutex::new(None),
+            last_open_timings: Mutex::new(Some(ShardOpenTimings {
+                discovery: discovery_time,
+                writer_lock: writer_lock_time,
+                packfile_recovery: recovery_time,
+                packfile_recovery_calls: recovery_calls,
+                packfile_open: packfile_open_time,
+                packfile_open_calls,
+                metadata_restore: metadata_restore_time,
+                unattributed: total.saturating_sub(named_phases),
+                total,
+            })),
             writable,
             compress,
             checksum_policy,
@@ -896,6 +960,12 @@ impl ShardPool {
             #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         })
+    }
+
+    /// Return the timing breakdown from the most recent pool open.
+    #[must_use]
+    pub fn open_timings(&self) -> Option<ShardOpenTimings> {
+        *self.last_open_timings.lock()
     }
 
     /// Claim the writer lock on `base_dir`: atomically create a
