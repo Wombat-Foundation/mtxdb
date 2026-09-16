@@ -786,4 +786,20 @@ mod tests {
         assert_eq!(fp, Some(0x42), "without a delta, durable = checkpoint fp");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn read_pack_fingerprint_malformed_returns_err() {
+        let dir = std::env::temp_dir().join(format!("mtxdb_malformed_ckpt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+
+        // Write a corrupted checkpoint (bad magic).
+        std::fs::write(&path, vec![0xFF; CHECKPOINT_HEADER_LEN]).unwrap();
+
+        assert!(
+            read_pack_fingerprint(&path).is_err(),
+            "malformed checkpoint must return Err"
+        );
+    }
 }
