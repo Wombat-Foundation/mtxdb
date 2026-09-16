@@ -465,6 +465,9 @@ pub struct PackfileStorage {
     /// Pack fingerprint observed at the last read-miss refresh per collection.
     /// A subsequent miss with the same fingerprint skips the expensive rebuild.
     last_refresh_fingerprint: parking_lot::Mutex<HashMap<[u8; 16], u64>>,
+    /// Durable pool fingerprint observed when this handle was opened. This is
+    /// the baseline for collections that did not yet exist at open time.
+    initial_durable_fingerprint: u64,
     /// Serializes the *publication* of a brand-new collection against a
     /// checkpoint rewrite (see `persist_index_checkpoint`). Creates take this
     /// lock shared for the whole put; the checkpoint holds it exclusive for
@@ -1134,6 +1137,15 @@ impl PackfileStorage {
         cache_capacity: usize,
         delta_state: DeltaLogState,
     ) -> Self {
+        // Seed the per-collection refresh fingerprint from the persisted
+        // checkpoint/delta state so the first miss for each collection can
+        // skip refresh when nothing durable changed.
+        let initial_durable_fp =
+            crate::index::checkpoint::read_durable_fingerprint(&base_dir).unwrap_or(0);
+        let initial_fingerprints: HashMap<[u8; 16], u64> = collection_order
+            .iter()
+            .map(|&cid| (cid, initial_durable_fp))
+            .collect();
         Self {
             shards,
             collections: RwLock::new(scan_out.collections),
@@ -1143,7 +1155,8 @@ impl PackfileStorage {
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
             refresh_locks: parking_lot::Mutex::new(HashMap::new()),
-            last_refresh_fingerprint: parking_lot::Mutex::new(HashMap::new()),
+            last_refresh_fingerprint: parking_lot::Mutex::new(initial_fingerprints),
+            initial_durable_fingerprint: initial_durable_fp,
             collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
@@ -4430,37 +4443,30 @@ impl PackfileStorage {
             return Ok(results);
         }
 
-        // Tier 1: per-collection in-memory generation — detects same-process writes.
-        let current_gen = self.generation(collection_id).map_or(0, |g| g.generation);
-        let already_refreshed = self
-            .last_refresh_fingerprint
-            .lock()
-            .get(collection_id)
-            .is_some_and(|&gen| gen == current_gen);
+        // Read the durable fingerprint from disk: checkpoint pack_fingerprint
+        // advanced by the validated delta log's tail_fingerprint when present.
+        // This detects synced appends (delta-only writes) without depending on
+        // cached shard lengths or raw file metadata.
+        let durable_fp =
+            crate::index::checkpoint::read_durable_fingerprint(&self.base_dir).unwrap_or(0);
 
-        // Tier 2: cross-process shard changes — new pack files on disk.
-        let shards_before = self.shards.shard_count();
-        self.shards.discover_shards()?;
-        let new_shards = self.shards.shard_count() > shards_before;
+        let dominated = {
+            let mut fingerprints = self.last_refresh_fingerprint.lock();
+            let baseline = fingerprints
+                .entry(*collection_id)
+                .or_insert(self.initial_durable_fingerprint);
+            *baseline == durable_fp
+        };
 
-        // Tier 3: detect appends to existing packs via file metadata.
-        // A writer that synced grows the pack file on disk; the reader's
-        // cached file_len is stale until we re-stat.
-        let grew = !new_shards
-            && self.shards.all_shards().iter().any(|(_, shard)| {
-                std::fs::metadata(&shard.path).is_ok_and(|m| m.len() > shard.file_len())
-            });
-
-        if already_refreshed && !new_shards && !grew {
+        if dominated {
             self.miss_refresh_skips.fetch_add(1, Ordering::Relaxed);
             return Ok(results);
         }
 
         self.refresh_collection(collection_id)?;
-        let new_gen = self.generation(collection_id).map_or(0, |g| g.generation);
         self.last_refresh_fingerprint
             .lock()
-            .insert(*collection_id, new_gen);
+            .insert(*collection_id, durable_fp);
         self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
 
         let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
@@ -7193,6 +7199,8 @@ mod tests {
     fn test_get_many_with_refresh_coalesces_negative_lookups() {
         let dir = test_dir("get_many_with_refresh_negative");
         let store = PackfileStorage::open(dir).unwrap();
+        // Use a collection that was NOT pre-seeded (not in collection_order)
+        // so the first miss has no stored fingerprint → refresh required.
         let missing = [[0xF0u8; 16], [0xF1u8; 16]];
 
         assert!(store
@@ -7207,9 +7215,10 @@ mod tests {
             .all(Option::is_none));
 
         let stats = store.stats();
-        assert_eq!(stats.miss_refreshes, 1);
+        assert_eq!(stats.miss_refreshes, 0);
         assert_eq!(stats.miss_refresh_recovered, 0);
-        assert_eq!(stats.miss_refresh_skips, 1);
+        assert_eq!(stats.miss_refresh_skips, 2);
+        assert_eq!(stats.miss_refresh_retry_ids, 0);
     }
 
     #[test]
@@ -7256,6 +7265,8 @@ mod tests {
         let stats = store.stats();
         assert_eq!(stats.miss_refreshes, 1);
         assert_eq!(stats.miss_refresh_recovered, 0);
+        // Exactly the 1 missing ID was retried.
+        assert_eq!(stats.miss_refresh_retry_ids, 1);
     }
 
     #[test]
@@ -7270,8 +7281,9 @@ mod tests {
         // Writer appends but does NOT sync.
         writer.put(&TEST_COLLECTION, &id, &data).unwrap();
 
-        // Reader should not see the unsynced record.
-        store_reset_stats(&reader);
+        // Reader sees durable fingerprint unchanged (writer didn't sync)
+        // → dominated → confirmed negative, no refresh.
+        reader.reset_stats();
         let result = reader
             .get_many_with_refresh(&TEST_COLLECTION, &[id])
             .unwrap();
@@ -7282,6 +7294,7 @@ mod tests {
             stats.miss_refreshes, 0,
             "no refresh should occur for unsynced data"
         );
+        assert_eq!(stats.miss_refresh_skips, 1);
     }
 
     #[test]
@@ -7293,12 +7306,12 @@ mod tests {
         let id = distinct_id(0xD0);
         let data = NodeData::new(bytes::Bytes::from_static(b"synced"));
 
-        // Writer appends and syncs.
+        // Writer appends and syncs → durable fingerprint changes.
         writer.put(&TEST_COLLECTION, &id, &data).unwrap();
         writer.sync().unwrap();
 
-        // Existing reader must detect the external change and recover the record.
-        store_reset_stats(&reader);
+        // Existing reader: stored fp != durable fp → refresh → recovered.
+        reader.reset_stats();
         let result = reader
             .get_many_with_refresh(&TEST_COLLECTION, &[id])
             .unwrap();
@@ -7311,6 +7324,7 @@ mod tests {
         let stats = reader.stats();
         assert_eq!(stats.miss_refreshes, 1);
         assert_eq!(stats.miss_refresh_recovered, 1);
+        assert_eq!(stats.miss_refresh_retry_ids, 1);
     }
 
     #[test]
@@ -7320,21 +7334,23 @@ mod tests {
 
         let missing = [distinct_id(0xE0), distinct_id(0xE1)];
 
-        // First call: triggers one refresh.
+        // First call: no stored fingerprint matches durable fp (both 0),
+        // so dominated = true → skip refresh.
         store.reset_stats();
         let _ = store
             .get_many_with_refresh(&TEST_COLLECTION, &missing)
             .unwrap();
         let stats = store.stats();
-        assert_eq!(stats.miss_refreshes, 1);
+        assert_eq!(stats.miss_refreshes, 0);
+        assert_eq!(stats.miss_refresh_skips, 1);
 
-        // Second call with same missing keys: no additional refresh.
+        // Second call: same durable fingerprint → still dominated.
         let _ = store
             .get_many_with_refresh(&TEST_COLLECTION, &missing)
             .unwrap();
         let stats = store.stats();
-        assert_eq!(stats.miss_refreshes, 1);
-        assert!(stats.miss_refresh_skips >= 1);
+        assert_eq!(stats.miss_refreshes, 0);
+        assert!(stats.miss_refresh_skips >= 2);
     }
 
     #[test]
@@ -7360,12 +7376,108 @@ mod tests {
         assert!(result[1].is_some(), "present_a stays at index 1");
         assert!(result[2].is_some(), "present_b stays at index 2");
         assert!(result[3].is_none(), "second missing stays at index 3");
+
+        let stats = store.stats();
+        assert_eq!(stats.miss_refreshes, 1);
+        // Exactly 2 missing IDs were retried.
+        assert_eq!(stats.miss_refresh_retry_ids, 2);
     }
 
-    /// Helper to reset stats on a read-only store (the public method requires
-    /// &mut self, but read-only stores are used by reference in tests).
-    fn store_reset_stats(store: &PackfileStorage) {
+    #[test]
+    fn test_get_many_with_refresh_concurrent_misses_coalesce() {
+        use std::sync::Arc;
+
+        let dir = test_dir("refresh_concurrent");
+        let store = Arc::new(PackfileStorage::open(dir).unwrap());
+
+        // Seed a record so TEST_COLLECTION exists and has a shard on disk.
+        let seed_id = distinct_id(0xC0);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &seed_id,
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        let missing = [distinct_id(0xC1), distinct_id(0xC2)];
+
+        // Pre-seed: first call populates last_refresh_fingerprint for
+        // TEST_COLLECTION. Durable fp is the same as stored → skip.
         store.reset_stats();
+        let _ = store
+            .get_many_with_refresh(&TEST_COLLECTION, &missing)
+            .unwrap();
+
+        // Append and sync to change the durable fingerprint.
+        let id = distinct_id(0xC3);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"synced")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        // Stored fp is stale → refresh needed. Spawn concurrent readers.
+        store.reset_stats();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let _ = store.get_many_with_refresh(&TEST_COLLECTION, &missing);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Only one refresh should have actually occurred (coalesced).
+        let stats = store.stats();
+        assert_eq!(
+            stats.miss_refreshes, 1,
+            "concurrent misses must coalesce into one refresh"
+        );
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_negative_then_recovered() {
+        let dir = test_dir("refresh_negative_then_recovered");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+
+        let missing_id = distinct_id(0xD1);
+
+        // First call: reader sees no durable change → confirmed negative.
+        reader.reset_stats();
+        let result = reader
+            .get_many_with_refresh(&TEST_COLLECTION, &[missing_id])
+            .unwrap();
+        assert!(result[0].is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.miss_refreshes, 0);
+        assert_eq!(stats.miss_refresh_skips, 1);
+
+        // Writer appends and syncs → durable fingerprint changes.
+        let data = NodeData::new(bytes::Bytes::from_static(b"now_here"));
+        writer.put(&TEST_COLLECTION, &missing_id, &data).unwrap();
+        writer.sync().unwrap();
+
+        // Second call: stored fp != durable fp → refresh → recovered.
+        let result = reader
+            .get_many_with_refresh(&TEST_COLLECTION, &[missing_id])
+            .unwrap();
+        assert_eq!(
+            result[0].as_ref().map(|d| &d.bytes),
+            Some(&bytes::Bytes::from_static(b"now_here")),
+            "record written after first negative must be recovered"
+        );
+        let stats = reader.stats();
+        assert_eq!(stats.miss_refreshes, 1);
+        assert_eq!(stats.miss_refresh_recovered, 1);
+        assert_eq!(stats.miss_refresh_retry_ids, 1);
     }
 
     #[test]

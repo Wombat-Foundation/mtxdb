@@ -409,9 +409,14 @@ pub fn read_durable_fingerprint(base_dir: &Path) -> Option<u64> {
         "{}.{ckpt_fp:016x}",
         crate::index::delta::INDEX_DELTA_FILE,
     ));
-    match crate::index::delta::read_delta_log(&delta_path) {
-        Some(log) if log.base_fingerprint == ckpt_fp => Some(log.tail_fingerprint),
-        _ => Some(ckpt_fp),
+    // Use the lightweight forward parser to avoid decoding every DeltaFrame.
+    match crate::index::delta::read_delta_tail_fingerprint(&delta_path) {
+        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp => Some(tail_fp.tail_fingerprint),
+        Ok(Some(_) | None) => Some(ckpt_fp),
+        Err(error) => {
+            eprintln!("warning: ignoring delta fingerprint: {error}");
+            Some(ckpt_fp)
+        }
     }
 }
 
@@ -653,6 +658,107 @@ mod tests {
             "write-only mode deliberately trusts a structurally valid checkpoint"
         );
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_pack_fingerprint_missing_file() {
+        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+        assert!(
+            read_pack_fingerprint(&path).is_none(),
+            "missing file must return None"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_pack_fingerprint_truncated() {
+        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_trunc");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+        std::fs::write(&path, [0u8; 32]).unwrap();
+        assert!(
+            read_pack_fingerprint(&path).is_none(),
+            "truncated header must return None"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_pack_fingerprint_invalid_magic() {
+        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_badmagic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+        let mut buf = [0u8; CHECKPOINT_HEADER_LEN];
+        buf[..8].copy_from_slice(b"BADMAGIC");
+        std::fs::write(&path, buf).unwrap();
+        assert!(
+            read_pack_fingerprint(&path).is_none(),
+            "bad magic must return None"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_pack_fingerprint_valid_roundtrip() {
+        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_valid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+
+        let header = CheckpointHeader {
+            magic: CHECKPOINT_MAGIC,
+            version: CHECKPOINT_VERSION,
+            collection_count: 0,
+            directory_bytes: 0,
+            slots_bytes: 0,
+            pack_fingerprint: 0xDEAD_BEEF_CAFE_BABE,
+            content_crc32: 0,
+        };
+        std::fs::write(&path, header.encode()).unwrap();
+
+        let fp = read_pack_fingerprint(&path);
+        assert_eq!(fp, Some(0xDEAD_BEEF_CAFE_BABE));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_durable_fingerprint_no_checkpoint() {
+        let dir = std::env::temp_dir().join("mtxdb_durable_no_ckpt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            read_durable_fingerprint(&dir).is_none(),
+            "missing checkpoint must return None"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_durable_fingerprint_checkpoint_only() {
+        let dir = std::env::temp_dir().join("mtxdb_durable_ckpt_only");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+
+        let header = CheckpointHeader {
+            magic: CHECKPOINT_MAGIC,
+            version: CHECKPOINT_VERSION,
+            collection_count: 0,
+            directory_bytes: 0,
+            slots_bytes: 0,
+            pack_fingerprint: 0x42,
+            content_crc32: 0,
+        };
+        std::fs::write(&path, header.encode()).unwrap();
+
+        let fp = read_durable_fingerprint(&dir);
+        assert_eq!(fp, Some(0x42), "without a delta, durable = checkpoint fp");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

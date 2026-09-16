@@ -36,8 +36,9 @@
 //! trailer", and only complete batches are trusted.
 
 use std::fs;
-use std::io::Write as _;
-use std::path::Path;
+use std::io::{Read as _, Seek as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::{fmt, io};
 
 use super::format::{DeltaFrame, DELTA_FRAME_LEN};
 
@@ -139,6 +140,240 @@ fn batch_crc(frames_bytes: &[u8], tail_fingerprint: u64) -> u32 {
     hasher.update(frames_bytes);
     hasher.update(&tail_fingerprint.to_le_bytes());
     hasher.finalize()
+}
+
+/// Validated result of a lightweight delta-log scan.
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaTailFingerprint {
+    /// The `base_fingerprint` from the log header (matches the checkpoint
+    /// that this delta continues).
+    pub base_fingerprint: u64,
+    /// The last committed `tail_fingerprint` from the validated batches.
+    pub tail_fingerprint: u64,
+}
+
+/// Failure while inspecting a delta log's durable fingerprint.
+#[derive(Debug)]
+pub enum DeltaFingerprintError {
+    /// The delta log could not be accessed or read.
+    Io {
+        /// Delta-log path involved in the operation.
+        path: PathBuf,
+        /// Operation being performed when the I/O error occurred.
+        operation: &'static str,
+        /// Underlying operating-system error.
+        source: io::Error,
+    },
+    /// The delta log has an invalid or unsupported on-disk structure.
+    Invalid {
+        /// Delta-log path involved in the validation failure.
+        path: PathBuf,
+        /// Human-readable validation failure.
+        reason: String,
+    },
+}
+
+impl fmt::Display for DeltaFingerprintError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io {
+                path,
+                operation,
+                source,
+            } => write!(formatter, "{} {}: {source}", operation, path.display()),
+            Self::Invalid { path, reason } => {
+                write!(
+                    formatter,
+                    "invalid delta fingerprint {}: {reason}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeltaFingerprintError {}
+
+fn invalid(path: &Path, reason: impl Into<String>) -> DeltaFingerprintError {
+    DeltaFingerprintError::Invalid {
+        path: path.to_owned(),
+        reason: reason.into(),
+    }
+}
+
+fn io_error(path: &Path, operation: &'static str, source: io::Error) -> DeltaFingerprintError {
+    DeltaFingerprintError::Io {
+        path: path.to_owned(),
+        operation,
+        source,
+    }
+}
+
+/// Lightweight forward scan of the delta log's last committed
+/// `tail_fingerprint`.
+///
+/// Walks each batch from the log header forward — reading batch headers,
+/// computing frame/trailer boundaries with checked arithmetic, and
+/// verifying CRC — retaining the last valid `tail_fingerprint`.  Stops at
+/// the first torn or corrupt suffix.  This avoids decoding individual
+/// [`DeltaFrame`] records while still validating every batch boundary.
+///
+/// When a torn trailing batch is encountered the function returns the
+/// last _valid_ `tail_fingerprint` (from a prior committed batch), which
+/// is the correct durable generation for the committed prefix.  Returns
+/// `None` only when the file is missing, too short, has an unrecognized
+/// magic/version, or has no committed batches at all. A missing file is
+/// returned as `Ok(None)` so callers can fall back to the checkpoint.
+///
+/// # Errors
+///
+/// Returns [`DeltaFingerprintError`] when the file cannot be read or its
+/// committed structure is invalid.
+#[allow(
+    clippy::too_many_lines,
+    reason = "parses the fixed-width log format in one pass"
+)]
+pub fn read_delta_tail_fingerprint(
+    path: &Path,
+) -> Result<Option<DeltaTailFingerprint>, DeltaFingerprintError> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(path, "open delta log", error)),
+    };
+    let len = file
+        .metadata()
+        .map_err(|error| io_error(path, "stat delta log", error))?
+        .len();
+    let log_header_len = u64::try_from(DELTA_LOG_HEADER_LEN)
+        .map_err(|_| invalid(path, "log header length overflows u64"))?;
+    let batch_header_len = u64::try_from(DELTA_BATCH_HEADER_LEN)
+        .map_err(|_| invalid(path, "batch header length overflows u64"))?;
+    let trailer_len = u64::try_from(DELTA_LOG_TRAILER_LEN)
+        .map_err(|_| invalid(path, "trailer length overflows u64"))?;
+    let delta_frame_len =
+        u64::try_from(DELTA_FRAME_LEN).map_err(|_| invalid(path, "frame length overflows u64"))?;
+
+    // Reject files that exceed the writer's own cap.
+    if len > MAX_DELTA_LOG_FILE_BYTES {
+        return Err(invalid(path, "file exceeds maximum delta-log size"));
+    }
+
+    // --- log header ---
+    if len < log_header_len {
+        return Err(invalid(path, "truncated log header"));
+    }
+    let mut log_hdr = [0u8; DELTA_LOG_HEADER_LEN];
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| io_error(path, "seek delta log header", error))?;
+    file.read_exact(&mut log_hdr)
+        .map_err(|error| io_error(path, "read delta log header", error))?;
+    if &log_hdr[..4] != DELTA_LOG_MAGIC || log_hdr[4] != DELTA_LOG_VERSION {
+        return Err(invalid(path, "unrecognized magic or version"));
+    }
+    let base_fp = u64::from_le_bytes(
+        log_hdr[8..16]
+            .try_into()
+            .map_err(|_| invalid(path, "invalid base fingerprint"))?,
+    );
+
+    let mut pos = log_header_len;
+    let mut tail_fingerprint: Option<u64> = None;
+
+    loop {
+        // Enough room for a batch header + trailer?
+        let batch_header_end = pos
+            .checked_add(batch_header_len)
+            .ok_or_else(|| invalid(path, "batch header offset overflow"))?;
+        if batch_header_end
+            .checked_add(trailer_len)
+            .ok_or_else(|| invalid(path, "batch trailer boundary overflow"))?
+            > len
+        {
+            break;
+        }
+        // --- batch header ---
+        let mut batch_hdr = [0u8; DELTA_BATCH_HEADER_LEN];
+        file.seek(std::io::SeekFrom::Start(pos))
+            .map_err(|error| io_error(path, "seek batch header", error))?;
+        file.read_exact(&mut batch_hdr)
+            .map_err(|error| io_error(path, "read batch header", error))?;
+        if &batch_hdr[..4] != DELTA_BATCH_MAGIC {
+            return match tail_fingerprint {
+                Some(tail_fingerprint) => Ok(Some(DeltaTailFingerprint {
+                    base_fingerprint: base_fp,
+                    tail_fingerprint,
+                })),
+                None => Err(invalid(
+                    path,
+                    format!("invalid batch header at offset {pos}"),
+                )),
+            };
+        }
+        let frame_count = u64::from(u32::from_le_bytes(
+            batch_hdr[4..8]
+                .try_into()
+                .map_err(|_| invalid(path, "invalid frame count"))?,
+        ));
+        let frame_bytes_len = frame_count
+            .checked_mul(delta_frame_len)
+            .ok_or_else(|| invalid(path, "frame byte length overflow"))?;
+        let trailer_start = batch_header_end
+            .checked_add(frame_bytes_len)
+            .ok_or_else(|| invalid(path, "trailer offset overflow"))?;
+        if trailer_start
+            .checked_add(trailer_len)
+            .ok_or_else(|| invalid(path, "trailer boundary overflow"))?
+            > len
+        {
+            break;
+        }
+        // --- trailer ---
+        let mut trailer = [0u8; DELTA_LOG_TRAILER_LEN];
+        file.seek(std::io::SeekFrom::Start(trailer_start))
+            .map_err(|error| io_error(path, "seek delta trailer", error))?;
+        file.read_exact(&mut trailer)
+            .map_err(|error| io_error(path, "read delta trailer", error))?;
+        if &trailer[..4] != DELTA_LOG_TRAILER_MAGIC {
+            break;
+        }
+        let tfp = u64::from_le_bytes(
+            trailer[TRAILER_FINGERPRINT_OFFSET..16]
+                .try_into()
+                .map_err(|_| invalid(path, "invalid trailer fingerprint"))?,
+        );
+        let stored_crc = u32::from_le_bytes(
+            trailer[TRAILER_CRC_OFFSET..8]
+                .try_into()
+                .map_err(|_| invalid(path, "invalid trailer CRC"))?,
+        );
+        // --- frame bytes for CRC ---
+        let frames_start = batch_header_end;
+        let frames_len_usize = usize::try_from(frame_bytes_len)
+            .map_err(|_| invalid(path, "frame bytes do not fit in memory"))?;
+        let mut frames = vec![0u8; frames_len_usize];
+        file.seek(std::io::SeekFrom::Start(frames_start))
+            .map_err(|error| io_error(path, "seek delta frames", error))?;
+        file.read_exact(&mut frames)
+            .map_err(|error| io_error(path, "read delta frames", error))?;
+        if batch_crc(&frames, tfp) != stored_crc {
+            if tail_fingerprint.is_some() {
+                break;
+            }
+            return Err(invalid(path, format!("invalid batch CRC at offset {pos}")));
+        }
+        tail_fingerprint = Some(tfp);
+        pos = trailer_start
+            .checked_add(trailer_len)
+            .ok_or_else(|| invalid(path, "next batch offset overflow"))?;
+    }
+    match tail_fingerprint {
+        Some(tail_fingerprint) => Ok(Some(DeltaTailFingerprint {
+            base_fingerprint: base_fp,
+            tail_fingerprint,
+        })),
+        None => Err(invalid(path, "no committed delta batch")),
+    }
 }
 
 /// Length in bytes of one fully framed batch carrying `frame_count` frames.
