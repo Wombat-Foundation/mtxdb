@@ -89,6 +89,18 @@ pub struct OpenTimings {
     pub packfile_open_calls: u64,
     /// Restoring pool metadata and persisted shard statistics.
     pub metadata_restore: std::time::Duration,
+    /// Restoring pool.meta header and reading next pack ID.
+    pub pool_meta_restore: std::time::Duration,
+    /// Reading and restoring persisted snapshot counters from `shard_stats.bin`.
+    pub persisted_stats_restore: std::time::Duration,
+    /// Writing store.meta version marker and syncing directory (fresh pool only; ZERO on existing pool).
+    pub store_meta_write: std::time::Duration,
+    /// Persisting pool.meta reservation and syncing directory (fresh pool only; ZERO on existing pool).
+    pub pool_meta_persist: std::time::Duration,
+    /// Creating initial packfile atomically, writing header, syncing and renaming (fresh pool only; ZERO on existing pool).
+    pub initial_pack_create: std::time::Duration,
+    /// Unattributed time inside the `metadata_restore` span.
+    pub metadata_unattributed: std::time::Duration,
     /// Shard-open time not covered by the named shard phases.
     pub shard_open_unattributed: std::time::Duration,
     /// Reading the collection-order and deleted-collections sidecars.
@@ -128,6 +140,12 @@ impl Default for OpenTimings {
             packfile_open: std::time::Duration::ZERO,
             packfile_open_calls: 0,
             metadata_restore: std::time::Duration::ZERO,
+            pool_meta_restore: std::time::Duration::ZERO,
+            persisted_stats_restore: std::time::Duration::ZERO,
+            store_meta_write: std::time::Duration::ZERO,
+            pool_meta_persist: std::time::Duration::ZERO,
+            initial_pack_create: std::time::Duration::ZERO,
+            metadata_unattributed: std::time::Duration::ZERO,
             shard_open_unattributed: std::time::Duration::ZERO,
             metadata_load: std::time::Duration::ZERO,
             checkpoint_decode: std::time::Duration::ZERO,
@@ -1007,6 +1025,12 @@ impl PackfileStorage {
             timings.packfile_open = shard_timings.packfile_open;
             timings.packfile_open_calls = shard_timings.packfile_open_calls;
             timings.metadata_restore = shard_timings.metadata_restore;
+            timings.pool_meta_restore = shard_timings.pool_meta_restore;
+            timings.persisted_stats_restore = shard_timings.persisted_stats_restore;
+            timings.store_meta_write = shard_timings.store_meta_write;
+            timings.pool_meta_persist = shard_timings.pool_meta_persist;
+            timings.initial_pack_create = shard_timings.initial_pack_create;
+            timings.metadata_unattributed = shard_timings.metadata_unattributed;
             timings.shard_open_unattributed = shard_timings.unattributed;
         }
 

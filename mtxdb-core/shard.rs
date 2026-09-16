@@ -530,6 +530,18 @@ pub struct ShardOpenTimings {
     pub packfile_open_calls: u64,
     /// Time spent restoring pool metadata and persisted shard statistics.
     pub metadata_restore: Duration,
+    /// Restoring pool.meta header and reading next pack ID.
+    pub pool_meta_restore: Duration,
+    /// Reading and restoring persisted snapshot counters from `shard_stats.bin`.
+    pub persisted_stats_restore: Duration,
+    /// Writing store.meta version marker and syncing directory (fresh pool only; ZERO on existing pool).
+    pub store_meta_write: Duration,
+    /// Persisting pool.meta reservation and syncing directory (fresh pool only; ZERO on existing pool).
+    pub pool_meta_persist: Duration,
+    /// Creating initial packfile atomically, writing header, syncing and renaming (fresh pool only; ZERO on existing pool).
+    pub initial_pack_create: Duration,
+    /// Unattributed time inside the `metadata_restore` span.
+    pub metadata_unattributed: Duration,
     /// Time not covered by the named phases (sorting, allocation, and other
     /// small bookkeeping). This makes the phase accounting explicit instead
     /// of inviting callers to assume the named fields sum to `total`.
@@ -870,8 +882,14 @@ impl ShardPool {
         // conservative than the file scan. A corrupt pool.meta is a hard
         // error — it means pack_ids could be reused, which is data corruption.
         let metadata_started = Instant::now();
+        let t_pool_meta_restore = Instant::now();
         let mut next_pack_id = Self::restore_pool_meta(&base_dir)?
             .map_or(max_pack_id, |persisted| persisted.max(max_pack_id));
+        let pool_meta_restore_time = t_pool_meta_restore.elapsed();
+
+        let mut store_meta_write_time = Duration::ZERO;
+        let mut pool_meta_persist_time = Duration::ZERO;
+        let mut initial_pack_create_time = Duration::ZERO;
 
         // If no shards exist, create the initial shard — but a read-only
         // open of a store that doesn't exist yet makes no sense; error
@@ -895,21 +913,27 @@ impl ShardPool {
             // `store.meta` survives, and overwriting it there would make
             // stats attribute store creation to whichever binary happens to
             // reopen an emptied pool.
+            let t_store_meta = Instant::now();
             if !base_dir.join(STORE_META_FILENAME).exists() {
                 persist_store_meta(&base_dir);
             }
+            store_meta_write_time = t_store_meta.elapsed();
             // Persist the high-water mark BEFORE creating the pack file.
             // A crash after pack creation but before next persist would
             // leave a pack_id in use with no pool.meta reservation — so
             // we write pool.meta first, guaranteeing the ID is reserved.
+            let t_pool_meta_persist = Instant::now();
             Self::persist_pool_meta_at(
                 &base_dir,
                 pack_id.checked_add(1).expect("pack_id overflow"),
             )?;
+            pool_meta_persist_time = t_pool_meta_persist.elapsed();
+            let t_initial_pack = Instant::now();
             let (file, path) = Self::create_packfile_atomically(&base_dir, pack_id)?;
             let file_len = file.metadata()?.len();
             shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
             next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
+            initial_pack_create_time = t_initial_pack.elapsed();
         }
 
         // Restoring is a pure read of shard_stats.bin applied to our own
@@ -919,8 +943,18 @@ impl ShardPool {
         // it absolutely should show whatever the real writer already
         // persisted — that's the entire point of a `shards`-style
         // inspection tool being able to see real numbers at all.
+        let t_stats = Instant::now();
         let stats_persisted_at = Self::restore_persisted_stats(&base_dir, &shards);
+        let persisted_stats_restore_time = t_stats.elapsed();
         let metadata_restore_time = metadata_started.elapsed();
+
+        let metadata_subphases_sum = pool_meta_restore_time
+            .saturating_add(store_meta_write_time)
+            .saturating_add(pool_meta_persist_time)
+            .saturating_add(initial_pack_create_time)
+            .saturating_add(persisted_stats_restore_time);
+        let metadata_unattributed_time =
+            metadata_restore_time.saturating_sub(metadata_subphases_sum);
 
         let total = open_started.elapsed();
         let named_phases = discovery_time
@@ -950,6 +984,12 @@ impl ShardPool {
                 packfile_open: packfile_open_time,
                 packfile_open_calls,
                 metadata_restore: metadata_restore_time,
+                pool_meta_restore: pool_meta_restore_time,
+                persisted_stats_restore: persisted_stats_restore_time,
+                store_meta_write: store_meta_write_time,
+                pool_meta_persist: pool_meta_persist_time,
+                initial_pack_create: initial_pack_create_time,
+                metadata_unattributed: metadata_unattributed_time,
                 unattributed: total.saturating_sub(named_phases),
                 total,
             })),
