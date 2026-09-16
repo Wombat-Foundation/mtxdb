@@ -7200,6 +7200,162 @@ mod tests {
     }
 
     #[test]
+    fn test_get_many_with_refresh_all_hit_skips_refresh() {
+        let dir = test_dir("refresh_all_hit");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let id_a = distinct_id(0xA0);
+        let id_b = distinct_id(0xA1);
+        let data = NodeData::new(bytes::Bytes::from_static(b"payload"));
+        store.put(&TEST_COLLECTION, &id_a, &data).unwrap();
+        store.put(&TEST_COLLECTION, &id_b, &data).unwrap();
+        store.sync().unwrap();
+
+        store.reset_stats();
+        let result = store
+            .get_many_with_refresh(&TEST_COLLECTION, &[id_a, id_b])
+            .unwrap();
+        assert!(result.iter().all(Option::is_some));
+
+        let stats = store.stats();
+        assert_eq!(stats.miss_refreshes, 0);
+        assert_eq!(stats.miss_refresh_skips, 0);
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_mixed_batch_retries_only_misses() {
+        let dir = test_dir("refresh_mixed_batch");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let present = distinct_id(0xB0);
+        let missing = distinct_id(0xBF);
+        let data = NodeData::new(bytes::Bytes::from_static(b"here"));
+        store.put(&TEST_COLLECTION, &present, &data).unwrap();
+        store.sync().unwrap();
+
+        store.reset_stats();
+        let result = store
+            .get_many_with_refresh(&TEST_COLLECTION, &[present, missing])
+            .unwrap();
+        assert!(result[0].is_some());
+        assert!(result[1].is_none());
+
+        let stats = store.stats();
+        assert_eq!(stats.miss_refreshes, 1);
+        assert_eq!(stats.miss_refresh_recovered, 0);
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_unsynced_append_invisible() {
+        let dir = test_dir("refresh_unsynced");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+
+        let id = distinct_id(0xC0);
+        let data = NodeData::new(bytes::Bytes::from_static(b"unsynced"));
+
+        // Writer appends but does NOT sync.
+        writer.put(&TEST_COLLECTION, &id, &data).unwrap();
+
+        // Reader should not see the unsynced record.
+        store_reset_stats(&reader);
+        let result = reader
+            .get_many_with_refresh(&TEST_COLLECTION, &[id])
+            .unwrap();
+        assert!(result[0].is_none(), "unsynced append must remain invisible");
+
+        let stats = reader.stats();
+        assert_eq!(
+            stats.miss_refreshes, 0,
+            "no refresh should occur for unsynced data"
+        );
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_synced_append_detected() {
+        let dir = test_dir("refresh_synced_append");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+
+        let id = distinct_id(0xD0);
+        let data = NodeData::new(bytes::Bytes::from_static(b"synced"));
+
+        // Writer appends and syncs.
+        writer.put(&TEST_COLLECTION, &id, &data).unwrap();
+        writer.sync().unwrap();
+
+        // Existing reader must detect the external change and recover the record.
+        store_reset_stats(&reader);
+        let result = reader
+            .get_many_with_refresh(&TEST_COLLECTION, &[id])
+            .unwrap();
+        assert_eq!(
+            result[0].as_ref().map(|d| &d.bytes),
+            Some(&bytes::Bytes::from_static(b"synced")),
+            "synced append must be recovered by the existing reader handle"
+        );
+
+        let stats = reader.stats();
+        assert_eq!(stats.miss_refreshes, 1);
+        assert_eq!(stats.miss_refresh_recovered, 1);
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_repeated_negative_suppressed() {
+        let dir = test_dir("refresh_repeated_negative");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let missing = [distinct_id(0xE0), distinct_id(0xE1)];
+
+        // First call: triggers one refresh.
+        store.reset_stats();
+        let _ = store
+            .get_many_with_refresh(&TEST_COLLECTION, &missing)
+            .unwrap();
+        let stats = store.stats();
+        assert_eq!(stats.miss_refreshes, 1);
+
+        // Second call with same missing keys: no additional refresh.
+        let _ = store
+            .get_many_with_refresh(&TEST_COLLECTION, &missing)
+            .unwrap();
+        let stats = store.stats();
+        assert_eq!(stats.miss_refreshes, 1);
+        assert!(stats.miss_refresh_skips >= 1);
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_preserves_result_order() {
+        let dir = test_dir("refresh_ordering");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let present_a = distinct_id(0xF0);
+        let present_b = distinct_id(0xF1);
+        let missing = distinct_id(0xFF);
+        let data = NodeData::new(bytes::Bytes::from_static(b"data"));
+
+        store.put(&TEST_COLLECTION, &present_a, &data).unwrap();
+        store.put(&TEST_COLLECTION, &present_b, &data).unwrap();
+        store.sync().unwrap();
+
+        let batch = [missing, present_a, present_b, missing];
+        let result = store
+            .get_many_with_refresh(&TEST_COLLECTION, &batch)
+            .unwrap();
+
+        assert!(result[0].is_none(), "first missing stays at index 0");
+        assert!(result[1].is_some(), "present_a stays at index 1");
+        assert!(result[2].is_some(), "present_b stays at index 2");
+        assert!(result[3].is_none(), "second missing stays at index 3");
+    }
+
+    /// Helper to reset stats on a read-only store (the public method requires
+    /// &mut self, but read-only stores are used by reference in tests).
+    fn store_reset_stats(store: &PackfileStorage) {
+        store.reset_stats();
+    }
+
+    #[test]
     fn test_refresh_collection_multi_worker_visibility() {
         let dir = test_dir("refresh_collection_multi_worker");
         let writer = PackfileStorage::open(dir.clone()).unwrap();
