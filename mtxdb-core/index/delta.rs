@@ -194,14 +194,18 @@ impl fmt::Display for DeltaFingerprintError {
 
 impl std::error::Error for DeltaFingerprintError {}
 
-fn invalid(path: &Path, reason: impl Into<String>) -> DeltaFingerprintError {
+pub(crate) fn invalid(path: &Path, reason: impl Into<String>) -> DeltaFingerprintError {
     DeltaFingerprintError::Invalid {
         path: path.to_owned(),
         reason: reason.into(),
     }
 }
 
-fn io_error(path: &Path, operation: &'static str, source: io::Error) -> DeltaFingerprintError {
+pub(crate) fn io_error(
+    path: &Path,
+    operation: &'static str,
+    source: io::Error,
+) -> DeltaFingerprintError {
     DeltaFingerprintError::Io {
         path: path.to_owned(),
         operation,

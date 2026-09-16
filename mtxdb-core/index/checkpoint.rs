@@ -27,7 +27,7 @@
 //! changes it and forces a rescan.
 
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -375,21 +375,36 @@ pub fn read_checkpoint_with_policy(
 
 /// Lightweight read of the persisted checkpoint's `pack_fingerprint`.
 ///
-/// Returns `None` if the file is missing, too short, or has an
-/// unrecognized magic/version — identical to the "no checkpoint" fallback
-/// that `read_checkpoint` uses, but at a fraction of the cost (a single
-/// 64-byte read instead of a full mmap + CRC pass).
-#[must_use]
-pub fn read_pack_fingerprint(path: &Path) -> Option<u64> {
-    let file = fs::File::open(path).ok()?;
+/// Returns `Ok(Some(fp))` for a valid checkpoint, `Ok(None)` if the file
+/// is missing (fresh store), and `Err` if the file exists but is truncated,
+/// has invalid magic/version, or an I/O error occurs.
+///
+/// # Errors
+///
+/// Returns a [`crate::index::delta::DeltaFingerprintError`] when an existing
+/// checkpoint cannot be read or validated.
+pub fn read_pack_fingerprint(
+    path: &Path,
+) -> Result<Option<u64>, crate::index::delta::DeltaFingerprintError> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(crate::index::delta::io_error(path, "open checkpoint", e)),
+    };
     let mut buf = [0u8; CHECKPOINT_HEADER_LEN];
     let mut handle = file.take(CHECKPOINT_HEADER_LEN as u64);
-    handle.read_exact(&mut buf).ok()?;
-    let header = CheckpointHeader::decode(&buf)?;
+    handle
+        .read_exact(&mut buf)
+        .map_err(|e| crate::index::delta::io_error(path, "read checkpoint header", e))?;
+    let header = CheckpointHeader::decode(&buf)
+        .ok_or_else(|| crate::index::delta::invalid(path, "checkpoint header decode failed"))?;
     if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
-        return None;
+        return Err(crate::index::delta::invalid(
+            path,
+            "invalid checkpoint magic/version",
+        ));
     }
-    Some(header.pack_fingerprint)
+    Ok(Some(header.pack_fingerprint))
 }
 
 /// Read the durable pack fingerprint for a store directory.
@@ -412,18 +427,20 @@ pub fn read_durable_fingerprint(
     base_dir: &Path,
 ) -> Result<Option<u64>, crate::index::delta::DeltaFingerprintError> {
     let ckpt_path = base_dir.join(INDEX_CHECKPOINT_FILE);
-    let ckpt_fp = read_pack_fingerprint(&ckpt_path);
+    let Some(ckpt_fp) = read_pack_fingerprint(&ckpt_path)? else {
+        return Ok(None);
+    };
     let delta_path = base_dir.join(format!(
         "{}.{:016x}",
         crate::index::delta::INDEX_DELTA_FILE,
-        ckpt_fp.unwrap_or(0),
+        ckpt_fp,
     ));
     // Use the lightweight forward parser to avoid decoding every DeltaFrame.
     match crate::index::delta::read_delta_tail_fingerprint(&delta_path) {
-        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp.unwrap_or(0) => {
+        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp => {
             Ok(Some(tail_fp.tail_fingerprint))
         }
-        Ok(Some(_) | None) => Ok(ckpt_fp),
+        Ok(Some(_) | None) => Ok(Some(ckpt_fp)),
         Err(e) => Err(e),
     }
 }
@@ -676,8 +693,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
         assert!(
-            read_pack_fingerprint(&path).is_none(),
-            "missing file must return None"
+            matches!(read_pack_fingerprint(&path), Ok(None)),
+            "missing file must return Ok(None)"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -690,8 +707,8 @@ mod tests {
         let path = dir.join(INDEX_CHECKPOINT_FILE);
         std::fs::write(&path, [0u8; 32]).unwrap();
         assert!(
-            read_pack_fingerprint(&path).is_none(),
-            "truncated header must return None"
+            read_pack_fingerprint(&path).is_err(),
+            "truncated header must return an error"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -706,8 +723,8 @@ mod tests {
         buf[..8].copy_from_slice(b"BADMAGIC");
         std::fs::write(&path, buf).unwrap();
         assert!(
-            read_pack_fingerprint(&path).is_none(),
-            "bad magic must return None"
+            read_pack_fingerprint(&path).is_err(),
+            "bad magic must return an error"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -730,7 +747,7 @@ mod tests {
         };
         std::fs::write(&path, header.encode()).unwrap();
 
-        let fp = read_pack_fingerprint(&path);
+        let fp = read_pack_fingerprint(&path).expect("valid checkpoint");
         assert_eq!(fp, Some(0xDEAD_BEEF_CAFE_BABE));
         std::fs::remove_dir_all(&dir).unwrap();
     }
