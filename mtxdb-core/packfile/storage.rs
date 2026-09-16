@@ -4,7 +4,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -463,9 +462,9 @@ pub struct PackfileStorage {
     /// an index miss waits for an in-flight refresh of the same collection
     /// instead of starting another full scan.
     refresh_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
-    /// Last successful refresh initiated by the read-miss path, used to avoid
-    /// rescanning a collection for repeated genuine negative lookups.
-    last_miss_refresh: parking_lot::Mutex<HashMap<[u8; 16], Instant>>,
+    /// Pack fingerprint observed at the last read-miss refresh per collection.
+    /// A subsequent miss with the same fingerprint skips the expensive rebuild.
+    last_refresh_fingerprint: parking_lot::Mutex<HashMap<[u8; 16], u64>>,
     /// Serializes the *publication* of a brand-new collection against a
     /// checkpoint rewrite (see `persist_index_checkpoint`). Creates take this
     /// lock shared for the whole put; the checkpoint holds it exclusive for
@@ -1141,7 +1140,7 @@ impl PackfileStorage {
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
             refresh_locks: parking_lot::Mutex::new(HashMap::new()),
-            last_miss_refresh: parking_lot::Mutex::new(HashMap::new()),
+            last_refresh_fingerprint: parking_lot::Mutex::new(HashMap::new()),
             collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
@@ -4394,8 +4393,6 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
-
         let mut results = self.get_many(collection_id, ids)?;
         let mut missing: Vec<usize> = results
             .iter()
@@ -4429,19 +4426,37 @@ impl PackfileStorage {
             return Ok(results);
         }
 
-        let now = Instant::now();
-        let refresh_recent = self
-            .last_miss_refresh
+        // Tier 1: per-collection in-memory generation — detects same-process writes.
+        let current_gen = self.generation(collection_id).map_or(0, |g| g.generation);
+        let already_refreshed = self
+            .last_refresh_fingerprint
             .lock()
             .get(collection_id)
-            .is_some_and(|last| now.duration_since(*last) < MIN_REFRESH_INTERVAL);
-        if refresh_recent {
+            .is_some_and(|&gen| gen == current_gen);
+
+        // Tier 2: cross-process shard changes — new pack files on disk.
+        let shards_before = self.shards.shard_count();
+        self.shards.discover_shards()?;
+        let new_shards = self.shards.shard_count() > shards_before;
+
+        // Tier 3: detect appends to existing packs via file metadata.
+        // A writer that synced grows the pack file on disk; the reader's
+        // cached file_len is stale until we re-stat.
+        let grew = !new_shards
+            && self.shards.all_shards().iter().any(|(_, shard)| {
+                std::fs::metadata(&shard.path).is_ok_and(|m| m.len() > shard.file_len())
+            });
+
+        if already_refreshed && !new_shards && !grew {
             self.miss_refresh_skips.fetch_add(1, Ordering::Relaxed);
             return Ok(results);
         }
 
         self.refresh_collection(collection_id)?;
-        self.last_miss_refresh.lock().insert(*collection_id, now);
+        let new_gen = self.generation(collection_id).map_or(0, |g| g.generation);
+        self.last_refresh_fingerprint
+            .lock()
+            .insert(*collection_id, new_gen);
         self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
 
         let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();

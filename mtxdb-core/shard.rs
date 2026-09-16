@@ -1370,6 +1370,12 @@ impl ShardPool {
             .collect()
     }
 
+    /// Number of currently-open shard slots (O(1), no allocation).
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.shards.read().iter().filter(|s| s.is_some()).count()
+    }
+
     /// Get the current active write shard.
     ///
     /// # Panics
