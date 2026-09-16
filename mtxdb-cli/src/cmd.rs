@@ -2948,9 +2948,17 @@ fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
         let state_group = u64::from_be_bytes(data.try_into().ok()?);
         return Some(format!("0x{state_group:016x}"));
     }
-    pretty_print_payload(data)
-        .is_none()
-        .then(|| format!("{} bytes (undecodable)", data.len()))
+    if pretty_print_payload(data).is_some() {
+        return None;
+    }
+    Some(match data.get(0..4) {
+        Some(magic) => format!(
+            "{} bytes (undecodable, magic={})",
+            data.len(),
+            magic.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ),
+        None => format!("{} bytes (undecodable, too short)", data.len()),
+    })
 }
 
 fn cmd_import(
