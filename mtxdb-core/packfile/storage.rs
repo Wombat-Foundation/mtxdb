@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -458,6 +459,13 @@ pub struct PackfileStorage {
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
     put_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
+    /// Per-collection gates for read-miss refreshes. A reader that observes
+    /// an index miss waits for an in-flight refresh of the same collection
+    /// instead of starting another full scan.
+    refresh_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
+    /// Last successful refresh initiated by the read-miss path, used to avoid
+    /// rescanning a collection for repeated genuine negative lookups.
+    last_miss_refresh: parking_lot::Mutex<HashMap<[u8; 16], Instant>>,
     /// Serializes the *publication* of a brand-new collection against a
     /// checkpoint rewrite (see `persist_index_checkpoint`). Creates take this
     /// lock shared for the whole put; the checkpoint holds it exclusive for
@@ -537,6 +545,12 @@ pub struct PackfileStorage {
     get_many_records: AtomicU64,
     /// `get_many` results that resolved to no record.
     get_many_misses: AtomicU64,
+    /// Read-miss refreshes that actually rescanned a collection.
+    miss_refreshes: AtomicU64,
+    /// Read-miss refreshes skipped because another refresh was recent.
+    miss_refresh_skips: AtomicU64,
+    /// Missing keys recovered by a read-miss refresh.
+    miss_refresh_recovered: AtomicU64,
 
     // Always-on write-path counters (per-record `fetch_add` only on the
     // single-record `put`, whose hot cost is dominated by the write itself).
@@ -1126,6 +1140,8 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
+            refresh_locks: parking_lot::Mutex::new(HashMap::new()),
+            last_miss_refresh: parking_lot::Mutex::new(HashMap::new()),
             collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
@@ -1149,6 +1165,9 @@ impl PackfileStorage {
             get_many_calls: AtomicU64::new(0),
             get_many_records: AtomicU64::new(0),
             get_many_misses: AtomicU64::new(0),
+            miss_refreshes: AtomicU64::new(0),
+            miss_refresh_skips: AtomicU64::new(0),
+            miss_refresh_recovered: AtomicU64::new(0),
             put_calls: AtomicU64::new(0),
             put_bytes: AtomicU64::new(0),
             put_many_calls: AtomicU64::new(0),
@@ -4356,6 +4375,90 @@ impl PackfileStorage {
     }
 }
 
+impl PackfileStorage {
+    /// Fetch records and, if necessary, refresh a stale read-only collection
+    /// index once before retrying only the missing keys.
+    ///
+    /// This is deliberately separate from [`StorageEngine::get_many`], whose
+    /// result is a snapshot of the caller's current in-memory index. The
+    /// refresh path is intended for multi-process readers that need to observe
+    /// records appended by another process. Refreshes are serialized per
+    /// collection and successful refreshes are rate-limited briefly so a run
+    /// of genuine negative lookups cannot cause a full pack scan per lookup.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if reading the collection or refreshing its
+    /// on-disk index fails.
+    pub fn get_many_with_refresh(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
+        let mut results = self.get_many(collection_id, ids)?;
+        let mut missing: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.is_none().then_some(index))
+            .collect();
+        if missing.is_empty() {
+            return Ok(results);
+        }
+
+        let refresh_lock = {
+            let mut locks = self.refresh_locks.lock();
+            locks
+                .entry(*collection_id)
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+                .clone()
+        };
+        let _refresh_guard = refresh_lock.lock();
+
+        // Another reader may have refreshed while this caller waited. Avoid a
+        // second refresh and just recheck the keys against the new generation.
+        let current_missing_ids: Vec<NodeId> = missing.iter().map(|&i| ids[i]).collect();
+        let rechecked = self.get_many(collection_id, &current_missing_ids)?;
+        for (index, value) in missing.iter().copied().zip(rechecked) {
+            if value.is_some() {
+                results[index] = value;
+            }
+        }
+        missing.retain(|index| results[*index].is_none());
+        if missing.is_empty() {
+            return Ok(results);
+        }
+
+        let now = Instant::now();
+        let refresh_recent = self
+            .last_miss_refresh
+            .lock()
+            .get(collection_id)
+            .is_some_and(|last| now.duration_since(*last) < MIN_REFRESH_INTERVAL);
+        if refresh_recent {
+            self.miss_refresh_skips.fetch_add(1, Ordering::Relaxed);
+            return Ok(results);
+        }
+
+        self.refresh_collection(collection_id)?;
+        self.last_miss_refresh.lock().insert(*collection_id, now);
+        self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
+
+        let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
+        let retry = self.get_many(collection_id, &retry_ids)?;
+        let mut recovered = 0u64;
+        for (index, value) in missing.into_iter().zip(retry) {
+            if value.is_some() {
+                recovered = recovered.saturating_add(1);
+                results[index] = value;
+            }
+        }
+        self.miss_refresh_recovered
+            .fetch_add(recovered, Ordering::Relaxed);
+        Ok(results)
+    }
+}
+
 impl StorageEngine for PackfileStorage {
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
         let track = self.stats_enabled.load(Ordering::Relaxed);
@@ -5167,6 +5270,9 @@ impl PackfileStorage {
             get_many_calls: self.get_many_calls.load(Ordering::Relaxed),
             get_many_records: self.get_many_records.load(Ordering::Relaxed),
             get_many_misses: self.get_many_misses.load(Ordering::Relaxed),
+            miss_refreshes: self.miss_refreshes.load(Ordering::Relaxed),
+            miss_refresh_skips: self.miss_refresh_skips.load(Ordering::Relaxed),
+            miss_refresh_recovered: self.miss_refresh_recovered.load(Ordering::Relaxed),
             put_calls: self.put_calls.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             put_many_calls: self.put_many_calls.load(Ordering::Relaxed),
@@ -5209,6 +5315,9 @@ impl PackfileStorage {
             &self.get_many_calls,
             &self.get_many_records,
             &self.get_many_misses,
+            &self.miss_refreshes,
+            &self.miss_refresh_skips,
+            &self.miss_refresh_recovered,
             &self.put_calls,
             &self.put_bytes,
             &self.put_many_calls,
@@ -5298,6 +5407,12 @@ pub struct RuntimeStats {
     pub get_many_records: u64,
     /// `get_many` results that resolved to no record.
     pub get_many_misses: u64,
+    /// Read-miss refreshes that rescanned a collection.
+    pub miss_refreshes: u64,
+    /// Read-miss refreshes skipped because a recent refresh already occurred.
+    pub miss_refresh_skips: u64,
+    /// Missing keys recovered after a read-miss refresh.
+    pub miss_refresh_recovered: u64,
     /// Single-record `put` attempts.
     pub put_calls: u64,
     /// Bytes accepted across single-record `put` attempts.
@@ -5351,6 +5466,9 @@ impl Default for RuntimeStats {
             get_many_calls: 0,
             get_many_records: 0,
             get_many_misses: 0,
+            miss_refreshes: 0,
+            miss_refresh_skips: 0,
+            miss_refresh_recovered: 0,
             put_calls: 0,
             put_bytes: 0,
             put_many_calls: 0,
@@ -7041,6 +7159,29 @@ mod tests {
         assert!(check_index_offset(0, &hash, PACK_INDEX_OFFSET_LIMIT).is_ok());
         assert!(check_index_offset(0, &hash, PACK_INDEX_OFFSET_LIMIT + 1).is_err());
         assert!(check_index_offset(0, &hash, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_coalesces_negative_lookups() {
+        let dir = test_dir("get_many_with_refresh_negative");
+        let store = PackfileStorage::open(dir).unwrap();
+        let missing = [[0xF0u8; 16], [0xF1u8; 16]];
+
+        assert!(store
+            .get_many_with_refresh(&TEST_COLLECTION, &missing)
+            .unwrap()
+            .iter()
+            .all(Option::is_none));
+        assert!(store
+            .get_many_with_refresh(&TEST_COLLECTION, &missing)
+            .unwrap()
+            .iter()
+            .all(Option::is_none));
+
+        let stats = store.stats();
+        assert_eq!(stats.miss_refreshes, 1);
+        assert_eq!(stats.miss_refresh_recovered, 0);
+        assert_eq!(stats.miss_refresh_skips, 1);
     }
 
     #[test]
