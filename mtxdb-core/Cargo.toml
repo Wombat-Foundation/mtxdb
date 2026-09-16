@@ -40,6 +40,9 @@ zstd-sys = { version = "2.1", features = ["pkg-config"] }
 [target.'cfg(target_family = "wasm")'.dependencies]
 zstd-sys = { version = "2.1", features = ["vendored"] }
 
+[dev-dependencies]
+hex = "0.4"
+
 # BENCHES live in `../benches/`, a standalone crate outside this workspace
 # (see its Cargo.toml) -- `cd ../benches` to build/lint/run them.
 
