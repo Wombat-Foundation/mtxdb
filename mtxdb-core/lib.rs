@@ -12,6 +12,8 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::module_name_repetitions)]
 
+/// Named application-owned lookup indexes sharing the normal packfile engine.
+pub mod auxiliary;
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
 pub mod cache;
 /// Compressed sparse row graph for deterministic topological ordering.
@@ -35,6 +37,9 @@ pub mod storage;
 /// Executable policy primitives for application collection templates.
 pub mod template;
 
+pub use auxiliary::{
+    auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
+};
 pub use cache::NodeCache;
 pub use index::LossyIndex;
 pub use layout::{DatabaseLayout, ShardType};

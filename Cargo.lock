@@ -465,6 +465,7 @@ dependencies = [
  "crc32fast",
  "memmap2",
  "parking_lot",
+ "sha2",
  "zstd",
  "zstd-sys",
 ]

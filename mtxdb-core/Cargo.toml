@@ -21,6 +21,7 @@ bytes = "1.5"
 crc32fast = "1.4"
 memmap2 = "0.9.11"
 parking_lot = "0.12"
+sha2 = "0.10"
 zstd = { version = "0.13", default-features = false }
 
 # Compile zstd's bundled C source ourselves on every target, pinned to the
