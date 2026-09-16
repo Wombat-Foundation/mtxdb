@@ -2466,12 +2466,16 @@ fn cmd_scan(
         let data = verbose
             .then(|| ShardPool::read_at_committed(&shard, *offset, true))
             .transpose()?;
-        let payload = data.as_ref().map(|data| scan_payload_cell(&data.data));
+        let payload = data
+            .as_ref()
+            .map(|data| scan_payload_cell(&data.data, cli.shard_type));
         println!(
             "{}",
             scan_table_row(&collection_hex, &id_hex, *offset, payload.as_deref())
         );
-        if let Some(data) = data.filter(|data| scan_payload_suffix(&data.data).is_none()) {
+        if let Some(data) =
+            data.filter(|data| scan_payload_suffix(&data.data, cli.shard_type).is_none())
+        {
             print_scan_payload(&data.data);
         }
     }
@@ -2503,8 +2507,8 @@ fn scan_table_row(location: &str, id: &str, offset: u64, payload: Option<&str>) 
 
 /// The PAYLOAD cell for one row: a decodable payload prints below the row
 /// instead (its formatted form spans lines), so the cell just says so.
-fn scan_payload_cell(data: &[u8]) -> String {
-    scan_payload_suffix(data).unwrap_or_else(|| "(decoded below)".to_owned())
+fn scan_payload_cell(data: &[u8], shard_type: ShardType) -> String {
+    scan_payload_suffix(data, shard_type).unwrap_or_else(|| "(decoded below)".to_owned())
 }
 
 /// Print every physical frame for a collection across all packs. This is a
@@ -2558,6 +2562,7 @@ fn cmd_scan_collection(
         frames: 0,
         raw_matches: Vec::new(),
         header_printed: false,
+        shard_type: cli.shard_type,
     };
     for (_, shard) in shards {
         if let Some(collection_packs) = &collection_packs {
@@ -2625,6 +2630,7 @@ struct CollectionScanContext {
     frames: usize,
     raw_matches: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, u64)>,
     header_printed: bool,
+    shard_type: ShardType,
 }
 
 fn scan_collection_shard(
@@ -2668,7 +2674,9 @@ fn print_collection_record(
         .verbose
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
-    let payload = data.as_ref().map(|data| scan_payload_cell(&data.data));
+    let payload = data
+        .as_ref()
+        .map(|data| scan_payload_cell(&data.data, context.shard_type));
     println!(
         "{}",
         scan_table_row(
@@ -2678,7 +2686,9 @@ fn print_collection_record(
             payload.as_deref(),
         )
     );
-    if let Some(data) = data.filter(|data| scan_payload_suffix(&data.data).is_none()) {
+    if let Some(data) =
+        data.filter(|data| scan_payload_suffix(&data.data, context.shard_type).is_none())
+    {
         print_scan_payload(&data.data);
     }
     Ok(())
@@ -2719,7 +2729,11 @@ fn print_scan_payload(data: &[u8]) {
 /// decode; a decodable payload (plain JSON, or a recognized record shape
 /// like `event_json`) is printed below its record instead because its
 /// formatted representation spans lines.
-fn scan_payload_suffix(data: &[u8]) -> Option<String> {
+fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
+    if shard_type == ShardType::State && data.len() == 8 {
+        let state_group = u64::from_be_bytes(data.try_into().ok()?);
+        return Some(format!("state group {state_group}"));
+    }
     pretty_print_payload(data)
         .is_none()
         .then(|| format!("{} bytes (undecodable)", data.len()))
@@ -4014,7 +4028,7 @@ mod tests {
         decode_hamt_root, default_matrix_import_template, event_room_id, extract_pointer_string,
         fmt_disk_megabytes, fmt_megabytes, glob_pack_files, interleaving_worth_noting,
         matrix_batch_has_create, matrix_create_details, parse_pack_id_selector,
-        parse_pack_selectors, pretty_print_payload, resolve_import_collection,
+        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
         template_collection_id, CollectionTemplate,
     };
     use crate::{Cli, Commands};
@@ -4027,6 +4041,18 @@ mod tests {
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
         simd_json::to_owned_value(&mut bytes).expect("valid JSON fixture")
+    }
+
+    #[test]
+    fn state_scan_decodes_big_endian_state_group_payload() {
+        assert_eq!(
+            scan_payload_suffix(&2u64.to_be_bytes(), ShardType::State),
+            Some("state group 2".to_owned())
+        );
+        assert_eq!(
+            scan_payload_suffix(&2u64.to_be_bytes(), ShardType::EventDag),
+            Some("8 bytes (undecodable)".to_owned())
+        );
     }
 
     fn unique_temp_dir() -> PathBuf {
