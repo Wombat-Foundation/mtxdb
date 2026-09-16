@@ -49,6 +49,7 @@ pub(crate) enum Commands {
         id: Option<String>,
         collection: Option<String>,
         raw: bool,
+        sort: Option<String>,
     },
     Import {
         paths: Vec<PathBuf>,
@@ -280,6 +281,7 @@ fn sub_scan() -> Command {
                      matches, or up to --limit; use -l 0 for no cap). With --verbose, a per-frame \
                      context line goes to stderr so stdout stays a clean byte stream",
         ))
+        .arg(sort_arg("payload"))
         .arg(limit_arg())
 }
 
@@ -506,6 +508,7 @@ fn parse_cli() -> Cli {
             id: m.get_one::<String>("id").cloned(),
             collection: m.get_one::<String>("collection").cloned(),
             raw: m.get_flag("raw"),
+            sort: m.get_one::<String>("sort").cloned(),
             limit: *m
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),

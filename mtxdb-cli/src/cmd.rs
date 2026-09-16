@@ -170,6 +170,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             id,
             collection,
             raw,
+            sort,
         } => cmd_scan(
             cli,
             selector,
@@ -178,6 +179,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             id.as_deref(),
             collection.as_deref(),
             *raw,
+            sort.as_deref(),
         ),
         Commands::Import {
             paths,
@@ -342,6 +344,41 @@ fn other_shard_type_hint(cli: &Cli, collection_id: &[u8; 16]) -> String {
     }
 }
 
+/// Best-effort hint for a node ID found in another independent shard pool.
+/// Unlike collection lookup, this must probe the selected pools' indexes
+/// because `get` has no collection ID from which to use the sidecar.
+fn other_shard_type_node_hint(cli: &Cli, node_id: &[u8; 16]) -> String {
+    let Ok(layout) = open_layout(cli) else {
+        return String::new();
+    };
+    let found: Vec<&str> = ShardType::ALL
+        .into_iter()
+        .filter(|&shard_type| shard_type != cli.shard_type)
+        .filter(|&shard_type| {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                return false;
+            };
+            let Ok(store) = PackfileStorage::open_read_only(dir) else {
+                return false;
+            };
+            store
+                .collection_summaries()
+                .into_iter()
+                .any(|summary| matches!(store.get(&summary.0, node_id), Ok(Some(_))))
+        })
+        .map(ShardType::as_str)
+        .collect();
+    if found.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (not in -t {}; found in -t {})",
+            cli.shard_type.as_str(),
+            found.join(", -t ")
+        )
+    }
+}
+
 /// Open the selected pool read-only for a collection lookup, treating an
 /// empty pool (e.g. the default `-t event-dag` when the collection actually
 /// lives under `-t state`) as "not found" rather than an error: prints the
@@ -411,7 +448,7 @@ fn cmd_get(
             .collect::<Result<_, _>>()?,
     };
     match matches.as_slice() {
-        [] => bail!("not found"),
+        [] => bail!("not found{}", other_shard_type_node_hint(cli, &node_id)),
         [(_, data)] => {
             let rendered = (!raw).then(|| pretty_print_payload(&data.bytes)).flatten();
             let emitted = rendered.as_deref().unwrap_or(&data.bytes);
@@ -2368,6 +2405,10 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
     u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the command dispatcher keeps scan filters and output options explicit"
+)]
 fn cmd_scan(
     cli: &Cli,
     selector: &str,
@@ -2376,7 +2417,16 @@ fn cmd_scan(
     id: Option<&str>,
     collection: Option<&str>,
     raw: bool,
+    sort: Option<&str>,
 ) -> anyhow::Result<()> {
+    let sort_payload = match sort {
+        None => false,
+        Some("payload") => true,
+        Some(column) => bail!("unknown scan sort column `{column}`"),
+    };
+    if sort_payload && (!verbose || raw) {
+        bail!("scan sorting requires --verbose and cannot be combined with --raw");
+    }
     // No `--id` requirement: `--raw` dumps every matching frame's payload
     // (concatenated, in scan order), capped by `--limit` like the normal
     // listing, so a bare selector with several matches still "just works"
@@ -2397,7 +2447,7 @@ fn cmd_scan(
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
         }
-        return cmd_scan_collection(cli, selector, verbose, limit, node_id, raw);
+        return cmd_scan_collection(cli, selector, verbose, limit, node_id, raw, sort_payload);
     }
     let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -2407,6 +2457,34 @@ fn cmd_scan(
         .into_iter()
         .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
         .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
+    scan_pack(
+        cli,
+        &shard,
+        pack_id,
+        verbose,
+        limit,
+        collection_filter,
+        node_id,
+        raw,
+        sort_payload,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pack scan helper receives the explicit scan filters and output options"
+)]
+fn scan_pack(
+    cli: &Cli,
+    shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
+    pack_id: u64,
+    verbose: bool,
+    limit: i64,
+    collection_filter: Option<[u8; 16]>,
+    node_id: Option<[u8; 16]>,
+    raw: bool,
+    sort_payload: bool,
+) -> anyhow::Result<()> {
     let path = &shard.path;
     let max_rows = scan_limit(limit);
     let mut records = Vec::new();
@@ -2423,16 +2501,24 @@ fn cmd_scan(
             continue;
         }
         matched_records = matched_records.saturating_add(1);
-        if records.len() < max_rows {
+        if sort_payload || records.len() < max_rows {
             records.push((record_collection, record_id, offset));
         } else {
             truncated = true;
             break;
         }
     }
+    if sort_payload {
+        records.sort_by_cached_key(|(_, _, offset)| {
+            ShardPool::read_at_committed(shard, *offset, true)
+                .map(|record| record.data.to_vec())
+                .unwrap_or_default()
+        });
+        truncated = records.len() > max_rows;
+    }
     if raw {
         for (.., offset) in records.iter().take(max_rows) {
-            let data = ShardPool::read_at_committed(&shard, *offset, true)?;
+            let data = ShardPool::read_at_committed(shard, *offset, true)?;
             if verbose {
                 eprintln!(
                     "pack 0x{pack_id:016x}: raw frame @ {offset} ({} bytes, checksum verified)",
@@ -2464,7 +2550,7 @@ fn cmd_scan(
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
         let data = verbose
-            .then(|| ShardPool::read_at_committed(&shard, *offset, true))
+            .then(|| ShardPool::read_at_committed(shard, *offset, true))
             .transpose()?;
         let payload = data
             .as_ref()
@@ -2521,6 +2607,7 @@ fn cmd_scan_collection(
     limit: i64,
     node_id: Option<[u8; 16]>,
     raw: bool,
+    sort_payload: bool,
 ) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -2556,13 +2643,13 @@ fn cmd_scan_collection(
     let mut context = CollectionScanContext {
         collection_id,
         node_id,
-        verbose,
-        raw,
+        mode: CollectionScanMode::new(verbose, raw, sort_payload),
         max_rows,
         frames: 0,
         raw_matches: Vec::new(),
         header_printed: false,
         shard_type: cli.shard_type,
+        sorted_records: Vec::new(),
     };
     for (_, shard) in shards {
         if let Some(collection_packs) = &collection_packs {
@@ -2572,7 +2659,7 @@ fn cmd_scan_collection(
         }
         let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
-        if bounded && context.frames >= max_rows {
+        if bounded && !sort_payload && context.frames >= max_rows {
             break;
         }
     }
@@ -2584,7 +2671,8 @@ fn cmd_scan_collection(
             other_shard_type_hint(cli, &collection_id)
         );
     }
-    if raw {
+    sort_collection_records(&mut context);
+    if context.mode.is_raw() {
         for (shard, offset) in context.raw_matches.iter().take(max_rows) {
             let data = ShardPool::read_at_committed(shard, *offset, true)?;
             if verbose {
@@ -2618,19 +2706,72 @@ fn cmd_scan_collection(
         );
         print_scan_limit_note(frames, max_rows);
     }
+    if context.mode.sorts_payload() {
+        let sorted_records = context.sorted_records.clone();
+        for (shard, record_id, offset) in sorted_records.iter().take(max_rows) {
+            print_collection_record(shard, *record_id, *offset, &mut context)?;
+        }
+    }
     Ok(())
+}
+
+fn sort_collection_records(context: &mut CollectionScanContext) {
+    if context.mode.sorts_payload() {
+        context
+            .sorted_records
+            .sort_by_cached_key(|(shard, _, offset)| {
+                ShardPool::read_at_committed(shard, *offset, true)
+                    .map(|record| record.data.to_vec())
+                    .unwrap_or_default()
+            });
+    }
 }
 
 struct CollectionScanContext {
     collection_id: [u8; 16],
     node_id: Option<[u8; 16]>,
-    verbose: bool,
-    raw: bool,
+    mode: CollectionScanMode,
     max_rows: usize,
     frames: usize,
     raw_matches: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, u64)>,
     header_printed: bool,
     shard_type: ShardType,
+    sorted_records: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, [u8; 16], u64)>,
+}
+
+#[derive(Clone, Copy)]
+enum CollectionScanMode {
+    Plain,
+    Verbose { sort_payload: bool },
+    Raw { verbose: bool },
+}
+
+impl CollectionScanMode {
+    fn new(verbose: bool, raw: bool, sort_payload: bool) -> Self {
+        if raw {
+            Self::Raw { verbose }
+        } else if verbose {
+            Self::Verbose { sort_payload }
+        } else {
+            Self::Plain
+        }
+    }
+
+    fn reads_payload(self) -> bool {
+        !matches!(self, Self::Plain)
+    }
+
+    fn is_raw(self) -> bool {
+        matches!(self, Self::Raw { .. })
+    }
+
+    fn sorts_payload(self) -> bool {
+        matches!(self, Self::Verbose { sort_payload: true })
+    }
+
+    fn verbose(self) -> bool {
+        matches!(self, Self::Verbose { .. } | Self::Raw { verbose: true })
+    }
 }
 
 fn scan_collection_shard(
@@ -2638,7 +2779,7 @@ fn scan_collection_shard(
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<bool> {
     let records =
-        mtxdb_core::packfile::scan_packfile_iter(&shard.path, context.verbose || context.raw)?;
+        mtxdb_core::packfile::scan_packfile_iter(&shard.path, context.mode.reads_payload())?;
     let mut matched_pack = false;
     for record in records {
         let (record_collection_id, record_id, offset) = record?;
@@ -2648,12 +2789,19 @@ fn scan_collection_shard(
         }
         matched_pack = true;
         context.frames = context.frames.saturating_add(1);
-        if context.raw {
+        if context.mode.is_raw() {
             context.raw_matches.push((shard.clone(), offset));
+        } else if context.mode.sorts_payload() {
+            context
+                .sorted_records
+                .push((shard.clone(), record_id, offset));
         } else if context.frames <= context.max_rows {
             print_collection_record(shard, record_id, offset, context)?;
         }
-        if context.max_rows != usize::MAX && context.frames >= context.max_rows {
+        if context.max_rows != usize::MAX
+            && !context.mode.sorts_payload()
+            && context.frames >= context.max_rows
+        {
             break;
         }
     }
@@ -2671,7 +2819,8 @@ fn print_collection_record(
         context.header_printed = true;
     }
     let data = context
-        .verbose
+        .mode
+        .verbose()
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
     let payload = data
