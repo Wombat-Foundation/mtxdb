@@ -2408,21 +2408,28 @@ fn cmd_scan(
         .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
         .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
     let path = &shard.path;
-    let records = if verbose || raw {
-        mtxdb_core::packfile::scan_packfile(path)?
-    } else {
-        mtxdb_core::packfile::scan_packfile_skip_payload(path)?
-    };
-    let records: Vec<_> = records
-        .into_iter()
-        .filter(|(record_collection, record_id, _)| {
-            // TODO: tied to MSRV 1.81.0 — replace with .is_none_or() once the
-            // minimum is bumped to 1.82+.
-            collection_filter.map_or(true, |wanted| *record_collection == wanted)
-                && node_id.map_or(true, |wanted| *record_id == wanted)
-        })
-        .collect();
     let max_rows = scan_limit(limit);
+    let mut records = Vec::new();
+    let mut matched_records = 0usize;
+    let mut truncated = false;
+    let verify_payload = verbose || raw;
+    for record in mtxdb_core::packfile::scan_packfile_iter(path, verify_payload)? {
+        let (record_collection, record_id, offset) = record?;
+        // TODO: tied to MSRV 1.81.0 — replace with .is_none_or() once the
+        // minimum is bumped to 1.82+.
+        if !collection_filter.map_or(true, |wanted| record_collection == wanted)
+            || !node_id.map_or(true, |wanted| record_id == wanted)
+        {
+            continue;
+        }
+        matched_records = matched_records.saturating_add(1);
+        if records.len() < max_rows {
+            records.push((record_collection, record_id, offset));
+        } else {
+            truncated = true;
+            break;
+        }
+    }
     if raw {
         for (.., offset) in records.iter().take(max_rows) {
             let data = ShardPool::read_at_committed(&shard, *offset, true)?;
@@ -2434,14 +2441,24 @@ fn cmd_scan(
             }
             io::stdout().write_all(&data.data)?;
         }
-        eprint_scan_limit_note(records.len(), max_rows);
+        if truncated {
+            eprintln!("note: only showing top {max_rows}; use `-l 0` to show all");
+        }
         return Ok(());
     }
-    println!(
-        "pack 0x{pack_id:016x}: {} bytes, {} records",
-        std::fs::metadata(path)?.len(),
-        records.len()
-    );
+    if truncated {
+        println!(
+            "pack 0x{pack_id:016x}: {} bytes, showing first {max_rows} matching records (at least {})",
+            std::fs::metadata(path)?.len(),
+            matched_records,
+        );
+    } else {
+        println!(
+            "pack 0x{pack_id:016x}: {} bytes, {} records",
+            std::fs::metadata(path)?.len(),
+            matched_records,
+        );
+    }
     print_scan_table_header("COLLECTION");
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = hex_encode(collection_id);
@@ -2458,7 +2475,9 @@ fn cmd_scan(
             print_scan_payload(&data.data);
         }
     }
-    print_scan_limit_note(records.len(), max_rows);
+    if truncated {
+        println!("note: only showing top {max_rows}; use `-l 0` to show all");
+    }
     Ok(())
 }
 

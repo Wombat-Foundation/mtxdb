@@ -5,7 +5,23 @@
 //! - bounded scan that stops after N matches (new behavior)
 //! - collection-filtered scan that skips unrelated shards
 //!
-//! Run via `cargo bench --bench scan` from the `benches/` directory.
+//! Run via `cargo bench --bench scan` from the `benches/` directory. The
+//! default run is intentionally limited to the small and medium datasets;
+//! set `MTXDB_BENCH_SCAN_FULL=1` to include the large and multi-shard cases.
+//!
+//! On a machine where the repository is on a removable or encrypted mount,
+//! isolate build and benchmark I/O with, for example:
+//!
+//! ```text
+//! CARGO_TARGET_DIR=/tmp/mtxdb-cargo-target \
+//! MTXDB_BENCH_ROOT=/tmp/mtxdb-scan-data \
+//! timeout 90s cargo bench --manifest-path benches/Cargo.toml --bench scan
+//! ```
+//!
+//! The dataset sizes can be overridden with `MTXDB_BENCH_SCAN_COLLECTIONS`,
+//! `MTXDB_BENCH_SCAN_RECORDS_PER_COLLECTION`, and
+//! `MTXDB_BENCH_SCAN_BOUNDED_LIMIT`. The multi-shard threshold can be
+//! overridden with `MTXDB_BENCH_SCAN_MAX_SHARD_BYTES`.
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::cast_precision_loss,
@@ -51,6 +67,22 @@ fn collection_id(idx: usize) -> [u8; 16] {
 static BENCH_ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
 static RUN: AtomicU64 = AtomicU64::new(0);
 
+struct ScratchDir {
+    path: std::path::PathBuf,
+}
+
+impl ScratchDir {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn bench_root() -> std::path::PathBuf {
     BENCH_ROOT
         .get_or_init(|| {
@@ -62,13 +94,13 @@ fn bench_root() -> std::path::PathBuf {
         .clone()
 }
 
-fn fresh_dir(label: &str) -> std::path::PathBuf {
+fn fresh_dir(label: &str) -> ScratchDir {
     let base = bench_root();
     let token = RUN.fetch_add(1, Ordering::Relaxed);
     let dir = base.join(format!("mtxdb_scan_bench_{label}_{token}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    dir
+    ScratchDir { path: dir }
 }
 
 // ── Benchmark harness ──────────────────────────────────────────────
@@ -102,7 +134,7 @@ fn run_scan_bench_inner(config: &ScanBenchConfig, max_shard_bytes: Option<u64>) 
     );
 
     // ── Initialize database layout ──────────────────────────────────
-    let layout = DatabaseLayout::open(root.clone()).unwrap();
+    let layout = DatabaseLayout::open(root.path().to_owned()).unwrap();
     let pool_dir = layout.pool_dir(ShardType::EventDag).unwrap();
 
     // ── Write phase ─────────────────────────────────────────────────
@@ -130,6 +162,7 @@ fn run_scan_bench_inner(config: &ScanBenchConfig, max_shard_bytes: Option<u64>) 
         store.put_many(&cid, &entries).unwrap();
     }
     store.sync_all().unwrap();
+    drop(store);
     let write_elapsed = t_write.elapsed();
     let pack_size: u64 = fs::read_dir(&pool_dir)
         .unwrap()
@@ -272,8 +305,39 @@ fn run_scan_bench_inner(config: &ScanBenchConfig, max_shard_bytes: Option<u64>) 
     }
     eprintln!("═══════════════════════════════════════════════════════════════");
 
-    drop(store);
-    let _ = fs::remove_dir_all(&root);
+    drop(shards);
+    drop(pool);
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {value:?}"))
+        })
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {value:?}"))
+        })
+        .unwrap_or(default)
+}
+
+fn configured(config: ScanBenchConfig) -> ScanBenchConfig {
+    ScanBenchConfig {
+        collections: env_usize("MTXDB_BENCH_SCAN_COLLECTIONS", config.collections),
+        records_per_collection: env_usize(
+            "MTXDB_BENCH_SCAN_RECORDS_PER_COLLECTION",
+            config.records_per_collection,
+        ),
+        bounded_limit: env_usize("MTXDB_BENCH_SCAN_BOUNDED_LIMIT", config.bounded_limit),
+    }
 }
 
 fn speedup(full: Duration, partial: Duration) -> String {
@@ -290,39 +354,43 @@ fn main() {
 
     // Small dataset: demonstrates the fixed overhead dominates
     eprintln!("── small dataset ──");
-    run_scan_bench(&ScanBenchConfig {
+    run_scan_bench(&configured(ScanBenchConfig {
         collections: 5,
         records_per_collection: 1_000,
         bounded_limit: 10,
-    });
+    }));
     eprintln!();
 
     // Medium dataset: realistic shard layout with interleaved collections
     eprintln!("── medium dataset ──");
-    run_scan_bench(&ScanBenchConfig {
+    run_scan_bench(&configured(ScanBenchConfig {
         collections: 20,
         records_per_collection: 5_000,
         bounded_limit: 50,
-    });
+    }));
+
+    if std::env::var("MTXDB_BENCH_SCAN_FULL").as_deref() != Ok("1") {
+        return;
+    }
     eprintln!();
 
     // Large dataset: stresses the streaming path
     eprintln!("── large dataset ──");
-    run_scan_bench(&ScanBenchConfig {
+    run_scan_bench(&configured(ScanBenchConfig {
         collections: 50,
         records_per_collection: 10_000,
         bounded_limit: 100,
-    });
+    }));
     eprintln!();
 
     // Multi-shard: forces shard rotation at 1 MiB to show shard-skipping benefit
     eprintln!("── multi-shard (1 MiB shards) ──");
     run_scan_bench_sharded(
-        &ScanBenchConfig {
+        &configured(ScanBenchConfig {
             collections: 20,
             records_per_collection: 5_000,
             bounded_limit: 50,
-        },
-        1024 * 1024,
+        }),
+        env_u64("MTXDB_BENCH_SCAN_MAX_SHARD_BYTES", 1024 * 1024),
     );
 }
