@@ -2501,7 +2501,7 @@ fn cmd_scan_collection(
 ) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
-    let pool = match ShardPool::open_read_only(pool_dir) {
+    let pool = match ShardPool::open_read_only(pool_dir.clone()) {
         Ok(pool) => pool,
         // An empty pool (e.g. the default `-t event-dag` when nothing was
         // ever written to that shard type) isn't a real error here -- it
@@ -2520,6 +2520,12 @@ fn cmd_scan_collection(
     };
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
+    // The persisted collection directory tells us which packs currently
+    // contain this collection. Avoid walking unrelated packs; older stores
+    // without a usable directory retain the conservative full-scan fallback.
+    let collection_packs = PackfileStorage::collection_shards_from_disk(&pool_dir)
+        .and_then(|mut collections| collections.remove(&collection_id))
+        .map(|packs| packs.into_iter().collect::<HashSet<_>>());
 
     let mut packs = 0_usize;
     let max_rows = scan_limit(limit);
@@ -2535,6 +2541,11 @@ fn cmd_scan_collection(
         header_printed: false,
     };
     for (_, shard) in shards {
+        if let Some(collection_packs) = &collection_packs {
+            if !collection_packs.contains(&shard.pack_id) {
+                continue;
+            }
+        }
         let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
         if bounded && context.frames >= max_rows {
@@ -2601,13 +2612,11 @@ fn scan_collection_shard(
     shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<bool> {
-    let records = if context.verbose || context.raw {
-        mtxdb_core::packfile::scan_packfile(&shard.path)?
-    } else {
-        mtxdb_core::packfile::scan_packfile_skip_payload(&shard.path)?
-    };
+    let records =
+        mtxdb_core::packfile::scan_packfile_iter(&shard.path, context.verbose || context.raw)?;
     let mut matched_pack = false;
-    for (record_collection_id, record_id, offset) in records {
+    for record in records {
+        let (record_collection_id, record_id, offset) = record?;
         let id_matches = context.node_id.map_or(true, |wanted| record_id == wanted);
         if record_collection_id != context.collection_id || !id_matches {
             continue;

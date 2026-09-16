@@ -128,6 +128,73 @@ pub const MAX_DATA_LEN: u32 = MAX_RECORD_LEN - FRAME_FIXED_LEN;
 /// A scanned `(collection_id, hash, file_offset)` entry from a packfile.
 pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 
+/// Streaming packfile metadata scanner.
+pub struct PackfileScanner {
+    reader: BufReader<File>,
+    file_end: u64,
+    verify_payload: bool,
+    done: bool,
+}
+
+/// Open a streaming scanner for a packfile.
+///
+/// When `verify_payload` is true, payloads and CRCs are consumed and
+/// validated. When false, only frame metadata and the declared frame bounds
+/// are checked, which is appropriate for diagnostic listing.
+///
+/// # Errors
+/// Returns an I/O error if the packfile cannot be opened or its header cannot
+/// be read.
+pub fn scan_packfile_iter(path: &Path, verify_payload: bool) -> io::Result<PackfileScanner> {
+    let file = File::open(path)?;
+    let file_end = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let done = read_header(&mut reader)?.is_none();
+    Ok(PackfileScanner {
+        reader,
+        file_end,
+        verify_payload,
+        done,
+    })
+}
+
+impl Iterator for PackfileScanner {
+    type Item = io::Result<ScanEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let offset = match self.reader.stream_position() {
+            Ok(offset) => offset,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        };
+        let result = if self.verify_payload {
+            read_record_metadata(&mut self.reader)
+        } else {
+            read_record_metadata_skip_payload_with_end(&mut self.reader, self.file_end)
+        };
+        match result {
+            Ok(Some(metadata)) => Some(Ok((metadata.collection_id, metadata.hash, offset))),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                self.done = true;
+                None
+            }
+            Err(error) => {
+                self.done = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
 /// A single record in the packfile.
 ///
 /// Frame layout on disk (v3):
