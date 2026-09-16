@@ -4488,16 +4488,22 @@ impl PackfileStorage {
 
         self.refresh_collection(collection_id)?;
         // Reread the durable fingerprint after refresh to handle the race
-        // where the writer synced more data during the refresh.
+        // where the writer synced more data during the refresh. On error,
+        // do not update the cached fingerprint so future misses will retry.
         let refreshed_fp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir)
         {
-            Ok(Some(fp)) => fp,
-            Ok(None) => 0,
-            Err(_) => durable_fp, // Fall back to pre-refresh value on error
+            Ok(Some(fp)) => Some(fp),
+            Ok(None) => Some(0),
+            Err(error) => {
+                eprintln!("warning: unable to observe post-refresh fingerprint: {error}");
+                None
+            }
         };
-        self.last_refresh_fingerprint
-            .lock()
-            .insert(*collection_id, refreshed_fp);
+        if let Some(fp) = refreshed_fp {
+            self.last_refresh_fingerprint
+                .lock()
+                .insert(*collection_id, fp);
+        }
         self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
 
         let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
