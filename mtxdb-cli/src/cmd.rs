@@ -3417,7 +3417,11 @@ fn cmd_import_file(
         }
     }
 
-    eprintln!("imported {event_count} events to collection {collection_hex}");
+    if let Some(room_id) = detected_collection.as_deref() {
+        eprintln!("imported {event_count} events to collection {collection_hex} (room {room_id})");
+    } else {
+        eprintln!("imported {event_count} events to collection {collection_hex}");
+    }
     if skipped > 0 {
         eprintln!("skipped {skipped} events (missing event_id)");
     }
