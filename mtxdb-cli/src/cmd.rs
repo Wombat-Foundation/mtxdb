@@ -450,9 +450,14 @@ fn cmd_get(
     match matches.as_slice() {
         [] => bail!("not found{}", other_shard_type_node_hint(cli, &node_id)),
         [(_, data)] => {
-            let rendered = (!raw).then(|| pretty_print_payload(&data.bytes)).flatten();
-            let emitted = rendered.as_deref().unwrap_or(&data.bytes);
-            io::stdout().write_all(emitted)?;
+            let emitted = if raw {
+                data.bytes.to_vec()
+            } else if let Some(rendered) = pretty_print_payload(&data.bytes) {
+                rendered
+            } else {
+                hex_bytes(&data.bytes).into_bytes()
+            };
+            io::stdout().write_all(&emitted)?;
             // Never decorate payload bytes: binary records can decode as
             // valid UTF-8, so only append a trailing newline when the caller
             // explicitly opted into `--text`. Decide from the actual bytes
@@ -474,8 +479,22 @@ fn cmd_get(
     Ok(())
 }
 
+/// Render arbitrary payload bytes safely for terminal output. Raw bytes stay
+/// available through `get --raw`; the default must not write binary data
+/// directly to a terminal.
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
+    for (index, byte) in bytes.iter().enumerate() {
+        if index != 0 {
+            output.push(' ');
+        }
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
 /// Pretty-print a stream of JSON objects or arrays, returning `None` for a
-/// non-JSON payload so `get` can retain its binary-storage behaviour.
+/// non-JSON payload.
 fn pretty_json_stream(bytes: &[u8]) -> Option<Vec<u8>> {
     let values = split_json_stream(bytes)?;
     let mut output = Vec::new();
