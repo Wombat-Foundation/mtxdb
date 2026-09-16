@@ -556,6 +556,9 @@ pub struct PackfileStorage {
     /// IDs submitted in the retry request after a refresh. Proves that only
     /// missing keys are retried: `miss_refresh_retry_ids == count(missing)`.
     miss_refresh_retry_ids: AtomicU64,
+    /// Fingerprint read errors after refresh — used to rate-limit warnings
+    /// and expose diagnostics.
+    miss_refresh_fp_errors: AtomicU64,
 
     // Always-on write-path counters (per-record `fetch_add` only on the
     // single-record `put`, whose hot cost is dominated by the write itself).
@@ -648,6 +651,66 @@ const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 const NEW_COLLECTION_INDEX_FLOOR: usize = 64;
 
 impl PackfileStorage {
+    fn refresh_lock(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(*collection_id)
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
+    fn post_refresh_fingerprint(&self) -> Option<u64> {
+        match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir) {
+            Ok(Some(fp)) => Some(fp),
+            Ok(None) => Some(0),
+            Err(error) => {
+                let previous = self.miss_refresh_fp_errors.fetch_add(1, Ordering::Relaxed);
+                let count = previous.saturating_add(1);
+                let periodic = count
+                    .checked_rem(100)
+                    .is_some_and(|remainder| remainder == 0);
+                if previous == 0 || periodic {
+                    eprintln!(
+                        "warning: unable to observe post-refresh fingerprint (count={count}): {error}"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    fn refresh_and_retry(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+        missing: Vec<usize>,
+        results: &mut [Option<NodeData>],
+    ) -> Result<(), StorageError> {
+        self.refresh_collection(collection_id)?;
+        if let Some(fp) = self.post_refresh_fingerprint() {
+            self.last_refresh_fingerprint
+                .lock()
+                .insert(*collection_id, fp);
+        }
+        self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
+
+        let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
+        let retry_count = u64::try_from(retry_ids.len()).unwrap_or(u64::MAX);
+        self.miss_refresh_retry_ids
+            .fetch_add(retry_count, Ordering::Relaxed);
+        let retry = self.get_many(collection_id, &retry_ids)?;
+        let mut recovered = 0u64;
+        for (index, value) in missing.into_iter().zip(retry) {
+            if value.is_some() {
+                recovered = recovered.saturating_add(1);
+                results[index] = value;
+            }
+        }
+        self.miss_refresh_recovered
+            .fetch_add(recovered, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Open a packfile storage with default settings.
     ///
     /// # Errors
@@ -1187,6 +1250,7 @@ impl PackfileStorage {
             miss_refresh_skips: AtomicU64::new(0),
             miss_refresh_recovered: AtomicU64::new(0),
             miss_refresh_retry_ids: AtomicU64::new(0),
+            miss_refresh_fp_errors: AtomicU64::new(0),
             put_calls: AtomicU64::new(0),
             put_bytes: AtomicU64::new(0),
             put_many_calls: AtomicU64::new(0),
@@ -4423,13 +4487,7 @@ impl PackfileStorage {
             return Ok(results);
         }
 
-        let refresh_lock = {
-            let mut locks = self.refresh_locks.lock();
-            locks
-                .entry(*collection_id)
-                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-                .clone()
-        };
+        let refresh_lock = self.refresh_lock(collection_id);
         let _refresh_guard = refresh_lock.lock();
 
         // Another reader may have refreshed while this caller waited. Avoid a
@@ -4450,25 +4508,7 @@ impl PackfileStorage {
             Ok(Some(fp)) => fp,
             Ok(None) => 0, // no checkpoint = fresh store, valid zero
             Err(_) => {
-                // Unreadable delta or corrupt checkpoint - force refresh.
-                self.refresh_collection(collection_id)?;
-                self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
-
-                let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
-                self.miss_refresh_retry_ids.fetch_add(
-                    u64::try_from(retry_ids.len()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-                let retry = self.get_many(collection_id, &retry_ids)?;
-                let mut recovered = 0u64;
-                for (index, value) in missing.into_iter().zip(retry) {
-                    if value.is_some() {
-                        recovered = recovered.saturating_add(1);
-                        results[index] = value;
-                    }
-                }
-                self.miss_refresh_recovered
-                    .fetch_add(recovered, Ordering::Relaxed);
+                self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
                 return Ok(results);
             }
         };
@@ -4486,41 +4526,7 @@ impl PackfileStorage {
             return Ok(results);
         }
 
-        self.refresh_collection(collection_id)?;
-        // Reread the durable fingerprint after refresh to handle the race
-        // where the writer synced more data during the refresh. On error,
-        // do not update the cached fingerprint so future misses will retry.
-        let refreshed_fp = match crate::index::checkpoint::read_durable_fingerprint(&self.base_dir)
-        {
-            Ok(Some(fp)) => Some(fp),
-            Ok(None) => Some(0),
-            Err(error) => {
-                eprintln!("warning: unable to observe post-refresh fingerprint: {error}");
-                None
-            }
-        };
-        if let Some(fp) = refreshed_fp {
-            self.last_refresh_fingerprint
-                .lock()
-                .insert(*collection_id, fp);
-        }
-        self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
-
-        let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
-        self.miss_refresh_retry_ids.fetch_add(
-            u64::try_from(retry_ids.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        let retry = self.get_many(collection_id, &retry_ids)?;
-        let mut recovered = 0u64;
-        for (index, value) in missing.into_iter().zip(retry) {
-            if value.is_some() {
-                recovered = recovered.saturating_add(1);
-                results[index] = value;
-            }
-        }
-        self.miss_refresh_recovered
-            .fetch_add(recovered, Ordering::Relaxed);
+        self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
         Ok(results)
     }
 }
@@ -5340,6 +5346,7 @@ impl PackfileStorage {
             miss_refresh_skips: self.miss_refresh_skips.load(Ordering::Relaxed),
             miss_refresh_recovered: self.miss_refresh_recovered.load(Ordering::Relaxed),
             miss_refresh_retry_ids: self.miss_refresh_retry_ids.load(Ordering::Relaxed),
+            miss_refresh_fp_errors: self.miss_refresh_fp_errors.load(Ordering::Relaxed),
             put_calls: self.put_calls.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             put_many_calls: self.put_many_calls.load(Ordering::Relaxed),
@@ -5386,6 +5393,7 @@ impl PackfileStorage {
             &self.miss_refresh_skips,
             &self.miss_refresh_recovered,
             &self.miss_refresh_retry_ids,
+            &self.miss_refresh_fp_errors,
             &self.put_calls,
             &self.put_bytes,
             &self.put_many_calls,
@@ -5483,6 +5491,8 @@ pub struct RuntimeStats {
     pub miss_refresh_recovered: u64,
     /// IDs submitted in retry requests after read-miss refreshes.
     pub miss_refresh_retry_ids: u64,
+    /// Post-refresh fingerprint read errors (rate-limits warnings).
+    pub miss_refresh_fp_errors: u64,
     /// Single-record `put` attempts.
     pub put_calls: u64,
     /// Bytes accepted across single-record `put` attempts.
@@ -5540,6 +5550,7 @@ impl Default for RuntimeStats {
             miss_refresh_skips: 0,
             miss_refresh_recovered: 0,
             miss_refresh_retry_ids: 0,
+            miss_refresh_fp_errors: 0,
             put_calls: 0,
             put_bytes: 0,
             put_many_calls: 0,
