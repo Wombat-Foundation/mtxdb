@@ -22,7 +22,6 @@ pub(crate) enum Commands {
     Get {
         collection: Option<String>,
         id: String,
-        text: bool,
         raw: bool,
     },
     Collections {
@@ -429,12 +428,6 @@ fn sub_get() -> Command {
                 .help("Node ID (32 hex characters) or Matrix event ID"),
         )
         .arg(
-            Arg::new("text")
-                .long("text")
-                .action(ArgAction::SetTrue)
-                .help("Append a trailing newline when printing a non-JSON payload"),
-        )
-        .arg(
             Arg::new("raw")
                 .long("raw")
                 .action(ArgAction::SetTrue)
@@ -480,7 +473,6 @@ fn parse_cli() -> Cli {
                 .or_else(|| m.get_one::<String>("id_option"))
                 .expect("clap requires either positional ID or --id")
                 .clone(),
-            text: m.get_flag("text"),
             raw: m.get_flag("raw"),
         },
         Some(("collections", m)) => Commands::Collections {

@@ -151,9 +151,8 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Get {
             collection,
             id,
-            text,
             raw,
-        } => cmd_get(cli, collection.as_deref(), id, *text, *raw),
+        } => cmd_get(cli, collection.as_deref(), id, *raw),
         Commands::Collections {
             all,
             layout,
@@ -419,13 +418,7 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     Ok(())
 }
 
-fn cmd_get(
-    cli: &Cli,
-    collection: Option<&str>,
-    id: &str,
-    text: bool,
-    raw: bool,
-) -> anyhow::Result<()> {
+fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::Result<()> {
     let node_id = parse_get_id(id)?;
     let store = open_store_read_only(cli)?;
     let matches: Vec<([u8; 16], NodeData)> = match collection {
@@ -458,12 +451,9 @@ fn cmd_get(
                 hex_bytes(&data.bytes).into_bytes()
             };
             io::stdout().write_all(&emitted)?;
-            // Never decorate payload bytes: binary records can decode as
-            // valid UTF-8, so only append a trailing newline when the caller
-            // explicitly opted into `--text`. Decide from the actual bytes
-            // just written: JSON rendering always supplies its own newline,
-            // even when the stored JSON did not have one.
-            if text && !emitted.ends_with(b"\n") {
+            // Raw output stays byte-exact. All textual output is
+            // newline-terminated, including encoded binary fallbacks.
+            if !raw && !emitted.ends_with(b"\n") {
                 io::stdout().write_all(b"\n")?;
             }
         }
@@ -480,8 +470,7 @@ fn cmd_get(
 }
 
 /// Render arbitrary payload bytes safely for terminal output. Raw bytes stay
-/// available through `get --raw`; the default must not write binary data
-/// directly to a terminal.
+/// available through `get --raw`; the default uses spaced hexadecimal bytes.
 fn hex_bytes(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
     for (index, byte) in bytes.iter().enumerate() {
@@ -2564,7 +2553,7 @@ fn scan_pack(
             matched_records,
         );
     }
-    print_scan_table_header("COLLECTION");
+    print_scan_table_header("COLLECTION", scan_payload_label(cli.shard_type));
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
@@ -2593,11 +2582,19 @@ fn scan_pack(
 /// Header for the scan table's aligned columns. `location_label` names the
 /// first column ("COLLECTION" for a pack scan, "PACK" for a collection
 /// scan) — the other column is whichever of the two identifies each row.
-fn print_scan_table_header(location_label: &str) {
+fn print_scan_table_header(location_label: &str, payload_label: &str) {
     println!(
-        "  {:<34} {:<34} {:>10}  PAYLOAD",
+        "  {:<34} {:<34} {:>10}  {payload_label}",
         location_label, "ID", "OFFSET"
     );
+}
+
+fn scan_payload_label(shard_type: ShardType) -> &'static str {
+    if shard_type == ShardType::State {
+        "STATE GROUP"
+    } else {
+        "PAYLOAD"
+    }
 }
 
 /// One aligned row: `location` is a collection or pack ID (hex), `id` the
@@ -2834,7 +2831,7 @@ fn print_collection_record(
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<()> {
     if !context.header_printed {
-        print_scan_table_header("PACK");
+        print_scan_table_header("PACK", scan_payload_label(context.shard_type));
         context.header_printed = true;
     }
     let data = context
@@ -2900,7 +2897,7 @@ fn print_scan_payload(data: &[u8]) {
 fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
     if shard_type == ShardType::State && data.len() == 8 {
         let state_group = u64::from_be_bytes(data.try_into().ok()?);
-        return Some(format!("state group {state_group}"));
+        return Some(format!("0x{state_group:016x}"));
     }
     pretty_print_payload(data)
         .is_none()
@@ -4215,7 +4212,7 @@ mod tests {
     fn state_scan_decodes_big_endian_state_group_payload() {
         assert_eq!(
             scan_payload_suffix(&2u64.to_be_bytes(), ShardType::State),
-            Some("state group 2".to_owned())
+            Some("0x0000000000000002".to_owned())
         );
         assert_eq!(
             scan_payload_suffix(&2u64.to_be_bytes(), ShardType::EventDag),
