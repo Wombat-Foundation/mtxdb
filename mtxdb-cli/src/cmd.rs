@@ -2946,7 +2946,7 @@ fn print_scan_payload(data: &[u8]) {
 fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
     if shard_type == ShardType::State && data.len() == 8 {
         let state_group = u64::from_be_bytes(data.try_into().ok()?);
-        return Some(format!("PTR: 0x{state_group:x}"));
+        return Some(format!("PTR: 0x{state_group:016x}"));
     }
     if pretty_print_payload(data).is_some() {
         return None;
@@ -4768,7 +4768,7 @@ mod tests {
     fn state_scan_decodes_big_endian_state_group_payload() {
         assert_eq!(
             scan_payload_suffix(&2u64.to_be_bytes(), ShardType::State),
-            Some("PTR: 0x2".to_owned())
+            Some("PTR: 0x0000000000000002".to_owned())
         );
         assert_eq!(
             scan_payload_suffix(&2u64.to_be_bytes(), ShardType::EventDag),
