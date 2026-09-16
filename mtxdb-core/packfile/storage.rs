@@ -687,8 +687,7 @@ impl PackfileStorage {
         results: &mut [Option<NodeData>],
     ) -> Result<(), StorageError> {
         self.refresh_collection(collection_id)?;
-        // Reread the fingerprint after refresh to handle the race
-        // where the writer synced more data during the refresh.
+        // Reread the fingerprint after refresh to handle a concurrent sync.
         if let Some(fp) = self.post_refresh_fingerprint() {
             self.last_refresh_fingerprint
                 .lock()
