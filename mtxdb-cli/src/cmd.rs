@@ -2953,9 +2953,9 @@ fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
     }
     Some(match data.get(0..4) {
         Some(magic) => format!(
-            "{} bytes (undecodable, magic={})",
+            "{} bytes (undecodable, magic=0x{:08x})",
             data.len(),
-            magic.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            u32::from_be_bytes(magic.try_into().unwrap())
         ),
         None => format!("{} bytes (undecodable, too short)", data.len()),
     })
@@ -4772,7 +4772,7 @@ mod tests {
         );
         assert_eq!(
             scan_payload_suffix(&2u64.to_be_bytes(), ShardType::EventDag),
-            Some("8 bytes (undecodable)".to_owned())
+            Some("8 bytes (undecodable, magic=0x00000000)".to_owned())
         );
     }
 
