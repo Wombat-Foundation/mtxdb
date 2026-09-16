@@ -5457,10 +5457,7 @@ mod tests {
         );
         // All edges resolve.
         let dangling = verify_auth_chain_edges(&[create.clone(), member.clone()], &[]);
-        assert_eq!(
-            dangling,
-            [] as [(std::string::String, std::string::String); 0]
-        );
+        assert_eq!(dangling, Vec::<(String, String)>::new());
 
         // $missing is not in either set.
         let bad = owned_value(
@@ -5483,10 +5480,7 @@ mod tests {
             r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","sender":"@a:x","auth_events":["$create"],"content":{}}"#,
         );
         let dangling = verify_auth_chain_edges(&[member], &[create]);
-        assert_eq!(
-            dangling,
-            [] as [(std::string::String, std::string::String); 0]
-        );
+        assert_eq!(dangling, Vec::<(String, String)>::new());
     }
 
     #[test]
