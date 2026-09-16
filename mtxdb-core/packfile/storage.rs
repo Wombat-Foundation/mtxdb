@@ -1140,8 +1140,11 @@ impl PackfileStorage {
         // Seed the per-collection refresh fingerprint from the persisted
         // checkpoint/delta state so the first miss for each collection can
         // skip refresh when nothing durable changed.
-        let initial_durable_fp =
-            crate::index::checkpoint::read_durable_fingerprint(&base_dir).unwrap_or(0);
+        let initial_durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&base_dir)
+        {
+            Ok(Some(fp)) => fp,
+            Ok(None) | Err(_) => 0,
+        };
         let initial_fingerprints: HashMap<[u8; 16], u64> = collection_order
             .iter()
             .map(|&cid| (cid, initial_durable_fp))
@@ -4447,8 +4450,31 @@ impl PackfileStorage {
         // advanced by the validated delta log's tail_fingerprint when present.
         // This detects synced appends (delta-only writes) without depending on
         // cached shard lengths or raw file metadata.
-        let durable_fp =
-            crate::index::checkpoint::read_durable_fingerprint(&self.base_dir).unwrap_or(0);
+        let Ok(Some(durable_fp)) =
+            crate::index::checkpoint::read_durable_fingerprint(&self.base_dir)
+        else {
+            // On error or missing checkpoint, force a refresh by treating
+            // as not dominated.
+            self.refresh_collection(collection_id)?;
+            self.miss_refreshes.fetch_add(1, Ordering::Relaxed);
+
+            let retry_ids: Vec<NodeId> = missing.iter().map(|&index| ids[index]).collect();
+            self.miss_refresh_retry_ids.fetch_add(
+                u64::try_from(retry_ids.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            let retry = self.get_many(collection_id, &retry_ids)?;
+            let mut recovered = 0u64;
+            for (index, value) in missing.into_iter().zip(retry) {
+                if value.is_some() {
+                    recovered = recovered.saturating_add(1);
+                    results[index] = value;
+                }
+            }
+            self.miss_refresh_recovered
+                .fetch_add(recovered, Ordering::Relaxed);
+            return Ok(results);
+        };
 
         let dominated = {
             let mut fingerprints = self.last_refresh_fingerprint.lock();

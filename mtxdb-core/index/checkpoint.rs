@@ -399,24 +399,32 @@ pub fn read_pack_fingerprint(path: &Path) -> Option<u64> {
 /// `base_fingerprint` matches the checkpoint.  This detects synced appends
 /// that only wrote to the delta log without rewriting the checkpoint.
 ///
-/// Returns `None` only when the checkpoint itself is missing or corrupt —
-/// the caller falls back to a full rescan in that case.
-#[must_use]
-pub fn read_durable_fingerprint(base_dir: &Path) -> Option<u64> {
+/// Returns `Ok(Some(fp))` for a validated durable fingerprint, `Ok(None)`
+/// when there is no checkpoint (fresh store), and `Err` when the checkpoint
+/// is corrupt or the delta log cannot be reliably read. On `Err` the caller
+/// must treat the state as unknown and force a refresh.
+///
+/// # Errors
+///
+/// Returns a [`crate::index::delta::DeltaFingerprintError`] when the delta
+/// log exists but cannot be validated or read reliably.
+pub fn read_durable_fingerprint(
+    base_dir: &Path,
+) -> Result<Option<u64>, crate::index::delta::DeltaFingerprintError> {
     let ckpt_path = base_dir.join(INDEX_CHECKPOINT_FILE);
-    let ckpt_fp = read_pack_fingerprint(&ckpt_path)?;
+    let ckpt_fp = read_pack_fingerprint(&ckpt_path);
     let delta_path = base_dir.join(format!(
-        "{}.{ckpt_fp:016x}",
+        "{}.{:016x}",
         crate::index::delta::INDEX_DELTA_FILE,
+        ckpt_fp.unwrap_or(0),
     ));
     // Use the lightweight forward parser to avoid decoding every DeltaFrame.
     match crate::index::delta::read_delta_tail_fingerprint(&delta_path) {
-        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp => Some(tail_fp.tail_fingerprint),
-        Ok(Some(_) | None) => Some(ckpt_fp),
-        Err(error) => {
-            eprintln!("warning: ignoring delta fingerprint: {error}");
-            Some(ckpt_fp)
+        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp.unwrap_or(0) => {
+            Ok(Some(tail_fp.tail_fingerprint))
         }
+        Ok(Some(_) | None) => Ok(ckpt_fp),
+        Err(e) => Err(e),
     }
 }
 
@@ -733,8 +741,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
-            read_durable_fingerprint(&dir).is_none(),
-            "missing checkpoint must return None"
+            matches!(read_durable_fingerprint(&dir), Ok(None)),
+            "missing checkpoint must return Ok(None)"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -757,7 +765,7 @@ mod tests {
         };
         std::fs::write(&path, header.encode()).unwrap();
 
-        let fp = read_durable_fingerprint(&dir);
+        let fp = read_durable_fingerprint(&dir).expect("read should succeed");
         assert_eq!(fp, Some(0x42), "without a delta, durable = checkpoint fp");
         std::fs::remove_dir_all(&dir).unwrap();
     }
