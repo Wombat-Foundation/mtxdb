@@ -2521,66 +2521,28 @@ fn cmd_scan_collection(
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
 
-    let mut frames = 0_usize;
     let mut packs = 0_usize;
     let max_rows = scan_limit(limit);
     let bounded = max_rows != usize::MAX;
-    let mut raw_matches = Vec::new();
-    let mut header_printed = false;
+    let mut context = CollectionScanContext {
+        collection_id,
+        node_id,
+        verbose,
+        raw,
+        max_rows,
+        frames: 0,
+        raw_matches: Vec::new(),
+        header_printed: false,
+    };
     for (_, shard) in shards {
-        let records = if verbose || raw {
-            mtxdb_core::packfile::scan_packfile(&shard.path)?
-        } else {
-            mtxdb_core::packfile::scan_packfile_skip_payload(&shard.path)?
-        };
-        let mut matched_pack = false;
-        for (record_collection_id, record_id, offset) in records {
-            let id_matches = match node_id {
-                Some(wanted) => record_id == wanted,
-                None => true,
-            };
-            if record_collection_id == collection_id && id_matches {
-                matched_pack = true;
-                frames = frames.saturating_add(1);
-                if raw {
-                    raw_matches.push((shard.clone(), offset));
-                    continue;
-                }
-                if frames <= max_rows {
-                    if !raw && !header_printed {
-                        print_scan_table_header("PACK");
-                        header_printed = true;
-                    }
-                    let data = verbose
-                        .then(|| ShardPool::read_at_committed(&shard, offset, true))
-                        .transpose()?;
-                    let payload = data.as_ref().map(|data| scan_payload_cell(&data.data));
-                    println!(
-                        "{}",
-                        scan_table_row(
-                            &format!("0x{:016x}", shard.pack_id),
-                            &hex_encode(&record_id),
-                            offset,
-                            payload.as_deref(),
-                        )
-                    );
-                    if let Some(data) =
-                        data.filter(|data| scan_payload_suffix(&data.data).is_none())
-                    {
-                        print_scan_payload(&data.data);
-                    }
-                }
-                if bounded && frames >= max_rows {
-                    break;
-                }
-            }
-        }
+        let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
-        if bounded && frames >= max_rows {
+        if bounded && context.frames >= max_rows {
             break;
         }
     }
 
+    let frames = context.frames;
     if frames == 0 {
         bail!(
             "no matching physical record found in collection {selector}{}",
@@ -2588,7 +2550,7 @@ fn cmd_scan_collection(
         );
     }
     if raw {
-        for (shard, offset) in raw_matches.iter().take(max_rows) {
+        for (shard, offset) in context.raw_matches.iter().take(max_rows) {
             let data = ShardPool::read_at_committed(shard, *offset, true)?;
             if verbose {
                 eprintln!(
@@ -2620,6 +2582,76 @@ fn cmd_scan_collection(
             if packs == 1 { "" } else { "s" },
         );
         print_scan_limit_note(frames, max_rows);
+    }
+    Ok(())
+}
+
+struct CollectionScanContext {
+    collection_id: [u8; 16],
+    node_id: Option<[u8; 16]>,
+    verbose: bool,
+    raw: bool,
+    max_rows: usize,
+    frames: usize,
+    raw_matches: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, u64)>,
+    header_printed: bool,
+}
+
+fn scan_collection_shard(
+    shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
+    context: &mut CollectionScanContext,
+) -> anyhow::Result<bool> {
+    let records = if context.verbose || context.raw {
+        mtxdb_core::packfile::scan_packfile(&shard.path)?
+    } else {
+        mtxdb_core::packfile::scan_packfile_skip_payload(&shard.path)?
+    };
+    let mut matched_pack = false;
+    for (record_collection_id, record_id, offset) in records {
+        let id_matches = context.node_id.map_or(true, |wanted| record_id == wanted);
+        if record_collection_id != context.collection_id || !id_matches {
+            continue;
+        }
+        matched_pack = true;
+        context.frames = context.frames.saturating_add(1);
+        if context.raw {
+            context.raw_matches.push((shard.clone(), offset));
+        } else if context.frames <= context.max_rows {
+            print_collection_record(shard, record_id, offset, context)?;
+        }
+        if context.max_rows != usize::MAX && context.frames >= context.max_rows {
+            break;
+        }
+    }
+    Ok(matched_pack)
+}
+
+fn print_collection_record(
+    shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
+    record_id: [u8; 16],
+    offset: u64,
+    context: &mut CollectionScanContext,
+) -> anyhow::Result<()> {
+    if !context.header_printed {
+        print_scan_table_header("PACK");
+        context.header_printed = true;
+    }
+    let data = context
+        .verbose
+        .then(|| ShardPool::read_at_committed(shard, offset, true))
+        .transpose()?;
+    let payload = data.as_ref().map(|data| scan_payload_cell(&data.data));
+    println!(
+        "{}",
+        scan_table_row(
+            &format!("0x{:016x}", shard.pack_id),
+            &hex_encode(&record_id),
+            offset,
+            payload.as_deref(),
+        )
+    );
+    if let Some(data) = data.filter(|data| scan_payload_suffix(&data.data).is_none()) {
+        print_scan_payload(&data.data);
     }
     Ok(())
 }
