@@ -1527,6 +1527,84 @@ fn run_checkpoint_rewrite_latency_benchmark(collections: usize, records_per_coll
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Measure the cost of unknown-key lookups separately from successful reads.
+/// Plain `get` should be an index probe; `get_many_with_refresh` additionally
+/// shows the cost and frequency of the read-miss refresh policy.
+fn run_unknown_key_benchmark() {
+    let dir = bench_root().join("mtxdb_bench_unknown_keys");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    const RECORDS: usize = 10_000;
+    const MISSES: usize = 1_000;
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let records: Vec<_> = (0..RECORDS)
+        .map(|index| {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            (id, NodeData::new(bytes::Bytes::from_static(b"benchmark")))
+        })
+        .collect();
+    store.put_many(&ROOM, &records).unwrap();
+    store.sync().unwrap();
+
+    let missing: Vec<NodeId> = (RECORDS..RECORDS + MISSES)
+        .map(|index| {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            id
+        })
+        .collect();
+
+    store.set_stats_enabled(true);
+    let direct_start = Instant::now();
+    let direct_found = missing
+        .iter()
+        .filter(|id| std::hint::black_box(store.get(&ROOM, id).unwrap()).is_some())
+        .count();
+    let direct_elapsed = direct_start.elapsed();
+    let direct_stats = store.stats();
+
+    store.reset_stats();
+    let refresh_start = Instant::now();
+    let refresh_found = missing
+        .iter()
+        .filter(|id| {
+            std::hint::black_box(
+                store
+                    .get_many_with_refresh(&ROOM, std::slice::from_ref(*id))
+                    .unwrap()[0]
+                    .is_some(),
+            )
+        })
+        .count();
+    let refresh_elapsed = refresh_start.elapsed();
+    let refresh_stats = store.stats();
+
+    println!(
+        "bench: unknown_keys RECORDS={RECORDS} MISSES={MISSES} \
+         DIRECT_FOUND={direct_found} DIRECT_NS_PER_LOOKUP={} \
+         REFRESH_FOUND={refresh_found} REFRESH_NS_PER_LOOKUP={} \
+         REFRESHES={} REFRESH_SKIPS={} REBUILDS={}",
+        direct_elapsed.as_nanos() / MISSES as u128,
+        refresh_elapsed.as_nanos() / MISSES as u128,
+        refresh_stats.miss_refreshes,
+        refresh_stats.miss_refresh_skips,
+        refresh_stats.index_rebuild_count.saturating_sub(direct_stats.index_rebuild_count),
+    );
+    eprintln!(
+        "unknown-key lookup cost: direct={direct_elapsed:?}, refresh-aware={refresh_elapsed:?}; \
+         refreshes={}, skips={}, rebuilds={}",
+        refresh_stats.miss_refreshes,
+        refresh_stats.miss_refresh_skips,
+        refresh_stats
+            .index_rebuild_count
+            .saturating_sub(direct_stats.index_rebuild_count),
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
     eprintln!("Note: shard Drop deletes superseded shard files on drop,");
@@ -1548,6 +1626,8 @@ fn main() {
     run_repack_benchmark(20_000, 1_000);
 
     run_checkpoint_rewrite_latency_benchmark(60, 5_000);
+
+    run_unknown_key_benchmark();
 
     // ── Connectivity check ──
     eprintln!();
