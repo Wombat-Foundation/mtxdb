@@ -259,11 +259,8 @@ fn persist_store_meta(base_dir: &Path) {
     let result = (|| -> io::Result<()> {
         let mut tmp = File::create(&tmp_path)?;
         tmp.write_all(&buf)?;
-        tmp.sync_all()?;
         drop(tmp);
         fs::rename(&tmp_path, &final_path)?;
-        let dir = File::open(base_dir)?;
-        dir.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
