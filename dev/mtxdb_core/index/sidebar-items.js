@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["DeserializationError","InsertError"],"mod":["checkpoint","delta","format"],"struct":["IndexSlot","LookupIter","LossyIndex"]};
+window.SIDEBAR_ITEMS = {"enum":["DeserializationError","InsertError"],"mod":["checkpoint","delta","format"],"struct":["IndexSlot","LookupIter","LossyIndex","SlotUndo"]};
