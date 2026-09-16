@@ -732,3 +732,534 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// Subprocess reader/writer tests for multi-process durability.
+#[cfg(test)]
+mod subprocess_tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
+    use mtxdb_core::PackfileStorage;
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Initialize a test database with proper structure (db.meta + pools/).
+    /// Returns (`database_root`, `pool_dir`).
+    fn setup_test_db(name: &str) -> (PathBuf, PathBuf) {
+        let db_root = std::env::temp_dir().join(format!(
+            "mtxdb_subprocess_{}_{}_{}",
+            name,
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&db_root);
+        std::fs::create_dir_all(&db_root).unwrap();
+
+        // Run mtxdb init to create db.meta and pools/ directories
+        let cli = mtxdb_cli();
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&db_root)
+            .arg("init")
+            .output()
+            .expect("mtxdb init must run");
+        assert!(
+            output.status.success(),
+            "mtxdb init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Pool directory for PackfileStorage operations
+        let pool_dir = db_root.join("pools").join("event-dag");
+        (db_root, pool_dir)
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_subprocess_{}_{}_{}",
+            name,
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mtxdb_cli() -> PathBuf {
+        // Build the CLI binary via cargo if needed, then use it directly
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or(".".to_owned());
+        // The mtxdb-cli binary is built in the workspace target dir, not the package target dir
+        // CARGO_MANIFEST_DIR is mtxdb-core, so workspace root is parent dir
+        let workspace_root = std::path::Path::new(&manifest_dir).parent().unwrap();
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .unwrap_or_else(|_| format!("{}/target", workspace_root.display()));
+        let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_owned());
+
+        let path = std::path::Path::new(&target_dir)
+            .join(&profile)
+            .join("mtxdb");
+        eprintln!("DEBUG: mtxdb_cli: manifest_dir={}, workspace_root={}, target_dir={}, profile={}, path={:?}", manifest_dir, workspace_root.display(), target_dir, profile, path);
+        if path.exists() {
+            return path;
+        }
+
+        // Fallback: build with cargo and use the built binary
+        let output = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("--package")
+            .arg("mtxdb-cli")
+            .current_dir(workspace_root)
+            .output()
+            .expect("cargo build mtxdb-cli must succeed");
+        assert!(
+            output.status.success(),
+            "cargo build mtxdb-cli failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        std::path::Path::new(&target_dir)
+            .join(&profile)
+            .join("mtxdb")
+    }
+
+    const SUBPROCESS_COLLECTION: NodeId = [0x01; 16];
+    const SUBPROCESS_RECORD: NodeId = [0xD0; 16];
+    const SUBPROCESS_SEED: NodeId = [0xC0; 16];
+
+    #[test]
+    fn unsynced_append_is_visible_but_not_durable() {
+        let dir = test_dir("unsynced_visible");
+
+        // Seed data
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &SUBPROCESS_COLLECTION,
+                &SUBPROCESS_SEED,
+                &NodeData::new(Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Writer: append WITHOUT sync (using default Eager append policy)
+        let cli = mtxdb_cli();
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&dir)
+            .arg("subprocess-writer-unsynced")
+            .arg(dir.to_str().unwrap())
+            .output()
+            .expect("subprocess writer must run");
+        assert!(
+            output.status.success(),
+            "writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // With Eager append policy (default), unsynced writes are immediately
+        // written to pack files and visible to other processes, but not durable
+        // (would be lost on crash before sync).
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        let result = store
+            .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
+            .unwrap();
+        assert!(
+            result[0].is_some(),
+            "unsynced record should be visible with Eager append policy"
+        );
+        assert_eq!(result[0].as_ref().unwrap().bytes.as_ref(), b"synced");
+
+        // Original seed still visible
+        let result = store.get(&SUBPROCESS_COLLECTION, &SUBPROCESS_SEED).unwrap();
+        assert!(result.is_some(), "seed must survive");
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn synced_append_is_recovered() {
+        let dir = test_dir("synced_recovered");
+
+        // Seed data
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &SUBPROCESS_COLLECTION,
+                &SUBPROCESS_SEED,
+                &NodeData::new(Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Writer: append WITH sync
+        let cli = mtxdb_cli();
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&dir)
+            .arg("subprocess-writer")
+            .arg(dir.to_str().unwrap())
+            .output()
+            .expect("subprocess writer must run");
+        assert!(
+            output.status.success(),
+            "writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Reader: must see the synced record via refresh
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        let result = store
+            .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
+            .unwrap();
+        assert!(
+            result[0].is_some(),
+            "synced record must be recovered after refresh"
+        );
+        assert_eq!(result[0].as_ref().unwrap().bytes.as_ref(), b"synced");
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_misses_perform_one_refresh() {
+        let (db_root, pool_dir) = setup_test_db("concurrent_misses");
+
+        // Seed data
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        store
+            .put(
+                &SUBPROCESS_COLLECTION,
+                &SUBPROCESS_SEED,
+                &NodeData::new(Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Writer: append and sync
+        let cli = mtxdb_cli();
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&db_root)
+            .arg("subprocess-writer")
+            .arg(pool_dir.to_str().unwrap())
+            .output()
+            .expect("subprocess writer must run");
+        assert!(
+            output.status.success(),
+            "writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Multiple reader processes: each should trigger at most one refresh
+        for _ in 0..3 {
+            let output = Command::new(&cli)
+                .arg("--dir")
+                .arg(&db_root)
+                .arg("subprocess-reader")
+                .arg(pool_dir.to_str().unwrap())
+                .output()
+                .expect("subprocess reader must run");
+            assert!(
+                output.status.success(),
+                "reader failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("RECOVERED"),
+                "reader must recover: {stdout}"
+            );
+            // miss_refreshes should be exactly 1 (one refresh per process)
+            assert!(
+                stdout.contains("miss_refreshes=1"),
+                "exactly one refresh: {stdout}"
+            );
+        }
+
+        std::fs::remove_dir_all(&db_root).unwrap();
+    }
+
+    #[test]
+    fn replacement_mutation() {
+        let (db_root, pool_dir) = setup_test_db("replacement");
+
+        // Seed data
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        store
+            .put(
+                &SUBPROCESS_COLLECTION,
+                &SUBPROCESS_SEED,
+                &NodeData::new(Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Writer: replace the record (same key, new value) and sync
+        let cli = mtxdb_cli();
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&db_root)
+            .arg("put")
+            .arg("-r")
+            .arg(hex::encode(SUBPROCESS_COLLECTION))
+            .arg("-i")
+            .arg(hex::encode(SUBPROCESS_RECORD))
+            .arg("-a")
+            .arg("replaced")
+            .output()
+            .expect("subprocess writer must run");
+        assert!(
+            output.status.success(),
+            "writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&db_root)
+            .arg("sync")
+            .output()
+            .expect("sync must run");
+        assert!(
+            output.status.success(),
+            "sync failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Reader: must see replaced value
+        let store = PackfileStorage::open_read_only(pool_dir.clone()).unwrap();
+        let result = store
+            .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
+            .unwrap();
+        assert!(result[0].is_some(), "replaced record must be visible");
+        assert_eq!(result[0].as_ref().unwrap().bytes.as_ref(), b"replaced");
+
+        drop(store);
+        std::fs::remove_dir_all(&db_root).unwrap();
+    }
+
+    #[test]
+    fn truncation_mutation() {
+        let (db_root, pool_dir) = setup_test_db("truncation");
+
+        // Seed data with 10 records
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        let mut entries = Vec::new();
+        for i in 0..10u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            let data = NodeData::new(Bytes::from(format!("value-{i}")));
+            entries.push((id, data));
+        }
+        store.put_many(&SUBPROCESS_COLLECTION, &entries).unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Writer: delete half the records (simulating truncation)
+        let cli = mtxdb_cli();
+        for i in 5..10u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            let output = Command::new(&cli)
+                .arg("--dir")
+                .arg(&db_root)
+                .arg("put")
+                .arg("-r")
+                .arg(hex::encode(SUBPROCESS_COLLECTION))
+                .arg("-i")
+                .arg(hex::encode(id))
+                .arg("-a")
+                .arg("")
+                .output()
+                .expect("delete must run");
+            assert!(
+                output.status.success(),
+                "delete failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&db_root)
+            .arg("sync")
+            .output()
+            .expect("sync must run");
+        assert!(
+            output.status.success(),
+            "sync failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Reader: must see remaining records, not deleted ones
+        let store = PackfileStorage::open_read_only(pool_dir.clone()).unwrap();
+        let mut keys = Vec::new();
+        for i in 0..10u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            keys.push(id);
+        }
+        let results = store
+            .get_many_with_refresh(&SUBPROCESS_COLLECTION, &keys)
+            .unwrap();
+
+        for i in 0..5 {
+            assert!(results[i].is_some(), "record {i} must survive truncation");
+            assert_eq!(
+                results[i].as_ref().unwrap().bytes.as_ref(),
+                format!("value-{i}").as_bytes()
+            );
+        }
+        for i in 5..10 {
+            assert!(
+                results[i].is_none(),
+                "record {i} must be deleted after truncation"
+            );
+        }
+
+        drop(store);
+        std::fs::remove_dir_all(&db_root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_recovery() {
+        let dir = test_dir("checkpoint_recovery");
+
+        // Seed data
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &SUBPROCESS_COLLECTION,
+                &SUBPROCESS_SEED,
+                &NodeData::new(Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Writer: append and sync (creates checkpoint + delta)
+        let cli = mtxdb_cli();
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&dir)
+            .arg("subprocess-writer")
+            .arg(dir.to_str().unwrap())
+            .output()
+            .expect("subprocess writer must run");
+        assert!(
+            output.status.success(),
+            "writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // New writer process: must recover from checkpoint
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let result = store
+            .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
+            .unwrap();
+        assert!(result[0].is_some(), "checkpoint recovery must work");
+        assert_eq!(result[0].as_ref().unwrap().bytes.as_ref(), b"synced");
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shard_mutation_recovery() {
+        let (db_root, pool_dir) = setup_test_db("shard_mutation");
+
+        // Seed data with enough records to force pack rotation
+        let store =
+            PackfileStorage::open_with_max_shard_bytes(pool_dir.clone(), 1024 * 1024).unwrap(); // 1MB
+
+        let mut entries = Vec::new();
+        for i in 0..500u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            let data = NodeData::new(Bytes::from(format!("value-{i}")));
+            entries.push((id, data));
+        }
+        store.put_many(&SUBPROCESS_COLLECTION, &entries).unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Writer: append more records (may cause rotation) and sync
+        let cli = mtxdb_cli();
+        let mut entries = Vec::new();
+        for i in 500..1000u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            let data = NodeData::new(Bytes::from(format!("value-{i}")));
+            entries.push((id, data));
+        }
+
+        // Use the CLI to add records
+        for (id, data) in &entries {
+            let output = Command::new(&cli)
+                .arg("--dir")
+                .arg(&db_root)
+                .arg("put")
+                .arg("-r")
+                .arg(hex::encode(SUBPROCESS_COLLECTION))
+                .arg("-i")
+                .arg(hex::encode(id))
+                .arg("-a")
+                .arg(String::from_utf8_lossy(data.bytes.as_ref()).to_string())
+                .output()
+                .expect("put must run");
+            assert!(
+                output.status.success(),
+                "put failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let output = Command::new(&cli)
+            .arg("--dir")
+            .arg(&db_root)
+            .arg("sync")
+            .output()
+            .expect("sync must run");
+        assert!(
+            output.status.success(),
+            "sync failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Reader: must see all records after refresh
+        let store = PackfileStorage::open_read_only(pool_dir.clone()).unwrap();
+        let mut keys = Vec::new();
+        for i in 0..1000u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            keys.push(id);
+        }
+        let results = store
+            .get_many_with_refresh(&SUBPROCESS_COLLECTION, &keys)
+            .unwrap();
+
+        for i in 0..1000 {
+            assert!(
+                results[i].is_some(),
+                "record {i} must survive shard rotation"
+            );
+            assert_eq!(
+                results[i].as_ref().unwrap().bytes.as_ref(),
+                format!("value-{i}").as_bytes()
+            );
+        }
+
+        drop(store);
+        std::fs::remove_dir_all(&db_root).unwrap();
+    }
+}
