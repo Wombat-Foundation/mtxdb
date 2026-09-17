@@ -3393,6 +3393,10 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the file-level import orchestration intentionally handles several import phases"
+)]
 fn cmd_import_file(
     store: &PackfileStorage,
     dir: &Path,
@@ -3496,8 +3500,7 @@ fn cmd_import_file(
             // only the missing records via `put_many` — one read plan and one
             // index/pack generation per collection instead of N individual
             // `put` round trips.
-            let mut by_collection: HashMap<[u8; 16], Vec<([u8; 16], String, NodeData)>> =
-                HashMap::new();
+            let mut by_collection: HashMap<[u8; 16], Vec<ImportBatchEntry>> = HashMap::new();
             for ev in &federation.auth_chain {
                 let Some(incoming_event_id) = event_id(ev) else {
                     auth_skipped = auth_skipped.saturating_add(1);
@@ -3523,8 +3526,7 @@ fn cmd_import_file(
                 // truncated hash, so two distinct event IDs mapping to one key
                 // is a collision to reject, not collapse; a repeat with the
                 // same event_id is the same logical event.
-                let mut first: Vec<([u8; 16], String, NodeData)> =
-                    Vec::with_capacity(entries.len());
+                let mut first: Vec<ImportBatchEntry> = Vec::with_capacity(entries.len());
                 let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(entries.len());
                 for (id_bytes, incoming_event_id, data) in entries {
                     if let Some(first_event_id) = seen_ids.get(&id_bytes) {
@@ -3557,6 +3559,11 @@ fn cmd_import_file(
                 }
                 if !to_write.is_empty() {
                     auth_store.put_many(&collection_id, &to_write)?;
+                    // Deliberate semantic change from the pre-batching loop,
+                    // which counted every accepted input event including ones
+                    // already on disk: `auth_count` now reports only genuinely
+                    // newly-written auth-chain events, so "imported N" means
+                    // records actually appended, and a reimport reports 0.
                     auth_count = auth_count.saturating_add(to_write.len() as u64);
                 }
             }
@@ -3574,6 +3581,10 @@ fn cmd_import_file(
         Ok(())
     }
 }
+
+/// A decoded import entry keyed by node ID, retaining the source event ID for
+/// collision validation before the record is written.
+type ImportBatchEntry = ([u8; 16], String, NodeData);
 
 /// An already-present record under the same node ID must carry the same
 /// `event_id` as the incoming event, or the two genuinely differ and
@@ -3602,6 +3613,10 @@ fn reject_cross_record_collision(
 #[allow(
     clippy::too_many_arguments,
     reason = "all parameters are necessary for the import flow"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the PDU import phase intentionally owns validation, batching, and state-group work"
 )]
 fn import_pdu_events(
     store: &PackfileStorage,
@@ -4874,17 +4889,22 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_event_dag, cmd_sync, compile_import_template, compute_state_groups,
+        build_event_dag, cmd_import_file, cmd_sync, compile_import_template, compute_state_groups,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
         default_matrix_import_template, event_id, event_room_id, extract_pointer_string,
-        fmt_disk_megabytes, fmt_megabytes, glob_pack_files, interleaving_worth_noting,
-        matrix_batch_has_create, matrix_create_details, parse_federation_input,
-        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        resolve_import_collection, scan_payload_suffix, template_collection_id,
+        fmt_disk_megabytes, fmt_megabytes, glob_pack_files, import_pdu_events,
+        interleaving_worth_noting, matrix_batch_has_create, matrix_create_details,
+        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        resolve_import_collection, scan_payload_suffix, template_collection_id, template_node_id,
         verify_auth_chain_edges, CollectionTemplate, StateSet,
     };
     use crate::{Cli, Commands};
+    use bytes::Bytes;
+    use mtxdb_core::packfile::storage::PackfileStorage;
+    use mtxdb_core::storage::{NodeData, StorageEngine};
+    use mtxdb_core::template::{CollectionKeyRule, PayloadPolicy, RecordIdentityRule};
     use mtxdb_core::{DatabaseLayout, ShardType};
+    use simd_json::prelude::Writable;
     use simd_json::OwnedValue;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -4980,6 +5000,259 @@ mod tests {
         }
         drop(layout);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Template whose record identity derives from `sender` rather than the
+    /// `event_id`, so two events with distinct `event_ids` can deliberately map to
+    /// the same storage node ID — modelling the truncated-hash collision the
+    /// import dedup must reject rather than collapse.
+    fn sender_identity_template() -> CollectionTemplate {
+        CollectionTemplate {
+            name: "collisions".into(),
+            collection_kind: "federation".into(),
+            record_identity: RecordIdentityRule {
+                pointer: "/sender".into(),
+                node_id_algorithm: "blake3-128".into(),
+            },
+            payload: PayloadPolicy::Source,
+            collection_key: CollectionKeyRule {
+                pointer: "/room_id".into(),
+                collection_id_algorithm: "blake3-128".into(),
+                display_id_pointer: "/room_id".into(),
+            },
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn import_fixture(
+        name: &str,
+    ) -> (
+        PackfileStorage,
+        PathBuf,
+        PathBuf,
+        CollectionTemplate,
+        [u8; 16],
+    ) {
+        let dir = unique_temp_dir().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let template = sender_identity_template();
+        let collection_id = template_collection_id(&template, "!room").unwrap();
+        let path = dir.join("fixture.json");
+        (store, dir, path, template, collection_id)
+    }
+
+    fn import_event(event_id_: &str, sender: &str, room: &str) -> OwnedValue {
+        owned_value(&format!(
+            r#"{{"event_id":"{event_id_}","sender":"{sender}","room_id":"{room}","type":"m.room.message","content":{{}}}}"#
+        ))
+    }
+
+    #[test]
+    fn import_dedups_repeated_event_id_within_one_input() {
+        let (store, dir, path, template, collection_id) = import_fixture("import_dedup");
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        let events = vec![
+            import_event("$a", "@alice", "!room"),
+            import_event("$a", "@alice", "!room"),
+        ];
+        import_pdu_events(
+            &store,
+            &dir,
+            &path,
+            &events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+        let stats = store.stats();
+        assert_eq!(
+            stats.put_many_calls, 1,
+            "a same-event repeat must collapse into one batched write"
+        );
+        assert_eq!(
+            stats.put_many_records, 1,
+            "the repeated event_id must not be written twice"
+        );
+        let node_id = template_node_id(&template, &events[0]).unwrap().unwrap();
+        assert!(
+            store.get(&collection_id, &node_id).unwrap().is_some(),
+            "the single stored record must be readable under its node ID"
+        );
+    }
+
+    #[test]
+    fn import_rejects_two_event_ids_mapping_to_one_node_id() {
+        let (store, dir, path, template, collection_id) = import_fixture("import_input_collision");
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        let events = vec![
+            import_event("$a", "@alice", "!room"),
+            import_event("$b", "@alice", "!room"),
+        ];
+        let error = import_pdu_events(
+            &store,
+            &dir,
+            &path,
+            &events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .expect_err("distinct event_ids truncating to one node ID must be rejected");
+        assert!(
+            error.to_string().contains("maps to multiple event IDs"),
+            "saw: {error}"
+        );
+        assert_eq!(
+            store.stats().put_many_calls,
+            0,
+            "no records may be written when the input itself collides"
+        );
+    }
+
+    #[test]
+    fn import_rejects_cross_record_event_id_collision() {
+        let (store, dir, path, template, collection_id) =
+            import_fixture("import_cross_record_collision");
+        let existing = import_event("$c", "@alice", "!room");
+        let node_id = template_node_id(&template, &existing).unwrap().unwrap();
+        store
+            .put(
+                &collection_id,
+                &node_id,
+                &NodeData::new(Bytes::from(existing.encode().into_bytes())),
+            )
+            .unwrap();
+
+        let incoming = import_event("$a", "@alice", "!room");
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        let error = import_pdu_events(
+            &store,
+            &dir,
+            &path,
+            &[incoming],
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .expect_err("an on-disk record with a differing event_id must refuse to be overwritten");
+        assert!(
+            error
+                .to_string()
+                .contains("collides with a different event_id"),
+            "saw: {error}"
+        );
+        assert_eq!(
+            store.stats().put_many_calls,
+            0,
+            "a collision must not trigger a write"
+        );
+    }
+
+    #[test]
+    fn import_keeps_existing_record_when_event_id_matches() {
+        let (store, dir, path, template, collection_id) = import_fixture("import_keep_same_event");
+        let event = import_event("$a", "@alice", "!room");
+        let node_id = template_node_id(&template, &event).unwrap().unwrap();
+        store
+            .put(
+                &collection_id,
+                &node_id,
+                &NodeData::new(Bytes::from(event.clone().encode().into_bytes())),
+            )
+            .unwrap();
+
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        import_pdu_events(
+            &store,
+            &dir,
+            &path,
+            &[event],
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+        assert_eq!(
+            store.stats().put_many_calls,
+            0,
+            "a matching existing record must be classified present, not rewritten"
+        );
+    }
+
+    /// Open every pack in a pool and total the records it physically holds.
+    fn count_pack_records(pool_dir: &Path) -> u64 {
+        let mut total = 0;
+        if !pool_dir.exists() {
+            return total;
+        }
+        for (pack_id, _, _) in glob_pack_files(pool_dir).unwrap() {
+            let pack = pool_dir.join(format!("pack_{pack_id:016x}.pack"));
+            let file = std::fs::File::open(pack).unwrap();
+            let mut reader = std::io::BufReader::new(file);
+            if mtxdb_core::packfile::read_header(&mut reader)
+                .unwrap()
+                .is_none()
+            {
+                continue;
+            }
+            while let Some(record) = mtxdb_core::packfile::read_record(&mut reader).unwrap() {
+                let _ = record;
+                total = total.saturating_add(1);
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn auth_chain_reimport_writes_nothing_new() {
+        let root = unique_temp_dir();
+        let pool_dir = root.join("pools").join("event-dag");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        let input = root.join("export.json");
+        std::fs::write(
+            &input,
+            r#"{
+                "pdus": [
+                    {"event_id":"$c","room_id":"!room","sender":"@server",
+                     "type":"m.room.create","state_key":"","content":{"creator":"@server"},
+                     "auth_events":[]}
+                ],
+                "auth_chain": [
+                    {"event_id":"$a1","room_id":"!room","sender":"@server",
+                     "type":"m.room.member","state_key":"@server",
+                     "content":{"membership":"join"},"auth_events":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let template = default_matrix_import_template();
+        let mut established = HashSet::new();
+
+        cmd_import_file(&store, &pool_dir, &input, None, &template, &mut established).unwrap();
+        // Declares the create so batch_has_create resolves for any follow-up.
+        cmd_import_file(&store, &pool_dir, &input, None, &template, &mut established).unwrap();
+
+        let auth_dir = pool_dir.parent().unwrap().join("auth-chain");
+        assert_eq!(
+            count_pack_records(&auth_dir),
+            1,
+            "the auth-chain pool must hold exactly the one imported auth event, unchanged by the reimport"
+        );
     }
 
     #[test]
@@ -5805,8 +6078,8 @@ mod tests {
             r#"{"pdus": [], "auth_chain": []}"#,
         ] {
             let input = parse_federation_input(json.as_bytes()).unwrap();
-            assert_eq!(input.pdus, [] as [simd_json::OwnedValue; 0]);
-            assert_eq!(input.auth_chain, [] as [simd_json::OwnedValue; 0]);
+            assert_eq!(input.pdus, Vec::<OwnedValue>::new());
+            assert_eq!(input.auth_chain, Vec::<OwnedValue>::new());
         }
     }
 
