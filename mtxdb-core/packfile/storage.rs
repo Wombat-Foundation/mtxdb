@@ -639,6 +639,10 @@ pub struct PackfileStorage {
     checkpoint_writes: AtomicU64,
     /// Syncs that appended the incremental delta log instead.
     delta_appends: AtomicU64,
+    /// Writes of the shard→collection inspection sidecar
+    /// (`shard_collections.bin`). Counts every temp-write+rename, whichever
+    /// caller triggered it.
+    sidecar_writes: AtomicU64,
     /// Whether any collection data changed since the last `index.checkpoint`
     /// write. Set by every generation swap (`put`/`put_many`/`repack`/`refresh`);
     /// cleared only by a successful [`Self::persist_index_checkpoint`], so a
@@ -1329,6 +1333,7 @@ impl PackfileStorage {
             sync_calls: AtomicU64::new(0),
             checkpoint_writes: AtomicU64::new(0),
             delta_appends: AtomicU64::new(0),
+            sidecar_writes: AtomicU64::new(0),
             delta_state: parking_lot::Mutex::new(delta_state),
         }
     }
@@ -2177,6 +2182,11 @@ impl PackfileStorage {
             return Err(StorageError::Io(e));
         }
         fs::rename(&tmp_path, &final_path).map_err(StorageError::Io)?;
+        // Counted only after the rename succeeds, so the metric reflects
+        // completed sidecar writes, not attempts (no containing-directory
+        // fsync is issued, so "completed" stops short of claiming power-loss
+        // durability for the directory entry itself).
+        self.sidecar_writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2428,16 +2438,6 @@ impl PackfileStorage {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         }
         drop(guards);
-        // Keep the inspection directory gated to the same pack set the
-        // checkpoint just became: ride the checkpoint rewrite (best-effort)
-        // so the next open can rebuild per-shard counts from records instead
-        // of walking every slot. Deliberately not wired to bare sync_all —
-        // after a dirty sync() the checkpoint advances to a new fingerprint
-        // while a sync_all-only sidecar would stay stale, silently regressing
-        // the very reopen this sidecar exists to speed up. A failure here
-        // leaves the previous directory stale; the fingerprint gate then
-        // falls back to the slot walk until the next rewrite.
-        self.persist_shard_collections_best_effort();
         Ok(())
     }
 
@@ -2738,7 +2738,6 @@ impl PackfileStorage {
         // memory with nothing to force its append.
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         drop(state);
-        self.persist_shard_collections_best_effort();
         Ok(())
     }
 
@@ -5171,9 +5170,12 @@ impl PackfileStorage {
 
     /// Sync all open shards to disk (full pool, not just dirty).
     ///
-    /// Also persists the shard→collection directory as a side effect, same as
-    /// `ShardPool::sync_all` persists shard IO stats — an explicit sync is
-    /// a natural point to flush this observability data too.
+    /// Also persists the shard→collection directory as a side effect — an
+    /// explicit sync is a natural point to flush this observability data too.
+    /// The sidecar is written exactly once, pinned to the same pack
+    /// fingerprint the index checkpoint/delta advance to inside
+    /// `persist_index_checkpoint_or_delta`; see its owner comment for why the
+    /// write lives there rather than here.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure.
@@ -5185,9 +5187,6 @@ impl PackfileStorage {
             timings.pack_flush = flush;
             timings.pack_fsync = fsync;
         }
-        let sidecar_started = std::time::Instant::now();
-        self.persist_shard_collections_best_effort();
-        timings.sidecar = sidecar_started.elapsed();
         self.persist_index_checkpoint_or_delta(&mut timings);
         timings.total = started.elapsed();
         self.count_sync_persistence(&timings);
@@ -5235,6 +5234,16 @@ impl PackfileStorage {
     /// Persist the dirty index state for a sync barrier — a delta append when
     /// the log can be continued, otherwise a full checkpoint rewrite — and
     /// record which path ran in `timings`. No-op when nothing is dirty.
+    ///
+    /// The shard→collection inspection sidecar is owned here, written exactly
+    /// once per dirty barrier whether the index persisted as a delta append or
+    /// a full rewrite: it must stay gated to the same pack set the checkpoint
+    /// just became, so the next open can rebuild per-shard counts from records
+    /// instead of walking every slot. A clean barrier writes nothing (the
+    /// sidecar can only have gone stale together with the index — the same
+    /// mutations that move a record into a shard also dirty the index). A
+    /// failure here leaves the previous directory stale; the fingerprint gate
+    /// then falls back to the slot walk until the next rewrite.
     fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return;
@@ -5243,24 +5252,27 @@ impl PackfileStorage {
             let checkpoint_started = std::time::Instant::now();
             self.persist_index_checkpoint_best_effort();
             timings.checkpoint = checkpoint_started.elapsed();
-            return;
-        }
-        // The frames were recorded against the pack set the preceding flush
-        // made durable, so the tail fingerprint is computed after that flush.
-        let tail_fingerprint = self.current_pack_fingerprint();
-        let delta_started = std::time::Instant::now();
-        if let Err(error) = self.append_index_delta(tail_fingerprint) {
-            // An append failure took the frames with it, so the pending state
-            // no longer reflects the live indexes. Fall back to a full
-            // rewrite rather than leaving the acceleration files stale until
-            // the next sync notices the gap.
-            eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
-            let checkpoint_started = std::time::Instant::now();
-            self.persist_index_checkpoint_best_effort();
-            timings.checkpoint = checkpoint_started.elapsed();
         } else {
-            timings.delta_log = delta_started.elapsed();
+            // The frames were recorded against the pack set the preceding flush
+            // made durable, so the tail fingerprint is computed after that flush.
+            let tail_fingerprint = self.current_pack_fingerprint();
+            let delta_started = std::time::Instant::now();
+            if let Err(error) = self.append_index_delta(tail_fingerprint) {
+                // An append failure took the frames with it, so the pending state
+                // no longer reflects the live indexes. Fall back to a full
+                // rewrite rather than leaving the acceleration files stale until
+                // the next sync notices the gap.
+                eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
+                let checkpoint_started = std::time::Instant::now();
+                self.persist_index_checkpoint_best_effort();
+                timings.checkpoint = checkpoint_started.elapsed();
+            } else {
+                timings.delta_log = delta_started.elapsed();
+            }
         }
+        let sidecar_started = std::time::Instant::now();
+        self.persist_shard_collections_best_effort();
+        timings.sidecar = sidecar_started.elapsed();
     }
 
     /// Fingerprint of the current on-disk pack set, computed from each
@@ -5464,6 +5476,7 @@ impl PackfileStorage {
             delta_invalidations: self.delta_invalidations.load(Ordering::Relaxed),
             checkpoint_writes: self.checkpoint_writes.load(Ordering::Relaxed),
             delta_appends: self.delta_appends.load(Ordering::Relaxed),
+            sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
             last_open_timings: self.open_timings(),
             last_sync_timings: self.sync_timings(),
@@ -5509,6 +5522,7 @@ impl PackfileStorage {
             &self.delta_invalidations,
             &self.checkpoint_writes,
             &self.delta_appends,
+            &self.sidecar_writes,
             &self.sync_calls,
         ] {
             counter.store(0, Ordering::Relaxed);
@@ -5621,6 +5635,9 @@ pub struct RuntimeStats {
     pub checkpoint_writes: u64,
     /// Syncs that appended the incremental delta log instead.
     pub delta_appends: u64,
+    /// Writes of the shard→collection inspection sidecar (every one counts,
+    /// whichever caller triggered it).
+    pub sidecar_writes: u64,
     /// `sync`/`sync_all` calls.
     pub sync_calls: u64,
     /// Per-phase breakdown of the most recent open.
@@ -5666,6 +5683,7 @@ impl Default for RuntimeStats {
             delta_invalidations: 0,
             checkpoint_writes: 0,
             delta_appends: 0,
+            sidecar_writes: 0,
             sync_calls: 0,
             last_open_timings: None,
             last_sync_timings: None,

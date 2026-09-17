@@ -135,6 +135,10 @@ mod tests {
             .sync_timings()
             .expect("sync_all must record its phase timings");
         assert!(
+            sync.sidecar.as_nanos() > 0,
+            "the first dirty sync must persist the shard→collection sidecar"
+        );
+        assert!(
             sync.total >= sync.pack_flush + sync.pack_fsync + sync.sidecar + sync.checkpoint,
             "the phases must all fit inside the measured total ({} vs {})",
             sync.total.as_nanos(),
@@ -638,6 +642,98 @@ mod tests {
                 .expect("record survives the structural rewrite");
             assert_eq!(got.bytes.as_ref(), payload_for(1, i).as_slice());
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression for the duplicate sidecar write: `sync_all` used to persist
+    /// `shard_collections.bin` once up-front and then again from inside the
+    /// delta append (and the old `sync_all`-only wiring left the checkpoint
+    /// path doubling too). The sidecar is now owned by the shared
+    /// index-persistence barrier and written exactly once per dirty sync,
+    /// pinned to the same pack fingerprint the checkpoint/delta behind it
+    /// advances to.
+    #[test]
+    fn each_dirty_sync_writes_the_sidecar_exactly_once() {
+        use mtxdb_core::packfile::storage::OpenPath;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_sidecar_once_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+        assert_eq!(
+            store.stats().sidecar_writes,
+            1,
+            "the first dirty sync_all (full checkpoint path) must write the sidecar exactly once"
+        );
+
+        // A clean sync writes nothing: no new records, so the sidecar is
+        // already current and must not be rewritten.
+        store.sync_all().unwrap();
+        assert_eq!(
+            store.stats().sidecar_writes,
+            1,
+            "a clean sync must not rewrite the sidecar"
+        );
+
+        // A plain write's dirty sync takes the delta-append path and still
+        // writes the sidecar exactly once.
+        let cid = collection_id(1);
+        store
+            .put(
+                &cid,
+                &node_id(1, 776),
+                &NodeData::new(Bytes::from(payload_for(1, 776))),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        let sync = store
+            .sync_timings()
+            .expect("sync must record its phase timings");
+        assert!(
+            sync.delta_log > std::time::Duration::ZERO,
+            "the plain write's sync must take the delta path"
+        );
+        assert_eq!(
+            store.stats().sidecar_writes,
+            2,
+            "a dirty delta-path sync must write the sidecar exactly once"
+        );
+
+        // A structural change forces the checkpoint-rewrite path; still one
+        // sidecar write.
+        store.delete_collection(&collection_id(2)).unwrap();
+        store.sync().unwrap();
+        let sync = store
+            .sync_timings()
+            .expect("sync must record its phase timings");
+        assert!(
+            sync.checkpoint > std::time::Duration::ZERO,
+            "a structural change must rewrite the checkpoint"
+        );
+        assert_eq!(
+            store.stats().sidecar_writes,
+            3,
+            "a dirty checkpoint-path sync must write the sidecar exactly once"
+        );
+
+        // The sidecar rides the newest checkpoint fingerprint, so the fast
+        // reopen path still serves it rather than falling back to a rescan.
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let open = reopened
+            .open_timings()
+            .expect("open must record its phase timings");
+        assert_eq!(
+            open.path,
+            OpenPath::Checkpoint,
+            "a current sidecar must not have gone stale for reopen"
+        );
+        drop(reopened);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

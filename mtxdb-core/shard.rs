@@ -446,6 +446,12 @@ pub struct ShardPool {
     /// Total number of shards retired (garbage-collected after a repack)
     /// over the pool's lifetime.
     retired_count: AtomicU64,
+    /// Number of `shard_stats.bin` snapshots durably renamed over the pool's
+    /// lifetime (counted only after the rename succeeds). The snapshot is
+    /// observability data whose rewrites should be gated to dirty syncs;
+    /// exposing the count lets callers and tests confirm a steady-state
+    /// clean sync pays no stats metadata write.
+    stats_snapshots: AtomicU64,
     /// Each collection's current "home" shard: writes for a collection are routed here
     /// instead of always following the pool-wide active-write cursor, so a
     /// collection's records stay contiguous within a shard rather than
@@ -978,6 +984,7 @@ impl ShardPool {
             dirty: parking_lot::Mutex::new(HashSet::new()),
             next_pack_id: AtomicU64::new(next_pack_id),
             retired_count: AtomicU64::new(0),
+            stats_snapshots: AtomicU64::new(0),
             collection_home: RwLock::new(HashMap::new()),
             stats_persisted_at: RwLock::new(stats_persisted_at),
             last_stats_flush: RwLock::new(None),
@@ -1401,6 +1408,7 @@ impl ShardPool {
             return Err(e);
         }
         fs::rename(&tmp_path, &final_path)?;
+        self.stats_snapshots.fetch_add(1, Ordering::Relaxed);
         *self.stats_persisted_at.write() = Some(persisted_at);
         Ok(())
     }
@@ -2394,6 +2402,13 @@ impl ShardPool {
         *self.stats_persisted_at.read()
     }
 
+    /// Number of `shard_stats.bin` snapshot rewrites that durably landed over
+    /// this pool's lifetime (see [`Self::stats_snapshots`]).
+    #[must_use]
+    pub fn stats_snapshots(&self) -> u64 {
+        self.stats_snapshots.load(Ordering::Relaxed)
+    }
+
     /// Sync all shards to disk.
     ///
     /// Commits any buffered frames first, so fsync covers everything a
@@ -2406,16 +2421,36 @@ impl ShardPool {
         self.flush_all()?;
         let flush_elapsed = flush_started.elapsed();
         let fsync_started = Instant::now();
+        let had_dirty;
         {
             let shards = self.shards.read();
+            let mut dirty_set = self.dirty.lock();
+            // Snapshot the shards with unsynced data and fsync the whole pool
+            // (not just those) — `sync_all` commits everything. Only the ids
+            // captured here are cleared afterwards, mirroring `sync_dirty`: a
+            // concurrent flush that lands between snapshot and fsync stays
+            // marked dirty so the next sync catches it, rather than being
+            // clobbered by this pass.
+            let dirty: Vec<u16> = dirty_set.iter().copied().collect();
+            had_dirty = !dirty.is_empty();
             for shard in shards.iter().flatten() {
                 shard.file.sync_all()?;
                 shard.sync_count.fetch_add(1, Ordering::Relaxed);
             }
+            for &id in &dirty {
+                dirty_set.remove(&id);
+            }
         }
         let fsync_elapsed = fsync_started.elapsed();
         *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
-        self.persist_stats_best_effort();
+        // The stats snapshot is observability, not state: only rewrite it when
+        // a sync actually moved or committed data (parallel to `sync_dirty`),
+        // so a steady-state writer that syncs between writes pays no metadata
+        // write+fsync+rename for a file nothing changed. Periodic freshness is
+        // `maybe_persist_stats`' job.
+        if had_dirty {
+            self.persist_stats_best_effort();
+        }
         Ok(())
     }
 

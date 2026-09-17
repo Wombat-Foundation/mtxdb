@@ -3491,8 +3491,15 @@ fn cmd_import_file(
                 PackfileStorage::open(auth_chain_dir).context("opening auth-chain store")?;
             let mut auth_count = 0u64;
             let mut auth_skipped = 0u64;
+            // Auth-chain events may span multiple rooms (collections). Group
+            // them, then batch-probe each group with `get_many` and insert
+            // only the missing records via `put_many` — one read plan and one
+            // index/pack generation per collection instead of N individual
+            // `put` round trips.
+            let mut by_collection: HashMap<[u8; 16], Vec<([u8; 16], String, NodeData)>> =
+                HashMap::new();
             for ev in &federation.auth_chain {
-                let Some(_incoming_event_id) = event_id(ev) else {
+                let Some(incoming_event_id) = event_id(ev) else {
                     auth_skipped = auth_skipped.saturating_add(1);
                     continue;
                 };
@@ -3505,9 +3512,53 @@ fn cmd_import_file(
                     .transpose()?
                     .unwrap_or([0u8; 16]);
                 let event_bytes = ev.encode().into_bytes();
-                let data = NodeData::new(bytes::Bytes::from(event_bytes));
-                auth_store.put(&collection_id, &id_bytes, &data)?;
-                auth_count = auth_count.saturating_add(1);
+                by_collection.entry(collection_id).or_default().push((
+                    id_bytes,
+                    incoming_event_id.to_owned(),
+                    NodeData::new(bytes::Bytes::from(event_bytes)),
+                ));
+            }
+            for (collection_id, entries) in by_collection {
+                // Same dedup rule as the PDU path: the 128-bit node ID is a
+                // truncated hash, so two distinct event IDs mapping to one key
+                // is a collision to reject, not collapse; a repeat with the
+                // same event_id is the same logical event.
+                let mut first: Vec<([u8; 16], String, NodeData)> =
+                    Vec::with_capacity(entries.len());
+                let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(entries.len());
+                for (id_bytes, incoming_event_id, data) in entries {
+                    if let Some(first_event_id) = seen_ids.get(&id_bytes) {
+                        if first_event_id != &incoming_event_id {
+                            bail!(
+                                "node ID {} maps to multiple event IDs in the input; refusing to merge them",
+                                hex_encode(&id_bytes)
+                            );
+                        }
+                        continue;
+                    }
+                    seen_ids.insert(id_bytes, incoming_event_id.clone());
+                    first.push((id_bytes, incoming_event_id, data));
+                }
+                let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
+                let existing = auth_store.get_many(&collection_id, &probe_ids)?;
+                let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
+                for ((id_bytes, incoming_event_id, data), existing_opt) in
+                    first.into_iter().zip(existing)
+                {
+                    if let Some(existing_record) = existing_opt {
+                        reject_cross_record_collision(
+                            &id_bytes,
+                            &incoming_event_id,
+                            &existing_record,
+                        )?;
+                    } else {
+                        to_write.push((id_bytes, data));
+                    }
+                }
+                if !to_write.is_empty() {
+                    auth_store.put_many(&collection_id, &to_write)?;
+                    auth_count = auth_count.saturating_add(to_write.len() as u64);
+                }
             }
             auth_store.sync_all()?;
             eprintln!(
@@ -3522,6 +3573,29 @@ fn cmd_import_file(
         let _ = pdu_count;
         Ok(())
     }
+}
+
+/// An already-present record under the same node ID must carry the same
+/// `event_id` as the incoming event, or the two genuinely differ and
+/// overwriting would lose data. Decode the stored record and refuse on a
+/// mismatch. The 128-bit node ID is a truncated hash, so such a cross-record
+/// collision is part of the format's threat model.
+fn reject_cross_record_collision(
+    id_bytes: &[u8; 16],
+    incoming_event_id: &str,
+    existing_record: &NodeData,
+) -> anyhow::Result<()> {
+    let mut existing_bytes = existing_record.bytes.to_vec();
+    let existing_event_id = simd_json::to_owned_value(&mut existing_bytes)
+        .ok()
+        .and_then(|event| event_id(&event).map(str::to_owned));
+    if existing_event_id.as_deref() != Some(incoming_event_id) {
+        bail!(
+            "node ID {} collides with a different event_id; refusing to overwrite it",
+            hex_encode(id_bytes)
+        );
+    }
+    Ok(())
 }
 
 /// Import PDU events through the normal event-DAG path.
@@ -3558,37 +3632,74 @@ fn import_pdu_events(
 
     let collection_hex = hex_encode(&collection_id);
 
-    for ev in events {
-        let Some(incoming_event_id) = event_id(ev) else {
-            skipped = skipped.saturating_add(1);
-            continue;
-        };
-        let Some(id_bytes) = template_node_id(template, ev)? else {
-            skipped = skipped.saturating_add(1);
-            continue;
-        };
+    // Decode and dedup in one pass, retaining the first occurrence of each
+    // node ID directly — no intermediate full-size buffer, so a large
+    // federation response's bodies are held once, not twice. The 128-bit
+    // node ID is a truncated hash, so two distinct event IDs can in
+    // principle truncate to the same key; that is a collision and must be
+    // rejected rather than silently collapsed. A same-ID repeat that carries
+    // the same event_id is the same logical event and counts as already
+    // present — the old per-event loop would have found the record its first
+    // occurrence just stored.
+    let first: Vec<([u8; 16], String, NodeData)> = {
+        let mut first = Vec::with_capacity(events.len());
+        let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(events.len());
+        for ev in events {
+            let Some(incoming_event_id) = event_id(ev) else {
+                skipped = skipped.saturating_add(1);
+                continue;
+            };
+            let Some(id_bytes) = template_node_id(template, ev)? else {
+                skipped = skipped.saturating_add(1);
+                continue;
+            };
 
-        let event_bytes = ev.encode().into_bytes();
-        if let Some(existing) = store.get(&collection_id, &id_bytes)? {
-            let mut existing_bytes = existing.bytes.to_vec();
-            let existing_event_id = simd_json::to_owned_value(&mut existing_bytes)
-                .ok()
-                .and_then(|event| event_id(&event).map(str::to_owned));
-            if existing_event_id.as_deref() != Some(incoming_event_id) {
-                bail!(
-                    "node ID {} collides with a different event_id; refusing to overwrite it",
-                    hex_encode(&id_bytes)
-                );
+            if let Some(first_event_id) = seen_ids.get(&id_bytes) {
+                if first_event_id != incoming_event_id {
+                    bail!(
+                        "node ID {} maps to multiple event IDs in the input; refusing to merge them",
+                        hex_encode(&id_bytes)
+                    );
+                }
+                already_present = already_present.saturating_add(1);
+                if already_present_ids.len() < 3 {
+                    already_present_ids.push(incoming_event_id.to_owned());
+                }
+                continue;
             }
+            seen_ids.insert(id_bytes, incoming_event_id.to_owned());
+            let event_bytes = ev.encode().into_bytes();
+            first.push((
+                id_bytes,
+                incoming_event_id.to_owned(),
+                NodeData::new(bytes::Bytes::from(event_bytes)),
+            ));
+        }
+        first
+    };
+
+    // One batched index probe for dedup/collision checks, then one `put_many`
+    // for only the genuinely-new records — instead of N get+put round trips,
+    // one index/pack generation, and a locality-ordered rather than
+    // offset-coalesced set of candidate reads (get_many sorts candidates but
+    // does not merge ranges).
+    let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
+    let existing = store.get_many(&collection_id, &probe_ids)?;
+    let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
+    for ((id_bytes, incoming_event_id, data), existing_opt) in first.into_iter().zip(existing) {
+        if let Some(existing_record) = existing_opt {
+            reject_cross_record_collision(&id_bytes, &incoming_event_id, &existing_record)?;
             already_present = already_present.saturating_add(1);
             if already_present_ids.len() < 3 {
                 already_present_ids.push(incoming_event_id);
             }
-            continue;
+        } else {
+            to_write.push((id_bytes, data));
         }
-        let data = NodeData::new(bytes::Bytes::from(event_bytes));
-        store.put(&collection_id, &id_bytes, &data)?;
-        event_count = event_count.saturating_add(1);
+    }
+    if !to_write.is_empty() {
+        store.put_many(&collection_id, &to_write)?;
+        event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
     if batch_has_create {
@@ -5694,8 +5805,8 @@ mod tests {
             r#"{"pdus": [], "auth_chain": []}"#,
         ] {
             let input = parse_federation_input(json.as_bytes()).unwrap();
-            assert!(input.pdus.is_empty());
-            assert!(input.auth_chain.is_empty());
+            assert_eq!(input.pdus, [] as [simd_json::OwnedValue; 0]);
+            assert_eq!(input.auth_chain, [] as [simd_json::OwnedValue; 0]);
         }
     }
 
