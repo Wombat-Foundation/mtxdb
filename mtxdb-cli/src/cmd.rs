@@ -301,7 +301,7 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
 /// Matrix events use the first 128 bits of `BLAKE3(event_id)` as their key.
 fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
     if id.starts_with('$') {
-        Ok(matrix_event_node_id(id))
+        matrix_event_node_id(id)
     } else {
         parse_node_id(id)
     }
@@ -310,11 +310,8 @@ fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
 /// The Matrix import template's accepted identity algorithm: BLAKE3 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,
 /// `--root`, and event-ID lookup must all use this same derivation.
-fn matrix_event_node_id(event_id: &str) -> [u8; 16] {
-    let hash = blake3::hash(event_id.as_bytes());
-    hash.as_bytes()[..16]
-        .try_into()
-        .expect("BLAKE3 digest is at least 16 bytes")
+fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
+    derive_template_key("blake3-128", event_id)
 }
 
 /// Open the store as its exclusive writer. Fails fast if another process
@@ -3414,7 +3411,11 @@ fn cmd_import_file(
             parse_jsonl_events(&content).or_else(|jsonl_error| {
                 // Some existing DAG exports carry a `.jsonl` suffix despite
                 // being a pretty-printed federation JSON document.
-                parse_federation_events(&content).map_err(|_| jsonl_error)
+                parse_federation_events(&content).map_err(|federation_error| {
+                    anyhow!(
+                        "{jsonl_error}; also not a valid Matrix federation document: {federation_error}"
+                    )
+                })
             })?;
         if events.is_empty() {
             bail!("no events found in {}", path.display());
@@ -3438,6 +3439,8 @@ fn cmd_import_file(
             .chain(federation.auth_chain.iter())
             .find_map(event_room_id)
             .map(str::to_owned);
+        // `parse_federation_input` validates the document shape; this check
+        // separately rejects a well-shaped but event-empty response.
         if federation.pdus.is_empty() && federation.auth_chain.is_empty() {
             bail!("no events found in {}", path.display());
         }
@@ -3773,6 +3776,9 @@ struct FederationInput {
     auth_chain: Vec<OwnedValue>,
 }
 
+const FEDERATION_JSON_HINT: &str =
+    "expected Matrix federation JSON with both `pdus` and `auth_chain` arrays; JSONL files must contain one event per line";
+
 fn parse_federation_input(content: &[u8]) -> anyhow::Result<FederationInput> {
     let mut bytes = content.to_vec();
     let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
@@ -3780,12 +3786,12 @@ fn parse_federation_input(content: &[u8]) -> anyhow::Result<FederationInput> {
         .get("pdus")
         .and_then(|v| v.as_array())
         .cloned()
-        .ok_or_else(|| anyhow!("expected Matrix federation JSON with a `pdus` array"))?;
+        .ok_or_else(|| anyhow!("{FEDERATION_JSON_HINT} (missing or invalid `pdus`)"))?;
     let auth_chain = val
         .get("auth_chain")
         .and_then(|v| v.as_array())
         .cloned()
-        .ok_or_else(|| anyhow!("expected Matrix federation JSON with an `auth_chain` array"))?;
+        .ok_or_else(|| anyhow!("{FEDERATION_JSON_HINT} (missing or invalid `auth_chain`)"))?;
     Ok(FederationInput { pdus, auth_chain })
 }
 
@@ -4419,7 +4425,7 @@ fn repack_preview(
         if !roots.is_empty() {
             let mut root_ids = Vec::new();
             for root in roots {
-                root_ids.push(matrix_event_node_id(root));
+                root_ids.push(matrix_event_node_id(root)?);
             }
             preview_store.set_live_roots(collection_id, root_ids);
         }
@@ -4605,7 +4611,7 @@ fn cmd_repack_target(
         if !roots.is_empty() {
             let mut root_ids = Vec::new();
             for root in roots {
-                root_ids.push(matrix_event_node_id(root));
+                root_ids.push(matrix_event_node_id(root)?);
             }
             store.set_live_roots(collection_id, root_ids);
         }
@@ -4661,7 +4667,14 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId
                 None
             };
             if let Some(s) = event_id {
-                edges.push(matrix_event_node_id(s));
+                // Matrix template compilation only permits blake3-128, so
+                // edge extraction must use the same identity derivation as
+                // import. This parser cannot surface an error through the
+                // storage callback, hence the invariant assertion here.
+                edges.push(
+                    matrix_event_node_id(s)
+                        .expect("Matrix event identity algorithm must remain supported"),
+                );
             }
         }
     }
@@ -5655,12 +5668,21 @@ mod tests {
             r#"{"auth_chain": []}"#,
             r#"{"pdus": null, "auth_chain": []}"#,
             r#"{"pdus": [], "auth_chain": null}"#,
+            r#"{"pdus": 3, "auth_chain": []}"#,
+            r#"{"pdus": {}, "auth_chain": []}"#,
         ] {
             assert!(
                 parse_federation_input(json.as_bytes()).is_err(),
                 "malformed federation document was accepted: {json}"
             );
         }
+    }
+
+    #[test]
+    fn parse_federation_input_accepts_empty_arrays_as_a_valid_shape() {
+        let input = parse_federation_input(br#"{"pdus": [], "auth_chain": []}"#).unwrap();
+        assert!(input.pdus.is_empty());
+        assert!(input.auth_chain.is_empty());
     }
 
     #[test]
