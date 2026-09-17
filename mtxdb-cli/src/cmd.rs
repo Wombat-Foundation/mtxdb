@@ -1320,6 +1320,7 @@ fn open_path_label(path: OpenPath) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_stats_table(
     dir: &Path,
     stats: &RuntimeStats,
@@ -1394,6 +1395,19 @@ fn print_stats_table(
         stats.get_many_misses
     );
     println!(
+        "    read amplification {} index candidates / {} candidate reads / {} hash mismatches / {} get_many shard touches",
+        stats.index_candidates,
+        stats.candidate_reads,
+        stats.candidate_hash_mismatches,
+        stats.get_many_shards_touched
+    );
+    println!(
+        "    read scatter     {} runs / {} span / {} bytes",
+        stats.read_many_runs,
+        fmt_bytes(stats.read_many_span_bytes),
+        fmt_bytes(stats.read_at_bytes)
+    );
+    println!(
         "    repack           {} reps / {} kept / {} dropped",
         stats.repack.repack_count, stats.repack.kept_total, stats.repack.dropped_total
     );
@@ -1420,6 +1434,7 @@ fn print_stats_table(
 /// JSON variant of `mtxdb stats`: open breakdown, runtime counters, and
 /// per-shard persisted counters as nested objects. Built by hand (no serde
 /// dependency) — every value is a plain number or a path string.
+#[allow(clippy::too_many_lines)]
 fn print_stats_json(
     dir: &Path,
     stats: &RuntimeStats,
@@ -1480,6 +1495,22 @@ fn print_stats_json(
             ("get_many_calls", stats.get_many_calls.to_string()),
             ("get_many_records", stats.get_many_records.to_string()),
             ("get_many_misses", stats.get_many_misses.to_string()),
+            ("index_candidates", stats.index_candidates.to_string()),
+            ("candidate_reads", stats.candidate_reads.to_string()),
+            (
+                "candidate_hash_mismatches",
+                stats.candidate_hash_mismatches.to_string(),
+            ),
+            (
+                "get_many_shards_touched",
+                stats.get_many_shards_touched.to_string(),
+            ),
+            ("read_at_bytes", stats.read_at_bytes.to_string()),
+            ("read_many_runs", stats.read_many_runs.to_string()),
+            (
+                "read_many_span_bytes",
+                stats.read_many_span_bytes.to_string(),
+            ),
             ("repack_count", stats.repack.repack_count.to_string()),
             ("repack_kept_total", stats.repack.kept_total.to_string()),
             (

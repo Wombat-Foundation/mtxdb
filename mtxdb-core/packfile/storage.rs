@@ -306,6 +306,16 @@ const PACK_INDEX_OFFSET_LIMIT: u64 = (1u64 << 28) - 2;
 /// of ~230k appends between full rewrites.
 const DELTA_LOG_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Candidate offsets closer than this on the same shard count as one
+/// sequential read run when measuring a `get_many` batch's locality.
+/// `record_disk_len` is `frame_len + 8` and frames are at least
+/// `FRAME_FIXED_LEN` bytes, so a gap this small means no more than one
+/// minimum-size interleaved foreign frame sits between two candidate frames —
+/// reading both is effectively a single sequential range. It is a shape
+/// heuristic for the optimizer's "one read plan per shard" target, not exact
+/// adjacency (that would require a per-candidate frame-length probe).
+const READ_RUN_GAP_BYTES: u64 = 128;
+
 /// Reject a record whose in-shard offset the 28-bit `IndexSlot` field cannot
 /// represent, so the caller surfaces a `StorageError::Corrupt` instead of
 /// silently dropping the record (or panicking in `IndexSlot::new`).
@@ -604,6 +614,31 @@ pub struct PackfileStorage {
     /// Fingerprint read errors after refresh — used to rate-limit warnings
     /// and expose diagnostics.
     miss_refresh_fp_errors: AtomicU64,
+    /// Candidate locations yielded by the lossy index.
+    index_candidates: AtomicU64,
+    /// Candidate locations actually read from packfiles.
+    candidate_reads: AtomicU64,
+    /// Candidate records rejected after full-hash verification.
+    candidate_hash_mismatches: AtomicU64,
+    /// Unique shards touched across `get_many` batches.
+    get_many_shards_touched: AtomicU64,
+    /// On-disk frame bytes touched by candidate-record reads (a prefix read
+    /// per frame; gated on stats, and only covers the candidate-resolve path,
+    /// not refresh rescan). The honest `disk-extent` complement to
+    /// `candidate_reads`: `read_at_bytes / candidate_reads` is the average
+    /// compressed frame the cold lookups drag in.
+    read_at_bytes: AtomicU64,
+    /// Offset runs a `get_many` batch collapses its candidate reads into.
+    /// Offsets within [`READ_RUN_GAP_BYTES`] of the previous candidate on the
+    /// same shard count as one sequential run; the frontier batch's "one read
+    /// plan per shard" target shows up here as runs ≈ shards, not ≈
+    /// candidates.
+    read_many_runs: AtomicU64,
+    /// Plan fan-in of a `get_many` batch: per shard, `last_offset −
+    /// first_offset` summed across touched shards (byte-extent the batch
+    /// scatters over, even if it only touches sparse frames). Drives the
+    /// scattered-read signal independent of candidate count.
+    read_many_span_bytes: AtomicU64,
 
     // Always-on write-path counters (per-record `fetch_add` only on the
     // single-record `put`, whose hot cost is dominated by the write itself).
@@ -1319,6 +1354,13 @@ impl PackfileStorage {
             miss_refresh_recovered: AtomicU64::new(0),
             miss_refresh_retry_ids: AtomicU64::new(0),
             miss_refresh_fp_errors: AtomicU64::new(0),
+            index_candidates: AtomicU64::new(0),
+            candidate_reads: AtomicU64::new(0),
+            candidate_hash_mismatches: AtomicU64::new(0),
+            get_many_shards_touched: AtomicU64::new(0),
+            read_at_bytes: AtomicU64::new(0),
+            read_many_runs: AtomicU64::new(0),
+            read_many_span_bytes: AtomicU64::new(0),
             put_calls: AtomicU64::new(0),
             put_bytes: AtomicU64::new(0),
             put_many_calls: AtomicU64::new(0),
@@ -3217,12 +3259,20 @@ impl PackfileStorage {
         &self,
         id: &NodeId,
         candidates: impl IntoIterator<Item = (u16, u64)>,
+        track: bool,
     ) -> Result<Option<NodeData>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for (shard_id, offset) in candidates {
             let Some(shard) = self.shards.get_shard(shard_id) else {
                 continue;
             };
+
+            if track {
+                self.candidate_reads.fetch_add(1, Ordering::Relaxed);
+                if let Ok(len) = Self::record_disk_len_at(shard.as_ref(), offset) {
+                    self.read_at_bytes.fetch_add(len, Ordering::Relaxed);
+                }
+            }
 
             match self.read_at(
                 &shard,
@@ -3231,6 +3281,10 @@ impl PackfileStorage {
             ) {
                 Ok(record) => {
                     if record.hash != *id {
+                        if track {
+                            self.candidate_hash_mismatches
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         continue;
                     }
 
@@ -3403,7 +3457,11 @@ impl PackfileStorage {
         if let Some(data) = gen.cache.get(id) {
             return Ok(Some((*data).clone()));
         }
-        self.resolve_from_candidates(id, gen.index.lookup_all(id))
+        self.resolve_from_candidates(
+            id,
+            gen.index.lookup_all(id),
+            self.stats_enabled.load(Ordering::Relaxed),
+        )
     }
 
     /// Read every record's edges, with no reachability filtering.
@@ -4633,7 +4691,12 @@ impl StorageEngine for PackfileStorage {
             }
             return Ok(Some((*data).clone()));
         }
-        let result = self.resolve_from_candidates(id, gen.index.lookup_all(id));
+        let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+        if track {
+            self.index_candidates
+                .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+        }
+        let result = self.resolve_from_candidates(id, candidates, track);
         if track {
             self.get_calls.fetch_add(1, Ordering::Relaxed);
             if result.as_ref().is_ok_and(Option::is_none) {
@@ -4665,6 +4728,10 @@ impl StorageEngine for PackfileStorage {
                     continue;
                 }
                 let candidates: Vec<(u16, u64)> = g.index.lookup_all(id).collect();
+                if track {
+                    self.index_candidates
+                        .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+                }
                 if !candidates.is_empty() {
                     to_fetch.push((i, candidates));
                 }
@@ -4673,8 +4740,41 @@ impl StorageEngine for PackfileStorage {
 
         to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
 
+        if track {
+            let touched: HashSet<u16> = to_fetch
+                .iter()
+                .flat_map(|(_, candidates)| candidates.iter().map(|(shard_id, _)| *shard_id))
+                .collect();
+            self.get_many_shards_touched
+                .fetch_add(touched.len() as u64, Ordering::Relaxed);
+
+            let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+            for (_, candidates) in &to_fetch {
+                for (shard_id, offset) in candidates {
+                    per_shard.entry(*shard_id).or_default().push(*offset);
+                }
+            }
+            let mut runs: u64 = 0;
+            let mut span: u64 = 0;
+            for offsets in per_shard.values_mut() {
+                offsets.sort_unstable();
+                let first = *offsets.first().expect("offsets non-empty by construction");
+                let last = *offsets.last().expect("offsets non-empty by construction");
+                runs = runs.saturating_add(1);
+                span = span.saturating_add(last.saturating_sub(first));
+                for pair in offsets.windows(2) {
+                    if pair[1].saturating_sub(pair[0]) > READ_RUN_GAP_BYTES {
+                        runs = runs.saturating_add(1);
+                    }
+                }
+            }
+            self.read_many_runs.fetch_add(runs, Ordering::Relaxed);
+            self.read_many_span_bytes.fetch_add(span, Ordering::Relaxed);
+        }
+
         for (i, candidates) in &to_fetch {
-            results[*i] = self.resolve_from_candidates(&ids[*i], candidates.iter().copied())?;
+            results[*i] =
+                self.resolve_from_candidates(&ids[*i], candidates.iter().copied(), track)?;
         }
 
         if track {
@@ -5461,6 +5561,13 @@ impl PackfileStorage {
             miss_refresh_recovered: self.miss_refresh_recovered.load(Ordering::Relaxed),
             miss_refresh_retry_ids: self.miss_refresh_retry_ids.load(Ordering::Relaxed),
             miss_refresh_fp_errors: self.miss_refresh_fp_errors.load(Ordering::Relaxed),
+            index_candidates: self.index_candidates.load(Ordering::Relaxed),
+            candidate_reads: self.candidate_reads.load(Ordering::Relaxed),
+            candidate_hash_mismatches: self.candidate_hash_mismatches.load(Ordering::Relaxed),
+            get_many_shards_touched: self.get_many_shards_touched.load(Ordering::Relaxed),
+            read_at_bytes: self.read_at_bytes.load(Ordering::Relaxed),
+            read_many_runs: self.read_many_runs.load(Ordering::Relaxed),
+            read_many_span_bytes: self.read_many_span_bytes.load(Ordering::Relaxed),
             put_calls: self.put_calls.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             put_many_calls: self.put_many_calls.load(Ordering::Relaxed),
@@ -5509,6 +5616,13 @@ impl PackfileStorage {
             &self.miss_refresh_recovered,
             &self.miss_refresh_retry_ids,
             &self.miss_refresh_fp_errors,
+            &self.index_candidates,
+            &self.candidate_reads,
+            &self.candidate_hash_mismatches,
+            &self.get_many_shards_touched,
+            &self.read_at_bytes,
+            &self.read_many_runs,
+            &self.read_many_span_bytes,
             &self.put_calls,
             &self.put_bytes,
             &self.put_many_calls,
@@ -5609,6 +5723,24 @@ pub struct RuntimeStats {
     pub miss_refresh_retry_ids: u64,
     /// Post-refresh fingerprint read errors (rate-limits warnings).
     pub miss_refresh_fp_errors: u64,
+    /// Candidate locations yielded by the lossy index.
+    pub index_candidates: u64,
+    /// Candidate locations actually read from packfiles.
+    pub candidate_reads: u64,
+    /// Candidate records rejected after full-hash verification.
+    pub candidate_hash_mismatches: u64,
+    /// Sum of unique shards touched by each `get_many` batch.
+    pub get_many_shards_touched: u64,
+    /// On-disk frame bytes touched by candidate-record reads (stats-gated;
+    /// the candidate-resolve path only, not refresh rescans).
+    pub read_at_bytes: u64,
+    /// Offset runs a `get_many` batch collapses candidate reads into
+    /// (stats-gated; gap heuristic per [`READ_RUN_GAP_BYTES`]).
+    pub read_many_runs: u64,
+    /// Per-shard `last − first` candidate-offset fan-in summed across a
+    /// `get_many` batch (stats-gated; the byte-extent the batch scatters
+    /// over).
+    pub read_many_span_bytes: u64,
     /// Single-record `put` attempts.
     pub put_calls: u64,
     /// Bytes accepted across single-record `put` attempts.
@@ -5670,6 +5802,13 @@ impl Default for RuntimeStats {
             miss_refresh_recovered: 0,
             miss_refresh_retry_ids: 0,
             miss_refresh_fp_errors: 0,
+            index_candidates: 0,
+            candidate_reads: 0,
+            candidate_hash_mismatches: 0,
+            get_many_shards_touched: 0,
+            read_at_bytes: 0,
+            read_many_runs: 0,
+            read_many_span_bytes: 0,
             put_calls: 0,
             put_bytes: 0,
             put_many_calls: 0,
@@ -7321,6 +7460,92 @@ mod tests {
         let snapshot = store.stats();
         assert_eq!(snapshot.sync_calls, 2);
         assert_eq!(snapshot.delta_appends, 1);
+    }
+
+    #[test]
+    fn test_read_amplification_counters_cover_batch_candidates() {
+        let dir = test_dir("read_amplification_counters");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let entries: Vec<_> = (0..4u8)
+            .map(|value| {
+                let mut id = [0u8; 16];
+                id[0] = value;
+                (id, NodeData::new(bytes::Bytes::from(vec![value; 8])))
+            })
+            .collect();
+        writer.put_many(&TEST_COLLECTION, &entries).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let reader = PackfileStorage::open_read_only(dir).unwrap();
+        reader.set_stats_enabled(true);
+        let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
+        let results = reader.get_many(&TEST_COLLECTION, &ids).unwrap();
+        assert_eq!(
+            results.iter().filter(|value| value.is_some()).count(),
+            ids.len()
+        );
+
+        let stats = reader.stats();
+        assert_eq!(stats.get_many_calls, 1);
+        assert_eq!(stats.get_many_records, ids.len() as u64);
+        assert!(stats.index_candidates >= ids.len() as u64);
+        assert!(stats.candidate_reads >= ids.len() as u64);
+        assert!(stats.get_many_shards_touched >= 1);
+    }
+
+    #[test]
+    fn test_read_scatter_counters_track_runs_span_and_bytes() {
+        let dir = test_dir("read_scatter_counters");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let entries: Vec<_> = (0..8u8)
+            .map(|value| {
+                let mut id = [0u8; 16];
+                id[0] = value;
+                id[9] = value.wrapping_mul(37).wrapping_add(11);
+                (id, NodeData::new(bytes::Bytes::from(vec![value; 16])))
+            })
+            .collect();
+        writer.put_many(&TEST_COLLECTION, &entries).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let reader = PackfileStorage::open_read_only(dir).unwrap();
+        reader.set_stats_enabled(true);
+
+        // One batch read of all eight records: the plan covers one shard,
+        // its offsets are a single sequential run, and span/bytes record the
+        // extent the batch drags in.
+        let before = reader.stats();
+        let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
+        let results = reader.get_many(&TEST_COLLECTION, &ids).unwrap();
+        assert_eq!(
+            results.iter().filter(|value| value.is_some()).count(),
+            entries.len()
+        );
+        let after = reader.stats();
+        assert_eq!(
+            after.get_many_shards_touched - before.get_many_shards_touched,
+            1
+        );
+        assert_eq!(after.read_many_runs - before.read_many_runs, 1);
+        assert!(after.read_many_span_bytes > before.read_many_span_bytes);
+        assert!(after.read_at_bytes > before.read_at_bytes);
+
+        // A single `get` adds candidate frame bytes but is not a batch, so
+        // the batch-scatter shape counters (`runs`, `span`) must not move.
+        let single_before = reader.stats();
+        reader
+            .get(&TEST_COLLECTION, &entries[0].0)
+            .unwrap()
+            .unwrap();
+        let single_after = reader.stats();
+        assert!(single_after.read_at_bytes > single_before.read_at_bytes);
+        assert_eq!(single_after.read_many_runs, single_before.read_many_runs);
+        assert_eq!(
+            single_after.read_many_span_bytes,
+            single_before.read_many_span_bytes
+        );
     }
 
     #[test]
