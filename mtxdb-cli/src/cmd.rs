@@ -301,13 +301,20 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
 /// Matrix events use the first 128 bits of `BLAKE3(event_id)` as their key.
 fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
     if id.starts_with('$') {
-        let hash = blake3::hash(id.as_bytes());
-        let mut node_id = [0_u8; 16];
-        node_id.copy_from_slice(&hash.as_bytes()[..16]);
-        Ok(node_id)
+        Ok(matrix_event_node_id(id))
     } else {
         parse_node_id(id)
     }
+}
+
+/// The Matrix import template's accepted identity algorithm: BLAKE3 truncated
+/// to the 128-bit node ID used by the packfile index. Repack edge extraction,
+/// `--root`, and event-ID lookup must all use this same derivation.
+fn matrix_event_node_id(event_id: &str) -> [u8; 16] {
+    let hash = blake3::hash(event_id.as_bytes());
+    hash.as_bytes()[..16]
+        .try_into()
+        .expect("BLAKE3 digest is at least 16 bytes")
 }
 
 /// Open the store as its exclusive writer. Fails fast if another process
@@ -636,24 +643,11 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(json.encode_pp().into_bytes())
 }
 
-/// Decode a rezzy-format CHAMP HAMT node and pretty-print its structure.
+/// Decode a Synapse state-group HAMT root and pretty-print its structure.
 ///
-/// Wire format (32-byte structural hashes):
-/// ```text
-/// [0..4]    magic (`MTHN`)
-/// [4]       wire version (0x01)
-/// [5..9]    datamap (u32 LE) -- bitmap of leaf slots
-/// [9..13]   nodemap (u32 LE) -- bitmap of child slots
-/// [13..17]  leaf_count (u32 LE)
-/// [17..21]  child_count (u32 LE)
-/// [21..]    inline leaves (K,V pairs in datamap bit order)
-///           Each leaf: two length-prefixed UTF-8 strings
-///           K = serde_json::to_string(&(EventType, StateKey))
-///               (a JSON 2-element array, e.g. `["m.room.member","@a:b"]`)
-///           V = EventId, as a plain string
-/// [...]     child hashes (child_count x 32 bytes in nodemap bit order)
-/// ```
-///
+/// Wire format (`MTHR`, version 1): a big-endian `u16` room-prefix length,
+/// the room-prefix bytes, a big-endian `u16` room-ID length, the UTF-8 room
+/// ID, a 32-byte root hash, and a 2048-byte lattice of 1024 big-endian lanes.
 /// Returns `None` when the bytes don't match this layout.
 fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     const MAGIC: &[u8; 4] = b"MTHR";
@@ -706,6 +700,24 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decode a rezzy-format CHAMP HAMT node and pretty-print its structure.
+///
+/// Wire format (32-byte structural hashes):
+/// ```text
+/// [0..4]    magic (`MTHN`)
+/// [4]       wire version (0x01)
+/// [5..9]    datamap (u32 LE) -- bitmap of leaf slots
+/// [9..13]   nodemap (u32 LE) -- bitmap of child slots
+/// [13..17]  leaf_count (u32 LE)
+/// [17..21]  child_count (u32 LE)
+/// [21..]    inline leaves (K,V pairs in datamap bit order)
+///           Each leaf: two length-prefixed UTF-8 strings
+///           K = serde_json::to_string(&(EventType, StateKey))
+///               (a JSON 2-element array, e.g. `["m.room.member","@a:b"]`)
+///           V = EventId, as a plain string
+/// [...]     child hashes (child_count x 32 bytes in nodemap bit order)
+/// ```
+///
 /// Returns `None` when the bytes don't match this layout.
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -3764,19 +3776,16 @@ struct FederationInput {
 fn parse_federation_input(content: &[u8]) -> anyhow::Result<FederationInput> {
     let mut bytes = content.to_vec();
     let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
-    let pdus: Vec<_> = val
+    let pdus = val
         .get("pdus")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
-    let auth_chain: Vec<_> = val
+        .ok_or_else(|| anyhow!("expected Matrix federation JSON with a `pdus` array"))?;
+    let auth_chain = val
         .get("auth_chain")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
-    if pdus.is_empty() && auth_chain.is_empty() {
-        bail!("expected Matrix federation JSON with a `pdus` or `auth_chain` array, or a .jsonl file containing one event per line");
-    }
+        .ok_or_else(|| anyhow!("expected Matrix federation JSON with an `auth_chain` array"))?;
     Ok(FederationInput { pdus, auth_chain })
 }
 
@@ -4410,10 +4419,7 @@ fn repack_preview(
         if !roots.is_empty() {
             let mut root_ids = Vec::new();
             for root in roots {
-                let hash = blake3::hash(root.as_bytes());
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&hash.as_bytes()[..16]);
-                root_ids.push(id);
+                root_ids.push(matrix_event_node_id(root));
             }
             preview_store.set_live_roots(collection_id, root_ids);
         }
@@ -4599,10 +4605,7 @@ fn cmd_repack_target(
         if !roots.is_empty() {
             let mut root_ids = Vec::new();
             for root in roots {
-                let hash = blake3::hash(root.as_bytes());
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&hash.as_bytes()[..16]);
-                root_ids.push(id);
+                root_ids.push(matrix_event_node_id(root));
             }
             store.set_live_roots(collection_id, root_ids);
         }
@@ -4658,10 +4661,7 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId
                 None
             };
             if let Some(s) = event_id {
-                let hash = blake3::hash(s.as_bytes());
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&hash.as_bytes()[..16]);
-                edges.push(id);
+                edges.push(matrix_event_node_id(s));
             }
         }
     }
@@ -5412,7 +5412,7 @@ mod tests {
     #[test]
     fn hamt_wrong_version_rejected() {
         let mut node = build_hamt_node(&[("m.room.name", "", "$ok")], &[]);
-        node[0] = 0x00;
+        node[4] = 0x00;
         assert!(decode_hamt_node(&node).is_none());
     }
 
@@ -5450,7 +5450,7 @@ mod tests {
     #[test]
     fn hamt_datamap_nodemap_overlap_rejected() {
         // Both bitmaps claim slot 0.
-        let mut buf = b"MTHN\x02".to_vec();
+        let mut buf = b"MTHN\x01".to_vec();
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap: slot 0
         buf.extend_from_slice(&1u32.to_le_bytes()); // nodemap: slot 0 (overlap)
         buf.extend_from_slice(&1u32.to_le_bytes()); // leaf_count
@@ -5461,7 +5461,7 @@ mod tests {
     #[test]
     fn hamt_leaf_count_mismatch_rejected() {
         // datamap says 1 leaf, but leaf_count says 0.
-        let mut buf = b"MTHN\x02".to_vec();
+        let mut buf = b"MTHN\x01".to_vec();
         buf.extend_from_slice(&1u32.to_le_bytes()); // datamap
         buf.extend_from_slice(&0u32.to_le_bytes()); // nodemap
         buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count (wrong)
@@ -5646,6 +5646,21 @@ mod tests {
     fn parse_federation_input_empty_rejected() {
         let json = r#"{"unrelated": true}"#;
         assert!(parse_federation_input(json.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn parse_federation_input_requires_both_arrays() {
+        for json in [
+            r#"{"pdus": []}"#,
+            r#"{"auth_chain": []}"#,
+            r#"{"pdus": null, "auth_chain": []}"#,
+            r#"{"pdus": [], "auth_chain": null}"#,
+        ] {
+            assert!(
+                parse_federation_input(json.as_bytes()).is_err(),
+                "malformed federation document was accepted: {json}"
+            );
+        }
     }
 
     #[test]

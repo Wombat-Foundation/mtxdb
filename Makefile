@@ -38,7 +38,7 @@ check: ##H Cargo check (core) and code dupe
 	jscpd $$(git ls-files '*.rs')
 
 .PHONY: lint
-lint: ##H Run clippy lints (only core, not full workspace)
+lint: ##H Run clippy lints across the workspace crates
 	$(CARGO) clippy  --workspace --all-targets --all-features -- $(if $(CI),-D warnings)
 	@if command -v flake8 >/dev/null 2>&1; then flake8 --max-line-length 88 $$(git ls-files '*.py'); fi
 
