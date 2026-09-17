@@ -1402,10 +1402,10 @@ fn print_stats_table(
         stats.get_many_shards_touched
     );
     println!(
-        "    read scatter     {} runs / {} span / {} bytes",
+        "    read scatter     {} est. runs / {} span / {} frame bytes",
         stats.read_many_runs,
         fmt_bytes(stats.read_many_span_bytes),
-        fmt_bytes(stats.read_at_bytes)
+        fmt_bytes(stats.candidate_frame_bytes)
     );
     println!(
         "    repack           {} reps / {} kept / {} dropped",
@@ -1505,7 +1505,10 @@ fn print_stats_json(
                 "get_many_shards_touched",
                 stats.get_many_shards_touched.to_string(),
             ),
-            ("read_at_bytes", stats.read_at_bytes.to_string()),
+            (
+                "candidate_frame_bytes",
+                stats.candidate_frame_bytes.to_string(),
+            ),
             ("read_many_runs", stats.read_many_runs.to_string()),
             (
                 "read_many_span_bytes",

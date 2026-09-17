@@ -45,6 +45,7 @@ DEFAULT_OPEN_LABELS = {"0.1"}
 # Four-way comparison bench (`benches/compare_external.rs`), same default
 # size, gated behind the `compare-external` feature (absent -> family absent).
 DEFAULT_EXT_LABELS = {"0.1"}
+DEFAULT_IMPORT_MODES = {"old", "batched"}
 
 ROW_OPEN = re.compile(
     r"^bench: open L=(?P<label>[\d.]+)gb N=\d+ COLS=\d+ WRITE_MS=(?P<write>[\d.]+) "
@@ -73,6 +74,23 @@ ROW_EXT = re.compile(
     r"RSS_WARM=(?P<rss_warm>\d+) PSS_WARM=(?P<pss_warm>\d+)"
     r"(?: CACHE_CAPACITY=\d+)?"
     r"(?: CHECKSUM=(?P<checksum>\w+))?",
+    re.MULTILINE,
+)
+
+ROW_IMPORT = re.compile(
+    r"^bench: import MODE=(?P<mode>\w+) COLLECTIONS=(?P<collections>\d+) "
+    r"RECORDS=(?P<records>\d+) IMPORT_MS=(?P<import_ms>[\d.]+) "
+    r"SYNC_MS=(?P<sync_ms>[\d.]+) GET_CALLS=(?P<get_calls>\d+) "
+    r"GET_MANY_CALLS=(?P<get_many_calls>\d+) PUT_CALLS=(?P<put_calls>\d+) "
+    r"PUT_MANY_CALLS=(?P<put_many_calls>\d+) INDEX_CANDIDATES=(?P<index_candidates>\d+) "
+    r"CANDIDATE_READS=(?P<candidate_reads>\d+) HASH_MISMATCHES=(?P<hash_mismatches>\d+) "
+    r"CACHE_MISSES=(?P<cache_misses>\d+) SHARDS=(?P<shards>\d+) "
+    r"EST_READ_RUNS=(?P<read_runs>\d+) READ_SPAN_BYTES=(?P<read_span_bytes>\d+) "
+    r"CANDIDATE_FRAME_BYTES=(?P<candidate_frame_bytes>\d+) SIDECAR_WRITES=(?P<sidecar_writes>\d+) "
+    r"CHECKPOINT_WRITES=(?P<checkpoint_writes>\d+) DELTA_APPENDS=(?P<delta_appends>\d+) "
+    r"PACK_FLUSH_MS=(?P<pack_flush_ms>[\d.]+) PACK_FSYNC_MS=(?P<pack_fsync_ms>[\d.]+) "
+    r"SIDECAR_MS=(?P<sidecar_ms>[\d.]+) DELTA_MS=(?P<delta_ms>[\d.]+) "
+    r"CHECKPOINT_MS=(?P<checkpoint_ms>[\d.]+)",
     re.MULTILINE,
 )
 
@@ -517,6 +535,75 @@ def storage_scenarios(output: str) -> list[Scenario]:
     return scenarios
 
 
+def import_scenario(output: str) -> Scenario:
+    """Build the old-vs-batched federation import scenario."""
+    scenario = Scenario(
+        filename="import.csv",
+        columns=[
+            "mode",
+            "collections",
+            "records",
+            "import_ms",
+            "sync_ms",
+            "get_calls",
+            "get_many_calls",
+            "put_calls",
+            "put_many_calls",
+            "index_candidates",
+            "candidate_reads",
+            "hash_mismatches",
+            "cache_misses",
+            "shards",
+            "read_runs",
+            "read_span_bytes",
+            "candidate_frame_bytes",
+            "sidecar_writes",
+            "checkpoint_writes",
+            "delta_appends",
+            "pack_flush_ms",
+            "pack_fsync_ms",
+            "sidecar_ms",
+            "delta_ms",
+            "checkpoint_ms",
+        ],
+    )
+    tracked_metrics = (
+        "import_ms",
+        "sync_ms",
+        "get_calls",
+        "get_many_calls",
+        "put_calls",
+        "put_many_calls",
+        "index_candidates",
+        "candidate_reads",
+        "hash_mismatches",
+        "cache_misses",
+        "shards",
+        "read_runs",
+        "read_span_bytes",
+        "candidate_frame_bytes",
+        "sidecar_writes",
+        "checkpoint_writes",
+        "delta_appends",
+        "pack_flush_ms",
+        "pack_fsync_ms",
+        "sidecar_ms",
+        "delta_ms",
+        "checkpoint_ms",
+    )
+    for match in ROW_IMPORT.finditer(output):
+        row = {
+            key: (float(value) if "." in value else int(value))
+            for key, value in match.groupdict().items()
+        }
+        row["mode"] = match["mode"]
+        base = f"import/{match['mode']}/"
+        for metric in tracked_metrics:
+            scenario.tracked[base + metric] = float(row[metric])
+        scenario.rows.append(row)
+    return scenario
+
+
 def elephant_scenarios(output: str) -> list[Scenario]:
     """Build the elephant (compaction sweep) and compact scenarios."""
     elephant = Scenario(
@@ -733,6 +820,14 @@ def parse_current(path: Path) -> list[Scenario]:
 
     scenarios.extend(storage_scenarios(output))
     scenarios.extend(elephant_scenarios(output))
+
+    imports = import_scenario(output)
+    if imports.rows:
+        modes = {row["mode"] for row in imports.rows}
+        missing = sorted(DEFAULT_IMPORT_MODES - modes)
+        if missing:
+            raise ValueError("import output omits default modes " + ", ".join(missing))
+    scenarios.append(imports)
 
     labels = {
         row["label"]

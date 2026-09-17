@@ -624,10 +624,13 @@ pub struct PackfileStorage {
     get_many_shards_touched: AtomicU64,
     /// On-disk frame bytes touched by candidate-record reads (a prefix read
     /// per frame; gated on stats, and only covers the candidate-resolve path,
-    /// not refresh rescan). The honest `disk-extent` complement to
-    /// `candidate_reads`: `read_at_bytes / candidate_reads` is the average
-    /// compressed frame the cold lookups drag in.
-    read_at_bytes: AtomicU64,
+    /// not refresh rescan). This sums on-disk *frame lengths* — a logical
+    /// extent estimate: an mmap read can pull in whole pages, readahead
+    /// ranges, and merged extents, so this must not be read as a physical
+    /// disk-byte count. The honest `disk-extent` complement to
+    /// `candidate_reads`: `candidate_frame_bytes / candidate_reads` is the
+    /// average compressed frame the cold lookups drag in.
+    candidate_frame_bytes: AtomicU64,
     /// Offset runs a `get_many` batch collapses its candidate reads into.
     /// Offsets within [`READ_RUN_GAP_BYTES`] of the previous candidate on the
     /// same shard count as one sequential run; the frontier batch's "one read
@@ -1358,7 +1361,7 @@ impl PackfileStorage {
             candidate_reads: AtomicU64::new(0),
             candidate_hash_mismatches: AtomicU64::new(0),
             get_many_shards_touched: AtomicU64::new(0),
-            read_at_bytes: AtomicU64::new(0),
+            candidate_frame_bytes: AtomicU64::new(0),
             read_many_runs: AtomicU64::new(0),
             read_many_span_bytes: AtomicU64::new(0),
             put_calls: AtomicU64::new(0),
@@ -3270,7 +3273,7 @@ impl PackfileStorage {
             if track {
                 self.candidate_reads.fetch_add(1, Ordering::Relaxed);
                 if let Ok(len) = Self::record_disk_len_at(shard.as_ref(), offset) {
-                    self.read_at_bytes.fetch_add(len, Ordering::Relaxed);
+                    self.candidate_frame_bytes.fetch_add(len, Ordering::Relaxed);
                 }
             }
 
@@ -3457,11 +3460,13 @@ impl PackfileStorage {
         if let Some(data) = gen.cache.get(id) {
             return Ok(Some((*data).clone()));
         }
-        self.resolve_from_candidates(
-            id,
-            gen.index.lookup_all(id),
-            self.stats_enabled.load(Ordering::Relaxed),
-        )
+        let track = self.stats_enabled.load(Ordering::Relaxed);
+        let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+        if track {
+            self.index_candidates
+                .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+        }
+        self.resolve_from_candidates(id, candidates, track)
     }
 
     /// Read every record's edges, with no reachability filtering.
@@ -5565,7 +5570,7 @@ impl PackfileStorage {
             candidate_reads: self.candidate_reads.load(Ordering::Relaxed),
             candidate_hash_mismatches: self.candidate_hash_mismatches.load(Ordering::Relaxed),
             get_many_shards_touched: self.get_many_shards_touched.load(Ordering::Relaxed),
-            read_at_bytes: self.read_at_bytes.load(Ordering::Relaxed),
+            candidate_frame_bytes: self.candidate_frame_bytes.load(Ordering::Relaxed),
             read_many_runs: self.read_many_runs.load(Ordering::Relaxed),
             read_many_span_bytes: self.read_many_span_bytes.load(Ordering::Relaxed),
             put_calls: self.put_calls.load(Ordering::Relaxed),
@@ -5620,7 +5625,7 @@ impl PackfileStorage {
             &self.candidate_reads,
             &self.candidate_hash_mismatches,
             &self.get_many_shards_touched,
-            &self.read_at_bytes,
+            &self.candidate_frame_bytes,
             &self.read_many_runs,
             &self.read_many_span_bytes,
             &self.put_calls,
@@ -5731,15 +5736,18 @@ pub struct RuntimeStats {
     pub candidate_hash_mismatches: u64,
     /// Sum of unique shards touched by each `get_many` batch.
     pub get_many_shards_touched: u64,
-    /// On-disk frame bytes touched by candidate-record reads (stats-gated;
-    /// the candidate-resolve path only, not refresh rescans).
-    pub read_at_bytes: u64,
-    /// Offset runs a `get_many` batch collapses candidate reads into
-    /// (stats-gated; gap heuristic per [`READ_RUN_GAP_BYTES`]).
+    /// Sum of on-disk frame lengths touched by candidate-record reads
+    /// (stats-gated; the candidate-resolve path only, not refresh rescans).
+    /// A logical extent estimate, not a physical disk-byte count — mmap may
+    /// fetch whole pages, readahead ranges, or merged extents.
+    pub candidate_frame_bytes: u64,
+    /// Estimated/logical offset runs a `get_many` batch collapses candidate
+    /// reads into (stats-gated; gap heuristic per [`READ_RUN_GAP_BYTES`], not
+    /// measured physical sequential reads).
     pub read_many_runs: u64,
     /// Per-shard `last − first` candidate-offset fan-in summed across a
-    /// `get_many` batch (stats-gated; the byte-extent the batch scatters
-    /// over).
+    /// `get_many` batch (stats-gated; the logical byte-extent the batch
+    /// scatters over, not physical disk bytes read).
     pub read_many_span_bytes: u64,
     /// Single-record `put` attempts.
     pub put_calls: u64,
@@ -5806,7 +5814,7 @@ impl Default for RuntimeStats {
             candidate_reads: 0,
             candidate_hash_mismatches: 0,
             get_many_shards_touched: 0,
-            read_at_bytes: 0,
+            candidate_frame_bytes: 0,
             read_many_runs: 0,
             read_many_span_bytes: 0,
             put_calls: 0,
@@ -7530,7 +7538,7 @@ mod tests {
         );
         assert_eq!(after.read_many_runs - before.read_many_runs, 1);
         assert!(after.read_many_span_bytes > before.read_many_span_bytes);
-        assert!(after.read_at_bytes > before.read_at_bytes);
+        assert!(after.candidate_frame_bytes > before.candidate_frame_bytes);
 
         // A single `get` adds candidate frame bytes but is not a batch, so
         // the batch-scatter shape counters (`runs`, `span`) must not move.
@@ -7540,12 +7548,62 @@ mod tests {
             .unwrap()
             .unwrap();
         let single_after = reader.stats();
-        assert!(single_after.read_at_bytes > single_before.read_at_bytes);
+        assert!(single_after.candidate_frame_bytes > single_before.candidate_frame_bytes);
         assert_eq!(single_after.read_many_runs, single_before.read_many_runs);
         assert_eq!(
             single_after.read_many_span_bytes,
             single_before.read_many_span_bytes
         );
+    }
+
+    #[test]
+    fn test_walk_ancestors_counts_candidate_probes_reads_and_frame_bytes() {
+        let dir = test_dir("walk_counter_tracking");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let ids: Vec<NodeId> = (0..3u8).map(distinct_id).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let byte = b'A' + u8::try_from(i).unwrap();
+            writer
+                .put(
+                    &TEST_COLLECTION,
+                    id,
+                    &NodeData::new(bytes::Bytes::from(vec![byte])),
+                )
+                .unwrap();
+        }
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        // A fresh read-only store has an empty decoded-node cache, so a walk
+        // must resolve every hash through the lossy index and the packfiles —
+        // and the counters for that traverse path (`resolve_pinned`, the
+        // ancestor/frontier hook) must move, not just `get`/`get_many`.
+        let reader = PackfileStorage::open_read_only(dir).unwrap();
+        reader.set_stats_enabled(true);
+        let edges =
+            std::collections::HashMap::from([(ids[1], vec![ids[0]]), (ids[2], vec![ids[1]])]);
+        let extract = |hash: &[u8; 16], _data: &[u8]| edges.get(hash).cloned().unwrap_or_default();
+        let walked: Vec<(NodeId, NodeData)> = reader
+            .walk_ancestors(
+                &TEST_COLLECTION,
+                &[ids[2]],
+                &[],
+                extract,
+                WalkLimits::default(),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(walked.len(), 3);
+
+        let stats = reader.stats();
+        assert!(stats.index_candidates >= 3);
+        assert!(stats.candidate_reads >= 3);
+        assert!(stats.candidate_frame_bytes >= stats.candidate_reads);
+        assert!(stats.cache.misses >= 3);
+        // `walk_ancestors` is a traversal, not a `get_many` batch: its
+        // scatter-shape counters must not be the ones that moved.
+        assert_eq!(stats.read_many_runs, 0);
     }
 
     #[test]

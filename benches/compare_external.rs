@@ -187,6 +187,9 @@ const MAX_STEADY_APPEND_ATTEMPTS: usize = STEADY_APPEND_BATCHES * 8;
 /// measuring a reuse/cache-hit workload.
 const DEFAULT_BENCH_CACHE_CAPACITY: usize = 0;
 const BUILD_BATCH_RECORDS: usize = 256;
+const IMPORT_COLLECTIONS: usize = 8;
+const IMPORT_SEED_RECORDS: usize = 512;
+const IMPORT_RECORDS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -291,6 +294,143 @@ fn mtxdb_open_read_only(dir: &std::path::Path) -> PackfileStorage {
         checksum_policy_from_env(),
     )
     .unwrap()
+}
+
+/// Compare the old per-event federation import loop with the batched import
+/// path. Both modes start from the same seeded store and perform one final
+/// sync_all, so the row captures both read amplification and sync-side HDD
+/// work without mixing those metrics into the external-engine comparison.
+///
+/// Read-amplification figures are logical: EST_READ_RUNS is a gap heuristic
+/// (offsets within `READ_RUN_GAP_BYTES` count as one run), CANDIDATE_FRAME_BYTES
+/// sums on-disk frame lengths rather than physical pages, and SPAN is the
+/// offset fan-in. None claim to measure disk sectors — that stays an
+/// OS-level metric.
+fn run_import_mode(mode: &str) {
+    let dir =
+        std::env::temp_dir().join(format!("mtxdb_bench_import_{mode}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let store = mtxdb_open(&dir);
+
+    for collection in 0..IMPORT_COLLECTIONS {
+        let entries: Vec<_> = (0..IMPORT_SEED_RECORDS)
+            .map(|offset| {
+                let node = collection * IMPORT_SEED_RECORDS + offset;
+                (
+                    node_id(node),
+                    NodeData::new(bytes::Bytes::from(payload(node as u64))),
+                )
+            })
+            .collect();
+        store
+            .put_many(&collection_for(collection), &entries)
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    store.reset_stats();
+    store.set_stats_enabled(true);
+    let import_node = |index: usize| {
+        let collection = index % IMPORT_COLLECTIONS;
+        if index < IMPORT_RECORDS / 2 {
+            collection * IMPORT_SEED_RECORDS + index % IMPORT_SEED_RECORDS
+        } else {
+            IMPORT_COLLECTIONS * IMPORT_SEED_RECORDS + index
+        }
+    };
+
+    let started = Instant::now();
+    if mode == "old" {
+        for index in 0..IMPORT_RECORDS {
+            let collection = index % IMPORT_COLLECTIONS;
+            let node = import_node(index);
+            let id = node_id(node);
+            if store
+                .get(&collection_for(collection), &id)
+                .unwrap()
+                .is_none()
+            {
+                store
+                    .put(
+                        &collection_for(collection),
+                        &id,
+                        &NodeData::new(bytes::Bytes::from(payload(node as u64))),
+                    )
+                    .unwrap();
+            }
+        }
+    } else {
+        let mut groups: Vec<Vec<(NodeId, NodeData)>> =
+            (0..IMPORT_COLLECTIONS).map(|_| Vec::new()).collect();
+        let mut ids: Vec<Vec<NodeId>> = (0..IMPORT_COLLECTIONS).map(|_| Vec::new()).collect();
+        for index in 0..IMPORT_RECORDS {
+            let collection = index % IMPORT_COLLECTIONS;
+            let node = import_node(index);
+            ids[collection].push(node_id(node));
+            groups[collection].push((
+                node_id(node),
+                NodeData::new(bytes::Bytes::from(payload(node as u64))),
+            ));
+        }
+        for collection in 0..IMPORT_COLLECTIONS {
+            let existing = store
+                .get_many(&collection_for(collection), &ids[collection])
+                .unwrap();
+            let missing: Vec<_> = groups[collection]
+                .drain(..)
+                .zip(existing)
+                .filter_map(|((id, data), existing)| existing.is_none().then_some((id, data)))
+                .collect();
+            if !missing.is_empty() {
+                store
+                    .put_many(&collection_for(collection), &missing)
+                    .unwrap();
+            }
+        }
+    }
+    let import_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    let sync_started = Instant::now();
+    store.sync_all().unwrap();
+    let sync_ms = sync_started.elapsed().as_secs_f64() * 1e3;
+    let stats = store.stats();
+    let sync = store.sync_timings().expect("import sync must be timed");
+    println!(
+        concat!(
+            "bench: import MODE={} COLLECTIONS={} RECORDS={} ",
+            "IMPORT_MS={:.3} SYNC_MS={:.3} GET_CALLS={} GET_MANY_CALLS={} ",
+            "PUT_CALLS={} PUT_MANY_CALLS={} INDEX_CANDIDATES={} CANDIDATE_READS={} ",
+            "HASH_MISMATCHES={} CACHE_MISSES={} SHARDS={} EST_READ_RUNS={} READ_SPAN_BYTES={} ",
+            "CANDIDATE_FRAME_BYTES={} SIDECAR_WRITES={} CHECKPOINT_WRITES={} DELTA_APPENDS={} ",
+            "PACK_FLUSH_MS={:.3} PACK_FSYNC_MS={:.3} SIDECAR_MS={:.3} DELTA_MS={:.3} CHECKPOINT_MS={:.3}"
+        ),
+        mode,
+        IMPORT_COLLECTIONS,
+        IMPORT_RECORDS,
+        import_ms,
+        sync_ms,
+        stats.get_calls,
+        stats.get_many_calls,
+        stats.put_calls,
+        stats.put_many_calls,
+        stats.index_candidates,
+        stats.candidate_reads,
+        stats.candidate_hash_mismatches,
+        stats.cache.misses,
+        stats.get_many_shards_touched,
+        stats.read_many_runs,
+        stats.read_many_span_bytes,
+        stats.candidate_frame_bytes,
+        stats.sidecar_writes,
+        stats.checkpoint_writes,
+        stats.delta_appends,
+        sync.pack_flush.as_secs_f64() * 1e3,
+        sync.pack_fsync.as_secs_f64() * 1e3,
+        sync.sidecar.as_secs_f64() * 1e3,
+        sync.delta_log.as_secs_f64() * 1e3,
+        sync.checkpoint.as_secs_f64() * 1e3,
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
@@ -1613,6 +1753,11 @@ fn main() {
             run_backend(*backend, *gb);
         }
     }
+
+    eprintln!();
+    eprintln!("federation import comparison: old per-event vs batched");
+    run_import_mode("old");
+    run_import_mode("batched");
 
     eprintln!();
     eprintln!("Interpretation (see DESIGN-open-and-index-persistence.md §1.2):");
