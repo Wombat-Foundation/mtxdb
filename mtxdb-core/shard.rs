@@ -2823,6 +2823,61 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_sync_all_does_not_rewrite_stats_snapshot() {
+        let dir = test_dir("clean_sync_stats");
+        let pool = ShardPool::open(dir).unwrap();
+        let before = pool.stats_snapshots();
+        pool.sync_all().unwrap();
+        assert_eq!(
+            pool.stats_snapshots(),
+            before,
+            "a clean sync must not rewrite the stats snapshot"
+        );
+        assert_eq!(
+            pool.stats_persisted_at(),
+            None,
+            "a clean sync must not persist any stats snapshot"
+        );
+    }
+
+    #[test]
+    fn test_dirty_sync_all_rewrites_stats_snapshot_once() {
+        let dir = test_dir("dirty_sync_stats_once");
+        let pool = ShardPool::open(dir).unwrap();
+        pool.put_record(&test_record(0x02, 0xBB, b"payload"))
+            .unwrap();
+        let before = pool.stats_snapshots();
+        pool.sync_all().unwrap();
+        assert_eq!(
+            pool.stats_snapshots(),
+            before + 1,
+            "a dirty sync must persist the stats snapshot exactly once"
+        );
+        assert!(
+            pool.stats_persisted_at().is_some(),
+            "the dirty sync must leave a stats snapshot timestamp"
+        );
+    }
+
+    #[test]
+    fn test_maybe_persist_stats_still_works_without_data_mutation() {
+        let dir = test_dir("periodic_stats_no_mutation");
+        let pool = ShardPool::open(dir).unwrap();
+        assert_eq!(pool.stats_persisted_at(), None);
+        let before = pool.stats_snapshots();
+        pool.maybe_persist_stats(Duration::ZERO);
+        assert_eq!(
+            pool.stats_snapshots(),
+            before + 1,
+            "the periodic flush must write a snapshot even with no dirty shards"
+        );
+        assert!(
+            pool.stats_persisted_at().is_some(),
+            "the periodic flush must leave a stats snapshot timestamp"
+        );
+    }
+
+    #[test]
     fn test_sync_dirty_clears_only_written_shards() {
         let dir = test_dir("sync_dirty_clears");
         let pool = ShardPool::open(dir).unwrap();
