@@ -3777,21 +3777,30 @@ struct FederationInput {
 }
 
 const FEDERATION_JSON_HINT: &str =
-    "expected Matrix federation JSON with both `pdus` and `auth_chain` arrays; JSONL files must contain one event per line";
+    "expected Matrix federation JSON with a `pdus` array, an `auth_chain` array, or both; JSONL files must contain one event per line";
 
 fn parse_federation_input(content: &[u8]) -> anyhow::Result<FederationInput> {
     let mut bytes = content.to_vec();
     let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
-    let pdus = val
-        .get("pdus")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .ok_or_else(|| anyhow!("{FEDERATION_JSON_HINT} (missing or invalid `pdus`)"))?;
-    let auth_chain = val
-        .get("auth_chain")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .ok_or_else(|| anyhow!("{FEDERATION_JSON_HINT} (missing or invalid `auth_chain`)"))?;
+    let has_pdu_field = val.get("pdus").is_some();
+    let has_auth_chain_field = val.get("auth_chain").is_some();
+    if !has_pdu_field && !has_auth_chain_field {
+        bail!("{FEDERATION_JSON_HINT}");
+    }
+    let pdus = match val.get("pdus") {
+        Some(value) => value
+            .as_array()
+            .cloned()
+            .ok_or_else(|| anyhow!("{FEDERATION_JSON_HINT} (`pdus` must be an array)"))?,
+        None => Vec::new(),
+    };
+    let auth_chain = match val.get("auth_chain") {
+        Some(value) => value
+            .as_array()
+            .cloned()
+            .ok_or_else(|| anyhow!("{FEDERATION_JSON_HINT} (`auth_chain` must be an array)"))?,
+        None => Vec::new(),
+    };
     Ok(FederationInput { pdus, auth_chain })
 }
 
@@ -4667,14 +4676,14 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId
                 None
             };
             if let Some(s) = event_id {
-                // Matrix template compilation only permits blake3-128, so
-                // edge extraction must use the same identity derivation as
-                // import. This parser cannot surface an error through the
-                // storage callback, hence the invariant assertion here.
-                edges.push(
-                    matrix_event_node_id(s)
-                        .expect("Matrix event identity algorithm must remain supported"),
-                );
+                // Matrix template compilation currently permits blake3-128,
+                // so edge extraction uses the same derivation as import. The
+                // storage callback cannot return an error; if that supported
+                // identity configuration ever changes, omit this edge rather
+                // than panicking in the CLI.
+                if let Ok(id) = matrix_event_node_id(s) {
+                    edges.push(id);
+                }
             }
         }
     }
@@ -5662,10 +5671,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_federation_input_requires_both_arrays() {
+    fn parse_federation_input_requires_an_array_and_rejects_wrong_types() {
         for json in [
-            r#"{"pdus": []}"#,
-            r#"{"auth_chain": []}"#,
+            r#"{"unrelated": true}"#,
             r#"{"pdus": null, "auth_chain": []}"#,
             r#"{"pdus": [], "auth_chain": null}"#,
             r#"{"pdus": 3, "auth_chain": []}"#,
@@ -5679,10 +5687,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_federation_input_accepts_empty_arrays_as_a_valid_shape() {
-        let input = parse_federation_input(br#"{"pdus": [], "auth_chain": []}"#).unwrap();
-        assert!(input.pdus.is_empty());
-        assert!(input.auth_chain.is_empty());
+    fn parse_federation_input_accepts_either_array_or_both() {
+        for json in [
+            r#"{"pdus": []}"#,
+            r#"{"auth_chain": []}"#,
+            r#"{"pdus": [], "auth_chain": []}"#,
+        ] {
+            let input = parse_federation_input(json.as_bytes()).unwrap();
+            assert!(input.pdus.is_empty());
+            assert!(input.auth_chain.is_empty());
+        }
     }
 
     #[test]
