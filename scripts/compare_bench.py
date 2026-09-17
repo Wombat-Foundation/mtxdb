@@ -57,41 +57,52 @@ ROW_OPEN = re.compile(
 )
 
 ROW_EXT = re.compile(
-    r"^bench: external ENG=(?P<eng>\w+) L=(?P<label>[\d.]+)gb N=\d+ "
-    r"WRITE_MS=(?P<write>[\d.]+) WARM_OPEN_MS=(?P<warm_open>[\d.]+) "
-    r"COLD_OPEN_MS=(?P<cold_open>[\d.]+) LOOKUP_US=(?P<lookup>[\d.]+) "
-    r"APPEND=\d+ APPEND_MS=(?P<append>[\d.]+) "
-    r"APPEND_PUTS_MS=(?P<append_puts>[\d.]+) "
-    r"APPEND_SYNC_MS=(?P<append_sync>[\d.]+)"
-    r"(?: APPEND_LOOP_MS=(?P<append_loop>[\d.]+))?"
-    r"(?: APPEND_SYNC_ALL_MS=(?P<append_sync_all>[\d.]+))?"
-    r" STEADY_APPEND=\d+ STEADY_APPEND_MS=(?P<steady_append>[\d.]+) "
-    r"STEADY_APPEND_PUTS_MS=(?P<steady_append_puts>[\d.]+) "
-    r"STEADY_APPEND_SYNC_MS=(?P<steady_append_sync>[\d.]+)"
-    r" FILES=(?P<files>\d+) "
-    r"MEM=(?P<mem>\d+) MEM_LABEL=(?P<mem_label>\w+) "
-    r"RSS_OPEN=(?P<rss_open>\d+) PSS_OPEN=(?P<pss_open>\d+) "
-    r"RSS_WARM=(?P<rss_warm>\d+) PSS_WARM=(?P<pss_warm>\d+)"
-    r"(?: CACHE_CAPACITY=\d+)?"
-    r"(?: CHECKSUM=(?P<checksum>\w+))?",
-    re.MULTILINE,
+    r"""
+    ^bench:\s+external\s+ENG=(?P<eng>\w+)\s+L=(?P<label>[\d.]+)gb\s+N=\d+
+    \s+WRITE_MS=(?P<write>[\d.]+)\s+WARM_OPEN_MS=(?P<warm_open>[\d.]+)
+    \s+COLD_OPEN_MS=(?P<cold_open>[\d.]+)\s+LOOKUP_US=(?P<lookup>[\d.]+)
+    \s+APPEND=\d+\s+APPEND_MS=(?P<append>[\d.]+)
+    \s+APPEND_PUTS_MS=(?P<append_puts>[\d.]+)
+    \s+APPEND_SYNC_MS=(?P<append_sync>[\d.]+)
+    (?:\s+APPEND_LOOP_MS=(?P<append_loop>[\d.]+))?
+    (?:\s+APPEND_SYNC_ALL_MS=(?P<append_sync_all>[\d.]+))?
+    \s+STEADY_APPEND=\d+\s+STEADY_APPEND_MS=(?P<steady_append>[\d.]+)
+    \s+STEADY_APPEND_PUTS_MS=(?P<steady_append_puts>[\d.]+)
+    \s+STEADY_APPEND_SYNC_MS=(?P<steady_append_sync>[\d.]+)
+    \s+FILES=(?P<files>\d+)
+    \s+MEM=(?P<mem>\d+)\s+MEM_LABEL=(?P<mem_label>\w+)
+    \s+RSS_OPEN=(?P<rss_open>\d+)\s+PSS_OPEN=(?P<pss_open>\d+)
+    \s+RSS_WARM=(?P<rss_warm>\d+)\s+PSS_WARM=(?P<pss_warm>\d+)
+    (?:\s+CACHE_CAPACITY=\d+)?
+    (?:\s+CHECKSUM=(?P<checksum>\w+))?
+    """,
+    re.MULTILINE | re.VERBOSE,
 )
 
 ROW_IMPORT = re.compile(
-    r"^bench: import MODE=(?P<mode>\w+) COLLECTIONS=(?P<collections>\d+) "
-    r"RECORDS=(?P<records>\d+) IMPORT_MS=(?P<import_ms>[\d.]+) "
-    r"SYNC_MS=(?P<sync_ms>[\d.]+) GET_CALLS=(?P<get_calls>\d+) "
-    r"GET_MANY_CALLS=(?P<get_many_calls>\d+) PUT_CALLS=(?P<put_calls>\d+) "
-    r"PUT_MANY_CALLS=(?P<put_many_calls>\d+) INDEX_CANDIDATES=(?P<index_candidates>\d+) "
-    r"CANDIDATE_READS=(?P<candidate_reads>\d+) HASH_MISMATCHES=(?P<hash_mismatches>\d+) "
-    r"CACHE_MISSES=(?P<cache_misses>\d+) SHARDS=(?P<shards>\d+) "
-    r"EST_READ_RUNS=(?P<read_runs>\d+) READ_SPAN_BYTES=(?P<read_span_bytes>\d+) "
-    r"CANDIDATE_FRAME_BYTES=(?P<candidate_frame_bytes>\d+) SIDECAR_WRITES=(?P<sidecar_writes>\d+) "
-    r"CHECKPOINT_WRITES=(?P<checkpoint_writes>\d+) DELTA_APPENDS=(?P<delta_appends>\d+) "
-    r"PACK_FLUSH_MS=(?P<pack_flush_ms>[\d.]+) PACK_FSYNC_MS=(?P<pack_fsync_ms>[\d.]+) "
-    r"SIDECAR_MS=(?P<sidecar_ms>[\d.]+) DELTA_MS=(?P<delta_ms>[\d.]+) "
-    r"CHECKPOINT_MS=(?P<checkpoint_ms>[\d.]+)",
-    re.MULTILINE,
+    r"""
+    ^bench:\s+import\s+MODE=(?P<mode>\w+)\s+COLLECTIONS=(?P<collections>\d+)
+    \s+RECORDS=(?P<records>\d+)\s+IMPORT_MS=(?P<import_ms>[\d.]+)
+    \s+SYNC_MS=(?P<sync_ms>[\d.]+)\s+GET_CALLS=(?P<get_calls>\d+)
+    \s+GET_MANY_CALLS=(?P<get_many_calls>\d+)\s+PUT_CALLS=(?P<put_calls>\d+)
+    \s+PUT_MANY_CALLS=(?P<put_many_calls>\d+)
+    \s+INDEX_CANDIDATES=(?P<index_candidates>\d+)
+    \s+CANDIDATE_READS=(?P<candidate_reads>\d+)
+    \s+HASH_MISMATCHES=(?P<hash_mismatches>\d+)
+    \s+CACHE_MISSES=(?P<cache_misses>\d+)\s+SHARDS=(?P<shards>\d+)
+    \s+EST_READ_RUNS=(?P<read_runs>\d+)
+    \s+READ_SPAN_BYTES=(?P<read_span_bytes>\d+)
+    \s+CANDIDATE_FRAME_BYTES=(?P<candidate_frame_bytes>\d+)
+    \s+SIDECAR_WRITES=(?P<sidecar_writes>\d+)
+    \s+CHECKPOINT_WRITES=(?P<checkpoint_writes>\d+)
+    \s+DELTA_APPENDS=(?P<delta_appends>\d+)
+    \s+PACK_FLUSH_MS=(?P<pack_flush_ms>[\d.]+)
+    \s+PACK_FSYNC_MS=(?P<pack_fsync_ms>[\d.]+)
+    \s+SIDECAR_MS=(?P<sidecar_ms>[\d.]+)
+    \s+DELTA_MS=(?P<delta_ms>[\d.]+)
+    \s+CHECKPOINT_MS=(?P<checkpoint_ms>[\d.]+)
+    """,
+    re.MULTILINE | re.VERBOSE,
 )
 
 
