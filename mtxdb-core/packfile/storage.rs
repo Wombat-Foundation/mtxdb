@@ -5742,7 +5742,7 @@ pub struct RuntimeStats {
     /// fetch whole pages, readahead ranges, or merged extents.
     pub candidate_frame_bytes: u64,
     /// Estimated/logical offset runs a `get_many` batch collapses candidate
-    /// reads into (stats-gated; gap heuristic per [`READ_RUN_GAP_BYTES`], not
+    /// reads into (stats-gated; gap heuristic per `READ_RUN_GAP_BYTES`, not
     /// measured physical sequential reads).
     pub read_many_runs: u64,
     /// Per-shard `last − first` candidate-offset fan-in summed across a
