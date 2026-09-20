@@ -5647,6 +5647,7 @@ impl PackfileStorage {
             index_bytes,
             collection_count: summaries.len(),
             max_index_probe_len,
+            dirty_lock_wait: self.shards.dirty_lock_wait(),
         }
     }
 
@@ -5853,6 +5854,14 @@ pub struct RuntimeStats {
     /// (e.g. under adversarial content against a misconfigured/unseeded
     /// deployment) without any change in behavior.
     pub max_index_probe_len: u32,
+    /// Cumulative wall-clock time any `sync`/`sync_all` caller has spent
+    /// waiting to acquire the shard pool's dirty-set lock (never reset —
+    /// see `ShardPool::dirty_lock_wait`). Exists to answer, before building
+    /// a finer-grained per-shard sync coalescing mechanism, whether the
+    /// current coarse lock is actually a measurable contention point under
+    /// real concurrent-writer load: compare this against total sync wall
+    /// time (`last_sync_timings`) to judge whether it's worth pursuing.
+    pub dirty_lock_wait: std::time::Duration,
 }
 
 impl Default for RuntimeStats {
@@ -5899,6 +5908,7 @@ impl Default for RuntimeStats {
             index_bytes: 0,
             collection_count: 0,
             max_index_probe_len: 0,
+            dirty_lock_wait: std::time::Duration::ZERO,
         }
     }
 }
@@ -7528,6 +7538,42 @@ mod tests {
         let snapshot = store.stats();
         assert_eq!(snapshot.sync_calls, 2);
         assert_eq!(snapshot.delta_appends, 1);
+    }
+
+    #[test]
+    fn stats_surfaces_max_index_probe_len_and_dirty_lock_wait() {
+        let dir = test_dir("stats_probe_len_and_lock_wait");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // Fresh store, no writes: neither counter has anything to report.
+        let snapshot = store.stats();
+        assert_eq!(snapshot.max_index_probe_len, 0);
+        assert_eq!(snapshot.dirty_lock_wait, std::time::Duration::ZERO);
+
+        for i in 0..20u8 {
+            let mut id = [0u8; 16];
+            id[0] = i;
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &id,
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        // A real sync exercises the dirty-set lock at least once; the exact
+        // wait duration is unmeasurable deterministically (uncontended in a
+        // single-threaded test), but the field must be wired through from
+        // `ShardPool::dirty_lock_wait` and never decrease.
+        store.sync().unwrap();
+        let after_sync = store.stats();
+        assert!(after_sync.dirty_lock_wait >= snapshot.dirty_lock_wait);
+        // 20 inserts into a real index will very likely walk at least one
+        // non-trivial probe chain, but this is observability, not a
+        // guarantee -- assert the field is wired through and sane
+        // (bounded by the collection's own capacity) rather than a specific
+        // value.
+        assert!(after_sync.max_index_probe_len < 1000);
     }
 
     #[test]

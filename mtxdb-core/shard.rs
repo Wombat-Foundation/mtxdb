@@ -491,6 +491,13 @@ pub struct ShardPool {
     /// attribute sync cost between buffered frame write-out and the fsync
     /// calls themselves. `None` until the first sync.
     last_sync_split: Mutex<Option<(Duration, Duration)>>,
+    /// Cumulative wall-clock time (microseconds) spent waiting to acquire
+    /// `dirty` inside `sync_dirty` and `sync_all`. Pure observability —
+    /// never resets, monotonically increasing. Lets operators confirm
+    /// whether the coarse dirty-set lock is actually a contention point
+    /// under concurrent load, before replacing it with a finer-grained
+    /// mechanism.
+    dirty_lock_wait: AtomicU64,
     last_open_timings: Mutex<Option<ShardOpenTimings>>,
     /// Whether this pool holds the writer lock on `base_dir` (see `open`
     /// vs `open_read_only`). Gates `persist_stats`: a read-only pool
@@ -792,7 +799,6 @@ impl ShardPool {
         Ok(pack_files)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn open_internal(
         base_dir: PathBuf,
         writable: bool,
@@ -1014,6 +1020,7 @@ impl ShardPool {
             stats_persisted_at: RwLock::new(stats_persisted_at),
             last_stats_flush: RwLock::new(None),
             last_sync_split: Mutex::new(None),
+            dirty_lock_wait: AtomicU64::new(0),
             last_open_timings: Mutex::new(Some(ShardOpenTimings {
                 discovery: discovery_time,
                 writer_lock: writer_lock_time,
@@ -2461,7 +2468,12 @@ impl ShardPool {
         let had_dirty;
         {
             let shards = self.shards.read();
+            let lock_wait = Instant::now();
             let mut dirty_set = self.dirty.lock();
+            self.dirty_lock_wait.fetch_add(
+                u64::try_from(lock_wait.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             // Snapshot the shards with unsynced data and fsync the whole pool
             // (not just those) — `sync_all` commits everything. Only the ids
             // captured here are cleared afterwards, mirroring `sync_dirty`: a
@@ -2498,6 +2510,15 @@ impl ShardPool {
         *self.last_sync_split.lock()
     }
 
+    /// Cumulative wall-clock time spent waiting to acquire the dirty-set
+    /// lock inside `sync_dirty` and `sync_all`. Monotonically increasing,
+    /// never reset. Compare against total sync wall time to gauge whether
+    /// the coarse lock is a real contention point under concurrent load.
+    #[must_use]
+    pub fn dirty_lock_wait(&self) -> Duration {
+        Duration::from_micros(self.dirty_lock_wait.load(Ordering::Relaxed))
+    }
+
     /// Sync only shards written to since the last sync.
     ///
     /// Each shard's dirty bit is cleared only after a successful fsync,
@@ -2517,7 +2538,12 @@ impl ShardPool {
         let had_dirty;
         {
             let shards = self.shards.read();
+            let lock_wait = Instant::now();
             let mut dirty_set = self.dirty.lock();
+            self.dirty_lock_wait.fetch_add(
+                u64::try_from(lock_wait.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             let dirty: Vec<u16> = dirty_set.iter().copied().collect();
             had_dirty = !dirty.is_empty();
             for &id in &dirty {
@@ -2752,6 +2778,35 @@ mod tests {
         assert!(pool.dirty.lock().is_empty());
         pool.sync_dirty().unwrap();
         assert!(pool.dirty.lock().is_empty());
+    }
+
+    #[test]
+    fn dirty_lock_wait_starts_at_zero_and_accrues_on_sync() {
+        let dir = test_dir("dirty_lock_wait");
+        let pool = ShardPool::open(dir).unwrap();
+        assert_eq!(
+            pool.dirty_lock_wait(),
+            Duration::ZERO,
+            "a fresh pool has never contended for the dirty-set lock"
+        );
+
+        let record = test_record(0x01, 0xAA, b"hello");
+        pool.put_record(&record).unwrap();
+        pool.sync_dirty().unwrap();
+        // A single-threaded sync still acquires the lock (uncontended), so
+        // this only asserts the counter is wired up and monotonic, not that
+        // it measures anything close to real contention -- that's the whole
+        // point of adding it before building a fancier coalescing
+        // mechanism: this call answers "is it wired up," a real concurrent
+        // workload answers "does it matter."
+        let after_one_sync = pool.dirty_lock_wait();
+
+        pool.put_record(&test_record(0x01, 0xAB, b"world")).unwrap();
+        pool.sync_dirty().unwrap();
+        assert!(
+            pool.dirty_lock_wait() >= after_one_sync,
+            "dirty_lock_wait must never decrease"
+        );
     }
 
     #[test]

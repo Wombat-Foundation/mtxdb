@@ -1421,16 +1421,21 @@ fn print_stats_table(
         stats.put_many_fast_path_calls, stats.put_many_clone_path_calls
     );
     println!(
-        "    index clone      {}   grows {}   rebuilds {}",
+        "    index clone      {}   grows {}   rebuilds {}   max probe len {}",
         fmt_ms(stats.index_clone_time),
         stats.index_grow_count,
-        stats.index_rebuild_count
+        stats.index_rebuild_count,
+        stats.max_index_probe_len
     );
     println!(
         "    delta            {} invalidations   {} checkpoint writes   {} delta appends",
         stats.delta_invalidations, stats.checkpoint_writes, stats.delta_appends
     );
-    println!("    sync             {} calls", stats.sync_calls);
+    println!(
+        "    sync             {} calls   dirty-lock wait {}",
+        stats.sync_calls,
+        fmt_ms(stats.dirty_lock_wait)
+    );
     println!(
         "    get (read ctrs)  {} calls / {} misses   get_many {} batches / {} records / {} misses",
         stats.get_calls,
@@ -1568,6 +1573,11 @@ fn print_stats_json(
             ("cache_hits", stats.cache.hits.to_string()),
             ("cache_misses", stats.cache.misses.to_string()),
             ("cache_hit_rate", stats.cache.hit_rate.to_string()),
+            ("max_index_probe_len", stats.max_index_probe_len.to_string()),
+            (
+                "dirty_lock_wait_ns",
+                stats.dirty_lock_wait.as_nanos().to_string(),
+            ),
         ],
         "  ",
     );
