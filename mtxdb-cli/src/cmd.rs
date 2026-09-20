@@ -2501,10 +2501,26 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
     u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
 }
 
+/// Common options shared by `scan_pack` and `cmd_scan_collection`.
 #[allow(
-    clippy::too_many_arguments,
-    reason = "the command dispatcher keeps scan filters and output options explicit"
+    clippy::struct_excessive_bools,
+    reason = "CLI scan flags map 1:1 to bools"
 )]
+struct ScanOptions {
+    verbose: bool,
+    limit: i64,
+    node_id: Option<[u8; 16]>,
+    raw: bool,
+    sort_payload: bool,
+    reverse: bool,
+}
+
+impl ScanOptions {
+    fn max_rows(&self) -> usize {
+        scan_limit(self.limit)
+    }
+}
+
 fn cmd_scan(
     cli: &Cli,
     selector: &str,
@@ -2524,12 +2540,16 @@ fn cmd_scan(
     if sort_payload && (!verbose || raw) {
         bail!("scan sorting requires --verbose and cannot be combined with --raw");
     }
-    // No `--id` requirement: `--raw` dumps every matching frame's payload
-    // (concatenated, in scan order), capped by `--limit` like the normal
-    // listing, so a bare selector with several matches still "just works"
-    // instead of erroring.
     let node_id = id.map(parse_node_id).transpose()?;
     let collection_filter = collection.map(parse_collection_id).transpose()?;
+    let opts = ScanOptions {
+        verbose,
+        limit,
+        node_id,
+        raw,
+        sort_payload,
+        reverse,
+    };
     // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
     // it's `0x`-prefixed with something other than 32 hex digits after it —
     // everything else (bare 32 hex digits, or `0x` + 32 hex digits) is a
@@ -2544,16 +2564,7 @@ fn cmd_scan(
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
         }
-        return cmd_scan_collection(
-            cli,
-            selector,
-            verbose,
-            limit,
-            node_id,
-            raw,
-            sort_payload,
-            reverse,
-        );
+        return cmd_scan_collection(cli, selector, &opts);
     }
     let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -2563,18 +2574,7 @@ fn cmd_scan(
         .into_iter()
         .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
         .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
-    scan_pack(
-        cli,
-        &shard,
-        pack_id,
-        verbose,
-        limit,
-        collection_filter,
-        node_id,
-        raw,
-        sort_payload,
-        reverse,
-    )
+    scan_pack(cli, &shard, pack_id, collection_filter, &opts)
 }
 
 #[allow(
@@ -2585,55 +2585,50 @@ fn scan_pack(
     cli: &Cli,
     shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
     pack_id: u64,
-    verbose: bool,
-    limit: i64,
     collection_filter: Option<[u8; 16]>,
-    node_id: Option<[u8; 16]>,
-    raw: bool,
-    sort_payload: bool,
-    reverse: bool,
+    opts: &ScanOptions,
 ) -> anyhow::Result<()> {
     let path = &shard.path;
-    let max_rows = scan_limit(limit);
+    let max_rows = opts.max_rows();
     let mut records = Vec::new();
     let mut matched_records = 0usize;
     let mut truncated = false;
-    let verify_payload = verbose || raw;
+    let verify_payload = opts.verbose || opts.raw;
     for record in mtxdb_core::packfile::scan_packfile_iter(path, verify_payload)? {
         let (record_collection, record_id, offset) = record?;
         // TODO: tied to MSRV 1.81.0 — replace with .is_none_or() once the
         // minimum is bumped to 1.82+.
         if !collection_filter.map_or(true, |wanted| record_collection == wanted)
-            || !node_id.map_or(true, |wanted| record_id == wanted)
+            || !opts.node_id.map_or(true, |wanted| record_id == wanted)
         {
             continue;
         }
         matched_records = matched_records.saturating_add(1);
-        if sort_payload || records.len() < max_rows {
+        if opts.sort_payload || records.len() < max_rows {
             records.push((record_collection, record_id, offset));
         } else {
             truncated = true;
             break;
         }
     }
-    if sort_payload {
+    if opts.sort_payload {
         records.sort_by_cached_key(|(_, _, offset)| {
             ShardPool::read_at_committed(shard, *offset, true)
                 .map(|record| record.data.to_vec())
                 .unwrap_or_default()
         });
-        if reverse {
+        if opts.reverse {
             records.reverse();
         }
         truncated = records.len() > max_rows;
     }
-    if raw {
+    if opts.raw {
         let stdout = io::stdout();
         let mut out = stdout.lock();
         for (_, _, offset) in records.iter().take(max_rows) {
             let data = ShardPool::read_at_committed(shard, *offset, true)?;
             out.write_all(&data.data)?;
-            if verbose {
+            if opts.verbose {
                 eprintln!(
                     "pack 0x{pack_id:016x}: raw frame @ {offset} ({} bytes, checksum verified)",
                     data.data.len()
@@ -2663,7 +2658,8 @@ fn scan_pack(
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
-        let data = verbose
+        let data = opts
+            .verbose
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
             .transpose()?;
         let payload = data
@@ -2722,16 +2718,7 @@ fn scan_payload_cell(data: &[u8], shard_type: ShardType) -> String {
 /// Print every physical frame for a collection across all packs. This is a
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
-fn cmd_scan_collection(
-    cli: &Cli,
-    selector: &str,
-    verbose: bool,
-    limit: i64,
-    node_id: Option<[u8; 16]>,
-    raw: bool,
-    sort_payload: bool,
-    reverse: bool,
-) -> anyhow::Result<()> {
+fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = match ShardPool::open_read_only(pool_dir.clone()) {
@@ -2761,19 +2748,19 @@ fn cmd_scan_collection(
         .map(|packs| packs.into_iter().collect::<HashSet<_>>());
 
     let mut packs = 0_usize;
-    let max_rows = scan_limit(limit);
+    let max_rows = opts.max_rows();
     let bounded = max_rows != usize::MAX;
     let mut context = CollectionScanContext {
         collection_id,
-        node_id,
-        mode: CollectionScanMode::new(verbose, raw, sort_payload),
+        node_id: opts.node_id,
+        mode: CollectionScanMode::new(opts.verbose, opts.raw, opts.sort_payload),
         max_rows,
         frames: 0,
         raw_matches: Vec::new(),
         header_printed: false,
         shard_type: cli.shard_type,
         sorted_records: Vec::new(),
-        reverse,
+        reverse: opts.reverse,
     };
     for (_, shard) in shards {
         if let Some(collection_packs) = &collection_packs {
@@ -2783,7 +2770,7 @@ fn cmd_scan_collection(
         }
         let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
-        if bounded && !sort_payload && context.frames >= max_rows {
+        if bounded && !opts.sort_payload && context.frames >= max_rows {
             break;
         }
     }
@@ -2802,7 +2789,7 @@ fn cmd_scan_collection(
         for (shard, _, offset) in context.raw_matches.iter().take(max_rows) {
             let data = ShardPool::read_at_committed(shard, *offset, true)?;
             out.write_all(&data.data)?;
-            if verbose {
+            if opts.verbose {
                 eprintln!(
                     "collection {}: raw frame @ {offset} ({} bytes, checksum verified)",
                     hex_encode(&collection_id),
@@ -3017,13 +3004,16 @@ fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
     if pretty_print_payload(data).is_some() {
         return None;
     }
-    Some(match data.get(0..4) {
-        Some(magic) => format!(
-            "{} bytes (undecodable, magic=0x{:08x})",
-            data.len(),
-            u32::from_be_bytes(magic.try_into().unwrap())
-        ),
-        None => format!("{} bytes (undecodable, too short)", data.len()),
+    Some(match data.len() {
+        0 => "0 bytes [TOMBSTONE - GC'd ON REPACK]".to_owned(),
+        _ => match data.get(0..4) {
+            Some(magic) => format!(
+                "{} bytes (undecodable, magic=0x{:08x})",
+                data.len(),
+                u32::from_be_bytes(magic.try_into().unwrap())
+            ),
+            None => format!("{} bytes (undecodable, too short)", data.len()),
+        },
     })
 }
 
