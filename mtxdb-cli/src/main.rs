@@ -49,6 +49,7 @@ pub(crate) enum Commands {
         collection: Option<String>,
         raw: bool,
         sort: Option<String>,
+        reverse: bool,
     },
     Import {
         paths: Vec<PathBuf>,
@@ -341,6 +342,13 @@ fn sub_scan() -> Command {
                      context line goes to stderr so stdout stays a clean byte stream",
         ))
         .arg(sort_arg("payload"))
+        .arg(
+            Arg::new("reverse")
+                .short('R')
+                .long("reverse")
+                .action(ArgAction::SetTrue)
+                .help("Reverse the sort order (descending) when used with -s"),
+        )
         .arg(limit_arg())
 }
 
@@ -561,6 +569,7 @@ fn parse_cli() -> Cli {
             collection: m.get_one::<String>("collection").cloned(),
             raw: m.get_flag("raw"),
             sort: m.get_one::<String>("sort").cloned(),
+            reverse: m.get_flag("reverse"),
             limit: *m
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),

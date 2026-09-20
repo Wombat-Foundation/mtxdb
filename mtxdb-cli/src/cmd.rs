@@ -170,6 +170,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection,
             raw,
             sort,
+            reverse,
         } => cmd_scan(
             cli,
             selector,
@@ -179,6 +180,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection.as_deref(),
             *raw,
             sort.as_deref(),
+            *reverse,
         ),
         Commands::Import {
             paths,
@@ -2512,6 +2514,7 @@ fn cmd_scan(
     collection: Option<&str>,
     raw: bool,
     sort: Option<&str>,
+    reverse: bool,
 ) -> anyhow::Result<()> {
     let sort_payload = match sort {
         None => false,
@@ -2541,7 +2544,16 @@ fn cmd_scan(
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
         }
-        return cmd_scan_collection(cli, selector, verbose, limit, node_id, raw, sort_payload);
+        return cmd_scan_collection(
+            cli,
+            selector,
+            verbose,
+            limit,
+            node_id,
+            raw,
+            sort_payload,
+            reverse,
+        );
     }
     let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -2561,6 +2573,7 @@ fn cmd_scan(
         node_id,
         raw,
         sort_payload,
+        reverse,
     )
 }
 
@@ -2578,6 +2591,7 @@ fn scan_pack(
     node_id: Option<[u8; 16]>,
     raw: bool,
     sort_payload: bool,
+    reverse: bool,
 ) -> anyhow::Result<()> {
     let path = &shard.path;
     let max_rows = scan_limit(limit);
@@ -2608,6 +2622,9 @@ fn scan_pack(
                 .map(|record| record.data.to_vec())
                 .unwrap_or_default()
         });
+        if reverse {
+            records.reverse();
+        }
         truncated = records.len() > max_rows;
     }
     if raw {
@@ -2713,6 +2730,7 @@ fn cmd_scan_collection(
     node_id: Option<[u8; 16]>,
     raw: bool,
     sort_payload: bool,
+    reverse: bool,
 ) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -2755,6 +2773,7 @@ fn cmd_scan_collection(
         header_printed: false,
         shard_type: cli.shard_type,
         sorted_records: Vec::new(),
+        reverse,
     };
     for (_, shard) in shards {
         if let Some(collection_packs) = &collection_packs {
@@ -2832,6 +2851,9 @@ fn sort_collection_records(context: &mut CollectionScanContext) {
                     .map(|record| record.data.to_vec())
                     .unwrap_or_default()
             });
+        if context.reverse {
+            context.sorted_records.reverse();
+        }
     }
 }
 
@@ -2845,6 +2867,7 @@ struct CollectionScanContext {
     header_printed: bool,
     shard_type: ShardType,
     sorted_records: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, [u8; 16], u64)>,
+    reverse: bool,
 }
 
 #[derive(Clone, Copy)]
