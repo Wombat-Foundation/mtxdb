@@ -23,10 +23,6 @@ impl Cli {
     }
 
     /// Iterate over the selected shard types (one if specific, all three if `-t all`).
-    #[allow(
-        dead_code,
-        reason = "used once collections/shards --all is consolidated"
-    )]
     pub(crate) fn shard_types(&self) -> impl Iterator<Item = ShardType> + '_ {
         self.shard_type.into_iter().chain(
             self.shard_type

@@ -975,9 +975,15 @@ fn cmd_collections(
     sort: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<()> {
-    if all {
+    // `--all` explicitly asks for every pool; `-t all` (no specific shard
+    // type selected) means the same thing — without this, `-t all` fell
+    // through to `selected_pool_dir`'s `require_shard_type`, which always
+    // rejects an unselected type, even though `-t all` completes and parses
+    // as a legitimate value.
+    if all || cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
-        for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
+        let types: Vec<ShardType> = cli.shard_types().collect();
+        for (index, shard_type) in types.into_iter().enumerate() {
             if index != 0 {
                 println!();
                 println!();
@@ -1290,9 +1296,12 @@ fn print_pack_physical_layout(
 }
 
 fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
-    if all {
+    // See the matching comment in `cmd_collections`: `-t all` must behave
+    // like `--all`, not fall through to `require_shard_type`'s rejection.
+    if all || cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
-        for (index, shard_type) in ShardType::ALL.into_iter().enumerate() {
+        let types: Vec<ShardType> = cli.shard_types().collect();
+        for (index, shard_type) in types.into_iter().enumerate() {
             if index != 0 {
                 println!();
                 println!();

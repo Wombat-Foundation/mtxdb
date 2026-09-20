@@ -1117,6 +1117,7 @@ impl PackfileStorage {
             &open_shards,
             &deleted_collections,
             writable,
+            index_config,
             &mut timings,
         ) {
             timings.path = OpenPath::Checkpoint;
@@ -1531,6 +1532,7 @@ impl PackfileStorage {
         open_shards: &[(u16, u64, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
         writable: bool,
+        index_config: crate::index::IndexConfig,
         timings: &mut OpenTimings,
     ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState)> {
         let decode_started = std::time::Instant::now();
@@ -1659,11 +1661,12 @@ impl PackfileStorage {
             // The checkpoint reader has already validated this range. Keep it
             // mmap-backed through the read-only fast path; the first writer
             // copy-on-writes it into the normal atomic slot array.
-            let mmap_index = LossyIndex::from_mmap_slots(
+            let mmap_index = LossyIndex::from_mmap_slots_with_config(
                 Arc::clone(&checkpoint.mmap),
                 loaded.slots_offset,
                 loaded.capacity,
                 loaded.slot_count,
+                index_config,
             );
             // Collections with replayed frames must be materialized (owned) so
             // the frames can be applied on top of the raw checkpoint slots;

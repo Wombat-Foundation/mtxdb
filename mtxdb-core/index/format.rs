@@ -12,7 +12,7 @@ pub const DELTA_FRAME_LEN: usize = 36;
 /// Bytes in the checkpoint header.
 pub const CHECKPOINT_HEADER_LEN: usize = 64;
 /// Bytes in one collection directory entry.
-pub const COLLECTION_DIR_ENTRY_LEN: usize = 40;
+pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
 
 /// One slot overwrite after a checkpoint.
 ///
@@ -62,7 +62,7 @@ impl DeltaFrame {
 }
 
 /// Checkpoint envelope.  The directory immediately follows this header,
-/// followed by the concatenated raw index slot arrays.
+/// followed by the concatenated raw index slot arrays, then homes and tails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointHeader {
     /// Format-identifying magic bytes.
@@ -79,15 +79,15 @@ pub struct CheckpointHeader {
     pub pack_fingerprint: u64,
     /// CRC-32/IEEE (`crc32fast`, the same crate/polynomial already used for
     /// pack-frame checksums) of every byte after this header — the
-    /// directory and raw slot sections combined. Verified once, in full, at
-    /// read time in place of re-deriving each collection's occupancy by
-    /// walking its slots (see `read_checkpoint`): a single SIMD-accelerated
-    /// pass over the same bytes catches the same corruption — and, because
-    /// the directory section (each entry's `capacity`/`slot_count`) is
-    /// inside the hashed range too, also catches directory corruption the
-    /// old per-collection occupancy walk never checked at all — at a
-    /// fraction of the cost of the manual scan-and-branch loop it replaces.
+    /// directory, raw slot, homes, and tails sections combined. Verified
+    /// once, in full, at read time.
     pub content_crc32: u32,
+    /// Total byte length of the homes section (all collections concatenated).
+    /// Zero for pre-v4 checkpoints.
+    pub homes_bytes: u64,
+    /// Total byte length of the tails section (all collections concatenated).
+    /// Zero for pre-v4 checkpoints.
+    pub tails_bytes: u64,
 }
 
 impl CheckpointHeader {
@@ -102,6 +102,8 @@ impl CheckpointHeader {
         bytes[24..32].copy_from_slice(&self.slots_bytes.to_le_bytes());
         bytes[32..40].copy_from_slice(&self.pack_fingerprint.to_le_bytes());
         bytes[40..44].copy_from_slice(&self.content_crc32.to_le_bytes());
+        bytes[44..52].copy_from_slice(&self.homes_bytes.to_le_bytes());
+        bytes[52..60].copy_from_slice(&self.tails_bytes.to_le_bytes());
         bytes
     }
 
@@ -117,11 +119,13 @@ impl CheckpointHeader {
             slots_bytes: u64::from_le_bytes(bytes[24..32].try_into().ok()?),
             pack_fingerprint: u64::from_le_bytes(bytes[32..40].try_into().ok()?),
             content_crc32: u32::from_le_bytes(bytes[40..44].try_into().ok()?),
+            homes_bytes: u64::from_le_bytes(bytes[44..52].try_into().ok()?),
+            tails_bytes: u64::from_le_bytes(bytes[52..60].try_into().ok()?),
         })
     }
 }
 
-/// Locates one collection's raw slot array in a checkpoint.
+/// Locates one collection's raw slot, homes, and tails arrays in a checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectionDirEntry {
     /// The collection whose raw slots this entry locates.
@@ -130,6 +134,12 @@ pub struct CollectionDirEntry {
     pub generation: u64,
     /// Byte offset of the collection's slot data in the checkpoint.
     pub slots_offset: u64,
+    /// Byte offset of the collection's homes data in the checkpoint.
+    /// Zero for pre-v4 checkpoints (homes not persisted).
+    pub homes_offset: u64,
+    /// Byte offset of the collection's tails data in the checkpoint.
+    /// Zero for pre-v4 checkpoints (tails not persisted).
+    pub tails_offset: u64,
     /// Number of slots allocated by the collection's index.
     pub capacity: u32,
     /// Number of occupied slots.
@@ -144,8 +154,10 @@ impl CollectionDirEntry {
         bytes[..16].copy_from_slice(&self.collection_id);
         bytes[16..24].copy_from_slice(&self.generation.to_le_bytes());
         bytes[24..32].copy_from_slice(&self.slots_offset.to_le_bytes());
-        bytes[32..36].copy_from_slice(&self.capacity.to_le_bytes());
-        bytes[36..40].copy_from_slice(&self.slot_count.to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.homes_offset.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.tails_offset.to_le_bytes());
+        bytes[48..52].copy_from_slice(&self.capacity.to_le_bytes());
+        bytes[52..56].copy_from_slice(&self.slot_count.to_le_bytes());
         bytes
     }
 
@@ -157,8 +169,10 @@ impl CollectionDirEntry {
             collection_id: bytes[..16].try_into().ok()?,
             generation: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
             slots_offset: u64::from_le_bytes(bytes[24..32].try_into().ok()?),
-            capacity: u32::from_le_bytes(bytes[32..36].try_into().ok()?),
-            slot_count: u32::from_le_bytes(bytes[36..40].try_into().ok()?),
+            homes_offset: u64::from_le_bytes(bytes[32..40].try_into().ok()?),
+            tails_offset: u64::from_le_bytes(bytes[40..48].try_into().ok()?),
+            capacity: u32::from_le_bytes(bytes[48..52].try_into().ok()?),
+            slot_count: u32::from_le_bytes(bytes[52..56].try_into().ok()?),
         })
     }
 }
@@ -179,12 +193,14 @@ mod tests {
 
         let header = CheckpointHeader {
             magic: *b"MTXIDX01",
-            version: 1,
+            version: 4,
             collection_count: 2,
-            directory_bytes: 80,
+            directory_bytes: 112,
             slots_bytes: 128,
             pack_fingerprint: 9,
             content_crc32: 0xDEAD_BEEF,
+            homes_bytes: 0,
+            tails_bytes: 0,
         };
         assert_eq!(CheckpointHeader::decode(&header.encode()), Some(header));
 
@@ -192,6 +208,8 @@ mod tests {
             collection_id: [5; 16],
             generation: 6,
             slots_offset: 7,
+            homes_offset: 100,
+            tails_offset: 200,
             capacity: 8,
             slot_count: 9,
         };

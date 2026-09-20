@@ -11,8 +11,49 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Immutable descriptor at a database root.
-const DB_META: &[u8] = b"MDBD\x01\nstate\nevent-dag\nauth-chain\n";
+///
+/// Layout: `magic(4) | version(1) | reserved(8) | pool list`. The reserved
+/// bytes are zero-filled and unused today; they exist so a future format
+/// revision can add a field without another exact-byte-equality break, the
+/// same way `pool.meta` carries a version byte. Not deployed anywhere yet,
+/// so the descriptor is parsed (magic + version + pool list), not compared
+/// byte-for-byte — a mismatched version is rejected with a specific error
+/// rather than silently misparsed.
+const DB_META_MAGIC: &[u8; 4] = b"MDBD";
+const DB_META_VERSION: u8 = 1;
+const DB_META_RESERVED_LEN: usize = 8;
+const DB_META_POOL_LIST: &[u8] = b"state\nevent-dag\nauth-chain\n";
 const DB_META_FILENAME: &str = "db.meta";
+
+/// `magic + version` header length shared by the writer and the validator.
+const DB_META_HEADER_LEN: usize = 4 + 1 + DB_META_RESERVED_LEN;
+
+/// Build the on-disk descriptor bytes for a fresh database root.
+fn db_meta_bytes() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(DB_META_HEADER_LEN.saturating_add(DB_META_POOL_LIST.len()));
+    buf.extend_from_slice(DB_META_MAGIC);
+    buf.push(DB_META_VERSION);
+    buf.extend_from_slice(&[0u8; DB_META_RESERVED_LEN]);
+    buf.extend_from_slice(DB_META_POOL_LIST);
+    buf
+}
+
+/// Validate a descriptor read from disk: correct magic, a version this
+/// build understands, and the expected pool list. The reserved bytes are
+/// not validated — a future version may give them meaning, but this build
+/// only ever writes them zero-filled.
+fn validate_db_meta(contents: &[u8]) -> bool {
+    if contents.len() < DB_META_HEADER_LEN {
+        return false;
+    }
+    if &contents[..4] != DB_META_MAGIC {
+        return false;
+    }
+    if contents[4] != DB_META_VERSION {
+        return false;
+    }
+    contents[DB_META_HEADER_LEN..] == *DB_META_POOL_LIST
+}
 
 /// A named independent packfile pool in an mtxdb database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +107,7 @@ impl DatabaseLayout {
         let meta_path = root.join(DB_META_FILENAME);
         if meta_path.exists() {
             let contents = fs::read(&meta_path)?;
-            if contents != DB_META {
+            if !validate_db_meta(&contents) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -135,7 +176,7 @@ impl DatabaseLayout {
             ));
         }
         let contents = fs::read(&meta_path)?;
-        if contents != DB_META {
+        if !validate_db_meta(&contents) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -171,12 +212,12 @@ impl DatabaseLayout {
     fn write_descriptor(path: &Path) -> io::Result<()> {
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
-                file.write_all(DB_META)?;
+                file.write_all(&db_meta_bytes())?;
                 file.sync_all()
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let contents = fs::read(path)?;
-                if contents == DB_META {
+                if validate_db_meta(&contents) {
                     Ok(())
                 } else {
                     Err(io::Error::new(
@@ -239,5 +280,36 @@ mod tests {
         let err = DatabaseLayout::open_read_only(root.clone()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn rejects_a_descriptor_with_an_unknown_version() {
+        let root = test_dir("bad_version");
+        fs::create_dir_all(&root).unwrap();
+        let mut bytes = super::db_meta_bytes();
+        bytes[4] = super::DB_META_VERSION.wrapping_add(1);
+        fs::write(root.join(DB_META_FILENAME), &bytes).unwrap();
+        let err = DatabaseLayout::open(root).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unrecognized"));
+    }
+
+    #[test]
+    fn rejects_a_truncated_descriptor() {
+        let root = test_dir("truncated_descriptor");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(DB_META_FILENAME), b"MDBD").unwrap();
+        let err = DatabaseLayout::open(root).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn reopening_an_existing_root_round_trips_the_descriptor() {
+        let root = test_dir("reopen_descriptor");
+        DatabaseLayout::open(root.clone()).unwrap();
+        // A second open of the same root must accept the descriptor it just
+        // wrote — this is the ordinary "reopen an existing database" path.
+        DatabaseLayout::open(root.clone()).unwrap();
+        DatabaseLayout::open_read_only(root).unwrap();
     }
 }

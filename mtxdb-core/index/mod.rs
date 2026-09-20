@@ -40,7 +40,11 @@ impl Default for IndexConfig {
 }
 
 impl IndexConfig {
-    /// Validate the configuration. Returns `Err(message)` on invalid values.
+    /// Validate the configuration.
+    ///
+    /// # Errors
+    /// Returns `Err(message)` if `load_factor_percent` is 0 or greater than
+    /// 90, or if `floor` is 0.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.load_factor_percent == 0 || self.load_factor_percent > 90 {
             return Err("load_factor_percent must be in 1..=90");
@@ -400,6 +404,10 @@ impl LossyIndex {
     /// # Errors
     /// Returns the same errors as [`Self::insert_tracked`] and leaves the
     /// table unmodified in every error case.
+    ///
+    /// # Panics
+    /// Never panics in practice: `hash[..8]` is always exactly 8 bytes for a
+    /// `&[u8; 16]` input, so the `try_into` this performs cannot fail.
     #[allow(clippy::cast_possible_truncation)]
     pub fn insert_undoable(
         &self,
@@ -660,12 +668,21 @@ impl LossyIndex {
 
     /// Look up all candidate offsets for a hash, yielding tag collisions.
     ///
-    /// The caller **must** verify each candidate against the caller-requested
-    /// hash. Tag collisions (0.1% at 24-bit tags) surface as candidates here;
-    /// only the one whose stored hash matches the request is valid.
+    /// Candidates with hydrated in-memory identity (home + tail) are verified
+    /// before yielding, so tag collisions in a live/warm index are filtered
+    /// out here rather than forcing the caller to disk. For a slot whose
+    /// identity is not yet hydrated (e.g. a fresh checkpoint restore), the
+    /// caller **must** verify the candidate against the caller-requested
+    /// hash — a raw tag collision (~1/65536 at 16-bit tags) can still surface
+    /// unverified.
     ///
-    /// Yields `(shard_id, offset)` for each slot whose tag matches, then
-    /// terminates at the first empty slot or after `capacity` probes.
+    /// Yields `(shard_id, offset)` for each slot whose tag matches and isn't
+    /// ruled out, then terminates at the first empty slot or after
+    /// `capacity` probes.
+    ///
+    /// # Panics
+    /// Never panics in practice: `hash[..8]` is always exactly 8 bytes for a
+    /// `&[u8; 16]` input, so the `try_into` this performs cannot fail.
     #[inline]
     #[must_use]
     pub fn lookup_all(&self, hash: &[u8; 16]) -> LookupIter<'_> {
@@ -785,14 +802,32 @@ impl LossyIndex {
     }
 
     /// Serialize the index to bytes for persistence.
+    ///
+    /// Format (all little-endian):
+    /// ```text
+    ///   [capacity: u64]
+    ///   [slot_0: u64] ... [slot_{cap-1}: u64]     ← capacity × 8 B
+    ///   [home_0: u64] ... [home_{cap-1}: u64]     ← capacity × 8 B (0 if unhydrated)
+    ///   [tail_0: u64] ... [tail_{cap-1}: u64]     ← capacity × 8 B (0 if unhydrated)
+    /// ```
+    /// Total: `8 + capacity * 24` bytes.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
-        let byte_len = 8_usize.wrapping_add((self.capacity as usize).wrapping_mul(8));
+        let cap = self.capacity as usize;
+        let byte_len = 8_usize.wrapping_add(cap.wrapping_mul(24));
         let mut buf = Vec::with_capacity(byte_len);
         buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
-        for index in 0..self.capacity as usize {
+        for index in 0..cap {
             let slot = IndexSlot(self.slot_at(index));
             buf.extend_from_slice(&slot.0.to_le_bytes());
+        }
+        let homes = self.homes.lock();
+        let tails = self.tails.lock();
+        for index in 0..cap {
+            buf.extend_from_slice(&homes[index].to_le_bytes());
+        }
+        for index in 0..cap {
+            buf.extend_from_slice(&tails[index].to_le_bytes());
         }
         buf
     }
@@ -811,6 +846,10 @@ impl LossyIndex {
     }
 
     /// Deserialize an index from bytes with a given config (providing seed).
+    ///
+    /// Accepts both the legacy slots-only format (`8 + cap*8` bytes) and the
+    /// v4 slots+homes+tails format (`8 + cap*24` bytes). Homes and tails are
+    /// populated from the blob when present; zeroed otherwise.
     ///
     /// # Errors
     /// Returns `DeserializationError::TooShort` if the data is too short,
@@ -835,10 +874,12 @@ impl LossyIndex {
             return Err(DeserializationError::InvalidCapacity);
         }
 
-        let expected_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(8));
-        if data.len() < expected_len {
+        let slots_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(8));
+        let full_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(24));
+        if data.len() < slots_len {
             return Err(DeserializationError::TooShort);
         }
+        let has_homes_tails = data.len() >= full_len;
 
         let mut slots = Vec::with_capacity(capacity_usize);
         let mut len: u32 = 0;
@@ -854,14 +895,42 @@ impl LossyIndex {
 
         let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
 
+        let homes = if has_homes_tails {
+            let base = slots_len;
+            let mut h = Vec::with_capacity(capacity_usize);
+            for i in 0..capacity_usize {
+                let offset = base.wrapping_add(i.wrapping_mul(8));
+                h.push(u64::from_le_bytes(
+                    data[offset..offset.wrapping_add(8)].try_into().unwrap(),
+                ));
+            }
+            h
+        } else {
+            vec![0; capacity_usize]
+        };
+
+        let tails = if has_homes_tails {
+            let base = slots_len.wrapping_add(capacity_usize.wrapping_mul(8));
+            let mut t = Vec::with_capacity(capacity_usize);
+            for i in 0..capacity_usize {
+                let offset = base.wrapping_add(i.wrapping_mul(8));
+                t.push(u64::from_le_bytes(
+                    data[offset..offset.wrapping_add(8)].try_into().unwrap(),
+                ));
+            }
+            t
+        } else {
+            vec![0; capacity_usize]
+        };
+
         Ok(Self {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
             config,
             slots: SlotStorage::Owned(slots),
-            homes: Mutex::new(vec![0; capacity_usize]),
-            tails: Mutex::new(vec![0; capacity_usize]),
+            homes: Mutex::new(homes),
+            tails: Mutex::new(tails),
             can_grow: false,
             len: AtomicU32::new(len),
         })

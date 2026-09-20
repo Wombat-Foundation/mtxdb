@@ -42,12 +42,12 @@ use super::format::{
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Current wire version (see [`CheckpointHeader::version`]).
 ///
-/// Bumped to 3: the slot layout changed from `24-bit tag | 12-bit shard | 28-bit
-/// offset` to `16-bit tag | 16-bit shard | 32-bit offset`, and homes/tails are
-/// now persisted in the checkpoint body. A pre-v3 checkpoint deserializes
-/// without error but decodes garbage under the new shift constants — this
-/// version gate rejects it instead.
-pub const CHECKPOINT_VERSION: u32 = 3;
+/// Bumped to 4: homes and tails are now persisted alongside packed slots.
+/// A pre-v4 checkpoint has `homes_bytes`/`tails_bytes` of 0 and is loaded
+/// with empty identity side tables (cold-start tag-collision verification
+/// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
+/// reads for tag collisions on cold start.
+pub const CHECKPOINT_VERSION: u32 = 4;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 
@@ -100,7 +100,7 @@ pub struct LoadedCheckpoint {
     pub mmap: Arc<Mmap>,
 }
 
-/// One collection's raw slots in the checkpoint mapping.
+/// One collection's raw slots, homes, and tails in the checkpoint mapping.
 #[derive(Debug)]
 pub struct LoadedCollection {
     /// The collection whose slots these are.
@@ -110,10 +110,18 @@ pub struct LoadedCollection {
     pub generation: u64,
     /// Absolute byte offset of the raw `capacity * 8` slot array.
     pub slots_offset: usize,
+    /// Absolute byte offset of the homes array (`capacity * 8` bytes).
+    /// 0 when the checkpoint is pre-v4 and homes were not persisted.
+    pub homes_offset: usize,
+    /// Absolute byte offset of the tails array (`capacity * 8` bytes).
+    /// 0 when the checkpoint is pre-v4 and tails were not persisted.
+    pub tails_offset: usize,
     /// Allocated index capacity.
     pub capacity: u32,
     /// Number of non-empty slots, recorded at checkpoint write time.
     pub slot_count: u32,
+    /// Whether homes/tails are present in this checkpoint.
+    pub has_homes_tails: bool,
 }
 
 /// Deterministic FNV-1a hash of the `(pack_id, file_len)` set a checkpoint
@@ -142,10 +150,16 @@ fn blob_capacity(blob: &[u8]) -> Option<u64> {
 }
 
 /// Number of occupied (non-`0u64`) slots in a `LossyIndex::serialize` blob's
-/// slot section.
+/// slot section. The blob format is `[capacity_u64][slots × cap][homes × cap][tails × cap]`.
 fn blob_slot_count(blob: &[u8]) -> u32 {
+    let Some(capacity) = blob_capacity(blob) else {
+        return 0;
+    };
+    let cap = capacity as usize;
+    let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
+    let slots = blob.get(8..slots_end).unwrap_or(&[]);
     u32::try_from(
-        blob[8..]
+        slots
             .chunks_exact(8)
             .filter(|slot| *slot != [0u8; 8])
             .count(),
@@ -184,52 +198,111 @@ pub fn write_checkpoint(
         .ok()
         .and_then(|n| n.checked_mul(COLLECTION_DIR_ENTRY_LEN as u64))
         .ok_or_else(|| std::io::Error::other("checkpoint directory size overflow"))?;
+
+    // Compute per-section byte lengths from the serialize blobs.
+    // Blob format: [capacity_u64][slots × cap][homes × cap][tails × cap]
     let mut slots_bytes: u64 = 0;
+    let mut homes_bytes: u64 = 0;
+    let mut tails_bytes: u64 = 0;
     for (_, _, blob) in collections {
-        let blob_len = u64::try_from(blob.len().saturating_sub(8))
-            .map_err(|_| std::io::Error::other("collection slot array too large"))?;
+        let capacity = blob_capacity(blob)
+            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
+        let cap8 = capacity
+            .checked_mul(8)
+            .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
         slots_bytes = slots_bytes
-            .checked_add(blob_len)
+            .checked_add(cap8)
             .ok_or_else(|| std::io::Error::other("checkpoint slots size overflow"))?;
+        // homes and tails are each capacity × 8 bytes when present in the blob
+        let blob_body = blob.len().saturating_sub(8);
+        if blob_body >= (capacity as usize) * 24 {
+            homes_bytes = homes_bytes
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint homes size overflow"))?;
+            tails_bytes = tails_bytes
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint tails size overflow"))?;
+        }
     }
 
+    let body_bytes = slots_bytes
+        .checked_add(homes_bytes)
+        .and_then(|v| v.checked_add(tails_bytes))
+        .ok_or_else(|| std::io::Error::other("checkpoint body size overflow"))?;
     let total_len = CHECKPOINT_HEADER_LEN
         .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(slots_bytes).unwrap_or(usize::MAX));
+        .saturating_add(usize::try_from(body_bytes).unwrap_or(usize::MAX));
     // Reserve the header first, then build the body directly into the final
     // buffer. This avoids retaining a second checkpoint-sized body merely to
     // calculate the CRC carried by the header.
     let mut buf = Vec::with_capacity(total_len);
     buf.resize(CHECKPOINT_HEADER_LEN, 0);
 
+    // Phase 1: build directory entries, tracking per-collection offsets.
     let mut slots_offset: u64 = 0;
+    let mut homes_offset: u64 = 0;
+    let mut tails_offset: u64 = 0;
     let mut dir_entries = Vec::with_capacity(collections.len());
     for (collection_id, generation, blob) in collections {
         let capacity = blob_capacity(blob)
             .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
         let capacity32 = u32::try_from(capacity)
             .map_err(|_| std::io::Error::other("index capacity exceeds u32"))?;
-        let slot_array_len: u64 = blob[8..]
-            .len()
-            .try_into()
-            .map_err(|_| std::io::Error::other("collection slot array too large"))?;
+        let cap8 = capacity
+            .checked_mul(8)
+            .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
+        let entry_homes_offset = homes_offset;
+        let entry_tails_offset = tails_offset;
         dir_entries.push(CollectionDirEntry {
             collection_id: *collection_id,
             generation: *generation,
             slots_offset,
+            homes_offset: entry_homes_offset,
+            tails_offset: entry_tails_offset,
             capacity: capacity32,
             slot_count: blob_slot_count(blob),
         });
         slots_offset = slots_offset
-            .checked_add(slot_array_len)
+            .checked_add(cap8)
             .ok_or_else(|| std::io::Error::other("checkpoint slots offset overflow"))?;
+        let blob_body = blob.len().saturating_sub(8);
+        if blob_body >= (capacity as usize) * 24 {
+            homes_offset = homes_offset
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint homes offset overflow"))?;
+            tails_offset = tails_offset
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint tails offset overflow"))?;
+        }
     }
+
+    // Phase 2: write directory entries.
     for entry in &dir_entries {
         buf.extend_from_slice(&entry.encode());
     }
+
+    // Phase 3: write slots, homes, tails as separate contiguous sections.
     for (_, _, blob) in collections {
-        buf.extend_from_slice(&blob[8..]);
+        let capacity = blob_capacity(blob)
+            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
+        let cap = capacity as usize;
+        let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
+        let homes_end = slots_end.saturating_add(cap.saturating_mul(8));
+        let tails_end = homes_end.saturating_add(cap.saturating_mul(8));
+        // Slots
+        if let Some(slots) = blob.get(8..slots_end) {
+            buf.extend_from_slice(slots);
+        }
+        // Homes
+        if let Some(homes) = blob.get(slots_end..homes_end) {
+            buf.extend_from_slice(homes);
+        }
+        // Tails
+        if let Some(tails) = blob.get(homes_end..tails_end) {
+            buf.extend_from_slice(tails);
+        }
     }
+
     let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
 
     let header = CheckpointHeader {
@@ -240,6 +313,8 @@ pub fn write_checkpoint(
         slots_bytes,
         pack_fingerprint: fingerprint,
         content_crc32,
+        homes_bytes,
+        tails_bytes,
     };
     buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
@@ -310,7 +385,11 @@ pub fn read_checkpoint_with_policy(
     }
     let slot_base =
         CHECKPOINT_HEADER_LEN.checked_add(usize::try_from(header.directory_bytes).ok()?)?;
-    if buf.len() != slot_base.checked_add(usize::try_from(header.slots_bytes).ok()?)? {
+    let body_bytes = header
+        .slots_bytes
+        .checked_add(header.homes_bytes)
+        .and_then(|v| v.checked_add(header.tails_bytes))?;
+    if buf.len() != slot_base.checked_add(usize::try_from(body_bytes).ok()?)? {
         return None;
     }
 
@@ -357,12 +436,34 @@ pub fn read_checkpoint_with_policy(
         if region.checked_add(slots_len)? > buf.len() {
             return None;
         }
+        let has_homes_tails = header.homes_bytes > 0 && header.tails_bytes > 0;
+        let homes_region = if has_homes_tails {
+            let r = slot_base.checked_add(usize::try_from(entry.homes_offset).ok()?)?;
+            if r.checked_add(slots_len)? > buf.len() {
+                return None;
+            }
+            r
+        } else {
+            0
+        };
+        let tails_region = if has_homes_tails {
+            let r = slot_base.checked_add(usize::try_from(entry.tails_offset).ok()?)?;
+            if r.checked_add(slots_len)? > buf.len() {
+                return None;
+            }
+            r
+        } else {
+            0
+        };
         collections.push(LoadedCollection {
             collection_id: entry.collection_id,
             generation: entry.generation,
             slots_offset: region,
+            homes_offset: homes_region,
+            tails_offset: tails_region,
             capacity: entry.capacity,
             slot_count: entry.slot_count,
+            has_homes_tails,
         });
     }
 
@@ -758,6 +859,8 @@ mod tests {
             slots_bytes: 0,
             pack_fingerprint: 0xDEAD_BEEF_CAFE_BABE,
             content_crc32: 0,
+            homes_bytes: 0,
+            tails_bytes: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 
@@ -793,6 +896,8 @@ mod tests {
             slots_bytes: 0,
             pack_fingerprint: 0x42,
             content_crc32: 0,
+            homes_bytes: 0,
+            tails_bytes: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 
