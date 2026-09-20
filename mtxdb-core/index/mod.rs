@@ -12,27 +12,28 @@ use crate::index::format::DeltaFrame;
 
 /// Per-slot entry in the lossy fanout index.
 ///
-/// Layout: `[24-bit tag | 12-bit shard_id | 28-bit offset]` packed into a `u64`.
+/// Layout: `[16-bit tag | 16-bit shard_id | 32-bit offset]` packed into a `u64`.
 ///
-/// - **tag** (high 24 bits): truncated fingerprint for fast rejection.
-/// - **`shard_id`** (next 12 bits): which shard file this record lives in.
-/// - **offset** (low 28 bits): byte offset within the shard, stored as
+/// - **tag** (high 16 bits): truncated fingerprint for fast rejection.
+/// - **`shard_id`** (next 16 bits): which shard file this record lives in.
+/// - **offset** (low 32 bits): byte offset within the shard, stored as
 ///   `offset + 1` so that the all-zeros encoding is reserved as the empty
 ///   sentinel. Actual offset 0 is stored as 1, and `offset()` subtracts 1
 ///   to recover the real value.
 ///
-/// Empty slots are all-zeros. The tag serves double duty: an empty slot
-/// (tag == 0) terminates a probe sequence, since hashes are uniformly random
-/// and the probability of a legitimate hash mapping to tag 0 is 1/16M.
+/// Empty slots are all-zeros. This is safe regardless of tag value: the
+/// `offset + 1` encoding guarantees a live slot's low 32 bits are never zero,
+/// so the all-zeros pattern can never be produced by a real insert — the tag
+/// bits play no role in reserving the sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexSlot(u64);
 
 impl IndexSlot {
     const EMPTY: Self = Self(0);
 
-    const TAG_SHIFT: u64 = 40; // SHARD_BITS + OFFSET_BITS
-    const SHARD_SHIFT: u64 = 28; // OFFSET_BITS
-    const OFFSET_MASK: u64 = 0x0FFF_FFFF;
+    const TAG_SHIFT: u64 = 48; // SHARD_BITS + OFFSET_BITS
+    const SHARD_SHIFT: u64 = 32; // OFFSET_BITS
+    const OFFSET_MASK: u64 = 0xFFFF_FFFF;
 
     /// Create a new slot from its components.
     ///
@@ -41,15 +42,13 @@ impl IndexSlot {
     /// stored as 1 in the slot.
     ///
     /// # Panics
-    /// Panics if `tag` exceeds 24 bits, `shard_id` exceeds 12 bits, or
-    /// `offset` exceeds `2^28 - 2`.
+    /// Panics if `tag` exceeds 16 bits or `offset` exceeds `2^32 - 2`.
     #[must_use]
     pub fn new(tag: u32, shard_id: u16, offset: u64) -> Self {
-        assert!(tag <= 0xFF_FFFF, "tag must fit in 24 bits");
-        assert!(shard_id <= 0xFFF, "shard_id must fit in 12 bits");
+        assert!(tag <= 0xFFFF, "tag must fit in 16 bits");
         assert!(
-            offset <= (1u64 << 28) - 2,
-            "offset must fit in 28 bits minus 1 (reserved for empty sentinel)"
+            offset <= (1u64 << 32) - 2,
+            "offset must fit in 32 bits minus 1 (reserved for empty sentinel)"
         );
         Self(
             (u64::from(tag) << Self::TAG_SHIFT)
@@ -70,16 +69,16 @@ impl IndexSlot {
         self.0 == 0
     }
 
-    /// The 24-bit tag stored in this slot.
+    /// The 16-bit tag stored in this slot.
     #[must_use]
     pub fn tag(self) -> u32 {
-        ((self.0 >> Self::TAG_SHIFT) & 0xFF_FFFF) as u32
+        ((self.0 >> Self::TAG_SHIFT) & 0xFFFF) as u32
     }
 
-    /// The 12-bit shard ID stored in this slot.
+    /// The 16-bit shard ID stored in this slot.
     #[must_use]
     pub fn shard_id(self) -> u16 {
-        ((self.0 >> Self::SHARD_SHIFT) & 0xFFF) as u16
+        ((self.0 >> Self::SHARD_SHIFT) & 0xFFFF) as u16
     }
 
     /// The byte offset within the shard stored in this slot.
@@ -235,18 +234,25 @@ impl LossyIndex {
         usize::try_from(masked).unwrap_or(usize::MAX)
     }
 
-    /// Extract the 24-bit tag from a 16-byte hash.
+    /// Extract the 16-bit tag from a 16-byte hash.
     ///
     /// Uses bytes 8..12, disjoint from the bytes `bucket()` reads (0..8).
     /// If the tag were derived from bucket bits (or a superset of them),
     /// same-bucket entries would already agree on those bits, collapsing
-    /// the tag's effective discriminating power from 2^-24 to roughly
-    /// 2^-(24 - `bucket_bits`) and causing far more spurious "same tag"
-    /// overwrites than the nominal 24-bit collision rate predicts.
+    /// the tag's effective discriminating power and causing far more
+    /// spurious "same tag" overwrites than the nominal collision rate
+    /// predicts.
+    ///
+    /// Deliberately unseeded (unlike `bucket()`/`home`): a tag match never
+    /// proves key equality or causes an overwrite by itself (see
+    /// `insert_undoable`), so seeding it would add no adversarial-collision
+    /// mitigation — the exploitable lever is bucket placement, not tag
+    /// false-positives. Keeping it unseeded also keeps `tag_for_hash` a
+    /// static, instance-independent function for recovery code.
     #[inline]
     fn tag(hash: &[u8; 16]) -> u32 {
         let top = u32::from_be_bytes(hash[8..12].try_into().unwrap());
-        top >> 8 // top 24 bits
+        top >> 16 // top 16 bits
     }
 
     /// The packed-slot tag for `hash`, exposed to crate-local recovery code
