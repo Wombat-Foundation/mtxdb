@@ -341,7 +341,7 @@ fn sub_scan() -> Command {
                      matches, or up to --limit; use -l 0 for no cap). With --verbose, a per-frame \
                      context line goes to stderr so stdout stays a clean byte stream",
         ))
-        .arg(sort_arg("payload"))
+        .arg(sort_arg("payload, offset"))
         .arg(
             Arg::new("reverse")
                 .short('R')

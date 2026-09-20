@@ -2511,16 +2511,40 @@ struct ScanOptions {
     limit: i64,
     node_id: Option<[u8; 16]>,
     raw: bool,
-    sort_payload: bool,
+    sort: Option<SortColumn>,
     reverse: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortColumn {
+    Payload,
+    Offset,
+}
+
+impl SortColumn {
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "payload" => Ok(Self::Payload),
+            "offset" => Ok(Self::Offset),
+            other => bail!("unknown scan sort column `{other}`"),
+        }
+    }
 }
 
 impl ScanOptions {
     fn max_rows(&self) -> usize {
         scan_limit(self.limit)
     }
+
+    fn is_sorting(&self) -> bool {
+        self.sort.is_some()
+    }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "maps 1:1 to CLI args before building ScanOptions"
+)]
 fn cmd_scan(
     cli: &Cli,
     selector: &str,
@@ -2532,12 +2556,8 @@ fn cmd_scan(
     sort: Option<&str>,
     reverse: bool,
 ) -> anyhow::Result<()> {
-    let sort_payload = match sort {
-        None => false,
-        Some("payload") => true,
-        Some(column) => bail!("unknown scan sort column `{column}`"),
-    };
-    if sort_payload && (!verbose || raw) {
+    let sort_column = sort.map(SortColumn::from_str).transpose()?;
+    if sort_column == Some(SortColumn::Payload) && (!verbose || raw) {
         bail!("scan sorting requires --verbose and cannot be combined with --raw");
     }
     let node_id = id.map(parse_node_id).transpose()?;
@@ -2547,7 +2567,7 @@ fn cmd_scan(
         limit,
         node_id,
         raw,
-        sort_payload,
+        sort: sort_column,
         reverse,
     };
     // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
@@ -2604,19 +2624,27 @@ fn scan_pack(
             continue;
         }
         matched_records = matched_records.saturating_add(1);
-        if opts.sort_payload || records.len() < max_rows {
+        if opts.is_sorting() || records.len() < max_rows {
             records.push((record_collection, record_id, offset));
         } else {
             truncated = true;
             break;
         }
     }
-    if opts.sort_payload {
-        records.sort_by_cached_key(|(_, _, offset)| {
-            ShardPool::read_at_committed(shard, *offset, true)
-                .map(|record| record.data.to_vec())
-                .unwrap_or_default()
-        });
+    if opts.is_sorting() {
+        match opts.sort {
+            Some(SortColumn::Payload) => {
+                records.sort_by_cached_key(|(_, _, offset)| {
+                    ShardPool::read_at_committed(shard, *offset, true)
+                        .map(|record| record.data.to_vec())
+                        .unwrap_or_default()
+                });
+            }
+            Some(SortColumn::Offset) => {
+                records.sort_by_key(|(_, _, offset)| *offset);
+            }
+            None => unreachable!(),
+        }
         if opts.reverse {
             records.reverse();
         }
@@ -2753,7 +2781,7 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
     let mut context = CollectionScanContext {
         collection_id,
         node_id: opts.node_id,
-        mode: CollectionScanMode::new(opts.verbose, opts.raw, opts.sort_payload),
+        mode: CollectionScanMode::new(opts.verbose, opts.raw, opts.sort),
         max_rows,
         frames: 0,
         raw_matches: Vec::new(),
@@ -2770,7 +2798,7 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
         }
         let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
-        if bounded && !opts.sort_payload && context.frames >= max_rows {
+        if bounded && !opts.is_sorting() && context.frames >= max_rows {
             break;
         }
     }
@@ -2820,7 +2848,7 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
         );
         print_scan_limit_note(frames, max_rows);
     }
-    if context.mode.sorts_payload() {
+    if context.mode.is_sorting() {
         let sorted_records = context.sorted_records.clone();
         for (shard, record_id, offset) in sorted_records.iter().take(max_rows) {
             print_collection_record(shard, *record_id, *offset, &mut context)?;
@@ -2830,14 +2858,22 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
 }
 
 fn sort_collection_records(context: &mut CollectionScanContext) {
-    if context.mode.sorts_payload() {
-        context
-            .sorted_records
-            .sort_by_cached_key(|(shard, _, offset)| {
-                ShardPool::read_at_committed(shard, *offset, true)
-                    .map(|record| record.data.to_vec())
-                    .unwrap_or_default()
-            });
+    if context.mode.is_sorting() {
+        match context.mode.sort_column() {
+            Some(SortColumn::Payload) => {
+                context
+                    .sorted_records
+                    .sort_by_cached_key(|(shard, _, offset)| {
+                        ShardPool::read_at_committed(shard, *offset, true)
+                            .map(|record| record.data.to_vec())
+                            .unwrap_or_default()
+                    });
+            }
+            Some(SortColumn::Offset) => {
+                context.sorted_records.sort_by_key(|(_, _, offset)| *offset);
+            }
+            None => unreachable!(),
+        }
         if context.reverse {
             context.sorted_records.reverse();
         }
@@ -2860,16 +2896,16 @@ struct CollectionScanContext {
 #[derive(Clone, Copy)]
 enum CollectionScanMode {
     Plain,
-    Verbose { sort_payload: bool },
+    Verbose { sort: Option<SortColumn> },
     Raw { verbose: bool },
 }
 
 impl CollectionScanMode {
-    fn new(verbose: bool, raw: bool, sort_payload: bool) -> Self {
+    fn new(verbose: bool, raw: bool, sort: Option<SortColumn>) -> Self {
         if raw {
             Self::Raw { verbose }
         } else if verbose {
-            Self::Verbose { sort_payload }
+            Self::Verbose { sort }
         } else {
             Self::Plain
         }
@@ -2883,8 +2919,15 @@ impl CollectionScanMode {
         matches!(self, Self::Raw { .. })
     }
 
-    fn sorts_payload(self) -> bool {
-        matches!(self, Self::Verbose { sort_payload: true })
+    fn is_sorting(self) -> bool {
+        matches!(self, Self::Verbose { sort: Some(_) })
+    }
+
+    fn sort_column(self) -> Option<SortColumn> {
+        match self {
+            Self::Verbose { sort } => sort,
+            _ => None,
+        }
     }
 
     fn verbose(self) -> bool {
@@ -2909,7 +2952,7 @@ fn scan_collection_shard(
         context.frames = context.frames.saturating_add(1);
         if context.mode.is_raw() {
             context.raw_matches.push((shard.clone(), record_id, offset));
-        } else if context.mode.sorts_payload() {
+        } else if context.mode.is_sorting() {
             context
                 .sorted_records
                 .push((shard.clone(), record_id, offset));
@@ -2917,7 +2960,7 @@ fn scan_collection_shard(
             print_collection_record(shard, record_id, offset, context)?;
         }
         if context.max_rows != usize::MAX
-            && !context.mode.sorts_payload()
+            && !context.mode.is_sorting()
             && context.frames >= context.max_rows
         {
             break;
