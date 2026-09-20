@@ -74,12 +74,31 @@ fn fmt_load_factor(len: usize, capacity: u32) -> String {
     if capacity == 0 {
         return "load factor: n/a".to_owned();
     }
-    // Collection sizes never approach f64's 52-bit mantissa, so this is
-    // display-only precision loss, not a real one.
-    #[allow(clippy::cast_precision_loss)]
-    let len_f64 = len as f64;
-    let percent = (len_f64 / f64::from(capacity)) * 100.0;
-    format!("load factor: {percent:.1}% ({len}/{capacity})")
+    format!(
+        "load factor: {:.1}% ({len}/{capacity})",
+        load_factor_percent(len, capacity)
+    )
+}
+
+/// Numeric index occupancy percentage, for sorting `collections` by load.
+/// Returns `0.0` for a zero/unknown capacity so a sort never panics.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn load_factor_percent(len: usize, capacity: u32) -> f64 {
+    if capacity == 0 {
+        0.0
+    } else {
+        (len as f64 / f64::from(capacity)) * 100.0
+    }
+}
+
+/// Column-friendly index occupancy ("24.2%"), for `collections` tables where
+/// `fmt_load_factor`'s long form would not fit a fixed-width column.
+fn fmt_load_percent(len: usize, capacity: u32) -> String {
+    if capacity == 0 {
+        return "n/a".to_owned();
+    }
+    format!("{:.1}%", load_factor_percent(len, capacity))
 }
 
 /// Decimal kilobytes for per-collection index allocations, where MB would
@@ -1023,6 +1042,7 @@ fn cmd_collections_in_dir(
                 | "nodes"
                 | "shards"
                 | "index"
+                | "load"
                 | "disk"
                 | "packs"
                 | "avoidable"
@@ -1046,6 +1066,8 @@ fn cmd_collections_in_dir(
                 .map_or(0, |s| s.pack_bytes.len())
                 .cmp(&left_layout.map_or(0, |s| s.pack_bytes.len())),
             "index" => right.2.cmp(&left.2),
+            "load" => load_factor_percent(right.1, right.3)
+                .total_cmp(&load_factor_percent(left.1, left.3)),
             "disk" => right_layout
                 .map_or(0, |s| s.disk_bytes)
                 .cmp(&left_layout.map_or(0, |s| s.disk_bytes)),
@@ -1059,26 +1081,37 @@ fn cmd_collections_in_dir(
     });
     if layout {
         println!(
-            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-            "slot", "collection", "nodes", "packs", "disk", "runs", "largest", "avoidable"
+            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "slot", "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
         );
     } else {
         println!(
-            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>12}  {:>13}",
-            "slot", "collection", "nodes", "shards", "index", "disk"
+            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "slot", "collection", "nodes", "load", "shards", "index", "disk"
         );
     }
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
     let total_rows = ordered.len();
+    for (_, (collection_id, nodes, memory, _)) in &ordered {
+        total_nodes = total_nodes
+            .checked_add(*nodes)
+            .context("total collection node count overflow")?;
+        total_memory = total_memory
+            .checked_add(*memory)
+            .context("total collection index memory overflow")?;
+        let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
+        total_disk_bytes = total_disk_bytes.saturating_add(disk);
+    }
     let max_rows = if limit <= 0 {
         usize::MAX
     } else {
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
-    for (i, (collection_id, nodes, memory, _capacity)) in ordered.into_iter().take(max_rows) {
+    for (i, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
         let hex = hex_encode(collection_id);
+        let load = fmt_load_percent(*nodes, *capacity);
         let shards = collection_shards
             .as_ref()
             .and_then(|by_collection| by_collection.get(collection_id))
@@ -1092,14 +1125,7 @@ fn cmd_collections_in_dir(
                     }
                 },
             );
-        total_nodes = total_nodes
-            .checked_add(*nodes)
-            .context("total collection node count overflow")?;
-        total_memory = total_memory
-            .checked_add(*memory)
-            .context("total collection index memory overflow")?;
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
-        total_disk_bytes = total_disk_bytes.saturating_add(disk);
         if layout {
             let stats = physical.collections.get(collection_id);
             let packs = stats.map_or(0, |s| s.pack_bytes.len());
@@ -1107,14 +1133,14 @@ fn cmd_collections_in_dir(
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
             let avoidable = avoidable_spread_bytes(stats);
             println!(
-                "  {i:>5}  0x{hex}  {nodes:>7}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
+                "  {i:>5}  0x{hex}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
                 fmt_disk_megabytes(disk),
                 fmt_bytes(largest),
                 fmt_bytes(avoidable)
             );
         } else {
             println!(
-                "  {i:>5}  0x{hex}  {nodes:>7}  {shards:>6}  {:>12}  {:>13}",
+                "  {i:>5}  0x{hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
                 fmt_index_kilobytes(*memory),
                 fmt_disk_megabytes(disk),
             );
@@ -1123,10 +1149,11 @@ fn cmd_collections_in_dir(
     println!();
     if layout {
         println!(
-            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
             "",
             "total",
             total_nodes,
+            "",
             "",
             fmt_disk_megabytes(total_disk_bytes),
             "",
@@ -1135,9 +1162,10 @@ fn cmd_collections_in_dir(
         );
     } else {
         println!(
-            "  {:>5}  {:<34}  {total_nodes:>7}  {:>6}  {:>12}  {:>13}",
+            "  {:>5}  {:<34}  {total_nodes:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
             "",
             "total",
+            "",
             "",
             fmt_index_kilobytes(total_memory),
             fmt_disk_megabytes(total_disk_bytes),

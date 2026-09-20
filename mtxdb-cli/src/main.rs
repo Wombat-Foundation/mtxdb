@@ -232,7 +232,7 @@ fn sub_collections() -> Command {
         )
         .arg(layout_arg())
         .arg(limit_arg())
-        .arg(sort_arg("slot, collection, nodes, shards, index, disk, packs, avoidable, segments, fragmentation"))
+        .arg(sort_arg("slot, collection, nodes, load, shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
 
 fn layout_arg() -> Arg {
