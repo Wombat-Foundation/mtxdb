@@ -42,12 +42,12 @@ use super::format::{
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Current wire version (see [`CheckpointHeader::version`]).
 ///
-/// Bumped to 2 when `content_crc32` was added to the header (replacing the
-/// read-time occupancy walk with a single checksum verification — see
-/// `read_checkpoint`). Not deployed anywhere yet, so no migration: a v1
-/// checkpoint simply fails the version check below and falls through to the
-/// existing full-rescan fallback, same as any other unreadable checkpoint.
-pub const CHECKPOINT_VERSION: u32 = 2;
+/// Bumped to 3: the slot layout changed from `24-bit tag | 12-bit shard | 28-bit
+/// offset` to `16-bit tag | 16-bit shard | 32-bit offset`, and homes/tails are
+/// now persisted in the checkpoint body. A pre-v3 checkpoint deserializes
+/// without error but decodes garbage under the new shift constants — this
+/// version gate rejects it instead.
+pub const CHECKPOINT_VERSION: u32 = 3;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 

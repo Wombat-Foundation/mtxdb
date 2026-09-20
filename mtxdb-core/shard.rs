@@ -20,14 +20,14 @@ pub const MAX_SHARDS: usize = 4096;
 /// and modular arithmetic.
 pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 
-/// Maximum shard size before rotation: `2^28 - 1` bytes (~256 MB), the
+/// Maximum shard size before rotation: `2^32 - 2` bytes (~4 GiB), the
 /// largest value for which every offset a shard can ever produce still
-/// fits `IndexSlot`'s 28-bit offset field (which reserves its all-zero
+/// fits `IndexSlot`'s 32-bit offset field (which reserves its all-zero
 /// encoding as the empty-slot sentinel, capping the max representable
-/// offset at `2^28 - 2` — see `index::IndexSlot`). Do not round this up
-/// to a clean `256 * 1024 * 1024`: that's one byte over the ceiling and
+/// offset at `2^32 - 2` — see `index::IndexSlot`). Do not round this up
+/// to a clean `4 * 1024 * 1024 * 1024`: that's one byte over the ceiling and
 /// lets a shard produce an offset `IndexSlot::new` panics on.
-pub const MAX_SHARD_BYTES: u64 = (1u64 << 28) - 1;
+pub const MAX_SHARD_BYTES: u64 = (1u64 << 32) - 2;
 
 /// Default in-memory threshold before a shard's buffered frames are written
 /// to disk as one positioned write. Keeps bulk writes from paying a
@@ -943,8 +943,7 @@ impl ShardPool {
             // precomputation against the unseeded content hash.
             if bucket_seed == 0 {
                 let mut seed_bytes = [0u8; 8];
-                getrandom::fill(&mut seed_bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                getrandom::fill(&mut seed_bytes).map_err(io::Error::other)?;
                 bucket_seed = u64::from_ne_bytes(seed_bytes);
             }
             // Persist the high-water mark BEFORE creating the pack file.
@@ -3569,7 +3568,11 @@ mod tests {
                 "fresh allocation after tmp crash gets pack_id 0"
             );
             let restored = ShardPool::restore_pool_meta(&dir).unwrap();
-            assert_eq!(restored, Some(1), "pool.meta must have next_pack_id = 1");
+            assert_eq!(
+                restored.map(|m| m.next_pack_id),
+                Some(1),
+                "pool.meta must have next_pack_id = 1"
+            );
         }
 
         // State 2: Crash after pool.meta rename, but before initial pack rename
@@ -3595,7 +3598,11 @@ mod tests {
                 "must assign pack_id 1 to prevent reuse of 0"
             );
             let restored = ShardPool::restore_pool_meta(&dir).unwrap();
-            assert_eq!(restored, Some(2), "pool.meta must now be advanced to 2");
+            assert_eq!(
+                restored.map(|m| m.next_pack_id),
+                Some(2),
+                "pool.meta must now be advanced to 2"
+            );
         }
 
         // State 3: Clean fresh initialization
@@ -3605,7 +3612,12 @@ mod tests {
             let summaries = pool.summaries();
             assert_eq!(summaries.len(), 1);
             assert_eq!(summaries[0].pack_id, 0);
-            assert_eq!(ShardPool::restore_pool_meta(&dir).unwrap(), Some(1));
+            assert_eq!(
+                ShardPool::restore_pool_meta(&dir)
+                    .unwrap()
+                    .map(|m| m.next_pack_id),
+                Some(1)
+            );
             drop(pool);
 
             // Reopen sees existing pack 0
@@ -3613,7 +3625,12 @@ mod tests {
             let summaries2 = pool2.summaries();
             assert_eq!(summaries2.len(), 1);
             assert_eq!(summaries2[0].pack_id, 0);
-            assert_eq!(ShardPool::restore_pool_meta(&dir).unwrap(), Some(1));
+            assert_eq!(
+                ShardPool::restore_pool_meta(&dir)
+                    .unwrap()
+                    .map(|m| m.next_pack_id),
+                Some(1)
+            );
         }
     }
 

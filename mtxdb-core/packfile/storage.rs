@@ -542,6 +542,9 @@ pub struct PackfileStorage {
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
+    /// Per-instance index config: seed from the pool's `pool.meta`, floor
+    /// and load factor from defaults (or future tuning).
+    index_config: crate::index::IndexConfig,
     /// Total number of `repack_collection_reachable` calls across all collections.
     repack_count: AtomicU64,
     /// Total records kept (rewritten into the new generation) across all repacks.
@@ -1060,6 +1063,10 @@ impl PackfileStorage {
         };
         let shard_open_time = shard_open_started.elapsed();
         timings.shard_open = shard_open_time;
+        let index_config = crate::index::IndexConfig {
+            seed: shards.bucket_seed(),
+            ..Default::default()
+        };
         if let Some(shard_timings) = shards.open_timings() {
             timings.shard_open = shard_timings.total;
             timings.shard_discovery = shard_timings.discovery;
@@ -1201,6 +1208,7 @@ impl PackfileStorage {
                 &collection_entries[collection_id],
                 &shards,
                 cache_capacity,
+                index_config,
                 &mut scan_out,
             )?;
         }
@@ -1237,6 +1245,7 @@ impl PackfileStorage {
         records: &[ShardRecord],
         shards: &ShardPool,
         cache_capacity: usize,
+        index_config: crate::index::IndexConfig,
         out: &mut RoomScanOutput,
     ) -> Result<(), StorageError> {
         // Seed each collection's home shard from the scan: the shard of its
@@ -1249,11 +1258,12 @@ impl PackfileStorage {
         if let Some(&(last_shard_id, _, _, _)) = records.last() {
             shards.set_collection_home(collection_id, last_shard_id);
         }
-        let index = LossyIndex::new(
+        let index = LossyIndex::with_config(
             records
                 .len()
                 .saturating_mul(2)
                 .max(NEW_COLLECTION_INDEX_FLOOR),
+            index_config,
         );
         for (shard_id, hash, offset, _pack_id) in records {
             check_index_offset(*shard_id, hash, *offset)?;
@@ -1306,6 +1316,10 @@ impl PackfileStorage {
         cache_capacity: usize,
         delta_state: DeltaLogState,
     ) -> Self {
+        let index_config = crate::index::IndexConfig {
+            seed: shards.bucket_seed(),
+            ..Default::default()
+        };
         // Seed the per-collection refresh fingerprint from the persisted
         // checkpoint/delta state so the first miss for each collection can
         // skip refresh when nothing durable changed.
@@ -1334,6 +1348,7 @@ impl PackfileStorage {
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
+            index_config,
             repack_count: AtomicU64::new(0),
             repack_kept_total: AtomicU64::new(0),
             repack_dropped_total: AtomicU64::new(0),
@@ -1980,12 +1995,16 @@ impl PackfileStorage {
         Ok(maps)
     }
 
-    fn build_index(offsets: &[([u8; 16], u16, u64)]) -> Result<LossyIndex, StorageError> {
-        let index = LossyIndex::new(
+    fn build_index(
+        offsets: &[([u8; 16], u16, u64)],
+        index_config: crate::index::IndexConfig,
+    ) -> Result<LossyIndex, StorageError> {
+        let index = LossyIndex::with_config(
             offsets
                 .len()
                 .saturating_mul(2)
                 .max(NEW_COLLECTION_INDEX_FLOOR),
+            index_config,
         );
         for (hash, shard_id, offset) in offsets {
             check_index_offset(*shard_id, hash, *offset)?;
@@ -3114,7 +3133,10 @@ impl PackfileStorage {
         self.shards.flush_all()?;
         let scanned = self.scan_collection_records(collection_id)?;
         let total: usize = scanned.iter().map(|(_, e)| e.len()).sum();
-        let index = LossyIndex::new(total.saturating_mul(2).max(NEW_COLLECTION_INDEX_FLOOR));
+        let index = LossyIndex::with_config(
+            total.saturating_mul(2).max(NEW_COLLECTION_INDEX_FLOOR),
+            self.index_config,
+        );
         for (shard_id, entries) in scanned {
             for (hash, offset) in entries {
                 // `IndexSlot` can only represent offsets up to
@@ -3158,7 +3180,7 @@ impl PackfileStorage {
                     "checkpoint index offset {offset} in shard {shard_id} belongs to another collection"
                 )));
             }
-            if LossyIndex::tag_for_hash(&hash) != slot_tag {
+            if index.tag_for_hash(&hash) != slot_tag {
                 return Err(StorageError::Corrupt(format!(
                     "checkpoint index tag does not match frame at offset {offset} in shard {shard_id}"
                 )));
@@ -4159,7 +4181,7 @@ impl PackfileStorage {
 
         let kept = new_offsets.len();
 
-        let index = Self::build_index(&new_offsets)?;
+        let index = Self::build_index(&new_offsets, self.index_config)?;
         self.replace_collection_shard_counts(
             collection_id,
             &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
@@ -4399,7 +4421,7 @@ impl PackfileStorage {
                 &mut output_state,
             )?;
             let kept = new_offsets.len();
-            let index = Self::build_index(&new_offsets)?;
+            let index = Self::build_index(&new_offsets, self.index_config)?;
             self.replace_collection_shard_counts(
                 collection_id,
                 &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
@@ -4868,7 +4890,7 @@ impl StorageEngine for PackfileStorage {
                 //
                 // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
                 // index's own smaller hard floor.
-                None => LossyIndex::new(NEW_COLLECTION_INDEX_FLOOR),
+                None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
             };
             let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
             if let Ok((bucket, slot)) = inserted {
@@ -5014,11 +5036,12 @@ impl StorageEngine for PackfileStorage {
             // `put_many` call) would otherwise still hit `grow()` almost
             // immediately, invalidating the delta log and forcing a full
             // checkpoint rewrite on the next sync.
-            None => Some(LossyIndex::new(
+            None => Some(LossyIndex::with_config(
                 entries
                     .len()
                     .saturating_mul(2)
                     .max(NEW_COLLECTION_INDEX_FLOOR),
+                self.index_config,
             )),
         };
         // Every non-empty batch materializes an owned index up front so its

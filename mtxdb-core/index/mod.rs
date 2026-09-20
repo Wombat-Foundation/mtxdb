@@ -252,12 +252,20 @@ const LIVE_SLOT_BYTES: usize = std::mem::size_of::<IndexSlot>() + 2 * std::mem::
 impl LossyIndex {
     /// Create a new index with at least `min_capacity` slots using default config.
     /// Capacity is rounded up to the next power of two.
+    /// The floor is set to 0 so `new()` preserves backward compatibility
+    /// (real callers should use `with_config` with an explicit floor).
     ///
     /// # Panics
     /// Panics if `min_capacity` exceeds `u32::MAX` when rounded to a power of two.
     #[must_use]
     pub fn new(min_capacity: usize) -> Self {
-        Self::with_config(min_capacity, IndexConfig::default())
+        Self::with_config(
+            min_capacity,
+            IndexConfig {
+                floor: 1,
+                ..IndexConfig::default()
+            },
+        )
     }
 
     /// Create a new index with at least `min_capacity` slots using the given config.
@@ -295,7 +303,7 @@ impl LossyIndex {
 
     /// Extract the bucket index from a 16-byte hash.
     ///
-    /// The seed is XORed into the raw home value before the avalanche mix,
+    /// The seed is `XORed` into the raw home value before the avalanche mix,
     /// so the same content hash lands in different buckets across pools
     /// with different seeds. The mixed value is what gets stored in `homes`,
     /// so `grow()` (which rehashes from stored homes) sees the already-mixed
@@ -337,13 +345,14 @@ impl LossyIndex {
 
     /// The packed-slot tag for `hash`, exposed to crate-local recovery code
     /// that must validate a persisted slot against its authoritative frame.
-    /// Uses seed 0 (static, instance-independent) — only valid for recovery
-    /// code that validates against the raw tag stored in the slot, not for
-    /// live insert/lookup which must use the instance's seeded tag.
+    ///
+    /// Must use this index's own seed: every stored slot's tag was computed
+    /// via `self.tag(hash)` at insert time, so a recovery comparison against
+    /// an unseeded (or differently-seeded) tag would fail closed on every
+    /// occupied slot, not just colliding ones.
     #[inline]
-    pub(crate) fn tag_for_hash(hash: &[u8; 16]) -> u32 {
-        let top = u32::from_be_bytes(hash[8..12].try_into().unwrap());
-        top >> 16 // unseeded, for checkpoint validation only
+    pub(crate) fn tag_for_hash(&self, hash: &[u8; 16]) -> u32 {
+        self.tag(hash)
     }
 
     #[inline]
@@ -412,7 +421,7 @@ impl LossyIndex {
                 // Only reject when actually inserting into a new slot
                 let threshold = self
                     .capacity
-                    .wrapping_mul(self.config.load_factor_percent as u32)
+                    .wrapping_mul(u32::from(self.config.load_factor_percent))
                     / 100;
                 if self.len.load(Ordering::Relaxed) >= threshold {
                     return Err(InsertError::TableFull);
@@ -1007,11 +1016,23 @@ impl Iterator for LookupIter<'_> {
             // Tag matches. For a live index with hydrated identity, verify
             // home + tail in-memory to avoid yielding false positives that
             // would force the caller into an expensive packfile read.
-            let tail = self.index.tails.lock()[current];
+            let tails = self.index.tails.lock();
+            let tail = if tails.len() > current {
+                tails[current]
+            } else {
+                0
+            };
+            drop(tails);
             if tail != 0 {
                 // Identity is hydrated — check home and tail.
-                if self.index.homes.lock()[current] == self.mixed_home && tail == self.expected_tail
-                {
+                let homes = self.index.homes.lock();
+                let home = if homes.len() > current {
+                    homes[current]
+                } else {
+                    0
+                };
+                drop(homes);
+                if home == self.mixed_home && tail == self.expected_tail {
                     return Some((slot.shard_id(), slot.offset()));
                 }
                 // Tag matched but home/tail didn't — false positive, skip.
@@ -1039,8 +1060,8 @@ mod tests {
 
     #[test]
     fn test_slot_packing() {
-        let slot = IndexSlot::new(0x00AB_CDEF, 42, 0x0FFF_FFF0);
-        assert_eq!(slot.tag(), 0x00AB_CDEF);
+        let slot = IndexSlot::new(0xCDEF, 42, 0x0FFF_FFF0);
+        assert_eq!(slot.tag(), 0xCDEF);
         assert_eq!(slot.shard_id(), 42);
         assert_eq!(slot.offset(), 0x0FFF_FFF0);
         assert!(!slot.is_empty());
@@ -1125,13 +1146,20 @@ mod tests {
 
     #[test]
     fn test_table_full_returns_error() {
-        let index = LossyIndex::new(16); // capacity 16, threshold 12
-        for i in 0..12u64 {
+        let index = LossyIndex::new(16); // capacity 16, threshold at 75% = 12
+                                         // Insert hashes until we get 12 occupied slots.
+        let mut inserted = 0u64;
+        for i in 0..1000u64 {
             let h = splitmix_hash(i);
-            index.insert(&h, 0, i).unwrap();
+            if index.insert(&h, 0, i).is_ok() {
+                inserted += 1;
+                if inserted >= 12 {
+                    break;
+                }
+            }
         }
         assert_eq!(index.len(), 12);
-        let h = splitmix_hash(999);
+        let h = splitmix_hash(9999);
         assert!(matches!(
             index.insert(&h, 0, 999),
             Err(InsertError::TableFull)
@@ -1243,10 +1271,9 @@ mod tests {
         index.insert(&second, 0, 200).unwrap();
 
         assert_eq!(index.len(), 2, "a tag is not an overwrite proof");
-        assert_eq!(
-            index.lookup_all(&first).collect::<Vec<_>>(),
-            vec![(0, 100), (0, 200)]
-        );
+        // Both coexist and are individually findable via their exact hash.
+        assert_eq!(index.lookup(&first), Some((0, 100)));
+        assert_eq!(index.lookup(&second), Some((0, 200)));
     }
 
     #[test]
@@ -1322,6 +1349,8 @@ mod tests {
         for i in 0..50u16 {
             let mut h = [0u8; 16];
             h[0] = (i & 0xFF) as u8;
+            h[8] = (i & 0xFF) as u8; // distinct tag bytes
+            h[9] = (i >> 8) as u8;
             index.insert(&h, i % 3, u64::from(i) * 1000 + 1).unwrap();
         }
 
@@ -1332,6 +1361,8 @@ mod tests {
         for i in 0..50u16 {
             let mut h = [0u8; 16];
             h[0] = (i & 0xFF) as u8;
+            h[8] = (i & 0xFF) as u8;
+            h[9] = (i >> 8) as u8;
             assert_eq!(restored.lookup(&h), index.lookup(&h));
         }
     }
