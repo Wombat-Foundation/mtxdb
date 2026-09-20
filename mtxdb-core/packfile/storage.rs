@@ -5586,6 +5586,17 @@ impl PackfileStorage {
                 cache.misses = cache.misses.saturating_add(stats.misses);
             }
         }
+        // Longest linear-probe chain observed across every live collection's
+        // index, for operator visibility into collision-chain growth (see
+        // `LossyIndex::max_probe_len` — pure observability, no cap, no
+        // effect on control flow).
+        let max_index_probe_len = self
+            .collections
+            .read()
+            .values()
+            .map(|generation| generation.load().index.max_probe_len())
+            .max()
+            .unwrap_or(0);
         let cache_accesses = cache.hits.saturating_add(cache.misses);
         cache.hit_rate = if cache_accesses > 0 {
             cache.hits as f64 / cache_accesses as f64
@@ -5635,6 +5646,7 @@ impl PackfileStorage {
             shards: self.shard_stats(),
             index_bytes,
             collection_count: summaries.len(),
+            max_index_probe_len,
         }
     }
 
@@ -5832,6 +5844,15 @@ pub struct RuntimeStats {
     pub index_bytes: u64,
     /// Number of live collections.
     pub collection_count: usize,
+    /// Longest linear-probe chain observed by any insert or lookup across
+    /// every live collection's index, since each collection's index was
+    /// constructed (never reset by `reset_stats`, matching `shards`/`cache`/
+    /// `index_bytes`/`repack` — see `LossyIndex::max_probe_len`). Pure
+    /// observability: no probe-length cap exists or is implied by this
+    /// value; it exists so an operator can notice collision-chain growth
+    /// (e.g. under adversarial content against a misconfigured/unseeded
+    /// deployment) without any change in behavior.
+    pub max_index_probe_len: u32,
 }
 
 impl Default for RuntimeStats {
@@ -5877,6 +5898,7 @@ impl Default for RuntimeStats {
             shards: Vec::new(),
             index_bytes: 0,
             collection_count: 0,
+            max_index_probe_len: 0,
         }
     }
 }

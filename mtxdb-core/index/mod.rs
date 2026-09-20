@@ -192,6 +192,14 @@ pub struct LossyIndex {
     can_grow: bool,
     /// Number of occupied slots.
     len: AtomicU32,
+    /// Longest linear-probe chain walked by any insert or lookup against
+    /// this index instance so far (never reset, monotonically
+    /// non-decreasing). Pure observability — insert has no probe-length
+    /// cap (see the doc on `InsertError::TableFull`: growth is what keeps
+    /// chains short, not a cap), so this exists to let an operator notice
+    /// a probe chain growing unexpectedly (e.g. an unseeded/misconfigured
+    /// deployment under adversarial content) without changing behavior.
+    max_probe_len: AtomicU32,
 }
 
 #[derive(Debug)]
@@ -246,6 +254,7 @@ impl Clone for LossyIndex {
             }),
             can_grow: self.can_grow,
             len: AtomicU32::new(self.len.load(Ordering::Acquire)),
+            max_probe_len: AtomicU32::new(self.max_probe_len.load(Ordering::Relaxed)),
         }
     }
 }
@@ -296,6 +305,7 @@ impl LossyIndex {
             tails: Mutex::new(vec![0; capacity_usize]),
             can_grow: true,
             len: AtomicU32::new(0),
+            max_probe_len: AtomicU32::new(0),
         }
     }
 
@@ -303,6 +313,24 @@ impl LossyIndex {
     #[must_use]
     pub(crate) fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    /// Longest linear-probe chain observed so far by any insert or lookup
+    /// against this index instance. Pure observability, never reset, never
+    /// influences control flow — see the field doc on `max_probe_len`.
+    #[must_use]
+    pub fn max_probe_len(&self) -> u32 {
+        self.max_probe_len.load(Ordering::Relaxed)
+    }
+
+    /// Record a probe chain of `len` steps as the new high-water mark if it
+    /// exceeds the current one. `Relaxed` is enough: this is an
+    /// observability counter with no ordering dependency on any other
+    /// field, and a lost update under concurrent writers only means a
+    /// transient undercount, never a wrong value that persists.
+    #[inline]
+    fn bump_max_probe_len(&self, len: u32) {
+        self.max_probe_len.fetch_max(len, Ordering::Relaxed);
     }
 
     /// Extract the bucket index from a 16-byte hash.
@@ -419,9 +447,11 @@ impl LossyIndex {
         let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
         let home = self.mix_home(raw_home);
         let mut bucket = self.bucket_for_home(home);
+        let mut probe_len: u32 = 0;
 
         loop {
             let SlotStorage::Owned(slots) = &self.slots else {
+                self.bump_max_probe_len(probe_len);
                 return Err(InsertError::TableFull);
             };
             let slot = IndexSlot(slots[bucket].load(Ordering::Acquire));
@@ -432,6 +462,7 @@ impl LossyIndex {
                     .wrapping_mul(u32::from(self.config.load_factor_percent))
                     / 100;
                 if self.len.load(Ordering::Relaxed) >= threshold {
+                    self.bump_max_probe_len(probe_len);
                     return Err(InsertError::TableFull);
                 }
                 let old_home = self.homes.lock()[bucket];
@@ -451,6 +482,7 @@ impl LossyIndex {
                     old_tail,
                     was_empty: true,
                 };
+                self.bump_max_probe_len(probe_len);
                 return Ok((bucket as u32, value, undo));
             }
             // A tag only filters candidates; it never proves key equality.
@@ -459,6 +491,7 @@ impl LossyIndex {
             if slot.tag() == tag {
                 let tail = self.tails.lock()[bucket];
                 if tail == 0 {
+                    self.bump_max_probe_len(probe_len);
                     return Err(InsertError::NeedsIdentity {
                         bucket: bucket as u32,
                         shard_id: slot.shard_id(),
@@ -477,9 +510,11 @@ impl LossyIndex {
                         old_tail: tail,
                         was_empty: false,
                     };
+                    self.bump_max_probe_len(probe_len);
                     return Ok((bucket as u32, value, undo));
                 }
             }
+            probe_len = probe_len.saturating_add(1);
             bucket = bucket.wrapping_add(1) & self.mask as usize;
         }
     }
@@ -699,6 +734,7 @@ impl LossyIndex {
             bucket,
             mask: self.mask as usize,
             remaining: self.capacity as usize,
+            steps: 0,
         }
     }
 
@@ -933,6 +969,7 @@ impl LossyIndex {
             tails: Mutex::new(tails),
             can_grow: false,
             len: AtomicU32::new(len),
+            max_probe_len: AtomicU32::new(0),
         })
     }
 
@@ -965,6 +1002,7 @@ impl LossyIndex {
             tails: Mutex::new(Vec::new()),
             can_grow: false,
             len: AtomicU32::new(len),
+            max_probe_len: AtomicU32::new(0),
         }
     }
 
@@ -1018,6 +1056,7 @@ impl LossyIndex {
             tails: Mutex::new(tails),
             can_grow: false,
             len: AtomicU32::new(len),
+            max_probe_len: AtomicU32::new(0),
         }
     }
 
@@ -1117,6 +1156,8 @@ pub struct LookupIter<'a> {
     bucket: usize,
     mask: usize,
     remaining: usize,
+    /// Steps walked so far, for `LossyIndex::max_probe_len` observability.
+    steps: u32,
 }
 
 impl Iterator for LookupIter<'_> {
@@ -1128,8 +1169,10 @@ impl Iterator for LookupIter<'_> {
             self.remaining = self.remaining.wrapping_sub(1);
             let slot = IndexSlot(self.index.slot_at(self.bucket));
             if slot.is_empty() {
+                self.index.bump_max_probe_len(self.steps);
                 return None;
             }
+            self.steps = self.steps.saturating_add(1);
             let current = self.bucket;
             self.bucket = self.bucket.wrapping_add(1) & self.mask;
             if slot.tag() != self.tag {
@@ -1155,6 +1198,7 @@ impl Iterator for LookupIter<'_> {
                 };
                 drop(homes);
                 if home == self.mixed_home && tail == self.expected_tail {
+                    self.index.bump_max_probe_len(self.steps);
                     return Some((slot.shard_id(), slot.offset()));
                 }
                 // Tag matched but home/tail didn't — false positive, skip.
@@ -1162,8 +1206,10 @@ impl Iterator for LookupIter<'_> {
             }
             // Checkpoint-backed without hydrated identity — yield and let
             // the caller verify against the packfile.
+            self.index.bump_max_probe_len(self.steps);
             return Some((slot.shard_id(), slot.offset()));
         }
+        self.index.bump_max_probe_len(self.steps);
         None
     }
 }
@@ -1300,6 +1346,55 @@ mod tests {
         let index = LossyIndex::new(128);
         index.insert(&test_hash(0x01), 0, 1).unwrap();
         assert!(!index.is_empty());
+    }
+
+    #[test]
+    fn max_probe_len_tracks_the_longest_insert_chain() {
+        let index = LossyIndex::new(16);
+        assert_eq!(
+            index.max_probe_len(),
+            0,
+            "a fresh index has walked no probes"
+        );
+        // Five hashes sharing identical bytes 0..8 (home) land in the same
+        // bucket regardless of seed/mix, forcing a deterministic 5-entry
+        // linear-probe chain: the Nth insert walks N-1 occupied slots.
+        for i in 0..5u8 {
+            let mut h = [0u8; 16];
+            h[9] = i; // varies tag (bytes 8..12) so entries stay distinct
+            h[15] = i;
+            index.insert(&h, 0, u64::from(i)).unwrap();
+        }
+        assert_eq!(
+            index.max_probe_len(),
+            4,
+            "the 5th colliding insert walks past the 4 entries ahead of it"
+        );
+    }
+
+    #[test]
+    fn max_probe_len_tracks_lookup_chains_independently_of_insert() {
+        let source = LossyIndex::new(16);
+        let mut hashes = Vec::new();
+        for i in 0..5u8 {
+            let mut h = [0u8; 16];
+            h[9] = i;
+            h[15] = i;
+            source.insert(&h, 0, u64::from(i)).unwrap();
+            hashes.push(h);
+        }
+        // Deserializing does not itself walk any probes.
+        let restored = LossyIndex::deserialize(&source.serialize()).unwrap();
+        assert_eq!(restored.max_probe_len(), 0);
+
+        let last = *hashes.last().expect("5 hashes inserted");
+        assert!(restored.lookup(&last).is_some());
+        assert!(
+            restored.max_probe_len() >= 4,
+            "looking up the deepest-chained entry must walk at least as \
+             far as its insert-time chain length, got {}",
+            restored.max_probe_len()
+        );
     }
 
     #[test]

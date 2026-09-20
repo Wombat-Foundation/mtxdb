@@ -5029,14 +5029,15 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_event_dag, cmd_import_file, cmd_sync, compile_import_template, compute_state_groups,
-        decode_event_json_record, decode_hamt_node, decode_hamt_root,
-        default_matrix_import_template, event_id, event_room_id, extract_pointer_string,
-        fmt_disk_megabytes, fmt_megabytes, glob_pack_files, import_pdu_events,
-        interleaving_worth_noting, matrix_batch_has_create, matrix_create_details,
-        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        resolve_import_collection, scan_payload_suffix, template_collection_id, template_node_id,
-        verify_auth_chain_edges, CollectionTemplate, StateSet,
+        build_event_dag, cmd_collections, cmd_import_file, cmd_shards, cmd_sync,
+        compile_import_template, compute_state_groups, decode_event_json_record, decode_hamt_node,
+        decode_hamt_root, default_matrix_import_template, event_id, event_room_id,
+        extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, glob_pack_files,
+        import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
+        matrix_create_details, parse_federation_input, parse_pack_id_selector,
+        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
+        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
+        StateSet,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -5139,6 +5140,112 @@ mod tests {
             );
         }
         drop(layout);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shard_types_yields_all_three_when_no_type_is_selected() {
+        // `-t all` parses to `shard_type: None` (main.rs's `"all" => None`
+        // match arm) -- this is the exact case that used to make
+        // `require_shard_type` reject `collections`/`shards` even though
+        // `-t all` completes and parses as a legitimate value.
+        let cli = Cli {
+            dir: None,
+            shard_type: None,
+            command: Commands::Collections {
+                all: false,
+                layout: false,
+                sort: None,
+                limit: -1,
+            },
+        };
+        assert_eq!(
+            cli.shard_types().collect::<Vec<_>>(),
+            ShardType::ALL.to_vec()
+        );
+    }
+
+    #[test]
+    fn shard_types_yields_just_the_selected_type() {
+        let cli = Cli {
+            dir: None,
+            shard_type: Some(ShardType::State),
+            command: Commands::Collections {
+                all: false,
+                layout: false,
+                sort: None,
+                limit: -1,
+            },
+        };
+        assert_eq!(
+            cli.shard_types().collect::<Vec<_>>(),
+            vec![ShardType::State]
+        );
+    }
+
+    #[test]
+    fn collections_dash_t_all_iterates_every_pool_without_the_all_flag() {
+        // Regression test for the `-t all` vs `--all` inconsistency: before
+        // the fix, `shard_type: None` with `all: false` (i.e. `-t all` typed
+        // without also passing `--all`) errored with "this command requires
+        // a specific shard type" instead of behaving like `--all`.
+        let dir = unique_temp_dir();
+        DatabaseLayout::open(dir.clone()).unwrap();
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: None,
+            command: Commands::Collections {
+                all: false,
+                layout: false,
+                sort: None,
+                limit: -1,
+            },
+        };
+
+        cmd_collections(&cli, false, false, None, -1).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shards_dash_t_all_iterates_every_pool_without_the_all_flag() {
+        let dir = unique_temp_dir();
+        DatabaseLayout::open(dir.clone()).unwrap();
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: None,
+            command: Commands::Shards {
+                all: false,
+                layout: false,
+                sort: None,
+            },
+        };
+
+        cmd_shards(&cli, false, false, None).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collections_with_a_specific_type_still_targets_only_that_pool() {
+        // Unaffected-path guard: a specific `-t` selection (the default,
+        // and the common case) must still behave exactly as before --
+        // single-pool, no iteration, no `open_layout` overhead.
+        let dir = unique_temp_dir();
+        DatabaseLayout::open(dir.clone()).unwrap();
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: Some(ShardType::State),
+            command: Commands::Collections {
+                all: false,
+                layout: false,
+                sort: None,
+                limit: -1,
+            },
+        };
+
+        cmd_collections(&cli, false, false, None, -1).unwrap();
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
