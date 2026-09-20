@@ -799,8 +799,8 @@ impl ShardPool {
         Ok(pack_files)
     }
 
-    /// Discover, validate, and sort pack files in `base_dir`. Enforces the
-    /// `MAX_SHARDS` capacity limit.
+    /// Discover and sort pack files in `base_dir`, enforcing the
+    /// `MAX_SHARDS` capacity bound.
     fn discover_pack_files_sorted(base_dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
         let mut pack_files = Self::discover_pack_files(base_dir)?;
         if pack_files.len() > MAX_SHARDS {
