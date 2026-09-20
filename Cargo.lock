@@ -453,6 +453,7 @@ dependencies = [
  "hex",
  "mtxdb-core",
  "rezzy",
+ "sha2",
  "simd-json",
 ]
 

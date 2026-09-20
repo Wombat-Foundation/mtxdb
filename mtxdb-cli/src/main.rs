@@ -11,6 +11,7 @@ use mtxdb_core::ShardType;
 pub(crate) struct Cli {
     pub(crate) dir: Option<PathBuf>,
     pub(crate) shard_type: Option<ShardType>,
+    pub(crate) namespace: Option<String>,
     pub(crate) command: Commands,
 }
 
@@ -186,6 +187,19 @@ fn global_args(cmd: Command) -> Command {
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on (use 'all' to target every pool)"),
+    )
+    .arg(
+        Arg::new("namespace")
+            .short('n')
+            .long("namespace")
+            .env("MTXDB_NAMESPACE")
+            .value_name("NAMESPACE")
+            .global(true)
+            .help(
+                "Homeserver namespace for deriving keys from `!room_id`/`$event_id` \
+                 (must match the namespace Synapse's embedded mirror wrote with, e.g. \
+                 its server_name); required when using those sigils",
+            ),
     )
 }
 
@@ -661,9 +675,12 @@ fn parse_cli() -> Cli {
         }
     };
 
+    let namespace = matches.get_one::<String>("namespace").cloned();
+
     Cli {
         dir,
         shard_type,
+        namespace,
         command,
     }
 }

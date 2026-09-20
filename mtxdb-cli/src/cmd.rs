@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
+use sha2::Sha256;
 
 use mtxdb_core::packfile::layout::{
     avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout,
@@ -318,11 +319,18 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-/// Resolve either the fixed-width storage key or a Matrix event ID. Imported
-/// Matrix events use the first 128 bits of `BLAKE3(event_id)` as their key.
-fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
-    if id.starts_with('$') {
-        matrix_event_node_id(id)
+/// Resolve either the fixed-width storage key or a Matrix event ID. `$id`
+/// is hashed exactly the way Synapse's embedded mirror derives it (see
+/// `synapse_event_node_id`), since the point of this sigil is finding data
+/// Synapse itself wrote — not CLI-imported data, which uses the import
+/// template's own (BLAKE3) identity rule instead (`matrix_event_node_id`).
+fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
+    if let Some(event_id) = id.strip_prefix('$') {
+        let namespace = namespace.context(
+            "resolving `$event_id` requires --namespace (or MTXDB_NAMESPACE) set to the same \
+             namespace Synapse's embedded mirror was configured with",
+        )?;
+        Ok(synapse_event_node_id(namespace, event_id))
     } else {
         parse_node_id(id)
     }
@@ -330,9 +338,56 @@ fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
 
 /// The Matrix import template's accepted identity algorithm: BLAKE3 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,
-/// `--root`, and event-ID lookup must all use this same derivation.
+/// `--root`, and CLI-imported collections use this same derivation — distinct
+/// from `synapse_event_node_id`, which matches Synapse's own live mirror.
 fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
     derive_template_key("blake3-128", event_id)
+}
+
+/// Matches `event_node_id` in Synapse's `rust/src/database/mtxdb.rs` byte
+/// for byte: the first 16 bytes of
+/// `SHA-256("event_json:event:" + namespace + "\0" + event_id)`. `$id`
+/// lookups only find anything if this derivation is identical to Synapse's.
+fn synapse_event_node_id(namespace: &str, event_id: &str) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"event_json:event:");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(event_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash[..16]);
+    id
+}
+
+/// Matches `event_dag_room_id` in Synapse's `rust/src/database/mtxdb.rs`:
+/// the room-scoped `EventDag` collection ID that `!room_id` resolves to. The
+/// first 16 bytes of `SHA-256("event_json:dag:" + namespace + "\0" + room_id)`.
+fn matrix_room_collection_id(namespace: &str, room_id: &str) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"event_json:dag:");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(room_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash[..16]);
+    id
+}
+
+/// Resolve either the fixed-width collection ID or a `!room_id`, the latter
+/// hashed the same way Synapse's embedded mirror derives a room's `EventDag`
+/// collection (see `matrix_room_collection_id`).
+fn parse_collection_selector(selector: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
+    if let Some(room_id) = selector.strip_prefix('!') {
+        let namespace = namespace.context(
+            "resolving `!room_id` requires --namespace (or MTXDB_NAMESPACE) set to the same \
+             namespace Synapse's embedded mirror was configured with",
+        )?;
+        Ok(matrix_room_collection_id(namespace, room_id))
+    } else {
+        parse_collection_id(selector)
+    }
 }
 
 /// Open the store as its exclusive writer. Fails fast if another process
@@ -495,11 +550,11 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
 }
 
 fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::Result<()> {
-    let node_id = parse_get_id(id)?;
+    let node_id = parse_get_id(id, cli.namespace.as_deref())?;
     let store = open_store_read_only(cli)?;
     let matches: Vec<([u8; 16], NodeData)> = match collection {
         Some(collection) => {
-            let collection_id = parse_collection_id(collection)?;
+            let collection_id = parse_collection_selector(collection, cli.namespace.as_deref())?;
             store
                 .get(&collection_id, &node_id)?
                 .map(|data| vec![(collection_id, data)])
@@ -2615,7 +2670,9 @@ fn cmd_scan(
         bail!("scan sorting requires --verbose and cannot be combined with --raw");
     }
     let node_id = id.map(parse_node_id).transpose()?;
-    let collection_filter = collection.map(parse_collection_id).transpose()?;
+    let collection_filter = collection
+        .map(|value| parse_collection_selector(value, cli.namespace.as_deref()))
+        .transpose()?;
     let opts = ScanOptions {
         verbose,
         limit,
@@ -2807,7 +2864,7 @@ fn cmd_scan_collection(
     opts: &ScanOptions,
     shard_type: ShardType,
 ) -> anyhow::Result<()> {
-    let collection_id = parse_collection_id(selector)?;
+    let collection_id = parse_collection_selector(selector, cli.namespace.as_deref())?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = match ShardPool::open_read_only(pool_dir.clone()) {
         Ok(pool) => pool,
@@ -5044,8 +5101,9 @@ mod tests {
         decode_hamt_root, default_matrix_import_template, event_id, event_room_id,
         extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, glob_pack_files,
         import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
-        matrix_create_details, parse_federation_input, parse_pack_id_selector,
-        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
+        matrix_create_details, matrix_room_collection_id, parse_federation_input,
+        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        resolve_import_collection, scan_payload_suffix, synapse_event_node_id,
         template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
         StateSet,
     };
@@ -5136,6 +5194,7 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: Some(ShardType::State),
+            namespace: None,
             command: Commands::Sync { all: true },
         };
 
@@ -5162,6 +5221,7 @@ mod tests {
         let cli = Cli {
             dir: None,
             shard_type: None,
+            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -5180,6 +5240,7 @@ mod tests {
         let cli = Cli {
             dir: None,
             shard_type: Some(ShardType::State),
+            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -5204,6 +5265,7 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
+            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -5224,6 +5286,7 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
+            namespace: None,
             command: Commands::Shards {
                 all: false,
                 layout: false,
@@ -5246,6 +5309,7 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: Some(ShardType::State),
+            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -6379,6 +6443,54 @@ mod tests {
         assert_eq!(
             digest,
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected.as_bytes())
+        );
+    }
+
+    /// Reimplements `event_node_id`/`event_dag_room_id` from Synapse's
+    /// `rust/src/database/mtxdb.rs` independently of `synapse_event_node_id`/
+    /// `matrix_room_collection_id`, so a drift between the two derivations
+    /// (e.g. someone editing the domain-separation prefix in only one place)
+    /// fails this test instead of silently breaking `$event_id`/`!room_id`
+    /// lookups against a live Synapse-written database.
+    fn reference_node_id(prefix: &[u8], namespace: &str, value: &str) -> [u8; 16] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(prefix);
+        hasher.update(namespace.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(value.as_bytes());
+        let hash = hasher.finalize();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&hash[..16]);
+        id
+    }
+
+    #[test]
+    fn synapse_event_node_id_matches_reference_derivation() {
+        let namespace = "example.org";
+        let event_id = "$abc123:example.org";
+        assert_eq!(
+            synapse_event_node_id(namespace, event_id),
+            reference_node_id(b"event_json:event:", namespace, event_id)
+        );
+        // Different namespaces must not collide.
+        assert_ne!(
+            synapse_event_node_id(namespace, event_id),
+            synapse_event_node_id("other.org", event_id)
+        );
+    }
+
+    #[test]
+    fn matrix_room_collection_id_matches_reference_derivation() {
+        let namespace = "example.org";
+        let room_id = "!roomid:example.org";
+        assert_eq!(
+            matrix_room_collection_id(namespace, room_id),
+            reference_node_id(b"event_json:dag:", namespace, room_id)
+        );
+        assert_ne!(
+            matrix_room_collection_id(namespace, room_id),
+            matrix_room_collection_id("other.org", room_id)
         );
     }
 }
