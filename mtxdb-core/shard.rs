@@ -799,6 +799,259 @@ impl ShardPool {
         Ok(pack_files)
     }
 
+    /// Discover, validate, and sort pack files in `base_dir`. Enforces the
+    /// `MAX_SHARDS` capacity limit.
+    fn discover_pack_files_sorted(base_dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+        let mut pack_files = Self::discover_pack_files(base_dir)?;
+        if pack_files.len() > MAX_SHARDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "too many pack files: {} found, but the pool can hold at most {}",
+                    pack_files.len(),
+                    MAX_SHARDS
+                ),
+            ));
+        }
+        pack_files.sort_unstable_by_key(|(pack_id, _)| *pack_id);
+        Ok(pack_files)
+    }
+
+    /// Recover (if writable) and open every pack file, slotting them into
+    /// the shard vector. Returns `(recovery_time, recovery_calls,
+    /// packfile_open_time, packfile_open_calls)`.
+    fn recover_and_open_packs(
+        writable: bool,
+        pack_files: &[(u64, PathBuf)],
+        shards: &mut [Option<Arc<Shard>>],
+        next_slot: &mut u16,
+        max_pack_id: &mut u64,
+    ) -> io::Result<(Duration, u64, Duration, u64)> {
+        let mut recovery_time = Duration::ZERO;
+        let mut recovery_calls: u64 = 0;
+        let mut packfile_open_time = Duration::ZERO;
+        let mut packfile_open_calls: u64 = 0;
+        for (pack_id, path) in pack_files {
+            if writable {
+                let recovery_started = Instant::now();
+                let _ = packfile::scan_and_recover_packfile(path).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "corrupt pack {}; failed to scan and recover: {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                recovery_time = recovery_time.saturating_add(recovery_started.elapsed());
+                recovery_calls = recovery_calls.saturating_add(1);
+            }
+
+            let packfile_open_started = Instant::now();
+            let file = packfile::open_packfile(path, writable, *pack_id).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupt pack {}; failed to open: {error}", path.display()),
+                )
+            })?;
+            packfile_open_time = packfile_open_time.saturating_add(packfile_open_started.elapsed());
+            packfile_open_calls = packfile_open_calls.saturating_add(1);
+
+            let file_len = file.metadata()?.len();
+            let slot = *next_slot;
+            *next_slot = next_slot.saturating_add(1);
+            let shard = Arc::new(Shard::new(slot, *pack_id, file, path.clone(), file_len));
+            shards[slot as usize] = Some(shard);
+            if *pack_id >= *max_pack_id {
+                *max_pack_id = pack_id.saturating_add(1);
+            }
+        }
+        Ok((
+            recovery_time,
+            recovery_calls,
+            packfile_open_time,
+            packfile_open_calls,
+        ))
+    }
+
+    /// Bootstrap a brand-new pool: create the first pack file, persist
+    /// `pool.meta` (with a fresh seed if needed), and write `store.meta`.
+    /// Returns `(next_pack_id, bucket_seed, store_meta_write_time,
+    /// pool_meta_persist_time, initial_pack_create_time)`.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the pool is empty and not writable.
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_empty_pool(
+        base_dir: &Path,
+        shards: &mut [Option<Arc<Shard>>],
+        mut next_pack_id: u64,
+        mut bucket_seed: u64,
+        writable: bool,
+    ) -> io::Result<(u64, u64, Duration, Duration, Duration)> {
+        if !writable {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no shards found in {} (nothing to read)",
+                    base_dir.display()
+                ),
+            ));
+        }
+        let pack_id = next_pack_id;
+
+        let t_store_meta = Instant::now();
+        if !base_dir.join(STORE_META_FILENAME).exists() {
+            persist_store_meta(base_dir);
+        }
+        let store_meta_write_time = t_store_meta.elapsed();
+
+        if bucket_seed == 0 {
+            let mut seed_bytes = [0u8; 8];
+            getrandom::fill(&mut seed_bytes).map_err(io::Error::other)?;
+            bucket_seed = u64::from_ne_bytes(seed_bytes);
+        }
+
+        let t_pool_meta_persist = Instant::now();
+        Self::persist_pool_meta_at_sync_dir(
+            base_dir,
+            pack_id.checked_add(1).expect("pack_id overflow"),
+            bucket_seed,
+            false,
+        )?;
+        let pool_meta_persist_time = t_pool_meta_persist.elapsed();
+
+        let t_initial_pack = Instant::now();
+        let (file, path) = Self::create_packfile_atomically(base_dir, pack_id)?;
+        let file_len = file.metadata()?.len();
+        shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
+        next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
+
+        let dir = File::open(base_dir)?;
+        dir.sync_all()?;
+        let initial_pack_create_time = t_initial_pack.elapsed();
+
+        Ok((
+            next_pack_id,
+            bucket_seed,
+            store_meta_write_time,
+            pool_meta_persist_time,
+            initial_pack_create_time,
+        ))
+    }
+
+    /// Restore `next_pack_id` and `bucket_seed` from `pool.meta`, falling
+    /// back to `max_pack_id` from discovered files. Returns
+    /// `(next_pack_id, bucket_seed, pool_meta_restore_time)`.
+    fn restore_pool_meta_state(
+        base_dir: &Path,
+        max_pack_id: u64,
+    ) -> io::Result<(u64, u64, Duration)> {
+        let started = Instant::now();
+        let restored_meta = Self::restore_pool_meta(base_dir)?;
+        let next_pack_id =
+            restored_meta.map_or(max_pack_id, |meta| meta.next_pack_id.max(max_pack_id));
+        let bucket_seed = restored_meta.map_or(0u64, |meta| meta.bucket_seed);
+        Ok((next_pack_id, bucket_seed, started.elapsed()))
+    }
+
+    /// Restore persisted stats from `shard_stats.bin`. Returns
+    /// `(stats_persisted_at, persisted_stats_restore_time)`.
+    fn restore_stats_phase(
+        base_dir: &Path,
+        shards: &[Option<Arc<Shard>>],
+    ) -> (Option<u64>, Duration) {
+        let started = Instant::now();
+        let stats_persisted_at = Self::restore_persisted_stats(base_dir, shards);
+        (stats_persisted_at, started.elapsed())
+    }
+
+    /// Assemble a `ShardPool` from its discovered parts. Separated from
+    /// `open_internal` to keep the latter under the clippy line limit.
+    #[allow(clippy::too_many_arguments)]
+    fn build_pool(
+        shards: Vec<Option<Arc<Shard>>>,
+        base_dir: PathBuf,
+        max_shard_bytes: u64,
+        bucket_seed: u64,
+        next_pack_id: u64,
+        highest_active: u16,
+        writable: bool,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+        stats_persisted_at: Option<u64>,
+        open_elapsed: Duration,
+        discovery_time: Duration,
+        writer_lock_time: Duration,
+        recovery_time: Duration,
+        recovery_calls: u64,
+        packfile_open_time: Duration,
+        packfile_open_calls: u64,
+        metadata_restore_time: Duration,
+        pool_meta_restore_time: Duration,
+        persisted_stats_restore_time: Duration,
+        store_meta_write_time: Duration,
+        pool_meta_persist_time: Duration,
+        initial_pack_create_time: Duration,
+        #[cfg(not(target_arch = "wasm32"))] writer_lock: Option<WriterLock>,
+    ) -> Self {
+        let metadata_subphases_sum = pool_meta_restore_time
+            .saturating_add(store_meta_write_time)
+            .saturating_add(pool_meta_persist_time)
+            .saturating_add(initial_pack_create_time)
+            .saturating_add(persisted_stats_restore_time);
+        let metadata_unattributed_time =
+            metadata_restore_time.saturating_sub(metadata_subphases_sum);
+
+        let named_phases = discovery_time
+            .saturating_add(writer_lock_time)
+            .saturating_add(recovery_time)
+            .saturating_add(packfile_open_time)
+            .saturating_add(metadata_restore_time);
+        let unattributed = open_elapsed.saturating_sub(named_phases);
+
+        Self {
+            shards: RwLock::new(shards),
+            active_write: parking_lot::Mutex::new(highest_active),
+            rotation_lock: parking_lot::Mutex::new(()),
+            base_dir,
+            max_shard_bytes,
+            bucket_seed,
+            dirty: parking_lot::Mutex::new(HashSet::new()),
+            next_pack_id: AtomicU64::new(next_pack_id),
+            retired_count: AtomicU64::new(0),
+            stats_snapshots: AtomicU64::new(0),
+            collection_home: RwLock::new(HashMap::new()),
+            stats_persisted_at: RwLock::new(stats_persisted_at),
+            last_stats_flush: RwLock::new(None),
+            last_sync_split: Mutex::new(None),
+            dirty_lock_wait: AtomicU64::new(0),
+            last_open_timings: Mutex::new(Some(ShardOpenTimings {
+                discovery: discovery_time,
+                writer_lock: writer_lock_time,
+                packfile_recovery: recovery_time,
+                packfile_recovery_calls: recovery_calls,
+                packfile_open: packfile_open_time,
+                packfile_open_calls,
+                metadata_restore: metadata_restore_time,
+                pool_meta_restore: pool_meta_restore_time,
+                persisted_stats_restore: persisted_stats_restore_time,
+                store_meta_write: store_meta_write_time,
+                pool_meta_persist: pool_meta_persist_time,
+                initial_pack_create: initial_pack_create_time,
+                metadata_unattributed: metadata_unattributed_time,
+                unattributed,
+                total: open_elapsed,
+            })),
+            writable,
+            compress,
+            checksum_policy,
+            append_policy: AppendPolicy::Eager,
+            #[cfg(not(target_arch = "wasm32"))]
+            writer_lock,
+        }
+    }
+
     fn open_internal(
         base_dir: PathBuf,
         writable: bool,
@@ -834,69 +1087,17 @@ impl ShardPool {
         let mut max_pack_id: u64 = 0;
 
         let discovery_started = Instant::now();
-        let mut pack_files = Self::discover_pack_files(&base_dir)?;
+        let pack_files = Self::discover_pack_files_sorted(&base_dir)?;
         let discovery_time = discovery_started.elapsed();
 
-        // Enforce capacity: more pack files than available slots is an
-        // error — we can't open them all, and silently ignoring extras
-        // would lose data.
-        if pack_files.len() > MAX_SHARDS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "too many pack files: {} found, but the pool can hold at most {}",
-                    pack_files.len(),
-                    MAX_SHARDS
-                ),
-            ));
-        }
-
-        // Process in pack_id order for deterministic recovery.
-        pack_files.sort_unstable_by_key(|(pack_id, _)| *pack_id);
-
-        let mut recovery_time = Duration::ZERO;
-        let mut recovery_calls: u64 = 0;
-        let mut packfile_open_time = Duration::ZERO;
-        let mut packfile_open_calls: u64 = 0;
-        for (pack_id, path) in pack_files {
-            if writable {
-                let recovery_started = Instant::now();
-                let _ = packfile::scan_and_recover_packfile(&path).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "corrupt pack {}; failed to scan and recover: {error}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                recovery_time = recovery_time.saturating_add(recovery_started.elapsed());
-                recovery_calls = recovery_calls.saturating_add(1);
-            }
-
-            // Validate the file before accepting it. A valid v4 file
-            // must have the right magic, version, and CRC. If it
-            // doesn't, the pool is corrupt — fail open rather than
-            // silently deleting data.
-            let packfile_open_started = Instant::now();
-            let file = packfile::open_packfile(&path, writable, pack_id).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("corrupt pack {}; failed to open: {error}", path.display()),
-                )
-            })?;
-            packfile_open_time = packfile_open_time.saturating_add(packfile_open_started.elapsed());
-            packfile_open_calls = packfile_open_calls.saturating_add(1);
-
-            let file_len = file.metadata()?.len();
-            let slot = next_slot;
-            next_slot = next_slot.saturating_add(1);
-            let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));
-            shards[slot as usize] = Some(shard);
-            if pack_id >= max_pack_id {
-                max_pack_id = pack_id.saturating_add(1);
-            }
-        }
+        let (recovery_time, recovery_calls, packfile_open_time, packfile_open_calls) =
+            Self::recover_and_open_packs(
+                writable,
+                &pack_files,
+                &mut shards,
+                &mut next_slot,
+                &mut max_pack_id,
+            )?;
 
         let highest_active = next_slot.saturating_sub(1);
 
@@ -906,145 +1107,71 @@ impl ShardPool {
         // conservative than the file scan. A corrupt pool.meta is a hard
         // error — it means pack_ids could be reused, which is data corruption.
         let metadata_started = Instant::now();
-        let t_pool_meta_restore = Instant::now();
-        let restored_meta = Self::restore_pool_meta(&base_dir)?;
-        let mut next_pack_id =
-            restored_meta.map_or(max_pack_id, |meta| meta.next_pack_id.max(max_pack_id));
-        let mut bucket_seed = restored_meta.map_or(0u64, |meta| meta.bucket_seed);
-        let pool_meta_restore_time = t_pool_meta_restore.elapsed();
+        let (next_pack_id, bucket_seed, pool_meta_restore_time) =
+            Self::restore_pool_meta_state(&base_dir, max_pack_id)?;
 
-        let mut store_meta_write_time = Duration::ZERO;
-        let mut pool_meta_persist_time = Duration::ZERO;
-        let mut initial_pack_create_time = Duration::ZERO;
-
-        // If no shards exist, create the initial shard — but a read-only
-        // open of a store that doesn't exist yet makes no sense; error
-        // instead of a read-only pool silently creating on-disk state.
-        if shards.iter().all(std::option::Option::is_none) {
-            if !writable {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "no shards found in {} (nothing to read)",
-                        base_dir.display()
-                    ),
-                ));
-            }
-            let pack_id = next_pack_id;
-            // Record which mtxdb-core version created this store. Best
-            // effort and diagnostic-only (see `persist_store_meta`), so it
-            // doesn't need the same before-the-pack-file ordering as
-            // pool.meta below. Only write it the first time: this branch
-            // also runs when every pack file has since been removed but
-            // `store.meta` survives, and overwriting it there would make
-            // stats attribute store creation to whichever binary happens to
-            // reopen an emptied pool.
-            let t_store_meta = Instant::now();
-            if !base_dir.join(STORE_META_FILENAME).exists() {
-                persist_store_meta(&base_dir);
-            }
-            store_meta_write_time = t_store_meta.elapsed();
-            // Generate a fresh bucket_seed if this is a brand-new pool
-            // (no prior pool.meta). The seed prevents offline adversarial
-            // precomputation against the unseeded content hash.
-            if bucket_seed == 0 {
-                let mut seed_bytes = [0u8; 8];
-                getrandom::fill(&mut seed_bytes).map_err(io::Error::other)?;
-                bucket_seed = u64::from_ne_bytes(seed_bytes);
-            }
-            // Persist the high-water mark BEFORE creating the pack file.
-            // A crash after pack creation but before next persist would
-            // leave a pack_id in use with no pool.meta reservation — so
-            // we write pool.meta first, guaranteeing the ID is reserved.
-            let t_pool_meta_persist = Instant::now();
-            Self::persist_pool_meta_at_sync_dir(
+        let (
+            store_meta_write_time,
+            pool_meta_persist_time,
+            initial_pack_create_time,
+            shards,
+            next_pack_id,
+            bucket_seed,
+        ) = if shards.iter().all(std::option::Option::is_none) {
+            let (npi, bs, smw, pmp, ipc) = Self::initialize_empty_pool(
                 &base_dir,
-                pack_id.checked_add(1).expect("pack_id overflow"),
+                &mut shards,
+                next_pack_id,
                 bucket_seed,
-                false,
+                writable,
             )?;
-            pool_meta_persist_time = t_pool_meta_persist.elapsed();
-            let t_initial_pack = Instant::now();
-            let (file, path) = Self::create_packfile_atomically(&base_dir, pack_id)?;
-            let file_len = file.metadata()?.len();
-            shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
-            next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
-
-            // Fsync the containing directory so both the pool.meta rename and the
-            // initial packfile rename are durable across power loss, coalescing
-            // directory synchronization into a single barrier.
-            let dir = File::open(&base_dir)?;
-            dir.sync_all()?;
-            initial_pack_create_time = t_initial_pack.elapsed();
-        }
+            (smw, pmp, ipc, shards, npi, bs)
+        } else {
+            (
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                shards,
+                next_pack_id,
+                bucket_seed,
+            )
+        };
 
         // Restoring is a pure read of shard_stats.bin applied to our own
         // in-memory Shard objects — unconditional regardless of writable.
-        // A read-only pool must never *write* a new snapshot (its own
-        // counters are always zero, since it never writes or syncs), but
-        // it absolutely should show whatever the real writer already
-        // persisted — that's the entire point of a `shards`-style
-        // inspection tool being able to see real numbers at all.
-        let t_stats = Instant::now();
-        let stats_persisted_at = Self::restore_persisted_stats(&base_dir, &shards);
-        let persisted_stats_restore_time = t_stats.elapsed();
+        let (stats_persisted_at, persisted_stats_restore_time) =
+            Self::restore_stats_phase(&base_dir, &shards);
         let metadata_restore_time = metadata_started.elapsed();
 
-        let metadata_subphases_sum = pool_meta_restore_time
-            .saturating_add(store_meta_write_time)
-            .saturating_add(pool_meta_persist_time)
-            .saturating_add(initial_pack_create_time)
-            .saturating_add(persisted_stats_restore_time);
-        let metadata_unattributed_time =
-            metadata_restore_time.saturating_sub(metadata_subphases_sum);
-
         let total = open_started.elapsed();
-        let named_phases = discovery_time
-            .saturating_add(writer_lock_time)
-            .saturating_add(recovery_time)
-            .saturating_add(packfile_open_time)
-            .saturating_add(metadata_restore_time);
 
-        Ok(Self {
-            shards: RwLock::new(shards),
-            active_write: parking_lot::Mutex::new(highest_active),
-            rotation_lock: parking_lot::Mutex::new(()),
+        Ok(Self::build_pool(
+            shards,
             base_dir,
             max_shard_bytes,
             bucket_seed,
-            dirty: parking_lot::Mutex::new(HashSet::new()),
-            next_pack_id: AtomicU64::new(next_pack_id),
-            retired_count: AtomicU64::new(0),
-            stats_snapshots: AtomicU64::new(0),
-            collection_home: RwLock::new(HashMap::new()),
-            stats_persisted_at: RwLock::new(stats_persisted_at),
-            last_stats_flush: RwLock::new(None),
-            last_sync_split: Mutex::new(None),
-            dirty_lock_wait: AtomicU64::new(0),
-            last_open_timings: Mutex::new(Some(ShardOpenTimings {
-                discovery: discovery_time,
-                writer_lock: writer_lock_time,
-                packfile_recovery: recovery_time,
-                packfile_recovery_calls: recovery_calls,
-                packfile_open: packfile_open_time,
-                packfile_open_calls,
-                metadata_restore: metadata_restore_time,
-                pool_meta_restore: pool_meta_restore_time,
-                persisted_stats_restore: persisted_stats_restore_time,
-                store_meta_write: store_meta_write_time,
-                pool_meta_persist: pool_meta_persist_time,
-                initial_pack_create: initial_pack_create_time,
-                metadata_unattributed: metadata_unattributed_time,
-                unattributed: total.saturating_sub(named_phases),
-                total,
-            })),
+            next_pack_id,
+            highest_active,
             writable,
             compress,
             checksum_policy,
-            append_policy: AppendPolicy::Eager,
+            stats_persisted_at,
+            total,
+            discovery_time,
+            writer_lock_time,
+            recovery_time,
+            recovery_calls,
+            packfile_open_time,
+            packfile_open_calls,
+            metadata_restore_time,
+            pool_meta_restore_time,
+            persisted_stats_restore_time,
+            store_meta_write_time,
+            pool_meta_persist_time,
+            initial_pack_create_time,
             #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
-        })
+        ))
     }
 
     /// Return the timing breakdown from the most recent pool open.
