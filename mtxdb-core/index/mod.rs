@@ -10,6 +10,61 @@ pub mod format;
 use crate::index::delta::DeltaReplayError;
 use crate::index::format::DeltaFrame;
 
+/// Per-database-instance tuning for [`LossyIndex`] construction.
+///
+/// `seed` is mixed into bucket *and* tag derivation to prevent adversarial
+/// precomputation against a fixed, unsalted content hash. Every real
+/// `PackfileStorage`-sourced config must carry the pool's actual persisted
+/// seed; the `Default` impl uses `seed: 0` only for tests and transient
+/// construction that never touches disk.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexConfig {
+    /// Mixed into bucket and tag derivation to prevent adversarial
+    /// precomputation. See `index/mod.rs` seed docs.
+    pub seed: u64,
+    /// Minimum initial capacity for a newly created collection's index.
+    /// Composes with the hard 16-slot minimum: `effective_min = floor.max(16)`.
+    pub floor: u32,
+    /// Load factor (percent, 1..=90) at which the index grows.
+    pub load_factor_percent: u8,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            seed: 0,
+            floor: 64,
+            load_factor_percent: 75,
+        }
+    }
+}
+
+impl IndexConfig {
+    /// Validate the configuration. Returns `Err(message)` on invalid values.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.load_factor_percent == 0 || self.load_factor_percent > 90 {
+            return Err("load_factor_percent must be in 1..=90");
+        }
+        if self.floor == 0 {
+            return Err("floor must be > 0");
+        }
+        Ok(())
+    }
+}
+
+/// Splitmix64-style avalanche finalizer. Cheap, well-distributed, no
+/// dependencies. Used to mix the per-pool seed into bucket and tag
+/// derivation so an attacker cannot precompute hash → bucket/tag mappings
+/// without knowing the seed.
+#[inline]
+fn mix(x: u64) -> u64 {
+    let mut v = x;
+    v = v.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    v = (v ^ (v >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    v ^ (v >> 31)
+}
+
 /// Per-slot entry in the lossy fanout index.
 ///
 /// Layout: `[16-bit tag | 16-bit shard_id | 32-bit offset]` packed into a `u64`.
@@ -112,6 +167,8 @@ pub struct LossyIndex {
     mask: u32,
     /// Shift to extract top bits from hash for bucket index.
     shift: u32,
+    /// Per-instance config: seed, floor, load factor.
+    config: IndexConfig,
     /// The flat slot array. Checkpoint-loaded indexes borrow the immutable
     /// raw slots from their mmap until their first write, which clones them
     /// into the owned atomic representation.
@@ -122,7 +179,7 @@ pub struct LossyIndex {
     homes: Mutex<Vec<u64>>,
     /// The remaining 40 bits of each live slot's hash, plus a high-bit
     /// marker that says the identity is known. Together with `homes` and the
-    /// packed 24-bit tag this makes overwrite equality exact without putting
+    /// packed tag this makes overwrite equality exact without putting
     /// full hashes in the checkpoint.
     tails: Mutex<Vec<u64>>,
     /// `deserialize` restores slots without their source hashes. Such an
@@ -167,6 +224,7 @@ impl Clone for LossyIndex {
             capacity: self.capacity,
             mask: self.mask,
             shift: self.shift,
+            config: self.config,
             slots: SlotStorage::Owned(self.slots.materialize(self.capacity as usize)),
             // Checkpoint-backed indexes deliberately omit source hashes. On
             // their first write, clone their slots into owned storage but
@@ -192,20 +250,35 @@ impl Clone for LossyIndex {
 const LIVE_SLOT_BYTES: usize = std::mem::size_of::<IndexSlot>() + 2 * std::mem::size_of::<u64>();
 
 impl LossyIndex {
-    /// Create a new index with at least `min_capacity` slots.
+    /// Create a new index with at least `min_capacity` slots using default config.
     /// Capacity is rounded up to the next power of two.
     ///
     /// # Panics
     /// Panics if `min_capacity` exceeds `u32::MAX` when rounded to a power of two.
     #[must_use]
     pub fn new(min_capacity: usize) -> Self {
-        let capacity_usize = min_capacity.next_power_of_two().max(16);
+        Self::with_config(min_capacity, IndexConfig::default())
+    }
+
+    /// Create a new index with at least `min_capacity` slots using the given config.
+    /// Capacity is rounded up to the next power of two. The configured `floor`
+    /// composes with the hard 16-slot minimum: `effective_min = floor.max(16)`.
+    ///
+    /// # Panics
+    /// Panics if `min_capacity` exceeds `u32::MAX` when rounded to a power of two,
+    /// or if `config` fails validation.
+    #[must_use]
+    pub fn with_config(min_capacity: usize, config: IndexConfig) -> Self {
+        config.validate().expect("invalid IndexConfig");
+        let effective_min = (config.floor.max(16)) as usize;
+        let capacity_usize = min_capacity.max(effective_min).next_power_of_two();
         let capacity = u32::try_from(capacity_usize).expect("index capacity exceeds u32::MAX");
         let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
         Self {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
+            config,
             slots: SlotStorage::Owned((0..capacity_usize).map(|_| AtomicU64::new(0)).collect()),
             homes: Mutex::new(vec![0; capacity_usize]),
             tails: Mutex::new(vec![0; capacity_usize]),
@@ -221,10 +294,25 @@ impl LossyIndex {
     }
 
     /// Extract the bucket index from a 16-byte hash.
+    ///
+    /// The seed is XORed into the raw home value before the avalanche mix,
+    /// so the same content hash lands in different buckets across pools
+    /// with different seeds. The mixed value is what gets stored in `homes`,
+    /// so `grow()` (which rehashes from stored homes) sees the already-mixed
+    /// value and doesn't need to know the seed at all.
     #[inline]
     fn bucket(&self, hash: &[u8; 16]) -> usize {
-        let top_bytes = u64::from_be_bytes(hash[..8].try_into().unwrap());
-        self.bucket_for_home(top_bytes)
+        let raw = u64::from_be_bytes(hash[..8].try_into().unwrap());
+        let home = mix(raw ^ self.config.seed);
+        self.bucket_for_home(home)
+    }
+
+    /// Mix a raw home value with this index's seed. Used by insert to store
+    /// the post-mix value in `homes`, and by `hydrate_slot_identity` to
+    /// reproduce the same home from a recovered hash.
+    #[inline]
+    fn mix_home(&self, raw_home: u64) -> u64 {
+        mix(raw_home ^ self.config.seed)
     }
 
     #[inline]
@@ -234,32 +322,28 @@ impl LossyIndex {
         usize::try_from(masked).unwrap_or(usize::MAX)
     }
 
-    /// Extract the 16-bit tag from a 16-byte hash.
+    /// Extract the 16-bit tag from a 16-byte hash, seeded with this index's seed.
     ///
     /// Uses bytes 8..12, disjoint from the bytes `bucket()` reads (0..8).
-    /// If the tag were derived from bucket bits (or a superset of them),
-    /// same-bucket entries would already agree on those bits, collapsing
-    /// the tag's effective discriminating power and causing far more
-    /// spurious "same tag" overwrites than the nominal collision rate
-    /// predicts.
-    ///
-    /// Deliberately unseeded (unlike `bucket()`/`home`): a tag match never
-    /// proves key equality or causes an overwrite by itself (see
-    /// `insert_undoable`), so seeding it would add no adversarial-collision
-    /// mitigation — the exploitable lever is bucket placement, not tag
-    /// false-positives. Keeping it unseeded also keeps `tag_for_hash` a
-    /// static, instance-independent function for recovery code.
+    /// Seeding the tag prevents an attacker from grinding offline for
+    /// tag collisions against a known target bucket — without the seed,
+    /// a narrower 16-bit tag would make I/O amplification attacks feasible.
     #[inline]
-    fn tag(hash: &[u8; 16]) -> u32 {
-        let top = u32::from_be_bytes(hash[8..12].try_into().unwrap());
-        top >> 16 // top 16 bits
+    fn tag(&self, hash: &[u8; 16]) -> u32 {
+        let raw = u32::from_be_bytes(hash[8..12].try_into().unwrap());
+        let mixed = mix(u64::from(raw) ^ self.config.seed);
+        (mixed >> 48) as u32
     }
 
     /// The packed-slot tag for `hash`, exposed to crate-local recovery code
     /// that must validate a persisted slot against its authoritative frame.
+    /// Uses seed 0 (static, instance-independent) — only valid for recovery
+    /// code that validates against the raw tag stored in the slot, not for
+    /// live insert/lookup which must use the instance's seeded tag.
     #[inline]
     pub(crate) fn tag_for_hash(hash: &[u8; 16]) -> u32 {
-        Self::tag(hash)
+        let top = u32::from_be_bytes(hash[8..12].try_into().unwrap());
+        top >> 16 // unseeded, for checkpoint validation only
     }
 
     #[inline]
@@ -314,10 +398,9 @@ impl LossyIndex {
         shard_id: u16,
         offset: u64,
     ) -> Result<(u32, u64, SlotUndo), InsertError> {
-        let tag = Self::tag(hash);
-        let home = u64::from_be_bytes([
-            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
-        ]);
+        let tag = self.tag(hash);
+        let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
+        let home = self.mix_home(raw_home);
         let mut bucket = self.bucket_for_home(home);
 
         loop {
@@ -327,7 +410,10 @@ impl LossyIndex {
             let slot = IndexSlot(slots[bucket].load(Ordering::Acquire));
             if slot.is_empty() {
                 // Only reject when actually inserting into a new slot
-                let threshold = self.capacity.wrapping_mul(3) / 4;
+                let threshold = self
+                    .capacity
+                    .wrapping_mul(self.config.load_factor_percent as u32)
+                    / 100;
                 if self.len.load(Ordering::Relaxed) >= threshold {
                     return Err(InsertError::TableFull);
                 }
@@ -412,10 +498,11 @@ impl LossyIndex {
             return false;
         }
         let slot = IndexSlot(self.slot_at(bucket));
-        if slot.is_empty() || slot.tag() != Self::tag(hash) {
+        if slot.is_empty() || slot.tag() != self.tag(hash) {
             return false;
         }
-        let home = u64::from_be_bytes(hash[..8].try_into().expect("16-byte hash"));
+        let raw_home = u64::from_be_bytes(hash[..8].try_into().expect("16-byte hash"));
+        let home = self.mix_home(raw_home);
         self.homes.lock()[bucket] = home;
         self.tails.lock()[bucket] = Self::tail(hash);
         true
@@ -484,7 +571,7 @@ impl LossyIndex {
         if !self.can_grow || self.capacity > u32::MAX / 2 {
             return None;
         }
-        let grown = Self::new(self.capacity as usize * 2);
+        let grown = Self::with_config(self.capacity as usize * 2, self.config);
         let homes = self.homes.lock();
         let tails = self.tails.lock();
         for (index, home) in homes.iter().copied().enumerate() {
@@ -540,7 +627,7 @@ impl LossyIndex {
         }
         locations.sort_unstable_by_key(|(shard_id, offset, _)| (*shard_id, *offset));
 
-        let grown = Self::new(self.capacity as usize * 2);
+        let grown = Self::with_config(self.capacity as usize * 2, self.config);
         for (shard_id, offset, slot_tag) in locations {
             let hash = hash_at(shard_id, offset, slot_tag)?;
             // A doubled table is at most 37.5% full because insertion only
@@ -573,11 +660,16 @@ impl LossyIndex {
     #[inline]
     #[must_use]
     pub fn lookup_all(&self, hash: &[u8; 16]) -> LookupIter<'_> {
-        let tag = Self::tag(hash);
+        let tag = self.tag(hash);
         let bucket = self.bucket(hash);
+        let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
+        let mixed_home = self.mix_home(raw_home);
+        let expected_tail = Self::tail(hash);
         LookupIter {
             index: self,
             tag,
+            mixed_home,
+            expected_tail,
             bucket,
             mask: self.mask as usize,
             remaining: self.capacity as usize,
@@ -696,7 +788,7 @@ impl LossyIndex {
         buf
     }
 
-    /// Deserialize an index from bytes.
+    /// Deserialize an index from bytes, using default config (no seed).
     ///
     /// # Errors
     /// Returns `DeserializationError::TooShort` if the data is too short,
@@ -706,6 +798,22 @@ impl LossyIndex {
     /// # Panics
     /// Panics if the 8-byte capacity header cannot be read (guaranteed by the length check).
     pub fn deserialize(data: &[u8]) -> Result<Self, DeserializationError> {
+        Self::deserialize_with_config(data, IndexConfig::default())
+    }
+
+    /// Deserialize an index from bytes with a given config (providing seed).
+    ///
+    /// # Errors
+    /// Returns `DeserializationError::TooShort` if the data is too short,
+    /// or `DeserializationError::InvalidCapacity` if the capacity is not
+    /// a power of two or is less than 16.
+    ///
+    /// # Panics
+    /// Panics if the 8-byte capacity header cannot be read (guaranteed by the length check).
+    pub fn deserialize_with_config(
+        data: &[u8],
+        config: IndexConfig,
+    ) -> Result<Self, DeserializationError> {
         if data.len() < 8 {
             return Err(DeserializationError::TooShort);
         }
@@ -741,6 +849,7 @@ impl LossyIndex {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
+            config,
             slots: SlotStorage::Owned(slots),
             homes: Mutex::new(vec![0; capacity_usize]),
             tails: Mutex::new(vec![0; capacity_usize]),
@@ -750,13 +859,29 @@ impl LossyIndex {
     }
 
     /// Build a read-only index directly over a validated checkpoint's raw
-    /// slots. The first write clones it into the normal owned representation.
+    /// slots, using default config. The first write clones it into the
+    /// normal owned representation.
     #[must_use]
     pub fn from_mmap_slots(mmap: Arc<Mmap>, offset: usize, capacity: u32, len: u32) -> Self {
+        Self::from_mmap_slots_with_config(mmap, offset, capacity, len, IndexConfig::default())
+    }
+
+    /// Build a read-only index directly over a validated checkpoint's raw
+    /// slots with a given config. The first write clones it into the
+    /// normal owned representation.
+    #[must_use]
+    pub fn from_mmap_slots_with_config(
+        mmap: Arc<Mmap>,
+        offset: usize,
+        capacity: u32,
+        len: u32,
+        config: IndexConfig,
+    ) -> Self {
         Self {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
+            config,
             slots: SlotStorage::Mmap { mmap, offset },
             homes: Mutex::new(Vec::new()),
             tails: Mutex::new(Vec::new()),
@@ -842,11 +967,22 @@ impl std::error::Error for DeserializationError {}
 
 /// Iterator over candidate offsets for a hash lookup.
 ///
-/// Yields `(shard_id, offset)` for each slot whose 24-bit tag matches,
-/// terminating at the first empty slot or after the full capacity is probed.
+/// Yields `(shard_id, offset)` for each slot whose tag matches and whose
+/// in-memory identity (home + tail) matches the query hash, terminating at
+/// the first empty slot or after the full capacity is probed.
+///
+/// When the index has hydrated identity (live/warm index), candidates are
+/// verified in-memory before yielding — this eliminates disk I/O for tag
+/// collisions on the normal path. For checkpoint-backed indexes without
+/// hydrated identity (tail == 0), all tag-matching candidates are yielded
+/// and the caller must verify against the packfile.
 pub struct LookupIter<'a> {
     index: &'a LossyIndex,
     tag: u32,
+    /// The mixed home for the query hash, for in-memory verification.
+    mixed_home: u64,
+    /// The expected tail for the query hash.
+    expected_tail: u64,
     bucket: usize,
     mask: usize,
     remaining: usize,
@@ -863,10 +999,27 @@ impl Iterator for LookupIter<'_> {
             if slot.is_empty() {
                 return None;
             }
+            let current = self.bucket;
             self.bucket = self.bucket.wrapping_add(1) & self.mask;
-            if slot.tag() == self.tag {
-                return Some((slot.shard_id(), slot.offset()));
+            if slot.tag() != self.tag {
+                continue;
             }
+            // Tag matches. For a live index with hydrated identity, verify
+            // home + tail in-memory to avoid yielding false positives that
+            // would force the caller into an expensive packfile read.
+            let tail = self.index.tails.lock()[current];
+            if tail != 0 {
+                // Identity is hydrated — check home and tail.
+                if self.index.homes.lock()[current] == self.mixed_home && tail == self.expected_tail
+                {
+                    return Some((slot.shard_id(), slot.offset()));
+                }
+                // Tag matched but home/tail didn't — false positive, skip.
+                continue;
+            }
+            // Checkpoint-backed without hydrated identity — yield and let
+            // the caller verify against the packfile.
+            return Some((slot.shard_id(), slot.offset()));
         }
         None
     }
@@ -1294,9 +1447,10 @@ mod tests {
         let capacity: u64 = 16;
         let mut bytes = Vec::with_capacity(8 + 16 * 8);
         bytes.extend_from_slice(&capacity.to_le_bytes());
+        let tmp = LossyIndex::new(16);
         for i in 0..16u64 {
             let h = splitmix_hash(i + 5000);
-            let tag = LossyIndex::tag(&h);
+            let tag = tmp.tag(&h);
             let slot = IndexSlot::new(tag, 0, i);
             bytes.extend_from_slice(&slot.0.to_le_bytes());
         }

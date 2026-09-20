@@ -227,7 +227,16 @@ const STATS_HEADER_LEN: usize = 4 + 1 + 8;
 const POOL_META_FILENAME: &str = "pool.meta";
 
 /// Pool metadata format version.
-const POOL_META_VERSION: u8 = 1;
+const POOL_META_VERSION: u8 = 2;
+
+/// Parsed pool metadata from `pool.meta`.
+#[derive(Debug, Clone, Copy)]
+struct PoolMeta {
+    /// First `pack_id` not yet allocated.
+    next_pack_id: u64,
+    /// Per-pool seed mixed into index bucket/tag derivation.
+    bucket_seed: u64,
+}
 
 /// Filename for the one-time store-creation marker: records which
 /// `mtxdb-core` version created this store. Written once, when the very
@@ -433,9 +442,13 @@ pub struct ShardPool {
     /// Per-pool rotation threshold, in bytes. Defaults to `MAX_SHARD_BYTES`
     /// but may be set lower (e.g. by a benchmark that wants many small
     /// packs to exercise repack/locality behavior) — never higher, since
-    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexSlot`'s 28-bit
+    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexSlot`'s 32-bit
     /// offset field.
     max_shard_bytes: u64,
+    /// Per-pool seed mixed into index bucket/tag derivation. Generated once
+    /// at first pool creation, persisted in `pool.meta`, immutable after
+    /// construction.
+    bucket_seed: u64,
     /// Shard IDs written to since the last sync, for scoped fsync.
     dirty: parking_lot::Mutex<HashSet<u16>>,
     /// Monotonically increasing `pack_id` counter for pack filenames.
@@ -881,15 +894,17 @@ impl ShardPool {
 
         let highest_active = next_slot.saturating_sub(1);
 
-        // Restore next_pack_id from pool.meta if available, falling back
-        // to max_pack_id computed from discovered files. The meta file
-        // survives retired-and-deleted shards, so it's strictly more
+        // Restore next_pack_id and bucket_seed from pool.meta if available,
+        // falling back to max_pack_id computed from discovered files. The meta
+        // file survives retired-and-deleted shards, so it's strictly more
         // conservative than the file scan. A corrupt pool.meta is a hard
         // error — it means pack_ids could be reused, which is data corruption.
         let metadata_started = Instant::now();
         let t_pool_meta_restore = Instant::now();
-        let mut next_pack_id = Self::restore_pool_meta(&base_dir)?
-            .map_or(max_pack_id, |persisted| persisted.max(max_pack_id));
+        let restored_meta = Self::restore_pool_meta(&base_dir)?;
+        let mut next_pack_id =
+            restored_meta.map_or(max_pack_id, |meta| meta.next_pack_id.max(max_pack_id));
+        let mut bucket_seed = restored_meta.map_or(0u64, |meta| meta.bucket_seed);
         let pool_meta_restore_time = t_pool_meta_restore.elapsed();
 
         let mut store_meta_write_time = Duration::ZERO;
@@ -923,6 +938,15 @@ impl ShardPool {
                 persist_store_meta(&base_dir);
             }
             store_meta_write_time = t_store_meta.elapsed();
+            // Generate a fresh bucket_seed if this is a brand-new pool
+            // (no prior pool.meta). The seed prevents offline adversarial
+            // precomputation against the unseeded content hash.
+            if bucket_seed == 0 {
+                let mut seed_bytes = [0u8; 8];
+                getrandom::fill(&mut seed_bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                bucket_seed = u64::from_ne_bytes(seed_bytes);
+            }
             // Persist the high-water mark BEFORE creating the pack file.
             // A crash after pack creation but before next persist would
             // leave a pack_id in use with no pool.meta reservation — so
@@ -931,6 +955,7 @@ impl ShardPool {
             Self::persist_pool_meta_at_sync_dir(
                 &base_dir,
                 pack_id.checked_add(1).expect("pack_id overflow"),
+                bucket_seed,
                 false,
             )?;
             pool_meta_persist_time = t_pool_meta_persist.elapsed();
@@ -981,6 +1006,7 @@ impl ShardPool {
             rotation_lock: parking_lot::Mutex::new(()),
             base_dir,
             max_shard_bytes,
+            bucket_seed,
             dirty: parking_lot::Mutex::new(HashSet::new()),
             next_pack_id: AtomicU64::new(next_pack_id),
             retired_count: AtomicU64::new(0),
@@ -1019,6 +1045,12 @@ impl ShardPool {
     #[must_use]
     pub fn open_timings(&self) -> Option<ShardOpenTimings> {
         *self.last_open_timings.lock()
+    }
+
+    /// Return the per-pool seed mixed into index bucket/tag derivation.
+    #[must_use]
+    pub(crate) fn bucket_seed(&self) -> u64 {
+        self.bucket_seed
     }
 
     /// Claim the writer lock on `base_dir`: atomically create a
@@ -1248,26 +1280,28 @@ impl ShardPool {
         base_dir.join(POOL_META_FILENAME)
     }
 
-    /// Persist `next_pack_id` to `pool.meta` using an atomic
+    /// Persist `next_pack_id` and `bucket_seed` to `pool.meta` using an atomic
     /// tmp+rename + dir-fsync pattern. The high-water mark is written
     /// *before* the pack file it protects is created, so a crash at any
     /// point never leaves a `pack_id` that could be reused.
-    ///
-    /// The `next` argument is the value to persist — the first `pack_id`
-    /// that has *not* yet been allocated. The caller must ensure this
-    /// is written before creating any pack file that uses IDs below it.
-    fn persist_pool_meta_at(base_dir: &Path, next: u64) -> io::Result<()> {
-        Self::persist_pool_meta_at_sync_dir(base_dir, next, true)
+    fn persist_pool_meta_at(base_dir: &Path, next: u64, bucket_seed: u64) -> io::Result<()> {
+        Self::persist_pool_meta_at_sync_dir(base_dir, next, bucket_seed, true)
     }
 
     /// Internal form of [`Self::persist_pool_meta_at`] allowing callers that
     /// create multiple files (such as fresh pool open) to defer directory
     /// synchronization until all renames have completed.
-    fn persist_pool_meta_at_sync_dir(base_dir: &Path, next: u64, sync_dir: bool) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(14);
+    fn persist_pool_meta_at_sync_dir(
+        base_dir: &Path,
+        next: u64,
+        bucket_seed: u64,
+        sync_dir: bool,
+    ) -> io::Result<()> {
+        let mut buf = Vec::with_capacity(22);
         buf.extend_from_slice(b"PMeta");
         buf.push(POOL_META_VERSION);
         buf.extend_from_slice(&next.to_le_bytes());
+        buf.extend_from_slice(&bucket_seed.to_le_bytes());
 
         let final_path = Self::pool_meta_path(base_dir);
         let tmp_path = final_path.with_extension(format!("meta.tmp.{}", std::process::id()));
@@ -1293,23 +1327,23 @@ impl ShardPool {
         Ok(())
     }
 
-    /// Restore `next_pack_id` from `pool.meta`. Returns an error if
+    /// Restore pool metadata from `pool.meta`. Returns an error if
     /// the file exists but is corrupt, truncated, or has an unknown
     /// version — a corrupt pool.meta means `pack_id`s could be reused,
     /// which is unrecoverable data corruption. Returns `Ok(None)` if
     /// the file does not exist (fresh pool).
-    fn restore_pool_meta(base_dir: &Path) -> io::Result<Option<u64>> {
+    fn restore_pool_meta(base_dir: &Path) -> io::Result<Option<PoolMeta>> {
         let path = Self::pool_meta_path(base_dir);
         let data = match fs::read(&path) {
             Ok(data) => data,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if data.len() < 14 {
+        if data.len() < 22 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "pool.meta is truncated ({} bytes, expected >= 14)",
+                    "pool.meta is truncated ({} bytes, expected >= 22)",
                     data.len()
                 ),
             ));
@@ -1329,8 +1363,12 @@ impl ShardPool {
                 ),
             ));
         }
-        let bytes: [u8; 8] = data[6..14].try_into().unwrap();
-        Ok(Some(u64::from_le_bytes(bytes)))
+        let next_pack_id = u64::from_le_bytes(data[6..14].try_into().unwrap());
+        let bucket_seed = u64::from_le_bytes(data[14..22].try_into().unwrap());
+        Ok(Some(PoolMeta {
+            next_pack_id,
+            bucket_seed,
+        }))
     }
 
     /// Load a persisted stats snapshot, if one exists, and restore each
@@ -2277,7 +2315,7 @@ impl ShardPool {
                 // Persist the high-water mark BEFORE creating the pack file.
                 // A crash after pack creation but before the next persist
                 // would leave a pack_id in use with no pool.meta reservation.
-                Self::persist_pool_meta_at(&self.base_dir, next)?;
+                Self::persist_pool_meta_at(&self.base_dir, next, self.bucket_seed)?;
 
                 let (file, path) = Self::create_packfile_atomically(&self.base_dir, pack_id)?;
                 let file_len = file.metadata()?.len();
@@ -3445,7 +3483,7 @@ mod tests {
         );
         let restored = ShardPool::restore_pool_meta(&dir).unwrap();
         assert_eq!(
-            restored,
+            restored.map(|m| m.next_pack_id),
             Some(1),
             "pool.meta should contain next_pack_id = 1 after initial shard 0"
         );
@@ -3464,7 +3502,7 @@ mod tests {
         assert!(ShardPool::pool_meta_path(&dir).exists());
         let restored = ShardPool::restore_pool_meta(&dir).unwrap();
         assert_eq!(
-            restored,
+            restored.map(|m| m.next_pack_id),
             Some(2),
             "pool.meta should contain next_pack_id = 2"
         );
@@ -3539,7 +3577,7 @@ mod tests {
             let dir = test_dir("interruption_state_2");
             // Simulate pool.meta was renamed with next_pack_id = 1, but
             // before the deferred directory sync.
-            ShardPool::persist_pool_meta_at_sync_dir(&dir, 1, false).unwrap();
+            ShardPool::persist_pool_meta_at_sync_dir(&dir, 1, 0xDEAD_BEEF, false).unwrap();
             // Stale pack tmp left behind
             fs::write(
                 dir.join("pack_0000000000000000.tmp.1234.0"),
