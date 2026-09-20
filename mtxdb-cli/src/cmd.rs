@@ -355,7 +355,7 @@ fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<Pa
 }
 
 fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
-    pool_dir(&open_layout(cli)?, cli.shard_type)
+    pool_dir(&open_layout(cli)?, cli.require_shard_type()?)
 }
 
 /// A collection ID not found under `cli.shard_type` is often just in one of
@@ -369,9 +369,12 @@ fn other_shard_type_hint(cli: &Cli, collection_id: &[u8; 16]) -> String {
     let Ok(layout) = open_layout(cli) else {
         return String::new();
     };
+    let Some(current) = cli.shard_type else {
+        return String::new();
+    };
     let found: Vec<&str> = ShardType::ALL
         .into_iter()
-        .filter(|&shard_type| shard_type != cli.shard_type)
+        .filter(|&shard_type| shard_type != current)
         .filter_map(|shard_type| {
             pool_dir(&layout, shard_type)
                 .ok()
@@ -388,7 +391,7 @@ fn other_shard_type_hint(cli: &Cli, collection_id: &[u8; 16]) -> String {
     } else {
         format!(
             " (not in -t {}; found in -t {})",
-            cli.shard_type.as_str(),
+            current.as_str(),
             found.join(", -t ")
         )
     }
@@ -401,9 +404,12 @@ fn other_shard_type_node_hint(cli: &Cli, node_id: &[u8; 16]) -> String {
     let Ok(layout) = open_layout(cli) else {
         return String::new();
     };
+    let Some(current) = cli.shard_type else {
+        return String::new();
+    };
     let found: Vec<&str> = ShardType::ALL
         .into_iter()
-        .filter(|&shard_type| shard_type != cli.shard_type)
+        .filter(|&shard_type| shard_type != current)
         .filter(|&shard_type| {
             let Ok(dir) = pool_dir(&layout, shard_type) else {
                 return false;
@@ -423,7 +429,7 @@ fn other_shard_type_node_hint(cli: &Cli, node_id: &[u8; 16]) -> String {
     } else {
         format!(
             " (not in -t {}; found in -t {})",
-            cli.shard_type.as_str(),
+            current.as_str(),
             found.join(", -t ")
         )
     }

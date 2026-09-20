@@ -4,13 +4,34 @@ mod cmd;
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
 use mtxdb_core::ShardType;
 
 pub(crate) struct Cli {
     pub(crate) dir: Option<PathBuf>,
-    pub(crate) shard_type: ShardType,
+    pub(crate) shard_type: Option<ShardType>,
     pub(crate) command: Commands,
+}
+
+impl Cli {
+    /// Return the single selected shard type, or bail if `-t all` was used.
+    pub(crate) fn require_shard_type(&self) -> anyhow::Result<ShardType> {
+        self.shard_type.context(
+            "this command requires a specific shard type (-t state, -t event-dag, or -t auth-chain)",
+        )
+    }
+
+    /// Iterate over the selected shard types (one if specific, all three if `-t all`).
+    pub(crate) fn shard_types(&self) -> impl Iterator<Item = ShardType> + '_ {
+        self.shard_type.into_iter().chain(
+            self.shard_type
+                .is_none()
+                .then(|| ShardType::ALL)
+                .into_iter()
+                .flatten(),
+        )
+    }
 }
 
 pub(crate) enum Commands {
@@ -161,7 +182,7 @@ fn global_args(cmd: Command) -> Command {
             .env("MTXDB_SHARD_TYPE")
             .value_name("TYPE")
             .default_value("event-dag")
-            .value_parser(["state", "event-dag", "auth-chain"])
+            .value_parser(["state", "event-dag", "auth-chain", "all"])
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on"),
@@ -522,9 +543,10 @@ fn parse_cli() -> Cli {
         .map(String::as_str)
         .expect("clap supplies the default shard type")
     {
-        "state" => ShardType::State,
-        "event-dag" => ShardType::EventDag,
-        "auth-chain" => ShardType::AuthChain,
+        "state" => Some(ShardType::State),
+        "event-dag" => Some(ShardType::EventDag),
+        "auth-chain" => Some(ShardType::AuthChain),
+        "all" => None,
         _ => unreachable!("clap validates shard type"),
     };
 
