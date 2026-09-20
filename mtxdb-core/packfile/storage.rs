@@ -1661,13 +1661,25 @@ impl PackfileStorage {
             // The checkpoint reader has already validated this range. Keep it
             // mmap-backed through the read-only fast path; the first writer
             // copy-on-writes it into the normal atomic slot array.
-            let mmap_index = LossyIndex::from_mmap_slots_with_config(
-                Arc::clone(&checkpoint.mmap),
-                loaded.slots_offset,
-                loaded.capacity,
-                loaded.slot_count,
-                index_config,
-            );
+            let mmap_index = if loaded.has_homes_tails {
+                LossyIndex::from_mmap_slots_with_homes_tails(
+                    Arc::clone(&checkpoint.mmap),
+                    loaded.slots_offset,
+                    loaded.homes_offset,
+                    loaded.tails_offset,
+                    loaded.capacity,
+                    loaded.slot_count,
+                    index_config,
+                )
+            } else {
+                LossyIndex::from_mmap_slots_with_config(
+                    Arc::clone(&checkpoint.mmap),
+                    loaded.slots_offset,
+                    loaded.capacity,
+                    loaded.slot_count,
+                    index_config,
+                )
+            };
             // Collections with replayed frames must be materialized (owned) so
             // the frames can be applied on top of the raw checkpoint slots;
             // everything else stays an O(1) mmap view.

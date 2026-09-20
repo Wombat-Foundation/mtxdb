@@ -155,7 +155,7 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
     let Some(capacity) = blob_capacity(blob) else {
         return 0;
     };
-    let cap = capacity as usize;
+    let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
     let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
     let slots = blob.get(8..slots_end).unwrap_or(&[]);
     u32::try_from(
@@ -187,6 +187,10 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
 /// # Errors
 /// Returns `io::Error` on any failure; the previous checkpoint (if any) is
 /// left intact in that case.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the three phases (directory, slots/homes/tails offsets, body write) are one atomic construction; splitting them would scatter overflow-checked arithmetic that must stay in lockstep"
+)]
 pub fn write_checkpoint(
     path: &Path,
     fingerprint: u64,
@@ -215,7 +219,8 @@ pub fn write_checkpoint(
             .ok_or_else(|| std::io::Error::other("checkpoint slots size overflow"))?;
         // homes and tails are each capacity × 8 bytes when present in the blob
         let blob_body = blob.len().saturating_sub(8);
-        if blob_body >= (capacity as usize) * 24 {
+        let cap_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
+        if blob_body >= cap_usize.saturating_mul(24) {
             homes_bytes = homes_bytes
                 .checked_add(cap8)
                 .ok_or_else(|| std::io::Error::other("checkpoint homes size overflow"))?;
@@ -239,9 +244,14 @@ pub fn write_checkpoint(
     buf.resize(CHECKPOINT_HEADER_LEN, 0);
 
     // Phase 1: build directory entries, tracking per-collection offsets.
-    let mut slots_offset: u64 = 0;
-    let mut homes_offset: u64 = 0;
-    let mut tails_offset: u64 = 0;
+    //
+    // Offsets must mirror Phase 3's actual write order exactly: each
+    // collection's slots/homes/tails are written back-to-back as one block
+    // (not as three separate all-slots/all-homes/all-tails sections), so a
+    // single running `body_offset` — not three independent per-kind
+    // counters — is what keeps a later collection's offsets from landing
+    // inside an earlier collection's bytes.
+    let mut body_offset: u64 = 0;
     let mut dir_entries = Vec::with_capacity(collections.len());
     for (collection_id, generation, blob) in collections {
         let capacity = blob_capacity(blob)
@@ -251,29 +261,40 @@ pub fn write_checkpoint(
         let cap8 = capacity
             .checked_mul(8)
             .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
-        let entry_homes_offset = homes_offset;
-        let entry_tails_offset = tails_offset;
+        let blob_body = blob.len().saturating_sub(8);
+        let cap_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let has_homes_tails = blob_body >= cap_usize.saturating_mul(24);
+
+        let slots_offset = body_offset;
+        let (homes_offset, tails_offset) = if has_homes_tails {
+            let homes_offset = body_offset
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint homes offset overflow"))?;
+            let tails_offset = homes_offset
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint tails offset overflow"))?;
+            (homes_offset, tails_offset)
+        } else {
+            (0, 0)
+        };
         dir_entries.push(CollectionDirEntry {
             collection_id: *collection_id,
             generation: *generation,
             slots_offset,
-            homes_offset: entry_homes_offset,
-            tails_offset: entry_tails_offset,
+            homes_offset,
+            tails_offset,
             capacity: capacity32,
             slot_count: blob_slot_count(blob),
         });
-        slots_offset = slots_offset
-            .checked_add(cap8)
-            .ok_or_else(|| std::io::Error::other("checkpoint slots offset overflow"))?;
-        let blob_body = blob.len().saturating_sub(8);
-        if blob_body >= (capacity as usize) * 24 {
-            homes_offset = homes_offset
-                .checked_add(cap8)
-                .ok_or_else(|| std::io::Error::other("checkpoint homes offset overflow"))?;
-            tails_offset = tails_offset
-                .checked_add(cap8)
-                .ok_or_else(|| std::io::Error::other("checkpoint tails offset overflow"))?;
-        }
+        let block_bytes = if has_homes_tails {
+            cap8.checked_mul(3)
+                .ok_or_else(|| std::io::Error::other("collection capacity × 24 overflow"))?
+        } else {
+            cap8
+        };
+        body_offset = body_offset
+            .checked_add(block_bytes)
+            .ok_or_else(|| std::io::Error::other("checkpoint body offset overflow"))?;
     }
 
     // Phase 2: write directory entries.
@@ -285,7 +306,7 @@ pub fn write_checkpoint(
     for (_, _, blob) in collections {
         let capacity = blob_capacity(blob)
             .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
-        let cap = capacity as usize;
+        let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
         let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
         let homes_end = slots_end.saturating_add(cap.saturating_mul(8));
         let tails_end = homes_end.saturating_add(cap.saturating_mul(8));
@@ -563,6 +584,7 @@ pub fn read_durable_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::IndexConfig;
     use crate::index::LossyIndex;
 
     fn hash_for(seed: u16, i: usize) -> [u8; 16] {
@@ -650,17 +672,29 @@ mod tests {
             let slots_len = (loaded.capacity as usize).saturating_mul(8);
             assert_eq!(
                 &mmap[loaded.slots_offset..loaded.slots_offset.saturating_add(slots_len)],
-                &expected_blob[8..],
+                &expected_blob[8..8 + slots_len],
                 "slots must round-trip verbatim"
             );
 
             // The mmap-backed index must find every hash the live index had.
-            let loaded_index = LossyIndex::from_mmap_slots(
-                Arc::clone(&mmap),
-                loaded.slots_offset,
-                loaded.capacity,
-                loaded.slot_count,
-            );
+            let loaded_index = if loaded.has_homes_tails {
+                LossyIndex::from_mmap_slots_with_homes_tails(
+                    Arc::clone(&mmap),
+                    loaded.slots_offset,
+                    loaded.homes_offset,
+                    loaded.tails_offset,
+                    loaded.capacity,
+                    loaded.slot_count,
+                    IndexConfig::default(),
+                )
+            } else {
+                LossyIndex::from_mmap_slots(
+                    Arc::clone(&mmap),
+                    loaded.slots_offset,
+                    loaded.capacity,
+                    loaded.slot_count,
+                )
+            };
             let original_index = LossyIndex::deserialize(expected_blob).unwrap();
             for i in 0..*count {
                 let hash = hash_for(*seed, i);

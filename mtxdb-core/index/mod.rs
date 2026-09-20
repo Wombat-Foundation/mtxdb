@@ -968,6 +968,59 @@ impl LossyIndex {
         }
     }
 
+    /// Build a read-only index directly over a validated checkpoint's raw
+    /// slots with a given config, loading pre-hydrated homes and tails from
+    /// the checkpoint mmap. This eliminates cold-start packfile reads for
+    /// tag-collision verification when the checkpoint carries identity data.
+    ///
+    /// The slots remain mmap-backed; homes and tails are copied into owned
+    /// `Vec<u64>` so they can be updated by `hydrate_slot_identity` if needed.
+    ///
+    /// # Panics
+    /// Panics if `[homes_offset, homes_offset + capacity*8)` or
+    /// `[tails_offset, tails_offset + capacity*8)` fall outside `mmap` —
+    /// callers must only pass offsets validated against a checkpoint's own
+    /// declared body length (see `checkpoint::read_checkpoint`).
+    #[must_use]
+    pub fn from_mmap_slots_with_homes_tails(
+        mmap: Arc<Mmap>,
+        slots_offset: usize,
+        homes_offset: usize,
+        tails_offset: usize,
+        capacity: u32,
+        len: u32,
+        config: IndexConfig,
+    ) -> Self {
+        let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let mut homes = Vec::with_capacity(cap);
+        let mut tails = Vec::with_capacity(cap);
+        let buf: &[u8] = &mmap;
+        for i in 0..cap {
+            let h_off = homes_offset.wrapping_add(i.wrapping_mul(8));
+            let t_off = tails_offset.wrapping_add(i.wrapping_mul(8));
+            homes.push(u64::from_le_bytes(
+                buf[h_off..h_off.wrapping_add(8)].try_into().unwrap(),
+            ));
+            tails.push(u64::from_le_bytes(
+                buf[t_off..t_off.wrapping_add(8)].try_into().unwrap(),
+            ));
+        }
+        Self {
+            mask: capacity.wrapping_sub(1),
+            capacity,
+            shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
+            config,
+            slots: SlotStorage::Mmap {
+                mmap,
+                offset: slots_offset,
+            },
+            homes: Mutex::new(homes),
+            tails: Mutex::new(tails),
+            can_grow: false,
+            len: AtomicU32::new(len),
+        }
+    }
+
     /// True while the index borrows raw slots from a checkpoint mapping.
     #[must_use]
     pub fn is_mmap_backed(&self) -> bool {
