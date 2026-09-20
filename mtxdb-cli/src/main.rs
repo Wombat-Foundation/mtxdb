@@ -23,11 +23,15 @@ impl Cli {
     }
 
     /// Iterate over the selected shard types (one if specific, all three if `-t all`).
+    #[allow(
+        dead_code,
+        reason = "used once collections/shards --all is consolidated"
+    )]
     pub(crate) fn shard_types(&self) -> impl Iterator<Item = ShardType> + '_ {
         self.shard_type.into_iter().chain(
             self.shard_type
                 .is_none()
-                .then(|| ShardType::ALL)
+                .then_some(ShardType::ALL)
                 .into_iter()
                 .flatten(),
         )
@@ -185,7 +189,7 @@ fn global_args(cmd: Command) -> Command {
             .value_parser(["state", "event-dag", "auth-chain", "all"])
             .hide_possible_values(true)
             .global(true)
-            .help("Independent shard pool to operate on"),
+            .help("Independent shard pool to operate on (use 'all' to target every pool)"),
     )
 }
 

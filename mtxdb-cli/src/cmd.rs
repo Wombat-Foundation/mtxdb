@@ -2020,7 +2020,7 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     );
 
     println!();
-    println!("type: {}", cli.shard_type.as_str());
+    println!("type: {}", cli.require_shard_type()?.as_str());
     println!("generation: {pack_id} (0x{pack_id:016x})");
     let path = dir.join(format!("pack_{pack_id:016x}.pack"));
     println!("path: {}", path.display());
@@ -2562,6 +2562,7 @@ fn cmd_scan(
     sort: Option<&str>,
     reverse: bool,
 ) -> anyhow::Result<()> {
+    let shard_type = cli.require_shard_type()?;
     let sort_column = sort.map(SortColumn::from_str).transpose()?;
     if sort_column == Some(SortColumn::Payload) && (!verbose || raw) {
         bail!("scan sorting requires --verbose and cannot be combined with --raw");
@@ -2590,7 +2591,7 @@ fn cmd_scan(
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
         }
-        return cmd_scan_collection(cli, selector, &opts);
+        return cmd_scan_collection(cli, selector, &opts, shard_type);
     }
     let pack_id = parse_pack_id_selector(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
@@ -2600,7 +2601,7 @@ fn cmd_scan(
         .into_iter()
         .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
         .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
-    scan_pack(cli, &shard, pack_id, collection_filter, &opts)
+    scan_pack(cli, &shard, pack_id, collection_filter, &opts, shard_type)
 }
 
 #[allow(
@@ -2608,11 +2609,12 @@ fn cmd_scan(
     reason = "the pack scan helper receives the explicit scan filters and output options"
 )]
 fn scan_pack(
-    cli: &Cli,
+    _cli: &Cli,
     shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
     pack_id: u64,
     collection_filter: Option<[u8; 16]>,
     opts: &ScanOptions,
+    shard_type: ShardType,
 ) -> anyhow::Result<()> {
     let path = &shard.path;
     let max_rows = opts.max_rows();
@@ -2688,7 +2690,7 @@ fn scan_pack(
             matched_records,
         );
     }
-    print_scan_table_header("COLLECTION", scan_payload_label(cli.shard_type));
+    print_scan_table_header("COLLECTION", scan_payload_label(shard_type));
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = hex_encode(collection_id);
         let id_hex = hex_encode(node_id);
@@ -2698,13 +2700,13 @@ fn scan_pack(
             .transpose()?;
         let payload = data
             .as_ref()
-            .map(|data| scan_payload_cell(&data.data, cli.shard_type));
+            .map(|data| scan_payload_cell(&data.data, shard_type));
         println!(
             "{}",
             scan_table_row(&collection_hex, &id_hex, *offset, payload.as_deref())
         );
         if let Some(data) =
-            data.filter(|data| scan_payload_suffix(&data.data, cli.shard_type).is_none())
+            data.filter(|data| scan_payload_suffix(&data.data, shard_type).is_none())
         {
             print_scan_payload(&data.data);
         }
@@ -2752,7 +2754,12 @@ fn scan_payload_cell(data: &[u8], shard_type: ShardType) -> String {
 /// Print every physical frame for a collection across all packs. This is a
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
-fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
+fn cmd_scan_collection(
+    cli: &Cli,
+    selector: &str,
+    opts: &ScanOptions,
+    shard_type: ShardType,
+) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(selector)?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = match ShardPool::open_read_only(pool_dir.clone()) {
@@ -2792,7 +2799,7 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
         frames: 0,
         raw_matches: Vec::new(),
         header_printed: false,
-        shard_type: cli.shard_type,
+        shard_type,
         sorted_records: Vec::new(),
         reverse: opts.reverse,
     };
@@ -5080,7 +5087,7 @@ mod tests {
         let layout = DatabaseLayout::open(dir.clone()).unwrap();
         let cli = Cli {
             dir: Some(dir.clone()),
-            shard_type: ShardType::State,
+            shard_type: Some(ShardType::State),
             command: Commands::Sync { all: true },
         };
 
