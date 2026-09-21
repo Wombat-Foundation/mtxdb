@@ -2885,9 +2885,20 @@ impl PackfileStorage {
         // epoch). Safe to let new-collection publication through now.
         drop(create_guard);
         // The checkpoint naming `fingerprint` is durable; record the journal
-        // LSN it covers so a reopen replays only mutations after it.
+        // LSN it covers so a reopen replays only mutations after it. Because
+        // the journal branch above fsynced every shard before this point,
+        // everything through `lsn` is now durable in the packfiles: the same
+        // coverage lets the segment drop its pre-checkpoint groups, so the
+        // journal holds only the post-checkpoint suffix instead of growing
+        // without bound. Best-effort — a failed compaction costs disk, never
+        // correctness (the checkpoint is already durable).
         if let Some(lsn) = wal_lsn {
             self.write_journal_lsn(lsn)?;
+            if let Some(journal) = self.journal() {
+                if let Err(error) = journal.reclaim_through(lsn) {
+                    eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                }
+            }
         }
         self.retire_delta_epoch(old_base_fingerprint);
         // The unlocked serialize/write window above let concurrent puts land
