@@ -15,8 +15,11 @@ use parking_lot::Mutex;
 use crc32fast::Hasher;
 
 const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
-const FILE_VERSION: u32 = 1;
-const FILE_HEADER_LEN: usize = 16;
+/// Bumped to 2 when the header gained the base sequence/LSN a rotated segment
+/// needs to keep numbering global across a rewrite.
+const FILE_VERSION: u32 = 2;
+// magic(8) + version(4) + base_sequence(8) + base_lsn(8) + header CRC(4).
+const FILE_HEADER_LEN: usize = 32;
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
 const GROUP_HEADER_LEN: usize = 48;
 const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
@@ -95,6 +98,16 @@ pub struct Scan {
     pub valid_len: u64,
     /// True when bytes after `valid_len` were an incomplete final append.
     pub truncated_tail: bool,
+}
+
+/// Outcome of compacting a journal segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reclaim {
+    /// Complete committed groups left in the segment because the checkpoint had
+    /// not yet materialized them.
+    pub retained_groups: u64,
+    /// Bytes removed from the segment.
+    pub reclaimed_bytes: u64,
 }
 
 /// A single-writer journal file. Calls to [`Self::commit_group`] are
@@ -310,6 +323,23 @@ impl JournalCoordinator {
         let target = self.capture_sync_target();
         self.sync_through(target)
     }
+
+    /// Compact the segment, dropping committed groups at or below
+    /// `covered_lsn` while preserving any newer groups.
+    ///
+    /// Intended to run after a checkpoint durably records that LSN as applied,
+    /// so it reclaims only data the packfiles already represent. Mutations that
+    /// are published but not yet committed are untouched: they live in memory
+    /// until the next [`Self::sync_through`]. Numbering is preserved across the
+    /// rewrite.
+    ///
+    /// # Errors
+    /// Returns an error if the journal is poisoned or the segment cannot be
+    /// rewritten.
+    pub fn reclaim_through(&self, covered_lsn: u64) -> io::Result<Reclaim> {
+        let mut journal = self.journal.lock();
+        journal.reclaim_through(covered_lsn)
+    }
 }
 
 impl Journal {
@@ -346,17 +376,17 @@ impl Journal {
             // failing open forever on a partial header.
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            write_file_header(&mut file)?;
+            write_file_header(&mut file, 1, 1)?;
             file.sync_all()?;
             sync_parent_dir(&path)?;
         }
 
         let bytes = fs::read(&path)?;
-        validate_file_header(&bytes)?;
+        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
         if bytes.len() as u64 > MAX_SEGMENT_LEN {
             return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
         }
-        let scan = scan_bytes(&bytes)?;
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn)?;
         if scan.truncated_tail {
             file.set_len(scan.valid_len)?;
         }
@@ -364,11 +394,11 @@ impl Journal {
         let next_sequence = scan
             .groups
             .last()
-            .map_or(1, |group| group.sequence.saturating_add(1));
+            .map_or(base_sequence, |group| group.sequence.saturating_add(1));
         let next_lsn = scan
             .groups
             .last()
-            .map_or(1, |group| group.last_lsn.saturating_add(1));
+            .map_or(base_lsn, |group| group.last_lsn.saturating_add(1));
 
         Ok((
             Self {
@@ -491,19 +521,111 @@ impl Journal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Compact this segment, dropping committed groups the checkpoint has
+    /// already materialized.
+    ///
+    /// Every group with `last_lsn <= covered_lsn` is removed; the survivors are
+    /// re-encoded with their original sequence and LSNs into a temporary file,
+    /// durably synced, and atomically renamed over the active path, after which
+    /// the parent directory is synced. A crash before the rename leaves the old
+    /// segment intact and the temp file inert. Because the header records the
+    /// surviving base numbering, the next [`Self::commit_group`] continues past
+    /// the last committed LSN rather than restarting at 1.
+    ///
+    /// A checkpoint that has not advanced past the current segment (or has
+    /// already reclaimed it) is a no-op.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the handle is poisoned, the segment cannot be
+    /// read or re-encoded, or the replacement cannot be synced or renamed.
+    pub fn reclaim_through(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "journal handle is poisoned after an earlier failed commit",
+            ));
+        }
+        let bytes = fs::read(&self.path)?;
+        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn)?;
+        let retained = scan
+            .groups
+            .iter()
+            .filter(|group| group.last_lsn > covered_lsn)
+            .collect::<Vec<_>>();
+        if retained.len() == scan.groups.len() {
+            return Ok(Reclaim {
+                retained_groups: u64::try_from(retained.len()).unwrap_or(u64::MAX),
+                reclaimed_bytes: 0,
+            });
+        }
+
+        let (new_base_sequence, new_base_lsn) = retained
+            .first()
+            .map_or((self.next_sequence, self.next_lsn), |group| {
+                (group.sequence, group.first_lsn)
+            });
+        let mut rebuilt = file_header_bytes(new_base_sequence, new_base_lsn);
+        for group in &retained {
+            encode_group(group, &mut rebuilt)?;
+        }
+
+        let temp_path = self.path.with_extension("rotate");
+        let write_result = (|| -> io::Result<()> {
+            let mut temp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            temp.write_all(&rebuilt)?;
+            temp.sync_all()?;
+            drop(temp);
+            fs::rename(&temp_path, &self.path)?;
+            sync_parent_dir(&self.path)
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        // Point the live handle at the replaced segment. A failure here means
+        // the handle no longer tracks the durable file, so poison it rather
+        // than append to a stale inode.
+        match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => self.file = file,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        }
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(Reclaim {
+            retained_groups: u64::try_from(retained.len()).unwrap_or(u64::MAX),
+            reclaimed_bytes: u64::try_from(bytes.len().saturating_sub(rebuilt.len()))
+                .unwrap_or(u64::MAX),
+        })
+    }
 }
 
-fn write_file_header(file: &mut File) -> io::Result<()> {
+fn file_header_bytes(base_sequence: u64, base_lsn: u64) -> Vec<u8> {
     let mut header = Vec::with_capacity(FILE_HEADER_LEN);
     header.extend_from_slice(FILE_MAGIC);
     header.extend_from_slice(&FILE_VERSION.to_le_bytes());
+    header.extend_from_slice(&base_sequence.to_le_bytes());
+    header.extend_from_slice(&base_lsn.to_le_bytes());
     let mut crc = Hasher::new();
     crc.update(&header);
     header.extend_from_slice(&crc.finalize().to_le_bytes());
-    file.write_all(&header)
+    header
 }
 
-fn validate_file_header(bytes: &[u8]) -> io::Result<()> {
+fn write_file_header(file: &mut File, base_sequence: u64, base_lsn: u64) -> io::Result<()> {
+    file.write_all(&file_header_bytes(base_sequence, base_lsn))
+}
+
+/// Validate the file header, returning the base `(sequence, lsn)` this segment
+/// starts numbering at. A rotated segment records the first surviving group's
+/// numbers here so scanning never has to assume the sequence begins at 1.
+fn validate_file_header(bytes: &[u8]) -> io::Result<(u64, u64)> {
     let Some(header) = bytes.get(..FILE_HEADER_LEN) else {
         return Err(invalid_data("truncated journal file header"));
     };
@@ -514,11 +636,14 @@ fn validate_file_header(bytes: &[u8]) -> io::Result<()> {
         return Err(invalid_data("unsupported journal version"));
     }
     let mut crc = Hasher::new();
-    crc.update(&header[..12]);
-    if u32::from_le_bytes(header[12..16].try_into().expect("fixed slice")) != crc.finalize() {
+    crc.update(&header[..28]);
+    if u32::from_le_bytes(header[28..32].try_into().expect("fixed slice")) != crc.finalize() {
         return Err(invalid_data("journal header checksum mismatch"));
     }
-    Ok(())
+    Ok((
+        u64::from_le_bytes(header[12..20].try_into().expect("fixed slice")),
+        u64::from_le_bytes(header[20..28].try_into().expect("fixed slice")),
+    ))
 }
 
 fn encode_group_header(
@@ -549,6 +674,34 @@ fn encode_group_trailer(sequence: u64, group_crc: u32) -> [u8; GROUP_TRAILER_LEN
     trailer[4..12].copy_from_slice(&sequence.to_le_bytes());
     trailer[12..16].copy_from_slice(&group_crc.to_le_bytes());
     trailer
+}
+
+/// Re-encode a committed group with its original sequence and LSNs, for a
+/// segment rewrite. Mirrors exactly the framing `commit_group` writes.
+fn encode_group(group: &CommittedGroup, into: &mut Vec<u8>) -> io::Result<()> {
+    let mut payload = Vec::new();
+    for entry in &group.entries {
+        encode_mutation(entry.lsn, &entry.mutation, &mut payload)?;
+    }
+    let record_count = u32::try_from(group.entries.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many journal mutations"))?;
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal group too large"))?;
+    let header = encode_group_header(
+        group.sequence,
+        group.first_lsn,
+        group.last_lsn,
+        payload_len,
+        record_count,
+    );
+    let mut group_crc = Hasher::new();
+    group_crc.update(&header);
+    group_crc.update(&payload);
+    let trailer = encode_group_trailer(group.sequence, group_crc.finalize());
+    into.extend_from_slice(&header);
+    into.extend_from_slice(&payload);
+    into.extend_from_slice(&trailer);
+    Ok(())
 }
 
 fn encode_mutation(lsn: u64, mutation: &Mutation, into: &mut Vec<u8>) -> io::Result<()> {
@@ -654,15 +807,15 @@ fn verify_group_payload<'a>(
     Ok(payload)
 }
 
-fn scan_bytes(bytes: &[u8]) -> io::Result<Scan> {
+fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Scan> {
     if bytes.len() < FILE_HEADER_LEN {
         return Err(invalid_data("truncated journal file header"));
     }
     let mut cursor = FILE_HEADER_LEN;
     let mut valid_len = cursor;
     let mut groups = Vec::new();
-    let mut expected_sequence = 1_u64;
-    let mut expected_lsn = 1_u64;
+    let mut expected_sequence = base_sequence;
+    let mut expected_lsn = base_lsn;
     let mut truncated_tail = false;
 
     while cursor < bytes.len() {
@@ -850,6 +1003,14 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ))
+    }
+
+    fn put(collection: u8, node: u8, payload: &[u8]) -> Mutation {
+        Mutation::Put {
+            collection_id: [collection; 16],
+            node_id: [node; 16],
+            payload: payload.to_vec(),
+        }
     }
 
     #[test]
@@ -1166,6 +1327,118 @@ mod tests {
             assert_eq!(group.first_lsn, expected_first);
             expected_first = group.last_lsn.saturating_add(1);
         }
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Rotation drops covered groups but keeps the uncovered suffix, preserving
+    /// each surviving group's original sequence and LSNs.
+    #[test]
+    fn reclaim_retains_uncovered_suffix_and_preserves_numbering() {
+        let path = temp_path("reclaim_suffix");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        let first = journal.commit_group(&[put(1, 1, b"first")]).unwrap();
+        let second = journal
+            .commit_group(&[
+                put(1, 2, b"second"),
+                Mutation::DeleteCollection {
+                    collection_id: [9; 16],
+                },
+            ])
+            .unwrap();
+        let third = journal.commit_group(&[put(1, 3, b"third")]).unwrap();
+
+        let reclaim = journal.reclaim_through(first.last_lsn).unwrap();
+        assert_eq!(reclaim.retained_groups, 2);
+        assert!(reclaim.reclaimed_bytes > 0);
+        assert!(!path.with_extension("rotate").exists());
+        drop(journal);
+
+        let (mut journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), 2);
+        assert_eq!(scan.groups[0].sequence, second.sequence);
+        assert_eq!(scan.groups[0].first_lsn, second.first_lsn);
+        assert_eq!(scan.groups[0].last_lsn, second.last_lsn);
+        assert_eq!(scan.groups[1].sequence, third.sequence);
+        assert_eq!(scan.groups[1].last_lsn, third.last_lsn);
+
+        // Numbering continues from the global high-water mark, not the new base.
+        let fourth = journal.commit_group(&[put(1, 4, b"fourth")]).unwrap();
+        assert_eq!(fourth.sequence, third.sequence.saturating_add(1));
+        assert_eq!(fourth.first_lsn, third.last_lsn.saturating_add(1));
+        drop(journal);
+
+        let (_journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), 3);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Reclaiming everything leaves an empty segment whose base still points
+    /// past the last committed LSN, so numbering never restarts.
+    #[test]
+    fn reclaim_all_covered_keeps_numbering_for_the_next_group() {
+        let path = temp_path("reclaim_all");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        journal.commit_group(&[put(1, 1, b"first")]).unwrap();
+        let second = journal.commit_group(&[put(1, 2, b"second")]).unwrap();
+
+        let reclaim = journal.reclaim_through(second.last_lsn).unwrap();
+        assert_eq!(reclaim.retained_groups, 0);
+        drop(journal);
+
+        let (mut journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), 0);
+        let third = journal.commit_group(&[put(1, 3, b"third")]).unwrap();
+        assert_eq!(third.sequence, second.sequence.saturating_add(1));
+        assert_eq!(third.first_lsn, second.last_lsn.saturating_add(1));
+        drop(journal);
+
+        let (_journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(scan.groups[0].first_lsn, second.last_lsn.saturating_add(1));
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A covered LSN at or below the segment base reclaims nothing.
+    #[test]
+    fn reclaim_below_base_is_a_noop() {
+        let path = temp_path("reclaim_noop");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        journal.commit_group(&[put(1, 1, b"only")]).unwrap();
+
+        let reclaim = journal.reclaim_through(0).unwrap();
+        assert_eq!(reclaim.retained_groups, 1);
+        assert_eq!(reclaim.reclaimed_bytes, 0);
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The coordinator exposes reclamation without disturbing its LSN counters:
+    /// a publish after reclaim still continues the sequence.
+    #[test]
+    fn coordinator_reclaims_without_reusing_lsns() {
+        let path = temp_path("coordinator_reclaim");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        let lsn = coordinator.publish(put(1, 1, b"first"), |_| {}).unwrap();
+        let receipt = coordinator.sync().unwrap().unwrap();
+        assert_eq!(receipt.last_lsn, lsn);
+
+        let reclaim = coordinator.reclaim_through(receipt.last_lsn).unwrap();
+        assert_eq!(reclaim.retained_groups, 0);
+        assert_eq!(coordinator.committed_lsn(), receipt.last_lsn);
+
+        let next = coordinator.publish(put(1, 2, b"second"), |_| {}).unwrap();
+        assert_eq!(next, lsn.saturating_add(1));
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let (_journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(scan.groups[0].first_lsn, lsn.saturating_add(1));
         fs::remove_file(path).unwrap();
     }
 }
