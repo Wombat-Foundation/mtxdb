@@ -302,6 +302,12 @@ impl TxnStage {
             _ => {}
         }
         let coordinators = [auth_chain, event_dag, state];
+        if coordinators.iter().all(Option::is_none) {
+            // Journaling is disabled process-wide. The eager packfile/index
+            // writes remain authoritative, so there is nothing to publish.
+            self.state.store(Self::PUBLISHED, Ordering::Release);
+            return Ok(());
+        }
         let pools = [ShardType::AuthChain, ShardType::EventDag, ShardType::State];
         for (ordered_index, pool) in pools.into_iter().enumerate() {
             let index = pool_index(pool);
@@ -689,15 +695,16 @@ impl JournalCoordinator {
     /// Append a complete transaction group without fsyncing it.
     ///
     /// Unlike [`Self::publish`], this does not add mutations to the legacy
-    /// queue: it writes the group and trailer immediately, then advances the
-    /// visible boundary. It requires that no legacy queued mutations are
-    /// outstanding, because mixing pre-transaction queued writes with a
-    /// post-commit group would violate transaction isolation.
+    /// queue: it appends queued legacy mutations first, followed by the staged
+    /// transaction mutations, in one complete group and then advances the
+    /// visible boundary. This preserves assigned LSN order and avoids making a
+    /// post-commit callback fail merely because background/legacy writes are
+    /// queued in the same pool.
     ///
     /// # Errors
-    /// Returns an error if queued mutations exist, the journal is poisoned,
-    /// or the append fails. A partial append poisons the underlying journal;
-    /// subsequent publication is rejected until reopen/recovery.
+    /// Returns an error if queued LSNs are inconsistent, the journal is
+    /// poisoned, or the append fails. A partial append poisons the underlying
+    /// journal; subsequent publication is rejected until reopen/recovery.
     pub fn append_pending(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
         if mutations.is_empty() {
             return Err(io::Error::new(
@@ -717,19 +724,28 @@ impl JournalCoordinator {
             ));
         }
         // Hold the queue lock through the append so a concurrent legacy
-        // publisher cannot assign the same next LSN after this check.
-        let pending = self.pending.lock();
-        if !pending.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "cannot append a staged transaction while legacy journal mutations are pending",
-            ));
+        // publisher cannot assign an LSN between the queued and staged parts.
+        let mut pending = self.pending.lock();
+        let mut group_mutations = Vec::with_capacity(pending.len().saturating_add(mutations.len()));
+        for (offset, (lsn, mutation)) in pending.iter().enumerate() {
+            let expected = journal
+                .next_lsn
+                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
+                .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
+            if *lsn != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy journal queue is not contiguous with the journal tail",
+                ));
+            }
+            group_mutations.push(mutation.clone());
         }
+        group_mutations.extend_from_slice(mutations);
         let sequence = self
             .sequence
             .as_ref()
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
-        let receipt = match journal.append_group_with_sequence(mutations, sequence) {
+        let receipt = match journal.append_group_with_sequence(&group_mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -742,9 +758,10 @@ impl JournalCoordinator {
             .last_lsn
             .checked_add(1)
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
+        pending.clear();
         self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn
-            .store(receipt.last_lsn, Ordering::Release);
+            .fetch_max(receipt.last_lsn, Ordering::Release);
         self.visible_lsn.store(receipt.last_lsn, Ordering::Release);
         drop(pending);
         Ok(receipt)

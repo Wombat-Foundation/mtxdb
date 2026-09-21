@@ -554,6 +554,16 @@ struct PutManyProgress {
     undo_log: Vec<SlotUndo>,
 }
 
+/// Index tables that must advance together when a reader reloads a checkpoint.
+/// Individual table guards are mapped from this shared lock, so a reload's
+/// replacement is indivisible with respect to every table lookup.
+struct IndexTables {
+    collections: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
+    collection_order: Vec<[u8; 16]>,
+    shard_collections: HashMap<u64, HashMap<[u8; 16], u64>>,
+    collection_shards: HashMap<[u8; 16], HashSet<u64>>,
+}
+
 /// Session state for the incremental index delta log (`index.delta`).
 ///
 /// A fresh checkpoint rewrite re-bases this structure. Between rewrites, live
@@ -636,8 +646,9 @@ struct V3PendingBatch {
 ///   (zero on the checkpoint path).
 pub struct PackfileStorage {
     shards: ShardPool,
-    collections: RwLock<HashMap<[u8; 16], ArcSwap<RoomGeneration>>>,
-    collection_order: RwLock<Vec<[u8; 16]>>,
+    /// Collection indexes and their cross-table bookkeeping, replaced as one
+    /// snapshot when a read-only worker reloads a checkpoint.
+    index_tables: RwLock<IndexTables>,
     pinned: PinnedNodes,
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
@@ -696,12 +707,10 @@ pub struct PackfileStorage {
     /// `LossyIndex::shard_counts`) rather than ever re-derived by
     /// scanning a shard file, which is what made `collections_referencing_shard`
     /// and a `collections`-style listing expensive before this existed.
-    shard_collections: RwLock<HashMap<u64, HashMap<[u8; 16], u64>>>,
     /// Reverse index of `shard_collections`: which shards a given collection currently
     /// contributes a nonzero count to. Lets a collection's full-index-rebuild
     /// path (`replace_collection_shard_counts`) clear exactly the shard entries
     /// it used to occupy without scanning every shard in `shard_collections`.
-    collection_shards: RwLock<HashMap<[u8; 16], HashSet<u64>>>,
     /// Wall-clock instant of the last `maybe_persist_shard_collections` flush,
     /// used to rate-limit that timer-driven path.
     last_shard_collections_flush: RwLock<Option<std::time::Instant>>,
@@ -1001,8 +1010,9 @@ impl ReadJournal {
 
     /// Apply every committed group above `observed_lsn` to the overlay.
     ///
-    /// A missing or short segment is treated as empty (the writer may not
-    /// have created it yet); a segment that shrank since the last scan was
+    /// A missing segment is treated as empty only before this reader has seen
+    /// any journal bytes; if an observed segment disappears, the caller must
+    /// reload the checkpoint. A segment that shrank since the last scan was
     /// reclaimed, so the overlay is rebuilt from scratch. Never repairs or
     /// creates the file, matching a read-only worker's constraints.
     ///
@@ -1016,7 +1026,12 @@ impl ReadJournal {
         let covered = self.covered;
         let len = match fs::metadata(&self.path) {
             Ok(meta) => meta.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.observed_len != 0 || self.observed_lsn > covered {
+                    return Ok(ReadRefresh::NeedsReload);
+                }
+                0
+            }
             Err(error) => return Err(StorageError::Io(error)),
         };
         if len != self.observed_len {
@@ -1738,8 +1753,12 @@ impl PackfileStorage {
         let read_covered_lsn = AtomicU64::new(read_covered);
         Self {
             shards,
-            collections: RwLock::new(scan_out.collections),
-            collection_order: RwLock::new(collection_order),
+            index_tables: RwLock::new(IndexTables {
+                collections: scan_out.collections,
+                collection_order,
+                shard_collections: scan_out.shard_collections,
+                collection_shards: scan_out.collection_shards,
+            }),
             pinned: PinnedNodes::new(),
             base_dir,
             swizzle,
@@ -1758,8 +1777,6 @@ impl PackfileStorage {
             repack_dropped_total: AtomicU64::new(0),
             repack_counts_by_collection: RwLock::new(HashMap::new()),
             repack_incremental: RwLock::new(HashMap::new()),
-            shard_collections: RwLock::new(scan_out.shard_collections),
-            collection_shards: RwLock::new(scan_out.collection_shards),
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
             journal: parking_lot::Mutex::new(None),
@@ -2372,15 +2389,36 @@ impl PackfileStorage {
     }
 
     fn generation(&self, collection_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
-        self.collections
-            .read()
+        self.collections_read()
             .get(collection_id)
             .map(arc_swap::ArcSwapAny::load)
     }
 
+    fn collections_read(
+        &self,
+    ) -> parking_lot::MappedRwLockReadGuard<'_, HashMap<[u8; 16], ArcSwap<RoomGeneration>>> {
+        parking_lot::RwLockReadGuard::map(self.index_tables.read(), |tables| &tables.collections)
+    }
+
+    fn collections_write(
+        &self,
+    ) -> parking_lot::MappedRwLockWriteGuard<'_, HashMap<[u8; 16], ArcSwap<RoomGeneration>>> {
+        parking_lot::RwLockWriteGuard::map(self.index_tables.write(), |tables| {
+            &mut tables.collections
+        })
+    }
+
+    fn shard_collections_read(
+        &self,
+    ) -> parking_lot::MappedRwLockReadGuard<'_, HashMap<u64, HashMap<[u8; 16], u64>>> {
+        parking_lot::RwLockReadGuard::map(self.index_tables.read(), |tables| {
+            &tables.shard_collections
+        })
+    }
+
     /// Collection IDs currently known to this engine, sorted for deterministic output.
     pub fn collection_ids(&self) -> Vec<[u8; 16]> {
-        let mut ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let mut ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         ids.sort_unstable();
         ids
     }
@@ -2418,8 +2456,7 @@ impl PackfileStorage {
         // dominant cost of shard retirement/evacuation-style operations
         // on a large shard.
         Ok(self
-            .shard_collections
-            .read()
+            .shard_collections_read()
             .get(&shard.pack_id)
             .map(|collections| collections.keys().copied().collect())
             .unwrap_or_default())
@@ -2468,7 +2505,7 @@ impl PackfileStorage {
     /// if the collection exists. `entry count / capacity` is the index's
     /// load factor.
     pub fn collection_index_info(&self, collection_id: &[u8; 16]) -> Option<(usize, usize, u32)> {
-        self.collections.read().get(collection_id).map(|gen| {
+        self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
             (g.index.len(), g.index.memory_usage(), g.index.capacity())
         })
@@ -2478,12 +2515,12 @@ impl PackfileStorage {
     /// for every known collection, sorted by collection ID, in a single pass
     /// over the collection map.
     pub fn collection_summaries(&self) -> Vec<CollectionSummary> {
-        let collections = self.collections.read();
-        self.collection_order
-            .read()
+        let tables = self.index_tables.read();
+        tables
+            .collection_order
             .iter()
             .filter_map(|id| {
-                collections.get(id).map(|gen| {
+                tables.collections.get(id).map(|gen| {
                     let g = gen.load();
                     (
                         *id,
@@ -2701,16 +2738,16 @@ impl PackfileStorage {
     /// change a collection's existing distribution (an index rebuild or a
     /// repack), so a normal write never regresses to O(collection size).
     fn record_new_shard_collection(&self, pack_id: u64, collection_id: &[u8; 16]) {
-        let mut shard_collections = self.shard_collections.write();
-        let count = shard_collections
+        let mut tables = self.index_tables.write();
+        let count = tables
+            .shard_collections
             .entry(pack_id)
             .or_default()
             .entry(*collection_id)
             .or_insert(0);
         *count = count.saturating_add(1);
-        drop(shard_collections);
-        self.collection_shards
-            .write()
+        tables
+            .collection_shards
             .entry(*collection_id)
             .or_default()
             .insert(pack_id);
@@ -2727,25 +2764,25 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         counts: &HashMap<u64, u64>,
     ) {
-        let old_shards = self
+        let mut tables = self.index_tables.write();
+        let old_shards = tables
             .collection_shards
-            .write()
             .insert(*collection_id, counts.keys().copied().collect());
-        let mut shard_collections = self.shard_collections.write();
         if let Some(old_shards) = old_shards {
             for pack_id in &old_shards {
                 if !counts.contains_key(pack_id) {
-                    if let Some(m) = shard_collections.get_mut(pack_id) {
+                    if let Some(m) = tables.shard_collections.get_mut(pack_id) {
                         m.remove(collection_id);
                         if m.is_empty() {
-                            shard_collections.remove(pack_id);
+                            tables.shard_collections.remove(pack_id);
                         }
                     }
                 }
             }
         }
         for (&pack_id, &count) in counts {
-            shard_collections
+            tables
+                .shard_collections
                 .entry(pack_id)
                 .or_default()
                 .insert(*collection_id, count);
@@ -2756,15 +2793,15 @@ impl PackfileStorage {
     /// used on collection deletion, where nothing of the collection survives in any
     /// shard.
     fn remove_collection_shard_counts(&self, collection_id: &[u8; 16]) {
-        let Some(old_shards) = self.collection_shards.write().remove(collection_id) else {
+        let mut tables = self.index_tables.write();
+        let Some(old_shards) = tables.collection_shards.remove(collection_id) else {
             return;
         };
-        let mut shard_collections = self.shard_collections.write();
         for pack_id in old_shards {
-            if let Some(m) = shard_collections.get_mut(&pack_id) {
+            if let Some(m) = tables.shard_collections.get_mut(&pack_id) {
                 m.remove(collection_id);
                 if m.is_empty() {
-                    shard_collections.remove(&pack_id);
+                    tables.shard_collections.remove(&pack_id);
                 }
             }
         }
@@ -2812,9 +2849,9 @@ impl PackfileStorage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
-        let collection_order: HashMap<[u8; 16], u64> = self
+        let tables = self.index_tables.read();
+        let collection_order: HashMap<[u8; 16], u64> = tables
             .collection_order
-            .read()
             .iter()
             .enumerate()
             .map(|(index, collection_id)| {
@@ -2825,7 +2862,7 @@ impl PackfileStorage {
                     })
             })
             .collect::<Result<_, _>>()?;
-        for (pack_id, collections) in self.shard_collections.read().iter() {
+        for (pack_id, collections) in &tables.shard_collections {
             for (collection_id, count) in collections {
                 buf.extend_from_slice(&pack_id.to_le_bytes());
                 buf.extend_from_slice(collection_id);
@@ -3005,7 +3042,7 @@ impl PackfileStorage {
         // `RoomGeneration` is immutable once published (COW, swapped
         // atomically), so an owned `Arc` clone taken under the lock is as
         // good a snapshot as the live one for serialization purposes.
-        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         collection_ids.sort_unstable();
         // The guards borrow these `Arc`s, so the handles must outlive the
         // guards; this vector is also re-used for the end-of-function
@@ -3031,7 +3068,7 @@ impl PackfileStorage {
         // wasn't in the locked set and must be now — otherwise a put to one
         // serially dispatched by the engine could still squeeze under the
         // fingerprint while its publication was snapshotted.
-        let ids_now: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let ids_now: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
             lock_arcs.push(self.put_mutex(id));
         }
@@ -3061,13 +3098,13 @@ impl PackfileStorage {
             .collect();
         let fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
 
-        let order = self.collection_order.read().clone();
         let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let collections = self.collections.read();
-            order
+            let tables = self.index_tables.read();
+            tables
+                .collection_order
                 .iter()
                 .filter_map(|collection_id| {
-                    collections.get(collection_id).map(|g| {
+                    tables.collections.get(collection_id).map(|g| {
                         let generation = arc_swap::ArcSwapAny::load_full(g);
                         (*collection_id, generation.generation, generation)
                     })
@@ -3237,24 +3274,24 @@ impl PackfileStorage {
             entered_unlocked_window.store(true, Ordering::Release);
             return Ok(());
         }
-        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         collection_ids.sort_unstable();
         let mut lock_arcs: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let create_guard = self.collection_creation.write();
-        let ids_now: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let ids_now: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
             lock_arcs.push(self.put_mutex(id));
         }
         let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
-        let order = self.collection_order.read().clone();
         let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let collections = self.collections.read();
-            order
+            let tables = self.index_tables.read();
+            tables
+                .collection_order
                 .iter()
                 .filter_map(|collection_id| {
-                    collections.get(collection_id).map(|g| {
+                    tables.collections.get(collection_id).map(|g| {
                         let generation = arc_swap::ArcSwapAny::load_full(g);
                         (*collection_id, generation.generation, generation)
                     })
@@ -3313,19 +3350,19 @@ impl PackfileStorage {
     /// its fingerprint yet.
     #[cfg(test)]
     fn test_rotate_epoch_without_checkpoint(&self) -> (u64, Option<u64>) {
-        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         collection_ids.sort_unstable();
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
         self.shards.flush_all().unwrap();
         let fingerprint = self.current_pack_fingerprint();
-        let order = self.collection_order.read().clone();
         let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let collections = self.collections.read();
-            order
+            let tables = self.index_tables.read();
+            tables
+                .collection_order
                 .iter()
                 .filter_map(|collection_id| {
-                    collections.get(collection_id).map(|g| {
+                    tables.collections.get(collection_id).map(|g| {
                         let generation = arc_swap::ArcSwapAny::load_full(g);
                         (*collection_id, generation.generation, generation)
                     })
@@ -3343,19 +3380,19 @@ impl PackfileStorage {
     /// and C0's now-stale D0 (orphaned) exist on disk simultaneously.
     #[cfg(test)]
     fn test_write_checkpoint_without_retire(&self) -> Result<(u64, Option<u64>), StorageError> {
-        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         collection_ids.sort_unstable();
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
-        let order = self.collection_order.read().clone();
         let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let collections = self.collections.read();
-            order
+            let tables = self.index_tables.read();
+            tables
+                .collection_order
                 .iter()
                 .filter_map(|collection_id| {
-                    collections.get(collection_id).map(|g| {
+                    tables.collections.get(collection_id).map(|g| {
                         let generation = arc_swap::ArcSwapAny::load_full(g);
                         (*collection_id, generation.generation, generation)
                     })
@@ -3418,7 +3455,7 @@ impl PackfileStorage {
         &self,
         state: &DeltaLogState,
     ) -> Result<V3PendingBatch, StorageError> {
-        let collections = self.collections.read();
+        let collections = self.collections_read();
         let mut operations = Vec::new();
         let mut pending_ids: Vec<_> = state.pending.keys().copied().collect();
         pending_ids.sort_unstable();
@@ -3560,7 +3597,7 @@ impl PackfileStorage {
     /// from appearing between pack flush and snapshot capture.
     fn append_index_delta_v3(&self) -> Result<(), StorageError> {
         let create_guard = self.collection_creation.write();
-        let mut ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let mut ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         {
             let state = self.delta_state.lock();
             ids.extend(state.pending.keys().copied());
@@ -3872,7 +3909,7 @@ impl PackfileStorage {
         bump_generation: bool,
     ) -> Result<(), StorageError> {
         let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
-        let is_new = self.collections.read().get(collection_id).is_none();
+        let is_new = self.collections_read().get(collection_id).is_none();
         let structural = bump_generation || is_new;
         if structural {
             self.invalidate_delta_log(collection_id);
@@ -3893,8 +3930,9 @@ impl PackfileStorage {
             if self.is_deleted_collection(collection_id) {
                 self.clear_deleted_collection(collection_id)?;
             }
-            self.collections
-                .write()
+            let mut tables = self.index_tables.write();
+            tables
+                .collections
                 .entry(*collection_id)
                 .or_insert_with(|| {
                     ArcSwap::from_pointee(RoomGeneration {
@@ -3904,21 +3942,19 @@ impl PackfileStorage {
                     })
                 })
                 .store(new_gen);
-
-            if !self.collection_order.read().contains(collection_id) {
-                self.collection_order.write().push(*collection_id);
+            if !tables.collection_order.contains(collection_id) {
+                tables.collection_order.push(*collection_id);
             }
         } else {
             // Fast path: just update the ArcSwap using a read lock on the map.
             // This avoids a global write lock on every single put() call.
-            let read_guard = self.collections.read();
+            let read_guard = self.collections_read();
             if let Some(arc_swap) = read_guard.get(collection_id) {
                 arc_swap.store(new_gen);
             } else {
                 // Fallback in case of a race condition with a deletion
                 drop(read_guard);
-                self.collections
-                    .write()
+                self.collections_write()
                     .entry(*collection_id)
                     .or_insert_with(|| {
                         ArcSwap::from_pointee(RoomGeneration {
@@ -4876,8 +4912,9 @@ impl PackfileStorage {
     /// generation. Rewritten or superseded append entries are excluded.
     #[must_use]
     pub fn shard_node_counts(&self) -> HashMap<u64, u64> {
-        self.shard_collections
+        self.index_tables
             .read()
+            .shard_collections
             .iter()
             .map(|(&shard_id, collections)| {
                 let count = collections
@@ -5432,8 +5469,7 @@ impl PackfileStorage {
         // Collect collection IDs in sorted order for deadlock-free lock acquisition.
         // Skip the collection whose put_mutex the caller already holds.
         let mut collections_to_lock: Vec<[u8; 16]> = self
-            .collections
-            .read()
+            .collections_read()
             .keys()
             .filter(|id| *id != held_collection)
             .copied()
@@ -5455,7 +5491,7 @@ impl PackfileStorage {
     /// This takes every collection lock itself, unlike [`Self::retire_empty_shards`]
     /// which is called while one particular collection lock is already held.
     fn retire_empty_shards_after_batch(&self) {
-        let mut collection_ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         collection_ids.sort_unstable();
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let _guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
@@ -5466,7 +5502,7 @@ impl PackfileStorage {
     fn retire_empty_shards_locked(&self) {
         // Do not retain the map guard while acquiring collection locks: another
         // operation may need the map lock while it holds a collection lock.
-        let collections = self.collections.read();
+        let collections = self.collections_read();
 
         // Build the union of shard IDs referenced across all collections.
         let mut referenced = [false; shard::MAX_SHARDS];
@@ -5618,10 +5654,13 @@ impl PackfileStorage {
         else {
             return false;
         };
-        *self.collections.write() = scan_out.collections;
-        *self.collection_order.write() = collection_order;
-        *self.shard_collections.write() = scan_out.shard_collections;
-        *self.collection_shards.write() = scan_out.collection_shards;
+        {
+            let mut tables = self.index_tables.write();
+            tables.collections = scan_out.collections;
+            tables.collection_order = collection_order;
+            tables.shard_collections = scan_out.shard_collections;
+            tables.collection_shards = scan_out.collection_shards;
+        }
         // Bind coverage to the checkpoint actually loaded, not to a
         // separately-read `journal.lsn` that a concurrent checkpoint may
         // already have advanced past this index.
@@ -5638,33 +5677,28 @@ impl PackfileStorage {
     /// the index/coverage pair together, after which the retry is consistent.
     /// Without a usable checkpoint the read fails closed.
     fn refresh_read_journal(&self) -> Result<(), StorageError> {
-        for _ in 0..2 {
-            let needs_reload = {
-                let mut guard = self.read_journal.lock();
-                match guard.as_mut() {
-                    Some(overlay) => overlay.refresh()? == ReadRefresh::NeedsReload,
-                    None => return Ok(()),
-                }
+        const RELOAD_ATTEMPTS: usize = 8;
+        for _ in 0..RELOAD_ATTEMPTS {
+            let mut guard = self.read_journal.lock();
+            let Some(overlay) = guard.as_mut() else {
+                return Ok(());
             };
-            if !needs_reload {
+            if overlay.refresh()? == ReadRefresh::Applied {
                 return Ok(());
             }
             if !self.reload_index_from_checkpoint() {
-                return Err(StorageError::Corrupt(
-                    "read-committed overlay needs a checkpoint reload, but no usable \
-                     checkpoint is on disk"
-                        .to_owned(),
-                ));
+                drop(guard);
+                std::thread::yield_now();
+                continue;
             }
-            let mut guard = self.read_journal.lock();
-            if let Some(overlay) = guard.as_mut() {
-                overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
-                overlay.reset_overlay();
-            }
+            overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
+            overlay.reset_overlay();
+            drop(guard);
         }
-        Err(StorageError::Corrupt(
-            "read-committed overlay still needs a checkpoint reload after reloading".to_owned(),
-        ))
+        Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "read-committed journal/checkpoint changed during reload; retry the read",
+        )))
     }
 
     /// Enable a read-only journal overlay for the read-committed API.
@@ -6423,7 +6457,7 @@ impl StorageEngine for PackfileStorage {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
-        self.collections.write().remove(collection_id);
+        self.collections_write().remove(collection_id);
         self.live_roots.write().remove(collection_id);
         // A deletion changes the collection directory the same way a refill
         // does, so any pending delta frames are no longer replayable against
@@ -7004,8 +7038,7 @@ impl PackfileStorage {
         // `LossyIndex::max_probe_len` — pure observability, no cap, no
         // effect on control flow).
         let max_index_probe_len = self
-            .collections
-            .read()
+            .collections_read()
             .values()
             .map(|generation| generation.load().index.max_probe_len())
             .max()
