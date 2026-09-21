@@ -1296,6 +1296,15 @@ mod tests {
         bad_len[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_v3_frame(&bad_len).is_none());
 
+        // A plausible, shorter length has enough bytes for framing, so this
+        // specifically proves the CRC covers the length field. The decoder
+        // must reject it at checksum validation rather than only at bounds
+        // checking.
+        let mut bad_len = frame.clone();
+        let payload_len = u32::from_le_bytes(frame[1..5].try_into().unwrap());
+        bad_len[1..5].copy_from_slice(&payload_len.checked_sub(1).unwrap().to_le_bytes());
+        assert!(decode_v3_frame(&bad_len).is_none());
+
         // An unknown operation kind with a recomputed valid CRC is rejected.
         let mut unknown = frame.clone();
         unknown[0] = 0x7F;
@@ -1307,6 +1316,13 @@ mod tests {
 
     #[test]
     fn v3_frame_encoded_sizes_are_exact() {
+        let incremental = DeltaOperation::Incremental(test_frame(3, 5));
+        assert_eq!(
+            encode_v3_frame(&incremental).unwrap().len(),
+            V3_FRAME_HEADER_LEN + 36 + V3_FRAME_TRAILER_LEN,
+            "incremental framing is header + fixed payload + crc"
+        );
+
         let snapshot = DeltaOperation::CollectionSnapshot {
             collection_id: [0x11; 16],
             generation: 7,
