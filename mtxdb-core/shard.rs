@@ -2608,6 +2608,15 @@ impl ShardPool {
     /// Commits any buffered frames first, so fsync covers everything a
     /// caller believes it has put.
     ///
+    /// **Deliberately does not skip-based-coalesce.** Unlike [`Self::sync_dirty`],
+    /// which may skip a shard once another caller has fsynced it, this fsyncs
+    /// every shard unconditionally: its contract is that everything put before
+    /// the call is durable, and "someone else fsynced this shard at some point"
+    /// does not prove that. The per-shard `sync_lock` here therefore provides
+    /// mutual exclusion only, not the coalescing win `sync_dirty` gets — two
+    /// concurrent `sync_all` callers can each issue their own fsync, which is
+    /// correct, just not deduplicated.
+    ///
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
@@ -2673,6 +2682,15 @@ impl ShardPool {
     /// that shard's `sync_lock`, then finds the bit already cleared and skips
     /// its own fsync. The pool-wide `dirty` lock is never held across an
     /// fsync.
+    ///
+    /// Skipping is safe because a shard's dirty bit is only cleared when an
+    /// fsync that *covers that shard's current bytes* has completed: every
+    /// flush writes its bytes (`flush_shard_with_guard`) before marking the
+    /// shard dirty, and each caller flushes before it claims — so any byte
+    /// whose dirty bit this caller observes was written before the fsync that
+    /// clears it, and an fsync covers all writes that completed before it.
+    /// A write that lands after the claim re-marks the shard dirty and is
+    /// caught by the next sync.
     ///
     /// Commits any buffered frames first, so the fsync covers everything a
     /// caller believes it has put.
