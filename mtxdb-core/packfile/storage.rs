@@ -6564,25 +6564,27 @@ impl PackfileStorage {
     /// Tests and benchmarks use this to exercise that path deterministically;
     /// production callers normally rely on `sync_all`.
     ///
-    /// It fsyncs dirty shard frames before taking `index_persist_lock`, so the
-    /// fsync never runs under the lock a concurrent sync holds across its own
-    /// checkpoint. That ordering matches the normal sync path
-    /// (`sync_durability` before `persist_index_checkpoint_or_delta`) and
-    /// avoids the inverse lock order. Marking the index dirty first makes the
-    /// rewrite run even immediately after a delta sync; the flag stays set if
-    /// the fsync fails, so a later call retries rather than dropping it.
-    ///
-    /// This is *not* a stronger durability guarantee than a normal sync: a
+    /// This hook is for reload-path testing, not a production durability
+    /// barrier. It fsyncs dirty shard frames before taking `index_persist_lock`
+    /// (so the fsync never runs under the lock a concurrent sync holds across
+    /// its own checkpoint — the same order as the normal sync path,
+    /// `sync_durability` before `persist_index_checkpoint_or_delta`). A
     /// concurrent put can still append between that fsync and the snapshot
-    /// `persist_index_checkpoint` takes under its collection locks, and that
-    /// function flushes — but does not fsync — those later frames. Like every
-    /// checkpoint, this file is an acceleration structure: if a crash loses
-    /// pack bytes it references, the fingerprint gate rejects it and the next
-    /// open rescans. With a journal enabled (the benchmark case), the journal
-    /// is authoritative.
+    /// `persist_index_checkpoint` takes under its collection locks.
     ///
-    /// Primarily a test/benchmark hook, intentionally part of the public API
-    /// so the standalone `mtxdb-benches` crate can reach it.
+    /// In the no-journal path, concurrent writes may be flushed but not fsynced
+    /// before the checkpoint snapshot, and the fingerprint gate is not
+    /// guaranteed to reject the result (a torn write that preserves the
+    /// recorded length can still match), so do not treat this call as a
+    /// durability boundary. With a journal enabled, `persist_index_checkpoint`
+    /// fsyncs the shards under its collection locks and the journal remains
+    /// authoritative. Marking the index dirty first makes the rewrite run even
+    /// immediately after a delta sync; the flag stays set if the fsync fails,
+    /// so a later call retries rather than dropping it.
+    ///
+    /// Intentionally public so the standalone `mtxdb-benches` crate can reach
+    /// it; a cargo feature-gated benchmark API would give stronger separation,
+    /// at the cost of a feature that crate would have to enable.
     ///
     /// # Errors
     /// Propagates any shard-fsync or checkpoint-write failure.
