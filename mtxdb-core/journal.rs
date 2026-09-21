@@ -1071,4 +1071,78 @@ mod tests {
         assert_eq!(recovered.groups[1].first_lsn, second_lsn);
         fs::remove_file(path).unwrap();
     }
+
+    /// A target that was never published is a caller bug, not a durable commit.
+    #[test]
+    fn sync_through_rejects_an_unpublished_target() {
+        let path = temp_path("coordinator_unpublished");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        assert!(coordinator.sync_through(0).unwrap().is_none());
+        let error = coordinator.sync_through(1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Many writers publishing and syncing concurrently must produce one
+    /// contiguous, gap-free LSN sequence: a caller that loses the commit race
+    /// is covered by another caller's group rather than acknowledged early.
+    #[test]
+    fn concurrent_callers_produce_contiguous_groups() {
+        let path = temp_path("coordinator_concurrent");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = std::sync::Arc::new(JournalCoordinator::new(journal, &scan));
+
+        let threads = 8_u8;
+        let per_thread = 16_u8;
+        let mut handles = Vec::new();
+        for thread in 0..threads {
+            let coordinator = std::sync::Arc::clone(&coordinator);
+            handles.push(std::thread::spawn(move || {
+                for item in 0..per_thread {
+                    coordinator
+                        .publish(
+                            Mutation::Put {
+                                collection_id: [thread; 16],
+                                node_id: [item; 16],
+                                payload: b"payload".to_vec(),
+                            },
+                            |_| {},
+                        )
+                        .unwrap();
+                    // Either this caller commits the group or a concurrent
+                    // caller already committed one covering this LSN.
+                    coordinator.sync().unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let published = coordinator.capture_sync_target();
+        assert_eq!(
+            published,
+            u64::from(u32::from(threads) * u32::from(per_thread))
+        );
+        coordinator.sync().unwrap();
+
+        drop(coordinator);
+        let (_journal, recovered) = Journal::open(&path).unwrap();
+        let total: u64 = recovered
+            .groups
+            .iter()
+            .map(|group| u64::try_from(group.entries.len()).unwrap())
+            .sum();
+        assert_eq!(total, published);
+        let mut expected_first = 1;
+        for group in &recovered.groups {
+            assert_eq!(group.first_lsn, expected_first);
+            expected_first = group.last_lsn.saturating_add(1);
+        }
+        fs::remove_file(path).unwrap();
+    }
 }
