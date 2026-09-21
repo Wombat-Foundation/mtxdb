@@ -6555,6 +6555,24 @@ impl PackfileStorage {
         Ok(())
     }
 
+    /// Force a full checkpoint rewrite now, bypassing the delta-append fast
+    /// path that a normal sync takes whenever the delta log can continue.
+    ///
+    /// The read-committed reader-reload path is only reached when a full
+    /// checkpoint advances coverage and reclaims the journal; a steady write
+    /// workload never takes that path (every sync appends a delta), so
+    /// benchmarks and tests need a deterministic way to force it. Not for
+    /// production use: it marks the index dirty so the rewrite runs even
+    /// immediately after a delta sync.
+    ///
+    /// # Errors
+    /// Propagates any write failure from the checkpoint rewrite.
+    pub fn force_index_checkpoint(&self) -> Result<(), StorageError> {
+        let _persist_guard = self.index_persist_lock.lock();
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        self.persist_index_checkpoint()
+    }
+
     /// Bound how often a structurally-needed full checkpoint rewrite may run.
     ///
     /// Both budgets are unlimited at zero, and the pair is *disabled* when both
