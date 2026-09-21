@@ -7705,6 +7705,12 @@ mod tests {
         let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
         store.enable_read_journal(&wal).unwrap();
 
+        // Remove the seed checkpoint so the writer's sync must write a full
+        // checkpoint instead of appending to its existing delta log. A delta
+        // append extends the loaded index but does not advance checkpoint
+        // coverage; this test specifically needs a checkpoint that covers LSN 1.
+        fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+
         // A real writer checkpoints `first` and reclaims through its LSN, so the
         // checkpoint embeds coverage 1 and its index contains `first`.
         let writer = PackfileStorage::open(dir.clone()).unwrap();
@@ -7726,9 +7732,10 @@ mod tests {
         let after_checkpoint = Journal::scan_read_only(&wal).unwrap();
         assert!(after_checkpoint.base_lsn > checkpoint.covered_lsn);
 
-        // Append a new record after the checkpoint, then commit its journal
-        // group without another pack/index checkpoint. Reload must accept the
-        // checkpoint's delta tail despite the live pack having grown.
+        // Append a new record after the checkpoint, then sync the writer. The
+        // sync commits its journal group and extends the checkpoint's delta
+        // log without rewriting the checkpoint. Reload must accept that delta
+        // tail despite the live pack having grown.
         writer
             .put(
                 &collection,
@@ -7736,8 +7743,7 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"second")),
             )
             .unwrap();
-        let journal = writer.journal().expect("writer journal enabled");
-        journal.sync_through(journal.published_lsn()).unwrap();
+        writer.sync().unwrap();
 
         let read_committed = store
             .get_read_committed(&collection, &[first, second])
