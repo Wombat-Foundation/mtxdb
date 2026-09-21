@@ -4978,9 +4978,9 @@ impl StorageEngine for PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
-    ) -> Result<(), StorageError> {
+    ) -> Result<usize, StorageError> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Validate every frame before appending the first one. In particular,
@@ -5248,7 +5248,7 @@ impl StorageEngine for PackfileStorage {
             self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
 
-        Ok(())
+        Ok(entries.len())
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -6339,7 +6339,16 @@ mod tests {
 
         let entries = ten_record_fixture();
 
-        store.put_many(&TEST_COLLECTION, &entries).unwrap();
+        assert_eq!(
+            store.put_many(&TEST_COLLECTION, &entries).unwrap(),
+            10,
+            "put_many reports every committed entry"
+        );
+        assert_eq!(
+            store.put_many(&TEST_COLLECTION, &[]).unwrap(),
+            0,
+            "an empty batch commits nothing"
+        );
 
         let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
         let results = store.get_many(&TEST_COLLECTION, &ids).unwrap();

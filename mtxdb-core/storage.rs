@@ -113,13 +113,19 @@ pub trait StorageEngine: Send + Sync {
 
     /// Store multiple new nodes in a single batch within a collection.
     ///
+    /// Returns the number of entries committed. A batch is **all-or-nothing**:
+    /// implementations roll back the index changes of a partially-appended
+    /// batch, so on error nothing is logically committed and there is no
+    /// partial count to report — callers retry the whole batch, which is safe
+    /// because the writes are idempotent.
+    ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
     fn put_many(
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
-    ) -> Result<(), StorageError>;
+    ) -> Result<usize, StorageError>;
 
     /// Delete all nodes for a given collection (range delete).
     ///
@@ -275,13 +281,13 @@ impl StorageEngine for InMemoryStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
-    ) -> Result<(), StorageError> {
+    ) -> Result<usize, StorageError> {
         let mut collections = self.collections.write();
         let collection = collections.entry(*collection_id).or_default();
         for (id, data) in entries {
             collection.insert(*id, data.clone());
         }
-        Ok(())
+        Ok(entries.len())
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -330,7 +336,13 @@ mod tests {
             })
             .collect();
 
-        store.put_many(&TEST_COLLECTION, &entries).unwrap();
+        let committed = store.put_many(&TEST_COLLECTION, &entries).unwrap();
+        assert_eq!(committed, 10, "put_many reports every committed entry");
+        assert_eq!(
+            store.put_many(&TEST_COLLECTION, &[]).unwrap(),
+            0,
+            "an empty batch commits nothing"
+        );
 
         let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
         let results = store.get_many(&TEST_COLLECTION, &ids).unwrap();
