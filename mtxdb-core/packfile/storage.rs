@@ -3121,6 +3121,7 @@ impl PackfileStorage {
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             wal_lsn.unwrap_or(0),
+            &packs,
             &blobs,
         )
         .map_err(StorageError::Io)?;
@@ -3262,6 +3263,7 @@ impl PackfileStorage {
                 .collect()
         };
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
         drop(guards);
         drop(create_guard);
 
@@ -3285,7 +3287,7 @@ impl PackfileStorage {
         crate::index::checkpoint::write_checkpoint(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
-            0,
+            covered_lsn,
             &blobs,
         )
         .map_err(StorageError::Io)?;
@@ -3362,6 +3364,7 @@ impl PackfileStorage {
                 .collect()
         };
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
         drop(guards);
         let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
             .iter()
@@ -3376,7 +3379,7 @@ impl PackfileStorage {
         crate::index::checkpoint::write_checkpoint(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
-            0,
+            covered_lsn,
             &blobs,
         )
         .map_err(StorageError::Io)?;
@@ -5584,20 +5587,22 @@ impl PackfileStorage {
         if self.shards.discover_shards().is_err() {
             return false;
         }
-        // Stat each pack rather than trusting the pool's cached length: the
-        // writer appends to existing packs, and the checkpoint it wrote names
-        // the grown length. A failed stat falls back to the cached length so a
-        // concurrently-retired pack cannot panic the read path.
-        let open_shards: Vec<(u16, u64, PathBuf, u64)> = self
-            .shards
-            .all_shards()
-            .into_iter()
-            .map(|(id, shard)| {
-                let len =
-                    fs::metadata(&shard.path).map_or_else(|_| shard.file_len(), |meta| meta.len());
-                (id, shard.pack_id, shard.path.clone(), len)
-            })
-            .collect();
+        // Rebuild the fingerprint from files that still exist. This worker's
+        // shard table can retain open handles to packs the writer retired and
+        // unlinked during repack; including their cached lengths makes every
+        // checkpoint fingerprint mismatch forever. New/grown live packs are
+        // included at their current lengths, and the checkpoint delta log
+        // validates the suffix from the checkpoint's original fingerprint.
+        let mut open_shards: Vec<(u16, u64, PathBuf, u64)> = Vec::new();
+        for (id, shard) in self.shards.all_shards() {
+            match fs::metadata(&shard.path) {
+                Ok(metadata) => {
+                    open_shards.push((id, shard.pack_id, shard.path.clone(), metadata.len()))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return false,
+            }
+        }
         let deleted_collections = self.deleted_collections.lock().clone();
         let mut timings = OpenTimings::default();
         let Some((scan_out, collection_order, _delta_state, checkpoint_covered)) =
@@ -7552,6 +7557,18 @@ mod tests {
 
         let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
         store.enable_read_journal(&wal).unwrap();
+        {
+            let overlay = store.read_journal.lock();
+            let overlay = overlay.as_ref().expect("journal overlay enabled");
+            assert!(
+                overlay.puts.is_empty(),
+                "covered puts must not stay in the overlay"
+            );
+            assert!(
+                overlay.delete_lsn.is_empty(),
+                "covered deletes must not stay in the overlay"
+            );
+        }
         let read_committed = store.get_read_committed(&collection, &[node]).unwrap();
         assert_eq!(
             read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
@@ -7701,23 +7718,32 @@ mod tests {
             )
             .unwrap();
         writer.sync().unwrap();
-        drop(writer);
 
-        // `second` is committed to the journal after the checkpoint, so it must
-        // be served from the overlay once the checkpoint index is reloaded.
-        let (mut journal, _) = Journal::open(&wal).unwrap();
-        journal
-            .append_group(&[JournalMutation::Put {
-                collection_id: collection,
-                node_id: second,
-                payload: b"second".to_vec(),
-            }])
+        let checkpoint = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+        assert_eq!(checkpoint.covered_lsn, 1);
+        let after_checkpoint = Journal::scan_read_only(&wal).unwrap();
+        assert!(after_checkpoint.base_lsn > checkpoint.covered_lsn);
+
+        // Append a new record after the checkpoint, then commit its journal
+        // group without another pack/index checkpoint. Reload must accept the
+        // checkpoint's delta tail despite the live pack having grown.
+        writer
+            .put(
+                &collection,
+                &second,
+                &NodeData::new(bytes::Bytes::from_static(b"second")),
+            )
             .unwrap();
-        drop(journal);
+        let journal = writer.journal().expect("writer journal enabled");
+        journal.sync_through(journal.published_lsn()).unwrap();
 
         let read_committed = store
             .get_read_committed(&collection, &[first, second])
             .unwrap();
+        assert_eq!(store.read_covered_lsn.load(Ordering::Acquire), 1);
         assert_eq!(
             read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
             Some(&b"first"[..]),
