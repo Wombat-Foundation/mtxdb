@@ -771,20 +771,26 @@ impl LossyIndex {
     /// indexes above that — e.g. `mtxdb-core`'s collections, which start at
     /// `NEW_COLLECTION_INDEX_FLOOR` — must pass its own floor here, or this
     /// underestimates a small collection's real capacity).
+    ///
+    /// Returns `None` when `entries` is large enough that the rounded capacity
+    /// would overflow `usize`. Callers that derive `entries` from a persisted
+    /// node count treat this as malformed input rather than panicking.
     #[must_use]
-    pub fn capacity_for_entries(entries: usize, min_capacity: usize) -> usize {
+    pub fn capacity_for_entries(entries: usize, min_capacity: usize) -> Option<usize> {
         let minimum = entries.saturating_mul(2).max(min_capacity.max(16));
-        minimum.next_power_of_two()
+        minimum.checked_next_power_of_two()
     }
 
     /// Memory that an index holding `entries` records would use after the
     /// standard two-times-capacity allocation policy is applied. See
-    /// [`Self::capacity_for_entries`] for `min_capacity`.
+    /// [`Self::capacity_for_entries`] for `min_capacity`. Returns `None` on the
+    /// same overflow conditions as [`Self::capacity_for_entries`], or when the
+    /// byte estimate itself would overflow.
     #[must_use]
-    pub fn memory_usage_for_entries(entries: usize, min_capacity: usize) -> usize {
-        Self::capacity_for_entries(entries, min_capacity)
-            .wrapping_mul(LIVE_SLOT_BYTES)
-            .wrapping_add(std::mem::size_of::<Self>())
+    pub fn memory_usage_for_entries(entries: usize, min_capacity: usize) -> Option<usize> {
+        Self::capacity_for_entries(entries, min_capacity)?
+            .checked_mul(LIVE_SLOT_BYTES)?
+            .checked_add(std::mem::size_of::<Self>())
     }
 
     /// Returns which shard IDs are referenced by at least one occupied slot.

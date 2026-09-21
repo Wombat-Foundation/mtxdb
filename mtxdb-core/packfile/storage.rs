@@ -3453,12 +3453,12 @@ impl PackfileStorage {
                 let capacity = u32::try_from(LossyIndex::capacity_for_entries(
                     nodes,
                     NEW_COLLECTION_INDEX_FLOOR,
-                ))
+                )?)
                 .ok()?;
                 Some((
                     collection_id,
                     nodes,
-                    LossyIndex::memory_usage_for_entries(nodes, NEW_COLLECTION_INDEX_FLOOR),
+                    LossyIndex::memory_usage_for_entries(nodes, NEW_COLLECTION_INDEX_FLOOR)?,
                     capacity,
                 ))
             })
