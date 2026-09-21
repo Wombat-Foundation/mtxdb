@@ -428,9 +428,14 @@ pub fn read_delta_tail_fingerprint(
         return Err(invalid(path, "unrecognized magic"));
     }
     if log_hdr[4] == DELTA_LOG_VERSION_V3 {
-        // V3 frames collection operations this reader does not replay yet, so
-        // recovery must fall back to a packfile rescan.
-        return Err(invalid(path, "delta log v3 is not supported here"));
+        let Some(log) = read_delta_log_v3(path) else {
+            return Err(invalid(path, "invalid v3 delta log"));
+        };
+        return Ok(Some(DeltaTailFingerprint {
+            base_fingerprint: log.base_fingerprint,
+            tail_fingerprint: log.tail_fingerprint,
+            torn_tail: log.torn_tail,
+        }));
     }
     if log_hdr[4] != DELTA_LOG_VERSION {
         return Err(invalid(path, "unrecognized version"));

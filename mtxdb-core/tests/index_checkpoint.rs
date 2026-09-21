@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn clean_sync_writes_nothing_but_a_write_appends_delta_and_structural_change_rewrites() {
+    fn clean_sync_and_v3_replays_incremental_and_structural_changes() {
         use mtxdb_core::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
@@ -666,9 +666,8 @@ mod tests {
         assert_eq!(got.bytes.as_ref(), payload_for(1, 777).as_slice());
         drop(reopened);
 
-        // A structural change (a delete invalidates the log mid-session) must
-        // force the next dirty sync into a full checkpoint rewrite, which
-        // re-bases and truncates the delta log.
+        // A structural deletion is represented by a tombstone in the v3 log,
+        // alongside this collection's pending incremental write.
         let store = PackfileStorage::open(dir.clone()).unwrap();
         store
             .put(
@@ -682,23 +681,12 @@ mod tests {
         let sync = store
             .sync_timings()
             .expect("sync must record its phase timings");
-        assert!(
-            sync.checkpoint > std::time::Duration::ZERO,
-            "a structural change must eventually rewrite the checkpoint"
-        );
+        assert_eq!(sync.checkpoint, std::time::Duration::ZERO);
+        assert!(sync.delta_log > std::time::Duration::ZERO);
+        assert!(current_delta_path(&dir).is_some());
         assert_eq!(
-            sync.delta_log,
-            std::time::Duration::ZERO,
-            "a structural change must not try to append"
-        );
-        assert!(
-            current_delta_path(&dir).is_none(),
-            "the rewrite re-bases the log and truncates its file"
-        );
-        assert_ne!(
             std::fs::read(checkpoint_path(&dir)).unwrap(),
-            first_checkpoint,
-            "the structural rewrite must change the checkpoint"
+            first_checkpoint
         );
         drop(store);
 
@@ -713,7 +701,7 @@ mod tests {
             let got = reopened
                 .get(&cid, &nid)
                 .expect("lookup succeeds")
-                .expect("record survives the structural rewrite");
+                .expect("record survives v3 replay");
             assert_eq!(got.bytes.as_ref(), payload_for(1, i).as_slice());
         }
 
@@ -778,17 +766,15 @@ mod tests {
             "a dirty delta-path sync must write the sidecar exactly once"
         );
 
-        // A structural change forces the checkpoint-rewrite path; still one
+        // A structural deletion uses the v3 tombstone append; still one
         // sidecar write.
         store.delete_collection(&collection_id(2)).unwrap();
         store.sync().unwrap();
         let sync = store
             .sync_timings()
             .expect("sync must record its phase timings");
-        assert!(
-            sync.checkpoint > std::time::Duration::ZERO,
-            "a structural change must rewrite the checkpoint"
-        );
+        assert_eq!(sync.checkpoint, std::time::Duration::ZERO);
+        assert!(sync.delta_log > std::time::Duration::ZERO);
         assert_eq!(
             store.stats().sidecar_writes,
             3,
@@ -849,9 +835,9 @@ mod tests {
         let delta_path =
             current_delta_path(&dir).expect("session 1's append must leave a delta log epoch");
         assert_eq!(
-            delta::read_delta_log(&delta_path)
-                .expect("session 1 must leave a decodable log")
-                .frames
+            delta::read_delta_log_v3(&delta_path)
+                .expect("session 1 must leave a decodable v3 log")
+                .operations
                 .len(),
             1,
             "session 1 appends exactly one frame"
@@ -870,10 +856,10 @@ mod tests {
         store.sync_all().unwrap();
         drop(store);
 
-        let log = delta::read_delta_log(&delta_path)
-            .expect("both appends must decode as one continued log");
+        let log = delta::read_delta_log_v3(&delta_path)
+            .expect("both appends must decode as one continued v3 log");
         assert_eq!(
-            log.frames.len(),
+            log.operations.len(),
             2,
             "the reopened session's append must decode as a second batch"
         );
@@ -899,6 +885,97 @@ mod tests {
             assert_eq!(got.bytes.as_ref(), payload_for(1, i).as_slice());
         }
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v3_collection_snapshots_and_tombstones_replay_across_reopen() {
+        use mtxdb_core::index::delta::{read_delta_log_v3, DeltaOperation};
+
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_v3_structural_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let new_collection = collection_id(9);
+        let deleted_collection = collection_id(2);
+        let new_node = node_id(9, 900);
+        let new_payload = payload_for(9, 900);
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+        store
+            .put(
+                &new_collection,
+                &new_node,
+                &NodeData::new(Bytes::from(new_payload.clone())),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        let path = current_delta_path(&dir).expect("new collection snapshot writes v3 log");
+        let log = read_delta_log_v3(&path).expect("snapshot log decodes");
+        assert!(log.operations.iter().any(|operation| matches!(
+            operation,
+            DeltaOperation::CollectionSnapshot { collection_id, .. }
+                if *collection_id == new_collection
+        )));
+        drop(store);
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .get(&new_collection, &new_node)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            new_payload.as_slice()
+        );
+        reopened.delete_collection(&deleted_collection).unwrap();
+        reopened.sync_all().unwrap();
+        let path = current_delta_path(&dir).expect("deletion leaves v3 log");
+        let log = read_delta_log_v3(&path).expect("tombstone log decodes");
+        assert!(log.operations.iter().any(|operation| matches!(
+            operation,
+            DeltaOperation::CollectionTombstone { collection_id, .. }
+                if *collection_id == deleted_collection
+        )));
+        drop(reopened);
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert!(!reopened.collection_ids().contains(&deleted_collection));
+        let restored_node = node_id(2, 901);
+        let restored_payload = payload_for(2, 901);
+        reopened
+            .put(
+                &deleted_collection,
+                &restored_node,
+                &NodeData::new(Bytes::from(restored_payload.clone())),
+            )
+            .unwrap();
+        reopened.sync_all().unwrap();
+        drop(reopened);
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .get(&deleted_collection, &restored_node)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            restored_payload.as_slice()
+        );
+        assert_eq!(
+            reopened
+                .get(&new_collection, &new_node)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            new_payload.as_slice()
+        );
+        drop(reopened);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

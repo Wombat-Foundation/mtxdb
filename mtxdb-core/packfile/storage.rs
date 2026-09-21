@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 
 use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
-use crate::index::delta::{self, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
+use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::{InsertError, LossyIndex, SlotUndo};
 use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
@@ -548,30 +548,45 @@ struct RoomGeneration {
 /// index mutations are recorded as [`crate::index::format::DeltaFrame`]s in
 /// `pending` and appended as a single framed batch by the next `sync()`, so a
 /// dirty sync pays a few-dozen-byte append instead of a multi-megabyte
-/// checkpoint rewrite. A structurally unsafe transition sets `invalid` (see
-/// below), which forces the next sync back to a full rewrite.
+/// checkpoint rewrite.
+///
+/// Slot updates, whole-index snapshots, and deletions are coalesced per
+/// collection and appended as v3 operations.
 #[derive(Default)]
 struct DeltaLogState {
     /// Fingerprint of the checkpoint this session continues. `None` when the
     /// store opened via a full rescan and hasn't rewritten a checkpoint yet —
     /// every such open forces the next dirty sync to a full rewrite.
     base_fingerprint: Option<u64>,
-    /// Generation of each collection at the last full checkpoint rewrite. A
-    /// frame is only recorded when the collection's live generation still
-    /// equals this value; bumping a generation (structural change) therefore
-    /// silently stops recording for that collection until the next rewrite.
+    /// Generation of each collection at the last checkpoint or snapshot.
     base_generations: HashMap<[u8; 16], u64>,
-    /// Frames accumulated since the last persist (checkpoint rewrite or delta
-    /// append). Cleared on every successful persist.
-    pending: Vec<DeltaFrame>,
+    /// Stable order keys preserved across deletes and snapshots.
+    base_order: HashMap<[u8; 16], u64>,
+    /// Monotonic order key allocated to the next newly created collection.
+    next_order_key: u64,
+    /// Per-collection operations pending for the next v3 append. Snapshot and
+    /// deletion entries subsume earlier slot updates for their collection.
+    pending: HashMap<[u8; 16], PendingDelta>,
     /// Bytes already committed to the on-disk log (upper bound that a fresh
     /// header may still need to be written). Resets to zero on rewrite.
     log_bytes: u64,
-    /// When set, the pending log can no longer be continued correctly —
-    /// capacity growth, full rebuild, repack, refresh, and collection
-    /// create/delete all invalidate it because replay couldn't reconstruct the
-    /// index from the last checkpoint alone. Forces the next full rewrite.
-    invalid: bool,
+    /// Wire version of the active on-disk epoch. A v2 epoch is read for
+    /// compatibility but is rebased to v3 before any further writes.
+    log_version: u8,
+}
+
+#[derive(Clone)]
+enum PendingDelta {
+    Slots(Vec<DeltaFrame>),
+    Snapshot,
+    Delete { generation: u64 },
+}
+
+struct V3PendingBatch {
+    operations: Vec<DeltaOperation>,
+    generation_updates: Vec<([u8; 16], u64)>,
+    order_updates: Vec<([u8; 16], u64)>,
+    next_order_key: u64,
 }
 
 /// A content-addressed packfile storage engine backed by a global shard pool.
@@ -798,12 +813,12 @@ pub struct PackfileStorage {
     /// `put_many` (batch-granular; drives the steady-append scaler's
     /// resume-from-checkpoint cost).
     index_clone_time_ns: AtomicU64,
-    /// Index grow/rebuild events in `put_many` (each invalidates the delta log).
+    /// Index grow/rebuild events in `put_many` (each requests a v3 snapshot).
     index_grow_count: AtomicU64,
     /// Fallback `rebuild_index` calls (full pack scan).
     index_rebuild_count: AtomicU64,
-    /// `invalidate_delta_log` calls — structural changes that force the next
-    /// dirty sync onto a full checkpoint rewrite + log re-base.
+    /// `invalidate_delta_log` calls — structural changes represented by a
+    /// whole-collection snapshot in the v3 log.
     delta_invalidations: AtomicU64,
     /// `sync`/`sync_all` calls.
     sync_calls: AtomicU64,
@@ -1368,10 +1383,7 @@ impl PackfileStorage {
             // A full rescan re-cooks every index from scratch, so no delta log
             // can continue anything the checkpoint recorded; force the next
             // dirty sync into a full checkpoint rewrite that re-bases the log.
-            DeltaLogState {
-                invalid: true,
-                ..DeltaLogState::default()
-            },
+            DeltaLogState::default(),
         );
         timings.total = started.elapsed();
         *store.last_open_timings.lock() = Some(timings);
@@ -1699,10 +1711,8 @@ impl PackfileStorage {
     ///
     /// On success, also returns the fresh [`DeltaLogState`] for the session: the
     /// delta log's base fingerprint (the checkpoint's) and each collection's
-    /// checkpoint generation, with `invalid` set only if a structural change
-    /// (e.g. a grow) forced replay to bail into a rescan — in which case this
-    /// function returns `None`, and the rescan path constructs the
-    /// invalidated state instead.
+    /// checkpoint generation. A malformed or semantically inconsistent log
+    /// makes this function return `None`, selecting the full rescan path.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
     fn checkpoint_scan_out(
@@ -1736,7 +1746,6 @@ impl PackfileStorage {
         let ckpt_generations: HashMap<[u8; 16], u64> = checkpoint
             .collections
             .iter()
-            .filter(|loaded| !deleted_collections.contains(&loaded.collection_id))
             .map(|loaded| (loaded.collection_id, loaded.generation))
             .collect();
 
@@ -1773,29 +1782,48 @@ impl PackfileStorage {
         // generation. Any failure rejects the log wholesale and falls through
         // to the rescan — never a partial replay.
         let mut replay_frames: Vec<DeltaFrame> = Vec::new();
+        let mut replay_operations = Vec::new();
+        // A checkpoint with no surviving delta log is a valid base for the
+        // current v3 writer. Only an actual v2 log needs a one-time rebase.
+        let mut replay_log_version = 3;
         if replay_needed {
             let delta_started = std::time::Instant::now();
-            let log = delta::read_delta_log(&delta_path);
-            let trusted = log.as_ref().is_some_and(|log| {
-                log.base_fingerprint == checkpoint.fingerprint
-                    && log.tail_fingerprint == local_fingerprint
-                    && log.frames.iter().all(|frame| {
-                        ckpt_generations.get(&frame.collection_id) == Some(&frame.generation)
-                    })
-            });
-            if trusted {
-                // The byte frontier travels with the decode (no re-stat):
-                // `file_len` is where the last committed trailer ends, which is
-                // exactly where the next append must continue.
-                let trusted_log = log.expect("trusted implies a decoded log");
-                log_bytes_on_disk = trusted_log.file_len;
-                replay_frames = trusted_log.frames;
-            } else {
-                timings.delta_replay = delta_started.elapsed();
-                if writable {
-                    let _ = std::fs::remove_file(&delta_path);
+            if let Some(log) = delta::read_delta_log_v3(&delta_path) {
+                if log.base_fingerprint != checkpoint.fingerprint
+                    || log.tail_fingerprint != local_fingerprint
+                {
+                    timings.delta_replay = delta_started.elapsed();
+                    if writable {
+                        let _ = std::fs::remove_file(&delta_path);
+                    }
+                    return None;
                 }
-                return None;
+                log_bytes_on_disk = log.file_len;
+                replay_operations = log.operations;
+                replay_log_version = 3;
+            } else {
+                let log = delta::read_delta_log(&delta_path);
+                let trusted = log.as_ref().is_some_and(|log| {
+                    log.base_fingerprint == checkpoint.fingerprint
+                        && log.tail_fingerprint == local_fingerprint
+                        && log.frames.iter().all(|frame| {
+                            !deleted_collections.contains(&frame.collection_id)
+                                && ckpt_generations.get(&frame.collection_id)
+                                    == Some(&frame.generation)
+                        })
+                });
+                if trusted {
+                    let trusted_log = log.expect("trusted implies a decoded v2 log");
+                    log_bytes_on_disk = trusted_log.file_len;
+                    replay_frames = trusted_log.frames;
+                    replay_log_version = 2;
+                } else {
+                    timings.delta_replay = delta_started.elapsed();
+                    if writable {
+                        let _ = std::fs::remove_file(&delta_path);
+                    }
+                    return None;
+                }
             }
             timings.delta_replay = delta_started.elapsed();
         }
@@ -1809,6 +1837,87 @@ impl PackfileStorage {
                 .entry(frame.collection_id)
                 .or_default()
                 .push(*frame);
+        }
+
+        let mut live_generations = ckpt_generations.clone();
+        let mut live_order: HashMap<[u8; 16], u64> = checkpoint
+            .collections
+            .iter()
+            .enumerate()
+            .map(|(order, loaded)| {
+                (
+                    loaded.collection_id,
+                    u64::try_from(order).unwrap_or(u64::MAX),
+                )
+            })
+            .collect();
+        let mut snapshot_indexes: HashMap<[u8; 16], (u64, LossyIndex)> = HashMap::new();
+        let mut v3_tombstones = HashSet::new();
+        for operation in replay_operations {
+            match operation {
+                DeltaOperation::Incremental(frame) => {
+                    if live_generations.get(&frame.collection_id) != Some(&frame.generation) {
+                        if writable {
+                            let _ = std::fs::remove_file(&delta_path);
+                        }
+                        return None;
+                    }
+                    if let Some((_, index)) = snapshot_indexes.get(&frame.collection_id) {
+                        if index.replay_frames(std::slice::from_ref(&frame)).is_err() {
+                            if writable {
+                                let _ = std::fs::remove_file(&delta_path);
+                            }
+                            return None;
+                        }
+                    } else {
+                        frames_by_collection
+                            .entry(frame.collection_id)
+                            .or_default()
+                            .push(frame);
+                    }
+                }
+                DeltaOperation::CollectionSnapshot {
+                    collection_id,
+                    generation,
+                    order_key,
+                    index_blob,
+                } => {
+                    let Ok(index) = LossyIndex::deserialize_with_config(&index_blob, index_config)
+                    else {
+                        if writable {
+                            let _ = std::fs::remove_file(&delta_path);
+                        }
+                        return None;
+                    };
+                    if index.serialize() != index_blob {
+                        if writable {
+                            let _ = std::fs::remove_file(&delta_path);
+                        }
+                        return None;
+                    }
+                    frames_by_collection.remove(&collection_id);
+                    snapshot_indexes.insert(collection_id, (generation, index));
+                    live_generations.insert(collection_id, generation);
+                    live_order.insert(collection_id, order_key);
+                    v3_tombstones.remove(&collection_id);
+                }
+                DeltaOperation::CollectionTombstone {
+                    collection_id,
+                    generation,
+                } => {
+                    if live_generations.get(&collection_id) != Some(&generation) {
+                        if writable {
+                            let _ = std::fs::remove_file(&delta_path);
+                        }
+                        return None;
+                    }
+                    live_generations.remove(&collection_id);
+                    live_order.remove(&collection_id);
+                    frames_by_collection.remove(&collection_id);
+                    snapshot_indexes.remove(&collection_id);
+                    v3_tombstones.insert(collection_id);
+                }
+            }
         }
 
         let slot_to_pack_id: HashMap<u16, u64> = open_shards
@@ -1833,7 +1942,9 @@ impl PackfileStorage {
             HashMap::with_capacity(checkpoint.collections.len());
         let materialization_started = std::time::Instant::now();
         for loaded in &checkpoint.collections {
-            if deleted_collections.contains(&loaded.collection_id) {
+            if deleted_collections.contains(&loaded.collection_id)
+                || v3_tombstones.contains(&loaded.collection_id)
+            {
                 // The checkpoint may predate the deletion marker; the
                 // logical-delete set is authoritative.
                 continue;
@@ -1841,43 +1952,43 @@ impl PackfileStorage {
             // The checkpoint reader has already validated this range. Keep it
             // mmap-backed through the read-only fast path; the first writer
             // copy-on-writes it into the normal atomic slot array.
-            let mmap_index = if loaded.has_homes_tails {
-                LossyIndex::from_mmap_slots_with_homes_tails(
-                    Arc::clone(&checkpoint.mmap),
-                    loaded.slots_offset,
-                    loaded.homes_offset,
-                    loaded.tails_offset,
-                    loaded.capacity,
-                    loaded.slot_count,
-                    index_config,
-                )
+            let (index, generation) = if let Some((generation, index)) =
+                snapshot_indexes.remove(&loaded.collection_id)
+            {
+                (index, generation)
             } else {
-                LossyIndex::from_mmap_slots_with_config(
-                    Arc::clone(&checkpoint.mmap),
-                    loaded.slots_offset,
-                    loaded.capacity,
-                    loaded.slot_count,
-                    index_config,
-                )
-            };
-            // Collections with replayed frames must be materialized (owned) so
-            // the frames can be applied on top of the raw checkpoint slots;
-            // everything else stays an O(1) mmap view.
-            let index = if let Some(frames) = frames_by_collection.get(&loaded.collection_id) {
-                let owned = mmap_index.clone();
-                if owned.replay_frames(frames).is_err() {
-                    // Structurally inconsistent with the checkpoint despite
-                    // passing the fingerprint/generation gates (e.g. a frame
-                    // bucket past this checkpoint's capacity). It can't be
-                    // replayed; fall through to the rescan.
-                    if writable {
-                        let _ = std::fs::remove_file(&delta_path);
+                let mmap_index = if loaded.has_homes_tails {
+                    LossyIndex::from_mmap_slots_with_homes_tails(
+                        Arc::clone(&checkpoint.mmap),
+                        loaded.slots_offset,
+                        loaded.homes_offset,
+                        loaded.tails_offset,
+                        loaded.capacity,
+                        loaded.slot_count,
+                        index_config,
+                    )
+                } else {
+                    LossyIndex::from_mmap_slots_with_config(
+                        Arc::clone(&checkpoint.mmap),
+                        loaded.slots_offset,
+                        loaded.capacity,
+                        loaded.slot_count,
+                        index_config,
+                    )
+                };
+                let index = if let Some(frames) = frames_by_collection.get(&loaded.collection_id) {
+                    let owned = mmap_index.clone();
+                    if owned.replay_frames(frames).is_err() {
+                        if writable {
+                            let _ = std::fs::remove_file(&delta_path);
+                        }
+                        return None;
                     }
-                    return None;
-                }
-                owned
-            } else {
-                mmap_index
+                    owned
+                } else {
+                    mmap_index
+                };
+                (index, loaded.generation)
             };
             current_len.insert(loaded.collection_id, u32::try_from(index.len()).ok()?);
             scan_out.collections.insert(
@@ -1885,19 +1996,37 @@ impl PackfileStorage {
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
                     cache: Arc::new(NodeCache::new(cache_capacity)),
-                    generation: loaded.generation,
+                    generation,
                 }),
             );
             collection_order.push(loaded.collection_id);
         }
+        for (collection_id, (generation, index)) in snapshot_indexes {
+            current_len.insert(collection_id, u32::try_from(index.len()).ok()?);
+            scan_out.collections.insert(
+                collection_id,
+                ArcSwap::from_pointee(RoomGeneration {
+                    index,
+                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    generation,
+                }),
+            );
+            collection_order.push(collection_id);
+        }
+        if replay_log_version == 3 {
+            collection_order
+                .sort_unstable_by_key(|id| (live_order.get(id).copied().unwrap_or(u64::MAX), *id));
+        }
         timings.index_materialization = materialization_started.elapsed();
 
+        let mut all_deleted_collections = deleted_collections.clone();
+        all_deleted_collections.extend(v3_tombstones.iter().copied());
         let (bookkeeping_source, sidecar_counts) = Self::gated_sidecar_bookkeeping(
             base_dir,
             local_fingerprint,
             &current_len,
             open_shards,
-            deleted_collections,
+            &all_deleted_collections,
         );
         timings.bookkeeping_source = bookkeeping_source;
 
@@ -1946,9 +2075,15 @@ impl PackfileStorage {
 
         let delta_state = DeltaLogState {
             base_fingerprint: Some(checkpoint.fingerprint),
-            base_generations: ckpt_generations,
+            base_generations: live_generations,
+            next_order_key: live_order
+                .values()
+                .copied()
+                .max()
+                .map_or(0, |last| last.saturating_add(1)),
+            base_order: live_order,
             log_bytes: log_bytes_on_disk,
-            invalid: false,
+            log_version: replay_log_version,
             ..DeltaLogState::default()
         };
 
@@ -2460,40 +2595,73 @@ impl PackfileStorage {
         }
     }
 
-    /// Mark that the pending delta log can no longer be continued: a
-    /// structural change (capacity growth, full rebuild, repack, refresh, or a
-    /// collection create/delete) means replay onto the last checkpoint can't
-    /// reconstruct the new state, so the next sync must do a full checkpoint
-    /// rewrite (which re-bases the log) instead of an append.
-    fn invalidate_delta_log(&self) {
+    /// Replace this collection's pending slot deltas with a whole-index v3
+    /// snapshot after a structural change (capacity growth, rebuild, repack,
+    /// refresh, or collection creation).
+    fn invalidate_delta_log(&self, collection_id: &[u8; 16]) {
         self.delta_invalidations.fetch_add(1, Ordering::Relaxed);
-        self.delta_state.lock().invalid = true;
+        self.delta_state
+            .lock()
+            .pending
+            .insert(*collection_id, PendingDelta::Snapshot);
+    }
+
+    fn mark_v3_collection_deleted(&self, collection_id: &[u8; 16]) {
+        let mut state = self.delta_state.lock();
+        // The tombstone validates against the generation visible to replay
+        // immediately before this operation, which may be an earlier
+        // checkpoint/snapshot generation rather than the just-deleted live
+        // generation (for example, if growth and deletion happened in one
+        // unsynced interval).
+        let generation = state
+            .base_generations
+            .get(collection_id)
+            .copied()
+            .unwrap_or(0);
+        state
+            .pending
+            .insert(*collection_id, PendingDelta::Delete { generation });
     }
 
     /// Record a successful index mutation as a delta frame, if the delta log
     /// can legitimately continue through it.
     ///
-    /// Recording is suppressed whenever continuing the log is unsafe: after a
-    /// structural invalidation, or when the frame's collection isn't part of
-    /// the log's base checkpoint or has since changed shape (its live
-    /// generation no longer equals the base's). A suppressed frame simply
-    /// leaves the log unable to cover the write; the next sync notices the
-    /// gap (missing frames for some collection ⇒ base generation mismatch
-    /// recorded at checkpoint-decode time forces a full rewrite) and re-bases.
+    /// Recording stops once a snapshot or tombstone supersedes that
+    /// collection's pending slot updates. A generation mismatch promotes the
+    /// pending update to a snapshot instead of allowing replay against the
+    /// wrong table shape.
     fn record_delta(&self, collection_id: &[u8; 16], generation: u64, bucket: u32, slot: u64) {
         let mut state = self.delta_state.lock();
-        if state.invalid {
-            return;
+        let base_generation_matches =
+            state.base_generations.get(collection_id) == Some(&generation);
+        match state.pending.entry(*collection_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if base_generation_matches {
+                    entry.insert(PendingDelta::Slots(vec![DeltaFrame {
+                        collection_id: *collection_id,
+                        bucket,
+                        generation,
+                        slot,
+                    }]));
+                } else {
+                    entry.insert(PendingDelta::Snapshot);
+                }
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if let PendingDelta::Slots(frames) = entry.get_mut() {
+                    if frames.iter().all(|frame| frame.generation == generation) {
+                        frames.push(DeltaFrame {
+                            collection_id: *collection_id,
+                            bucket,
+                            generation,
+                            slot,
+                        });
+                    } else {
+                        entry.insert(PendingDelta::Snapshot);
+                    }
+                }
+            }
         }
-        if state.base_generations.get(collection_id) != Some(&generation) {
-            return;
-        }
-        state.pending.push(DeltaFrame {
-            collection_id: *collection_id,
-            bucket,
-            generation,
-            slot,
-        });
     }
 
     /// Persist the full per-collection index state to `index.checkpoint`, so
@@ -2709,7 +2877,7 @@ impl PackfileStorage {
         let guards = lock_arcs.iter().map(|arc| arc.lock()).collect::<Vec<_>>();
         let has_unfinished_work = {
             let state = self.delta_state.lock();
-            !state.pending.is_empty() || state.invalid
+            !state.pending.is_empty()
         };
         if !has_unfinished_work {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
@@ -2738,9 +2906,17 @@ impl PackfileStorage {
             .iter()
             .map(|(collection_id, generation, _)| (*collection_id, *generation))
             .collect();
+        state.base_order = snapshots
+            .iter()
+            .enumerate()
+            .map(|(order, (collection_id, _, _))| {
+                (*collection_id, u64::try_from(order).unwrap_or(u64::MAX))
+            })
+            .collect();
+        state.next_order_key = u64::try_from(snapshots.len()).unwrap_or(u64::MAX);
         state.pending.clear();
         state.log_bytes = 0;
-        state.invalid = false;
+        state.log_version = 3;
         old_base_fingerprint
     }
 
@@ -2818,7 +2994,7 @@ impl PackfileStorage {
         let guards = lock_arcs.iter().map(|m| m.lock()).collect::<Vec<_>>();
         let has_unfinished_work = {
             let state = self.delta_state.lock();
-            !state.pending.is_empty() || state.invalid
+            !state.pending.is_empty()
         };
         if !has_unfinished_work {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
@@ -2934,27 +3110,96 @@ impl PackfileStorage {
     /// continued; otherwise a fresh header pins `base_fingerprint` (the
     /// checkpoint the frames extend) for the reopen replay gate.
     fn append_index_delta(&self, tail_fingerprint: u64) -> Result<(), StorageError> {
-        let mut state = self.delta_state.lock();
-        let Some(base_fingerprint) = state.base_fingerprint else {
-            return Err(StorageError::Io(std::io::Error::other(
-                "delta append with no base fingerprint",
-            )));
-        };
-        if state.invalid {
-            return Err(StorageError::Io(std::io::Error::other(
-                "delta append while the log is invalidated",
-            )));
+        self.append_index_delta_v3(tail_fingerprint)
+    }
+
+    fn build_v3_pending_batch(
+        &self,
+        state: &DeltaLogState,
+    ) -> Result<V3PendingBatch, StorageError> {
+        let collections = self.collections.read();
+        let mut operations = Vec::new();
+        let mut pending_ids: Vec<_> = state.pending.keys().copied().collect();
+        pending_ids.sort_unstable();
+        let mut generation_updates = Vec::new();
+        let mut order_updates = Vec::new();
+        let mut next_order_key = state.next_order_key;
+        for collection_id in pending_ids {
+            let pending = state
+                .pending
+                .get(&collection_id)
+                .expect("pending id exists");
+            match pending {
+                PendingDelta::Slots(frames) => {
+                    let Some(base_generation) = state.base_generations.get(&collection_id) else {
+                        return Err(StorageError::Io(std::io::Error::other(
+                            "incremental v3 frames target a collection without a base",
+                        )));
+                    };
+                    if frames
+                        .iter()
+                        .any(|frame| frame.generation != *base_generation)
+                    {
+                        return Err(StorageError::Io(std::io::Error::other(
+                            "incremental v3 frame generation differs from its base",
+                        )));
+                    }
+                    operations.extend(frames.iter().copied().map(DeltaOperation::Incremental));
+                }
+                PendingDelta::Snapshot => {
+                    if let Some(room) = collections.get(&collection_id) {
+                        let generation = arc_swap::ArcSwapAny::load_full(room);
+                        let order_key =
+                            if let Some(order_key) = state.base_order.get(&collection_id) {
+                                *order_key
+                            } else {
+                                let order_key = next_order_key;
+                                next_order_key = next_order_key.saturating_add(1);
+                                order_key
+                            };
+                        operations.push(DeltaOperation::CollectionSnapshot {
+                            collection_id,
+                            generation: generation.generation,
+                            order_key,
+                            index_blob: generation.index.serialize(),
+                        });
+                        generation_updates.push((collection_id, generation.generation));
+                        order_updates.push((collection_id, order_key));
+                    } else if let Some(&generation) = state.base_generations.get(&collection_id) {
+                        operations.push(DeltaOperation::CollectionTombstone {
+                            collection_id,
+                            generation,
+                        });
+                        generation_updates.push((collection_id, 0));
+                    }
+                }
+                PendingDelta::Delete { generation } => {
+                    if state.base_generations.contains_key(&collection_id) {
+                        operations.push(DeltaOperation::CollectionTombstone {
+                            collection_id,
+                            generation: *generation,
+                        });
+                        generation_updates.push((collection_id, 0));
+                    }
+                }
+            }
         }
-        if state.pending.is_empty() {
-            return Err(StorageError::Io(std::io::Error::other(
-                "delta append with no pending frames",
-            )));
-        }
+        Ok(V3PendingBatch {
+            operations,
+            generation_updates,
+            order_updates,
+            next_order_key,
+        })
+    }
+
+    fn write_v3_delta_batch(
+        &self,
+        state: &mut DeltaLogState,
+        base_fingerprint: u64,
+        operations: &[DeltaOperation],
+        tail_fingerprint: u64,
+    ) -> Result<(), StorageError> {
         let path = Self::delta_path(&self.base_dir, base_fingerprint);
-        // A decoder deliberately stops at a torn or corrupt suffix and gives
-        // us the sealed frontier. Before extending the log, discard that
-        // suffix: appending after it would leave every new, valid batch behind
-        // bytes a future decoder correctly refuses to cross.
         let on_disk_len = fs::metadata(&path)
             .map_or_else(
                 |error| {
@@ -2969,7 +3214,7 @@ impl PackfileStorage {
             .map_err(StorageError::Io)?;
         if on_disk_len < state.log_bytes {
             return Err(StorageError::Io(std::io::Error::other(
-                "delta log shrank below its sealed frontier",
+                "v3 delta log shrank below its sealed frontier",
             )));
         }
         if on_disk_len > state.log_bytes {
@@ -2980,11 +3225,8 @@ impl PackfileStorage {
                 .map_err(StorageError::Io)?;
         }
         let write_header = state.log_bytes == 0;
-        // Do not charge a continuation for another header: the exact next
-        // physical write is either one batch, or a header plus one batch.
-        let batch_bytes = delta::batch_len(state.pending.len()).ok_or_else(|| {
-            StorageError::Io(std::io::Error::other("delta batch length overflow"))
-        })?;
+        let batch_bytes = delta::v3_batch_len(operations)
+            .ok_or_else(|| StorageError::Io(std::io::Error::other("v3 batch size overflow")))?;
         let next_len = state
             .log_bytes
             .saturating_add(u64::try_from(batch_bytes).unwrap_or(u64::MAX))
@@ -2995,26 +3237,92 @@ impl PackfileStorage {
             });
         if next_len > DELTA_LOG_CAP_BYTES {
             return Err(StorageError::Io(std::io::Error::other(
-                "delta log cap reached",
+                "v3 delta log cap reached",
             )));
         }
-        let pending = std::mem::take(&mut state.pending);
-        let appended = delta::append_batch(
+        let bytes_written = delta::append_v3_batch(
             &path,
             write_header,
             base_fingerprint,
-            &pending,
+            operations,
             tail_fingerprint,
         )
         .map_err(StorageError::Io)?;
-        state.log_bytes = state.log_bytes.saturating_add(appended as u64);
-        // Clear the dirty flag *under* the delta-state lock: a racing put
-        // pushes its frame (`record_delta`) before setting the flag, so
-        // clearing after `drop(state)` could clobber a frame that was pushed
-        // between the `mem::take` above and this store, leaving it stranded in
-        // memory with nothing to force its append.
+        state.log_bytes = state
+            .log_bytes
+            .saturating_add(u64::try_from(bytes_written).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
+    /// Append v3 operations. Collection locks pin every live index
+    /// and the collection-creation lock prevents an unrepresented collection
+    /// from appearing between pack flush and snapshot capture.
+    fn append_index_delta_v3(&self, expected_tail_fingerprint: u64) -> Result<(), StorageError> {
+        let create_guard = self.collection_creation.write();
+        let mut ids: Vec<[u8; 16]> = self.collections.read().keys().copied().collect();
+        {
+            let state = self.delta_state.lock();
+            ids.extend(state.pending.keys().copied());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let lock_arcs: Vec<_> = ids.iter().map(|id| self.put_mutex(id)).collect();
+        let guards: Vec<_> = lock_arcs.iter().map(|lock| lock.lock()).collect();
+
+        // A put may have completed after the caller's initial dirty flush but
+        // before these locks were acquired. Flush again while the snapshot set
+        // is stable so the tail fingerprint covers every serialized slot.
+        self.shards.flush_all()?;
+        let tail_fingerprint = self.current_pack_fingerprint();
+        if tail_fingerprint != expected_tail_fingerprint {
+            return Err(StorageError::Io(std::io::Error::other(
+                "pack fingerprint changed while preparing v3 delta batch",
+            )));
+        }
+
+        let mut state = self.delta_state.lock();
+        let Some(base_fingerprint) = state.base_fingerprint else {
+            return Err(StorageError::Io(std::io::Error::other(
+                "v3 delta append with no base fingerprint",
+            )));
+        };
+        if state.log_version != 3 {
+            return Err(StorageError::Io(std::io::Error::other(
+                "v3 delta append without a clean v3 checkpoint base",
+            )));
+        }
+        if state.pending.is_empty() {
+            return Err(StorageError::Io(std::io::Error::other(
+                "v3 delta append with no pending operations",
+            )));
+        }
+
+        let batch = self.build_v3_pending_batch(&state)?;
+        let V3PendingBatch {
+            operations,
+            generation_updates,
+            order_updates,
+            next_order_key,
+        } = batch;
+
+        self.write_v3_delta_batch(&mut state, base_fingerprint, &operations, tail_fingerprint)?;
+        for (collection_id, generation) in generation_updates {
+            if generation == 0 {
+                state.base_generations.remove(&collection_id);
+                state.base_order.remove(&collection_id);
+            } else {
+                state.base_generations.insert(collection_id, generation);
+            }
+        }
+        for (collection_id, order_key) in order_updates {
+            state.base_order.insert(collection_id, order_key);
+        }
+        state.next_order_key = state.next_order_key.max(next_order_key);
+        state.pending.clear();
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         drop(state);
+        drop(guards);
+        drop(create_guard);
         Ok(())
     }
 
@@ -3230,14 +3538,9 @@ impl PackfileStorage {
     /// any prior tombstone in `deleted.collections` is cleared so the collection
     /// survives a restart.
     ///
-    /// `bump_generation` marks a *shape* change to the index (capacity growth,
-    /// a from-scratch rebuild, repack, refresh) versus a plain COW update that
-    /// preserves the previous generation. Shape changes invalidate the pending
-    /// delta log — its frames were recorded against the old table, so they
-    /// can't be replayed onto the checkpoint's — and the next sync rewrites the
-    /// checkpoint instead of appending. Creating a brand-new collection also
-    /// invalidates the log: a log that predates the collection can't express
-    /// its records, so replaying it would silently omit every one.
+    /// `bump_generation` marks a shape change (capacity growth, rebuild,
+    /// repack, refresh) rather than a plain copy-on-write update. Shape changes
+    /// and new collections are represented by whole-index snapshots in v3.
     fn store_generation(
         &self,
         collection_id: &[u8; 16],
@@ -3249,7 +3552,7 @@ impl PackfileStorage {
         let is_new = self.collections.read().get(collection_id).is_none();
         let structural = bump_generation || is_new;
         if structural {
-            self.invalidate_delta_log();
+            self.invalidate_delta_log(collection_id);
         }
         let generation = self.generation(collection_id).map_or(1, |gen| {
             gen.generation.saturating_add(u64::from(bump_generation))
@@ -5123,7 +5426,7 @@ impl StorageEngine for PackfileStorage {
                 // The insert was rejected (table full). The collection's shape
                 // is about to change, so any delta frames would no longer be
                 // replayable against a checkpoint at this generation.
-                self.invalidate_delta_log();
+                self.invalidate_delta_log(collection_id);
                 if let Some(grown) = index.grow() {
                     // The failed insert did not mutate the table, so retry it
                     // after the in-memory rehash. This is the normal capacity
@@ -5252,8 +5555,7 @@ impl StorageEngine for PackfileStorage {
             // Floor is 64, not 16 -- see the matching comment on `put`'s
             // `None` arm above: a small batch (e.g. a single-event
             // `put_many` call) would otherwise still hit `grow()` almost
-            // immediately, invalidating the delta log and forcing a full
-            // checkpoint rewrite on the next sync.
+            // immediately and require a full collection snapshot on sync.
             None => Some(LossyIndex::with_config(
                 entries
                     .len()
@@ -5419,7 +5721,7 @@ impl StorageEngine for PackfileStorage {
         // All fallible work is complete. Only now make the batch visible to
         // the shared index, delta state, and shard bookkeeping.
         if invalidate_delta {
-            self.invalidate_delta_log();
+            self.invalidate_delta_log(collection_id);
         } else {
             for (bucket, slot) in pending_deltas {
                 self.record_delta(collection_id, generation, bucket, slot);
@@ -5473,7 +5775,8 @@ impl StorageEngine for PackfileStorage {
         // A deletion changes the collection directory the same way a refill
         // does, so any pending delta frames are no longer replayable against
         // the checkpoint they were recorded against.
-        self.invalidate_delta_log();
+        self.delta_invalidations.fetch_add(1, Ordering::Relaxed);
+        self.mark_v3_collection_deleted(collection_id);
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         // Keep lock entries for the storage lifetime. Removing an entry while
         // a caller still owns its Arc permits a later put to obtain a second
@@ -5774,29 +6077,15 @@ impl PackfileStorage {
         );
     }
 
-    /// Whether the pending mutation set must be persisted as a full index
-    /// checkpoint rather than a delta append. A delta append can only cover a
-    /// log that has been continued continuously from the last checkpoint: any
-    /// structural invalidation, a missing log base, an empty frame set, or a
-    /// log grown past `DELTA_LOG_CAP_BYTES` breaks that chain — the delta
-    /// path would either replay garbage or never terminate (grow forever).
+    /// Whether pending state needs a full checkpoint rather than a v3 delta
+    /// append. Missing bases, legacy v2 epochs, or no pending operations need
+    /// a checkpoint; oversized v3 batches fall back from the append helper.
     fn delta_state_needs_full_rewrite(&self) -> bool {
         let state = self.delta_state.lock();
-        if state.invalid || state.base_fingerprint.is_none() || state.pending.is_empty() {
+        if state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty() {
             return true;
         }
-        let Some(batch_bytes) = delta::batch_len(state.pending.len()) else {
-            return true;
-        };
-        state
-            .log_bytes
-            .saturating_add(u64::try_from(batch_bytes).unwrap_or(u64::MAX))
-            .saturating_add(if state.log_bytes == 0 {
-                DELTA_LOG_HEADER_LEN as u64
-            } else {
-                0
-            })
-            > DELTA_LOG_CAP_BYTES
+        false
     }
 
     /// Persist the dirty index state for a sync barrier — a delta append when
@@ -7556,20 +7845,14 @@ mod tests {
         }
     }
 
-    /// Confirms, quantitatively, which mutation events poison the delta log:
-    /// creating a collection between barriers (`is_new`) and forcing an index
-    /// grow (`bump_generation`), not the syncs or ordinary puts themselves.
-    ///
-    /// This is the measurement behind the finding that a room-churn workload
-    /// never takes the delta fast path: `delta_appends` stays at zero while
-    /// every barrier becomes an O(store) checkpoint rewrite.
+    /// Collection creation and growth become per-collection v3 snapshots, so
+    /// neither mutation requires a store-wide checkpoint rewrite.
     #[test]
     fn delta_invalidation_triggers_are_new_collections_and_growth() {
         const ROUNDS: u8 = 5;
 
         // Arm A: one new collection per barrier -- the Complement room-churn
-        // shape. Each create invalidates the whole store's log, so every
-        // barrier rewrites the checkpoint and the delta path never runs.
+        // shape. Each create adds a collection snapshot to the v3 log.
         let store_a = PackfileStorage::open(test_dir("delta_triggers_new_collections")).unwrap();
         let before_a = store_a.stats();
         for round in 0..ROUNDS {
@@ -7595,18 +7878,17 @@ mod tests {
         );
         assert_eq!(
             after_a.checkpoint_writes - before_a.checkpoint_writes,
-            u64::from(ROUNDS),
-            "every barrier must rewrite the checkpoint, not append"
+            1,
+            "only the initial empty-store baseline needs a checkpoint"
         );
         assert_eq!(
             after_a.delta_appends - before_a.delta_appends,
-            0,
-            "the delta fast path never runs while a new collection appears each round"
+            u64::from(ROUNDS - 1),
+            "new collections after the baseline append snapshots"
         );
 
-        // Arm B: one collection that never grows. Its creation invalidates
-        // once; the first rewrite re-bases the log, and every later barrier
-        // appends the delta instead of rewriting.
+        // Arm B: one collection that never grows. Its first sync establishes
+        // the baseline; subsequent writes append incrementals.
         let store_b = PackfileStorage::open(test_dir("delta_triggers_single_collection")).unwrap();
         let before_b = store_b.stats();
         let mut next = 0u8;
@@ -7627,7 +7909,7 @@ mod tests {
         assert_eq!(
             after_b.delta_invalidations - before_b.delta_invalidations,
             1,
-            "only the collection's own creation invalidates; syncs and puts do not"
+            "only collection creation is structural"
         );
         assert_eq!(
             after_b.checkpoint_writes - before_b.checkpoint_writes,
@@ -7643,8 +7925,7 @@ mod tests {
         // Arm C: force that same collection past the index's 75%-load grow
         // threshold with a batch (`put_many` is the path that sizes and grows
         // an index; the single-record `put` grow path is not what
-        // `index_grow_count` tracks). The grow invalidates, so the next
-        // barrier rewrites again.
+        // `index_grow_count` tracks). The grow emits a replacement snapshot.
         let before_c = store_b.stats();
         let entries: Vec<(NodeId, NodeData)> = (next..80u8)
             .map(|i| {
@@ -7668,21 +7949,18 @@ mod tests {
         );
         assert_eq!(
             after_c.delta_appends - before_c.delta_appends,
-            0,
-            "a growing collection cannot continue the log"
+            1,
+            "a growing collection appends one replacement snapshot"
         );
         assert_eq!(
             after_c.checkpoint_writes - before_c.checkpoint_writes,
-            1,
-            "the barrier after the grow rewrites the checkpoint"
+            0,
+            "growth no longer rewrites the whole checkpoint"
         );
     }
 
-    /// Demonstrates the write-neutral stopgap: with a rewrite budget set, a
-    /// room-churn barrier sequence that would otherwise rewrite the whole
-    /// checkpoint on every sync instead rewrites once and defers the rest.
-    /// Data still survives a reopen (via rescan), because packfiles remain
-    /// authoritative and are synced before the deferred index persist.
+    /// The per-collection v3 snapshots make the rewrite budget irrelevant to
+    /// ordinary room churn: after the initial baseline, each sync appends.
     #[test]
     fn checkpoint_rewrite_budget_defers_invalidated_rewrites() {
         const ROUNDS: u8 = 5;
@@ -7719,22 +7997,24 @@ mod tests {
             "one baseline rewrite, then the budget defers"
         );
         assert_eq!(
-            skips,
-            u64::from(ROUNDS - 1),
-            "every later invalidated barrier defers instead of rewriting"
+            skips, 0,
+            "v3 snapshots avoid checkpoint skips for ordinary structural changes"
+        );
+        assert_eq!(
+            after.delta_appends - before.delta_appends,
+            u64::from(ROUNDS - 1)
         );
         drop(store);
 
-        // The deferred checkpoints cost only acceleration: a reopen rescans the
-        // authoritative packfiles and recovers every record.
+        // The v3 log replays the collection snapshots on reopen.
         let reopened = PackfileStorage::open(dir).unwrap();
         assert_eq!(
             reopened
                 .open_timings()
                 .expect("open must record timings")
                 .path,
-            OpenPath::FullScan,
-            "the stale checkpoint must be rejected, not trusted"
+            OpenPath::Checkpoint,
+            "the checkpoint plus v3 log should avoid a full scan"
         );
         for (cid, id, expected) in &written {
             let got = reopened
@@ -7890,9 +8170,7 @@ mod tests {
         // Discriminates reopen-materialization cost from real capacity-growth
         // cost: build to a load well under the 75% grow threshold (so the
         // post-reopen append batch cannot trigger `index_grow_count`), then
-        // reopen and append. If sync still takes the checkpoint path here,
-        // materialization alone invalidates the delta log and a re-base
-        // frame (which only helps the growth case) buys nothing.
+        // reopen and append. Reopen should continue the v3 epoch directly.
         let dir = test_dir("probe_reopen_sync_no_growth");
         let total = 2000u32; // 2032 / 4096 is well under the 75% grow threshold.
         build_reopen_probe_checkpoint(&dir, total);
@@ -7906,15 +8184,14 @@ mod tests {
             let d = store.delta_state.lock();
             let room = store.generation(&REOPEN_PROBE_COLLECTION).unwrap();
             eprintln!(
-                "AFTER REOPEN PUT: cap={} len={} load={:.3} clones+={} grows+={} invalids+={} | pending={} invalid={}",
+                "AFTER REOPEN PUT: cap={} len={} load={:.3} clones+={} grows+={} invalids+={} | pending={:?}",
                 room.index.capacity(),
                 room.index.len(),
                 reopen_probe_load_factor(&room),
                 after_put.put_many_clone_path_calls - before.put_many_clone_path_calls,
                 after_put.index_grow_count - before.index_grow_count,
                 after_put.delta_invalidations - before.delta_invalidations,
-                d.pending.len(),
-                d.invalid,
+                d.pending.keys().collect::<Vec<_>>(),
             );
             assert_eq!(
                 after_put.index_grow_count - before.index_grow_count,
@@ -7925,7 +8202,10 @@ mod tests {
                 after_put.delta_invalidations - before.delta_invalidations,
                 0
             );
-            assert!(!d.invalid);
+            assert!(matches!(
+                d.pending.get(&REOPEN_PROBE_COLLECTION),
+                Some(PendingDelta::Slots(_))
+            ));
             drop(d);
             store.sync().unwrap();
             let st = store.stats();
@@ -8016,9 +8296,8 @@ mod tests {
             let store = PackfileStorage::open(dir.clone()).unwrap();
             let d = store.delta_state.lock();
             eprintln!(
-                "REOPEN delta_state: base_fingerprint={:?} invalid={} pending={} log_bytes={}",
+                "REOPEN delta_state: base_fingerprint={:?} pending={} log_bytes={}",
                 d.base_fingerprint,
-                d.invalid,
                 d.pending.len(),
                 d.log_bytes
             );
@@ -8041,12 +8320,11 @@ mod tests {
             let after_put = store.stats();
             let d = store.delta_state.lock();
             eprintln!(
-                "AFTER REOPEN PUT: clones+={} grows+={} invalids+={} | pending={} invalid={}",
+                "AFTER REOPEN PUT: clones+={} grows+={} invalids+={} | pending={:?}",
                 after_put.put_many_clone_path_calls - before.put_many_clone_path_calls,
                 after_put.index_grow_count - before.index_grow_count,
                 after_put.delta_invalidations - before.delta_invalidations,
-                d.pending.len(),
-                d.invalid,
+                d.pending.keys().collect::<Vec<_>>(),
             );
             assert_eq!(
                 after_put.put_many_clone_path_calls - before.put_many_clone_path_calls,
@@ -8057,7 +8335,10 @@ mod tests {
                 after_put.delta_invalidations - before.delta_invalidations,
                 1
             );
-            assert!(d.invalid);
+            assert!(matches!(
+                d.pending.get(&REOPEN_PROBE_COLLECTION),
+                Some(PendingDelta::Snapshot)
+            ));
             drop(d);
             store.sync().unwrap();
             let st = store.stats();
@@ -8071,10 +8352,10 @@ mod tests {
                 st.checkpoint_writes - before.checkpoint_writes,
                 st.delta_appends - before.delta_appends,
             );
-            assert_eq!(st.checkpoint_writes - before.checkpoint_writes, 1);
-            assert_eq!(st.delta_appends - before.delta_appends, 0);
-            assert!(ts.checkpoint > std::time::Duration::ZERO);
-            assert_eq!(ts.delta_log, std::time::Duration::ZERO);
+            assert_eq!(st.checkpoint_writes - before.checkpoint_writes, 0);
+            assert_eq!(st.delta_appends - before.delta_appends, 1);
+            assert_eq!(ts.checkpoint, std::time::Duration::ZERO);
+            assert!(ts.delta_log > std::time::Duration::ZERO);
 
             reopen_probe_put_range(&store, (total + 32)..(total + 288), 256, |_| {
                 NodeData::new(bytes::Bytes::from_static(b"z"))
@@ -8087,6 +8368,14 @@ mod tests {
             );
             assert_eq!(ts.checkpoint, std::time::Duration::ZERO);
             assert!(ts.delta_log > std::time::Duration::ZERO);
+        }
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        for i in total..(total + 288) {
+            let got = reopened
+                .get(&REOPEN_PROBE_COLLECTION, &reopen_probe_id(i))
+                .unwrap()
+                .expect("snapshot and following incrementals survive reopen");
+            assert_eq!(got.bytes.as_ref(), if i < total + 32 { b"y" } else { b"z" });
         }
     }
 
