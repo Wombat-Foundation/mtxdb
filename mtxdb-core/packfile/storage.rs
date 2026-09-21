@@ -660,9 +660,12 @@ pub struct PackfileStorage {
     /// Pack fingerprint observed at the last read-miss refresh per collection.
     /// A subsequent miss with the same fingerprint skips the expensive rebuild.
     last_refresh_fingerprint: parking_lot::Mutex<HashMap<[u8; 16], u64>>,
+    /// Fsync-gated pack fingerprint observed at the last read-miss check.
+    last_synced_pack_fingerprint: parking_lot::Mutex<HashMap<[u8; 16], u64>>,
     /// Durable pool fingerprint observed when this handle was opened. This is
     /// the baseline for collections that did not yet exist at open time.
     initial_durable_fingerprint: u64,
+    initial_synced_pack_fingerprint: u64,
     /// Serializes the *publication* of a brand-new collection against a
     /// checkpoint rewrite (see `persist_index_checkpoint`). Creates take this
     /// lock shared for the whole put; the checkpoint holds it exclusive for
@@ -1154,6 +1157,14 @@ impl PackfileStorage {
             .entry(*collection_id)
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone()
+    }
+
+    /// Fingerprint of the pack set recorded after the most recent successful
+    /// shard sync. This deliberately reads the sidecar rather than shard file
+    /// metadata: file length and mtime also change for unsynced appends.
+    fn synced_shard_fingerprint(&self) -> u64 {
+        read_persisted_shard_collections(&self.base_dir)
+            .map_or(0, |directory| directory.fingerprint)
     }
 
     fn post_refresh_fingerprint(&self) -> Option<u64> {
@@ -1747,6 +1758,12 @@ impl PackfileStorage {
             .iter()
             .map(|&cid| (cid, initial_durable_fp))
             .collect();
+        let initial_synced_fp = read_persisted_shard_collections(&base_dir)
+            .map_or(0, |directory| directory.fingerprint);
+        let initial_synced_fingerprints: HashMap<[u8; 16], u64> = collection_order
+            .iter()
+            .map(|&cid| (cid, initial_synced_fp))
+            .collect();
         // The checkpoint coverage this open's index corresponds to, captured
         // before the index was loaded. Bound to the loaded index, never
         // re-read from disk by the overlay.
@@ -1765,7 +1782,9 @@ impl PackfileStorage {
             put_locks: parking_lot::Mutex::new(HashMap::new()),
             refresh_locks: parking_lot::Mutex::new(HashMap::new()),
             last_refresh_fingerprint: parking_lot::Mutex::new(initial_fingerprints),
+            last_synced_pack_fingerprint: parking_lot::Mutex::new(initial_synced_fingerprints),
             initial_durable_fingerprint: initial_durable_fp,
+            initial_synced_pack_fingerprint: initial_synced_fp,
             collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
@@ -5591,12 +5610,24 @@ impl PackfileStorage {
             *baseline == durable_fp.fingerprint
         };
 
-        if dominated && !durable_fp.torn_tail {
+        let synced_dominated = {
+            let synced_fp = self.synced_shard_fingerprint();
+            let mut fingerprints = self.last_synced_pack_fingerprint.lock();
+            let baseline = fingerprints
+                .entry(*collection_id)
+                .or_insert(self.initial_synced_pack_fingerprint);
+            *baseline == synced_fp
+        };
+
+        if dominated && synced_dominated && !durable_fp.torn_tail {
             self.miss_refresh_skips.fetch_add(1, Ordering::Relaxed);
             return Ok(results);
         }
 
         self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
+        self.last_synced_pack_fingerprint
+            .lock()
+            .insert(*collection_id, self.synced_shard_fingerprint());
         Ok(results)
     }
 
@@ -6803,6 +6834,11 @@ impl PackfileStorage {
                 timings.pack_fsync = fsync;
             }
         }
+        // Publish the post-sync pack fingerprint before checkpoint persistence
+        // (which may be deferred). Readers use this sidecar as the second
+        // invalidation signal; unlike filesystem metadata, it advances only
+        // after this durability barrier completes.
+        self.persist_shard_collections_best_effort();
         Ok(())
     }
 
