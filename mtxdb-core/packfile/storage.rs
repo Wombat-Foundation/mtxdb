@@ -9156,7 +9156,7 @@ mod tests {
         // timing-independent proof that no durable fingerprint was probed is
         // the `miss_refreshes == 0` counter below.
         assert!(receiver
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap());
         drop(refresh_guard);
         reader.join().unwrap();
