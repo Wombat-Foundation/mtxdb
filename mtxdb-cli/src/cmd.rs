@@ -509,30 +509,6 @@ fn other_shard_type_node_hint(cli: &Cli, node_id: &[u8; 16]) -> String {
     }
 }
 
-/// Open the selected pool read-only for a collection lookup, treating an
-/// empty pool (e.g. the default `-t event-dag` when the collection actually
-/// lives under `-t state`) as "not found" rather than an error: prints the
-/// same message a populated-but-non-matching pool would give, with the
-/// other-shard-type hint, and returns `Ok(None)` so the caller can bail via
-/// `let-else` instead of repeating this match.
-fn open_pool_for_collection_lookup(
-    cli: &Cli,
-    collection_id: &[u8; 16],
-    not_found_message: &str,
-) -> anyhow::Result<Option<PackfileStorage>> {
-    match PackfileStorage::open_read_only(selected_pool_dir(cli)?) {
-        Ok(store) => Ok(Some(store)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            eprintln!(
-                "{not_found_message}{}",
-                other_shard_type_hint(cli, collection_id)
-            );
-            Ok(None)
-        }
-        Err(error) => Err(error).context("failed to open store"),
-    }
-}
-
 fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(collection)?;
     let node_id = parse_node_id(id)?;
@@ -549,55 +525,102 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     Ok(())
 }
 
-fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::Result<()> {
-    let node_id = parse_get_id(id, cli.namespace.as_deref())?;
-    let store = open_store_read_only(cli)?;
-    let matches: Vec<([u8; 16], NodeData)> = match collection {
+fn emit_get_data(data: &NodeData, raw: bool) -> anyhow::Result<()> {
+    let emitted = if raw {
+        data.bytes.to_vec()
+    } else if let Some(rendered) = pretty_print_payload(&data.bytes) {
+        rendered
+    } else {
+        hex_bytes(&data.bytes).into_bytes()
+    };
+    io::stdout().write_all(&emitted)?;
+    // Raw output stays byte-exact. All textual output is
+    // newline-terminated, including encoded binary fallbacks.
+    if !raw && !emitted.ends_with(b"\n") {
+        io::stdout().write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn get_matches_in_store(
+    store: &PackfileStorage,
+    collection: Option<&str>,
+    node_id: &[u8; 16],
+    namespace: Option<&str>,
+) -> anyhow::Result<Vec<([u8; 16], NodeData)>> {
+    match collection {
         Some(collection) => {
-            let collection_id = parse_collection_selector(collection, cli.namespace.as_deref())?;
-            store
-                .get(&collection_id, &node_id)?
+            let collection_id = parse_collection_selector(collection, namespace)?;
+            Ok(store
+                .get(&collection_id, node_id)?
                 .map(|data| vec![(collection_id, data)])
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
         None => store
             .collection_summaries()
             .into_iter()
             .map(|s| s.0)
-            .filter_map(|collection_id| match store.get(&collection_id, &node_id) {
+            .filter_map(|collection_id| match store.get(&collection_id, node_id) {
                 Ok(Some(data)) => Some(Ok((collection_id, data))),
                 Ok(None) => None,
-                Err(error) => Some(Err(error)),
+                Err(error) => Some(Err(anyhow::Error::from(error))),
             })
-            .collect::<Result<_, _>>()?,
-    };
-    match matches.as_slice() {
-        [] => bail!("not found{}", other_shard_type_node_hint(cli, &node_id)),
-        [(_, data)] => {
-            let emitted = if raw {
-                data.bytes.to_vec()
-            } else if let Some(rendered) = pretty_print_payload(&data.bytes) {
-                rendered
-            } else {
-                hex_bytes(&data.bytes).into_bytes()
+            .collect(),
+    }
+}
+
+fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::Result<()> {
+    let node_id = parse_get_id(id, cli.namespace.as_deref())?;
+    if cli.shard_type.is_none() {
+        let db_layout = open_layout(cli)?;
+        let mut matches: Vec<(ShardType, [u8; 16], NodeData)> = Vec::new();
+        for shard_type in cli.shard_types() {
+            let dir = pool_dir(&db_layout, shard_type)?;
+            let Ok(store) = PackfileStorage::open_read_only(dir) else {
+                continue;
             };
-            io::stdout().write_all(&emitted)?;
-            // Raw output stays byte-exact. All textual output is
-            // newline-terminated, including encoded binary fallbacks.
-            if !raw && !emitted.ends_with(b"\n") {
-                io::stdout().write_all(b"\n")?;
+            for (col_id, data) in
+                get_matches_in_store(&store, collection, &node_id, cli.namespace.as_deref())?
+            {
+                matches.push((shard_type, col_id, data));
             }
         }
-        _ => bail!(
-            "node ID {id} is present in multiple collections ({}); specify --collection",
-            matches
-                .iter()
-                .map(|(collection_id, _)| hex_encode(collection_id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        match matches.as_slice() {
+            [] => bail!("not found"),
+            [(_, _, data)] => emit_get_data(data, raw),
+            _ => {
+                let locations = matches
+                    .iter()
+                    .map(|(shard_type, col_id, _)| {
+                        format!(
+                            "-t {} collection {}",
+                            shard_type.as_str(),
+                            hex_encode(col_id)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "node ID {id} is present in multiple pools/collections ({locations}); specify -t and/or --collection"
+                );
+            }
+        }
+    } else {
+        let store = open_store_read_only(cli)?;
+        let matches = get_matches_in_store(&store, collection, &node_id, cli.namespace.as_deref())?;
+        match matches.as_slice() {
+            [] => bail!("not found{}", other_shard_type_node_hint(cli, &node_id)),
+            [(_, data)] => emit_get_data(data, raw),
+            _ => bail!(
+                "node ID {id} is present in multiple collections ({}); specify --collection",
+                matches
+                    .iter()
+                    .map(|(collection_id, _)| hex_encode(collection_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     }
-    Ok(())
 }
 
 /// Render arbitrary payload bytes safely for terminal output. Raw bytes stay
@@ -1008,19 +1031,24 @@ fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
 /// Enumerate live collections from the persisted directory. Stores created before
 /// that sidecar existed fall back to a one-time index rebuild; `mtxdb sync`
 /// makes future calls fast.
-fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
-    let dir = selected_pool_dir(cli)?;
-    if PackfileStorage::collection_directory_persisted_at(&dir).is_some() {
-        return Ok(PackfileStorage::collection_directory_from_disk(&dir)
+fn collection_ids_in_dir(dir: &Path) -> anyhow::Result<Vec<[u8; 16]>> {
+    if PackfileStorage::collection_directory_persisted_at(dir).is_some() {
+        return Ok(PackfileStorage::collection_directory_from_disk(dir)
             .into_iter()
             .map(|(collection_id, _)| collection_id)
             .collect());
     }
-    Ok(open_store_read_only(cli)?
+    let store =
+        PackfileStorage::open_read_only(dir.to_path_buf()).context("failed to open store")?;
+    Ok(store
         .collection_summaries()
         .into_iter()
         .map(|(collection_id, _, _, _)| collection_id)
         .collect())
+}
+
+fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
+    collection_ids_in_dir(&selected_pool_dir(cli)?)
 }
 
 fn cmd_collections(
@@ -1378,30 +1406,58 @@ fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow:
 /// restored from `shard_stats.bin`. In-process embedders get the full live
 /// picture from `PackfileStorage::stats()` instead — this command is the
 /// on-disk + cold-open view.
+fn read_stats_for_dir(
+    dir: &Path,
+) -> anyhow::Result<(RuntimeStats, Vec<mtxdb_core::shard::ShardSummary>)> {
+    if glob_pack_files(dir)?.is_empty() {
+        Ok((RuntimeStats::default(), Vec::new()))
+    } else {
+        let store =
+            PackfileStorage::open_read_only(dir.to_path_buf()).context("failed to open store")?;
+        let stats = store.stats();
+        let summaries = store.shard_summaries();
+        Ok((stats, summaries))
+    }
+}
+
+fn cmd_stats_in_dir(dir: &Path, json: bool) -> anyhow::Result<()> {
+    let (stats, summaries) = read_stats_for_dir(dir)?;
+    if json {
+        print_stats_json(dir, &stats, &summaries);
+    } else {
+        print_stats_table(dir, &stats, &summaries);
+    }
+    Ok(())
+}
+
 fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
-    let dir = selected_pool_dir(cli)?;
-    // A newly initialized pool has no pack to open yet. It is still a valid
-    // database, and stats should describe its zero state rather than failing
-    // through the storage opener.
-    if glob_pack_files(&dir)?.is_empty() {
-        let stats = RuntimeStats::default();
+    if cli.shard_type.is_none() {
+        let db_layout = open_layout(cli)?;
+        let types: Vec<ShardType> = cli.shard_types().collect();
         if json {
-            print_stats_json(&dir, &stats, &[]);
+            let mut fields = Vec::new();
+            for shard_type in &types {
+                let dir = pool_dir(&db_layout, *shard_type)?;
+                let (stats, summaries) = read_stats_for_dir(&dir)?;
+                fields.push((
+                    shard_type.as_str(),
+                    stats_json_object(&dir, &stats, &summaries),
+                ));
+            }
+            println!("{}", json_object(&fields, ""));
         } else {
-            print_stats_table(&dir, &stats, &[]);
+            for (index, shard_type) in types.into_iter().enumerate() {
+                if index != 0 {
+                    println!();
+                    println!();
+                }
+                print_section_header(shard_type);
+                cmd_stats_in_dir(&pool_dir(&db_layout, shard_type)?, false)?;
+            }
         }
         return Ok(());
     }
-
-    let store = open_store_read_only(cli)?;
-    let stats = store.stats();
-
-    if json {
-        print_stats_json(&dir, &stats, &store.shard_summaries());
-    } else {
-        print_stats_table(&dir, &stats, &store.shard_summaries());
-    }
-    Ok(())
+    cmd_stats_in_dir(&selected_pool_dir(cli)?, json)
 }
 
 /// Milliseconds with two decimals (`2.12 ms`).
@@ -1540,11 +1596,11 @@ fn print_stats_table(
 /// per-shard persisted counters as nested objects. Built by hand (no serde
 /// dependency) — every value is a plain number or a path string.
 #[allow(clippy::too_many_lines)]
-fn print_stats_json(
+fn stats_json_object(
     dir: &Path,
     stats: &RuntimeStats,
     summaries: &[mtxdb_core::shard::ShardSummary],
-) {
+) -> String {
     let open_path = stats
         .last_open_timings
         .as_ref()
@@ -1668,7 +1724,15 @@ fn print_stats_json(
         ("runtime", runtime),
         ("shards", shards),
     ];
-    println!("{}", json_object(&top, ""));
+    json_object(&top, "")
+}
+
+fn print_stats_json(
+    dir: &Path,
+    stats: &RuntimeStats,
+    summaries: &[mtxdb_core::shard::ShardSummary],
+) {
+    println!("{}", stats_json_object(dir, stats, summaries));
 }
 
 /// A complete `{ ... }` JSON object from pre-rendered fields, with
@@ -2083,20 +2147,15 @@ fn print_pack_lifetime(path: &Path) {
     clippy::too_many_lines,
     reason = "prints one pack's stats, physical layout, and per-collection breakdown in sequence"
 )]
-fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
-    let pack_id = parse_pack_id_selector(selector)?;
-    let dir = selected_pool_dir(cli)?;
-    let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
-        .into_iter()
-        .filter(|&(id, _, _)| id == pack_id)
-        .collect();
-    if shard_entries.is_empty() {
-        eprintln!("pack 0x{pack_id:016x}: not found");
-        return Ok(());
-    }
-    let (stats_map, _) = decode_stats_snapshot(&dir);
-    let node_counts = PackfileStorage::shard_node_counts_from_disk(&dir);
-    let collection_counts = PackfileStorage::shard_collection_counts_from_disk(&dir);
+fn print_pack_info(
+    dir: &Path,
+    pack_id: u64,
+    shard_entries: &[(u64, u64, u8)],
+    shard_type: ShardType,
+) {
+    let (stats_map, _) = decode_stats_snapshot(dir);
+    let node_counts = PackfileStorage::shard_node_counts_from_disk(dir);
+    let collection_counts = PackfileStorage::shard_collection_counts_from_disk(dir);
     // Scoped to the selected pack, not the pool: `shard_entries` (and thus
     // the table's per-row bytes/nodes/syncs) already contain only this one
     // pack, so the "total" row below must match rather than mixing in
@@ -2106,13 +2165,13 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         .and_then(|counts| counts.get(&pack_id))
         .map(|&count| usize::try_from(count).unwrap_or(usize::MAX));
     let index_requirements_by_shard =
-        index_requirements_from_disk(&dir).map(|(_, by_shard)| by_shard);
+        index_requirements_from_disk(dir).map(|(_, by_shard)| by_shard);
     let index_requirement = index_requirements_by_shard
         .as_ref()
         .and_then(|by_shard| by_shard.get(&pack_id))
         .copied();
     print_shard_table(
-        &shard_entries,
+        shard_entries,
         &stats_map,
         node_counts.as_ref(),
         collection_counts.as_ref(),
@@ -2122,7 +2181,7 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     );
 
     println!();
-    println!("type: {}", cli.require_shard_type()?.as_str());
+    println!("type: {}", shard_type.as_str());
     println!("generation: {pack_id} (0x{pack_id:016x})");
     let path = dir.join(format!("pack_{pack_id:016x}.pack"));
     println!("path: {}", path.display());
@@ -2145,10 +2204,10 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
             .unwrap_or(0)
     );
 
-    let collection_shards = PackfileStorage::collection_shards_from_disk(&dir);
-    match physical_layout(&dir) {
+    let collection_shards = PackfileStorage::collection_shards_from_disk(dir);
+    match physical_layout(dir) {
         Ok(physical) => {
-            print_pack_physical_layout(&shard_entries, &physical);
+            print_pack_physical_layout(shard_entries, &physical);
             if let Some(pack_layout) = physical.packs.get(&pack_id) {
                 let mut collections: Vec<[u8; 16]> =
                     pack_layout.collections.iter().copied().collect();
@@ -2203,10 +2262,166 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
             );
         }
     }
+}
+
+fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    let pack_id = parse_pack_id_selector(selector)?;
+    if cli.shard_type.is_none() {
+        let db_layout = open_layout(cli)?;
+        let mut matched_any = false;
+        for shard_type in cli.shard_types() {
+            let dir = pool_dir(&db_layout, shard_type)?;
+            let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
+                .into_iter()
+                .filter(|&(id, _, _)| id == pack_id)
+                .collect();
+            if !shard_entries.is_empty() {
+                if matched_any {
+                    println!();
+                    println!();
+                }
+                print_section_header(shard_type);
+                print_pack_info(&dir, pack_id, &shard_entries, shard_type);
+                matched_any = true;
+            }
+        }
+        if !matched_any {
+            eprintln!("pack 0x{pack_id:016x}: not found");
+        }
+        return Ok(());
+    }
+    let dir = selected_pool_dir(cli)?;
+    let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
+        .into_iter()
+        .filter(|&(id, _, _)| id == pack_id)
+        .collect();
+    if shard_entries.is_empty() {
+        eprintln!("pack 0x{pack_id:016x}: not found");
+        return Ok(());
+    }
+    print_pack_info(&dir, pack_id, &shard_entries, cli.require_shard_type()?);
     Ok(())
 }
 
+fn print_collection_info(
+    dir: &Path,
+    collection_id: &[u8; 16],
+    len: usize,
+    mem: usize,
+    capacity: u32,
+    shards: &[u64],
+) {
+    let hex = hex_encode(collection_id);
+    println!(
+        "collection {hex}: {len} nodes, {} index ({})",
+        fmt_megabytes(mem),
+        fmt_load_factor(len, capacity)
+    );
+    print_collection_shards(shards);
+    if let Some(details) = matrix_room_details_from_cache(dir, collection_id) {
+        print_matrix_room_details(details, None);
+    } else {
+        println!(
+            "  {:<12} scanning {} shard{}...",
+            "metadata:",
+            shards.len(),
+            if shards.len() == 1 { "" } else { "s" }
+        );
+        let details =
+            matrix_room_details_from_shards(dir, collection_id, shards).unwrap_or_else(|error| {
+                eprintln!("warning: unable to inspect Matrix room metadata: {error}");
+                MatrixRoomDetails::default()
+            });
+        if let Err(error) = persist_matrix_room_details(dir, collection_id, &details) {
+            eprintln!("warning: unable to cache Matrix room metadata: {error}");
+        }
+        print_matrix_room_details(details, Some(shards.len()));
+    }
+}
+
+fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result<bool> {
+    if let (Some(summaries), Some(collection_shards)) = (
+        PackfileStorage::collection_summaries_from_disk(dir),
+        PackfileStorage::collection_shards_from_disk(dir),
+    ) {
+        if let Some((_, len, mem, capacity)) = summaries
+            .into_iter()
+            .find(|(id, _, _, _)| id == collection_id)
+        {
+            let shards = collection_shards
+                .get(collection_id)
+                .cloned()
+                .unwrap_or_default();
+            print_collection_info(dir, collection_id, len, mem, capacity, &shards);
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    let Ok(store) = PackfileStorage::open_read_only(dir.to_path_buf()) else {
+        return Ok(false);
+    };
+    if let Some((len, mem, capacity)) = store.collection_index_info(collection_id) {
+        let hex = hex_encode(collection_id);
+        println!(
+            "collection {hex}: {len} nodes, {} index ({})",
+            fmt_megabytes(mem),
+            fmt_load_factor(len, capacity)
+        );
+        let shards = store.collection_referenced_pack_ids(collection_id);
+        print_collection_shards(&shards);
+        print_matrix_room_details(matrix_room_details(&store, dir, collection_id)?, None);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
+    if cli.shard_type.is_none() {
+        let db_layout = open_layout(cli)?;
+        let mut matched_any = false;
+        for shard_type in cli.shard_types() {
+            let dir = pool_dir(&db_layout, shard_type)?;
+            let collection_id = match collection.parse::<usize>() {
+                Ok(slot) => {
+                    let Ok(collections) = collection_ids_in_dir(&dir) else {
+                        continue;
+                    };
+                    match collections.get(slot) {
+                        Some(&id) => id,
+                        None => continue,
+                    }
+                }
+                Err(_) => parse_collection_selector(collection, cli.namespace.as_deref())?,
+            };
+            let has_collection =
+                if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir) {
+                    summaries.iter().any(|(id, _, _, _)| id == &collection_id)
+                } else if let Ok(store) = PackfileStorage::open_read_only(dir.clone()) {
+                    store.collection_index_info(&collection_id).is_some()
+                } else {
+                    false
+                };
+            if has_collection {
+                if matched_any {
+                    println!();
+                    println!();
+                }
+                print_section_header(shard_type);
+                inspect_collection_in_dir(&dir, &collection_id)?;
+                matched_any = true;
+            }
+        }
+        if !matched_any {
+            let display = match parse_collection_selector(collection, cli.namespace.as_deref()) {
+                Ok(id) => hex_encode(&id),
+                Err(_) => collection.to_owned(),
+            };
+            eprintln!("collection {display}: not found");
+        }
+        return Ok(());
+    }
+
     let collection_id = match collection.parse::<usize>() {
         Ok(slot) => {
             let collections = collection_ids(cli)?;
@@ -2215,87 +2430,19 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
                 .copied()
                 .with_context(|| format!("collection slot {slot} not found"))?
         }
-        Err(_) => parse_collection_id(collection)?,
+        Err(_) => parse_collection_selector(collection, cli.namespace.as_deref())?,
     };
     let hex = hex_encode(&collection_id);
     let dir = selected_pool_dir(cli)?;
 
-    // The persisted directory is enough for the numerical summary and the
-    // collection's physical placement. Do not rebuild every collection index merely to
-    // answer `info` for one collection.
-    if let (Some(summaries), Some(collection_shards)) = (
-        PackfileStorage::collection_summaries_from_disk(&dir),
-        PackfileStorage::collection_shards_from_disk(&dir),
-    ) {
-        if let Some((_, len, mem, capacity)) = summaries
-            .into_iter()
-            .find(|(id, _, _, _)| *id == collection_id)
-        {
-            println!(
-                "collection {hex}: {len} nodes, {} index ({})",
-                fmt_megabytes(mem),
-                fmt_load_factor(len, capacity)
-            );
-            let shards = collection_shards
-                .get(&collection_id)
-                .cloned()
-                .unwrap_or_default();
-            print_collection_shards(&shards);
-            if let Some(details) = matrix_room_details_from_cache(&dir, &collection_id) {
-                print_matrix_room_details(details, None);
-            } else {
-                println!(
-                    "  {:<12} scanning {} shard{}...",
-                    "metadata:",
-                    shards.len(),
-                    if shards.len() == 1 { "" } else { "s" }
-                );
-                let details = matrix_room_details_from_shards(&dir, &collection_id, &shards)
-                    .unwrap_or_else(|error| {
-                        eprintln!("warning: unable to inspect Matrix room metadata: {error}");
-                        MatrixRoomDetails::default()
-                    });
-                if let Err(error) = persist_matrix_room_details(&dir, &collection_id, &details) {
-                    eprintln!("warning: unable to cache Matrix room metadata: {error}");
-                }
-                print_matrix_room_details(details, Some(shards.len()));
-            }
-            return Ok(());
-        }
-        eprintln!(
-            "collection {hex}: not found{}",
-            other_shard_type_hint(cli, &collection_id)
-        );
+    if inspect_collection_in_dir(&dir, &collection_id)? {
         return Ok(());
     }
 
-    // A store predating the inspection sidecar has no cheap authoritative
-    // summary. Preserve the old full-scan fallback until `mtxdb sync` can
-    // create the sidecar.
-    let Some(store) = open_pool_for_collection_lookup(
-        cli,
-        &collection_id,
-        &format!("collection {hex}: not found"),
-    )?
-    else {
-        return Ok(());
-    };
-    match store.collection_index_info(&collection_id) {
-        Some((len, mem, capacity)) => {
-            println!(
-                "collection {hex}: {len} nodes, {} index ({})",
-                fmt_megabytes(mem),
-                fmt_load_factor(len, capacity)
-            );
-            let shards = store.collection_referenced_pack_ids(&collection_id);
-            print_collection_shards(&shards);
-            print_matrix_room_details(matrix_room_details(&store, &dir, &collection_id)?, None);
-        }
-        None => eprintln!(
-            "collection {hex}: not found{}",
-            other_shard_type_hint(cli, &collection_id)
-        ),
-    }
+    eprintln!(
+        "collection {hex}: not found{}",
+        other_shard_type_hint(cli, &collection_id)
+    );
     Ok(())
 }
 
@@ -2664,7 +2811,6 @@ fn cmd_scan(
     sort: Option<&str>,
     reverse: bool,
 ) -> anyhow::Result<()> {
-    let shard_type = cli.require_shard_type()?;
     let sort_column = sort.map(SortColumn::from_str).transpose()?;
     if sort_column == Some(SortColumn::Payload) && (!verbose || raw) {
         bail!("scan sorting requires --verbose and cannot be combined with --raw");
@@ -2695,9 +2841,37 @@ fn cmd_scan(
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
         }
-        return cmd_scan_collection(cli, selector, &opts, shard_type);
+        return cmd_scan_collection(cli, selector, &opts);
     }
     let pack_id = parse_pack_id_selector(selector)?;
+    if cli.shard_type.is_none() {
+        let db_layout = open_layout(cli)?;
+        let mut matched_any = false;
+        for shard_type in cli.shard_types() {
+            let pool_dir = pool_dir(&db_layout, shard_type)?;
+            let Ok(pool) = ShardPool::open_read_only(pool_dir) else {
+                continue;
+            };
+            let shard = pool
+                .all_shards()
+                .into_iter()
+                .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard));
+            if let Some(shard) = shard {
+                if matched_any {
+                    println!();
+                    println!();
+                }
+                print_section_header(shard_type);
+                scan_pack(cli, &shard, pack_id, collection_filter, &opts, shard_type)?;
+                matched_any = true;
+            }
+        }
+        if !matched_any {
+            eprintln!("pack 0x{pack_id:016x}: not found");
+        }
+        return Ok(());
+    }
+    let shard_type = cli.require_shard_type()?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
     let shard = pool
@@ -2858,37 +3032,27 @@ fn scan_payload_cell(data: &[u8], shard_type: ShardType) -> String {
 /// Print every physical frame for a collection across all packs. This is a
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
-fn cmd_scan_collection(
-    cli: &Cli,
-    selector: &str,
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "pool directory, options, and section-header formatting flags passed down"
+)]
+fn cmd_scan_collection_in_pool(
+    pool_dir: &Path,
+    collection_id: [u8; 16],
     opts: &ScanOptions,
     shard_type: ShardType,
-) -> anyhow::Result<()> {
-    let collection_id = parse_collection_selector(selector, cli.namespace.as_deref())?;
-    let pool_dir = selected_pool_dir(cli)?;
-    let pool = match ShardPool::open_read_only(pool_dir.clone()) {
+    show_section_header: bool,
+    needs_section_spacing: bool,
+) -> anyhow::Result<usize> {
+    let pool = match ShardPool::open_read_only(pool_dir.to_path_buf()) {
         Ok(pool) => pool,
-        // An empty pool (e.g. the default `-t event-dag` when nothing was
-        // ever written to that shard type) isn't a real error here -- it
-        // just means this collection can't be in it. Report the same
-        // "not found" a populated-but-non-matching pool would give,
-        // complete with the other-shard-type hint, instead of a raw
-        // low-level "no shards found" error.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            eprintln!(
-                "no matching physical record found in collection {selector}{}",
-                other_shard_type_hint(cli, &collection_id)
-            );
-            return Ok(());
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error).context("failed to open shard store"),
     };
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
-    // The persisted collection directory tells us which packs currently
-    // contain this collection. Avoid walking unrelated packs; older stores
-    // without a usable directory retain the conservative full-scan fallback.
-    let collection_packs = PackfileStorage::collection_shards_from_disk(&pool_dir)
+    let collection_packs = PackfileStorage::collection_shards_from_disk(pool_dir)
         .and_then(|mut collections| collections.remove(&collection_id))
         .map(|packs| packs.into_iter().collect::<HashSet<_>>());
 
@@ -2906,6 +3070,8 @@ fn cmd_scan_collection(
         shard_type,
         sorted_records: Vec::new(),
         reverse: opts.reverse,
+        show_section_header,
+        needs_section_spacing,
     };
     for (_, shard) in shards {
         if let Some(collection_packs) = &collection_packs {
@@ -2922,13 +3088,17 @@ fn cmd_scan_collection(
 
     let frames = context.frames;
     if frames == 0 {
-        bail!(
-            "no matching physical record found in collection {selector}{}",
-            other_shard_type_hint(cli, &collection_id)
-        );
+        return Ok(0);
     }
     sort_collection_records(&mut context);
     if context.mode.is_raw() {
+        if context.show_section_header && !context.raw_matches.is_empty() {
+            if context.needs_section_spacing {
+                println!();
+                println!();
+            }
+            print_section_header(context.shard_type);
+        }
         let stdout = io::stdout();
         let mut out = stdout.lock();
         for (shard, _, offset) in context.raw_matches.iter().take(max_rows) {
@@ -2948,7 +3118,38 @@ fn cmd_scan_collection(
         } else {
             eprint_scan_limit_note(frames, max_rows);
         }
-        return Ok(());
+        return Ok(frames);
+    }
+    if context.mode.is_sorting() {
+        if context.show_section_header && !context.header_printed {
+            if context.needs_section_spacing {
+                println!();
+                println!();
+            }
+            print_section_header(context.shard_type);
+            context.header_printed = true;
+        }
+        if bounded && frames >= max_rows {
+            println!(
+                "collection {}: showing first {frames} physical records (at least {packs} pack{})",
+                hex_encode(&collection_id),
+                if packs == 1 { "" } else { "s" },
+            );
+        } else {
+            println!(
+                "collection {}: {frames} physical record{} across {packs} pack{}",
+                hex_encode(&collection_id),
+                if frames == 1 { "" } else { "s" },
+                if packs == 1 { "" } else { "s" },
+            );
+            print_scan_limit_note(frames, max_rows);
+        }
+        print_scan_table_header("PACK", scan_payload_label(context.shard_type));
+        let sorted_records = context.sorted_records.clone();
+        for (shard, record_id, offset) in sorted_records.iter().take(max_rows) {
+            print_collection_record(shard, *record_id, *offset, &mut context)?;
+        }
+        return Ok(frames);
     }
     if bounded && frames >= max_rows {
         println!(
@@ -2965,11 +3166,45 @@ fn cmd_scan_collection(
         );
         print_scan_limit_note(frames, max_rows);
     }
-    if context.mode.is_sorting() {
-        let sorted_records = context.sorted_records.clone();
-        for (shard, record_id, offset) in sorted_records.iter().take(max_rows) {
-            print_collection_record(shard, *record_id, *offset, &mut context)?;
+    Ok(frames)
+}
+
+/// Print every physical frame for a collection across all packs. This is a
+/// diagnostic scan, so superseded copies are deliberately retained in the
+/// output; use `export` to enumerate only the collection's live records.
+fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
+    let collection_id = parse_collection_selector(selector, cli.namespace.as_deref())?;
+    if cli.shard_type.is_none() {
+        let db_layout = open_layout(cli)?;
+        let mut matched_any = false;
+        for shard_type in cli.shard_types() {
+            let pool_dir = pool_dir(&db_layout, shard_type)?;
+            let frames = cmd_scan_collection_in_pool(
+                &pool_dir,
+                collection_id,
+                opts,
+                shard_type,
+                true,
+                matched_any,
+            )?;
+            if frames > 0 {
+                matched_any = true;
+            }
         }
+        if !matched_any {
+            bail!("no matching physical record found in collection {selector}");
+        }
+        return Ok(());
+    }
+    let shard_type = cli.require_shard_type()?;
+    let pool_dir = selected_pool_dir(cli)?;
+    let frames =
+        cmd_scan_collection_in_pool(&pool_dir, collection_id, opts, shard_type, false, false)?;
+    if frames == 0 {
+        bail!(
+            "no matching physical record found in collection {selector}{}",
+            other_shard_type_hint(cli, &collection_id)
+        );
     }
     Ok(())
 }
@@ -2997,6 +3232,10 @@ fn sort_collection_records(context: &mut CollectionScanContext) {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "diagnostic scan state tracks output mode, row limits, and table header formatting"
+)]
 struct CollectionScanContext {
     collection_id: [u8; 16],
     node_id: Option<[u8; 16]>,
@@ -3008,6 +3247,8 @@ struct CollectionScanContext {
     shard_type: ShardType,
     sorted_records: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, [u8; 16], u64)>,
     reverse: bool,
+    show_section_header: bool,
+    needs_section_spacing: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3093,6 +3334,13 @@ fn print_collection_record(
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<()> {
     if !context.header_printed {
+        if context.show_section_header {
+            if context.needs_section_spacing {
+                println!();
+                println!();
+            }
+            print_section_header(context.shard_type);
+        }
         print_scan_table_header("PACK", scan_payload_label(context.shard_type));
         context.header_printed = true;
     }
@@ -5096,16 +5344,16 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_event_dag, cmd_collections, cmd_import_file, cmd_shards, cmd_sync,
-        compile_import_template, compute_state_groups, decode_event_json_record, decode_hamt_node,
-        decode_hamt_root, default_matrix_import_template, event_id, event_room_id,
-        extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, glob_pack_files,
-        import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
-        matrix_create_details, matrix_room_collection_id, parse_federation_input,
-        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        resolve_import_collection, scan_payload_suffix, synapse_event_node_id,
-        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        StateSet,
+        build_event_dag, cmd_collections, cmd_get, cmd_import_file, cmd_info, cmd_scan, cmd_shards,
+        cmd_stats, cmd_sync, compile_import_template, compute_state_groups,
+        decode_event_json_record, decode_hamt_node, decode_hamt_root,
+        default_matrix_import_template, event_id, event_room_id, extract_pointer_string,
+        fmt_disk_megabytes, fmt_megabytes, glob_pack_files, import_pdu_events,
+        interleaving_worth_noting, matrix_batch_has_create, matrix_create_details,
+        matrix_room_collection_id, parse_federation_input, parse_pack_id_selector,
+        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
+        synapse_event_node_id, template_collection_id, template_node_id, verify_auth_chain_edges,
+        CollectionTemplate, StateSet,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -5320,6 +5568,112 @@ mod tests {
 
         cmd_collections(&cli, false, false, None, -1).unwrap();
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stats_dash_t_all_iterates_every_pool() {
+        let dir = unique_temp_dir();
+        DatabaseLayout::open(dir.clone()).unwrap();
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: None,
+            namespace: None,
+            command: Commands::Stats { json: false },
+        };
+        cmd_stats(&cli, false).unwrap();
+        cmd_stats(&cli, true).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn get_dash_t_all_finds_record_across_pools() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+        let store = PackfileStorage::open(state_dir).unwrap();
+        let col_id = [0x01; 16];
+        let node_id = [0x02; 16];
+        let data = NodeData::new(Bytes::from_static(b"{\"hello\":\"world\"}\n"));
+        store.put(&col_id, &node_id, &data).unwrap();
+        store.sync().unwrap();
+
+        let col_hex = hex::encode(col_id);
+        let node_hex = hex::encode(node_id);
+
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: None,
+            namespace: None,
+            command: Commands::Get {
+                collection: None,
+                id: node_hex.clone(),
+                raw: false,
+            },
+        };
+
+        cmd_get(&cli, None, &node_hex, false).unwrap();
+        cmd_get(&cli, Some(&col_hex), &node_hex, true).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn info_dash_t_all_finds_collection_across_pools() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+        let store = PackfileStorage::open(state_dir).unwrap();
+        let col_id = [0x01; 16];
+        let node_id = [0x02; 16];
+        let data = NodeData::new(Bytes::from_static(b"hello"));
+        store.put(&col_id, &node_id, &data).unwrap();
+        store.sync().unwrap();
+
+        let col_hex = hex::encode(col_id);
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: None,
+            namespace: None,
+            command: Commands::Info {
+                collection: col_hex.clone(),
+            },
+        };
+
+        cmd_info(&cli, &col_hex).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_dash_t_all_finds_collection_across_pools() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+        let store = PackfileStorage::open(state_dir).unwrap();
+        let col_id = [0x01; 16];
+        let node_id = [0x02; 16];
+        let data = NodeData::new(Bytes::from_static(b"hello"));
+        store.put(&col_id, &node_id, &data).unwrap();
+        store.sync().unwrap();
+
+        let col_hex = hex::encode(col_id);
+        let cli = Cli {
+            dir: Some(dir.clone()),
+            shard_type: None,
+            namespace: None,
+            command: Commands::Scan {
+                selector: col_hex.clone(),
+                verbose: false,
+                limit: -1,
+                id: None,
+                collection: None,
+                raw: false,
+                sort: None,
+                reverse: false,
+            },
+        };
+
+        cmd_scan(&cli, &col_hex, false, -1, None, None, false, None, false).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
