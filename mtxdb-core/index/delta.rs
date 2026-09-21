@@ -665,6 +665,123 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
     })
 }
 
+/// A decoded v3 delta log that passed its structural gates.
+#[derive(Debug)]
+pub struct DeltaLogV3 {
+    /// The checkpoint fingerprint this log continues from.
+    pub base_fingerprint: u64,
+    /// The pack fingerprint the final committed batch was written against.
+    pub tail_fingerprint: u64,
+    /// Byte length of the committed region through the last committed trailer.
+    pub file_len: u64,
+    /// Whether a torn or unparsable tail was encountered after the last batch.
+    pub torn_tail: bool,
+    /// Every committed operation in file order (torn trailing batches absent).
+    pub operations: Vec<DeltaOperation>,
+}
+
+/// Read and structurally validate a v3 delta log.
+///
+/// Unlike v2 the frame region is variable-length, so after the fixed batch
+/// header the reader decodes exactly `frame_count` self-describing frames and
+/// expects the trailer immediately after the last one — it never scans for
+/// magic inside a payload. A frame that fails to decode, a short frame region,
+/// or a bad batch CRC after at least one committed batch is treated as the end
+/// of the trustworthy prefix; the fingerprint gates in storage reject a log
+/// that has lost a later batch. Returns `None` for a missing file, a bad
+/// header, the wrong version, or a log with no complete committed batch.
+#[must_use]
+pub fn read_delta_log_v3(path: &Path) -> Option<DeltaLogV3> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > MAX_DELTA_LOG_FILE_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; usize::try_from(len).ok()?];
+    file.read_exact(&mut buf).ok()?;
+    if buf.len() < DELTA_LOG_HEADER_LEN {
+        return None;
+    }
+    if &buf[..4] != DELTA_LOG_MAGIC || buf[4] != DELTA_LOG_VERSION_V3 {
+        return None;
+    }
+    let base_fingerprint = u64::from_le_bytes(buf[BASE_FINGERPRINT_OFFSET..16].try_into().ok()?);
+
+    let mut operations: Vec<DeltaOperation> = Vec::new();
+    let mut tail_fingerprint: Option<u64> = None;
+    let mut offset = DELTA_LOG_HEADER_LEN;
+    while offset < buf.len() {
+        let Some(header_end) = offset.checked_add(DELTA_BATCH_HEADER_LEN) else {
+            break;
+        };
+        let Some(header) = buf.get(offset..header_end) else {
+            break;
+        };
+        if &header[..4] != DELTA_BATCH_MAGIC {
+            break;
+        }
+        let frame_count = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+
+        let mut cursor = header_end;
+        let mut batch_operations: Vec<DeltaOperation> = Vec::new();
+        let mut decoded_all = true;
+        for _ in 0..frame_count {
+            let Some(remaining) = buf.get(cursor..) else {
+                decoded_all = false;
+                break;
+            };
+            let Some((operation, consumed)) = decode_v3_frame(remaining) else {
+                decoded_all = false;
+                break;
+            };
+            if consumed == 0 {
+                decoded_all = false;
+                break;
+            }
+            batch_operations.push(operation);
+            let Some(next) = cursor.checked_add(consumed) else {
+                decoded_all = false;
+                break;
+            };
+            cursor = next;
+        }
+        if !decoded_all {
+            break;
+        }
+
+        let Some(trailer_end) = cursor.checked_add(DELTA_LOG_TRAILER_LEN) else {
+            break;
+        };
+        let Some(trailer) = buf.get(cursor..trailer_end) else {
+            break;
+        };
+        if &trailer[..4] != DELTA_LOG_TRAILER_MAGIC {
+            break;
+        }
+        let Some(frames) = buf.get(header_end..cursor) else {
+            break;
+        };
+        let stored_crc = u32::from_le_bytes(trailer[TRAILER_CRC_OFFSET..8].try_into().ok()?);
+        let batch_tail_fingerprint =
+            u64::from_le_bytes(trailer[TRAILER_FINGERPRINT_OFFSET..16].try_into().ok()?);
+        if batch_crc(frames, batch_tail_fingerprint) != stored_crc {
+            break;
+        }
+        operations.append(&mut batch_operations);
+        tail_fingerprint = Some(batch_tail_fingerprint);
+        offset = trailer_end;
+    }
+    let torn_tail = offset < buf.len();
+    Some(DeltaLogV3 {
+        base_fingerprint,
+        tail_fingerprint: tail_fingerprint?,
+        file_len: u64::try_from(offset).unwrap_or(u64::MAX),
+        torn_tail,
+        operations,
+    })
+}
+
 /// Append one batch (optional header, then a count-framed batch) to the delta
 /// log. Returns the number of bytes appended. `write_header` must be `true`
 /// when writing to a freshly created (or truncated) file that doesn't yet
@@ -977,5 +1094,214 @@ mod tests {
         assert!(read_delta_log(&path).is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn v3_batch_bytes(operations: &[DeltaOperation], tail_fingerprint: u64) -> Vec<u8> {
+        let mut frames = Vec::new();
+        for operation in operations {
+            frames.extend_from_slice(&encode_v3_frame(operation).unwrap());
+        }
+        let crc = batch_crc(&frames, tail_fingerprint);
+        let mut batch = Vec::from(encode_batch_header(
+            u32::try_from(operations.len()).unwrap(),
+        ));
+        batch.extend_from_slice(&frames);
+        batch.extend_from_slice(&encode_trailer(tail_fingerprint, crc));
+        batch
+    }
+
+    fn sample_v3_operations() -> Vec<DeltaOperation> {
+        vec![
+            DeltaOperation::Incremental(DeltaFrame {
+                collection_id: [7; 16],
+                bucket: 1,
+                generation: 4,
+                slot: 99,
+            }),
+            DeltaOperation::CollectionSnapshot {
+                collection_id: [8; 16],
+                generation: 5,
+                order_key: 1,
+                index_blob: vec![1, 2, 3, 4],
+            },
+            DeltaOperation::CollectionTombstone {
+                collection_id: [9; 16],
+                generation: 6,
+            },
+        ]
+    }
+
+    fn v3_log(operations: &[DeltaOperation], tail_fingerprint: u64) -> Vec<u8> {
+        let mut log = Vec::from(encode_header(0xABC));
+        log[4] = DELTA_LOG_VERSION_V3;
+        log.extend_from_slice(&v3_batch_bytes(operations, tail_fingerprint));
+        log
+    }
+
+    #[test]
+    fn v3_log_round_trips_operations() {
+        let dir = std::env::temp_dir().join(format!("mtxdb_delta_v3_round_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_DELTA_FILE);
+
+        let operations = sample_v3_operations();
+        let mut log = v3_log(&operations[..2], 0x111);
+        log.extend_from_slice(&v3_batch_bytes(&operations[2..], 0x222));
+        std::fs::write(&path, &log).unwrap();
+
+        let decoded = read_delta_log_v3(&path).expect("valid v3 log reads");
+        assert_eq!(decoded.base_fingerprint, 0xABC);
+        assert_eq!(decoded.tail_fingerprint, 0x222);
+        assert_eq!(decoded.operations, operations);
+        assert!(!decoded.torn_tail);
+        assert_eq!(decoded.file_len, u64::try_from(log.len()).unwrap());
+        // The v2 reader must not misread a v3 epoch.
+        assert!(read_delta_log(&path).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v3_torn_tail_keeps_the_committed_prefix() {
+        let dir = std::env::temp_dir().join(format!("mtxdb_delta_v3_torn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_DELTA_FILE);
+
+        let operations = sample_v3_operations();
+        let mut log = v3_log(&operations[..1], 0x111);
+        let committed_len = u64::try_from(log.len()).unwrap();
+        // A second batch with a header and one frame but no trailer.
+        log.extend_from_slice(&encode_batch_header(2));
+        log.extend_from_slice(&encode_v3_frame(&operations[1]).unwrap());
+        std::fs::write(&path, &log).unwrap();
+
+        let decoded = read_delta_log_v3(&path).expect("committed prefix is trusted");
+        assert_eq!(decoded.operations, vec![operations[0].clone()]);
+        assert_eq!(decoded.tail_fingerprint, 0x111);
+        assert_eq!(decoded.file_len, committed_len);
+        assert!(decoded.torn_tail);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v3_corrupt_batch_drops_that_batch_and_later() {
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_delta_v3_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_DELTA_FILE);
+
+        let operations = sample_v3_operations();
+        let mut log = v3_log(&operations[..1], 0x111);
+        let first_batch_end = log.len();
+        log.extend_from_slice(&v3_batch_bytes(&operations[1..], 0x222));
+        // Corrupt one byte inside the second batch's frame region.
+        let corrupt_at = first_batch_end
+            .saturating_add(DELTA_BATCH_HEADER_LEN)
+            .saturating_add(4);
+        log[corrupt_at] ^= 0x20;
+        std::fs::write(&path, &log).unwrap();
+
+        let decoded = read_delta_log_v3(&path).expect("first batch is trusted");
+        assert_eq!(decoded.operations, vec![operations[0].clone()]);
+        assert_eq!(decoded.tail_fingerprint, 0x111);
+        assert!(decoded.torn_tail);
+        assert_eq!(decoded.file_len, u64::try_from(first_batch_end).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v3_reader_rejects_v2_and_empty_logs() {
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_delta_v3_reject_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_DELTA_FILE);
+
+        // A v2 header (the default `encode_header` version) is not a v3 log.
+        std::fs::write(&path, encode_header(1)).unwrap();
+        assert!(read_delta_log_v3(&path).is_none());
+
+        // A v3 header with no committed batch is not replayable.
+        let mut header_only = Vec::from(encode_header(1));
+        header_only[4] = DELTA_LOG_VERSION_V3;
+        std::fs::write(&path, header_only).unwrap();
+        assert!(read_delta_log_v3(&path).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v3_frames_round_trip_every_variant() {
+        // Incremental, CollectionSnapshot, and CollectionTombstone: each must
+        // survive encode -> decode byte-for-byte.
+        for operation in sample_v3_operations() {
+            let frame = encode_v3_frame(&operation).expect("frame encodes");
+            let (decoded, consumed) = decode_v3_frame(&frame).expect("frame decodes");
+            assert_eq!(decoded, operation);
+            assert_eq!(consumed, frame.len());
+        }
+    }
+
+    #[test]
+    fn v3_frame_decode_consumes_exactly_one_frame() {
+        let operations = sample_v3_operations();
+        let first = encode_v3_frame(&operations[0]).unwrap();
+        let second = encode_v3_frame(&operations[1]).unwrap();
+        let mut concatenated = first.clone();
+        concatenated.extend_from_slice(&second);
+
+        let (decoded, consumed) = decode_v3_frame(&concatenated).expect("first frame decodes");
+        assert_eq!(decoded, operations[0]);
+        assert_eq!(consumed, first.len());
+
+        let (decoded_second, second_consumed) =
+            decode_v3_frame(&concatenated[consumed..]).expect("second frame decodes");
+        assert_eq!(decoded_second, operations[1]);
+        assert_eq!(second_consumed, second.len());
+    }
+
+    #[test]
+    fn v3_frame_decode_rejects_corruption_and_truncation() {
+        let operation = DeltaOperation::CollectionSnapshot {
+            collection_id: [5; 16],
+            generation: 2,
+            order_key: 1,
+            index_blob: vec![9, 8, 7, 6],
+        };
+        let frame = encode_v3_frame(&operation).unwrap();
+
+        // Every truncation short of the complete frame must fail, not panic.
+        for shorter in [0, 1, V3_FRAME_HEADER_LEN, frame.len().saturating_sub(1)] {
+            assert!(decode_v3_frame(&frame[..shorter]).is_none());
+        }
+
+        // A flipped payload byte must be caught by the frame CRC.
+        let mut corrupt_payload = frame.clone();
+        corrupt_payload[V3_FRAME_HEADER_LEN] ^= 0x40;
+        assert!(decode_v3_frame(&corrupt_payload).is_none());
+
+        // ...as must a flipped CRC byte.
+        let mut corrupt_crc = frame.clone();
+        let crc_byte = corrupt_crc.len().saturating_sub(1);
+        corrupt_crc[crc_byte] ^= 0x01;
+        assert!(decode_v3_frame(&corrupt_crc).is_none());
+
+        // A length field reaching past the buffer must fail, not allocate.
+        let mut bad_len = frame.clone();
+        bad_len[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_v3_frame(&bad_len).is_none());
+
+        // An unknown operation kind with a recomputed valid CRC is rejected.
+        let mut unknown = frame.clone();
+        unknown[0] = 0x7F;
+        let crc_len = unknown.len().saturating_sub(V3_FRAME_TRAILER_LEN);
+        let crc = crc32fast::hash(&unknown[..crc_len]).to_le_bytes();
+        unknown[crc_len..].copy_from_slice(&crc);
+        assert!(decode_v3_frame(&unknown).is_none());
     }
 }
