@@ -181,6 +181,9 @@ pub struct SyncTimings {
     pub delta_log: std::time::Duration,
     /// Persisting the index checkpoint.
     pub checkpoint: std::time::Duration,
+    /// Committing the pending write-ahead journal group (one sequential
+    /// fsync). Zero when no journal is configured.
+    pub wal: std::time::Duration,
     /// Total wall time of the `sync_all` call.
     pub total: std::time::Duration,
 }
@@ -193,6 +196,7 @@ impl Default for SyncTimings {
             sidecar: std::time::Duration::ZERO,
             delta_log: std::time::Duration::ZERO,
             checkpoint: std::time::Duration::ZERO,
+            wal: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
         }
     }
@@ -222,6 +226,8 @@ struct SyncTotals {
     delta_log_ns: AtomicU64,
     /// Sum of [`SyncTimings::checkpoint`].
     checkpoint_ns: AtomicU64,
+    /// Sum of [`SyncTimings::wal`].
+    wal_ns: AtomicU64,
 }
 
 impl SyncTotals {
@@ -241,6 +247,7 @@ impl SyncTotals {
         Self::add_duration(&self.sidecar_ns, timings.sidecar);
         Self::add_duration(&self.delta_log_ns, timings.delta_log);
         Self::add_duration(&self.checkpoint_ns, timings.checkpoint);
+        Self::add_duration(&self.wal_ns, timings.wal);
     }
 
     fn snapshot(&self) -> SyncTotalsSnapshot {
@@ -254,6 +261,7 @@ impl SyncTotals {
             sidecar: duration(&self.sidecar_ns),
             delta_log: duration(&self.delta_log_ns),
             checkpoint: duration(&self.checkpoint_ns),
+            wal: duration(&self.wal_ns),
         }
     }
 
@@ -266,6 +274,7 @@ impl SyncTotals {
             &self.sidecar_ns,
             &self.delta_log_ns,
             &self.checkpoint_ns,
+            &self.wal_ns,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -291,6 +300,8 @@ pub struct SyncTotalsSnapshot {
     pub delta_log: std::time::Duration,
     /// Cumulative [`SyncTimings::checkpoint`].
     pub checkpoint: std::time::Duration,
+    /// Cumulative [`SyncTimings::wal`].
+    pub wal: std::time::Duration,
 }
 
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
@@ -822,6 +833,12 @@ pub struct PackfileStorage {
     /// per-shard pack fsyncs and the index checkpoint can be deferred without
     /// risking acknowledged data (see [`Self::enable_journal`]).
     journal: parking_lot::Mutex<Option<Arc<JournalCoordinator>>>,
+    /// Committed groups recovered when the journal was opened, retained for
+    /// [`Self::replay_journal`] to re-apply after a reopen.
+    journal_recovery: parking_lot::Mutex<Vec<crate::journal::CommittedGroup>>,
+    /// Set while [`Self::replay_journal`] re-applies recovered mutations, so
+    /// those writes are not re-published to the journal.
+    replaying: AtomicBool,
 }
 
 /// Per-collection state for incremental repack.
@@ -1485,6 +1502,8 @@ impl PackfileStorage {
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
             journal: parking_lot::Mutex::new(None),
+            journal_recovery: parking_lot::Mutex::new(Vec::new()),
+            replaying: AtomicBool::new(false),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
@@ -1551,6 +1570,35 @@ impl PackfileStorage {
     /// automatically ignored without any extra bookkeeping.
     fn delta_path(base_dir: &std::path::Path, fingerprint: u64) -> PathBuf {
         base_dir.join(format!("{INDEX_DELTA_FILE}.{fingerprint:016x}"))
+    }
+
+    /// Path of the sidecar recording the journal LSN the on-disk index
+    /// checkpoint covers. Written only when a journal is enabled; its contents
+    /// bound [`Self::replay_journal`] to the post-checkpoint suffix.
+    fn journal_lsn_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join("journal.lsn")
+    }
+
+    /// Durably record the journal LSN the just-written checkpoint covers.
+    fn write_journal_lsn(&self, lsn: u64) -> Result<(), StorageError> {
+        let path = Self::journal_lsn_path(&self.base_dir);
+        let tmp = path.with_extension("lsn.tmp");
+        fs::write(&tmp, lsn.to_le_bytes()).map_err(StorageError::Io)?;
+        fs::File::open(&tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(StorageError::Io)?;
+        fs::rename(&tmp, &path).map_err(StorageError::Io)?;
+        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        Ok(())
+    }
+
+    /// The journal LSN the on-disk checkpoint covers (0 when none is recorded).
+    fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
+        fs::read(Self::journal_lsn_path(base_dir))
+            .ok()
+            .and_then(|bytes| bytes.get(..8).map(<[u8; 8]>::try_from))
+            .and_then(Result::ok)
+            .map_or(0, u64::from_le_bytes)
     }
 
     /// Remove every on-disk delta-log epoch file except `keep` (pass `None`
@@ -2546,7 +2594,15 @@ impl PackfileStorage {
         // offsets must be readable against exactly that length on the next
         // open. Writing the checkpoint while records are still buffered
         // would persist virtual offsets the fingerprint can't describe.
-        self.shards.flush_all()?;
+        //
+        // With a journal enabled the checkpoint is also the point at which the
+        // packfiles themselves must become durable — the WAL only covers the
+        // post-checkpoint suffix — so fsync every shard here, not just flush.
+        if self.journal().is_some() {
+            self.shards.sync_all()?;
+        } else {
+            self.shards.flush_all()?;
+        }
         let packs: Vec<(u64, u64)> = self
             .shards
             .all_shards()
@@ -2574,6 +2630,11 @@ impl PackfileStorage {
         // checkpoint (C1) is durable; every collection's writers already
         // target the new epoch (D1) by the time the locks drop next.
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        // Every collection's put mutex is held here, so no `put` is mid-flight
+        // and every published mutation has completed its index update. The
+        // checkpoint about to be written therefore covers exactly
+        // `published_lsn`; record it so a reopen replays only the suffix.
+        let wal_lsn = self.journal().map(|journal| journal.published_lsn());
         drop(guards);
         // `create_guard` is deliberately NOT dropped here, unlike the
         // per-collection put mutexes above. An existing collection's
@@ -2628,6 +2689,11 @@ impl PackfileStorage {
         // write (full rescan on fingerprint mismatch, or a fresh delta
         // epoch). Safe to let new-collection publication through now.
         drop(create_guard);
+        // The checkpoint naming `fingerprint` is durable; record the journal
+        // LSN it covers so a reopen replays only mutations after it.
+        if let Some(lsn) = wal_lsn {
+            self.write_journal_lsn(lsn)?;
+        }
         self.retire_delta_epoch(old_base_fingerprint);
         // The unlocked serialize/write window above let concurrent puts land
         // after the rotation. C1 was snapshotted before them, so such a put
@@ -5423,11 +5489,7 @@ impl StorageEngine for PackfileStorage {
     fn sync(&self) -> Result<(), StorageError> {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
-        self.shards.sync_dirty()?;
-        if let Some((flush, fsync)) = self.shards.last_sync_split() {
-            timings.pack_flush = flush;
-            timings.pack_fsync = fsync;
-        }
+        self.sync_durability(true, &mut timings)?;
         self.persist_index_checkpoint_or_delta(&mut timings);
         timings.total = started.elapsed();
         self.count_sync_persistence(&timings);
@@ -5472,11 +5534,7 @@ impl PackfileStorage {
     pub fn sync_all(&self) -> Result<(), StorageError> {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
-        self.shards.sync_all()?;
-        if let Some((flush, fsync)) = self.shards.last_sync_split() {
-            timings.pack_flush = flush;
-            timings.pack_fsync = fsync;
-        }
+        self.sync_durability(false, &mut timings)?;
         self.persist_index_checkpoint_or_delta(&mut timings);
         timings.total = started.elapsed();
         self.count_sync_persistence(&timings);
@@ -5523,8 +5581,63 @@ impl PackfileStorage {
     /// committed prefix cannot be validated.
     pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
+        self.journal_recovery.lock().clone_from(&scan.groups);
         *self.journal.lock() = Some(Arc::new(JournalCoordinator::new(journal, &scan)));
         Ok(())
+    }
+
+    /// Re-apply the recovered journal's post-checkpoint mutations after a
+    /// reopen, then dirty the index so the next sync checkpoints them.
+    ///
+    /// Only entries with `lsn >` the sidecar's covered LSN are re-applied, so a
+    /// checkpoint bounds the work. Re-applying a mutation that was already
+    /// durable in a packfile (because its shard fsync happened to survive) is
+    /// idempotent on the append-only store: it writes a duplicate frame and
+    /// repoints the index, and a later repack drops the dead copy.
+    ///
+    /// Returns the number of mutations re-applied. No-op (0) when no journal is
+    /// enabled or nothing is uncovered.
+    ///
+    /// # Errors
+    /// Propagates any write failure from re-applying a mutation.
+    pub fn replay_journal(&self) -> Result<u64, StorageError> {
+        if self.journal().is_none() {
+            return Ok(0);
+        }
+        let covered = Self::read_journal_lsn(&self.base_dir);
+        let groups = self.journal_recovery.lock().clone();
+        self.replaying.store(true, Ordering::SeqCst);
+        let result = (|| -> Result<u64, StorageError> {
+            let mut replayed = 0u64;
+            for group in &groups {
+                for entry in &group.entries {
+                    if entry.lsn <= covered {
+                        continue;
+                    }
+                    match &entry.mutation {
+                        JournalMutation::Put {
+                            collection_id,
+                            node_id,
+                            payload,
+                        } => {
+                            let data = NodeData::new(bytes::Bytes::from(payload.clone()));
+                            self.put(collection_id, node_id, &data)?;
+                        }
+                        JournalMutation::DeleteCollection { collection_id } => {
+                            self.delete_collection(collection_id)?;
+                        }
+                    }
+                    replayed = replayed.saturating_add(1);
+                }
+            }
+            Ok(replayed)
+        })();
+        self.replaying.store(false, Ordering::SeqCst);
+        let replayed = result?;
+        if replayed > 0 {
+            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
+        Ok(replayed)
     }
 
     /// The journal coordinator, if [`Self::enable_journal`] was called.
@@ -5545,12 +5658,54 @@ impl PackfileStorage {
         let Some(journal) = self.journal() else {
             return Ok(None);
         };
+        // Replayed mutations are already durable in the journal; never
+        // re-publish them.
+        if self.replaying.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         // The live index is already updated synchronously on the write path,
         // so the overlay callback has nothing to publish.
         journal
             .publish(mutation(), |_lsn| {})
             .map(Some)
             .map_err(StorageError::Io)
+    }
+
+    /// Advance one barrier's durability boundary.
+    ///
+    /// With a journal enabled, that boundary is the pending WAL group: flush
+    /// buffered frames to the page cache, then commit the group as one
+    /// sequential fsync. Packfile shard fsyncs and the index checkpoint are
+    /// then acceleration-only and recovered from the journal on reopen.
+    /// Without a journal, behaves as before (fsync the dirty shards, or every
+    /// shard for `sync_all`).
+    fn sync_durability(
+        &self,
+        dirty_only: bool,
+        timings: &mut SyncTimings,
+    ) -> Result<(), StorageError> {
+        if let Some(journal) = self.journal() {
+            let flush_started = std::time::Instant::now();
+            self.shards.flush_all()?;
+            timings.pack_flush = flush_started.elapsed();
+            let target = journal.capture_sync_target();
+            let wal_started = std::time::Instant::now();
+            journal.sync_through(target).map_err(StorageError::Io)?;
+            timings.wal = wal_started.elapsed();
+        } else if dirty_only {
+            self.shards.sync_dirty()?;
+            if let Some((flush, fsync)) = self.shards.last_sync_split() {
+                timings.pack_flush = flush;
+                timings.pack_fsync = fsync;
+            }
+        } else {
+            self.shards.sync_all()?;
+            if let Some((flush, fsync)) = self.shards.last_sync_split() {
+                timings.pack_flush = flush;
+                timings.pack_fsync = fsync;
+            }
+        }
+        Ok(())
     }
 
     /// Batch-granular sync accounting: every sync counts once, and the

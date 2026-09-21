@@ -238,6 +238,13 @@ impl JournalCoordinator {
             .take_while(|(lsn, _)| *lsn <= target_lsn)
             .count();
         if covered_count == 0 {
+            // A concurrent sync may have committed and drained this exact
+            // target between our early committed-LSN check and acquiring the
+            // locks above. Re-check under the locks: if it is covered now,
+            // this caller shares that completed group.
+            if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             return Err(io::Error::other(
                 "published sync target has no pending journal mutations",
             ));
