@@ -24,6 +24,8 @@ pub mod dag;
 pub mod frontier;
 /// Lossy, append-only index mapping content hashes to packfile locations.
 pub mod index;
+/// Checksummed append-only journal primitives for durable group commits.
+pub mod journal;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
 /// Matrix-specific room-version policy.
