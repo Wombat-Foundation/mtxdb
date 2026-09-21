@@ -1149,6 +1149,7 @@ const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 /// without ever growing, while remaining ~64x smaller than the old flat
 /// 4096-slot (32 KiB) floor this replaced.
 const NEW_COLLECTION_INDEX_FLOOR: usize = 64;
+type RefreshFingerprintSeed = (u64, u64, HashMap<[u8; 16], u64>, HashMap<[u8; 16], u64>);
 
 impl PackfileStorage {
     fn refresh_lock(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
@@ -1727,6 +1728,21 @@ impl PackfileStorage {
         Ok(())
     }
 
+    fn initial_refresh_fingerprints(
+        base_dir: &std::path::Path,
+        collection_order: &[[u8; 16]],
+    ) -> RefreshFingerprintSeed {
+        let durable = crate::index::checkpoint::read_durable_fingerprint(base_dir)
+            .ok()
+            .flatten()
+            .map_or(0, |fp| fp.fingerprint);
+        let synced =
+            read_persisted_shard_collections(base_dir).map_or(0, |directory| directory.fingerprint);
+        let durable_by_collection = collection_order.iter().map(|&cid| (cid, durable)).collect();
+        let synced_by_collection = collection_order.iter().map(|&cid| (cid, synced)).collect();
+        (durable, synced, durable_by_collection, synced_by_collection)
+    }
+
     /// Assemble a fully constructed store from the per-collection state both
     /// the rescan path and the checkpoint fast path produce, so the two share
     /// one field-for-field constructor.
@@ -1746,24 +1762,12 @@ impl PackfileStorage {
             seed: shards.bucket_seed(),
             ..Default::default()
         };
-        // Seed the per-collection refresh fingerprint from the persisted
-        // checkpoint/delta state so the first miss for each collection can
-        // skip refresh when nothing durable changed.
-        let initial_durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&base_dir)
-        {
-            Ok(Some(dfp)) => dfp.fingerprint,
-            Ok(None) | Err(_) => 0,
-        };
-        let initial_fingerprints: HashMap<[u8; 16], u64> = collection_order
-            .iter()
-            .map(|&cid| (cid, initial_durable_fp))
-            .collect();
-        let initial_synced_fp = read_persisted_shard_collections(&base_dir)
-            .map_or(0, |directory| directory.fingerprint);
-        let initial_synced_fingerprints: HashMap<[u8; 16], u64> = collection_order
-            .iter()
-            .map(|&cid| (cid, initial_synced_fp))
-            .collect();
+        let (
+            initial_durable_fp,
+            initial_synced_fp,
+            initial_fingerprints,
+            initial_synced_fingerprints,
+        ) = Self::initial_refresh_fingerprints(&base_dir, &collection_order);
         // The checkpoint coverage this open's index corresponds to, captured
         // before the index was loaded. Bound to the loaded index, never
         // re-read from disk by the overlay.
@@ -6813,6 +6817,7 @@ impl PackfileStorage {
         dirty_only: bool,
         timings: &mut SyncTimings,
     ) -> Result<(), StorageError> {
+        let write_synced_marker = self.index_checkpoint_dirty.load(Ordering::Relaxed);
         if let Some(journal) = self.journal() {
             let flush_started = std::time::Instant::now();
             self.shards.flush_all()?;
@@ -6838,7 +6843,11 @@ impl PackfileStorage {
         // (which may be deferred). Readers use this sidecar as the second
         // invalidation signal; unlike filesystem metadata, it advances only
         // after this durability barrier completes.
-        self.persist_shard_collections_best_effort();
+        if write_synced_marker {
+            let sidecar_started = std::time::Instant::now();
+            self.persist_shard_collections_best_effort();
+            timings.sidecar = sidecar_started.elapsed();
+        }
         Ok(())
     }
 
@@ -6969,9 +6978,6 @@ impl PackfileStorage {
                 timings.delta_log = delta_started.elapsed();
             }
         }
-        let sidecar_started = std::time::Instant::now();
-        self.persist_shard_collections_best_effort();
-        timings.sidecar = sidecar_started.elapsed();
     }
 
     /// Fingerprint of the current on-disk pack set, computed from each
