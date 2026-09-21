@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -862,6 +862,157 @@ pub struct PackfileStorage {
     /// Set while [`Self::replay_journal`] re-applies recovered mutations, so
     /// those writes are not re-published to the journal.
     replaying: AtomicBool,
+    /// Optional read-only journal overlay backing [`Self::get_read_committed`].
+    /// Enabled on a read-only store so a worker can observe committed-but-
+    /// unflushed journal groups that the durable fingerprint gate deliberately
+    /// hides. See [`Self::enable_read_journal`].
+    read_journal: parking_lot::Mutex<Option<ReadJournal>>,
+}
+
+/// One committed value in the read-journal overlay: payload and its LSN.
+type ReadJournalValue = (bytes::Bytes, u64);
+/// Values for one collection, keyed by node ID.
+type ReadJournalCollection = HashMap<[u8; 16], ReadJournalValue>;
+/// Committed puts keyed `collection_id -> node_id`.
+type ReadJournalPuts = HashMap<[u8; 16], ReadJournalCollection>;
+
+/// In-memory overlay of committed journal groups, built by scanning a
+/// writer's journal segment read-only. It is the read-committed source of
+/// truth for [`PackfileStorage::get_read_committed`]: entries at or below
+/// `observed_lsn` have a complete commit trailer, so they are committed even
+/// though the writer may not have fsynced or advanced the durable index yet.
+struct ReadJournal {
+    /// Segment file scanned for committed groups.
+    path: PathBuf,
+    /// Pool directory holding the `journal.lsn` sidecar that records the LSN
+    /// the on-disk checkpoint covers.
+    base_dir: PathBuf,
+    /// Raw file length at the last scan. Skips a rescan when unchanged, so an
+    /// unchanged partial tail is not re-probed on every read.
+    observed_len: u64,
+    /// Absolute offset after the last complete group consumed. A partial tail
+    /// is re-probed from here once more bytes land.
+    observed_valid_len: u64,
+    /// Highest applied LSN. Groups at or below this are already in the overlay.
+    observed_lsn: u64,
+    /// Committed puts as `(payload, lsn)`, keyed `collection_id -> node_id`.
+    puts: ReadJournalPuts,
+    /// Highest committed delete LSN per collection. This is a persistent
+    /// boundary: durable fallback stays suppressed for the collection until the
+    /// checkpoint covers the delete, because the durable index may still hold
+    /// pre-delete records. A later put does not clear it.
+    delete_lsn: HashMap<[u8; 16], u64>,
+}
+
+impl ReadJournal {
+    fn empty(path: PathBuf, base_dir: PathBuf) -> Self {
+        Self {
+            path,
+            base_dir,
+            observed_len: 0,
+            observed_valid_len: 0,
+            observed_lsn: 0,
+            puts: HashMap::new(),
+            delete_lsn: HashMap::new(),
+        }
+    }
+
+    /// Drop all applied state so the next refresh rebuilds from the segment.
+    fn reset_overlay(&mut self) {
+        self.puts.clear();
+        self.delete_lsn.clear();
+        self.observed_lsn = 0;
+        self.observed_valid_len = 0;
+    }
+
+    /// Discard overlay state the durable checkpoint now covers.
+    ///
+    /// Reclaim is best-effort, so a journal group can outlive the checkpoint
+    /// that covers it. Without this, an old journal put or delete could shadow
+    /// newer checkpointed state. `covered` is monotonic, so this only shrinks.
+    fn prune_covered(&mut self, covered: u64) {
+        if covered == 0 {
+            return;
+        }
+        self.puts.retain(|_, entries| {
+            entries.retain(|_, (_, lsn)| *lsn > covered);
+            !entries.is_empty()
+        });
+        self.delete_lsn.retain(|_, lsn| *lsn > covered);
+    }
+
+    /// Apply every committed group above `observed_lsn` to the overlay.
+    ///
+    /// A missing or short segment is treated as empty (the writer may not
+    /// have created it yet); a segment that shrank since the last scan was
+    /// reclaimed, so the overlay is rebuilt from scratch. Never repairs or
+    /// creates the file, matching a read-only worker's constraints.
+    fn refresh(&mut self) -> Result<(), StorageError> {
+        let covered = PackfileStorage::read_journal_lsn(&self.base_dir);
+        let len = match fs::metadata(&self.path) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        if len != self.observed_len {
+            if len < self.observed_len {
+                // The segment was reclaimed/rotated; re-derive from the start.
+                self.reset_overlay();
+            }
+            let scan = if self.observed_valid_len == 0 {
+                Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
+            } else {
+                // Read only the tail past the last complete group. A failure
+                // here means the segment was replaced under us (or a rotation
+                // changed its base), so fall back to a full rescan.
+                if let Ok(scan) = Journal::scan_read_only_from(
+                    &self.path,
+                    self.observed_valid_len,
+                    self.observed_lsn.saturating_add(1),
+                ) {
+                    scan
+                } else {
+                    self.reset_overlay();
+                    Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
+                }
+            };
+            for group in &scan.groups {
+                for entry in &group.entries {
+                    if entry.lsn <= self.observed_lsn || entry.lsn <= covered {
+                        continue;
+                    }
+                    match &entry.mutation {
+                        JournalMutation::Put {
+                            collection_id,
+                            node_id,
+                            payload,
+                        } => {
+                            self.puts.entry(*collection_id).or_default().insert(
+                                *node_id,
+                                (bytes::Bytes::copy_from_slice(payload), entry.lsn),
+                            );
+                        }
+                        JournalMutation::DeleteCollection { collection_id } => {
+                            self.puts.remove(collection_id);
+                            self.delete_lsn
+                                .entry(*collection_id)
+                                .and_modify(|lsn| *lsn = (*lsn).max(entry.lsn))
+                                .or_insert(entry.lsn);
+                        }
+                    }
+                }
+                self.observed_lsn = self.observed_lsn.max(group.last_lsn);
+            }
+            // Resume from the last complete group, not the raw file length, so
+            // a partial tail is re-probed once its trailer lands.
+            self.observed_valid_len = scan.valid_len;
+            self.observed_len = len;
+        }
+        // The checkpoint can advance without the segment changing (reclaim is
+        // best-effort), so prune overlay state it now covers.
+        self.prune_covered(covered);
+        Ok(())
+    }
 }
 
 /// Per-collection state for incremental repack.
@@ -1524,6 +1675,7 @@ impl PackfileStorage {
             journal: parking_lot::Mutex::new(None),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
+            read_journal: parking_lot::Mutex::new(None),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
@@ -5322,6 +5474,87 @@ impl PackfileStorage {
         self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
         Ok(results)
     }
+
+    /// Enable a read-only journal overlay for the read-committed API.
+    ///
+    /// `path` is a writer's journal segment. The overlay is built with
+    /// [`Journal::scan_read_only`], which never creates, repairs, or locks the
+    /// segment, so this is safe from a read-only worker process. The durable
+    /// read API ([`StorageEngine::get_many`], [`Self::get_many_with_refresh`])
+    /// is unchanged and continues to hide unflushed writes; only
+    /// [`Self::get_read_committed`] consults the overlay.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the segment is unreadable or a committed
+    /// group fails validation.
+    pub fn enable_read_journal(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
+        let mut overlay = ReadJournal::empty(path.as_ref().to_path_buf(), self.base_dir.clone());
+        overlay.refresh()?;
+        *self.read_journal.lock() = Some(overlay);
+        Ok(())
+    }
+
+    /// Read records at read-committed visibility: the durable index plus any
+    /// committed-but-unflushed journal group.
+    ///
+    /// This is the cross-process freshness path for read-only workers, and it
+    /// is deliberately separate from the durable API. A key absent from the
+    /// durable index is filled from a complete journal group (commit trailer
+    /// present) even before the writer fsyncs or advances the index
+    /// checkpoint. A committed collection delete shadows durable records.
+    ///
+    /// Without [`Self::enable_read_journal`] this degrades to
+    /// [`Self::get_many_with_refresh`].
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if reading the durable index or scanning the
+    /// journal segment fails.
+    pub fn get_read_committed(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
+        let mut unresolved: Vec<usize> = Vec::new();
+
+        {
+            let mut guard = self.read_journal.lock();
+            if let Some(overlay) = guard.as_mut() {
+                overlay.refresh()?;
+                match overlay.puts.get(collection_id) {
+                    Some(committed) => {
+                        for (index, id) in ids.iter().enumerate() {
+                            match committed.get(id) {
+                                Some((payload, _)) => {
+                                    results[index] = Some(NodeData::new(payload.clone()));
+                                }
+                                None => unresolved.push(index),
+                            }
+                        }
+                    }
+                    None => unresolved.extend(0..ids.len()),
+                }
+                // A delete the checkpoint does not yet cover means the durable
+                // index may still hold pre-delete records, so falling back for
+                // missing keys would resurrect them. Return the overlay's view
+                // (post-delete puts only) until the delete is covered.
+                if overlay.delete_lsn.contains_key(collection_id) {
+                    return Ok(results);
+                }
+            } else {
+                unresolved.extend(0..ids.len());
+            }
+        }
+
+        if !unresolved.is_empty() {
+            let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();
+            let durable = self.get_many_with_refresh(collection_id, &durable_ids)?;
+            for (index, value) in unresolved.into_iter().zip(durable) {
+                results[index] = value;
+            }
+        }
+        Ok(results)
+    }
 }
 
 impl StorageEngine for PackfileStorage {
@@ -6033,6 +6266,30 @@ impl PackfileStorage {
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
         *self.journal.lock() = Some(Arc::new(JournalCoordinator::new(journal, &scan)));
+        Ok(())
+    }
+
+    /// Route durability through a journal whose group sequence is drawn from a
+    /// shared, cross-pool counter.
+    ///
+    /// Identical to [`Self::enable_journal`] except the coordinator orders its
+    /// groups by `sequence`, so several pools' segments share one global order
+    /// (see [`JournalCoordinator::with_shared_sequence`]). The caller
+    /// initializes `sequence` above the maximum recovered
+    /// [`Journal::next_sequence`] across the participating segments.
+    ///
+    /// # Errors
+    /// Same as [`Self::enable_journal`].
+    pub fn enable_journal_with_sequence(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        sequence: Arc<AtomicU64>,
+    ) -> Result<(), StorageError> {
+        let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
+        self.journal_recovery.lock().clone_from(&scan.groups);
+        *self.journal.lock() = Some(Arc::new(JournalCoordinator::with_shared_sequence(
+            journal, &scan, sequence,
+        )));
         Ok(())
     }
 
@@ -6868,6 +7125,226 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn read_committed_overlay_sees_a_committed_but_unflushed_group() {
+        let dir = test_dir("read_committed_unflushed");
+        let wal = dir.join("wal.bin");
+        let collection = [0x42u8; 16];
+        let node = [0x07u8; 16];
+
+        // A read-only open needs at least one shard on disk, so seed a
+        // durable record first.
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x99u8; 16],
+            &[0x99u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        // A complete group (trailer present) with no fsync: committed, but
+        // invisible to the durable fingerprint gate.
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"committed-unflushed".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        let read_committed = store.get_read_committed(&collection, &[node]).unwrap();
+        assert_eq!(
+            read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"committed-unflushed"[..])
+        );
+
+        // The durable API still hides the unflushed group.
+        let durable = store.get_many_with_refresh(&collection, &[node]).unwrap();
+        assert!(
+            durable[0].is_none(),
+            "durable read must not observe an unflushed journal group"
+        );
+    }
+
+    #[test]
+    fn read_committed_overlay_shadows_durable_with_a_committed_delete() {
+        let dir = test_dir("read_committed_delete");
+        let wal = dir.join("wal.bin");
+        let collection = [0x43u8; 16];
+        let node = [0x08u8; 16];
+
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer
+            .put(
+                &collection,
+                &node,
+                &NodeData::new(bytes::Bytes::from_static(b"live")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::DeleteCollection {
+                collection_id: collection,
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        let read_committed = store.get_read_committed(&collection, &[node]).unwrap();
+        assert!(
+            read_committed[0].is_none(),
+            "a committed delete must shadow the durable record"
+        );
+    }
+
+    #[test]
+    fn read_committed_overlay_preserves_a_delete_boundary_across_recreate() {
+        let dir = test_dir("read_committed_recreate");
+        let wal = dir.join("wal.bin");
+        let collection = [0x45u8; 16];
+        let old = [0x0au8; 16];
+        let new = [0x0bu8; 16];
+
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer
+            .put(
+                &collection,
+                &old,
+                &NodeData::new(bytes::Bytes::from_static(b"old")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        // Delete the collection, then recreate it with a different record. The
+        // pre-delete record must not be resurrected by the durable fallback.
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::DeleteCollection {
+                collection_id: collection,
+            }])
+            .unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: new,
+                payload: b"new".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        let read_committed = store.get_read_committed(&collection, &[old, new]).unwrap();
+        assert!(
+            read_committed[0].is_none(),
+            "a pre-delete record must stay deleted after the collection is recreated"
+        );
+        assert_eq!(
+            read_committed[1].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"new"[..])
+        );
+    }
+
+    #[test]
+    fn read_committed_overlay_ignores_entries_the_checkpoint_covers() {
+        let dir = test_dir("read_committed_covered");
+        let wal = dir.join("wal.bin");
+        let collection = [0x44u8; 16];
+        let node = [0x09u8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x98u8; 16],
+            &[0x98u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        // Claim the checkpoint already covers LSN 1, as if reclaim were
+        // deferred. The overlay must not serve that journal entry.
+        seed.write_journal_lsn(1).unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"covered".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        let read_committed = store.get_read_committed(&collection, &[node]).unwrap();
+        assert!(
+            read_committed[0].is_none(),
+            "an entry at or below the checkpoint's covered LSN must not be served from the overlay"
+        );
+    }
+
+    #[test]
+    fn read_committed_overlay_picks_up_groups_appended_after_the_first_scan() {
+        let dir = test_dir("read_committed_tail");
+        let wal = dir.join("wal.bin");
+        let collection = [0x46u8; 16];
+        let first = [0x0cu8; 16];
+        let second = [0x0du8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x97u8; 16],
+            &[0x97u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: first,
+                payload: b"first".to_vec(),
+            }])
+            .unwrap();
+
+        // Open the overlay now, so its first scan stops at the first group.
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        assert!(store.get_read_committed(&collection, &[first]).unwrap()[0].is_some());
+
+        // A later append must be picked up by the incremental tail scan.
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: second,
+                payload: b"second".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let read_committed = store.get_read_committed(&collection, &[second]).unwrap();
+        assert_eq!(
+            read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"second"[..])
+        );
     }
 
     fn ten_record_fixture() -> Vec<(NodeId, NodeData)> {

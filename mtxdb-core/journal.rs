@@ -6,9 +6,10 @@
 //! target LSN and releases it only after a durable group covers that target.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -159,6 +160,11 @@ pub struct JournalCoordinator {
     /// committed-but-unflushed group.
     visible_lsn: AtomicU64,
     committed_lsn: AtomicU64,
+    /// Optional shared, cross-pool group-sequence allocator. When present,
+    /// each committed group draws its sequence from here instead of the
+    /// segment's own counter, so groups across several pool segments share one
+    /// global order. See [`Self::with_shared_sequence`].
+    sequence: Option<Arc<AtomicU64>>,
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
@@ -177,8 +183,24 @@ impl JournalCoordinator {
             published_lsn: AtomicU64::new(committed_lsn),
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
+            sequence: None,
             poisoned: AtomicBool::new(false),
         }
+    }
+
+    /// Build a coordinator whose groups draw their sequence from a shared,
+    /// cross-pool counter instead of this segment's own numbering.
+    ///
+    /// The caller must initialize `sequence` above every participating
+    /// segment's recovered next sequence (see [`Journal::next_sequence`]), so
+    /// the first allocation is larger than any sequence already on disk. Gaps
+    /// in a single segment's group sequence are then expected; recovery
+    /// permits them.
+    #[must_use]
+    pub fn with_shared_sequence(journal: Journal, scan: &Scan, sequence: Arc<AtomicU64>) -> Self {
+        let mut coordinator = Self::new(journal, scan);
+        coordinator.sequence = Some(sequence);
+        coordinator
     }
 
     /// Highest durably committed LSN. Everything at or below this is on disk.
@@ -314,7 +336,11 @@ impl JournalCoordinator {
             pending.drain(..covered_count).collect::<Vec<_>>()
         };
         let mutations: Vec<Mutation> = batch.iter().map(|(_, mutation)| mutation.clone()).collect();
-        let receipt = match journal.append_group(&mutations) {
+        let sequence = self
+            .sequence
+            .as_ref()
+            .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
+        let receipt = match journal.append_group_with_sequence(&mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -420,6 +446,45 @@ impl Journal {
         scan_bytes(&bytes, base_sequence, base_lsn)
     }
 
+    /// Scan only the committed groups appended at or after `start`, a group
+    /// boundary returned by an earlier scan's `valid_len`.
+    ///
+    /// Reads only the tail bytes, so a reader that already applied the earlier
+    /// groups does not re-decode them. `expected_lsn` is the next LSN the
+    /// caller expects (its highest applied LSN plus one); a mismatch means the
+    /// segment was replaced or rotated, and the caller should rebuild from a
+    /// full [`Self::scan_read_only`]. Never repairs or creates the file.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the tail is unreadable or a group fails
+    /// validation. A missing file yields an empty scan.
+    // This intentionally seeks to `start` and reads only the appended tail;
+    // `fs::read` would decode the whole segment on every incremental refresh.
+    #[allow(clippy::verbose_file_reads)]
+    pub fn scan_read_only_from(
+        path: impl AsRef<Path>,
+        start: u64,
+        expected_lsn: u64,
+    ) -> io::Result<Scan> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Scan::empty()),
+            Err(error) => return Err(error),
+        };
+        let len = file.metadata()?.len();
+        if start >= len {
+            return Ok(Scan {
+                groups: Vec::new(),
+                valid_len: start.min(len),
+                truncated_tail: false,
+            });
+        }
+        file.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        scan_groups_from(&tail, start, 0, expected_lsn)
+    }
+
     /// Open a journal and recover its committed groups.
     ///
     /// A segment shorter than the file header (a fresh file, or a crash while
@@ -502,6 +567,25 @@ impl Journal {
     /// oversized, the LSN/sequence space is exhausted, the segment is full
     /// (`WouldBlock`; the caller must drain/rotate), or the write fails.
     pub fn append_group(&mut self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
+        self.append_group_with_sequence(mutations, None)
+    }
+
+    /// Append a group using `sequence` when given, or this segment's own next
+    /// sequence otherwise.
+    ///
+    /// A shared sequence lets several pools' segments be ordered by one global
+    /// group sequence; a gap between a segment's consecutive groups is then
+    /// expected, and recovery permits it (integrity still comes from the group
+    /// header CRC and commit trailer, which both cover the sequence).
+    ///
+    /// # Errors
+    /// Same as [`Self::append_group`], plus `InvalidInput` if `sequence` is
+    /// behind this segment's next sequence.
+    pub fn append_group_with_sequence(
+        &mut self,
+        mutations: &[Mutation],
+        sequence: Option<u64>,
+    ) -> io::Result<CommitReceipt> {
         if self.poisoned {
             return Err(io::Error::other(
                 "journal handle is poisoned after an earlier failed commit",
@@ -521,7 +605,13 @@ impl Journal {
         let last_lsn = first_lsn
             .checked_add(u64::from(record_count).saturating_sub(1))
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-        let sequence = self.next_sequence;
+        let sequence = sequence.unwrap_or(self.next_sequence);
+        if sequence < self.next_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal group sequence would move backwards",
+            ));
+        }
 
         let mut payload = Vec::new();
         for (index, mutation) in mutations.iter().enumerate() {
@@ -635,6 +725,16 @@ impl Journal {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Sequence the next group appended without an explicit sequence would use.
+    ///
+    /// Callers sharing one cross-pool sequence allocator initialize it above
+    /// the maximum of these across segments. See
+    /// [`JournalCoordinator::with_shared_sequence`].
+    #[must_use]
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
     }
 
     /// Compact this segment, dropping committed groups the checkpoint has
@@ -940,11 +1040,30 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
     if bytes.len() < FILE_HEADER_LEN {
         return Err(invalid_data("truncated journal file header"));
     }
-    let mut cursor = FILE_HEADER_LEN;
-    let mut valid_len = cursor;
+    scan_groups_from(
+        &bytes[FILE_HEADER_LEN..],
+        u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX),
+        base_sequence,
+        base_lsn,
+    )
+}
+
+/// Scan complete groups from `bytes`, which begins at absolute file offset
+/// `base_offset`.
+///
+/// `expected_sequence` is a floor, not an exact match: a segment sharing a
+/// global sequence with other pools may skip values. `expected_lsn` must match
+/// the first group's `first_lsn` exactly, since LSNs stay contiguous within a
+/// segment. `Scan::valid_len` is absolute in the file, not relative to `bytes`.
+fn scan_groups_from(
+    bytes: &[u8],
+    base_offset: u64,
+    mut expected_sequence: u64,
+    mut expected_lsn: u64,
+) -> io::Result<Scan> {
+    let mut cursor = 0usize;
+    let mut valid_len = base_offset;
     let mut groups = Vec::new();
-    let mut expected_sequence = base_sequence;
-    let mut expected_lsn = base_lsn;
     let mut truncated_tail = false;
 
     while cursor < bytes.len() {
@@ -957,7 +1076,7 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
             .get(cursor..cursor.saturating_add(GROUP_HEADER_LEN))
             .ok_or_else(|| invalid_data("truncated journal group header"))?;
         let group = parse_group_header(header)?;
-        if group.sequence != expected_sequence
+        if group.sequence < expected_sequence
             || group.first_lsn != expected_lsn
             || group.last_lsn < group.first_lsn
             || group
@@ -982,10 +1101,14 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
             truncated_tail = true;
             break;
         }
-        let payload_start = cursor.saturating_add(GROUP_HEADER_LEN);
-        let payload = verify_group_payload(bytes, header, &group, payload_start, payload_len)?;
+        let payload_index = cursor.saturating_add(GROUP_HEADER_LEN);
+        let payload = verify_group_payload(bytes, header, &group, payload_index, payload_len)?;
+        let payload_offset = base_offset
+            .saturating_add(u64::try_from(payload_index).unwrap_or(u64::MAX))
+            .try_into()
+            .unwrap_or(usize::MAX);
         let entries =
-            decode_mutations(payload, group.first_lsn, group.record_count, payload_start)?;
+            decode_mutations(payload, group.first_lsn, group.record_count, payload_offset)?;
         groups.push(CommittedGroup {
             sequence: group.sequence,
             first_lsn: group.first_lsn,
@@ -993,8 +1116,9 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
             entries,
         });
         cursor = cursor.saturating_add(total_len);
-        valid_len = cursor;
-        expected_sequence = expected_sequence
+        valid_len = base_offset.saturating_add(u64::try_from(cursor).unwrap_or(u64::MAX));
+        expected_sequence = group
+            .sequence
             .checked_add(1)
             .ok_or_else(|| invalid_data("journal group sequence overflow"))?;
         expected_lsn = group
@@ -1005,7 +1129,7 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
 
     Ok(Scan {
         groups,
-        valid_len: u64::try_from(valid_len).unwrap_or(u64::MAX),
+        valid_len,
         truncated_tail,
     })
 }
@@ -1125,6 +1249,8 @@ mod tests {
     use super::{Journal, JournalCoordinator, Mutation};
     use std::fs;
     use std::io::Write as _;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1677,5 +1803,50 @@ mod tests {
         assert_eq!(scan.groups.len(), 1);
         assert_eq!(scan.groups[0].first_lsn, lsn.saturating_add(1));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shared_sequence_orders_groups_across_segments_and_allows_gaps() {
+        let dir = temp_path("shared_sequence");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let counter = Arc::new(AtomicU64::new(1));
+
+        let path_a = dir.join("a.wal");
+        let path_b = dir.join("b.wal");
+        let (journal_a, scan_a) = Journal::open(&path_a).unwrap();
+        let (journal_b, scan_b) = Journal::open(&path_b).unwrap();
+        let a = JournalCoordinator::with_shared_sequence(journal_a, &scan_a, Arc::clone(&counter));
+        let b = JournalCoordinator::with_shared_sequence(journal_b, &scan_b, Arc::clone(&counter));
+
+        // Interleave commits; the shared counter hands out 1, 2, 3 so each
+        // segment skips the values the other consumed.
+        a.publish(put(1, 1, b"a1"), |_| {}).unwrap();
+        a.sync().unwrap();
+        b.publish(put(2, 1, b"b1"), |_| {}).unwrap();
+        b.sync().unwrap();
+        a.publish(put(1, 2, b"a2"), |_| {}).unwrap();
+        a.sync().unwrap();
+
+        drop(a);
+        drop(b);
+        // Segment A holds sequences 1 and 3; recovery must accept the gap.
+        let (_journal, scan) = Journal::open(&path_a).unwrap();
+        assert_eq!(
+            scan.groups
+                .iter()
+                .map(|group| group.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        let (_journal, scan) = Journal::open(&path_b).unwrap();
+        assert_eq!(
+            scan.groups
+                .iter()
+                .map(|group| group.sequence)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }
