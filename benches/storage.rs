@@ -82,8 +82,18 @@ impl DagGenerator {
 
         for i in 1..total_events {
             let mut extra_prevs = Vec::new();
-            if !pending_joins.is_empty() && (i % join_depth == 0 || tips.len() >= 8) {
-                extra_prevs = pending_joins.remove(0);
+            if !pending_joins.is_empty() && i % join_depth == 0 {
+                // Merge every outstanding orphan at the periodic boundary, not
+                // just one. `tips` is capped below the old `tips.len() >= 8`
+                // pressure valve (see the `tips.len() > 4` cull below), so that
+                // valve never fired and joins could not keep pace with forks --
+                // stranding a third or more of the DAG's joins for the terminal
+                // bulk-absorb pass and leaving the workload's merge structure
+                // unrepresentative.
+                extra_prevs = std::mem::take(&mut pending_joins)
+                    .into_iter()
+                    .flatten()
+                    .collect();
             }
 
             let tip_idx = if tips.len() == 1 { 0 } else { tips.len() - 1 };
