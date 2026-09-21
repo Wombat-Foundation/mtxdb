@@ -117,7 +117,7 @@ impl Journal {
     /// # Errors
     /// Returns `io::Error` if the segment cannot be created or read, if a
     /// data-bearing segment's header is invalid, if any committed group fails
-    /// validation, or if the segment exceeds [`MAX_SEGMENT_LEN`].
+    /// validation, or if the segment exceeds `MAX_SEGMENT_LEN`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {

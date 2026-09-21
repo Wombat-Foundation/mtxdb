@@ -681,6 +681,25 @@ pub struct PackfileStorage {
     /// across a whole run instead of only the most recent barrier (which
     /// `last_sync_timings` alone cannot answer).
     sync_totals: SyncTotals,
+    /// Minimum wall-clock interval between full checkpoint rewrites needed
+    /// because the delta log is invalid. Zero disables this half of the
+    /// rewrite budget. See [`Self::set_checkpoint_rewrite_budget`].
+    checkpoint_rewrite_min_interval_ns: AtomicU64,
+    /// Maximum `put_bytes + put_many_bytes` accumulated since the last full
+    /// checkpoint rewrite before one is forced even inside the time interval.
+    /// Zero disables this half of the budget.
+    checkpoint_rewrite_max_bytes: AtomicU64,
+    /// Instant of the last full checkpoint rewrite this session — the time
+    /// half of the rewrite budget.
+    last_checkpoint_rewrite_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// `put_bytes + put_many_bytes` sampled at the last full checkpoint
+    /// rewrite — the size half of the rewrite budget.
+    checkpoint_bytes_at_last_rewrite: AtomicU64,
+    /// Syncs that skipped a structurally-needed full checkpoint rewrite
+    /// because the configured time/size budget still had headroom. The
+    /// on-disk checkpoint stays stale by design; the next open then falls
+    /// back to a rescan because the pack fingerprint advanced past it.
+    checkpoint_skips: AtomicU64,
     /// Gates the logical read-path counters (`get`/`get_many` below). Off by
     /// default so a store doing no reads-of-record pays one relaxed load per
     /// logical read at most, and the write/batch/sync counters are the only
@@ -1462,6 +1481,11 @@ impl PackfileStorage {
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
+            checkpoint_rewrite_min_interval_ns: AtomicU64::new(0),
+            checkpoint_rewrite_max_bytes: AtomicU64::new(0),
+            last_checkpoint_rewrite_at: parking_lot::Mutex::new(None),
+            checkpoint_bytes_at_last_rewrite: AtomicU64::new(0),
+            checkpoint_skips: AtomicU64::new(0),
             stats_enabled: AtomicBool::new(false),
             open_count: AtomicU64::new(1),
             get_calls: AtomicU64::new(0),
@@ -5438,6 +5462,29 @@ impl PackfileStorage {
         Ok(())
     }
 
+    /// Bound how often a structurally-needed full checkpoint rewrite may run.
+    ///
+    /// Both budgets are unlimited at zero, and the pair is *disabled* when both
+    /// are zero (the default), preserving the historical rewrite-on-every-
+    /// invalidated-dirty-barrier behavior. A rewrite is deferred only while both
+    /// configured budgets still have headroom; exhausting either forces it.
+    ///
+    /// Deferring is safe for durability: packfiles stay authoritative and are
+    /// still synced first, so this only costs the next open a rescan — the
+    /// stale on-disk checkpoint (and the delta log, whose tail no longer matches
+    /// the advanced packs) is rejected by the fingerprint gates. It is the
+    /// write-neutral stopgap for the case where the delta fast path is
+    /// invalidated on nearly every barrier (see `delta_state_needs_full_rewrite`
+    /// and `checkpoint_skips`).
+    pub fn set_checkpoint_rewrite_budget(&self, min_interval: std::time::Duration, max_bytes: u64) {
+        self.checkpoint_rewrite_min_interval_ns.store(
+            u64::try_from(min_interval.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.checkpoint_rewrite_max_bytes
+            .store(max_bytes, Ordering::Relaxed);
+    }
+
     /// Batch-granular sync accounting: every sync counts once, and the
     /// checkpoint-vs-delta discriminator comes from which phase
     /// `persist_index_checkpoint_or_delta` actually ran (a non-dirty sync runs
@@ -5453,6 +5500,57 @@ impl PackfileStorage {
             self.delta_appends.fetch_add(1, Ordering::Relaxed);
         }
     }
+    /// `put_bytes + put_many_bytes` written since the last full checkpoint
+    /// rewrite — the size dimension of the rewrite budget.
+    fn written_bytes_since_last_rewrite(&self) -> u64 {
+        self.put_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.put_many_bytes.load(Ordering::Relaxed))
+            .saturating_sub(
+                self.checkpoint_bytes_at_last_rewrite
+                    .load(Ordering::Relaxed),
+            )
+    }
+
+    /// Whether a structurally-needed full checkpoint rewrite should be deferred
+    /// under the configured time/size budget.
+    ///
+    /// Both budgets are unlimited at zero. A zero/zero budget (the default)
+    /// never defers, preserving the historical behavior of rewriting on every
+    /// invalidated dirty barrier. With one budget configured, deferral is gated
+    /// on that one alone; with both, a rewrite runs as soon as either headroom
+    /// runs out.
+    fn should_defer_checkpoint_rewrite(&self) -> bool {
+        let interval = std::time::Duration::from_nanos(
+            self.checkpoint_rewrite_min_interval_ns
+                .load(Ordering::Relaxed),
+        );
+        let max_bytes = self.checkpoint_rewrite_max_bytes.load(Ordering::Relaxed);
+        if interval.is_zero() && max_bytes == 0 {
+            return false;
+        }
+        let time_headroom = interval.is_zero()
+            || self
+                .last_checkpoint_rewrite_at
+                .lock()
+                .as_ref()
+                .is_some_and(|last| last.elapsed() < interval);
+        let size_headroom = max_bytes == 0 || self.written_bytes_since_last_rewrite() < max_bytes;
+        time_headroom && size_headroom
+    }
+
+    /// Record that a full checkpoint rewrite just completed, resetting both
+    /// budget baselines to now and the current write counter.
+    fn note_checkpoint_rewrite(&self) {
+        *self.last_checkpoint_rewrite_at.lock() = Some(std::time::Instant::now());
+        self.checkpoint_bytes_at_last_rewrite.store(
+            self.put_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(self.put_many_bytes.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+    }
+
     /// Whether the pending mutation set must be persisted as a full index
     /// checkpoint rather than a delta append. A delta append can only cover a
     /// log that has been continued continuously from the last checkpoint: any
@@ -5496,8 +5594,20 @@ impl PackfileStorage {
             return;
         }
         if self.delta_state_needs_full_rewrite() {
+            if self.should_defer_checkpoint_rewrite() {
+                // Write-neutral stopgap: the caller already synced the
+                // packfiles, so skipping the acceleration rewrite costs only
+                // the next open a rescan — the stale on-disk checkpoint no
+                // longer matches the advanced pack fingerprint, and the delta
+                // log's tail does not either, so the opener rejects both. Leave
+                // `index_checkpoint_dirty` set so a later barrier past the
+                // budget still rewrites.
+                self.checkpoint_skips.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let checkpoint_started = std::time::Instant::now();
             self.persist_index_checkpoint_best_effort();
+            self.note_checkpoint_rewrite();
             timings.checkpoint = checkpoint_started.elapsed();
         } else {
             // The frames were recorded against the pack set the preceding flush
@@ -5512,6 +5622,7 @@ impl PackfileStorage {
                 eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
                 let checkpoint_started = std::time::Instant::now();
                 self.persist_index_checkpoint_best_effort();
+                self.note_checkpoint_rewrite();
                 timings.checkpoint = checkpoint_started.elapsed();
             } else {
                 timings.delta_log = delta_started.elapsed();
@@ -5740,6 +5851,7 @@ impl PackfileStorage {
             index_rebuild_count: self.index_rebuild_count.load(Ordering::Relaxed),
             delta_invalidations: self.delta_invalidations.load(Ordering::Relaxed),
             checkpoint_writes: self.checkpoint_writes.load(Ordering::Relaxed),
+            checkpoint_skips: self.checkpoint_skips.load(Ordering::Relaxed),
             delta_appends: self.delta_appends.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
@@ -5797,6 +5909,7 @@ impl PackfileStorage {
             &self.index_rebuild_count,
             &self.delta_invalidations,
             &self.checkpoint_writes,
+            &self.checkpoint_skips,
             &self.delta_appends,
             &self.sidecar_writes,
             &self.sync_calls,
@@ -5931,6 +6044,11 @@ pub struct RuntimeStats {
     pub delta_invalidations: u64,
     /// Syncs that rewrote the index checkpoint in full.
     pub checkpoint_writes: u64,
+    /// Syncs that deferred a structurally-needed full checkpoint rewrite under
+    /// the configured time/size budget (see
+    /// [`PackfileStorage::set_checkpoint_rewrite_budget`]). Non-zero only when
+    /// a budget is configured.
+    pub checkpoint_skips: u64,
     /// Syncs that appended the incremental delta log instead.
     pub delta_appends: u64,
     /// Writes of the shard→collection inspection sidecar (every one counts,
@@ -6008,6 +6126,7 @@ impl Default for RuntimeStats {
             index_rebuild_count: 0,
             delta_invalidations: 0,
             checkpoint_writes: 0,
+            checkpoint_skips: 0,
             delta_appends: 0,
             sidecar_writes: 0,
             sync_calls: 0,
@@ -7211,6 +7330,195 @@ mod tests {
                 .unwrap()
                 .expect("every write survives a reopen onto the new checkpoint");
             assert_eq!(got.bytes.as_ref(), expected_bytes.as_ref());
+        }
+    }
+
+    /// Confirms, quantitatively, which mutation events poison the delta log:
+    /// creating a collection between barriers (`is_new`) and forcing an index
+    /// grow (`bump_generation`), not the syncs or ordinary puts themselves.
+    ///
+    /// This is the measurement behind the finding that a room-churn workload
+    /// never takes the delta fast path: `delta_appends` stays at zero while
+    /// every barrier becomes an O(store) checkpoint rewrite.
+    #[test]
+    fn delta_invalidation_triggers_are_new_collections_and_growth() {
+        const ROUNDS: u8 = 5;
+
+        // Arm A: one new collection per barrier -- the Complement room-churn
+        // shape. Each create invalidates the whole store's log, so every
+        // barrier rewrites the checkpoint and the delta path never runs.
+        let store_a = PackfileStorage::open(test_dir("delta_triggers_new_collections")).unwrap();
+        let before_a = store_a.stats();
+        for round in 0..ROUNDS {
+            let mut cid = [0u8; 16];
+            cid[0] = 0xA0;
+            cid[1] = round;
+            for i in 0..3u8 {
+                store_a
+                    .put(
+                        &cid,
+                        &distinct_id(i),
+                        &NodeData::new(bytes::Bytes::from(format!("round {round} node {i}"))),
+                    )
+                    .unwrap();
+            }
+            store_a.sync_all().unwrap();
+        }
+        let after_a = store_a.stats();
+        assert_eq!(
+            after_a.delta_invalidations - before_a.delta_invalidations,
+            u64::from(ROUNDS),
+            "one is_new invalidation per collection created between barriers"
+        );
+        assert_eq!(
+            after_a.checkpoint_writes - before_a.checkpoint_writes,
+            u64::from(ROUNDS),
+            "every barrier must rewrite the checkpoint, not append"
+        );
+        assert_eq!(
+            after_a.delta_appends - before_a.delta_appends,
+            0,
+            "the delta fast path never runs while a new collection appears each round"
+        );
+
+        // Arm B: one collection that never grows. Its creation invalidates
+        // once; the first rewrite re-bases the log, and every later barrier
+        // appends the delta instead of rewriting.
+        let store_b = PackfileStorage::open(test_dir("delta_triggers_single_collection")).unwrap();
+        let before_b = store_b.stats();
+        let mut next = 0u8;
+        for _ in 0..ROUNDS {
+            for _ in 0..3u8 {
+                store_b
+                    .put(
+                        &TEST_COLLECTION,
+                        &distinct_id(next),
+                        &NodeData::new(bytes::Bytes::from(format!("node {next}"))),
+                    )
+                    .unwrap();
+                next = next.wrapping_add(1);
+            }
+            store_b.sync_all().unwrap();
+        }
+        let after_b = store_b.stats();
+        assert_eq!(
+            after_b.delta_invalidations - before_b.delta_invalidations,
+            1,
+            "only the collection's own creation invalidates; syncs and puts do not"
+        );
+        assert_eq!(
+            after_b.checkpoint_writes - before_b.checkpoint_writes,
+            1,
+            "one rewrite re-bases the log, then it is continuable"
+        );
+        assert_eq!(
+            after_b.delta_appends - before_b.delta_appends,
+            u64::from(ROUNDS - 1),
+            "every barrier after the re-base appends the delta"
+        );
+
+        // Arm C: force that same collection past the index's 75%-load grow
+        // threshold with a batch (`put_many` is the path that sizes and grows
+        // an index; the single-record `put` grow path is not what
+        // `index_grow_count` tracks). The grow invalidates, so the next
+        // barrier rewrites again.
+        let before_c = store_b.stats();
+        let entries: Vec<(NodeId, NodeData)> = (next..80u8)
+            .map(|i| {
+                (
+                    distinct_id(i),
+                    NodeData::new(bytes::Bytes::from(format!("node {i}"))),
+                )
+            })
+            .collect();
+        store_b.put_many(&TEST_COLLECTION, &entries).unwrap();
+        store_b.sync_all().unwrap();
+        let after_c = store_b.stats();
+        let grows = after_c.index_grow_count - before_c.index_grow_count;
+        assert!(
+            grows >= 1,
+            "crossing the load threshold must grow the index"
+        );
+        assert!(
+            after_c.delta_invalidations - before_c.delta_invalidations >= grows,
+            "each grow invalidates the pending log"
+        );
+        assert_eq!(
+            after_c.delta_appends - before_c.delta_appends,
+            0,
+            "a growing collection cannot continue the log"
+        );
+        assert_eq!(
+            after_c.checkpoint_writes - before_c.checkpoint_writes,
+            1,
+            "the barrier after the grow rewrites the checkpoint"
+        );
+    }
+
+    /// Demonstrates the write-neutral stopgap: with a rewrite budget set, a
+    /// room-churn barrier sequence that would otherwise rewrite the whole
+    /// checkpoint on every sync instead rewrites once and defers the rest.
+    /// Data still survives a reopen (via rescan), because packfiles remain
+    /// authoritative and are synced before the deferred index persist.
+    #[test]
+    fn checkpoint_rewrite_budget_defers_invalidated_rewrites() {
+        const ROUNDS: u8 = 5;
+        let dir = test_dir("checkpoint_rewrite_budget");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        // Once a rewrite has run, defer the next for an hour; no size budget.
+        store.set_checkpoint_rewrite_budget(Duration::from_secs(3600), 0);
+        let before = store.stats();
+        let mut written: Vec<([u8; 16], [u8; 16], Vec<u8>)> = Vec::new();
+        for round in 0..ROUNDS {
+            let mut cid = [0u8; 16];
+            cid[0] = 0xB0;
+            cid[1] = round;
+            for i in 0..3u8 {
+                let id = distinct_id(i);
+                let value = format!("budget round {round} node {i}").into_bytes();
+                store
+                    .put(&cid, &id, &NodeData::new(bytes::Bytes::from(value.clone())))
+                    .unwrap();
+                written.push((cid, id, value));
+            }
+            store.sync_all().unwrap();
+        }
+        let after = store.stats();
+        let checkpoints = after.checkpoint_writes - before.checkpoint_writes;
+        let skips = after.checkpoint_skips - before.checkpoint_skips;
+        eprintln!(
+            "rewrite-budget impact over {ROUNDS} barriers: checkpoint_writes={checkpoints} \
+             checkpoint_skips={skips} delta_appends={}",
+            after.delta_appends - before.delta_appends
+        );
+        assert_eq!(
+            checkpoints, 1,
+            "one baseline rewrite, then the budget defers"
+        );
+        assert_eq!(
+            skips,
+            u64::from(ROUNDS - 1),
+            "every later invalidated barrier defers instead of rewriting"
+        );
+        drop(store);
+
+        // The deferred checkpoints cost only acceleration: a reopen rescans the
+        // authoritative packfiles and recovers every record.
+        let reopened = PackfileStorage::open(dir).unwrap();
+        assert_eq!(
+            reopened
+                .open_timings()
+                .expect("open must record timings")
+                .path,
+            OpenPath::FullScan,
+            "the stale checkpoint must be rejected, not trusted"
+        );
+        for (cid, id, expected) in &written {
+            let got = reopened
+                .get(cid, id)
+                .unwrap()
+                .expect("record survives the rescan");
+            assert_eq!(got.bytes.as_ref(), expected.as_slice());
         }
     }
 
