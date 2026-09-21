@@ -112,6 +112,13 @@ pub struct Shard {
     pub(crate) mmap: RwLock<Option<Arc<Mmap>>>,
     /// Serializes appends to this shard.
     pub(crate) append_lock: parking_lot::Mutex<()>,
+    /// Serializes fsyncs of this shard across concurrent `sync_dirty`/
+    /// `sync_all` callers. A second caller waits here for an in-flight
+    /// fsync, then finds the dirty bit already cleared and skips its own —
+    /// so N concurrent sync callers for one shard still cost one physical
+    /// fsync, without any of them holding the pool-wide `dirty` lock across
+    /// the fsync. Distinct from `append_lock`, which serializes writes.
+    pub(crate) sync_lock: parking_lot::Mutex<()>,
     /// Whether this shard is still in active use. Set to `false` when
     /// retired by the pool (all records reclaimed by repack). Drop
     /// deletes the file only when retired.
@@ -335,6 +342,7 @@ impl Shard {
             path,
             mmap: RwLock::new(None),
             append_lock: parking_lot::Mutex::new(()),
+            sync_lock: parking_lot::Mutex::new(()),
             is_current: AtomicBool::new(true),
             file_len: AtomicU64::new(file_len),
             pending: Mutex::new(Vec::new()),
@@ -2580,6 +2588,39 @@ impl ShardPool {
         self.stats_snapshots.load(Ordering::Relaxed)
     }
 
+    /// Claim this shard's dirty bit, returning whether it was set. The
+    /// pool-wide `dirty` lock is held only for the check-and-remove, never
+    /// across an fsync, so concurrent sync callers don't serialize on it.
+    /// The wait is folded into `dirty_lock_wait`.
+    fn take_dirty(&self, id: u16) -> bool {
+        let lock_wait = Instant::now();
+        let mut dirty = self.dirty.lock();
+        self.dirty_lock_wait.fetch_add(
+            u64::try_from(lock_wait.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        dirty.remove(&id)
+    }
+
+    /// Re-mark a shard dirty after a failed fsync so the next sync retries
+    /// it. Callers hold the shard's `sync_lock`, so no concurrent syncer can
+    /// observe the transiently-clean state.
+    fn restore_dirty(&self, id: u16) {
+        self.dirty.lock().insert(id);
+    }
+
+    /// Snapshot the ids currently marked dirty without holding the lock
+    /// across any fsync.
+    fn dirty_snapshot(&self) -> Vec<u16> {
+        let lock_wait = Instant::now();
+        let dirty = self.dirty.lock();
+        self.dirty_lock_wait.fetch_add(
+            u64::try_from(lock_wait.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        dirty.iter().copied().collect()
+    }
+
     /// Sync all shards to disk.
     ///
     /// Commits any buffered frames first, so fsync covers everything a
@@ -2592,30 +2633,23 @@ impl ShardPool {
         self.flush_all()?;
         let flush_elapsed = flush_started.elapsed();
         let fsync_started = Instant::now();
-        let had_dirty;
-        {
-            let shards = self.shards.read();
-            let lock_wait = Instant::now();
-            let mut dirty_set = self.dirty.lock();
-            self.dirty_lock_wait.fetch_add(
-                u64::try_from(lock_wait.elapsed().as_micros()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            // Snapshot the shards with unsynced data and fsync the whole pool
-            // (not just those) — `sync_all` commits everything. Only the ids
-            // captured here are cleared afterwards, mirroring `sync_dirty`: a
-            // concurrent flush that lands between snapshot and fsync stays
-            // marked dirty so the next sync catches it, rather than being
-            // clobbered by this pass.
-            let dirty: Vec<u16> = dirty_set.iter().copied().collect();
-            had_dirty = !dirty.is_empty();
-            for shard in shards.iter().flatten() {
-                shard.file.sync_all()?;
-                shard.sync_count.fetch_add(1, Ordering::Relaxed);
+        let mut had_dirty = false;
+        for (id, shard) in self.all_shards() {
+            // Full-pool sync fsyncs every shard unconditionally (that is its
+            // contract), so unlike `sync_dirty` it can't skip a clean shard —
+            // but the per-shard lock still serializes it against a concurrent
+            // `sync_dirty` fsyncing the same file, and the dirty bit is
+            // claimed before the fsync rather than under the pool lock
+            // across it.
+            let _sync_guard = shard.sync_lock.lock();
+            if self.take_dirty(id) {
+                had_dirty = true;
             }
-            for &id in &dirty {
-                dirty_set.remove(&id);
+            if let Err(error) = shard.file.sync_all() {
+                self.restore_dirty(id);
+                return Err(error);
             }
+            shard.sync_count.fetch_add(1, Ordering::Relaxed);
         }
         let fsync_elapsed = fsync_started.elapsed();
         *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
@@ -2648,9 +2682,15 @@ impl ShardPool {
 
     /// Sync only shards written to since the last sync.
     ///
-    /// Each shard's dirty bit is cleared only after a successful fsync,
-    /// so a partial failure leaves the untried shards marked dirty for
-    /// the next call.
+    /// Each shard's dirty bit is claimed before its fsync and restored if the
+    /// fsync fails, so a partial failure leaves the untried shards marked
+    /// dirty for the next call.
+    ///
+    /// Concurrent callers coalesce per shard: the first to claim a shard's
+    /// dirty bit fsyncs it; any other caller wanting the same shard waits on
+    /// that shard's `sync_lock`, then finds the bit already cleared and skips
+    /// its own fsync. The pool-wide `dirty` lock is never held across an
+    /// fsync.
     ///
     /// Commits any buffered frames first, so the fsync covers everything a
     /// caller believes it has put.
@@ -2662,28 +2702,29 @@ impl ShardPool {
         self.flush_all()?;
         let flush_elapsed = flush_started.elapsed();
         let fsync_started = Instant::now();
-        let had_dirty;
-        {
-            let shards = self.shards.read();
-            let lock_wait = Instant::now();
-            let mut dirty_set = self.dirty.lock();
-            self.dirty_lock_wait.fetch_add(
-                u64::try_from(lock_wait.elapsed().as_micros()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            let dirty: Vec<u16> = dirty_set.iter().copied().collect();
-            had_dirty = !dirty.is_empty();
-            for &id in &dirty {
-                if let Some(shard) = shards.get(id as usize).and_then(|s| s.as_ref()) {
-                    shard.file.sync_all()?;
-                    shard.sync_count.fetch_add(1, Ordering::Relaxed);
-                    dirty_set.remove(&id);
-                }
+        let mut synced_any = false;
+        for id in self.dirty_snapshot() {
+            let Some(shard) = self.get_shard(id) else {
+                // Slot was retired between snapshot and lookup; leave any
+                // remaining dirty bit for the next pass to resolve.
+                continue;
+            };
+            let _sync_guard = shard.sync_lock.lock();
+            if !self.take_dirty(id) {
+                // A concurrent syncer we just waited for already fsynced
+                // this shard — nothing left to do.
+                continue;
             }
+            if let Err(error) = shard.file.sync_all() {
+                self.restore_dirty(id);
+                return Err(error);
+            }
+            shard.sync_count.fetch_add(1, Ordering::Relaxed);
+            synced_any = true;
         }
         let fsync_elapsed = fsync_started.elapsed();
         *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
-        if had_dirty {
+        if synced_any {
             self.persist_stats_best_effort();
         }
         Ok(())
@@ -2922,10 +2963,10 @@ mod tests {
         pool.sync_dirty().unwrap();
         // A single-threaded sync still acquires the lock (uncontended), so
         // this only asserts the counter is wired up and monotonic, not that
-        // it measures anything close to real contention -- that's the whole
-        // point of adding it before building a fancier coalescing
-        // mechanism: this call answers "is it wired up," a real concurrent
-        // workload answers "does it matter."
+        // it measures anything close to real contention. Since the per-shard
+        // sync coalescing landed, the pool-wide lock is only held for the
+        // brief dirty-bit check/claim, so real contention shows up here only
+        // if many syncers collide on that short critical section.
         let after_one_sync = pool.dirty_lock_wait();
 
         pool.put_record(&test_record(0x01, 0xAB, b"world")).unwrap();
@@ -2933,6 +2974,42 @@ mod tests {
         assert!(
             pool.dirty_lock_wait() >= after_one_sync,
             "dirty_lock_wait must never decrease"
+        );
+    }
+
+    /// N concurrent `sync_dirty` callers for the same shard must coalesce
+    /// into one physical fsync: the first to claim the dirty bit fsyncs, the
+    /// rest wait on the shard's `sync_lock` for that fsync, then find the bit
+    /// already cleared and skip theirs.
+    #[test]
+    fn concurrent_sync_dirty_coalesces_to_a_single_fsync() {
+        use std::thread;
+
+        let dir = test_dir("concurrent_sync_dirty_coalesce");
+        let pool = Arc::new(ShardPool::open(dir).unwrap());
+        let record = test_record(0x01, 0xAA, b"coalesce me");
+        let (slot, _offset) = pool.put_record(&record).unwrap();
+        let shard = pool.get_shard(slot).unwrap();
+        assert_eq!(shard.stats().sync_count, 0);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                thread::spawn(move || pool.sync_dirty())
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        assert_eq!(
+            shard.stats().sync_count,
+            1,
+            "8 concurrent sync_dirty callers must coalesce into one fsync"
+        );
+        assert!(
+            pool.dirty.lock().is_empty(),
+            "sync_dirty must clear the dirty bit it claimed"
         );
     }
 
