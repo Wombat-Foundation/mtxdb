@@ -197,6 +197,101 @@ impl Default for SyncTimings {
     }
 }
 
+/// Store-internal lifetime accumulator of per-phase sync wall time.
+///
+/// Each field is a running total in nanoseconds, added once per
+/// `sync()`/`sync_all` call in `count_sync_persistence`. This is the
+/// cumulative counterpart to the most-recent-only [`SyncTimings`] retained in
+/// `last_sync_timings`: without it, a run's scatter-vs-rewrite split can only
+/// be read off one (possibly atypical) barrier. [`Self::snapshot`] converts the
+/// atomics to a plain [`SyncTotalsSnapshot`] for [`RuntimeStats`].
+#[derive(Default)]
+struct SyncTotals {
+    /// Every sync that ran these accumulations (dirty or not).
+    calls: AtomicU64,
+    /// Sum of [`SyncTimings::total`].
+    total_ns: AtomicU64,
+    /// Sum of [`SyncTimings::pack_flush`].
+    pack_flush_ns: AtomicU64,
+    /// Sum of [`SyncTimings::pack_fsync`].
+    pack_fsync_ns: AtomicU64,
+    /// Sum of [`SyncTimings::sidecar`].
+    sidecar_ns: AtomicU64,
+    /// Sum of [`SyncTimings::delta_log`].
+    delta_log_ns: AtomicU64,
+    /// Sum of [`SyncTimings::checkpoint`].
+    checkpoint_ns: AtomicU64,
+}
+
+impl SyncTotals {
+    fn add_duration(counter: &AtomicU64, duration: std::time::Duration) {
+        counter.fetch_add(
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Fold one barrier's phase breakdown into the lifetime totals.
+    fn accumulate(&self, timings: &SyncTimings) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Self::add_duration(&self.total_ns, timings.total);
+        Self::add_duration(&self.pack_flush_ns, timings.pack_flush);
+        Self::add_duration(&self.pack_fsync_ns, timings.pack_fsync);
+        Self::add_duration(&self.sidecar_ns, timings.sidecar);
+        Self::add_duration(&self.delta_log_ns, timings.delta_log);
+        Self::add_duration(&self.checkpoint_ns, timings.checkpoint);
+    }
+
+    fn snapshot(&self) -> SyncTotalsSnapshot {
+        let duration =
+            |counter: &AtomicU64| std::time::Duration::from_nanos(counter.load(Ordering::Relaxed));
+        SyncTotalsSnapshot {
+            calls: self.calls.load(Ordering::Relaxed),
+            total: duration(&self.total_ns),
+            pack_flush: duration(&self.pack_flush_ns),
+            pack_fsync: duration(&self.pack_fsync_ns),
+            sidecar: duration(&self.sidecar_ns),
+            delta_log: duration(&self.delta_log_ns),
+            checkpoint: duration(&self.checkpoint_ns),
+        }
+    }
+
+    fn reset(&self) {
+        for counter in [
+            &self.calls,
+            &self.total_ns,
+            &self.pack_flush_ns,
+            &self.pack_fsync_ns,
+            &self.sidecar_ns,
+            &self.delta_log_ns,
+            &self.checkpoint_ns,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Plain, copyable lifetime totals of per-phase sync wall time — the cumulative
+/// counterpart to [`SyncTimings`]. `calls` counts every sync that accumulated,
+/// so phase averages are `phase / calls` and shares are `phase / total`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncTotalsSnapshot {
+    /// Number of syncs folded into these totals.
+    pub calls: u64,
+    /// Cumulative [`SyncTimings::total`].
+    pub total: std::time::Duration,
+    /// Cumulative [`SyncTimings::pack_flush`].
+    pub pack_flush: std::time::Duration,
+    /// Cumulative [`SyncTimings::pack_fsync`].
+    pub pack_fsync: std::time::Duration,
+    /// Cumulative [`SyncTimings::sidecar`].
+    pub sidecar: std::time::Duration,
+    /// Cumulative [`SyncTimings::delta_log`].
+    pub delta_log: std::time::Duration,
+    /// Cumulative [`SyncTimings::checkpoint`].
+    pub checkpoint: std::time::Duration,
+}
+
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
 ///
 /// Without a cap, a walk whose `stop_at` set is never reached (e.g. the
@@ -581,6 +676,11 @@ pub struct PackfileStorage {
     last_open_timings: parking_lot::Mutex<Option<OpenTimings>>,
     /// Wall-clock breakdown of the most recent `sync_all`, by phase.
     last_sync_timings: parking_lot::Mutex<Option<SyncTimings>>,
+    /// Lifetime per-phase sync totals, accumulated once per sync in
+    /// `count_sync_persistence`, so the scatter-vs-rewrite split can be read
+    /// across a whole run instead of only the most recent barrier (which
+    /// `last_sync_timings` alone cannot answer).
+    sync_totals: SyncTotals,
     /// Gates the logical read-path counters (`get`/`get_many` below). Off by
     /// default so a store doing no reads-of-record pays one relaxed load per
     /// logical read at most, and the write/batch/sync counters are the only
@@ -1361,6 +1461,7 @@ impl PackfileStorage {
             index_checkpoint_dirty: AtomicBool::new(false),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
+            sync_totals: SyncTotals::default(),
             stats_enabled: AtomicBool::new(false),
             open_count: AtomicU64::new(1),
             get_calls: AtomicU64::new(0),
@@ -5340,9 +5441,12 @@ impl PackfileStorage {
     /// Batch-granular sync accounting: every sync counts once, and the
     /// checkpoint-vs-delta discriminator comes from which phase
     /// `persist_index_checkpoint_or_delta` actually ran (a non-dirty sync runs
-    /// neither). `sync` (dirty-scoped) and `sync_all` both funnel through here.
+    /// neither). `sync` (dirty-scoped) and `sync_all` both funnel through here,
+    /// so this is also the single point that folds each barrier's phase
+    /// breakdown into the lifetime `sync_totals`.
     fn count_sync_persistence(&self, timings: &SyncTimings) {
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
+        self.sync_totals.accumulate(timings);
         if !timings.checkpoint.is_zero() {
             self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
         } else if !timings.delta_log.is_zero() {
@@ -5641,6 +5745,7 @@ impl PackfileStorage {
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
             last_open_timings: self.open_timings(),
             last_sync_timings: self.sync_timings(),
+            sync_totals: self.sync_totals.snapshot(),
             repack: self.repack_stats(),
             cache,
             shards: self.shard_stats(),
@@ -5659,7 +5764,8 @@ impl PackfileStorage {
     /// "lie about the database."
     ///
     /// Also clears the retained `last_open_timings`/`last_sync_timings`
-    /// breakdowns and leaves the `stats_enabled` flag untouched.
+    /// breakdowns and the lifetime `sync_totals` accumulator, and leaves the
+    /// `stats_enabled` flag untouched.
     pub fn reset_stats(&self) {
         for counter in [
             &self.get_calls,
@@ -5699,6 +5805,7 @@ impl PackfileStorage {
         }
         *self.last_open_timings.lock() = None;
         *self.last_sync_timings.lock() = None;
+        self.sync_totals.reset();
     }
 
     /// Number of times a specific collection has been repacked. 0 if it has
@@ -5835,6 +5942,10 @@ pub struct RuntimeStats {
     pub last_open_timings: Option<OpenTimings>,
     /// Per-phase breakdown of the most recent sync.
     pub last_sync_timings: Option<SyncTimings>,
+    /// Lifetime per-phase sync totals — the cumulative counterpart to
+    /// `last_sync_timings`, and the only view that can answer a run-wide
+    /// scatter-vs-rewrite split (the most-recent breakdown is one barrier).
+    pub sync_totals: SyncTotalsSnapshot,
     /// Cumulative repack activity (persisted across opens).
     pub repack: RepackStats,
     /// Aggregate decoded-node cache hit/miss across loaded collections.
@@ -5902,6 +6013,7 @@ impl Default for RuntimeStats {
             sync_calls: 0,
             last_open_timings: None,
             last_sync_timings: None,
+            sync_totals: SyncTotalsSnapshot::default(),
             repack: RepackStats::default(),
             cache: CacheStats::default(),
             shards: Vec::new(),
