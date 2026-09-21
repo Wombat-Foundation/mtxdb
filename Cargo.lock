@@ -436,7 +436,15 @@ dependencies = [
 name = "mtxdb"
 version = "0.1.0-beta.1"
 dependencies = [
- "mtxdb-core",
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "getrandom",
+ "memmap2",
+ "parking_lot",
+ "sha2",
+ "zstd",
+ "zstd-sys",
 ]
 
 [[package]]
@@ -451,25 +459,10 @@ dependencies = [
  "clap",
  "clap_complete",
  "hex",
- "mtxdb-core",
+ "mtxdb",
  "rezzy",
  "sha2",
  "simd-json",
-]
-
-[[package]]
-name = "mtxdb-core"
-version = "0.1.0-beta.1"
-dependencies = [
- "arc-swap",
- "bytes",
- "crc32fast",
- "getrandom",
- "memmap2",
- "parking_lot",
- "sha2",
- "zstd",
- "zstd-sys",
 ]
 
 [[package]]

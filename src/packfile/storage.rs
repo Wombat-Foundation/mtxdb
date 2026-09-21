@@ -2613,7 +2613,7 @@ impl PackfileStorage {
     /// Repacking is entirely caller-driven — nothing in this engine polls
     /// this on its own. A background GC worker is expected to call this
     /// periodically and issue `repack_collection_reachable` itself; nothing in
-    /// `mtxdb-core` currently does so.
+    /// `mtxdb` currently does so.
     #[must_use]
     pub fn needs_repack(&self, collection_id: &[u8; 16]) -> bool {
         let count = self
@@ -7066,8 +7066,8 @@ impl PackfileStorage {
     /// benchmark that syncs explicitly — `Buffered` usually wins:
     ///
     /// ```
-    /// use mtxdb_core::shard::AppendPolicy;
-    /// use mtxdb_core::PackfileStorage;
+    /// use mtxdb::shard::AppendPolicy;
+    /// use mtxdb::PackfileStorage;
     /// # let dir = std::env::temp_dir().join("mtxdb-doc-with-append-policy");
     /// let store = PackfileStorage::open(dir.clone())
     ///     .unwrap()

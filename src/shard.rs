@@ -253,7 +253,7 @@ struct PoolMeta {
 }
 
 /// Filename for the one-time store-creation marker: records which
-/// `mtxdb-core` version created this store. Written once, when the very
+/// `mtxdb` version created this store. Written once, when the very
 /// first shard is created, and never rewritten — unlike `pool.meta`, it
 /// has no in-place-updated field, so it needs no version-preservation
 /// dance across later opens.
@@ -262,7 +262,7 @@ const STORE_META_FILENAME: &str = "store.meta";
 /// Store metadata format version.
 const STORE_META_VERSION: u8 = 1;
 
-/// Write the one-time store-creation marker, recording the `mtxdb-core`
+/// Write the one-time store-creation marker, recording the `mtxdb`
 /// version (`CARGO_PKG_VERSION`) that created this store. Best-effort: a
 /// failure here doesn't fail store creation, since this is diagnostic
 /// metadata, not data the engine depends on to operate correctly.
@@ -291,7 +291,7 @@ fn persist_store_meta(base_dir: &Path) {
     }
 }
 
-/// Read back the `mtxdb-core` version that created this store, if the
+/// Read back the `mtxdb` version that created this store, if the
 /// store was created by a build new enough to record it (`store.meta`
 /// predates this feature, so an older store — or one with an unreadable
 /// or corrupt marker — returns `None` rather than erroring: this is

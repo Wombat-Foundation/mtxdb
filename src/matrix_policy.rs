@@ -1,8 +1,8 @@
 //! Matrix-specific room-version policy used by the Matrix import adapter.
 //!
-//! This is deliberately outside `mtxdb-core`: packs and collection templates
-//! are protocol-neutral, while redaction, authorization, and room-version
-//! rules are Matrix wire semantics.
+//! This is deliberately separate from the protocol-neutral storage engine:
+//! packs and collection templates carry no Matrix semantics, while redaction,
+//! authorization, and room-version rules are Matrix wire semantics.
 //!
 //! The current archive importer does not yet evaluate every policy below. They
 //! remain together here because a Matrix adapter must use one coherent,

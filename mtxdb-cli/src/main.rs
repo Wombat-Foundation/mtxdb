@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
-use mtxdb_core::ShardType;
+use mtxdb::ShardType;
 
 pub(crate) struct Cli {
     pub(crate) dir: Option<PathBuf>,

@@ -36,9 +36,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use mtxdb_core::packfile::scan_packfile_iter;
-use mtxdb_core::storage::{NodeData, StorageEngine};
-use mtxdb_core::{DatabaseLayout, PackfileStorage, ShardPool, ShardType};
+use mtxdb::packfile::scan_packfile_iter;
+use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::{DatabaseLayout, PackfileStorage, ShardPool, ShardType};
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);

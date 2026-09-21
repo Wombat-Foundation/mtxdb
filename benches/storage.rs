@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use mtxdb_core::storage::{NodeData, NodeId, NodeRef, StorageEngine};
-use mtxdb_core::PackfileStorage;
+use mtxdb::storage::{NodeData, NodeId, NodeRef, StorageEngine};
+use mtxdb::PackfileStorage;
 
 const ROOM: [u8; 16] = [0xAB; 16];
 
@@ -1639,8 +1639,8 @@ fn run_read_committed_reload_benchmark(
     read_ops: usize,
     force: bool,
 ) {
-    use mtxdb_core::journal::Journal;
-    use mtxdb_core::storage::StorageError;
+    use mtxdb::journal::Journal;
+    use mtxdb::storage::StorageError;
 
     let dir = bench_root().join(format!(
         "mtxdb_bench_read_committed_reload_{seed_collections}x{seed_records}"

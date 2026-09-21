@@ -768,7 +768,7 @@ impl LossyIndex {
     ///
     /// `min_capacity` is the caller's own actual starting floor (`Self::new`
     /// always rounds up to at least 16, but a caller that always creates
-    /// indexes above that — e.g. `mtxdb-core`'s collections, which start at
+    /// indexes above that — e.g. `mtxdb`'s collections, which start at
     /// `NEW_COLLECTION_INDEX_FLOOR` — must pass its own floor here, or this
     /// underestimates a small collection's real capacity).
     ///

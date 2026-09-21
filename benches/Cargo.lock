@@ -544,19 +544,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "mtxdb-benches"
-version = "0.1.0-beta.1"
-dependencies = [
- "bytes",
- "crc32fast",
- "fjall",
- "libmdbx",
- "mtxdb-core",
- "rusqlite",
-]
-
-[[package]]
-name = "mtxdb-core"
+name = "mtxdb"
 version = "0.1.0-beta.1"
 dependencies = [
  "arc-swap",
@@ -568,6 +556,18 @@ dependencies = [
  "sha2",
  "zstd",
  "zstd-sys",
+]
+
+[[package]]
+name = "mtxdb-benches"
+version = "0.1.0-beta.1"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "fjall",
+ "libmdbx",
+ "mtxdb",
+ "rusqlite",
 ]
 
 [[package]]

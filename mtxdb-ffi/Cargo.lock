@@ -150,7 +150,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mtxdb-core"
+name = "mtxdb"
 version = "0.1.0-beta.1"
 dependencies = [
  "arc-swap",
@@ -169,7 +169,7 @@ name = "mtxdb-ffi"
 version = "0.1.0-beta.1"
 dependencies = [
  "bytes",
- "mtxdb-core",
+ "mtxdb",
 ]
 
 [[package]]

@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 use wasm_bindgen::prelude::*;
 
-use mtxdb_core::storage::{NodeData, StorageEngine};
-use mtxdb_core::PackfileStorage;
+use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::PackfileStorage;
 
 /// JavaScript-accessible handle to a mtxdb storage instance.
 #[wasm_bindgen]
@@ -32,12 +32,12 @@ impl MdbStorage {
         // Validate the pool name up front so an unsupported value fails
         // without creating the database descriptor or any pool directories.
         let shard_type = match pool.as_deref() {
-            None | Some("event-dag") => mtxdb_core::ShardType::EventDag,
-            Some("state") => mtxdb_core::ShardType::State,
-            Some("auth-chain") => mtxdb_core::ShardType::AuthChain,
+            None | Some("event-dag") => mtxdb::ShardType::EventDag,
+            Some("state") => mtxdb::ShardType::State,
+            Some("auth-chain") => mtxdb::ShardType::AuthChain,
             Some(pool) => return Err(JsValue::from_str(&format!("unsupported pool: {pool}"))),
         };
-        let layout = mtxdb_core::DatabaseLayout::open(PathBuf::from(path))
+        let layout = mtxdb::DatabaseLayout::open(PathBuf::from(path))
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let pool_dir = layout.pool_dir(shard_type)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;

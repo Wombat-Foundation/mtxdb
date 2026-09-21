@@ -41,8 +41,8 @@ use std::borrow::Cow;
 use std::fs;
 use std::time::Instant;
 
-use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb_core::PackfileStorage;
+use mtxdb::storage::{NodeData, NodeId, StorageEngine};
+use mtxdb::PackfileStorage;
 
 // ── Shared deterministic RNG + dataset builders ──────────────────────
 
@@ -242,15 +242,15 @@ fn collection_for(node: usize) -> [u8; 16] {
     collection
 }
 
-fn checksum_policy_from_env() -> mtxdb_core::packfile::ChecksumPolicy {
+fn checksum_policy_from_env() -> mtxdb::packfile::ChecksumPolicy {
     // MTXDB_BENCH_CHECKSUM=writeonly|disabled lowers the per-frame checksum
     // policy from the default Full (see ChecksumPolicy): writeonly still
     // writes real CRCs but skips the hashing pass on point-lookup reads,
     // disabled also stops computing them on writes.
     match std::env::var("MTXDB_BENCH_CHECKSUM").as_deref() {
-        Ok("writeonly") => mtxdb_core::packfile::ChecksumPolicy::WriteOnly,
-        Ok("disabled") => mtxdb_core::packfile::ChecksumPolicy::Disabled,
-        _ => mtxdb_core::packfile::ChecksumPolicy::Full,
+        Ok("writeonly") => mtxdb::packfile::ChecksumPolicy::WriteOnly,
+        Ok("disabled") => mtxdb::packfile::ChecksumPolicy::Disabled,
+        _ => mtxdb::packfile::ChecksumPolicy::Full,
     }
 }
 
@@ -276,7 +276,7 @@ fn mtxdb_open(dir: &std::path::Path) -> PackfileStorage {
     // This bench syncs explicitly (sync_all after build, sync after append),
     // so it opts into the buffered append policy: frames accumulate for one
     // positioned write per ~1 MiB instead of one per record.
-    let policy = mtxdb_core::shard::AppendPolicy::buffered();
+    let policy = mtxdb::shard::AppendPolicy::buffered();
     PackfileStorage::open_with_cache_and_policies(
         dir.to_path_buf(),
         cache_capacity,
@@ -1596,9 +1596,9 @@ fn run_backend(backend: Backend, target_gb: f64) {
     // equivalent knob, so they keep their plain name.
     let engine_label = match backend {
         Backend::Mtxdb => match checksum_policy_from_env() {
-            mtxdb_core::packfile::ChecksumPolicy::Full => "mtxdb_full",
-            mtxdb_core::packfile::ChecksumPolicy::WriteOnly => "mtxdb_writeonly",
-            mtxdb_core::packfile::ChecksumPolicy::Disabled => "mtxdb_none",
+            mtxdb::packfile::ChecksumPolicy::Full => "mtxdb_full",
+            mtxdb::packfile::ChecksumPolicy::WriteOnly => "mtxdb_writeonly",
+            mtxdb::packfile::ChecksumPolicy::Disabled => "mtxdb_none",
         },
         Backend::Mdbx | Backend::Sqlite | Backend::Fjall => backend.name(),
     };
@@ -1611,9 +1611,9 @@ fn run_backend(backend: Backend, target_gb: f64) {
     // this field is the one that actually distinguishes all three.
     let checksum_policy = match backend {
         Backend::Mtxdb => match checksum_policy_from_env() {
-            mtxdb_core::packfile::ChecksumPolicy::Full => "full",
-            mtxdb_core::packfile::ChecksumPolicy::WriteOnly => "writeonly",
-            mtxdb_core::packfile::ChecksumPolicy::Disabled => "none",
+            mtxdb::packfile::ChecksumPolicy::Full => "full",
+            mtxdb::packfile::ChecksumPolicy::WriteOnly => "writeonly",
+            mtxdb::packfile::ChecksumPolicy::Disabled => "none",
         },
         Backend::Mdbx | Backend::Sqlite | Backend::Fjall => "na",
     };

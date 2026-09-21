@@ -9,15 +9,15 @@ mod tests {
 
     use bytes::Bytes;
 
-    use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
-    use mtxdb_core::PackfileStorage;
+    use mtxdb::storage::{NodeData, NodeId, StorageEngine};
+    use mtxdb::PackfileStorage;
 
     /// Locate the current delta-log epoch file, if any. The on-disk name is
     /// now `index.delta.<hex fingerprint>` (see `PackfileStorage::delta_path`)
     /// rather than a fixed name, so tests that need to see the file directly
     /// have to search for it rather than joining a constant.
     fn current_delta_path(dir: &Path) -> Option<PathBuf> {
-        use mtxdb_core::index::delta::INDEX_DELTA_FILE;
+        use mtxdb::index::delta::INDEX_DELTA_FILE;
         let prefix = format!("{INDEX_DELTA_FILE}.");
         std::fs::read_dir(dir).ok()?.find_map(|entry| {
             let path = entry.ok()?.path();
@@ -27,10 +27,10 @@ mod tests {
     }
 
     fn assert_delete_then_recreate_in_log(
-        operations: &[mtxdb_core::index::delta::DeltaOperation],
+        operations: &[mtxdb::index::delta::DeltaOperation],
         collection: [u8; 16],
     ) {
-        use mtxdb_core::index::delta::DeltaOperation;
+        use mtxdb::index::delta::DeltaOperation;
         let tombstone = operations
             .iter()
             .position(|operation| {
@@ -116,7 +116,7 @@ mod tests {
     }
 
     fn checkpoint_path(dir: &Path) -> PathBuf {
-        dir.join(mtxdb_core::index::checkpoint::INDEX_CHECKPOINT_FILE)
+        dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE)
     }
 
     #[test]
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn open_and_sync_timings_are_recorded() {
-        use mtxdb_core::packfile::storage::OpenPath;
+        use mtxdb::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_open_timings_{}",
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn shard_directory_bookkeeping_gate_and_fallback() {
-        use mtxdb_core::packfile::storage::{BookkeepingSource, OpenPath};
+        use mtxdb::packfile::storage::{BookkeepingSource, OpenPath};
 
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_sidecar_{}",
@@ -424,7 +424,7 @@ mod tests {
     /// whose only index entry lived in the lost tail.
     #[test]
     fn torn_delta_log_falls_back_to_rescan() {
-        use mtxdb_core::packfile::storage::OpenPath;
+        use mtxdb::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_torn_delta_{}",
@@ -526,7 +526,7 @@ mod tests {
         // convenience path, this test would start validating drop's flush
         // instead of crash semantics -- it should fail loudly, not silently
         // pass, so keep the drop path here honest.
-        let store = store.with_append_policy(mtxdb_core::shard::AppendPolicy::buffered());
+        let store = store.with_append_policy(mtxdb::shard::AppendPolicy::buffered());
         let cid = collection_id(1);
         let ghost = node_id(1, 200);
         store
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn clean_sync_and_v3_replays_incremental_and_structural_changes() {
-        use mtxdb_core::packfile::storage::OpenPath;
+        use mtxdb::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_dirty_{}",
@@ -745,7 +745,7 @@ mod tests {
     /// advances to.
     #[test]
     fn each_dirty_sync_writes_the_sidecar_exactly_once() {
-        use mtxdb_core::packfile::storage::OpenPath;
+        use mtxdb::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_sidecar_once_{}",
@@ -835,8 +835,8 @@ mod tests {
     /// rejecting the whole log on the next open.
     #[test]
     fn reopened_session_continues_an_inherited_delta_log() {
-        use mtxdb_core::index::delta;
-        use mtxdb_core::packfile::storage::OpenPath;
+        use mtxdb::index::delta;
+        use mtxdb::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_delta_continue_{}",
@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn v3_collection_snapshots_and_tombstones_replay_across_reopen() {
-        use mtxdb_core::index::delta::{read_delta_log_v3, DeltaOperation};
+        use mtxdb::index::delta::{read_delta_log_v3, DeltaOperation};
 
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_v3_structural_{}",

@@ -21,9 +21,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use mtxdb_core::packfile::{self, storage::PackfileStorage};
-use mtxdb_core::shard::ShardPool;
-use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
+use mtxdb::packfile::{self, storage::PackfileStorage};
+use mtxdb::shard::ShardPool;
+use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 
 const MAX_DATA_LEN: usize = 65535 - 100;
 
@@ -305,7 +305,7 @@ fn format_bytes(bytes: u64) -> String {
 /// (e.g. hundreds, spread across many files) into one contiguous run in
 /// one file.
 ///
-/// Delegates to `mtxdb_core::packfile::layout::physical_layout` — the
+/// Delegates to `mtxdb::packfile::layout::physical_layout` — the
 /// same scan `mtxdb collections --layout`'s `runs` column uses — rather
 /// than reimplementing the scan here, so both stay backed by one
 /// canonical implementation instead of two that could silently drift.

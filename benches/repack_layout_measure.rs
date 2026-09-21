@@ -12,9 +12,9 @@
 
 use std::path::Path;
 
-use mtxdb_core::packfile::layout::physical_layout;
-use mtxdb_core::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb_core::PackfileStorage;
+use mtxdb::packfile::layout::physical_layout;
+use mtxdb::storage::{NodeData, NodeId, StorageEngine};
+use mtxdb::PackfileStorage;
 
 const COLLECTIONS: usize = 250;
 const ROUNDS: usize = 40;

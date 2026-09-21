@@ -9,13 +9,11 @@ use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use sha2::Sha256;
 
-use mtxdb_core::packfile::layout::{
-    avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout,
-};
-use mtxdb_core::packfile::storage::{OpenPath, RuntimeStats};
-use mtxdb_core::shard::ShardPool;
-use mtxdb_core::storage::{NodeData, StorageEngine};
-use mtxdb_core::{
+use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
+use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
+use mtxdb::shard::ShardPool;
+use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::{
     CollectionKeyRule, CollectionTemplate, DatabaseLayout, PackfileStorage, PayloadPolicy,
     RecordIdentityRule, ShardType,
 };
@@ -706,7 +704,7 @@ fn split_json_stream(bytes: &[u8]) -> Option<Vec<&[u8]>> {
 /// Decode Synapse's `event_json`-mirror record layout: a fixed 8-byte binary
 /// header (big-endian `i32` `format_version`, big-endian `u32` length of
 /// `internal_metadata`) followed by the `internal_metadata` JSON string and
-/// then the PDU JSON string, with no delimiter between the two. mtxdb-core
+/// then the PDU JSON string, with no delimiter between the two. mtxdb
 /// stores this as an opaque blob — it has no concept of the layout — so a
 /// plain JSON parse of the whole value fails; this recognizes that specific
 /// shape instead of leaving it as a "(non-JSON)" dead end.
@@ -1288,7 +1286,7 @@ fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
         }
         let file = fs::File::open(&path)
             .with_context(|| format!("failed to open shard `{}`", path.display()))?;
-        mtxdb_core::packfile::read_header(&mut BufReader::new(file))
+        mtxdb::packfile::read_header(&mut BufReader::new(file))
             .with_context(|| format!("unsupported or corrupt shard `{}`", path.display()))?;
     }
     Ok(())
@@ -1331,7 +1329,7 @@ fn interleaving_worth_noting(collections: u64, excess_runs: u64) -> bool {
 /// the note that repack is never automatic.
 fn print_pack_physical_layout(
     shard_entries: &[(u64, u64, u8)],
-    physical: &mtxdb_core::packfile::layout::PhysicalLayout,
+    physical: &mtxdb::packfile::layout::PhysicalLayout,
 ) {
     // Aggregate only over the packs listed in `shard_entries`: the caller
     // passes every pack for `mtxdb shards --layout` (pool-wide totals) but a
@@ -1408,7 +1406,7 @@ fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow:
 /// on-disk + cold-open view.
 fn read_stats_for_dir(
     dir: &Path,
-) -> anyhow::Result<(RuntimeStats, Vec<mtxdb_core::shard::ShardSummary>)> {
+) -> anyhow::Result<(RuntimeStats, Vec<mtxdb::shard::ShardSummary>)> {
     if glob_pack_files(dir)?.is_empty() {
         Ok((RuntimeStats::default(), Vec::new()))
     } else {
@@ -1477,15 +1475,11 @@ fn open_path_label(path: OpenPath) -> &'static str {
 }
 
 #[allow(clippy::too_many_lines)]
-fn print_stats_table(
-    dir: &Path,
-    stats: &RuntimeStats,
-    summaries: &[mtxdb_core::shard::ShardSummary],
-) {
+fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard::ShardSummary]) {
     println!("mtxdb stats: {}", dir.display());
     println!(
-        "  created by     mtxdb-core {}",
-        mtxdb_core::shard::store_created_by_version(dir)
+        "  created by     mtxdb {}",
+        mtxdb::shard::store_created_by_version(dir)
             .as_deref()
             .unwrap_or("unknown (created before version tracking, or marker unreadable)")
     );
@@ -1599,7 +1593,7 @@ fn print_stats_table(
 fn stats_json_object(
     dir: &Path,
     stats: &RuntimeStats,
-    summaries: &[mtxdb_core::shard::ShardSummary],
+    summaries: &[mtxdb::shard::ShardSummary],
 ) -> String {
     let open_path = stats
         .last_open_timings
@@ -1711,11 +1705,11 @@ fn stats_json_object(
     }
     shards.push_str("  ]");
 
-    let created_by = mtxdb_core::shard::store_created_by_version(dir)
-        .map_or("null".to_owned(), |v| json_string(&v));
+    let created_by =
+        mtxdb::shard::store_created_by_version(dir).map_or("null".to_owned(), |v| json_string(&v));
     let top = vec![
         ("dir", json_string(&dir.to_string_lossy())),
-        ("created_by_mtxdb_core_version", created_by),
+        ("created_by_mtxdb_version", created_by),
         ("open_path", open_path),
         ("open_count", stats.open_count.to_string()),
         ("collections", stats.collection_count.to_string()),
@@ -1727,11 +1721,7 @@ fn stats_json_object(
     json_object(&top, "")
 }
 
-fn print_stats_json(
-    dir: &Path,
-    stats: &RuntimeStats,
-    summaries: &[mtxdb_core::shard::ShardSummary],
-) {
+fn print_stats_json(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard::ShardSummary]) {
     println!("{}", stats_json_object(dir, stats, summaries));
 }
 
@@ -1931,7 +1921,7 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
         }
         let file = fs::File::open(&path)
             .with_context(|| format!("failed to open pack `{}`", path.display()))?;
-        let header = mtxdb_core::packfile::read_header(&mut BufReader::new(file))
+        let header = mtxdb::packfile::read_header(&mut BufReader::new(file))
             .with_context(|| format!("unsupported or corrupt pack `{}`", path.display()))?
             .with_context(|| format!("invalid pack header `{}`", path.display()))?;
         if header.pack_id != pack_id {
@@ -1941,11 +1931,7 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
                 header.pack_id
             );
         }
-        packs.push((
-            pack_id,
-            entry.metadata()?.len(),
-            mtxdb_core::packfile::VERSION,
-        ));
+        packs.push((pack_id, entry.metadata()?.len(), mtxdb::packfile::VERSION));
     }
     packs.sort_unstable_by_key(|(pack_id, _, _)| *pack_id);
     Ok(packs)
@@ -2107,7 +2093,7 @@ fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
 /// same header `mtxdb shards` already validates when discovering packs.
 fn print_pack_lifetime(path: &Path) {
     let created_at = fs::File::open(path).ok().and_then(|file| {
-        mtxdb_core::packfile::read_header(&mut BufReader::new(file))
+        mtxdb::packfile::read_header(&mut BufReader::new(file))
             .ok()
             .flatten()
             .map(|header| header.created_at)
@@ -2620,7 +2606,7 @@ fn matrix_room_details(
         {
             continue;
         }
-        for (record_collection_id, node_id, _) in mtxdb_core::packfile::scan_packfile(&path)? {
+        for (record_collection_id, node_id, _) in mtxdb::packfile::scan_packfile(&path)? {
             if &record_collection_id != collection_id || !seen.insert(node_id) {
                 continue;
             }
@@ -2668,11 +2654,11 @@ fn matrix_room_details_from_shards(
         };
         let file = fs::File::open(&shard.path)?;
         let mut reader = BufReader::new(file);
-        if mtxdb_core::packfile::read_header(&mut reader)?.is_none() {
+        if mtxdb::packfile::read_header(&mut reader)?.is_none() {
             continue;
         }
         loop {
-            let record = match mtxdb_core::packfile::read_record(&mut reader) {
+            let record = match mtxdb::packfile::read_record(&mut reader) {
                 Ok(Some(record)) => record,
                 Ok(None) => break,
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -2888,7 +2874,7 @@ fn cmd_scan(
 )]
 fn scan_pack(
     _cli: &Cli,
-    shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
+    shard: &std::sync::Arc<mtxdb::shard::Shard>,
     pack_id: u64,
     collection_filter: Option<[u8; 16]>,
     opts: &ScanOptions,
@@ -2900,7 +2886,7 @@ fn scan_pack(
     let mut matched_records = 0usize;
     let mut truncated = false;
     let verify_payload = opts.verbose || opts.raw;
-    for record in mtxdb_core::packfile::scan_packfile_iter(path, verify_payload)? {
+    for record in mtxdb::packfile::scan_packfile_iter(path, verify_payload)? {
         let (record_collection, record_id, offset) = record?;
         // TODO: tied to MSRV 1.81.0 — replace with .is_none_or() once the
         // minimum is bumped to 1.82+.
@@ -3242,10 +3228,10 @@ struct CollectionScanContext {
     mode: CollectionScanMode,
     max_rows: usize,
     frames: usize,
-    raw_matches: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, [u8; 16], u64)>,
+    raw_matches: Vec<(std::sync::Arc<mtxdb::shard::Shard>, [u8; 16], u64)>,
     header_printed: bool,
     shard_type: ShardType,
-    sorted_records: Vec<(std::sync::Arc<mtxdb_core::shard::Shard>, [u8; 16], u64)>,
+    sorted_records: Vec<(std::sync::Arc<mtxdb::shard::Shard>, [u8; 16], u64)>,
     reverse: bool,
     show_section_header: bool,
     needs_section_spacing: bool,
@@ -3294,11 +3280,10 @@ impl CollectionScanMode {
 }
 
 fn scan_collection_shard(
-    shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
+    shard: &std::sync::Arc<mtxdb::shard::Shard>,
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<bool> {
-    let records =
-        mtxdb_core::packfile::scan_packfile_iter(&shard.path, context.mode.reads_payload())?;
+    let records = mtxdb::packfile::scan_packfile_iter(&shard.path, context.mode.reads_payload())?;
     let mut matched_pack = false;
     for record in records {
         let (record_collection_id, record_id, offset) = record?;
@@ -3328,7 +3313,7 @@ fn scan_collection_shard(
 }
 
 fn print_collection_record(
-    shard: &std::sync::Arc<mtxdb_core::shard::Shard>,
+    shard: &std::sync::Arc<mtxdb::shard::Shard>,
     record_id: [u8; 16],
     offset: u64,
     context: &mut CollectionScanContext,
@@ -3444,7 +3429,7 @@ fn cmd_import(
     // flushes and fsyncs everything below — the explicit durability schedule
     // the buffered append policy is meant for. A `put` command that syncs
     // per record stays on the default eager path.
-    let store = open_store(cli)?.with_append_policy(mtxdb_core::shard::AppendPolicy::buffered());
+    let store = open_store(cli)?.with_append_policy(mtxdb::shard::AppendPolicy::buffered());
     let mut failures = 0_usize;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {
@@ -3819,8 +3804,7 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     let mut ordered_ids = Vec::new();
     for (_, shard) in &shards {
-        for (candidate_collection, node_id, _) in mtxdb_core::packfile::scan_packfile(&shard.path)?
-        {
+        for (candidate_collection, node_id, _) in mtxdb::packfile::scan_packfile(&shard.path)? {
             if candidate_collection == collection_id
                 && seen.insert(node_id)
                 && store.get(&collection_id, &node_id)?.is_some()
@@ -4192,7 +4176,7 @@ fn import_pdu_events(
         }
     };
     if !state_groups.is_empty() {
-        use mtxdb_core::auxiliary::AuxiliaryIndex;
+        use mtxdb::auxiliary::AuxiliaryIndex;
         let aux = AuxiliaryIndex::open(store, "matrix-state-groups");
         let mut state_count = 0u64;
         for (event_id, state_group_id) in &state_groups {
@@ -4301,10 +4285,10 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
     for (_, shard) in pool.all_shards() {
         let file = fs::File::open(&shard.path)?;
         let mut reader = BufReader::new(file);
-        if mtxdb_core::packfile::read_header(&mut reader)?.is_none() {
+        if mtxdb::packfile::read_header(&mut reader)?.is_none() {
             continue;
         }
-        while let Some(record) = mtxdb_core::packfile::read_record(&mut reader)? {
+        while let Some(record) = mtxdb::packfile::read_record(&mut reader)? {
             if deleted.contains(&record.collection_id) {
                 continue;
             }
@@ -4435,11 +4419,11 @@ fn verify_auth_chain_edges(
 fn build_event_dag(
     events: &[OwnedValue],
 ) -> (
-    mtxdb_core::dag::ActiveRoomFrontier,
+    mtxdb::dag::ActiveRoomFrontier,
     HashMap<String, u64>,
     HashMap<u64, String>,
 ) {
-    use mtxdb_core::dag::ActiveRoomFrontier;
+    use mtxdb::dag::ActiveRoomFrontier;
 
     let mut frontier = ActiveRoomFrontier::new();
     let mut id_map: HashMap<String, u64> = HashMap::new();
@@ -4500,7 +4484,7 @@ fn extract_event_edge_ids(
 /// `Err` with the list of events involved in a cycle or whose parents
 /// are missing from the DAG.
 fn topo_sort_dag(
-    frontier: &mtxdb_core::dag::ActiveRoomFrontier,
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
     reverse_map: &HashMap<u64, String>,
 ) -> Result<Vec<usize>, Vec<String>> {
     let n = frontier.nodes.len();
@@ -5239,7 +5223,7 @@ fn cmd_repack_target(
     Ok(())
 }
 
-fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb_core::NodeId> {
+fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
     let mut input = data.to_vec();
     let val: simd_json::OwnedValue = match simd_json::to_owned_value(&mut input) {
         Ok(v) => v,
@@ -5357,10 +5341,10 @@ mod tests {
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
-    use mtxdb_core::packfile::storage::PackfileStorage;
-    use mtxdb_core::storage::{NodeData, StorageEngine};
-    use mtxdb_core::template::{CollectionKeyRule, PayloadPolicy, RecordIdentityRule};
-    use mtxdb_core::{DatabaseLayout, ShardType};
+    use mtxdb::packfile::storage::PackfileStorage;
+    use mtxdb::storage::{NodeData, StorageEngine};
+    use mtxdb::template::{CollectionKeyRule, PayloadPolicy, RecordIdentityRule};
+    use mtxdb::{DatabaseLayout, ShardType};
     use simd_json::prelude::Writable;
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -5878,13 +5862,10 @@ mod tests {
             let pack = pool_dir.join(format!("pack_{pack_id:016x}.pack"));
             let file = std::fs::File::open(pack).unwrap();
             let mut reader = std::io::BufReader::new(file);
-            if mtxdb_core::packfile::read_header(&mut reader)
-                .unwrap()
-                .is_none()
-            {
+            if mtxdb::packfile::read_header(&mut reader).unwrap().is_none() {
                 continue;
             }
-            while let Some(record) = mtxdb_core::packfile::read_record(&mut reader).unwrap() {
+            while let Some(record) = mtxdb::packfile::read_record(&mut reader).unwrap() {
                 let _ = record;
                 total = total.saturating_add(1);
             }
@@ -6343,7 +6324,7 @@ mod tests {
     }
 
     // `physical_layout`/`avoidable_spread_bytes` coverage now lives with
-    // their implementation in `mtxdb_core::packfile::layout::tests` —
+    // their implementation in `mtxdb::packfile::layout::tests` —
     // this crate just imports and displays them, nothing left to test here.
 
     // ---- HAMT decoder tests ----

@@ -9,8 +9,8 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 
-use mtxdb_core::storage::{NodeData, StorageEngine};
-use mtxdb_core::PackfileStorage;
+use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::PackfileStorage;
 
 /// Opaque handle to a PackfileStorage instance.
 pub struct MdbStorage {
@@ -61,16 +61,16 @@ pub unsafe extern "C" fn mdb_storage_open(path: *const c_char, pool: *const c_ch
     // Validate the pool name up front so an unsupported value fails without
     // creating the database descriptor or any pool directories.
     let shard_type = if pool.is_null() {
-        mtxdb_core::ShardType::EventDag
+        mtxdb::ShardType::EventDag
     } else {
         match unsafe { CStr::from_ptr(pool) }.to_str() {
-            Ok("event-dag") => mtxdb_core::ShardType::EventDag,
-            Ok("state") => mtxdb_core::ShardType::State,
-            Ok("auth-chain") => mtxdb_core::ShardType::AuthChain,
+            Ok("event-dag") => mtxdb::ShardType::EventDag,
+            Ok("state") => mtxdb::ShardType::State,
+            Ok("auth-chain") => mtxdb::ShardType::AuthChain,
             _ => return ptr::null_mut(),
         }
     };
-    let layout = match mtxdb_core::DatabaseLayout::open(std::path::PathBuf::from(c_str)) {
+    let layout = match mtxdb::DatabaseLayout::open(std::path::PathBuf::from(c_str)) {
         Ok(l) => l,
         Err(_) => return ptr::null_mut(),
     };
@@ -117,16 +117,16 @@ pub unsafe extern "C" fn mdb_storage_open_read_only(
         Err(_) => return ptr::null_mut(),
     };
     let shard_type = if pool.is_null() {
-        mtxdb_core::ShardType::EventDag
+        mtxdb::ShardType::EventDag
     } else {
         match unsafe { CStr::from_ptr(pool) }.to_str() {
-            Ok("event-dag") => mtxdb_core::ShardType::EventDag,
-            Ok("state") => mtxdb_core::ShardType::State,
-            Ok("auth-chain") => mtxdb_core::ShardType::AuthChain,
+            Ok("event-dag") => mtxdb::ShardType::EventDag,
+            Ok("state") => mtxdb::ShardType::State,
+            Ok("auth-chain") => mtxdb::ShardType::AuthChain,
             _ => return ptr::null_mut(),
         }
     };
-    let layout = match mtxdb_core::DatabaseLayout::open_read_only(std::path::PathBuf::from(c_str)) {
+    let layout = match mtxdb::DatabaseLayout::open_read_only(std::path::PathBuf::from(c_str)) {
         Ok(l) => l,
         Err(_) => return ptr::null_mut(),
     };
@@ -253,8 +253,8 @@ pub unsafe extern "C" fn mdb_get_ex(
         }
         Err(e) => {
             let code = match e {
-                mtxdb_core::storage::StorageError::Io(_) => MdbError::Io,
-                mtxdb_core::storage::StorageError::Corrupt(_) => MdbError::Io,
+                mtxdb::storage::StorageError::Io(_) => MdbError::Io,
+                mtxdb::storage::StorageError::Corrupt(_) => MdbError::Io,
                 _ => MdbError::Internal,
             };
             unsafe { *out_err = code };

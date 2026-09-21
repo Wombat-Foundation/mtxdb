@@ -1,6 +1,6 @@
 //! Raw-versus-zstd write-cost microbenchmark for packfile frames.
 //!
-//! Run with `cargo bench -p mtxdb-core --bench compression`. This measures
+//! Run with `cargo bench --bench compression` from `benches/`. This measures
 //! CPU-side frame production only: output goes to a black-box discard writer so filesystem
 //! latency, shard rotation, index insertion, and fsync do not obscure the
 //! per-record cost of `write_record`'s unconditional zstd attempt.
@@ -22,7 +22,7 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use mtxdb_core::packfile::{self, Record};
+use mtxdb::packfile::{self, Record};
 
 const RECORDS_PER_CASE: usize = 25_000;
 const COLLECTION_ID: [u8; 16] = [0xC0; 16];
@@ -100,7 +100,7 @@ fn payload(kind: PayloadKind, len: usize, seed: usize) -> Vec<u8> {
 /// framing, allocation, and CRC, but deliberately stores plaintext payloads.
 /// Keeping this here lets the benchmark identify the marginal cost of the
 /// current unconditional compressor call without exposing a test-only raw
-/// writer through mtxdb-core's public API.
+/// writer through mtxdb's public API.
 fn write_record_raw(writer: &mut impl Write, record: &Record) -> io::Result<u64> {
     const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
 

@@ -1,4 +1,3 @@
-
 [package]
 name = "mtxdb"
 version.workspace = true
@@ -11,15 +10,22 @@ publish = false
 # aren't the only way in. See the BENCHES comment below.
 autobenches = false
 
+repository = "https://github.com/Wombat-Foundation/mtxdb"
+description = "mtxdb: write-once, content-addressed packfile storage engine for Matrix"
+license = "MIT OR Apache-2.0"
+authors = ["Shane Jaroch <chown_tee@proton.me>"]
+keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
+categories = ["database-implementations", "storage"]
+
 [workspace]
 resolver = "2"
-members = ["mtxdb-cli", "mtxdb-core"]
+members = ["mtxdb-cli"]
 # mtxdb-ffi and mtxdb-wasm deliberately stay out: a workspace member's own
 # [profile.*] is ignored (only the workspace root's applies), and
 # mtxdb-wasm's release profile (opt-level "z", lto, panic="abort") is
 # load-bearing for wasm binary size — folding it in here silently
 # discards it. They stay standalone builds, each with their own
-# [workspace] table, depending on mtxdb-core via a path dependency.
+# [workspace] table, depending on the mtxdb library via a path dependency.
 
 [workspace.package]
 version = "0.1.0-beta.1"
@@ -64,7 +70,30 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [dependencies]
-mtxdb-core = { path = "mtxdb-core" }
+arc-swap = "1"
+bytes = "1.5"
+crc32fast = "1.4"
+getrandom = "0.4"
+memmap2 = "0.9.11"
+parking_lot = "0.12"
+sha2 = "0.10"
+zstd = { version = "0.13", default-features = false }
+
+# Native builds link the system libzstd via pkg-config (already installed
+# at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
+# `zstd`/`zstd-safe` don't forward a "pkg-config" feature of their own, so
+# this reaches it by depending on `zstd-sys` directly at the same version
+# zstd-safe resolves to — Cargo unifies the two into one build.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zstd-sys = { version = "2.1", features = ["pkg-config"] }
+
+# wasm targets have no libzstd to pkg-config against. `zstd-sys` ships a
+# "vendored" feature that forces its bundled C sources to be compiled from
+# source instead (overriding "pkg-config" outright, whichever target
+# enabled it) using its own `wasm-shim` — minimal libc stubs — so `cc`
+# can target wasm32 directly without a full WASI sysroot.
+[target.'cfg(target_family = "wasm")'.dependencies]
+zstd-sys = { version = "2.1", features = ["vendored"] }
 
 [lints]
 workspace = true

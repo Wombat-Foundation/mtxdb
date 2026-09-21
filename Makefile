@@ -50,10 +50,10 @@ fix: ##H Apply auto-fixes with clippy across workspace crates
 .PHONY: doc
 doc: ##H Build docs
 	$(CARGO) test --workspace --doc
-	# Document library crates only — the mtxdb-cli binary shares the name
-	# "mtxdb" with the root facade lib, hitting cargo #6313.  Skip it;
+	# Document the library only — the mtxdb-cli binary shares the name
+	# "mtxdb" with the root library, hitting cargo #6313.  Skip it;
 	# CLI usage is covered by `mtxdb --help`.
-	$(CARGO) doc -p mtxdb -p mtxdb-core --no-deps
+	$(CARGO) doc -p mtxdb --no-deps
 	echo '<meta http-equiv="refresh" content="0;url=mtxdb/index.html">' > target/doc/index.html
 
 
@@ -62,7 +62,7 @@ doc: ##H Build docs
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .PHONY: test
-test: ##H Run tests (only core)
+test: ##H Run library and workspace tests
 	$(CARGO) test --workspace --lib --tests --timings
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
@@ -72,16 +72,16 @@ LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 cov: ##H Run code coverage and generate HTML report
 	# TODO: include `src/bin/` in coverage
 	# Run coverage
-	$(CARGO) llvm-cov -p mtxdb-core --lib --tests \
+	$(CARGO) llvm-cov -p mtxdb --lib --tests \
 		--html --output-dir .coverage \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Print per-file summary to the terminal (functions/lines only)
 	@echo ''
 	@echo '══════════════ COVERAGE SUMMARY ══════════════'
-	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report -p mtxdb-core \
+	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report -p mtxdb \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Process report to codecov-compatible JSON
-	$(CARGO) llvm-cov report -p mtxdb-core \
+	$(CARGO) llvm-cov report -p mtxdb \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*' \
 		--codecov --output-path .coverage/codecov.json
 	@echo DONE. You may open it with:
@@ -121,7 +121,6 @@ install:	##H Install CLI from source
 clean: ##H Clean build artifacts
 	$(CARGO) clean
 	cd mtxdb-cli && $(CARGO) clean
-	cd mtxdb-core && $(CARGO) clean
 	cd mtxdb-ffi && $(CARGO) clean
 	cd mtxdb-wasm && $(CARGO) clean
 	cd benches && $(CARGO) clean
@@ -132,7 +131,7 @@ clean: ##H Clean build artifacts
 # Execute command for reach submodule
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-PROJECT_CRATES ?= mtxdb-cli/ mtxdb-core/ mtxdb-ffi/ mtxdb-wasm/ benches/
+PROJECT_CRATES ?= mtxdb-cli/ mtxdb-ffi/ mtxdb-wasm/ benches/
 
 .PHONY: sub
 sub:	##H Run a command for each crate (set c)
