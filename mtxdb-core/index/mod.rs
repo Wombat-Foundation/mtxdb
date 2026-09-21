@@ -412,8 +412,8 @@ impl LossyIndex {
     /// Returns `InsertError::TableFull` under the same conditions as
     /// [`Self::insert`] (the table is left unmodified).
     // `bucket` is always below `self.capacity`, which is capped at `u32::MAX`
-    // by construction, so the `as u32` narrowings below never truncate.
-    #[allow(clippy::cast_possible_truncation)]
+    // by construction, so the checked `u32::try_from` in `insert_undoable`
+    // below can never fail.
     pub fn insert_tracked(
         &self,
         hash: &[u8; 16],
@@ -436,7 +436,6 @@ impl LossyIndex {
     /// # Panics
     /// Never panics in practice: `hash[..8]` is always exactly 8 bytes for a
     /// `&[u8; 16]` input, so the `try_into` this performs cannot fail.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn insert_undoable(
         &self,
         hash: &[u8; 16],
@@ -450,6 +449,11 @@ impl LossyIndex {
         let mut probe_len: u32 = 0;
 
         loop {
+            // `bucket` is masked by `self.mask` (capacity - 1) and capacity is
+            // a u32, so the conversion is lossless; it is done once here so the
+            // return/undo structs below don't each need a checked cast.
+            let bucket_wire = u32::try_from(bucket)
+                .expect("bucket is masked by the u32 capacity, so it always fits");
             let SlotStorage::Owned(slots) = &self.slots else {
                 self.bump_max_probe_len(probe_len);
                 return Err(InsertError::TableFull);
@@ -476,14 +480,14 @@ impl LossyIndex {
                 slots[bucket].store(value, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
                 let undo = SlotUndo {
-                    bucket: bucket as u32,
+                    bucket: bucket_wire,
                     old_slot: 0,
                     old_home,
                     old_tail,
                     was_empty: true,
                 };
                 self.bump_max_probe_len(probe_len);
-                return Ok((bucket as u32, value, undo));
+                return Ok((bucket_wire, value, undo));
             }
             // A tag only filters candidates; it never proves key equality.
             // Checkpoint-derived slots initially lack their 40-bit tail and
@@ -493,7 +497,7 @@ impl LossyIndex {
                 if tail == 0 {
                     self.bump_max_probe_len(probe_len);
                     return Err(InsertError::NeedsIdentity {
-                        bucket: bucket as u32,
+                        bucket: bucket_wire,
                         shard_id: slot.shard_id(),
                         offset: slot.offset(),
                     });
@@ -504,14 +508,14 @@ impl LossyIndex {
                     let value = IndexSlot::new(tag, shard_id, offset).0;
                     slots[bucket].store(value, Ordering::Release);
                     let undo = SlotUndo {
-                        bucket: bucket as u32,
+                        bucket: bucket_wire,
                         old_slot,
                         old_home,
                         old_tail: tail,
                         was_empty: false,
                     };
                     self.bump_max_probe_len(probe_len);
-                    return Ok((bucket as u32, value, undo));
+                    return Ok((bucket_wire, value, undo));
                 }
             }
             probe_len = probe_len.saturating_add(1);
