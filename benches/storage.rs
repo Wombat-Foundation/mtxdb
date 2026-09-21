@@ -1596,7 +1596,9 @@ fn run_unknown_key_benchmark() {
         refresh_elapsed.as_nanos() / MISSES as u128,
         refresh_stats.miss_refreshes,
         refresh_stats.miss_refresh_skips,
-        refresh_stats.index_rebuild_count.saturating_sub(direct_stats.index_rebuild_count),
+        refresh_stats
+            .index_rebuild_count
+            .saturating_sub(direct_stats.index_rebuild_count),
     );
     eprintln!(
         "unknown-key lookup cost: direct={direct_elapsed:?}, refresh-aware={refresh_elapsed:?}; \
@@ -1622,10 +1624,20 @@ fn run_unknown_key_benchmark() {
 /// concurrent writer sync+reclaim can invalidate the overlay mid-read. Reports
 /// per-read latency and how many reads exhausted the retry budget
 /// (`WouldBlock`) or hit a genuine gap (`Corrupt`) — the 500 path.
+///
+/// Two modes, selected by `force`:
+/// - `force = true` (**forced-checkpoint stress mode**): the writer calls
+///   `force_index_checkpoint()` every round, so the journal is reclaimed and
+///   the reader reloads. This is the mode that exercises the reload path, and
+///   its numbers include the writer's checkpoint+reclaim work — do **not**
+///   compare them to the plain write loop.
+/// - `force = false` (delta-only baseline): the writer just `sync_all`s, which
+///   appends a delta and never advances coverage, so the reader never reloads.
 fn run_read_committed_reload_benchmark(
     seed_collections: usize,
     seed_records: usize,
     read_ops: usize,
+    force: bool,
 ) {
     use mtxdb_core::journal::Journal;
     use mtxdb_core::storage::StorageError;
@@ -1674,6 +1686,7 @@ fn run_read_committed_reload_benchmark(
     let mut retryable = 0usize;
     let mut corrupt = 0usize;
 
+    let bench_start = Instant::now();
     std::thread::scope(|scope| {
         {
             let writer = &writer;
@@ -1697,11 +1710,13 @@ fn run_read_committed_reload_benchmark(
                         .unwrap();
                     writer.delete_collection(&throwaway).unwrap();
                     writer.sync_all().unwrap();
-                    // A plain sync appends a delta and never advances
-                    // checkpoint coverage, so the reader would never need to
-                    // reload. Force the full checkpoint + journal reclaim that
-                    // actually exercises `refresh_read_journal`.
-                    writer.force_index_checkpoint().unwrap();
+                    if force {
+                        // A plain sync appends a delta and never advances
+                        // checkpoint coverage, so the reader would never need
+                        // to reload. Force the full checkpoint + journal
+                        // reclaim that exercises `refresh_read_journal`.
+                        writer.force_index_checkpoint().unwrap();
+                    }
                     round += 1;
                     writer_rounds.store(round, Ordering::Relaxed);
                 }
@@ -1712,9 +1727,7 @@ fn run_read_committed_reload_benchmark(
             let start = Instant::now();
             match std::hint::black_box(reader.get_read_committed(&collection, &read_ids)) {
                 Ok(_) => {}
-                Err(StorageError::Io(error))
-                    if error.kind() == std::io::ErrorKind::WouldBlock =>
-                {
+                Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     retryable += 1;
                 }
                 Err(_) => corrupt += 1,
@@ -1723,6 +1736,7 @@ fn run_read_committed_reload_benchmark(
         }
         done.store(true, Ordering::Relaxed);
     });
+    let bench_elapsed = bench_start.elapsed();
 
     latencies_us.sort_unstable();
     let percentile = |p: usize| -> u128 {
@@ -1733,26 +1747,55 @@ fn run_read_committed_reload_benchmark(
     let max = latencies_us.last().copied().unwrap_or(0);
     let rounds = writer_rounds.load(Ordering::Relaxed);
 
+    let mode = if force {
+        "forced-checkpoint-stress"
+    } else {
+        "delta-only"
+    };
+    let elapsed_secs = bench_elapsed.as_secs_f64();
+    let rounds_per_sec = if elapsed_secs > 0.0 {
+        rounds as f64 / elapsed_secs
+    } else {
+        0.0
+    };
     println!(
-        "bench: read_committed_reload SEED={seed_collections}x{seed_records} READS={read_ops} \
-         WRITER_ROUNDS={rounds} WOULD_BLOCK={retryable} CORRUPT={corrupt} \
-         P50_US={p50} P95_US={p95} P99_US={p99} MAX_US={max}"
+        "bench: read_committed_reload MODE={mode} SEED={seed_collections}x{seed_records} \
+         READS={read_ops} WRITER_ROUNDS={rounds} WRITER_ROUNDS_PER_SEC={rounds_per_sec:.0} \
+         WOULD_BLOCK={retryable} CORRUPT={corrupt} P50_US={p50} P95_US={p95} P99_US={p99} \
+         MAX_US={max}"
     );
-    eprintln!(
-        "read-committed reload: {read_ops} reads against {rounds} writer checkpoint+reclaim \
-         rounds; p50={p50}us p95={p95}us p99={p99}us max={max}us; \
-         exhausted-retry-budget (WouldBlock)={retryable}, corrupt={corrupt}"
-    );
+    if force {
+        eprintln!(
+            "read-committed reload [{mode}] (reload stress): measured reader latency while a \
+             writer forces a full checkpoint+reclaim every round. p50/p95/p99 are reader \
+             `get_read_committed` time only — the writer's checkpoint duration is not added, \
+             only its disk-I/O and lock contention — and this synthetic loop is not a normal \
+             rollover, so do not compare it to the delta-only baseline. Writer: {rounds} rounds \
+             in {elapsed_secs:.2}s (~{rounds_per_sec:.0}/s). {read_ops} reads, \
+             WouldBlock={retryable}, corrupt={corrupt}."
+        );
+    } else {
+        eprintln!(
+            "read-committed reload [{mode}]: plain sync_all loop (no coverage advance, no reader \
+             reload). Writer: {rounds} rounds in {elapsed_secs:.2}s (~{rounds_per_sec:.0}/s). \
+             {read_ops} reads, p50={p50}us p95={p95}us p99={p99}us max={max}us, \
+             WouldBlock={retryable}, corrupt={corrupt}."
+        );
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }
 
 /// Run the read-committed reload bench only when explicitly requested.
 ///
-/// Value is `COLLECTIONSxRECORDSxREADS`, or `1`/empty for the defaults
-/// (`32x2000x300`). Unset skips it, so a plain `cargo bench` does not pay for
-/// the concurrent writer. Example:
+/// `MTXDB_BENCH_READ_COMMITTED` is `COLLECTIONSxRECORDSxREADS`, or `1`/empty
+/// for the defaults (`32x2000x300`). Unset skips it, so a plain `cargo bench`
+/// does not pay for the concurrent writer. Example:
 /// `MTXDB_BENCH_READ_COMMITTED=64x5000x500 cargo bench --bench storage`.
+///
+/// `MTXDB_BENCH_READ_COMMITTED_FORCE` (default on) toggles the writer's
+/// per-round `force_index_checkpoint`; set it falsey (`0`/`false`/`no`/`off`)
+/// for the delta-only baseline.
 fn run_read_committed_reload_from_env() {
     let spec = match std::env::var("MTXDB_BENCH_READ_COMMITTED") {
         Ok(raw) => raw,
@@ -1777,7 +1820,17 @@ fn run_read_committed_reload_from_env() {
             parts[2].trim().parse().expect("invalid reads"),
         )
     };
-    run_read_committed_reload_benchmark(collections, records, reads);
+    let force = match std::env::var("MTXDB_BENCH_READ_COMMITTED_FORCE") {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("MTXDB_BENCH_READ_COMMITTED_FORCE must be valid UTF-8")
+        }
+    };
+    run_read_committed_reload_benchmark(collections, records, reads, force);
 }
 
 fn main() {

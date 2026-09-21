@@ -6555,21 +6555,41 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Force a full checkpoint rewrite now, bypassing the delta-append fast
-    /// path that a normal sync takes whenever the delta log can continue.
+    /// Rewrite the on-disk index checkpoint now, bypassing the delta-append
+    /// fast path a normal sync takes whenever the delta log can continue.
     ///
-    /// The read-committed reader-reload path is only reached when a full
-    /// checkpoint advances coverage and reclaims the journal; a steady write
-    /// workload never takes that path (every sync appends a delta), so
-    /// benchmarks and tests need a deterministic way to force it. Not for
-    /// production use: it marks the index dirty so the rewrite runs even
-    /// immediately after a delta sync.
+    /// [`Self::sync_all`] appends a delta and does not advance the checkpoint's
+    /// covered LSN, so the read-committed reader-reload path is reached only
+    /// when a full checkpoint runs — a delta-log cap rollover, or this call.
+    /// Tests and benchmarks use this to exercise that path deterministically;
+    /// production callers normally rely on `sync_all`.
+    ///
+    /// It fsyncs dirty shard frames before taking `index_persist_lock`, so the
+    /// fsync never runs under the lock a concurrent sync holds across its own
+    /// checkpoint. That ordering matches the normal sync path
+    /// (`sync_durability` before `persist_index_checkpoint_or_delta`) and
+    /// avoids the inverse lock order. Marking the index dirty first makes the
+    /// rewrite run even immediately after a delta sync; the flag stays set if
+    /// the fsync fails, so a later call retries rather than dropping it.
+    ///
+    /// This is *not* a stronger durability guarantee than a normal sync: a
+    /// concurrent put can still append between that fsync and the snapshot
+    /// `persist_index_checkpoint` takes under its collection locks, and that
+    /// function flushes — but does not fsync — those later frames. Like every
+    /// checkpoint, this file is an acceleration structure: if a crash loses
+    /// pack bytes it references, the fingerprint gate rejects it and the next
+    /// open rescans. With a journal enabled (the benchmark case), the journal
+    /// is authoritative.
+    ///
+    /// Primarily a test/benchmark hook, intentionally part of the public API
+    /// so the standalone `mtxdb-benches` crate can reach it.
     ///
     /// # Errors
-    /// Propagates any write failure from the checkpoint rewrite.
+    /// Propagates any shard-fsync or checkpoint-write failure.
     pub fn force_index_checkpoint(&self) -> Result<(), StorageError> {
-        let _persist_guard = self.index_persist_lock.lock();
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        self.shards.sync_dirty().map_err(StorageError::Io)?;
+        let _persist_guard = self.index_persist_lock.lock();
         self.persist_index_checkpoint()
     }
 
@@ -7831,6 +7851,52 @@ mod tests {
             read_committed[1].as_ref().map(|data| data.bytes.as_ref()),
             Some(&b"second"[..]),
             "the post-checkpoint group must be served from the overlay"
+        );
+    }
+
+    #[test]
+    fn force_index_checkpoint_rewrites_with_and_without_pending_delta() {
+        let dir = test_dir("force_index_checkpoint");
+        let wal = dir.join("wal.bin");
+        let checkpoint_path = PackfileStorage::index_checkpoint_path(&dir);
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(&wal).unwrap();
+
+        // Empty delta log: no mutations yet. A normal sync would be a no-op;
+        // forcing still writes a checkpoint with no committed coverage.
+        store.force_index_checkpoint().unwrap();
+        let empty = crate::index::checkpoint::read_checkpoint(&checkpoint_path).unwrap();
+
+        // Non-empty delta: the put commits a journal group, and sync_all takes
+        // the delta fast path, which does not advance checkpoint coverage.
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0x11; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"x")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        let after_sync = crate::index::checkpoint::read_checkpoint(&checkpoint_path).unwrap();
+        assert_eq!(
+            after_sync.covered_lsn, empty.covered_lsn,
+            "a delta append must not advance checkpoint coverage"
+        );
+
+        // Forcing must take the full-rewrite path and record the committed
+        // journal tail. Read the tail from the journal rather than hardcoding
+        // an LSN, so this survives any change to how the first mutation is
+        // numbered.
+        let committed = store.journal().expect("journal enabled").committed_lsn();
+        assert!(
+            committed > after_sync.covered_lsn,
+            "the put must have committed past the loaded coverage"
+        );
+        store.force_index_checkpoint().unwrap();
+        let forced = crate::index::checkpoint::read_checkpoint(&checkpoint_path).unwrap();
+        assert_eq!(
+            forced.covered_lsn, committed,
+            "force must advance coverage to the committed journal tail"
         );
     }
 
