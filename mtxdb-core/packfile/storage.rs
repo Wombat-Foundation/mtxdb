@@ -3870,17 +3870,6 @@ impl PackfileStorage {
         Ok(Some(NodeRef::Resolved(*id, Arc::new(data))))
     }
 
-    fn resolve_from_candidates(
-        &self,
-        id: &NodeId,
-        candidates: impl IntoIterator<Item = (u16, u64)>,
-        track: bool,
-    ) -> Result<Option<NodeData>, StorageError> {
-        let candidates: Vec<(u16, u64)> = candidates.into_iter().collect();
-        let pinned = self.pin_shards(candidates.iter().map(|&(shard_id, _)| shard_id));
-        self.resolve_from_pinned(id, &candidates, &pinned, track)
-    }
-
     /// Resolve `id` against `candidates` through `pinned` shard handles.
     ///
     /// Holding the pinned `Arc<Shard>`s for the whole read keeps each shard's
@@ -4046,6 +4035,20 @@ impl PackfileStorage {
         let at_cap =
             |visited: &HashSet<[u8; 16]>| limits.max_nodes.is_some_and(|max| visited.len() >= max);
 
+        // Pin every shard this snapshot's index references before resolving
+        // anything. The walk reads against a frozen generation, but a
+        // concurrent repack can still retire the shard ids that generation's
+        // index points at; without pinning, a node resolved after the swap
+        // would miss even though it is still live. See `pin_shards`.
+        let pinned = self.pin_shards(
+            gen.index
+                .referenced_shard_ids()
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, referenced)| referenced)
+                .map(|(slot, _)| u16::try_from(slot).expect("shard slot fits u16")),
+        );
+
         for root in frontier {
             if !boundary.contains(root) && !at_cap(&visited) && visited.insert(*root) {
                 queue.push_back(*root);
@@ -4053,7 +4056,7 @@ impl PackfileStorage {
         }
 
         while let Some(hash) = queue.pop_front() {
-            let Some(data) = self.resolve_pinned(gen, &hash)? else {
+            let Some(data) = self.resolve_pinned(gen, &pinned, &hash)? else {
                 // Not actually present under this generation — nothing to
                 // expand from and nothing to yield.
                 continue;
@@ -4080,11 +4083,16 @@ impl PackfileStorage {
     /// Resolves `id` within a specific, already-loaded generation snapshot
     /// rather than whatever generation happens to be live when called —
     /// the building block [`Self::bfs_ancestors`] uses to keep an entire
-    /// walk consistent against one point-in-time view of the collection, immune
-    /// to a repack swapping in a new generation partway through.
+    /// walk consistent against one point-in-time view of the collection.
+    ///
+    /// `pinned` must hold every shard the snapshot's index references (see
+    /// [`Self::pin_shards`]), so a repack that swaps in a new generation and
+    /// retires those shards partway through the walk cannot make a later node
+    /// miss.
     fn resolve_pinned(
         &self,
         gen: &Arc<RoomGeneration>,
+        pinned: &HashMap<u16, Arc<Shard>>,
         id: &NodeId,
     ) -> Result<Option<NodeData>, StorageError> {
         if let Some(data) = gen.cache.get(id) {
@@ -4096,7 +4104,7 @@ impl PackfileStorage {
             self.index_candidates
                 .fetch_add(candidates.len() as u64, Ordering::Relaxed);
         }
-        self.resolve_from_candidates(id, candidates, track)
+        self.resolve_from_pinned(id, &candidates, pinned, track)
     }
 
     /// Read every record's edges, with no reachability filtering.
@@ -5340,6 +5348,8 @@ impl StorageEngine for PackfileStorage {
                 return Ok(Some((*data).clone()));
             }
             let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+            #[cfg(test)]
+            Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(shard_id, _)| shard_id));
             let still_current = match gen_guard.as_ref() {
                 Some(loaded) => {
@@ -5398,6 +5408,8 @@ impl StorageEngine for PackfileStorage {
                 }
             }
 
+            #[cfg(test)]
+            Self::run_test_before_pin();
             let pinned = self.pin_shards(
                 to_fetch
                     .iter()
@@ -6802,6 +6814,30 @@ impl Default for RuntimeStats {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test-only hook run by `get`/`get_many` after candidate shard ids are
+    /// collected but before they are pinned, allowing deterministic repack
+    /// interleavings in the read-path race tests.
+    static TEST_BEFORE_PIN: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+impl PackfileStorage {
+    fn set_test_before_pin(hook: Option<Box<dyn Fn()>>) {
+        TEST_BEFORE_PIN.with(|slot| *slot.borrow_mut() = hook);
+    }
+
+    fn run_test_before_pin() {
+        TEST_BEFORE_PIN.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
@@ -7531,6 +7567,187 @@ mod tests {
             bytes,
             vec![b'A', b'B'],
             "a walk built before a concurrent repack must not lose nodes that repack GC'd afterward"
+        );
+    }
+
+    #[test]
+    fn test_get_retries_when_a_repack_retires_the_shard_mid_lookup() {
+        // Regression test for the shard-retirement race: a repack that swaps
+        // the generation and retires the shards a lookup just read its
+        // candidates from must not turn a live record into a miss. The hook
+        // fires in the exact window (after candidates are collected, before
+        // they are pinned), so this does not rely on timing luck.
+        let dir = test_dir("get_retry_mid_repack");
+        let store = Arc::new(PackfileStorage::open(dir).unwrap());
+        let id = distinct_id(0x77);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"payload")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+        let old_shard = store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .index
+            .lookup_all(&id)
+            .next()
+            .expect("id is indexed")
+            .0;
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let hook_fired = Arc::clone(&fired);
+        let hook_store = Arc::clone(&store);
+        PackfileStorage::set_test_before_pin(Some(Box::new(move || {
+            if !hook_fired.swap(true, Ordering::Relaxed) {
+                // Force the repack's output onto a new shard so the record's
+                // original shard is actually retired, not reused as the live
+                // write shard.
+                hook_store.shards.active_shard().file_len.store(
+                    shard::MAX_SHARD_BYTES - 10,
+                    std::sync::atomic::Ordering::Release,
+                );
+                hook_store.set_live_roots(&TEST_COLLECTION, vec![id]);
+                hook_store
+                    .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+                    .unwrap();
+            }
+        })));
+        let result = store.get(&TEST_COLLECTION, &id).unwrap();
+        PackfileStorage::set_test_before_pin(None);
+
+        assert!(fired.load(Ordering::Relaxed), "the test hook must have run");
+        assert!(
+            store.shards.get_shard(old_shard).is_none(),
+            "the repack must have retired the looked-up shard, or this test proves nothing"
+        );
+        assert!(
+            result.is_some(),
+            "get must retry and still find a record whose shard a repack retired mid-lookup"
+        );
+    }
+
+    #[test]
+    fn test_get_many_retries_when_a_repack_retires_the_shard_mid_lookup() {
+        let dir = test_dir("get_many_retry_mid_repack");
+        let store = Arc::new(PackfileStorage::open(dir).unwrap());
+        let id = distinct_id(0x78);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"payload")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+        let old_shard = store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .index
+            .lookup_all(&id)
+            .next()
+            .expect("id is indexed")
+            .0;
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let hook_fired = Arc::clone(&fired);
+        let hook_store = Arc::clone(&store);
+        PackfileStorage::set_test_before_pin(Some(Box::new(move || {
+            if !hook_fired.swap(true, Ordering::Relaxed) {
+                hook_store.shards.active_shard().file_len.store(
+                    shard::MAX_SHARD_BYTES - 10,
+                    std::sync::atomic::Ordering::Release,
+                );
+                hook_store.set_live_roots(&TEST_COLLECTION, vec![id]);
+                hook_store
+                    .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+                    .unwrap();
+            }
+        })));
+        let results = store.get_many(&TEST_COLLECTION, &[id]).unwrap();
+        PackfileStorage::set_test_before_pin(None);
+
+        assert!(fired.load(Ordering::Relaxed), "the test hook must have run");
+        assert!(
+            store.shards.get_shard(old_shard).is_none(),
+            "the repack must have retired the looked-up shard, or this test proves nothing"
+        );
+        assert!(
+            results[0].is_some(),
+            "get_many must retry and still find a record whose shard a repack retired mid-lookup"
+        );
+    }
+
+    #[test]
+    fn test_walk_ancestors_pins_shards_against_a_mid_walk_repack() {
+        // The walk freezes one generation, but a concurrent repack can still
+        // retire the shards that generation's index points at. `extract_edges`
+        // runs between node resolutions, so triggering the repack from it
+        // deterministically reproduces a mid-walk swap; every node must still
+        // resolve.
+        let dir = test_dir("walk_pins_mid_repack");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        let a = distinct_id(0xA0);
+        let b = distinct_id(0xA1);
+        let c = distinct_id(0xA2);
+        for (id, byte) in [(&a, b'A'), (&b, b'B'), (&c, b'C')] {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    id,
+                    &NodeData::new(bytes::Bytes::copy_from_slice(&[byte])),
+                )
+                .unwrap();
+        }
+        store.sync().unwrap();
+        let old_shard = store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .index
+            .lookup_all(&c)
+            .next()
+            .expect("c is indexed")
+            .0;
+
+        let edges = std::collections::HashMap::from([(c, vec![b]), (b, vec![a])]);
+        let fired = std::cell::Cell::new(false);
+        let extract = |hash: &[u8; 16], _data: &[u8]| {
+            if !fired.replace(true) {
+                // Force the repack's output onto a new shard so the snapshot's
+                // shard is retired rather than reused as the live write shard.
+                store.shards.active_shard().file_len.store(
+                    shard::MAX_SHARD_BYTES - 10,
+                    std::sync::atomic::Ordering::Release,
+                );
+                store.set_live_roots(&TEST_COLLECTION, vec![c]);
+                let (kept, dropped) = store
+                    .repack_collection_reachable(&TEST_COLLECTION, |h, _d| {
+                        edges.get(h).cloned().unwrap_or_default()
+                    })
+                    .unwrap();
+                assert_eq!((kept, dropped), (3, 0), "all three nodes stay reachable");
+            }
+            edges.get(hash).cloned().unwrap_or_default()
+        };
+
+        let walk = store
+            .walk_ancestors(&TEST_COLLECTION, &[c], &[], extract, WalkLimits::default())
+            .unwrap();
+        let results: Vec<(NodeId, NodeData)> = walk.collect::<Result<_, _>>().unwrap();
+
+        assert!(
+            store.shards.get_shard(old_shard).is_none(),
+            "the repack must have retired the snapshot's shard, or this test proves nothing"
+        );
+        assert_eq!(
+            results.len(),
+            3,
+            "the walk must resolve every node even though a repack retired the snapshot's shards mid-walk"
         );
     }
 
