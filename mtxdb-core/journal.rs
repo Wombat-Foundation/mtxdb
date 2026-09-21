@@ -78,7 +78,11 @@ pub struct CommittedGroup {
     pub entries: Vec<JournalEntry>,
 }
 
-/// Receipt returned after a group and its commit trailer are durably synced.
+/// Receipt returned after a group and its commit trailer are appended.
+///
+/// A receipt is produced by [`Journal::append_group`]. The group is complete
+/// and readable by a read-only scanner at this point, but not yet durable;
+/// [`Journal::make_durable`] is what fsyncs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitReceipt {
     /// Monotonic group sequence.
@@ -123,9 +127,10 @@ pub struct Reclaim {
     pub reclaimed_bytes: u64,
 }
 
-/// A single-writer journal file. Calls to [`Self::commit_group`] are
-/// serialized by the caller's coordinator (or by `&mut self`) and return only
-/// after the group is durably synced.
+/// A single-writer journal file. [`Self::append_group`] writes a complete
+/// group and its commit trailer; [`Self::make_durable`] fsyncs it;
+/// [`Self::commit_group`] does both. Calls are serialized by the caller's
+/// coordinator (or by `&mut self`).
 pub struct Journal {
     path: PathBuf,
     file: File,
@@ -148,6 +153,11 @@ pub struct JournalCoordinator {
     /// I/O, so a publish never blocks behind a sync's fsync.
     next_lsn: AtomicU64,
     published_lsn: AtomicU64,
+    /// Highest LSN whose group is complete (trailer appended) but not
+    /// necessarily fsynced. Advanced between [`Journal::append_group`] and
+    /// [`Journal::make_durable`] so a read-only overlay can observe a
+    /// committed-but-unflushed group.
+    visible_lsn: AtomicU64,
     committed_lsn: AtomicU64,
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
@@ -165,6 +175,7 @@ impl JournalCoordinator {
             pending: Mutex::new(Vec::new()),
             next_lsn: AtomicU64::new(next_lsn),
             published_lsn: AtomicU64::new(committed_lsn),
+            visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             poisoned: AtomicBool::new(false),
         }
@@ -174,6 +185,17 @@ impl JournalCoordinator {
     #[must_use]
     pub fn committed_lsn(&self) -> u64 {
         self.committed_lsn.load(Ordering::Acquire)
+    }
+
+    /// Highest LSN whose journal group is complete (commit trailer appended),
+    /// whether or not it has been fsynced.
+    ///
+    /// A read-only overlay may observe everything at or below this. Durability
+    /// is only promised by [`Self::committed_lsn`]: a crash before the fsync
+    /// may lose a visible-but-uncommitted group.
+    #[must_use]
+    pub fn visible_lsn(&self) -> u64 {
+        self.visible_lsn.load(Ordering::Acquire)
     }
 
     /// Highest published (assigned) LSN, committed or not.
@@ -292,7 +314,7 @@ impl JournalCoordinator {
             pending.drain(..covered_count).collect::<Vec<_>>()
         };
         let mutations: Vec<Mutation> = batch.iter().map(|(_, mutation)| mutation.clone()).collect();
-        let receipt = match journal.commit_group(&mutations) {
+        let receipt = match journal.append_group(&mutations) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -304,6 +326,15 @@ impl JournalCoordinator {
                 return Err(error);
             }
         };
+        // The group is complete and readable by a read-only overlay, but not
+        // yet durable. Publish the visibility boundary before the fsync so
+        // workers can observe it. A crash before `make_durable` may lose it,
+        // which is safe: an unfsynced group is never acknowledged.
+        self.visible_lsn.store(receipt.last_lsn, Ordering::Release);
+        if let Err(error) = journal.make_durable() {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
         // The group is durable, so record its extent before checking the
         // receipt. This prevents a retry from re-appending committed entries.
         self.committed_lsn
@@ -458,17 +489,19 @@ impl Journal {
         ))
     }
 
-    /// Append a non-empty group and durably sync it. Each mutation receives
-    /// its own monotonic LSN. If writing or syncing fails, this handle is
-    /// poisoned: the caller must reopen and rescan before attempting another
-    /// commit, because the failed group's on-disk state is uncertain.
+    /// Append a non-empty group and its commit trailer, without fsyncing.
+    ///
+    /// Each mutation receives its own monotonic LSN. The group is complete and
+    /// readable by [`Self::scan_read_only`] as soon as this returns, so a
+    /// caller can publish a visibility boundary before [`Self::make_durable`]
+    /// fsyncs it. If writing fails, this handle is poisoned: the caller must
+    /// reopen and rescan before attempting another commit.
     ///
     /// # Errors
     /// Returns `io::Error` if the handle is poisoned, the group is empty or
     /// oversized, the LSN/sequence space is exhausted, the segment is full
-    /// (`WouldBlock`; the caller must drain/rotate), or the write or durable
-    /// sync fails.
-    pub fn commit_group(&mut self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
+    /// (`WouldBlock`; the caller must drain/rotate), or the write fails.
+    pub fn append_group(&mut self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
         if self.poisoned {
             return Err(io::Error::other(
                 "journal handle is poisoned after an earlier failed commit",
@@ -545,7 +578,7 @@ impl Journal {
             self.file.write_all(&header)?;
             self.file.write_all(&payload)?;
             self.file.write_all(&trailer)?;
-            self.file.sync_all()
+            Ok(())
         })();
         if let Err(error) = write_result {
             self.poisoned = true;
@@ -560,6 +593,42 @@ impl Journal {
             first_lsn,
             last_lsn,
         })
+    }
+
+    /// Fsync the bytes [`Self::append_group`] wrote, making the group durable.
+    ///
+    /// Separate from [`Self::append_group`] so a caller can publish a
+    /// visibility boundary after the group is complete but before the fsync.
+    /// On failure this handle is poisoned: the appended group's on-disk state
+    /// is uncertain, so the caller must reopen and rescan.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the handle is poisoned or the sync fails.
+    pub fn make_durable(&mut self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "journal handle is poisoned after an earlier failed commit",
+            ));
+        }
+        if let Err(error) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Append a non-empty group and durably sync it.
+    ///
+    /// Convenience wrapper over [`Self::append_group`] followed by
+    /// [`Self::make_durable`] for callers that do not need to publish a
+    /// visibility boundary between the two.
+    ///
+    /// # Errors
+    /// Propagates either step's failure. A failure leaves the handle poisoned.
+    pub fn commit_group(&mut self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
+        let receipt = self.append_group(mutations)?;
+        self.make_durable()?;
+        Ok(receipt)
     }
 
     /// Path of this journal file.
@@ -1099,6 +1168,64 @@ mod tests {
             node_id: [node; 16],
             payload: payload.to_vec(),
         }
+    }
+
+    #[test]
+    fn append_group_is_visible_before_make_durable() {
+        let path = temp_path("append_visible");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        let receipt = journal.append_group(&[put(1, 1, b"pending")]).unwrap();
+        assert_eq!((receipt.first_lsn, receipt.last_lsn), (1, 1));
+
+        // The complete group, trailer included, is readable by a read-only
+        // scanner before any fsync: this is the committed-but-unflushed state
+        // the read overlay observes.
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(scan.groups[0].last_lsn, 1);
+        assert!(!scan.truncated_tail);
+
+        // `make_durable` is idempotent and must not duplicate the group.
+        journal.make_durable().unwrap();
+        journal.make_durable().unwrap();
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn commit_group_appends_then_syncs() {
+        let path = temp_path("commit_appends_then_syncs");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        let receipt = journal.commit_group(&[put(1, 1, b"durable")]).unwrap();
+        assert_eq!(receipt.last_lsn, 1);
+        // The wrapper left the group complete and readable.
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        // A later explicit make_durable is a harmless no-op.
+        journal.make_durable().unwrap();
+        assert_eq!(Journal::scan_read_only(&path).unwrap().groups.len(), 1);
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn coordinator_visible_lsn_matches_committed_after_sync() {
+        let path = temp_path("coordinator_visible");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        assert_eq!(coordinator.visible_lsn(), 0);
+        let lsn = coordinator.publish(put(1, 1, b"first"), |_| {}).unwrap();
+        coordinator.sync().unwrap();
+        assert_eq!(coordinator.visible_lsn(), lsn);
+        assert_eq!(coordinator.committed_lsn(), lsn);
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
