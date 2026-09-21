@@ -94,18 +94,19 @@ struct TxnStageData {
 /// [`Self::discard`] drops only the buffered journal mutations. It does **not**
 /// undo the eager packfile record or live-index entry that
 /// `PackfileStorage::put_staged`/`put_many_staged` wrote before staging: those
-/// mutate the collection generation, `index_tables`, and the shard packfile
-/// immediately (the `append_put_record` + `insert_index` + `store_generation`
-/// path in `put_internal`). A rolled-back attempt therefore leaves an
-/// *orphaned* record that this process's ordinary reads can still observe.
+/// mutate storage immediately, independent of the stage's later discard or
+/// publish outcome. A rolled-back attempt therefore leaves an *orphaned*
+/// record that this process's ordinary reads can still observe.
 ///
 /// # Why an orphan is (conditionally) tolerable
 ///
-/// The crate-level contract is append-only: records are content-addressed,
-/// never mutated, never deleted, never tombstoned, and garbage collection is a
-/// background repack that rewrites only reachable data. An orphan is inert and
-/// is dropped the next time `repack_collection_reachable` rewrites its
-/// collection.
+/// Individual content-addressed records are append-only within a live
+/// collection: once put, a record is never mutated or individually deleted
+/// or tombstoned (whole-collection deletion is a separate, coarser
+/// operation — see `delete_collection`). Garbage collection is a background
+/// repack that rewrites only reachable data, so a record-level orphan is
+/// inert and is dropped the next time `repack_collection_reachable`
+/// rewrites its collection.
 ///
 /// That reaping is **conditional, not blanket**. Repack keys on the
 /// collection's `live_roots`, and
@@ -113,7 +114,9 @@ struct TxnStageData {
 /// pins that a collection with no live roots keeps *everything*, orphans
 /// included. So "a discarded staged write is eventually reaped" holds only
 /// where the collection's live roots exclude the orphan; for a rootless
-/// collection (`event_json`'s shape) the orphan is permanent.
+/// collection (`event_json`'s shape) the orphan is retained by repack and
+/// not reclaimed that way (though it may still be removed by other
+/// administrative action, e.g. collection deletion).
 ///
 /// # Checkpoint hazard
 ///

@@ -5817,13 +5817,19 @@ impl PackfileStorage {
     ///
     /// The packfile and live-index mutation happen immediately and
     /// unconditionally, regardless of `stage`'s eventual `discard()` or
-    /// publish outcome — only the journal entry (visibility to other
-    /// processes) is deferred. `TxnStage::discard()` cannot undo this write:
-    /// on SQL rollback the record remains visible to in-process reads and,
-    /// if an index checkpoint runs before the rollback is handled, the
-    /// checkpoint can retain the record across a reopen; whether a later
-    /// repack removes it then depends on the collection's live-root policy.
-    /// Do not use this API where SQL
+    /// publish outcome — only *journal* visibility (the mechanism other
+    /// processes normally use to observe new writes) is deferred to publish.
+    /// The packfile bytes and this process's live index are updated eagerly,
+    /// so a reader that refreshes or rebuilds its durable index, or an
+    /// in-process reader, can observe the record even before the journal
+    /// entry is published. `TxnStage::discard()` cannot undo this write —
+    /// and neither can a `stage_puts` failure after the eager mutation has
+    /// already happened, so a failed staged write is not rollback-safe
+    /// either. On SQL rollback the record remains visible to in-process
+    /// reads and, if an index checkpoint runs before the rollback is
+    /// handled, the checkpoint can retain the record across a reopen;
+    /// whether a later repack removes it then depends on the collection's
+    /// live-root policy. Do not use this API where SQL
     /// transaction atomicity is required until the index mutation itself is
     /// deferred to commit (a private write set / transaction-local overlay).
     ///
@@ -11034,13 +11040,16 @@ mod tests {
             assert_eq!(got.bytes.as_ref(), b"staged".as_slice());
 
             // A checkpoint taken after the discard captures the orphan into
-            // the on-disk checkpoint state.
+            // the on-disk checkpoint state; `sync()` then fsyncs the shard
+            // and checkpoint so the reopen below reads genuinely durable
+            // state, not just an OS page-cache artifact of the same process.
             store.persist_index_checkpoint().unwrap();
+            store.sync().unwrap();
         }
 
         // Reopen from scratch: this proves the checkpoint actually captured
-        // the record on disk, rather than the earlier read having been
-        // served from the still-live in-memory index.
+        // the record durably on disk, rather than the earlier read having
+        // been served from the still-live in-memory index.
         let reopened = PackfileStorage::open(dir).unwrap();
         let got_after_reopen = reopened
             .get(&TEST_COLLECTION, &id)
