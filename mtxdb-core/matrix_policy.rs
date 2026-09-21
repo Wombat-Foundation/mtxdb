@@ -46,6 +46,11 @@ pub enum ReferenceHashEncoding {
 }
 
 /// What fields are stripped before calculating a reference-hash event ID.
+///
+/// A reference hash is taken over the *redacted* event, so this boundary
+/// tracks [`RedactionPolicy`]: whenever the redaction algorithm changes, the
+/// reference-hash input changes with it. Version 11 changed the redaction
+/// algorithm, so v9/v10 and v11+ cannot share one variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceHashInputPolicy {
     /// Event IDs are server-assigned, so no reference-hash input exists.
@@ -54,8 +59,10 @@ pub enum ReferenceHashInputPolicy {
     V1ToV5,
     /// Room version 6 to 8.
     V6ToV8,
-    /// Room version 9 and later.
-    V9Plus,
+    /// Room version 9 to 10.
+    V9ToV10,
+    /// Room version 11 and later.
+    V11Plus,
 }
 
 /// Versioned Matrix redaction content table.
@@ -188,7 +195,8 @@ impl MatrixRoomVersion {
             Self::V1 | Self::V2 => ReferenceHashInputPolicy::NotApplicable,
             Self::V3 | Self::V4 | Self::V5 => ReferenceHashInputPolicy::V1ToV5,
             Self::V6 | Self::V7 | Self::V8 => ReferenceHashInputPolicy::V6ToV8,
-            _ => ReferenceHashInputPolicy::V9Plus,
+            Self::V9 | Self::V10 => ReferenceHashInputPolicy::V9ToV10,
+            Self::V11 | Self::V12 => ReferenceHashInputPolicy::V11Plus,
         }
     }
 
@@ -291,5 +299,26 @@ mod tests {
             MatrixRoomVersion::V12.state_resolution_policy(),
             StateResolutionPolicy::V2_1
         );
+    }
+
+    /// A reference hash is over the redacted event, so its input policy must
+    /// split at the same v11 boundary the redaction algorithm does. v9/v10
+    /// and v11/v12 must not collapse to one variant.
+    #[test]
+    fn reference_hash_input_policy_splits_at_v11() {
+        for version in [MatrixRoomVersion::V9, MatrixRoomVersion::V10] {
+            assert_eq!(version.redaction_policy(), RedactionPolicy::V9ToV10);
+            assert_eq!(
+                version.reference_hash_input_policy(),
+                ReferenceHashInputPolicy::V9ToV10
+            );
+        }
+        for version in [MatrixRoomVersion::V11, MatrixRoomVersion::V12] {
+            assert_eq!(version.redaction_policy(), RedactionPolicy::V11Plus);
+            assert_eq!(
+                version.reference_hash_input_policy(),
+                ReferenceHashInputPolicy::V11Plus
+            );
+        }
     }
 }
