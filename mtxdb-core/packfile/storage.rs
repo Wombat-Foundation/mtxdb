@@ -9127,20 +9127,33 @@ mod tests {
     #[test]
     fn test_get_many_with_refresh_disabled_is_authoritative() {
         let dir = test_dir("refresh_disabled_authoritative");
-        let store = PackfileStorage::open(dir).unwrap();
+        let store = Arc::new(PackfileStorage::open(dir).unwrap());
         // A single writer's in-memory index is authoritative for every key it
         // has written, so a negative lookup must bypass the refresh lock and
         // the durable-fingerprint probe entirely rather than paying either.
         store.set_refresh_on_miss(false);
 
         let missing = [[0xF0u8; 16], [0xF1u8; 16]];
-        for _ in 0..2 {
-            assert!(store
+        let refresh_lock = store.refresh_lock(&TEST_COLLECTION);
+        let refresh_guard = refresh_lock.lock();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader_store = Arc::clone(&store);
+        let reader = std::thread::spawn(move || {
+            let result = reader_store
                 .get_many_with_refresh(&TEST_COLLECTION, &missing)
                 .unwrap()
                 .iter()
-                .all(Option::is_none));
-        }
+                .all(Option::is_none);
+            sender.send(result).unwrap();
+        });
+
+        // Keep the refresh lock held while the lookup runs. The writer path
+        // must return from the in-memory index without waiting for it.
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap());
+        drop(refresh_guard);
+        reader.join().unwrap();
 
         let stats = store.stats();
         assert_eq!(stats.miss_refreshes, 0);
