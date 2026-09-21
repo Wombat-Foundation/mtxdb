@@ -7745,6 +7745,72 @@ mod tests {
         }
     }
 
+    /// With a journal enabled, `sync` makes the WAL group commit the
+    /// durability point rather than the per-shard pack fsyncs.
+    #[test]
+    fn journal_sync_routes_durability_through_wal() {
+        let dir = test_dir("journal_sync_routing");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(dir.join("wal.bin")).unwrap();
+        let id = distinct_id(7);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"wal")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        let timings = store.sync_timings().expect("sync must record timings");
+        assert!(
+            timings.wal > Duration::ZERO,
+            "the journal group commit is the durability point"
+        );
+        assert_eq!(
+            timings.pack_fsync,
+            Duration::ZERO,
+            "the barrier path must not fsync pack shards with a WAL"
+        );
+        assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
+        assert!(store.journal().expect("journal enabled").committed_lsn() >= 1);
+    }
+
+    /// A mutation committed to the journal after the last checkpoint is
+    /// re-applied by `replay_journal` on a fresh open.
+    #[test]
+    fn journal_replays_post_checkpoint_mutations_on_reopen() {
+        let dir = test_dir("journal_replay");
+        let journal_path = dir.join("wal.bin");
+        let id = distinct_id(9);
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store.enable_journal(&journal_path).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(8),
+                    &NodeData::new(bytes::Bytes::from_static(b"checkpointed")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+            // A second, non-structural put: the next sync's delta path does not
+            // write a checkpoint, so this mutation stays journal-only.
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &id,
+                    &NodeData::new(bytes::Bytes::from_static(b"wal-only")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+        }
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.enable_journal(&journal_path).unwrap();
+        let replayed = reopened.replay_journal().unwrap();
+        assert!(replayed >= 1, "the post-checkpoint mutation must be replayed");
+        assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+
     #[test]
     fn test_swizzle_callback() {
         static SWIZZLE_CALLS: AtomicU64 = AtomicU64::new(0);
