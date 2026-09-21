@@ -962,6 +962,9 @@ impl ReadJournal {
         self.delete_lsn.clear();
         self.observed_lsn = 0;
         self.observed_valid_len = 0;
+        // Zero the length too, so an equal-length segment after a reload still
+        // forces a full rescan instead of short-circuiting on `len == observed_len`.
+        self.observed_len = 0;
     }
 
     /// Discard overlay state the durable index this reader loaded now covers.
@@ -1023,7 +1026,8 @@ impl ReadJournal {
                 self.reset_overlay();
                 reset = true;
             }
-            let scan = if self.observed_valid_len == 0 {
+            let full_scan = self.observed_valid_len == 0;
+            let scan = if full_scan {
                 Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
             } else {
                 // Read only the tail past the last complete group. A failure
@@ -1041,7 +1045,11 @@ impl ReadJournal {
                     Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
                 }
             };
-            if reset && Self::reset_has_coverage_gap(&scan, covered) {
+            // A full rescan has no continuity with the previous overlay, so it
+            // must be gap-checked too — not only an explicit shrink. Without
+            // this, a reload that rebinds `covered` below the segment base
+            // would silently serve a hole.
+            if (reset || full_scan) && Self::reset_has_coverage_gap(&scan, covered) {
                 return Ok(ReadRefresh::NeedsReload);
             }
             for group in &scan.groups {
@@ -1499,16 +1507,18 @@ impl PackfileStorage {
         // always yields a bound <= the coverage of the checkpoint/scan below.
         let read_covered = Self::read_journal_lsn(&base_dir);
         timings.metadata_load = metadata_started.elapsed();
-        if let Some((scan_out, collection_order, delta_state)) = Self::checkpoint_scan_out(
-            &base_dir,
-            cache_capacity,
-            &shards,
-            &open_shards,
-            &deleted_collections,
-            writable,
-            index_config,
-            &mut timings,
-        ) {
+        if let Some((scan_out, collection_order, delta_state, checkpoint_covered)) =
+            Self::checkpoint_scan_out(
+                &base_dir,
+                cache_capacity,
+                &shards,
+                &open_shards,
+                &deleted_collections,
+                writable,
+                index_config,
+                &mut timings,
+            )
+        {
             timings.path = OpenPath::Checkpoint;
             let store = Self::assemble(
                 shards,
@@ -1519,7 +1529,7 @@ impl PackfileStorage {
                 swizzle,
                 cache_capacity,
                 delta_state,
-                read_covered,
+                checkpoint_covered,
             );
             timings.total = started.elapsed();
             *store.last_open_timings.lock() = Some(timings);
@@ -1967,12 +1977,13 @@ impl PackfileStorage {
         writable: bool,
         index_config: crate::index::IndexConfig,
         timings: &mut OpenTimings,
-    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState)> {
+    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
         let decode_started = std::time::Instant::now();
         let checkpoint =
             crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir));
         timings.checkpoint_decode = decode_started.elapsed();
         let checkpoint = checkpoint?;
+        let covered_lsn = checkpoint.covered_lsn;
         let fingerprint_started = std::time::Instant::now();
         let packs: Vec<(u64, u64)> = open_shards
             .iter()
@@ -2357,7 +2368,7 @@ impl PackfileStorage {
             ..DeltaLogState::default()
         };
 
-        Some((scan_out, collection_order, delta_state))
+        Some((scan_out, collection_order, delta_state, covered_lsn))
     }
 
     fn generation(&self, collection_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
@@ -3109,6 +3120,7 @@ impl PackfileStorage {
         crate::index::checkpoint::write_checkpoint(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
+            wal_lsn.unwrap_or(0),
             &blobs,
         )
         .map_err(StorageError::Io)?;
@@ -3273,6 +3285,7 @@ impl PackfileStorage {
         crate::index::checkpoint::write_checkpoint(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
+            0,
             &blobs,
         )
         .map_err(StorageError::Io)?;
@@ -3363,6 +3376,7 @@ impl PackfileStorage {
         crate::index::checkpoint::write_checkpoint(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
+            0,
             &blobs,
         )
         .map_err(StorageError::Io)?;
@@ -5564,32 +5578,51 @@ impl PackfileStorage {
     /// Coverage is captured before the checkpoint is read, so the new bound can
     /// never be newer than the index loaded below.
     fn reload_index_from_checkpoint(&self) -> bool {
-        let covered = Self::read_journal_lsn(&self.base_dir);
+        // A writer may have created new packs since this handle opened, and the
+        // checkpoint it wrote names that new pack set. Rediscover before
+        // building the fingerprint, or the reload can never match.
+        if self.shards.discover_shards().is_err() {
+            return false;
+        }
+        // Stat each pack rather than trusting the pool's cached length: the
+        // writer appends to existing packs, and the checkpoint it wrote names
+        // the grown length. A failed stat falls back to the cached length so a
+        // concurrently-retired pack cannot panic the read path.
         let open_shards: Vec<(u16, u64, PathBuf, u64)> = self
             .shards
             .all_shards()
             .into_iter()
-            .map(|(id, shard)| (id, shard.pack_id, shard.path.clone(), shard.file_len()))
+            .map(|(id, shard)| {
+                let len =
+                    fs::metadata(&shard.path).map_or_else(|_| shard.file_len(), |meta| meta.len());
+                (id, shard.pack_id, shard.path.clone(), len)
+            })
             .collect();
         let deleted_collections = self.deleted_collections.lock().clone();
         let mut timings = OpenTimings::default();
-        let Some((scan_out, collection_order, _delta_state)) = Self::checkpoint_scan_out(
-            &self.base_dir,
-            self.cache_capacity,
-            &self.shards,
-            &open_shards,
-            &deleted_collections,
-            false,
-            self.index_config,
-            &mut timings,
-        ) else {
+        let Some((scan_out, collection_order, _delta_state, checkpoint_covered)) =
+            Self::checkpoint_scan_out(
+                &self.base_dir,
+                self.cache_capacity,
+                &self.shards,
+                &open_shards,
+                &deleted_collections,
+                false,
+                self.index_config,
+                &mut timings,
+            )
+        else {
             return false;
         };
         *self.collections.write() = scan_out.collections;
         *self.collection_order.write() = collection_order;
         *self.shard_collections.write() = scan_out.shard_collections;
         *self.collection_shards.write() = scan_out.collection_shards;
-        self.read_covered_lsn.store(covered, Ordering::Release);
+        // Bind coverage to the checkpoint actually loaded, not to a
+        // separately-read `journal.lsn` that a concurrent checkpoint may
+        // already have advanced past this index.
+        self.read_covered_lsn
+            .store(checkpoint_covered, Ordering::Release);
         true
     }
 
@@ -7502,35 +7535,28 @@ mod tests {
         let collection = [0x44u8; 16];
         let node = [0x09u8; 16];
 
-        let seed = PackfileStorage::open(dir.clone()).unwrap();
-        seed.put(
-            &[0x98u8; 16],
-            &[0x98u8; 16],
-            &NodeData::new(bytes::Bytes::from_static(b"seed")),
-        )
-        .unwrap();
-        seed.sync().unwrap();
-        // Claim the checkpoint already covers LSN 1, as if reclaim were
-        // deferred. The overlay must not serve that journal entry.
-        seed.write_journal_lsn(1).unwrap();
-        drop(seed);
-
-        let (mut journal, _) = Journal::open(&wal).unwrap();
-        journal
-            .append_group(&[JournalMutation::Put {
-                collection_id: collection,
-                node_id: node,
-                payload: b"covered".to_vec(),
-            }])
+        // A real writer with a journal: its sync checkpoints the put and embeds
+        // the covered LSN atomically, so the node is both durable and covered
+        // rather than the test merely claiming coverage the index never had.
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer
+            .put(
+                &collection,
+                &node,
+                &NodeData::new(bytes::Bytes::from_static(b"covered")),
+            )
             .unwrap();
-        drop(journal);
+        writer.sync().unwrap();
+        drop(writer);
 
         let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
         store.enable_read_journal(&wal).unwrap();
         let read_committed = store.get_read_committed(&collection, &[node]).unwrap();
-        assert!(
-            read_committed[0].is_none(),
-            "an entry at or below the checkpoint's covered LSN must not be served from the overlay"
+        assert_eq!(
+            read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"covered"[..]),
+            "an entry the checkpoint covers must be served from the durable index"
         );
     }
 
@@ -7646,6 +7672,7 @@ mod tests {
         let first = [0x11u8; 16];
         let second = [0x12u8; 16];
 
+        // Durable seed, then an empty journal segment the reader can attach to.
         let seed = PackfileStorage::open(dir.clone()).unwrap();
         seed.put(
             &[0x94u8; 16],
@@ -7655,15 +7682,30 @@ mod tests {
         .unwrap();
         seed.sync().unwrap();
         drop(seed);
+        let (journal, _) = Journal::open(&wal).unwrap();
+        drop(journal);
 
-        let (mut journal, _) = Journal::open(&wal).unwrap();
-        journal
-            .append_group(&[JournalMutation::Put {
-                collection_id: collection,
-                node_id: first,
-                payload: b"first".to_vec(),
-            }])
+        // Reader attaches with the pre-advance index (coverage 0).
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        // A real writer checkpoints `first` and reclaims through its LSN, so the
+        // checkpoint embeds coverage 1 and its index contains `first`.
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer
+            .put(
+                &collection,
+                &first,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
             .unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        // `second` is committed to the journal after the checkpoint, so it must
+        // be served from the overlay once the checkpoint index is reloaded.
+        let (mut journal, _) = Journal::open(&wal).unwrap();
         journal
             .append_group(&[JournalMutation::Put {
                 collection_id: collection,
@@ -7673,29 +7715,18 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
-        store.enable_read_journal(&wal).unwrap();
-
-        // The writer checkpoints LSN 1 and reclaims through it, so the segment
-        // now begins at LSN 2 while the reader's index incorporated only
-        // coverage 0. Reloading the checkpoint must advance the pair and let
-        // the surviving group stay readable, rather than erroring forever.
-        store.write_journal_lsn(1).unwrap();
-        let (mut journal, _) = Journal::open(&wal).unwrap();
-        journal.reclaim_through(1).unwrap();
-        drop(journal);
-
         let read_committed = store
             .get_read_committed(&collection, &[first, second])
             .unwrap();
-        assert!(
-            read_committed[0].is_none(),
-            "the reclaimed group must not be resurrected"
+        assert_eq!(
+            read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"first"[..]),
+            "the reloaded checkpoint index must serve the covered record, not a hole"
         );
         assert_eq!(
             read_committed[1].as_ref().map(|data| data.bytes.as_ref()),
             Some(&b"second"[..]),
-            "the surviving group must remain readable after the reload"
+            "the post-checkpoint group must be served from the overlay"
         );
     }
 

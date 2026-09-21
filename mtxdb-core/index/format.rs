@@ -10,7 +10,7 @@ compile_error!("the persisted index cache is currently supported only on little-
 /// Bytes in one [`DeltaFrame`].
 pub const DELTA_FRAME_LEN: usize = 36;
 /// Bytes in the checkpoint header.
-pub const CHECKPOINT_HEADER_LEN: usize = 64;
+pub const CHECKPOINT_HEADER_LEN: usize = 72;
 /// Bytes in one collection directory entry.
 pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
 
@@ -88,6 +88,12 @@ pub struct CheckpointHeader {
     /// Total byte length of the tails section (all collections concatenated).
     /// Zero for pre-v4 checkpoints.
     pub tails_bytes: u64,
+    /// Journal LSN whose mutations this checkpoint's index snapshot already
+    /// incorporates. Written atomically with the checkpoint, so a reader can
+    /// bind its overlay coverage to exactly the index it loaded rather than to
+    /// a separately-read `journal.lsn` that may have advanced past it. Zero
+    /// when the checkpoint was written without a journal.
+    pub covered_lsn: u64,
 }
 
 impl CheckpointHeader {
@@ -104,6 +110,7 @@ impl CheckpointHeader {
         bytes[40..44].copy_from_slice(&self.content_crc32.to_le_bytes());
         bytes[44..52].copy_from_slice(&self.homes_bytes.to_le_bytes());
         bytes[52..60].copy_from_slice(&self.tails_bytes.to_le_bytes());
+        bytes[60..68].copy_from_slice(&self.covered_lsn.to_le_bytes());
         bytes
     }
 
@@ -121,6 +128,7 @@ impl CheckpointHeader {
             content_crc32: u32::from_le_bytes(bytes[40..44].try_into().ok()?),
             homes_bytes: u64::from_le_bytes(bytes[44..52].try_into().ok()?),
             tails_bytes: u64::from_le_bytes(bytes[52..60].try_into().ok()?),
+            covered_lsn: u64::from_le_bytes(bytes[60..68].try_into().ok()?),
         })
     }
 }
@@ -201,6 +209,7 @@ mod tests {
             content_crc32: 0xDEAD_BEEF,
             homes_bytes: 0,
             tails_bytes: 0,
+            covered_lsn: 11,
         };
         assert_eq!(CheckpointHeader::decode(&header.encode()), Some(header));
 

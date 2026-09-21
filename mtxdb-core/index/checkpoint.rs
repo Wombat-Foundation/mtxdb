@@ -42,12 +42,17 @@ use super::format::{
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Current wire version (see [`CheckpointHeader::version`]).
 ///
+/// Bumped to 5: the header now carries the journal `covered_lsn` the index
+/// snapshot incorporates, so a read-committed reader binds its overlay
+/// coverage to the exact index it loaded instead of a separately-read
+/// `journal.lsn`. A v4 checkpoint has no such field and is rebuilt.
+///
 /// Bumped to 4: homes and tails are now persisted alongside packed slots.
 /// A pre-v4 checkpoint has `homes_bytes`/`tails_bytes` of 0 and is loaded
 /// with empty identity side tables (cold-start tag-collision verification
 /// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
 /// reads for tag collisions on cold start.
-pub const CHECKPOINT_VERSION: u32 = 4;
+pub const CHECKPOINT_VERSION: u32 = 5;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 
@@ -93,6 +98,10 @@ static CHECKPOINT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct LoadedCheckpoint {
     /// The pack-fingerprint the checkpoint was written against.
     pub fingerprint: u64,
+    /// Journal LSN this checkpoint's index snapshot covers, captured atomically
+    /// with the snapshot. Zero when the checkpoint was written without a
+    /// journal.
+    pub covered_lsn: u64,
     /// One entry per collection, in the checkpoint's directory order.
     pub collections: Vec<LoadedCollection>,
     /// Keeps the raw slot arrays alive for mmap-backed indexes built from
@@ -194,6 +203,7 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
 pub fn write_checkpoint(
     path: &Path,
     fingerprint: u64,
+    covered_lsn: u64,
     collections: &[([u8; 16], u64, &[u8])],
 ) -> std::io::Result<()> {
     let count = u32::try_from(collections.len())
@@ -336,6 +346,7 @@ pub fn write_checkpoint(
         content_crc32,
         homes_bytes,
         tails_bytes,
+        covered_lsn,
     };
     buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
@@ -490,6 +501,7 @@ pub fn read_checkpoint_with_policy(
 
     Some(LoadedCheckpoint {
         fingerprint: header.pack_fingerprint,
+        covered_lsn: header.covered_lsn,
         collections,
         mmap,
     })
@@ -644,6 +656,7 @@ mod tests {
         write_checkpoint(
             &path,
             fingerprint,
+            0,
             &blobs
                 .iter()
                 .map(|(id, blob)| (*id, 0, blob.as_slice()))
@@ -720,7 +733,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
-        write_checkpoint(&path, pack_fingerprint(&[]), &[]).unwrap();
+        write_checkpoint(&path, pack_fingerprint(&[]), 0, &[]).unwrap();
         let loaded = read_checkpoint(&path).expect("empty checkpoint is still a valid file");
         assert_eq!(loaded.fingerprint, pack_fingerprint(&[]));
         assert!(loaded.collections.is_empty());
@@ -742,6 +755,7 @@ mod tests {
         write_checkpoint(
             &path,
             0,
+            0,
             &blobs
                 .iter()
                 .map(|(id, b)| (*id, 0, b.as_slice()))
@@ -760,6 +774,7 @@ mod tests {
         // Wrong version byte in an otherwise valid file.
         write_checkpoint(
             &path,
+            0,
             0,
             &blobs
                 .iter()
@@ -798,6 +813,7 @@ mod tests {
         let blobs = [([7u8; 16], index_with_entries(3, 40).serialize())];
         write_checkpoint(
             &path,
+            0,
             0,
             &blobs
                 .iter()
@@ -895,6 +911,7 @@ mod tests {
             content_crc32: 0,
             homes_bytes: 0,
             tails_bytes: 0,
+            covered_lsn: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 
@@ -932,6 +949,7 @@ mod tests {
             content_crc32: 0,
             homes_bytes: 0,
             tails_bytes: 0,
+            covered_lsn: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 
