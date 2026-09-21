@@ -829,6 +829,56 @@ pub fn append_batch(
     Ok(appended)
 }
 
+/// Append one v3 batch of length-prefixed operations (optional header, then a
+/// count-framed batch) to the delta log. Returns the number of bytes appended.
+///
+/// Mirrors [`append_batch`], but the frame region holds self-describing
+/// [`DeltaOperation`] frames whose widths vary per operation, so the batch
+/// header's operation count (not a fixed frame width) bounds the region. When
+/// `write_header` is set, the file gets a v3 log header, starting a fresh v3
+/// epoch — only legitimate once a full checkpoint established the new base.
+/// Deliberately does not fsync: same rebuildable-acceleration contract as
+/// [`append_batch`], so a crash may tear the tail the framing drops.
+///
+/// # Errors
+/// Returns an error if the operation count exceeds `u32` or a frame fails to
+/// encode (a payload length beyond `u32`).
+pub fn append_v3_batch(
+    path: &Path,
+    write_header: bool,
+    base_fingerprint: u64,
+    operations: &[DeltaOperation],
+    tail_fingerprint: u64,
+) -> std::io::Result<usize> {
+    let operation_count = u32::try_from(operations.len())
+        .map_err(|_| std::io::Error::other("delta batch exceeds u32 operation count"))?;
+    let mut appended = 0usize;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if write_header {
+        let mut header = encode_header(base_fingerprint);
+        header[4] = DELTA_LOG_VERSION_V3;
+        file.write_all(&header)?;
+        appended = appended.saturating_add(DELTA_LOG_HEADER_LEN);
+    }
+    file.write_all(&encode_batch_header(operation_count))?;
+    appended = appended.saturating_add(DELTA_BATCH_HEADER_LEN);
+    let mut frames_bytes = Vec::new();
+    for operation in operations {
+        frames_bytes.extend_from_slice(&encode_v3_frame(operation)?);
+    }
+    file.write_all(&frames_bytes)?;
+    appended = appended.saturating_add(frames_bytes.len());
+    file.write_all(&encode_trailer(
+        tail_fingerprint,
+        batch_crc(&frames_bytes, tail_fingerprint),
+    ))?;
+    appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
+    Ok(appended)
+}
+
 /// Errors that can arise while applying a replayed delta log to a
 /// checkpoint-backed index. Any of these means the log is structurally
 /// inconsistent with the checkpoint it claims to continue, and the whole log
@@ -1366,5 +1416,41 @@ mod tests {
             decode_v3_frame(&frame).is_none(),
             "declared blob length must match the payload exactly"
         );
+    }
+
+    #[test]
+    fn v3_append_batch_round_trips_through_the_reader() {
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_delta_v3_append_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_DELTA_FILE);
+
+        let first = sample_v3_operations();
+        let mut expected_len = DELTA_LOG_HEADER_LEN
+            .saturating_add(DELTA_BATCH_HEADER_LEN)
+            .saturating_add(DELTA_LOG_TRAILER_LEN);
+        for operation in &first {
+            expected_len = expected_len.saturating_add(encode_v3_frame(operation).unwrap().len());
+        }
+        let appended = append_v3_batch(&path, true, 0xABC, &first, 0x111).expect("append v3 batch");
+        assert_eq!(appended, expected_len, "append reports the bytes it wrote");
+
+        let second = [DeltaOperation::CollectionTombstone {
+            collection_id: [3; 16],
+            generation: 4,
+        }];
+        append_v3_batch(&path, false, 0xABC, &second, 0x222).expect("continue the v3 log");
+
+        let decoded = read_delta_log_v3(&path).expect("appended v3 log reads");
+        assert_eq!(decoded.base_fingerprint, 0xABC);
+        assert_eq!(decoded.tail_fingerprint, 0x222);
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        assert_eq!(decoded.operations, expected);
+        assert!(!decoded.torn_tail);
+        assert_eq!(decoded.file_len, fs::metadata(&path).unwrap().len());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
