@@ -2826,10 +2826,15 @@ impl PackfileStorage {
         // target the new epoch (D1) by the time the locks drop next.
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         // Every collection's put mutex is held here, so no `put` is mid-flight
-        // and every published mutation has completed its index update. The
-        // checkpoint about to be written therefore covers exactly
-        // `published_lsn`; record it so a reopen replays only the suffix.
-        let wal_lsn = self.journal().map(|journal| journal.published_lsn());
+        // and every mutation published so far has completed its index update.
+        // The recorded LSN must be *committed*, not merely published: a
+        // concurrent put can publish above the last WAL commit, and LSNs above
+        // `committed_lsn` are discarded and reused after a crash. Recording one
+        // as covered would make a reopen skip a future mutation that reuses
+        // that LSN (the journal scan only knows the committed prefix). The
+        // committed LSN is conservative -- the fsynced packs above may cover
+        // more -- and replaying that suffix again is idempotent.
+        let wal_lsn = self.journal().map(|journal| journal.committed_lsn());
         drop(guards);
         // `create_guard` is deliberately NOT dropped here, unlike the
         // per-collection put mutexes above. An existing collection's
