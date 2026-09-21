@@ -3562,6 +3562,19 @@ impl PackfileStorage {
             .collect()
     }
 
+    /// Whether `loaded` still refers to the collection's current generation.
+    ///
+    /// The read paths use this to detect a repack that swapped the generation
+    /// (and so may have retired the shards `loaded`'s index points at) between
+    /// an index lookup and pinning those shards. A stable generation means the
+    /// pin happened before any retirement.
+    fn same_generation(
+        current: Option<&arc_swap::Guard<Arc<RoomGeneration>>>,
+        loaded: &arc_swap::Guard<Arc<RoomGeneration>>,
+    ) -> bool {
+        current.is_some_and(|current| Arc::ptr_eq(&**current, &**loaded))
+    }
+
     /// Copy a record from an old (pinned) shard to the active shard.
     /// Returns the new `(hash, shard_id, offset)` or None if `old_shard_id`
     /// isn't in `pinned`.
@@ -3863,9 +3876,27 @@ impl PackfileStorage {
         candidates: impl IntoIterator<Item = (u16, u64)>,
         track: bool,
     ) -> Result<Option<NodeData>, StorageError> {
+        let candidates: Vec<(u16, u64)> = candidates.into_iter().collect();
+        let pinned = self.pin_shards(candidates.iter().map(|&(shard_id, _)| shard_id));
+        self.resolve_from_pinned(id, &candidates, &pinned, track)
+    }
+
+    /// Resolve `id` against `candidates` through `pinned` shard handles.
+    ///
+    /// Holding the pinned `Arc<Shard>`s for the whole read keeps each shard's
+    /// file handle alive, so a concurrent repack that swaps the generation and
+    /// retires those shard ids cannot turn a live record into a miss while the
+    /// lookup is in flight. See [`Self::pin_shards`].
+    fn resolve_from_pinned(
+        &self,
+        id: &NodeId,
+        candidates: &[(u16, u64)],
+        pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+    ) -> Result<Option<NodeData>, StorageError> {
         let mut last_err: Option<StorageError> = None;
-        for (shard_id, offset) in candidates {
-            let Some(shard) = self.shards.get_shard(shard_id) else {
+        for &(shard_id, offset) in candidates {
+            let Some(shard) = pinned.get(&shard_id) else {
                 continue;
             };
 
@@ -3877,7 +3908,7 @@ impl PackfileStorage {
             }
 
             match self.read_at(
-                &shard,
+                shard,
                 offset,
                 self.shards.checksum_policy().verifies_reads(),
             ) {
@@ -5288,35 +5319,51 @@ impl PackfileStorage {
 impl StorageEngine for PackfileStorage {
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
         let track = self.stats_enabled.load(Ordering::Relaxed);
-        let gen_guard = self.generation(collection_id);
-        let gen = gen_guard.as_deref();
-
-        let Some(gen) = gen else {
+        // A concurrent repack can swap the generation and retire the shard ids
+        // its index pointed at. Pin the candidate shards and confirm the
+        // generation did not change between the index lookup and the pin
+        // (retirement only follows a swap); retry against the new generation if
+        // it did.
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let Some(gen) = gen_guard.as_deref() else {
+                if track {
+                    self.get_calls.fetch_add(1, Ordering::Relaxed);
+                    self.get_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(None);
+            };
+            if let Some(data) = gen.cache.get(id) {
+                if track {
+                    self.get_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Some((*data).clone()));
+            }
+            let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+            let pinned = self.pin_shards(candidates.iter().map(|&(shard_id, _)| shard_id));
+            let still_current = match gen_guard.as_ref() {
+                Some(loaded) => {
+                    let current = self.generation(collection_id);
+                    Self::same_generation(current.as_ref(), loaded)
+                }
+                None => true,
+            };
+            if !still_current {
+                continue;
+            }
+            if track {
+                self.index_candidates
+                    .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+            }
+            let result = self.resolve_from_pinned(id, &candidates, &pinned, track);
             if track {
                 self.get_calls.fetch_add(1, Ordering::Relaxed);
-                self.get_misses.fetch_add(1, Ordering::Relaxed);
+                if result.as_ref().is_ok_and(Option::is_none) {
+                    self.get_misses.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            return Ok(None);
-        };
-        if let Some(data) = gen.cache.get(id) {
-            if track {
-                self.get_calls.fetch_add(1, Ordering::Relaxed);
-            }
-            return Ok(Some((*data).clone()));
+            return result;
         }
-        let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
-        if track {
-            self.index_candidates
-                .fetch_add(candidates.len() as u64, Ordering::Relaxed);
-        }
-        let result = self.resolve_from_candidates(id, candidates, track);
-        if track {
-            self.get_calls.fetch_add(1, Ordering::Relaxed);
-            if result.as_ref().is_ok_and(Option::is_none) {
-                self.get_misses.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        result
     }
 
     fn get_many(
@@ -5325,82 +5372,100 @@ impl StorageEngine for PackfileStorage {
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
         let track = self.stats_enabled.load(Ordering::Relaxed);
-        let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
+        // As in `get`: pin the candidate shards and retry if a concurrent
+        // repack swapped the generation (and so may have retired them) between
+        // the index lookups and the pin.
+        loop {
+            let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
 
-        let gen_guard = self.generation(collection_id);
-        let gen = gen_guard.as_deref();
-
-        let mut to_fetch: Vec<(usize, Vec<(u16, u64)>)> = Vec::new();
-        if let Some(g) = gen {
-            for (i, id) in ids.iter().enumerate() {
-                // The generation-local cache only contains records from this
-                // generation, so it is authoritative for hits. Avoid an
-                // otherwise redundant index probe for the common warm case.
-                if let Some(data) = g.cache.get(id) {
-                    results[i] = Some((*data).clone());
-                    continue;
-                }
-                let candidates: Vec<(u16, u64)> = g.index.lookup_all(id).collect();
-                if track {
-                    self.index_candidates
-                        .fetch_add(candidates.len() as u64, Ordering::Relaxed);
-                }
-                if !candidates.is_empty() {
-                    to_fetch.push((i, candidates));
-                }
-            }
-        }
-
-        to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
-
-        if track {
-            let touched: HashSet<u16> = to_fetch
-                .iter()
-                .flat_map(|(_, candidates)| candidates.iter().map(|(shard_id, _)| *shard_id))
-                .collect();
-            self.get_many_shards_touched
-                .fetch_add(touched.len() as u64, Ordering::Relaxed);
-
-            let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
-            for (_, candidates) in &to_fetch {
-                for (shard_id, offset) in candidates {
-                    per_shard.entry(*shard_id).or_default().push(*offset);
-                }
-            }
-            let mut runs: u64 = 0;
-            let mut span: u64 = 0;
-            for offsets in per_shard.values_mut() {
-                offsets.sort_unstable();
-                let first = *offsets.first().expect("offsets non-empty by construction");
-                let last = *offsets.last().expect("offsets non-empty by construction");
-                runs = runs.saturating_add(1);
-                span = span.saturating_add(last.saturating_sub(first));
-                for pair in offsets.windows(2) {
-                    if pair[1].saturating_sub(pair[0]) > READ_RUN_GAP_BYTES {
-                        runs = runs.saturating_add(1);
+            let gen_guard = self.generation(collection_id);
+            let mut to_fetch: Vec<(usize, Vec<(u16, u64)>)> = Vec::new();
+            let mut candidates_seen: u64 = 0;
+            if let Some(g) = gen_guard.as_deref() {
+                for (i, id) in ids.iter().enumerate() {
+                    // The generation-local cache only contains records from this
+                    // generation, so it is authoritative for hits. Avoid an
+                    // otherwise redundant index probe for the common warm case.
+                    if let Some(data) = g.cache.get(id) {
+                        results[i] = Some((*data).clone());
+                        continue;
+                    }
+                    let candidates: Vec<(u16, u64)> = g.index.lookup_all(id).collect();
+                    candidates_seen = candidates_seen.saturating_add(candidates.len() as u64);
+                    if !candidates.is_empty() {
+                        to_fetch.push((i, candidates));
                     }
                 }
             }
-            self.read_many_runs.fetch_add(runs, Ordering::Relaxed);
-            self.read_many_span_bytes.fetch_add(span, Ordering::Relaxed);
-        }
 
-        for (i, candidates) in &to_fetch {
-            results[*i] =
-                self.resolve_from_candidates(&ids[*i], candidates.iter().copied(), track)?;
-        }
-
-        if track {
-            self.get_many_calls.fetch_add(1, Ordering::Relaxed);
-            self.get_many_records
-                .fetch_add(ids.len() as u64, Ordering::Relaxed);
-            self.get_many_misses.fetch_add(
-                results.iter().filter(|r| r.is_none()).count() as u64,
-                Ordering::Relaxed,
+            let pinned = self.pin_shards(
+                to_fetch
+                    .iter()
+                    .flat_map(|(_, candidates)| candidates.iter().map(|&(shard_id, _)| shard_id)),
             );
-        }
+            let still_current = match gen_guard.as_ref() {
+                Some(loaded) => {
+                    let current = self.generation(collection_id);
+                    Self::same_generation(current.as_ref(), loaded)
+                }
+                None => true,
+            };
+            if !still_current {
+                continue;
+            }
 
-        Ok(results)
+            to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
+
+            if track {
+                self.index_candidates
+                    .fetch_add(candidates_seen, Ordering::Relaxed);
+                let touched: HashSet<u16> = to_fetch
+                    .iter()
+                    .flat_map(|(_, candidates)| candidates.iter().map(|(shard_id, _)| *shard_id))
+                    .collect();
+                self.get_many_shards_touched
+                    .fetch_add(touched.len() as u64, Ordering::Relaxed);
+
+                let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+                for (_, candidates) in &to_fetch {
+                    for (shard_id, offset) in candidates {
+                        per_shard.entry(*shard_id).or_default().push(*offset);
+                    }
+                }
+                let mut runs: u64 = 0;
+                let mut span: u64 = 0;
+                for offsets in per_shard.values_mut() {
+                    offsets.sort_unstable();
+                    let first = *offsets.first().expect("offsets non-empty by construction");
+                    let last = *offsets.last().expect("offsets non-empty by construction");
+                    runs = runs.saturating_add(1);
+                    span = span.saturating_add(last.saturating_sub(first));
+                    for pair in offsets.windows(2) {
+                        if pair[1].saturating_sub(pair[0]) > READ_RUN_GAP_BYTES {
+                            runs = runs.saturating_add(1);
+                        }
+                    }
+                }
+                self.read_many_runs.fetch_add(runs, Ordering::Relaxed);
+                self.read_many_span_bytes.fetch_add(span, Ordering::Relaxed);
+            }
+
+            for (i, candidates) in &to_fetch {
+                results[*i] = self.resolve_from_pinned(&ids[*i], candidates, &pinned, track)?;
+            }
+
+            if track {
+                self.get_many_calls.fetch_add(1, Ordering::Relaxed);
+                self.get_many_records
+                    .fetch_add(ids.len() as u64, Ordering::Relaxed);
+                self.get_many_misses.fetch_add(
+                    results.iter().filter(|r| r.is_none()).count() as u64,
+                    Ordering::Relaxed,
+                );
+            }
+
+            return Ok(results);
+        }
     }
 
     fn put(
