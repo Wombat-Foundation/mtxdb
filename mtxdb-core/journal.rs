@@ -380,6 +380,73 @@ fn encode_mutation(lsn: u64, mutation: &Mutation, into: &mut Vec<u8>) -> io::Res
     Ok(())
 }
 
+/// Validated fixed fields of one committed group header.
+struct GroupHeader {
+    sequence: u64,
+    first_lsn: u64,
+    last_lsn: u64,
+    payload_len: u64,
+    record_count: u32,
+}
+
+/// Validate a group header's magic, length, and CRC, returning its fields.
+fn parse_group_header(header: &[u8]) -> io::Result<GroupHeader> {
+    if &header[..4] != GROUP_MAGIC
+        || u32::from_le_bytes(header[4..8].try_into().expect("fixed slice"))
+            != u32::try_from(GROUP_HEADER_LEN).expect("GROUP_HEADER_LEN fits in u32")
+    {
+        return Err(invalid_data("invalid journal group header"));
+    }
+    let mut header_crc = Hasher::new();
+    header_crc.update(&header[..44]);
+    if u32::from_le_bytes(header[44..48].try_into().expect("fixed slice")) != header_crc.finalize()
+    {
+        return Err(invalid_data("journal group header checksum mismatch"));
+    }
+    Ok(GroupHeader {
+        sequence: u64::from_le_bytes(header[8..16].try_into().expect("fixed slice")),
+        first_lsn: u64::from_le_bytes(header[16..24].try_into().expect("fixed slice")),
+        last_lsn: u64::from_le_bytes(header[24..32].try_into().expect("fixed slice")),
+        payload_len: u64::from_le_bytes(header[32..40].try_into().expect("fixed slice")),
+        record_count: u32::from_le_bytes(header[40..44].try_into().expect("fixed slice")),
+    })
+}
+
+/// Verify a group's commit trailer and whole-group CRC, returning its payload.
+fn verify_group_payload<'a>(
+    bytes: &'a [u8],
+    header: &[u8],
+    group: &GroupHeader,
+    payload_start: usize,
+    payload_len: usize,
+) -> io::Result<&'a [u8]> {
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or_else(|| invalid_data("journal group length overflow"))?;
+    let trailer_end = payload_end
+        .checked_add(GROUP_TRAILER_LEN)
+        .ok_or_else(|| invalid_data("journal group length overflow"))?;
+    let trailer = bytes
+        .get(payload_end..trailer_end)
+        .ok_or_else(|| invalid_data("truncated journal commit trailer"))?;
+    if &trailer[..4] != GROUP_COMMIT_MAGIC
+        || u64::from_le_bytes(trailer[4..12].try_into().expect("fixed slice")) != group.sequence
+    {
+        return Err(invalid_data("invalid journal commit trailer"));
+    }
+    let payload = bytes
+        .get(payload_start..payload_end)
+        .ok_or_else(|| invalid_data("truncated journal group payload"))?;
+    let mut group_crc = Hasher::new();
+    group_crc.update(header);
+    group_crc.update(payload);
+    if u32::from_le_bytes(trailer[12..16].try_into().expect("fixed slice")) != group_crc.finalize()
+    {
+        return Err(invalid_data("journal committed group checksum mismatch"));
+    }
+    Ok(payload)
+}
+
 fn scan_bytes(bytes: &[u8]) -> io::Result<Scan> {
     if bytes.len() < FILE_HEADER_LEN {
         return Err(invalid_data("truncated journal file header"));
@@ -400,77 +467,40 @@ fn scan_bytes(bytes: &[u8]) -> io::Result<Scan> {
         let header = bytes
             .get(cursor..cursor.saturating_add(GROUP_HEADER_LEN))
             .ok_or_else(|| invalid_data("truncated journal group header"))?;
-        if &header[..4] != GROUP_MAGIC
-            || u32::from_le_bytes(header[4..8].try_into().expect("fixed slice"))
-                != u32::try_from(GROUP_HEADER_LEN).expect("GROUP_HEADER_LEN fits in u32")
-        {
-            return Err(invalid_data("invalid journal group header"));
-        }
-        let mut header_crc = Hasher::new();
-        header_crc.update(&header[..44]);
-        if u32::from_le_bytes(header[44..48].try_into().expect("fixed slice"))
-            != header_crc.finalize()
-        {
-            return Err(invalid_data("journal group header checksum mismatch"));
-        }
-
-        let sequence = u64::from_le_bytes(header[8..16].try_into().expect("fixed slice"));
-        let first_lsn = u64::from_le_bytes(header[16..24].try_into().expect("fixed slice"));
-        let last_lsn = u64::from_le_bytes(header[24..32].try_into().expect("fixed slice"));
-        let payload_len = u64::from_le_bytes(header[32..40].try_into().expect("fixed slice"));
-        let record_count = u32::from_le_bytes(header[40..44].try_into().expect("fixed slice"));
-        if sequence != expected_sequence
-            || first_lsn != expected_lsn
-            || last_lsn < first_lsn
-            || last_lsn.saturating_sub(first_lsn).saturating_add(1) != u64::from(record_count)
-            || record_count == 0
-            || payload_len > MAX_GROUP_LEN
-            || u64::from(record_count).saturating_mul(MIN_FRAME_LEN as u64) > payload_len
+        let group = parse_group_header(header)?;
+        if group.sequence != expected_sequence
+            || group.first_lsn != expected_lsn
+            || group.last_lsn < group.first_lsn
+            || group
+                .last_lsn
+                .saturating_sub(group.first_lsn)
+                .saturating_add(1)
+                != u64::from(group.record_count)
+            || group.record_count == 0
+            || group.payload_len > MAX_GROUP_LEN
+            || u64::from(group.record_count).saturating_mul(MIN_FRAME_LEN as u64)
+                > group.payload_len
         {
             return Err(invalid_data("invalid journal sequence or group bounds"));
         }
-        let payload_len_usize = usize::try_from(payload_len)
+        let payload_len = usize::try_from(group.payload_len)
             .map_err(|_| invalid_data("journal group length exceeds address space"))?;
         let total_len = GROUP_HEADER_LEN
-            .checked_add(payload_len_usize)
+            .checked_add(payload_len)
             .and_then(|len| len.checked_add(GROUP_TRAILER_LEN))
             .ok_or_else(|| invalid_data("journal group length overflow"))?;
         if remaining < total_len {
             truncated_tail = true;
             break;
         }
-
         let payload_start = cursor.saturating_add(GROUP_HEADER_LEN);
-        let payload_end = payload_start
-            .checked_add(payload_len_usize)
-            .ok_or_else(|| invalid_data("journal group length overflow"))?;
-        let trailer_end = payload_end
-            .checked_add(GROUP_TRAILER_LEN)
-            .ok_or_else(|| invalid_data("journal group length overflow"))?;
-        let trailer = bytes
-            .get(payload_end..trailer_end)
-            .ok_or_else(|| invalid_data("truncated journal commit trailer"))?;
-        if &trailer[..4] != GROUP_COMMIT_MAGIC
-            || u64::from_le_bytes(trailer[4..12].try_into().expect("fixed slice")) != sequence
-        {
-            return Err(invalid_data("invalid journal commit trailer"));
-        }
-        let payload = bytes
-            .get(payload_start..payload_end)
-            .ok_or_else(|| invalid_data("truncated journal group payload"))?;
-        let mut group_crc = Hasher::new();
-        group_crc.update(header);
-        group_crc.update(payload);
-        if u32::from_le_bytes(trailer[12..16].try_into().expect("fixed slice"))
-            != group_crc.finalize()
-        {
-            return Err(invalid_data("journal committed group checksum mismatch"));
-        }
-        let entries = decode_mutations(payload, first_lsn, record_count, payload_start)?;
+        let payload = verify_group_payload(bytes, header, &group, payload_start, payload_len)?;
+        let entries =
+            decode_mutations(payload, group.first_lsn, group.record_count, payload_start)?;
         groups.push(CommittedGroup {
-            sequence,
-            first_lsn,
-            last_lsn,
+            sequence: group.sequence,
+            first_lsn: group.first_lsn,
+            last_lsn: group.last_lsn,
             entries,
         });
         cursor = cursor.saturating_add(total_len);
@@ -478,7 +508,8 @@ fn scan_bytes(bytes: &[u8]) -> io::Result<Scan> {
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or_else(|| invalid_data("journal group sequence overflow"))?;
-        expected_lsn = last_lsn
+        expected_lsn = group
+            .last_lsn
             .checked_add(1)
             .ok_or_else(|| invalid_data("journal LSN overflow"))?;
     }
