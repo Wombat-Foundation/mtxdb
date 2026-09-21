@@ -5212,7 +5212,9 @@ impl PackfileStorage {
     ///
     /// A store whose in-memory index is authoritative (a single writer, see
     /// [`Self::set_refresh_on_miss`]) can disable the refresh entirely; the
-    /// call then degrades to a plain [`StorageEngine::get_many`] snapshot.
+    /// call then degrades to a plain [`StorageEngine::get_many`] snapshot,
+    /// skipping the refresh path's miss scan/allocation and lock rather than
+    /// the underlying index lookups.
     ///
     /// # Errors
     /// Returns [`StorageError`] if reading the collection or refreshing its
