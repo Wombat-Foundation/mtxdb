@@ -729,6 +729,14 @@ pub struct PackfileStorage {
     /// on a write-locked or per-call path, never per-record on the hot read
     /// path). See [`Self::set_stats_enabled`].
     stats_enabled: AtomicBool,
+    /// Whether [`Self::get_many_with_refresh`] may rescan a collection when
+    /// the caller's in-memory snapshot misses. On by default. A single-writer
+    /// store sets this `false`: its in-memory index is authoritative for every
+    /// key it has written, so a negative lookup is a true miss and refreshing
+    /// can only spend a durable-fingerprint probe -- and, after each
+    /// checkpoint, a full rescan -- to rediscover nothing. Multi-process
+    /// readers leave it on to observe records the writer process appends.
+    refresh_on_miss: AtomicBool,
     /// Number of times this class of store was assembled in this process — 1
     /// for a fresh open. Not reset by `reset_stats` (it counts stores, not work).
     open_count: AtomicU64,
@@ -1523,6 +1531,7 @@ impl PackfileStorage {
             checkpoint_bytes_at_last_rewrite: AtomicU64::new(0),
             checkpoint_skips: AtomicU64::new(0),
             stats_enabled: AtomicBool::new(false),
+            refresh_on_miss: AtomicBool::new(true),
             open_count: AtomicU64::new(1),
             get_calls: AtomicU64::new(0),
             get_misses: AtomicU64::new(0),
@@ -5199,6 +5208,10 @@ impl PackfileStorage {
     /// collection and successful refreshes are rate-limited briefly so a run
     /// of genuine negative lookups cannot cause a full pack scan per lookup.
     ///
+    /// A store whose in-memory index is authoritative (a single writer, see
+    /// [`Self::set_refresh_on_miss`]) can disable the refresh entirely; the
+    /// call then degrades to a plain [`StorageEngine::get_many`] snapshot.
+    ///
     /// # Errors
     /// Returns [`StorageError`] if reading the collection or refreshing its
     /// on-disk index fails.
@@ -5207,6 +5220,9 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        if !self.refresh_on_miss.load(Ordering::Relaxed) {
+            return self.get_many(collection_id, ids);
+        }
         let mut results = self.get_many(collection_id, ids)?;
         let mut missing: Vec<usize> = results
             .iter()
@@ -6334,6 +6350,17 @@ impl PackfileStorage {
     /// transition are reflected as fewer `get_*` calls, not as zeros.
     pub fn set_stats_enabled(&self, enabled: bool) {
         self.stats_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Set whether [`Self::get_many_with_refresh`] refreshes a collection's
+    /// index when the caller's in-memory snapshot misses. Defaults to `true`
+    /// (multi-process readers). A single writer -- whose in-memory index is
+    /// authoritative for everything it has written -- sets this `false` so a
+    /// negative lookup degrades to a plain [`StorageEngine::get_many`] and
+    /// never touches the refresh lock or the durable fingerprint. See the
+    /// `refresh_on_miss` field docs.
+    pub fn set_refresh_on_miss(&self, enabled: bool) {
+        self.refresh_on_miss.store(enabled, Ordering::Relaxed);
     }
 
     /// Point-in-time snapshot of this store's runtime counters, plus the
@@ -9095,6 +9122,51 @@ mod tests {
         assert_eq!(stats.miss_refresh_recovered, 0);
         assert_eq!(stats.miss_refresh_skips, 2);
         assert_eq!(stats.miss_refresh_retry_ids, 0);
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_disabled_is_authoritative() {
+        let dir = test_dir("refresh_disabled_authoritative");
+        let store = PackfileStorage::open(dir).unwrap();
+        // A single writer's in-memory index is authoritative for every key it
+        // has written, so a negative lookup must bypass the refresh lock and
+        // the durable-fingerprint probe entirely rather than paying either.
+        store.set_refresh_on_miss(false);
+
+        let missing = [[0xF0u8; 16], [0xF1u8; 16]];
+        for _ in 0..2 {
+            assert!(store
+                .get_many_with_refresh(&TEST_COLLECTION, &missing)
+                .unwrap()
+                .iter()
+                .all(Option::is_none));
+        }
+
+        let stats = store.stats();
+        assert_eq!(stats.miss_refreshes, 0);
+        assert_eq!(stats.miss_refresh_skips, 0);
+        assert_eq!(stats.miss_refresh_retry_ids, 0);
+    }
+
+    #[test]
+    fn test_get_many_with_refresh_flag_gates_the_reader_path() {
+        let dir = test_dir("refresh_flag_gates");
+        let store = PackfileStorage::open(dir).unwrap();
+        let missing = [[0xF2u8; 16]];
+
+        store.set_refresh_on_miss(false);
+        let _ = store
+            .get_many_with_refresh(&TEST_COLLECTION, &missing)
+            .unwrap();
+        assert_eq!(store.stats().miss_refresh_skips, 0);
+
+        // Re-enabling restores the multi-process-reader behavior: the miss is
+        // rate-limited by the durable fingerprint rather than bypassed.
+        store.set_refresh_on_miss(true);
+        let _ = store
+            .get_many_with_refresh(&TEST_COLLECTION, &missing)
+            .unwrap();
+        assert_eq!(store.stats().miss_refresh_skips, 1);
     }
 
     #[test]
