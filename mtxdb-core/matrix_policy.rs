@@ -47,10 +47,18 @@ pub enum ReferenceHashEncoding {
 
 /// What fields are stripped before calculating a reference-hash event ID.
 ///
-/// A reference hash is taken over the *redacted* event, so this boundary
-/// tracks [`RedactionPolicy`]: whenever the redaction algorithm changes, the
-/// reference-hash input changes with it. Version 11 changed the redaction
-/// algorithm, so v9/v10 and v11+ cannot share one variant.
+/// A reference hash is taken over the *redacted* event — the server-server
+/// API's "Calculating the reference hash for an event" puts the event through
+/// the redaction algorithm as its first step — so this boundary must track
+/// [`RedactionPolicy`] exactly: whenever the redaction algorithm changes, the
+/// reference hash's input changes with it.
+///
+/// Room version 11 changed the redaction algorithm (see `rooms/v11`: the
+/// top-level `origin`, `membership`, and `prev_state` properties are no longer
+/// protected, `m.room.create` keeps its entire `content`, `m.room.redaction`
+/// keeps `redacts` under `content`, and `m.room.power_levels` keeps `invite`).
+/// Version 12 inherits it. That is why v9/v10 and v11+ cannot share one
+/// variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceHashInputPolicy {
     /// Event IDs are server-assigned, so no reference-hash input exists.
