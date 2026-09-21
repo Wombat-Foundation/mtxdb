@@ -5815,6 +5815,18 @@ impl PackfileStorage {
     /// staging its journal mutation for the SQL transaction's post-commit
     /// callback. This bypasses the legacy queue-on-put path.
     ///
+    /// The packfile and live-index mutation happen immediately and
+    /// unconditionally, regardless of `stage`'s eventual `discard()` or
+    /// publish outcome — only the journal entry (visibility to other
+    /// processes) is deferred. `TxnStage::discard()` cannot undo this write:
+    /// on SQL rollback the record remains visible to in-process reads and,
+    /// if an index checkpoint runs before the rollback is handled, the
+    /// checkpoint can retain the record across a reopen; whether a later
+    /// repack removes it then depends on the collection's live-root policy.
+    /// Do not use this API where SQL
+    /// transaction atomicity is required until the index mutation itself is
+    /// deferred to commit (a private write set / transaction-local overlay).
+    ///
     /// # Errors
     /// Returns a storage or staging error if the record cannot be written or
     /// the transaction stage is inactive or full.
@@ -5831,6 +5843,10 @@ impl PackfileStorage {
 
     /// Batch variant of [`Self::put_staged`]. The group's mutations enter the
     /// stage only after the full eager packfile/index batch succeeds.
+    ///
+    /// See [`Self::put_staged`]: the same "not rollback" caveat applies here
+    /// — a `discard()` on `stage` does not undo this batch's packfile/index
+    /// writes.
     ///
     /// # Errors
     /// Returns a storage or staging error if the batch cannot be written or
@@ -10971,6 +10987,66 @@ mod tests {
                 .expect("record missing after topo repack");
             assert_eq!(got.bytes.as_ref(), expected);
         }
+    }
+
+    /// TEMPORARY CHARACTERIZATION TEST — pins the current (unsafe-for-SQL-
+    /// atomicity) behavior described in the doc comments on
+    /// `put_staged`/`put_many_staged`/`TxnStage::discard`, so that a future
+    /// deferred-transaction-buffer fix (see the "Wiring precondition"
+    /// section on [`TxnStage`]) changes this test deliberately rather than
+    /// by accident. This test should be deleted or rewritten once
+    /// `put_staged`/`put_many_staged` defer the index mutation to commit.
+    ///
+    /// `TxnStage::discard()` is journal-publication discard, not rollback:
+    /// it does not undo the eager packfile/live-index write made through
+    /// `put_staged`, and a checkpoint taken in the window before the caller
+    /// notices the SQL rollback can retain the record durably across a
+    /// reopen (whether a later repack removes it then depends on the
+    /// collection's live-root policy — not exercised here).
+    #[test]
+    fn discard_is_not_rollback() {
+        let dir = test_dir("discard_no_rollback");
+        let id = distinct_id(0x11);
+
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            let stage = TxnStage::new();
+            store
+                .put_staged(
+                    &stage,
+                    ShardType::EventDag,
+                    &TEST_COLLECTION,
+                    &id,
+                    &NodeData::new(bytes::Bytes::from_static(b"staged")),
+                )
+                .unwrap();
+
+            // Simulate the SQL transaction's error callback.
+            stage.discard();
+
+            // The eager write is still visible to an ordinary read: discard()
+            // only suppressed journal publication, not the index/packfile
+            // mutation.
+            let got = store
+                .get(&TEST_COLLECTION, &id)
+                .unwrap()
+                .expect("discard() must not undo the eager packfile/index write");
+            assert_eq!(got.bytes.as_ref(), b"staged".as_slice());
+
+            // A checkpoint taken after the discard captures the orphan into
+            // the on-disk checkpoint state.
+            store.persist_index_checkpoint().unwrap();
+        }
+
+        // Reopen from scratch: this proves the checkpoint actually captured
+        // the record on disk, rather than the earlier read having been
+        // served from the still-live in-memory index.
+        let reopened = PackfileStorage::open(dir).unwrap();
+        let got_after_reopen = reopened
+            .get(&TEST_COLLECTION, &id)
+            .unwrap()
+            .expect("checkpoint must not have dropped the discarded record across reopen");
+        assert_eq!(got_after_reopen.bytes.as_ref(), b"staged".as_slice());
     }
 
     #[test]
