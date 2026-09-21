@@ -1,6 +1,9 @@
 [alias]
 test-ffi = "test --manifest-path mtxdb-ffi/Cargo.toml"
-test-wasm = "test --manifest-path mtxdb-wasm/Cargo.toml"
+# mtxdb-wasm is a cdylib with no test harness and no wasm test runner, so a
+# host `cargo test` only compiles a native harness and reports 0 tests. Check
+# it against the real target (what `make build` compiles) instead.
+test-wasm = "check --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1"
 test-all = "!cargo test && cargo test-ffi && cargo test-wasm"
 
 [build]
