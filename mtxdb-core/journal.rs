@@ -1,13 +1,16 @@
 //! Append-only, checksummed commit journal used by the packfile WAL path.
 //!
 //! This module owns the journal's disk framing and durability boundary. It
-//! deliberately does not decide when several writers may share a commit;
-//! that coordinator must capture each caller's target LSN and only release it
-//! after a durable group covers that target.
+//! also provides [`JournalCoordinator`](crate::journal::JournalCoordinator),
+//! which captures each sync caller's
+//! target LSN and releases it only after a durable group covers that target.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex;
 
 use crc32fast::Hasher;
 
@@ -103,6 +106,148 @@ pub struct Journal {
     next_sequence: u64,
     next_lsn: u64,
     poisoned: bool,
+}
+
+/// Serializes mutation publication and durable commits for one journal.
+///
+/// Mutations are assigned LSNs and published under one mutex. A sync caller
+/// captures the published LSN before taking that mutex; once it acquires the
+/// mutex, it either observes that LSN already committed or commits all pending
+/// mutations through it as one durable group. Concurrent callers therefore
+/// share a completed covering commit without acknowledging a later write by
+/// mistake.
+pub struct JournalCoordinator {
+    journal: Mutex<Journal>,
+    pending: Mutex<Vec<(u64, Mutation)>>,
+    published_lsn: AtomicU64,
+    committed_lsn: AtomicU64,
+}
+
+impl JournalCoordinator {
+    /// Build a coordinator from an opened journal and its recovery scan.
+    #[must_use]
+    pub fn new(journal: Journal, scan: &Scan) -> Self {
+        let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
+        Self {
+            journal: Mutex::new(journal),
+            pending: Mutex::new(Vec::new()),
+            published_lsn: AtomicU64::new(committed_lsn),
+            committed_lsn: AtomicU64::new(committed_lsn),
+        }
+    }
+
+    /// Assign an LSN, publish the mutation to the caller's live overlay, and
+    /// queue it for the next covering durable group.
+    ///
+    /// The callback runs while publication is serialized and before the LSN
+    /// becomes visible to sync callers. It must not call back into this
+    /// coordinator. Keeping overlay publication in this critical section
+    /// prevents a successful sync from racing ahead of a not-yet-visible put.
+    ///
+    /// # Errors
+    /// Returns an error if the journal has been poisoned by a failed commit or
+    /// if its LSN space is exhausted.
+    pub fn publish(
+        &self,
+        mutation: Mutation,
+        publish_overlay: impl FnOnce(u64),
+    ) -> io::Result<u64> {
+        let journal = self.journal.lock();
+        if journal.poisoned {
+            return Err(io::Error::other(
+                "journal is poisoned after a failed commit",
+            ));
+        }
+        let mut pending = self.pending.lock();
+        let lsn = journal
+            .next_lsn
+            .checked_add(
+                u64::try_from(pending.len())
+                    .map_err(|_| io::Error::other("journal pending LSN space exhausted"))?,
+            )
+            .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
+        publish_overlay(lsn);
+        pending.push((lsn, mutation));
+        self.published_lsn.store(lsn, Ordering::Release);
+        Ok(lsn)
+    }
+
+    /// Capture the latest fully published mutation as this sync caller's
+    /// acknowledgement boundary.
+    #[must_use]
+    pub fn capture_sync_target(&self) -> u64 {
+        self.published_lsn.load(Ordering::Acquire)
+    }
+
+    /// Durably commit pending mutations through `target_lsn`.
+    ///
+    /// Calls with the same or an earlier target are covered by an already
+    /// completed group. Later published mutations are left for a later group.
+    /// The mutex serializes the disk commit; concurrent sync callers wait for
+    /// it and then recheck the committed LSN before deciding whether to write.
+    ///
+    /// # Errors
+    /// Returns an error if the target was never published, the journal is
+    /// poisoned, or writing/syncing the covering group fails.
+    pub fn sync_through(&self, target_lsn: u64) -> io::Result<Option<CommitReceipt>> {
+        if target_lsn == 0 {
+            return Ok(None);
+        }
+        let mut journal = self.journal.lock();
+        if target_lsn > self.published_lsn.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sync target has not been published",
+            ));
+        }
+        if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+
+        let mut pending = self.pending.lock();
+        let covered_count = pending
+            .iter()
+            .take_while(|(lsn, _)| *lsn <= target_lsn)
+            .count();
+        if covered_count == 0 {
+            return Err(io::Error::other(
+                "published sync target has no pending journal mutations",
+            ));
+        }
+        let expected_first_lsn = journal.next_lsn;
+        if pending
+            .first()
+            .map_or(true, |(lsn, _)| *lsn != expected_first_lsn)
+        {
+            return Err(io::Error::other(
+                "journal pending LSN sequence is discontinuous",
+            ));
+        }
+        let mutations: Vec<Mutation> = pending
+            .iter()
+            .take(covered_count)
+            .map(|(_, mutation)| mutation.clone())
+            .collect();
+        let receipt = journal.commit_group(&mutations)?;
+        if receipt.last_lsn < target_lsn {
+            return Err(io::Error::other(
+                "durable journal group did not cover requested sync target",
+            ));
+        }
+        pending.drain(..covered_count);
+        self.committed_lsn
+            .store(receipt.last_lsn, Ordering::Release);
+        Ok(Some(receipt))
+    }
+
+    /// Capture the current boundary and wait for a durable group covering it.
+    ///
+    /// # Errors
+    /// Returns an error if committing the captured boundary fails.
+    pub fn sync(&self) -> io::Result<Option<CommitReceipt>> {
+        let target = self.capture_sync_target();
+        self.sync_through(target)
+    }
 }
 
 impl Journal {
@@ -633,7 +778,7 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, Mutation};
+    use super::{Journal, JournalCoordinator, Mutation};
     use std::fs;
     use std::io::Write as _;
 
@@ -836,6 +981,55 @@ mod tests {
         assert_eq!(scan.groups[0].last_lsn, 1);
         assert_eq!(scan.groups[1].first_lsn, 2);
         assert_eq!(scan.groups[1].last_lsn, 3);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn coordinator_commits_only_through_the_captured_sync_boundary() {
+        let path = temp_path("coordinator_boundary");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        let first_lsn = coordinator
+            .publish(
+                Mutation::Put {
+                    collection_id: [1; 16],
+                    node_id: [1; 16],
+                    payload: b"first".to_vec(),
+                },
+                |_| {},
+            )
+            .unwrap();
+        let first_target = coordinator.capture_sync_target();
+        assert_eq!(first_target, first_lsn);
+
+        let second_lsn = coordinator
+            .publish(
+                Mutation::Put {
+                    collection_id: [1; 16],
+                    node_id: [2; 16],
+                    payload: b"second".to_vec(),
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(second_lsn, first_lsn.saturating_add(1));
+
+        let first_commit = coordinator.sync_through(first_target).unwrap().unwrap();
+        assert_eq!(first_commit.first_lsn, first_lsn);
+        assert_eq!(first_commit.last_lsn, first_target);
+        assert!(coordinator.sync_through(first_target).unwrap().is_none());
+
+        let second_commit = coordinator.sync().unwrap().unwrap();
+        assert_eq!(second_commit.first_lsn, second_lsn);
+        assert_eq!(second_commit.last_lsn, second_lsn);
+
+        drop(coordinator);
+        let (_journal, recovered) = Journal::open(&path).unwrap();
+        assert_eq!(recovered.groups.len(), 2);
+        assert_eq!(recovered.groups[0].last_lsn, first_target);
+        assert_eq!(recovered.groups[1].first_lsn, second_lsn);
         fs::remove_file(path).unwrap();
     }
 }
