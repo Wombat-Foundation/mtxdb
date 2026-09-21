@@ -9148,9 +9148,13 @@ mod tests {
         });
 
         // Keep the refresh lock held while the lookup runs. The writer path
-        // must return from the in-memory index without waiting for it.
+        // must return from the in-memory index without waiting for it. This is
+        // a deadlock guard, not a latency assertion: the timeout is generous
+        // enough that a merely loaded CI worker cannot trip it. The
+        // timing-independent proof that no durable fingerprint was probed is
+        // the `miss_refreshes == 0` counter below.
         assert!(receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .unwrap());
         drop(refresh_guard);
         reader.join().unwrap();
