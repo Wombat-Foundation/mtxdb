@@ -826,11 +826,12 @@ impl ShardPool {
     }
 
     /// Recover (if writable) and open every pack file, slotting them into
-    /// the shard vector. Returns `(recovery_time, recovery_calls,
-    /// packfile_open_time, packfile_open_calls)`.
+    /// the shard vector. Consumes `pack_files` so each `PathBuf` moves into
+    /// its `Shard` rather than being cloned. Returns `(recovery_time,
+    /// recovery_calls, packfile_open_time, packfile_open_calls)`.
     fn recover_and_open_packs(
         writable: bool,
-        pack_files: &[(u64, PathBuf)],
+        pack_files: Vec<(u64, PathBuf)>,
         shards: &mut [Option<Arc<Shard>>],
         next_slot: &mut u16,
         max_pack_id: &mut u64,
@@ -842,7 +843,7 @@ impl ShardPool {
         for (pack_id, path) in pack_files {
             if writable {
                 let recovery_started = Instant::now();
-                let _ = packfile::scan_and_recover_packfile(path).map_err(|error| {
+                let _ = packfile::scan_and_recover_packfile(&path).map_err(|error| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -856,7 +857,7 @@ impl ShardPool {
             }
 
             let packfile_open_started = Instant::now();
-            let file = packfile::open_packfile(path, writable, *pack_id).map_err(|error| {
+            let file = packfile::open_packfile(&path, writable, pack_id).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("corrupt pack {}; failed to open: {error}", path.display()),
@@ -868,9 +869,9 @@ impl ShardPool {
             let file_len = file.metadata()?.len();
             let slot = *next_slot;
             *next_slot = next_slot.saturating_add(1);
-            let shard = Arc::new(Shard::new(slot, *pack_id, file, path.clone(), file_len));
+            let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));
             shards[slot as usize] = Some(shard);
-            if *pack_id >= *max_pack_id {
+            if pack_id >= *max_pack_id {
                 *max_pack_id = pack_id.saturating_add(1);
             }
         }
@@ -975,7 +976,10 @@ impl ShardPool {
     }
 
     /// Assemble a `ShardPool` from its discovered parts. Separated from
-    /// `open_internal` to keep the latter under the clippy line limit.
+    /// `open_internal` to keep the latter under the clippy line limit; the
+    /// raw timing values travel as one [`ShardOpenTimings`] rather than a
+    /// dozen positional `Duration`s, and the two derived fields
+    /// (`metadata_unattributed`, `unattributed`) are computed here.
     #[allow(clippy::too_many_arguments)]
     fn build_pool(
         shards: Vec<Option<Arc<Shard>>>,
@@ -988,35 +992,26 @@ impl ShardPool {
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
         stats_persisted_at: Option<u64>,
-        open_elapsed: Duration,
-        discovery_time: Duration,
-        writer_lock_time: Duration,
-        recovery_time: Duration,
-        recovery_calls: u64,
-        packfile_open_time: Duration,
-        packfile_open_calls: u64,
-        metadata_restore_time: Duration,
-        pool_meta_restore_time: Duration,
-        persisted_stats_restore_time: Duration,
-        store_meta_write_time: Duration,
-        pool_meta_persist_time: Duration,
-        initial_pack_create_time: Duration,
+        mut timings: ShardOpenTimings,
         #[cfg(not(target_arch = "wasm32"))] writer_lock: Option<WriterLock>,
     ) -> Self {
-        let metadata_subphases_sum = pool_meta_restore_time
-            .saturating_add(store_meta_write_time)
-            .saturating_add(pool_meta_persist_time)
-            .saturating_add(initial_pack_create_time)
-            .saturating_add(persisted_stats_restore_time);
-        let metadata_unattributed_time =
-            metadata_restore_time.saturating_sub(metadata_subphases_sum);
+        let metadata_subphases_sum = timings
+            .pool_meta_restore
+            .saturating_add(timings.store_meta_write)
+            .saturating_add(timings.pool_meta_persist)
+            .saturating_add(timings.initial_pack_create)
+            .saturating_add(timings.persisted_stats_restore);
+        timings.metadata_unattributed = timings
+            .metadata_restore
+            .saturating_sub(metadata_subphases_sum);
 
-        let named_phases = discovery_time
-            .saturating_add(writer_lock_time)
-            .saturating_add(recovery_time)
-            .saturating_add(packfile_open_time)
-            .saturating_add(metadata_restore_time);
-        let unattributed = open_elapsed.saturating_sub(named_phases);
+        let named_phases = timings
+            .discovery
+            .saturating_add(timings.writer_lock)
+            .saturating_add(timings.packfile_recovery)
+            .saturating_add(timings.packfile_open)
+            .saturating_add(timings.metadata_restore);
+        timings.unattributed = timings.total.saturating_sub(named_phases);
 
         Self {
             shards: RwLock::new(shards),
@@ -1034,23 +1029,7 @@ impl ShardPool {
             last_stats_flush: RwLock::new(None),
             last_sync_split: Mutex::new(None),
             dirty_lock_wait: AtomicU64::new(0),
-            last_open_timings: Mutex::new(Some(ShardOpenTimings {
-                discovery: discovery_time,
-                writer_lock: writer_lock_time,
-                packfile_recovery: recovery_time,
-                packfile_recovery_calls: recovery_calls,
-                packfile_open: packfile_open_time,
-                packfile_open_calls,
-                metadata_restore: metadata_restore_time,
-                pool_meta_restore: pool_meta_restore_time,
-                persisted_stats_restore: persisted_stats_restore_time,
-                store_meta_write: store_meta_write_time,
-                pool_meta_persist: pool_meta_persist_time,
-                initial_pack_create: initial_pack_create_time,
-                metadata_unattributed: metadata_unattributed_time,
-                unattributed,
-                total: open_elapsed,
-            })),
+            last_open_timings: Mutex::new(Some(timings)),
             writable,
             compress,
             checksum_policy,
@@ -1101,7 +1080,7 @@ impl ShardPool {
         let (recovery_time, recovery_calls, packfile_open_time, packfile_open_calls) =
             Self::recover_and_open_packs(
                 writable,
-                &pack_files,
+                pack_files,
                 &mut shards,
                 &mut next_slot,
                 &mut max_pack_id,
@@ -1164,19 +1143,22 @@ impl ShardPool {
             compress,
             checksum_policy,
             stats_persisted_at,
-            total,
-            discovery_time,
-            writer_lock_time,
-            recovery_time,
-            recovery_calls,
-            packfile_open_time,
-            packfile_open_calls,
-            metadata_restore_time,
-            pool_meta_restore_time,
-            persisted_stats_restore_time,
-            store_meta_write_time,
-            pool_meta_persist_time,
-            initial_pack_create_time,
+            ShardOpenTimings {
+                discovery: discovery_time,
+                writer_lock: writer_lock_time,
+                packfile_recovery: recovery_time,
+                packfile_recovery_calls: recovery_calls,
+                packfile_open: packfile_open_time,
+                packfile_open_calls,
+                metadata_restore: metadata_restore_time,
+                pool_meta_restore: pool_meta_restore_time,
+                persisted_stats_restore: persisted_stats_restore_time,
+                store_meta_write: store_meta_write_time,
+                pool_meta_persist: pool_meta_persist_time,
+                initial_pack_create: initial_pack_create_time,
+                total,
+                ..Default::default()
+            },
             #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         ))
