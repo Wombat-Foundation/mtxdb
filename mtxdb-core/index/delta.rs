@@ -504,12 +504,18 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
 }
 
 /// Append one batch (optional header, then a count-framed batch) to the delta
-/// log and fsync it. Returns the number of bytes appended. `write_header` must
-/// be `true` when writing to a freshly created (or truncated) file that
-/// doesn't yet carry the base header.
+/// log. Returns the number of bytes appended. `write_header` must be `true`
+/// when writing to a freshly created (or truncated) file that doesn't yet
+/// carry the base header.
+///
+/// Deliberately does not fsync. The log is a rebuildable acceleration
+/// structure: a crash may lose or tear its tail, which the framing + batch
+/// CRC below detect, and the next open then rescans the packfiles. The pack
+/// data the frames describe is synced *before* this append (`sync()` writes
+/// shards first), so skipping this fsync cannot lose acknowledged data.
 ///
 /// # Errors
-/// Returns `io::Error` on any write or fsync failure.
+/// Returns `io::Error` on any write failure.
 pub fn append_batch(
     path: &Path,
     write_header: bool,
@@ -541,7 +547,6 @@ pub fn append_batch(
         batch_crc(&frames_bytes, tail_fingerprint),
     ))?;
     appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
-    file.sync_all()?;
     Ok(appended)
 }
 

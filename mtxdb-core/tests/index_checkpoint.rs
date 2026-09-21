@@ -388,6 +388,80 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A delta-append sync deliberately does not fsync the delta log: it is
+    /// rebuildable acceleration, and the pack data it points at is synced
+    /// first. This locks the recovery contract for that choice — a torn or
+    /// missing delta tail must fall back to a full rescan and still serve
+    /// every record, never silently serve a stale index that omits the write
+    /// whose only index entry lived in the lost tail.
+    #[test]
+    fn torn_delta_log_falls_back_to_rescan() {
+        use mtxdb_core::packfile::storage::OpenPath;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_torn_delta_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+
+        // A plain write's sync takes the delta-append path: pack bytes are
+        // synced, the delta log is appended but (by design) not fsynced.
+        let cid = collection_id(1);
+        store
+            .put(
+                &cid,
+                &node_id(1, 900),
+                &NodeData::new(Bytes::from(payload_for(1, 900))),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        let sync = store
+            .sync_timings()
+            .expect("sync must record its phase timings");
+        assert!(
+            sync.delta_log > std::time::Duration::ZERO,
+            "the plain write's sync must take the delta path"
+        );
+        drop(store);
+
+        // Simulate the crash-lost tail: truncate the delta log mid-batch so
+        // its trailer (and therefore its durable tail fingerprint) is gone.
+        let delta = current_delta_path(&dir).expect("delta append must leave a log");
+        let len = std::fs::metadata(&delta).unwrap().len();
+        assert!(len > 1, "delta log must have bytes to truncate");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&delta)
+            .unwrap()
+            .set_len(len / 2)
+            .unwrap();
+
+        // Reopen: the checkpoint can no longer pair with a valid delta tail,
+        // so open must rescan and still serve every record, including the one
+        // whose only index entry was in the lost tail.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let open = reopened
+            .open_timings()
+            .expect("open must record its phase timings");
+        assert_eq!(
+            open.path,
+            OpenPath::FullScan,
+            "a torn delta tail must fall back to a rescan"
+        );
+        assert_all_records(&reopened);
+        let got = reopened
+            .get(&cid, &node_id(1, 900))
+            .expect("lookup succeeds")
+            .expect("a record recorded only in the lost delta tail must survive via rescan");
+        assert_eq!(got.bytes.as_ref(), payload_for(1, 900).as_slice());
+        drop(reopened);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Accounting regression for the buffered append policy: a process crash
     /// with bytes still in the RAM buffer must leave neither the pack files
     /// nor the persisted fingerprint claiming those bytes. If either ran

@@ -224,8 +224,8 @@ const STATS_VERSION: u8 = 4;
 /// Minimum interval between implicit stats-snapshot writes from the hot
 /// dirty-sync path ([`ShardPool::sync_dirty`]). The snapshot is
 /// observability data rebuilt from live counters, so a dirty sync persists
-/// it at most this often; an explicit `sync_all` (and `Drop`) still
-/// persists it unconditionally.
+/// it at most this often; `sync_all` (when it had dirty shards) and `Drop`
+/// still persist it.
 const STATS_FLUSH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// On-disk size of one v4 stats record: `pack_id`(8) + 3×counter(8) = 32 bytes.
@@ -2745,8 +2745,8 @@ impl ShardPool {
         *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
         if synced_any {
             // Rate-limit the snapshot on the hot dirty path: it is
-            // observability data, and `sync_all`/`Drop` persist it
-            // unconditionally.
+            // observability data, and `sync_all` (on dirty shards) / `Drop`
+            // persist it.
             self.maybe_persist_stats(STATS_FLUSH_MIN_INTERVAL);
         }
         Ok(())
