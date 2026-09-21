@@ -100,6 +100,19 @@ pub struct Scan {
     pub truncated_tail: bool,
 }
 
+impl Scan {
+    /// Empty result for a journal segment that does not exist or has not yet
+    /// acquired a complete file header.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            groups: Vec::new(),
+            valid_len: 0,
+            truncated_tail: false,
+        }
+    }
+}
+
 /// Outcome of compacting a journal segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reclaim {
@@ -343,6 +356,39 @@ impl JournalCoordinator {
 }
 
 impl Journal {
+    /// Scan an existing journal without opening it for writing or repairing a
+    /// torn tail. A read-only worker uses this to observe only complete,
+    /// committed groups while the writer may still be appending or reclaiming
+    /// the segment.
+    ///
+    /// An incomplete final group is reported in [`Scan::truncated_tail`] and
+    /// excluded from `groups`; the file is left byte-for-byte unchanged. A
+    /// malformed committed group remains an error.
+    ///
+    /// A missing file or one shorter than the file header is treated as an
+    /// empty segment. This permits a read-only worker to start before the
+    /// writer has created the journal, without creating or repairing it.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the file is unreadable, a complete header is
+    /// invalid, the segment is oversized, or a committed group fails
+    /// validation.
+    pub fn scan_read_only(path: impl AsRef<Path>) -> io::Result<Scan> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Scan::empty()),
+            Err(error) => return Err(error),
+        };
+        if bytes.len() < FILE_HEADER_LEN {
+            return Ok(Scan::empty());
+        }
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SEGMENT_LEN {
+            return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
+        }
+        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        scan_bytes(&bytes, base_sequence, base_lsn)
+    }
+
     /// Open a journal and recover its committed groups.
     ///
     /// A segment shorter than the file header (a fresh file, or a crash while
@@ -1019,6 +1065,34 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn read_only_scan_treats_missing_and_short_segments_as_empty() {
+        let missing = temp_path("read_only_missing");
+        let _ = fs::remove_file(&missing);
+        let scan = Journal::scan_read_only(&missing).unwrap();
+        assert_eq!(scan.groups.len(), 0);
+        assert_eq!(scan.valid_len, 0);
+        assert!(!scan.truncated_tail);
+        assert!(
+            !missing.exists(),
+            "read-only scan must not create a segment"
+        );
+
+        let short = temp_path("read_only_short");
+        fs::write(&short, b"MTXWAL").unwrap();
+        let before = fs::read(&short).unwrap();
+        let scan = Journal::scan_read_only(&short).unwrap();
+        assert_eq!(scan.groups.len(), 0);
+        assert_eq!(scan.valid_len, 0);
+        assert!(!scan.truncated_tail);
+        assert_eq!(
+            fs::read(&short).unwrap(),
+            before,
+            "scan must not repair bytes"
+        );
+        fs::remove_file(short).unwrap();
+    }
+
     fn put(collection: u8, node: u8, payload: &[u8]) -> Mutation {
         Mutation::Put {
             collection_id: [collection; 16],
@@ -1114,6 +1188,28 @@ mod tests {
         assert_eq!(scan.groups.len(), 1);
         assert_eq!(fs::metadata(&path).unwrap().len(), good_len);
         drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_only_scan_keeps_complete_groups_and_leaves_torn_tail_untouched() {
+        let path = temp_path("read_only_torn_tail");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        journal.commit_group(&[put(1, 2, b"complete")]).unwrap();
+        drop(journal);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"MWG1\x30\0")
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert!(scan.truncated_tail);
+        assert_eq!(fs::read(&path).unwrap(), before, "scan must not truncate");
         fs::remove_file(path).unwrap();
     }
 
