@@ -545,6 +545,12 @@ impl Journal {
                 "journal handle is poisoned after an earlier failed commit",
             ));
         }
+        if covered_lsn >= self.next_lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot reclaim an LSN that has not been committed",
+            ));
+        }
         let bytes = fs::read(&self.path)?;
         let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
         let scan = scan_bytes(&bytes, base_sequence, base_lsn)?;
@@ -580,24 +586,32 @@ impl Journal {
             temp.write_all(&rebuilt)?;
             temp.sync_all()?;
             drop(temp);
-            fs::rename(&temp_path, &self.path)?;
-            sync_parent_dir(&self.path)
+            fs::rename(&temp_path, &self.path)
         })();
         if let Err(error) = write_result {
             let _ = fs::remove_file(&temp_path);
             return Err(error);
         }
-        // Point the live handle at the replaced segment. A failure here means
-        // the handle no longer tracks the durable file, so poison it rather
-        // than append to a stale inode.
-        match OpenOptions::new().read(true).write(true).open(&self.path) {
-            Ok(file) => self.file = file,
+        // The rename has replaced the path, so from here onward any failure
+        // must poison the handle: continuing to append through the old file
+        // descriptor would write an unlinked inode and could acknowledge data
+        // that is absent from the journal path.
+        let replacement = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
             Err(error) => {
                 self.poisoned = true;
                 return Err(error);
             }
+        };
+        self.file = replacement;
+        if let Err(error) = sync_parent_dir(&self.path) {
+            self.poisoned = true;
+            return Err(error);
         }
-        self.file.seek(SeekFrom::End(0))?;
+        if let Err(error) = self.file.seek(SeekFrom::End(0)) {
+            self.poisoned = true;
+            return Err(error);
+        }
         Ok(Reclaim {
             retained_groups: u64::try_from(retained.len()).unwrap_or(u64::MAX),
             reclaimed_bytes: u64::try_from(bytes.len().saturating_sub(rebuilt.len()))
