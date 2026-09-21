@@ -867,6 +867,15 @@ pub struct PackfileStorage {
     /// unflushed journal groups that the durable fingerprint gate deliberately
     /// hides. See [`Self::enable_read_journal`].
     read_journal: parking_lot::Mutex<Option<ReadJournal>>,
+    /// Journal LSN covered by the durable index this handle actually loaded.
+    ///
+    /// Read once at open, when the index is built from the on-disk checkpoint
+    /// (or a full scan). It is the *only* coverage the overlay may prune
+    /// through: a fresher `journal.lsn` written by a concurrent checkpoint does
+    /// not mean this handle's in-memory index contains those records. Advancing
+    /// this pair requires loading the corresponding checkpoint, not a live
+    /// packfile rescan. See [`Self::get_read_committed`].
+    read_covered_lsn: AtomicU64,
 }
 
 /// One committed value in the read-journal overlay: payload and its LSN.
@@ -884,9 +893,16 @@ type ReadJournalPuts = HashMap<[u8; 16], ReadJournalCollection>;
 struct ReadJournal {
     /// Segment file scanned for committed groups.
     path: PathBuf,
-    /// Pool directory holding the `journal.lsn` sidecar that records the LSN
-    /// the on-disk checkpoint covers.
-    base_dir: PathBuf,
+    /// The journal LSN covered by the durable index this reader actually
+    /// loaded, fixed when the overlay was enabled.
+    ///
+    /// This is the *only* coverage entries may be filtered or pruned against.
+    /// Reading a fresher `journal.lsn` from disk would prune a committed entry
+    /// the reader's stale in-memory index does not yet contain, dropping the
+    /// record from both places. It is deliberately not advanced by a live
+    /// packfile rescan: only loading the corresponding checkpoint may advance
+    /// the index/coverage pair.
+    covered: u64,
     /// Raw file length at the last scan. Skips a rescan when unchanged, so an
     /// unchanged partial tail is not re-probed on every read.
     observed_len: u64,
@@ -905,10 +921,10 @@ struct ReadJournal {
 }
 
 impl ReadJournal {
-    fn empty(path: PathBuf, base_dir: PathBuf) -> Self {
+    fn empty(path: PathBuf, covered: u64) -> Self {
         Self {
             path,
-            base_dir,
+            covered,
             observed_len: 0,
             observed_valid_len: 0,
             observed_lsn: 0,
@@ -925,11 +941,13 @@ impl ReadJournal {
         self.observed_valid_len = 0;
     }
 
-    /// Discard overlay state the durable checkpoint now covers.
+    /// Discard overlay state the durable index this reader loaded now covers.
     ///
     /// Reclaim is best-effort, so a journal group can outlive the checkpoint
     /// that covers it. Without this, an old journal put or delete could shadow
-    /// newer checkpointed state. `covered` is monotonic, so this only shrinks.
+    /// newer checkpointed state. The bound is [`Self::covered`] — the coverage
+    /// of the loaded index, not a detached disk read — so an entry is only
+    /// dropped once the fallback index is known to contain it.
     fn prune_covered(&mut self, covered: u64) {
         if covered == 0 {
             return;
@@ -941,6 +959,28 @@ impl ReadJournal {
         self.delete_lsn.retain(|_, lsn| *lsn > covered);
     }
 
+    /// Validate that a reset (reclaimed/rotated) segment still begins within
+    /// the coverage this reader's durable index incorporated.
+    ///
+    /// After a reset the overlay is rebuilt from the segment alone. If the
+    /// segment's first surviving group starts past `covered + 1`, the writer
+    /// reclaimed groups this reader's index never absorbed: those records are
+    /// in neither the overlay nor the index, so fail closed rather than serve a
+    /// gap. A missing/empty segment has nothing to validate.
+    fn check_reset_coverage(scan: &crate::journal::Scan, covered: u64) -> Result<(), StorageError> {
+        let Some(first) = scan.groups.first() else {
+            return Ok(());
+        };
+        if first.first_lsn > covered.saturating_add(1) {
+            return Err(StorageError::Corrupt(format!(
+                "journal segment base LSN {} is past covered LSN {} this reader \
+                 incorporated; reload the checkpoint before reading",
+                first.first_lsn, covered
+            )));
+        }
+        Ok(())
+    }
+
     /// Apply every committed group above `observed_lsn` to the overlay.
     ///
     /// A missing or short segment is treated as empty (the writer may not
@@ -948,16 +988,21 @@ impl ReadJournal {
     /// reclaimed, so the overlay is rebuilt from scratch. Never repairs or
     /// creates the file, matching a read-only worker's constraints.
     fn refresh(&mut self) -> Result<(), StorageError> {
-        let covered = PackfileStorage::read_journal_lsn(&self.base_dir);
+        // Coverage is fixed to the index this reader loaded. Reading
+        // `journal.lsn` fresh would prune entries the reader's stale index has
+        // not incorporated yet, dropping records from both sources.
+        let covered = self.covered;
         let len = match fs::metadata(&self.path) {
             Ok(meta) => meta.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(StorageError::Io(error)),
         };
         if len != self.observed_len {
+            let mut reset = false;
             if len < self.observed_len {
                 // The segment was reclaimed/rotated; re-derive from the start.
                 self.reset_overlay();
+                reset = true;
             }
             let scan = if self.observed_valid_len == 0 {
                 Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
@@ -973,9 +1018,13 @@ impl ReadJournal {
                     scan
                 } else {
                     self.reset_overlay();
+                    reset = true;
                     Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
                 }
             };
+            if reset {
+                Self::check_reset_coverage(&scan, covered)?;
+            }
             for group in &scan.groups {
                 for entry in &group.entries {
                     if entry.lsn <= self.observed_lsn || entry.lsn <= covered {
@@ -1646,6 +1695,9 @@ impl PackfileStorage {
             .iter()
             .map(|&cid| (cid, initial_durable_fp))
             .collect();
+        // The checkpoint coverage this open's index corresponds to. Bound to
+        // the loaded index, never re-read from disk by the overlay.
+        let read_covered_lsn = AtomicU64::new(PackfileStorage::read_journal_lsn(&base_dir));
         Self {
             shards,
             collections: RwLock::new(scan_out.collections),
@@ -1676,6 +1728,7 @@ impl PackfileStorage {
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
             read_journal: parking_lot::Mutex::new(None),
+            read_covered_lsn,
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
@@ -5488,7 +5541,11 @@ impl PackfileStorage {
     /// Returns [`StorageError`] if the segment is unreadable or a committed
     /// group fails validation.
     pub fn enable_read_journal(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
-        let mut overlay = ReadJournal::empty(path.as_ref().to_path_buf(), self.base_dir.clone());
+        // Bind the overlay to the coverage of the index this handle loaded, not
+        // whatever `journal.lsn` says now: a concurrent checkpoint may already
+        // have advanced past this handle's in-memory index.
+        let covered = self.read_covered_lsn.load(Ordering::Acquire);
+        let mut overlay = ReadJournal::empty(path.as_ref().to_path_buf(), covered);
         overlay.refresh()?;
         *self.read_journal.lock() = Some(overlay);
         Ok(())
@@ -7295,6 +7352,110 @@ mod tests {
         assert!(
             read_committed[0].is_none(),
             "an entry at or below the checkpoint's covered LSN must not be served from the overlay"
+        );
+    }
+
+    #[test]
+    fn read_committed_overlay_keeps_entries_a_newer_checkpoint_covers() {
+        let dir = test_dir("read_committed_stale_index");
+        let wal = dir.join("wal.bin");
+        let collection = [0x47u8; 16];
+        let node = [0x0eu8; 16];
+
+        // Durable value V0, loaded by the reader's index at open.
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer
+            .put(
+                &collection,
+                &node,
+                &NodeData::new(bytes::Bytes::from_static(b"v0")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        // V1 committed to the journal but not checkpointed into the reader's
+        // already-loaded index.
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"v1".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        assert_eq!(
+            store.get_read_committed(&collection, &[node]).unwrap()[0]
+                .as_ref()
+                .map(|data| data.bytes.as_ref()),
+            Some(&b"v1"[..])
+        );
+
+        // A concurrent checkpoint advances coverage past V1's LSN, but this
+        // handle's in-memory index still holds only V0. Pruning against that
+        // detached coverage would drop V1 from the overlay and resurrect the
+        // stale V0 from the index.
+        store.write_journal_lsn(1).unwrap();
+        assert_eq!(
+            store.get_read_committed(&collection, &[node]).unwrap()[0]
+                .as_ref()
+                .map(|data| data.bytes.as_ref()),
+            Some(&b"v1"[..]),
+            "a checkpoint this handle has not loaded must not evict overlay entries"
+        );
+    }
+
+    #[test]
+    fn read_committed_overlay_fails_closed_when_reclaim_skips_its_covered_lsn() {
+        let dir = test_dir("read_committed_reclaim_gap");
+        let wal = dir.join("wal.bin");
+        let collection = [0x48u8; 16];
+        let node = [0x0fu8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x95u8; 16],
+            &[0x95u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"first".to_vec(),
+            }])
+            .unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: [0x10u8; 16],
+                payload: b"second".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        // Reclaim drops LSN 1, so the segment now begins at LSN 2 while the
+        // reader's index only incorporated coverage 0. Those records are in
+        // neither source, so the read must fail closed rather than serve a gap.
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal.reclaim_through(1).unwrap();
+        drop(journal);
+
+        assert!(
+            store.get_read_committed(&collection, &[node]).is_err(),
+            "a reclaimed segment base beyond the reader's covered LSN must error"
         );
     }
 
