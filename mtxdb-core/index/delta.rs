@@ -554,6 +554,17 @@ pub fn batch_len(frame_count: usize) -> Option<usize> {
         .checked_add(DELTA_LOG_TRAILER_LEN)
 }
 
+/// Length in bytes of one framed v3 batch carrying `operations`, or `None` if a
+/// frame fails to encode or the total does not fit `usize`.
+#[must_use]
+pub fn v3_batch_len(operations: &[DeltaOperation]) -> Option<usize> {
+    let mut total = DELTA_BATCH_HEADER_LEN.checked_add(DELTA_LOG_TRAILER_LEN)?;
+    for operation in operations {
+        total = total.checked_add(encode_v3_frame(operation).ok()?.len())?;
+    }
+    Some(total)
+}
+
 /// Read and structurally validate the delta log. Returns `None` for a missing
 /// file, a bad header, a log with no complete committed batch (entirely torn),
 /// or any other structural inconsistency — the caller treats that as "no
