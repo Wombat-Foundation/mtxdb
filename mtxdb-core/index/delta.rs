@@ -73,6 +73,10 @@ const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
 /// state. A v1 log fails the version check below and falls back to a full
 /// rescan, same as any other structurally rejected log.
 const DELTA_LOG_VERSION: u8 = 2;
+/// Next delta-log version. Its frame codec is introduced independently of
+/// the production v2 writer so the existing recovery path stays unchanged
+/// until the v3 reader and writer are integrated together.
+const DELTA_LOG_VERSION_V3: u8 = 3;
 const DELTA_BATCH_MAGIC: &[u8; 4] = b"MDLB";
 const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"DLTR";
 
@@ -81,6 +85,148 @@ const TRAILER_FINGERPRINT_OFFSET: usize = 8;
 /// Offset of the batch's frame-bytes CRC32 within the trailer's reserved
 /// field (bytes 4..8, between the magic and the tail fingerprint).
 const TRAILER_CRC_OFFSET: usize = 4;
+
+/// V3 frame kinds. The frame envelope is `kind:u8 | payload_len:u32 | payload | crc32:u32`.
+const V3_INCREMENTAL: u8 = 0x01;
+const V3_COLLECTION_SNAPSHOT: u8 = 0x02;
+const V3_COLLECTION_TOMBSTONE: u8 = 0x03;
+const V3_FRAME_HEADER_LEN: usize = 1 + 4;
+const V3_FRAME_TRAILER_LEN: usize = 4;
+const V3_SNAPSHOT_FIXED_LEN: usize = 16 + 8 + 8 + 4;
+const V3_TOMBSTONE_LEN: usize = 16 + 8;
+
+/// One v3 operation in a count-framed delta batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaOperation {
+    /// Apply one fixed-shape insertion to a reconstructed collection index.
+    Incremental(DeltaFrame),
+    /// Create or replace a collection from a complete serialized index.
+    /// `order_key` preserves the store's durable collection order even when
+    /// the inspection sidecar is unavailable or stale.
+    CollectionSnapshot {
+        /// Collection being replaced or created.
+        collection_id: [u8; 16],
+        /// Structural generation represented by `index_blob`.
+        generation: u64,
+        /// Stable position in `collection_order`.
+        order_key: u64,
+        /// `LossyIndex::serialize()` bytes; semantic validation occurs during
+        /// replay, where the configured index policy is available.
+        index_blob: Vec<u8>,
+    },
+    /// Remove a collection from the replayed checkpoint state.
+    CollectionTombstone {
+        /// Collection being deleted.
+        collection_id: [u8; 16],
+        /// Generation observed by the deletion operation.
+        generation: u64,
+    },
+}
+
+/// Encode one self-describing v3 frame. The CRC covers the kind, payload
+/// length, and payload, so corruption in either framing or contents is caught.
+///
+/// # Errors
+/// Returns `InvalidInput` if the encoded payload length does not fit `u32`.
+pub fn encode_v3_frame(operation: &DeltaOperation) -> io::Result<Vec<u8>> {
+    let (kind, payload) = match operation {
+        DeltaOperation::Incremental(frame) => (V3_INCREMENTAL, frame.encode().to_vec()),
+        DeltaOperation::CollectionSnapshot {
+            collection_id,
+            generation,
+            order_key,
+            index_blob,
+        } => {
+            let blob_len = u32::try_from(index_blob.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "snapshot blob exceeds u32")
+            })?;
+            let mut payload =
+                Vec::with_capacity(V3_SNAPSHOT_FIXED_LEN.saturating_add(index_blob.len()));
+            payload.extend_from_slice(collection_id);
+            payload.extend_from_slice(&generation.to_le_bytes());
+            payload.extend_from_slice(&order_key.to_le_bytes());
+            payload.extend_from_slice(&blob_len.to_le_bytes());
+            payload.extend_from_slice(index_blob);
+            (V3_COLLECTION_SNAPSHOT, payload)
+        }
+        DeltaOperation::CollectionTombstone {
+            collection_id,
+            generation,
+        } => {
+            let mut payload = Vec::with_capacity(V3_TOMBSTONE_LEN);
+            payload.extend_from_slice(collection_id);
+            payload.extend_from_slice(&generation.to_le_bytes());
+            (V3_COLLECTION_TOMBSTONE, payload)
+        }
+    };
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "delta frame exceeds u32"))?;
+    let frame_len = V3_FRAME_HEADER_LEN
+        .checked_add(payload.len())
+        .and_then(|length| length.checked_add(V3_FRAME_TRAILER_LEN))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "delta frame length overflow")
+        })?;
+    let mut encoded = Vec::with_capacity(frame_len);
+    encoded.push(kind);
+    encoded.extend_from_slice(&payload_len.to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    encoded.extend_from_slice(&crc32fast::hash(&encoded).to_le_bytes());
+    Ok(encoded)
+}
+
+/// Decode one v3 frame from the front of `bytes`, returning its operation and
+/// consumed length. Extra bytes belong to subsequent frames in the same batch.
+/// Unknown kinds, invalid lengths, or checksum failures return `None`.
+#[must_use]
+pub fn decode_v3_frame(bytes: &[u8]) -> Option<(DeltaOperation, usize)> {
+    let kind = *bytes.first()?;
+    let payload_len_bytes: [u8; 4] = bytes.get(1..5)?.try_into().ok()?;
+    let payload_len = usize::try_from(u32::from_le_bytes(payload_len_bytes)).ok()?;
+    let payload_start = V3_FRAME_HEADER_LEN;
+    let payload_end = payload_start.checked_add(payload_len)?;
+    let frame_end = payload_end.checked_add(V3_FRAME_TRAILER_LEN)?;
+    let payload = bytes.get(payload_start..payload_end)?;
+    let stored_crc = u32::from_le_bytes(bytes.get(payload_end..frame_end)?.try_into().ok()?);
+    if crc32fast::hash(bytes.get(..payload_end)?) != stored_crc {
+        return None;
+    }
+
+    let operation = match kind {
+        V3_INCREMENTAL => DeltaFrame::decode(payload).map(DeltaOperation::Incremental)?,
+        V3_COLLECTION_SNAPSHOT => {
+            if payload.len() < V3_SNAPSHOT_FIXED_LEN {
+                return None;
+            }
+            let collection_id = payload.get(..16)?.try_into().ok()?;
+            let generation = u64::from_le_bytes(payload.get(16..24)?.try_into().ok()?);
+            let order_key = u64::from_le_bytes(payload.get(24..32)?.try_into().ok()?);
+            let blob_len =
+                usize::try_from(u32::from_le_bytes(payload.get(32..36)?.try_into().ok()?)).ok()?;
+            let blob_end = V3_SNAPSHOT_FIXED_LEN.checked_add(blob_len)?;
+            if blob_end != payload.len() {
+                return None;
+            }
+            DeltaOperation::CollectionSnapshot {
+                collection_id,
+                generation,
+                order_key,
+                index_blob: payload.get(V3_SNAPSHOT_FIXED_LEN..blob_end)?.to_vec(),
+            }
+        }
+        V3_COLLECTION_TOMBSTONE => {
+            if payload.len() != V3_TOMBSTONE_LEN {
+                return None;
+            }
+            DeltaOperation::CollectionTombstone {
+                collection_id: payload.get(..16)?.try_into().ok()?,
+                generation: u64::from_le_bytes(payload.get(16..24)?.try_into().ok()?),
+            }
+        }
+        _ => return None,
+    };
+    Some((operation, frame_end))
+}
 
 /// A decoded delta log that passed its structural gates.
 #[derive(Debug)]
@@ -278,8 +424,16 @@ pub fn read_delta_tail_fingerprint(
         .map_err(|error| io_error(path, "seek delta log header", error))?;
     file.read_exact(&mut log_hdr)
         .map_err(|error| io_error(path, "read delta log header", error))?;
-    if &log_hdr[..4] != DELTA_LOG_MAGIC || log_hdr[4] != DELTA_LOG_VERSION {
-        return Err(invalid(path, "unrecognized magic or version"));
+    if &log_hdr[..4] != DELTA_LOG_MAGIC {
+        return Err(invalid(path, "unrecognized magic"));
+    }
+    if log_hdr[4] == DELTA_LOG_VERSION_V3 {
+        // V3 frames collection operations this reader does not replay yet, so
+        // recovery must fall back to a packfile rescan.
+        return Err(invalid(path, "delta log v3 is not supported here"));
+    }
+    if log_hdr[4] != DELTA_LOG_VERSION {
+        return Err(invalid(path, "unrecognized version"));
     }
     let base_fp = u64::from_le_bytes(
         log_hdr[8..16]
@@ -429,7 +583,15 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
     if buf.len() < DELTA_LOG_HEADER_LEN {
         return None;
     }
-    if &buf[..4] != DELTA_LOG_MAGIC || buf[4] != DELTA_LOG_VERSION {
+    if &buf[..4] != DELTA_LOG_MAGIC {
+        return None;
+    }
+    if buf[4] == DELTA_LOG_VERSION_V3 {
+        // V3 frames collection operations this reader does not replay yet, so
+        // recovery must fall back to a packfile rescan.
+        return None;
+    }
+    if buf[4] != DELTA_LOG_VERSION {
         return None;
     }
     let base_fingerprint = u64::from_le_bytes(buf[BASE_FINGERPRINT_OFFSET..16].try_into().ok()?);
