@@ -13,6 +13,7 @@ use crate::csr::Csr;
 use crate::index::delta::{self, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::{InsertError, LossyIndex, SlotUndo};
+use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
 use crate::packfile::{self, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -816,6 +817,11 @@ pub struct PackfileStorage {
     /// fingerprint + generations the log continues, and the frames accumulated
     /// since the last persist. See [`DeltaLogState`].
     delta_state: parking_lot::Mutex<DeltaLogState>,
+    /// Optional write-ahead journal coordinator. When present, every mutation
+    /// is published to it and `sync` commits a single durable group, so the
+    /// per-shard pack fsyncs and the index checkpoint can be deferred without
+    /// risking acknowledged data (see [`Self::enable_journal`]).
+    journal: parking_lot::Mutex<Option<Arc<JournalCoordinator>>>,
 }
 
 /// Per-collection state for incremental repack.
@@ -1478,6 +1484,7 @@ impl PackfileStorage {
             collection_shards: RwLock::new(scan_out.collection_shards),
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
+            journal: parking_lot::Mutex::new(None),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
@@ -4987,6 +4994,11 @@ impl StorageEngine for PackfileStorage {
             data: data.bytes.clone(),
         };
         let (shard_id, offset) = self.shards.put_record(&record)?;
+        self.publish_mutation(|| JournalMutation::Put {
+            collection_id: *collection_id,
+            node_id: *id,
+            payload: data.bytes.to_vec(),
+        })?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
                 if let Ok((bucket, slot)) =
@@ -5238,6 +5250,13 @@ impl StorageEngine for PackfileStorage {
                 // fingerprint-matched scan publish the failed prefix.
                 Err(error) => rollback_and_fail!(error.into()),
             };
+            if let Err(error) = self.publish_mutation(|| JournalMutation::Put {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+            }) {
+                rollback_and_fail!(error);
+            }
 
             if index_needs_rebuild {
                 continue;
@@ -5395,6 +5414,9 @@ impl StorageEngine for PackfileStorage {
         // mutex and bypass this deletion's serialization.
         self.remove_collection_shard_counts(collection_id);
         self.persist_deleted_collection(collection_id)?;
+        self.publish_mutation(|| JournalMutation::DeleteCollection {
+            collection_id: *collection_id,
+        })?;
         Ok(())
     }
 
@@ -5483,6 +5505,52 @@ impl PackfileStorage {
         );
         self.checkpoint_rewrite_max_bytes
             .store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// Route durability through a write-ahead journal at `path`.
+    ///
+    /// After this, every mutation (`put`/`put_many`/`delete_collection`) is
+    /// published to the journal with a monotonic LSN, and `sync` durably
+    /// commits the pending group as one sequential fsync. Packfile shard
+    /// fsyncs and the index checkpoint then become acceleration-only: a crash
+    /// that loses them replays the journal instead of rescanning every pack.
+    ///
+    /// This is opt-in and off by default (the store's historical behavior —
+    /// packfiles are the sync point — is unchanged until it is called).
+    ///
+    /// # Errors
+    /// Returns `StorageError` if the journal segment cannot be opened or its
+    /// committed prefix cannot be validated.
+    pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
+        let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
+        *self.journal.lock() = Some(Arc::new(JournalCoordinator::new(journal, &scan)));
+        Ok(())
+    }
+
+    /// The journal coordinator, if [`Self::enable_journal`] was called.
+    #[must_use]
+    pub fn journal(&self) -> Option<Arc<JournalCoordinator>> {
+        self.journal.lock().clone()
+    }
+
+    /// Publish one mutation to the journal, if enabled. Returns the assigned
+    /// LSN, or `None` when no journal is configured.
+    ///
+    /// `mutation` is a closure so its payload (a full record copy) is only
+    /// built when a journal is actually configured.
+    fn publish_mutation(
+        &self,
+        mutation: impl FnOnce() -> JournalMutation,
+    ) -> Result<Option<u64>, StorageError> {
+        let Some(journal) = self.journal() else {
+            return Ok(None);
+        };
+        // The live index is already updated synchronously on the write path,
+        // so the overlay callback has nothing to publish.
+        journal
+            .publish(mutation(), |_lsn| {})
+            .map(Some)
+            .map_err(StorageError::Io)
     }
 
     /// Batch-granular sync accounting: every sync counts once, and the
