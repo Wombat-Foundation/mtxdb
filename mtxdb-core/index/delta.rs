@@ -1096,6 +1096,158 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn sample_snapshot_blob() -> Vec<u8> {
+        (0u8..=127).collect()
+    }
+
+    fn snapshot_operation() -> DeltaOperation {
+        DeltaOperation::CollectionSnapshot {
+            collection_id: [0x11; 16],
+            generation: 7,
+            order_key: 42,
+            index_blob: sample_snapshot_blob(),
+        }
+    }
+
+    fn tombstone_operation() -> DeltaOperation {
+        DeltaOperation::CollectionTombstone {
+            collection_id: [0x22; 16],
+            generation: 9,
+        }
+    }
+
+    #[test]
+    fn v3_incremental_frame_round_trips() {
+        let operation = DeltaOperation::Incremental(test_frame(3, 5));
+        let encoded = encode_v3_frame(&operation).unwrap();
+        let (decoded, consumed) = decode_v3_frame(&encoded).expect("v3 incremental decodes");
+        assert_eq!(decoded, operation);
+        assert_eq!(
+            consumed,
+            encoded.len(),
+            "a lone frame consumes exactly its bytes"
+        );
+    }
+
+    #[test]
+    fn v3_snapshot_frame_round_trips() {
+        let operation = snapshot_operation();
+        let blob_len = sample_snapshot_blob().len();
+        let encoded = encode_v3_frame(&operation).unwrap();
+        assert_eq!(
+            encoded.len(),
+            V3_FRAME_HEADER_LEN + V3_SNAPSHOT_FIXED_LEN + blob_len + V3_FRAME_TRAILER_LEN,
+            "snapshot framing is header + fixed fields + blob + crc"
+        );
+        let (decoded, consumed) = decode_v3_frame(&encoded).expect("v3 snapshot decodes");
+        assert_eq!(decoded, operation);
+        assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn v3_tombstone_frame_round_trips() {
+        let operation = tombstone_operation();
+        let encoded = encode_v3_frame(&operation).unwrap();
+        assert_eq!(
+            encoded.len(),
+            V3_FRAME_HEADER_LEN + V3_TOMBSTONE_LEN + V3_FRAME_TRAILER_LEN
+        );
+        let (decoded, consumed) = decode_v3_frame(&encoded).expect("v3 tombstone decodes");
+        assert_eq!(decoded, operation);
+        assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn v3_frames_walk_by_consumed_length() {
+        let operations = [
+            DeltaOperation::Incremental(test_frame(1, 3)),
+            snapshot_operation(),
+            tombstone_operation(),
+        ];
+        let mut stream = Vec::new();
+        for operation in &operations {
+            stream.extend_from_slice(&encode_v3_frame(operation).unwrap());
+        }
+
+        let mut offset = 0;
+        for expected in &operations {
+            let (decoded, consumed) = decode_v3_frame(&stream[offset..]).expect("frame decodes");
+            assert_eq!(&decoded, expected);
+            offset += consumed;
+        }
+        assert_eq!(offset, stream.len(), "walking consumes the whole stream");
+    }
+
+    #[test]
+    fn v3_frame_crc_rejects_corrupted_payload() {
+        let encoded = encode_v3_frame(&snapshot_operation()).unwrap();
+        let mut corrupted = encoded.clone();
+        // Flip a payload byte, well clear of the framing header.
+        corrupted[V3_FRAME_HEADER_LEN + 4] ^= 0xFF;
+        assert!(
+            decode_v3_frame(&corrupted).is_none(),
+            "payload corruption must fail the frame CRC"
+        );
+    }
+
+    #[test]
+    fn v3_frame_crc_rejects_corrupted_length_field() {
+        let encoded = encode_v3_frame(&snapshot_operation()).unwrap();
+        let mut corrupted = encoded.clone();
+        // Change the advertised payload length. The CRC covers the length
+        // field too, so a shifted frame must not decode.
+        corrupted[1] ^= 0x01;
+        assert!(decode_v3_frame(&corrupted).is_none());
+    }
+
+    #[test]
+    fn v3_frame_crc_rejects_corrupted_checksum() {
+        let encoded = encode_v3_frame(&tombstone_operation()).unwrap();
+        let mut corrupted = encoded.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        assert!(decode_v3_frame(&corrupted).is_none());
+    }
+
+    #[test]
+    fn v3_frame_decode_rejects_short_input() {
+        assert!(decode_v3_frame(&[]).is_none());
+        assert!(decode_v3_frame(&[V3_INCREMENTAL]).is_none());
+        assert!(decode_v3_frame(&[V3_INCREMENTAL, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn v3_frame_decode_rejects_unknown_kind_with_valid_crc() {
+        let payload = [0x33; V3_TOMBSTONE_LEN];
+        let mut frame = Vec::new();
+        frame.push(0x7F);
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&crc32fast::hash(&frame).to_le_bytes());
+        assert!(decode_v3_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn v3_snapshot_rejects_blob_length_mismatch() {
+        // Valid framing and CRC, but the advertised blob length is longer than
+        // the bytes actually present.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x11; 16]);
+        payload.extend_from_slice(&7_u64.to_le_bytes());
+        payload.extend_from_slice(&42_u64.to_le_bytes());
+        payload.extend_from_slice(&128_u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 8]);
+        let mut frame = Vec::new();
+        frame.push(V3_COLLECTION_SNAPSHOT);
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&crc32fast::hash(&frame).to_le_bytes());
+        assert!(
+            decode_v3_frame(&frame).is_none(),
+            "declared blob length must match the payload exactly"
+        );
+    }
+
     fn v3_batch_bytes(operations: &[DeltaOperation], tail_fingerprint: u64) -> Vec<u8> {
         let mut frames = Vec::new();
         for operation in operations {
