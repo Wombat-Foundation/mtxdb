@@ -3121,7 +3121,6 @@ impl PackfileStorage {
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             wal_lsn.unwrap_or(0),
-            &packs,
             &blobs,
         )
         .map_err(StorageError::Io)?;
@@ -5597,7 +5596,7 @@ impl PackfileStorage {
         for (id, shard) in self.shards.all_shards() {
             match fs::metadata(&shard.path) {
                 Ok(metadata) => {
-                    open_shards.push((id, shard.pack_id, shard.path.clone(), metadata.len()))
+                    open_shards.push((id, shard.pack_id, shard.path.clone(), metadata.len()));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return false,
