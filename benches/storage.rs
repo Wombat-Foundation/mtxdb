@@ -13,7 +13,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -1611,6 +1611,137 @@ fn run_unknown_key_benchmark() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Reader-side cost of the read-committed overlay when a writer keeps
+/// checkpointing and reclaiming the journal underneath it.
+///
+/// A reclaim that outruns the reader's loaded coverage forces
+/// `reload_index_from_checkpoint()` — a full checkpoint re-scan — on the read
+/// path, retried up to 8× internally (≤191 ms of backoff) before the read
+/// fails. This is the cost the delete/purge paths pay: `censor_events` and
+/// `purge_events` read event JSON through `get_read_committed`, and a
+/// concurrent writer sync+reclaim can invalidate the overlay mid-read. Reports
+/// per-read latency and how many reads exhausted the retry budget
+/// (`WouldBlock`) or hit a genuine gap (`Corrupt`) — the 500 path.
+fn run_read_committed_reload_benchmark(
+    seed_collections: usize,
+    seed_records: usize,
+    read_ops: usize,
+) {
+    use mtxdb_core::journal::Journal;
+    use mtxdb_core::storage::StorageError;
+
+    let dir = bench_root().join(format!(
+        "mtxdb_bench_read_committed_reload_{seed_collections}x{seed_records}"
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let wal = dir.join("wal.bin");
+
+    let collection = [0xC1u8; 16];
+    let records: Vec<(NodeId, NodeData)> = (0..seed_records)
+        .map(|index| {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            (id, NodeData::new(bytes::Bytes::from_static(b"seed")))
+        })
+        .collect();
+
+    // Durable seed: a non-trivial index for the reader to reload.
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    for c in 0..seed_collections {
+        let mut coll = [0xC0u8; 16];
+        coll[1..9].copy_from_slice(&(c as u64).to_be_bytes());
+        seed.put_many(&coll, &records).unwrap();
+    }
+    seed.put_many(&collection, &records).unwrap();
+    seed.sync_all().unwrap();
+    drop(seed);
+
+    // Empty journal segment the reader attaches to.
+    let (journal, _) = Journal::open(&wal).unwrap();
+    drop(journal);
+
+    let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+    reader.enable_read_journal(&wal).unwrap();
+
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+
+    let read_ids: Vec<NodeId> = records.iter().map(|(id, _)| *id).collect();
+    let done = AtomicBool::new(false);
+    let writer_rounds = AtomicU64::new(0);
+    let mut latencies_us: Vec<u128> = Vec::with_capacity(read_ops);
+    let mut retryable = 0usize;
+    let mut corrupt = 0usize;
+
+    std::thread::scope(|scope| {
+        {
+            let writer = &writer;
+            let done = &done;
+            let writer_rounds = &writer_rounds;
+            scope.spawn(move || {
+                let mut round = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    // Create then delete a throwaway collection so each sync
+                    // takes the full-checkpoint path. A delta append would not
+                    // advance coverage or reclaim, so the reader would never
+                    // need to reload and the bench would measure nothing.
+                    let mut throwaway = [0xDDu8; 16];
+                    throwaway[1..9].copy_from_slice(&round.to_le_bytes());
+                    writer
+                        .put(
+                            &throwaway,
+                            &[1u8; 16],
+                            &NodeData::new(bytes::Bytes::from_static(b"x")),
+                        )
+                        .unwrap();
+                    writer.delete_collection(&throwaway).unwrap();
+                    writer.sync_all().unwrap();
+                    round += 1;
+                    writer_rounds.store(round, Ordering::Relaxed);
+                }
+            });
+        }
+
+        for _ in 0..read_ops {
+            let start = Instant::now();
+            match std::hint::black_box(reader.get_read_committed(&collection, &read_ids)) {
+                Ok(_) => {}
+                Err(StorageError::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    retryable += 1;
+                }
+                Err(_) => corrupt += 1,
+            }
+            latencies_us.push(start.elapsed().as_micros());
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+
+    latencies_us.sort_unstable();
+    let percentile = |p: usize| -> u128 {
+        let index = latencies_us.len().saturating_sub(1) * p / 100;
+        latencies_us.get(index).copied().unwrap_or(0)
+    };
+    let (p50, p95, p99) = (percentile(50), percentile(95), percentile(99));
+    let max = latencies_us.last().copied().unwrap_or(0);
+    let rounds = writer_rounds.load(Ordering::Relaxed);
+
+    println!(
+        "bench: read_committed_reload SEED={seed_collections}x{seed_records} READS={read_ops} \
+         WRITER_ROUNDS={rounds} WOULD_BLOCK={retryable} CORRUPT={corrupt} \
+         P50_US={p50} P95_US={p95} P99_US={p99} MAX_US={max}"
+    );
+    eprintln!(
+        "read-committed reload: {read_ops} reads against {rounds} writer checkpoint+reclaim \
+         rounds; p50={p50}us p95={p95}us p99={p99}us max={max}us; \
+         exhausted-retry-budget (WouldBlock)={retryable}, corrupt={corrupt}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
     eprintln!("Note: shard Drop deletes superseded shard files on drop,");
@@ -1634,6 +1765,8 @@ fn main() {
     run_checkpoint_rewrite_latency_benchmark(60, 5_000);
 
     run_unknown_key_benchmark();
+
+    run_read_committed_reload_benchmark(32, 2_000, 300);
 
     // ── Connectivity check ──
     eprintln!();
