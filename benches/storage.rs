@@ -1697,6 +1697,11 @@ fn run_read_committed_reload_benchmark(
                         .unwrap();
                     writer.delete_collection(&throwaway).unwrap();
                     writer.sync_all().unwrap();
+                    // A plain sync appends a delta and never advances
+                    // checkpoint coverage, so the reader would never need to
+                    // reload. Force the full checkpoint + journal reclaim that
+                    // actually exercises `refresh_read_journal`.
+                    writer.force_index_checkpoint().unwrap();
                     round += 1;
                     writer_rounds.store(round, Ordering::Relaxed);
                 }
@@ -1742,6 +1747,39 @@ fn run_read_committed_reload_benchmark(
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Run the read-committed reload bench only when explicitly requested.
+///
+/// Value is `COLLECTIONSxRECORDSxREADS`, or `1`/empty for the defaults
+/// (`32x2000x300`). Unset skips it, so a plain `cargo bench` does not pay for
+/// the concurrent writer. Example:
+/// `MTXDB_BENCH_READ_COMMITTED=64x5000x500 cargo bench --bench storage`.
+fn run_read_committed_reload_from_env() {
+    let spec = match std::env::var("MTXDB_BENCH_READ_COMMITTED") {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("MTXDB_BENCH_READ_COMMITTED must be valid UTF-8")
+        }
+    };
+    let spec = spec.trim();
+    let (collections, records, reads) = if spec.is_empty() || spec == "1" {
+        (32usize, 2_000usize, 300usize)
+    } else {
+        let parts: Vec<&str> = spec.split('x').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "MTXDB_BENCH_READ_COMMITTED must be 1 or COLLECTIONSxRECORDSxREADS"
+        );
+        (
+            parts[0].trim().parse().expect("invalid collections"),
+            parts[1].trim().parse().expect("invalid records"),
+            parts[2].trim().parse().expect("invalid reads"),
+        )
+    };
+    run_read_committed_reload_benchmark(collections, records, reads);
+}
+
 fn main() {
     eprintln!("mdb benchmark harness — cold-read measurement");
     eprintln!("Note: shard Drop deletes superseded shard files on drop,");
@@ -1766,7 +1804,7 @@ fn main() {
 
     run_unknown_key_benchmark();
 
-    run_read_committed_reload_benchmark(32, 2_000, 300);
+    run_read_committed_reload_from_env();
 
     // ── Connectivity check ──
     eprintln!();
