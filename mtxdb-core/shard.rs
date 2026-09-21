@@ -2716,15 +2716,7 @@ impl ShardPool {
         let flush_elapsed = flush_started.elapsed();
         let fsync_started = Instant::now();
         let mut synced_any = false;
-        // Fsync in ascending pack-id order so a dirty barrier touches the pack
-        // files in their on-disk order. `dirty` is a HashSet, so the natural
-        // iteration order is arbitrary; issuing fsyncs out of disk order makes
-        // a rotational disk pay a seek per shard. `pack_id`, not the recycled
-        // slot id, is what orders the files on disk.
-        let mut dirty_ids = self.dirty_snapshot();
-        dirty_ids
-            .sort_unstable_by_key(|id| self.get_shard(*id).map_or(u64::MAX, |shard| shard.pack_id));
-        for id in dirty_ids {
+        for id in self.dirty_snapshot() {
             let Some(shard) = self.get_shard(id) else {
                 // Slot was retired between snapshot and lookup; leave any
                 // remaining dirty bit for the next pass to resolve.
