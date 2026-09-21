@@ -221,6 +221,13 @@ const STATS_MAGIC: &[u8; 4] = b"MSTA";
 /// legacy fallback; a v2 file is simply not restored.
 const STATS_VERSION: u8 = 4;
 
+/// Minimum interval between implicit stats-snapshot writes from the hot
+/// dirty-sync path ([`ShardPool::sync_dirty`]). The snapshot is
+/// observability data rebuilt from live counters, so a dirty sync persists
+/// it at most this often; an explicit `sync_all` (and `Drop`) still
+/// persists it unconditionally.
+const STATS_FLUSH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// On-disk size of one v4 stats record: `pack_id`(8) + 3×counter(8) = 32 bytes.
 const STATS_RECORD_LEN: usize = 8 + 8 * 3;
 
@@ -467,8 +474,9 @@ pub struct ShardPool {
     /// Total number of shards retired (garbage-collected after a repack)
     /// over the pool's lifetime.
     retired_count: AtomicU64,
-    /// Number of `shard_stats.bin` snapshots durably renamed over the pool's
-    /// lifetime (counted only after the rename succeeds). The snapshot is
+    /// Number of `shard_stats.bin` snapshots renamed into place over the
+    /// pool's lifetime (counted only after the rename succeeds; the snapshot
+    /// is best-effort observability and is not fsynced). The snapshot is
     /// observability data whose rewrites should be gated to dirty syncs;
     /// exposing the count lets callers and tests confirm a steady-state
     /// clean sync pays no stats metadata write.
@@ -1557,10 +1565,15 @@ impl ShardPool {
         let tmp_path = Self::stats_path(&self.base_dir)
             .with_extension(format!("bin.tmp.{}.{unique}", std::process::id()));
         let final_path = Self::stats_path(&self.base_dir);
+        // Deliberately no fsync here. The snapshot is observability data
+        // (rebuilt from live counters; open tolerates a missing/old/short
+        // file), and the rename below is never followed by a directory
+        // fsync -- so the old `tmp.sync_all()` paid an fsync per persist for
+        // a power-loss guarantee the rename didn't actually provide.
         let write_result = (|| -> io::Result<()> {
             let mut tmp = File::create(&tmp_path)?;
             tmp.write_all(&buf)?;
-            tmp.sync_all()
+            Ok(())
         })();
         if let Err(e) = write_result {
             // Don't leave a half-written tmp file behind under its
@@ -2536,9 +2549,9 @@ impl ShardPool {
     /// `min_interval` has passed since the last flush from here — the
     /// caller can tick this on every write without it turning into
     /// `persist_stats`' full snapshot-write-and-rename on every call.
-    /// Never fsyncs anything beyond what `persist_stats` itself does for
-    /// the snapshot file's own durability — this is observability data,
-    /// not something worth slowing writes down to protect.
+    /// `persist_stats` issues no fsync (the snapshot is best-effort
+    /// observability), so this path never forces durability work onto a
+    /// write.
     pub fn maybe_persist_stats(&self, min_interval: Duration) {
         if !self.writable {
             return;
@@ -2647,7 +2660,7 @@ impl ShardPool {
         // The stats snapshot is observability, not state: only rewrite it when
         // a sync actually moved or committed data (parallel to `sync_dirty`),
         // so a steady-state writer that syncs between writes pays no metadata
-        // write+fsync+rename for a file nothing changed. Periodic freshness is
+        // write+rename for a file nothing changed. Periodic freshness is
         // `maybe_persist_stats`' job.
         if had_dirty {
             self.persist_stats_best_effort();
@@ -2715,7 +2728,13 @@ impl ShardPool {
                 // this shard — nothing left to do.
                 continue;
             }
-            if let Err(error) = shard.file.sync_all() {
+            // `sync_data` (fdatasync): the packfile is append-only and its
+            // frame framing/size live in the data stream, so flushing data
+            // plus the size metadata makes appended bytes readable after a
+            // crash; the mode/timestamp metadata `sync_all` would also write
+            // is not needed. The full-barrier `sync_all` above keeps
+            // `sync_all`.
+            if let Err(error) = shard.file.sync_data() {
                 self.restore_dirty(id);
                 return Err(error);
             }
@@ -2725,7 +2744,10 @@ impl ShardPool {
         let fsync_elapsed = fsync_started.elapsed();
         *self.last_sync_split.lock() = Some((flush_elapsed, fsync_elapsed));
         if synced_any {
-            self.persist_stats_best_effort();
+            // Rate-limit the snapshot on the hot dirty path: it is
+            // observability data, and `sync_all`/`Drop` persist it
+            // unconditionally.
+            self.maybe_persist_stats(STATS_FLUSH_MIN_INTERVAL);
         }
         Ok(())
     }
