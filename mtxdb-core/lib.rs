@@ -44,6 +44,7 @@ pub use auxiliary::{
 };
 pub use cache::NodeCache;
 pub use index::LossyIndex;
+pub use journal::{TxnStage, TxnStageState};
 pub use layout::{DatabaseLayout, ShardType};
 pub use matrix_policy::{
     EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,

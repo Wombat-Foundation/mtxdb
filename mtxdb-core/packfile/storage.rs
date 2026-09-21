@@ -13,7 +13,8 @@ use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::{InsertError, LossyIndex, SlotUndo};
-use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
+use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation, TxnStage};
+use crate::layout::ShardType;
 use crate::packfile::{self, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -542,6 +543,17 @@ struct RoomGeneration {
     generation: u64,
 }
 
+struct PutManyProgress {
+    generation: u64,
+    owned_index: Option<LossyIndex>,
+    structural_change: bool,
+    index_needs_rebuild: bool,
+    pending_deltas: Vec<(u32, u64)>,
+    pending_shard_collections: Vec<u64>,
+    invalidate_delta: bool,
+    undo_log: Vec<SlotUndo>,
+}
+
 /// Session state for the incremental index delta log (`index.delta`).
 ///
 /// A fresh checkpoint rewrite re-bases this structure. Between rewrites, live
@@ -885,6 +897,17 @@ type ReadJournalCollection = HashMap<[u8; 16], ReadJournalValue>;
 /// Committed puts keyed `collection_id -> node_id`.
 type ReadJournalPuts = HashMap<[u8; 16], ReadJournalCollection>;
 
+/// Outcome of refreshing the overlay against the writer's segment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadRefresh {
+    /// The segment was scanned and applied; the overlay is current.
+    Applied,
+    /// The segment was reclaimed past the coverage this reader's index
+    /// incorporated. The checkpoint-bound index must be reloaded before the
+    /// overlay can be trusted again.
+    NeedsReload,
+}
+
 /// In-memory overlay of committed journal groups, built by scanning a
 /// writer's journal segment read-only. It is the read-committed source of
 /// truth for [`PackfileStorage::get_read_committed`]: entries at or below
@@ -959,26 +982,18 @@ impl ReadJournal {
         self.delete_lsn.retain(|_, lsn| *lsn > covered);
     }
 
-    /// Validate that a reset (reclaimed/rotated) segment still begins within
-    /// the coverage this reader's durable index incorporated.
+    /// Whether a reset (reclaimed/rotated) segment now begins past the
+    /// coverage this reader's durable index incorporated.
     ///
     /// After a reset the overlay is rebuilt from the segment alone. If the
-    /// segment's first surviving group starts past `covered + 1`, the writer
-    /// reclaimed groups this reader's index never absorbed: those records are
-    /// in neither the overlay nor the index, so fail closed rather than serve a
-    /// gap. A missing/empty segment has nothing to validate.
-    fn check_reset_coverage(scan: &crate::journal::Scan, covered: u64) -> Result<(), StorageError> {
-        let Some(first) = scan.groups.first() else {
-            return Ok(());
-        };
-        if first.first_lsn > covered.saturating_add(1) {
-            return Err(StorageError::Corrupt(format!(
-                "journal segment base LSN {} is past covered LSN {} this reader \
-                 incorporated; reload the checkpoint before reading",
-                first.first_lsn, covered
-            )));
-        }
-        Ok(())
+    /// segment's base LSN is past `covered + 1`, the writer reclaimed groups
+    /// this reader's index never absorbed: those records are in neither the
+    /// overlay nor the index. This uses the header base LSN, not the first
+    /// group, so a fully reclaimed (header-only) segment — where the segment
+    /// has no groups at all — is still detected. A missing/short segment
+    /// reports base 0 and is not a gap.
+    fn reset_has_coverage_gap(scan: &crate::journal::Scan, covered: u64) -> bool {
+        scan.base_lsn > covered.saturating_add(1)
     }
 
     /// Apply every committed group above `observed_lsn` to the overlay.
@@ -987,7 +1002,11 @@ impl ReadJournal {
     /// have created it yet); a segment that shrank since the last scan was
     /// reclaimed, so the overlay is rebuilt from scratch. Never repairs or
     /// creates the file, matching a read-only worker's constraints.
-    fn refresh(&mut self) -> Result<(), StorageError> {
+    ///
+    /// Returns [`ReadRefresh::NeedsReload`] when a reset reveals the writer
+    /// reclaimed past this reader's incorporated coverage; the caller must
+    /// reload the checkpoint-bound index and rebind `covered` before retrying.
+    fn refresh(&mut self) -> Result<ReadRefresh, StorageError> {
         // Coverage is fixed to the index this reader loaded. Reading
         // `journal.lsn` fresh would prune entries the reader's stale index has
         // not incorporated yet, dropping records from both sources.
@@ -1022,8 +1041,8 @@ impl ReadJournal {
                     Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
                 }
             };
-            if reset {
-                Self::check_reset_coverage(&scan, covered)?;
+            if reset && Self::reset_has_coverage_gap(&scan, covered) {
+                return Ok(ReadRefresh::NeedsReload);
             }
             for group in &scan.groups {
                 for entry in &group.entries {
@@ -1060,7 +1079,7 @@ impl ReadJournal {
         // The checkpoint can advance without the segment changing (reclaim is
         // best-effort), so prune overlay state it now covers.
         self.prune_covered(covered);
-        Ok(())
+        Ok(ReadRefresh::Applied)
     }
 }
 
@@ -1474,6 +1493,11 @@ impl PackfileStorage {
         // rescan and index rebuild entirely. It is only trusted when every
         // pack on disk still matches the fingerprint it was written against.
         let deleted_collections = Self::load_deleted_collections(&base_dir);
+        // Capture the journal coverage *before* loading the index, so the bound
+        // can never be newer than the index this handle builds. A writer writes
+        // `journal.lsn` only after its covering checkpoint, so reading it first
+        // always yields a bound <= the coverage of the checkpoint/scan below.
+        let read_covered = Self::read_journal_lsn(&base_dir);
         timings.metadata_load = metadata_started.elapsed();
         if let Some((scan_out, collection_order, delta_state)) = Self::checkpoint_scan_out(
             &base_dir,
@@ -1495,6 +1519,7 @@ impl PackfileStorage {
                 swizzle,
                 cache_capacity,
                 delta_state,
+                read_covered,
             );
             timings.total = started.elapsed();
             *store.last_open_timings.lock() = Some(timings);
@@ -1592,6 +1617,7 @@ impl PackfileStorage {
             // can continue anything the checkpoint recorded; force the next
             // dirty sync into a full checkpoint rewrite that re-bases the log.
             DeltaLogState::default(),
+            read_covered,
         );
         timings.total = started.elapsed();
         *store.last_open_timings.lock() = Some(timings);
@@ -1669,6 +1695,7 @@ impl PackfileStorage {
     /// the rescan path and the checkpoint fast path produce, so the two share
     /// one field-for-field constructor.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         shards: ShardPool,
         scan_out: RoomScanOutput,
@@ -1678,6 +1705,7 @@ impl PackfileStorage {
         swizzle: Option<SwizzleFn>,
         cache_capacity: usize,
         delta_state: DeltaLogState,
+        read_covered: u64,
     ) -> Self {
         let index_config = crate::index::IndexConfig {
             seed: shards.bucket_seed(),
@@ -1695,9 +1723,10 @@ impl PackfileStorage {
             .iter()
             .map(|&cid| (cid, initial_durable_fp))
             .collect();
-        // The checkpoint coverage this open's index corresponds to. Bound to
-        // the loaded index, never re-read from disk by the overlay.
-        let read_covered_lsn = AtomicU64::new(PackfileStorage::read_journal_lsn(&base_dir));
+        // The checkpoint coverage this open's index corresponds to, captured
+        // before the index was loaded. Bound to the loaded index, never
+        // re-read from disk by the overlay.
+        let read_covered_lsn = AtomicU64::new(read_covered);
         Self {
             shards,
             collections: RwLock::new(scan_out.collections),
@@ -5528,6 +5557,80 @@ impl PackfileStorage {
         Ok(results)
     }
 
+    /// Reload the durable index from the current on-disk checkpoint and rebind
+    /// [`Self::read_covered_lsn`] to it.
+    ///
+    /// Returns `false` when no checkpoint matching the current packs is on
+    /// disk, so the caller can fail closed instead of serving a stale index.
+    /// Coverage is captured before the checkpoint is read, so the new bound can
+    /// never be newer than the index loaded below.
+    fn reload_index_from_checkpoint(&self) -> bool {
+        let covered = Self::read_journal_lsn(&self.base_dir);
+        let open_shards: Vec<(u16, u64, PathBuf, u64)> = self
+            .shards
+            .all_shards()
+            .into_iter()
+            .map(|(id, shard)| (id, shard.pack_id, shard.path.clone(), shard.file_len()))
+            .collect();
+        let deleted_collections = self.deleted_collections.lock().clone();
+        let mut timings = OpenTimings::default();
+        let Some((scan_out, collection_order, _delta_state)) = Self::checkpoint_scan_out(
+            &self.base_dir,
+            self.cache_capacity,
+            &self.shards,
+            &open_shards,
+            &deleted_collections,
+            false,
+            self.index_config,
+            &mut timings,
+        ) else {
+            return false;
+        };
+        *self.collections.write() = scan_out.collections;
+        *self.collection_order.write() = collection_order;
+        *self.shard_collections.write() = scan_out.shard_collections;
+        *self.collection_shards.write() = scan_out.collection_shards;
+        self.read_covered_lsn.store(covered, Ordering::Release);
+        true
+    }
+
+    /// Refresh the read-committed overlay, reloading the checkpoint-bound index
+    /// when the writer reclaimed past this reader's incorporated coverage.
+    ///
+    /// A reclaim that outruns the reader's index is the one case the overlay
+    /// cannot resolve from the segment alone; reloading the checkpoint advances
+    /// the index/coverage pair together, after which the retry is consistent.
+    /// Without a usable checkpoint the read fails closed.
+    fn refresh_read_journal(&self) -> Result<(), StorageError> {
+        for _ in 0..2 {
+            let needs_reload = {
+                let mut guard = self.read_journal.lock();
+                match guard.as_mut() {
+                    Some(overlay) => overlay.refresh()? == ReadRefresh::NeedsReload,
+                    None => return Ok(()),
+                }
+            };
+            if !needs_reload {
+                return Ok(());
+            }
+            if !self.reload_index_from_checkpoint() {
+                return Err(StorageError::Corrupt(
+                    "read-committed overlay needs a checkpoint reload, but no usable \
+                     checkpoint is on disk"
+                        .to_owned(),
+                ));
+            }
+            let mut guard = self.read_journal.lock();
+            if let Some(overlay) = guard.as_mut() {
+                overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
+                overlay.reset_overlay();
+            }
+        }
+        Err(StorageError::Corrupt(
+            "read-committed overlay still needs a checkpoint reload after reloading".to_owned(),
+        ))
+    }
+
     /// Enable a read-only journal overlay for the read-committed API.
     ///
     /// `path` is a writer's journal segment. The overlay is built with
@@ -5538,16 +5641,19 @@ impl PackfileStorage {
     /// [`Self::get_read_committed`] consults the overlay.
     ///
     /// # Errors
-    /// Returns [`StorageError`] if the segment is unreadable or a committed
-    /// group fails validation.
+    /// Returns [`StorageError`] if the segment is unreadable, a committed
+    /// group fails validation, or a coverage gap cannot be resolved by
+    /// reloading the checkpoint.
     pub fn enable_read_journal(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
         // Bind the overlay to the coverage of the index this handle loaded, not
         // whatever `journal.lsn` says now: a concurrent checkpoint may already
         // have advanced past this handle's in-memory index.
         let covered = self.read_covered_lsn.load(Ordering::Acquire);
-        let mut overlay = ReadJournal::empty(path.as_ref().to_path_buf(), covered);
-        overlay.refresh()?;
-        *self.read_journal.lock() = Some(overlay);
+        *self.read_journal.lock() = Some(ReadJournal::empty(path.as_ref().to_path_buf(), covered));
+        if let Err(error) = self.refresh_read_journal() {
+            *self.read_journal.lock() = None;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -5574,10 +5680,13 @@ impl PackfileStorage {
         let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
         let mut unresolved: Vec<usize> = Vec::new();
 
+        // Refresh outside the read lock: this may reload the checkpoint-bound
+        // index if the writer reclaimed past this reader's coverage.
+        self.refresh_read_journal()?;
+
         {
-            let mut guard = self.read_journal.lock();
-            if let Some(overlay) = guard.as_mut() {
-                overlay.refresh()?;
+            let guard = self.read_journal.lock();
+            if let Some(overlay) = guard.as_ref() {
                 match overlay.puts.get(collection_id) {
                     Some(committed) => {
                         for (index, id) in ids.iter().enumerate() {
@@ -5611,6 +5720,507 @@ impl PackfileStorage {
             }
         }
         Ok(results)
+    }
+}
+
+impl PackfileStorage {
+    /// Eagerly write an immutable record to the packfile and live index while
+    /// staging its journal mutation for the SQL transaction's post-commit
+    /// callback. This bypasses the legacy queue-on-put path.
+    ///
+    /// # Errors
+    /// Returns a storage or staging error if the record cannot be written or
+    /// the transaction stage is inactive or full.
+    pub fn put_staged(
+        &self,
+        stage: &TxnStage,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+    ) -> Result<(), StorageError> {
+        self.put_internal(collection_id, id, data, Some((stage, pool)))
+    }
+
+    /// Batch variant of [`Self::put_staged`]. The group's mutations enter the
+    /// stage only after the full eager packfile/index batch succeeds.
+    ///
+    /// # Errors
+    /// Returns a storage or staging error if the batch cannot be written or
+    /// the transaction stage is inactive or full.
+    pub fn put_many_staged(
+        &self,
+        stage: &TxnStage,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+    ) -> Result<usize, StorageError> {
+        self.put_many_internal(collection_id, entries, Some((stage, pool)))
+    }
+
+    fn append_put_record(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        staged: Option<(&TxnStage, ShardType)>,
+    ) -> Result<(u16, u64), StorageError> {
+        if let Some((stage, _)) = staged {
+            stage.ensure_capacity(data.bytes.len().saturating_add(64))?;
+        }
+        let record = Record {
+            collection_id: *collection_id,
+            hash: *id,
+            data: data.bytes.clone(),
+        };
+        let location = self.shards.put_record(&record)?;
+        if let Some((stage, pool)) = staged {
+            stage.stage_put(pool, *collection_id, *id, data.bytes.to_vec())?;
+        } else {
+            self.publish_mutation(|| JournalMutation::Put {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+            })?;
+        }
+        Ok(location)
+    }
+
+    fn put_internal(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        staged: Option<(&TxnStage, ShardType)>,
+    ) -> Result<(), StorageError> {
+        self.put_calls.fetch_add(1, Ordering::Relaxed);
+        self.put_bytes
+            .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+
+        // New-collection puts must not interleave their record flush with a
+        // concurrent checkpoint's fingerprint→snapshot window (see
+        // `persist_index_checkpoint`). Existing collections are already gated
+        // by their `put_mutex`; a brand-new one isn't in that set yet, so we
+        // hold the publication lock shared for the whole put instead — the
+        // checkpoint holds it exclusive, excluding this put from the window.
+        let _create_guard = if self.generation(collection_id).is_none() {
+            Some(self.collection_creation.read())
+        } else {
+            None
+        };
+
+        let (shard_id, offset) = self.append_put_record(collection_id, id, data, staged)?;
+        if let Some(gen) = self.generation(collection_id) {
+            if !gen.index.is_mmap_backed() {
+                if let Ok((bucket, slot)) =
+                    self.insert_index(collection_id, &gen.index, id, shard_id, offset)?
+                {
+                    self.record_delta(collection_id, gen.generation, bucket, slot);
+                    let pack_id = self
+                        .shards
+                        .get_shard(shard_id)
+                        .map_or(u64::from(shard_id), |shard| shard.pack_id);
+                    self.record_new_shard_collection(pack_id, collection_id);
+
+                    let mut data_to_cache = data.clone();
+                    for child in &mut data_to_cache.children {
+                        if let NodeRef::Lazy(child_id) = child {
+                            if let Some(child_data) = self.pinned.get(child_id) {
+                                *child = NodeRef::Resolved(*child_id, child_data);
+                            }
+                        }
+                    }
+                    gen.cache.insert(*id, Arc::new(data_to_cache));
+                    self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
+        }
+        let (index, cache) = {
+            let old_gen = self.generation(collection_id);
+            let mut index = match &old_gen {
+                Some(g) => g.index.clone(),
+                // A brand-new collection's first insert: no count hint to
+                // size from (unlike `put_many`, which knows `entries.len()`),
+                // so start at a small fixed floor and let `grow()` size it
+                // up as real entries land. Previously this was a flat
+                // 4096-slot (32 KiB) floor per collection regardless of how
+                // many records it would ever hold -- workloads with many
+                // small/near-empty collections (e.g. per-room collections
+                // holding a handful of records each) paid that 32 KiB up
+                // front per collection, dwarfing the actual data by orders
+                // of magnitude.
+                //
+                // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
+                // index's own smaller hard floor.
+                None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
+            };
+            let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
+            if let Ok((bucket, slot)) = inserted {
+                let generation = old_gen.as_ref().map_or(1, |g| g.generation);
+                self.record_delta(collection_id, generation, bucket, slot);
+                let pack_id = self
+                    .shards
+                    .get_shard(shard_id)
+                    .map_or(u64::from(shard_id), |s| s.pack_id);
+                self.record_new_shard_collection(pack_id, collection_id);
+            } else {
+                // The insert was rejected (table full). The collection's shape
+                // is about to change, so any delta frames would no longer be
+                // replayable against a checkpoint at this generation.
+                self.invalidate_delta_log(collection_id);
+                if let Some(grown) = index.grow() {
+                    // The failed insert did not mutate the table, so retry it
+                    // after the in-memory rehash. This is the normal capacity
+                    // path and must not turn into a full-pack scan.
+                    let _ = grown.insert(id, shard_id, offset);
+                    index = grown;
+                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
+                    // A checkpoint-backed index has locations but not homes.
+                    // Recovering the hashes from those locations is bounded
+                    // by this collection, unlike `rebuild_index`'s pack scan.
+                    let _ = grown.insert(id, shard_id, offset);
+                    index = grown;
+                } else {
+                    index = self.rebuild_index(collection_id)?;
+                    let _ = index.insert(id, shard_id, offset);
+                }
+                // The rebuild re-derived the collection's entire live set from
+                // scratch, so its shard distribution needs a full
+                // recompute too, not just crediting this one record.
+                self.replace_collection_shard_counts(
+                    collection_id,
+                    &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+                );
+            }
+            let cache = match &old_gen {
+                Some(g) => g.cache.clone(),
+                None => Arc::new(NodeCache::new(self.cache_capacity)),
+            };
+
+            let mut data_to_cache = data.clone();
+            for child in &mut data_to_cache.children {
+                if let NodeRef::Lazy(child_id) = child {
+                    if let Some(child_data) = self.pinned.get(child_id) {
+                        *child = NodeRef::Resolved(*child_id, child_data);
+                    }
+                }
+            }
+            cache.insert(*id, Arc::new(data_to_cache));
+
+            (index, cache)
+        };
+
+        self.store_generation(collection_id, index, Some(cache), false)?;
+
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the live-index fast path and its clone-on-demand fallback read clearest \
+                  kept together rather than split across helpers that would each need most \
+                  of the same state (old_gen, owned_index, structural_change) threaded through"
+    )]
+    fn put_many_internal(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        staged: Option<(&TxnStage, ShardType)>,
+    ) -> Result<usize, StorageError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        if let Some((stage, _)) = staged {
+            let charge = entries.iter().fold(0usize, |total, (_, data)| {
+                total.saturating_add(data.bytes.len().saturating_add(64))
+            });
+            stage.ensure_capacity(charge)?;
+        }
+
+        // Validate every frame before appending the first one. In particular,
+        // an oversized or otherwise unencodable later entry must not leave an
+        // earlier prefix physically present for crash recovery to rediscover.
+        // I/O failures still use the append-only storage's dirty/recovery path.
+        for (id, data) in entries {
+            ShardPool::validate_record(&Record {
+                collection_id: *collection_id,
+                hash: *id,
+                data: data.bytes.clone(),
+            })?;
+        }
+
+        self.put_many_calls.fetch_add(1, Ordering::Relaxed);
+        self.put_many_records
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.put_many_bytes.fetch_add(
+            entries
+                .iter()
+                .map(|(_, data)| data.bytes.len() as u64)
+                .sum::<u64>(),
+            Ordering::Relaxed,
+        );
+
+        let collection_arc = self.put_mutex(collection_id);
+        let collection_guard = collection_arc.lock();
+
+        // Same comment as in `put`: a brand-new collection must be excluded
+        // from a concurrent checkpoint's fingerprint→snapshot window.
+        let create_guard = if self.generation(collection_id).is_none() {
+            Some(self.collection_creation.read())
+        } else {
+            None
+        };
+
+        let old_gen = self.generation(collection_id);
+        let generation = old_gen.as_ref().map_or(1, |g| g.generation);
+        let cache = match &old_gen {
+            Some(g) => g.cache.clone(),
+            None => Arc::new(NodeCache::new(self.cache_capacity)),
+        };
+
+        // Batches use copy-on-write even when their current index is already
+        // materialized. That is deliberately unlike `put`: a batch can fail
+        // after an earlier record append, so its index changes must remain
+        // private until every fallible operation has succeeded.
+        let materialize_started = std::time::Instant::now();
+        // A batch is published as one generation. In particular, never
+        // insert directly into the currently published index: a later shard
+        // append can fail, and callers must not observe the successful prefix
+        // of that failed batch.
+        let mut owned_index: Option<LossyIndex> = match &old_gen {
+            // A batch against an already-materialized (non-mmap) index can
+            // mutate it in place instead of paying a full clone: each write
+            // is captured in `undo_log` below and rolled back in reverse if
+            // a later entry's shard append fails, so the live index never
+            // ends up observably holding a failed batch's partial prefix.
+            Some(g) if !g.index.is_mmap_backed() => None,
+            Some(g) => Some(g.index.clone()),
+            // Unlike `put`'s single-record path, we know exactly how many
+            // records this brand-new collection is about to receive -- size
+            // from that instead of the old flat 4096-slot (32 KiB) floor,
+            // matching the `records.len().saturating_mul(2).max(16)` pattern
+            // used elsewhere in this file (e.g. checkpoint/pack rebuild).
+            // Floor is 64, not 16 -- see the matching comment on `put`'s
+            // `None` arm above: a small batch (e.g. a single-event
+            // `put_many` call) would otherwise still hit `grow()` almost
+            // immediately and require a full collection snapshot on sync.
+            None => Some(LossyIndex::with_config(
+                entries
+                    .len()
+                    .saturating_mul(2)
+                    .max(NEW_COLLECTION_INDEX_FLOOR),
+                self.index_config,
+            )),
+        };
+        // Every non-empty batch materializes an owned index up front so its
+        // contents can be published atomically.
+        if owned_index.is_some() {
+            self.put_many_clone_path_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.index_clone_time_ns.fetch_add(
+                u64::try_from(materialize_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        } else {
+            self.put_many_fast_path_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // The owned index is always published after a successful batch.
+        let mut structural_change = owned_index.is_some();
+        let mut index_needs_rebuild = false;
+        let mut pending_deltas = Vec::with_capacity(entries.len());
+        let mut pending_shard_collections = Vec::with_capacity(entries.len());
+        let mut invalidate_delta = false;
+        // Undo entries for writes made directly to `old_gen`'s live index
+        // (only populated while `owned_index` is still `None`). Replayed in
+        // reverse on any later failure so the live index never ends up
+        // observably holding a failed batch's partial prefix -- the
+        // property the unconditional clone used to provide for free.
+        let mut undo_log: Vec<SlotUndo> = Vec::new();
+
+        macro_rules! rollback_and_fail {
+            ($error:expr) => {{
+                if let Some(g) = &old_gen {
+                    for undo in undo_log.iter().rev() {
+                        g.index.rollback_slot(undo);
+                    }
+                }
+                drop(create_guard);
+                drop(collection_guard);
+                return Err(self.persist_failed_batch_boundary($error));
+            }};
+        }
+
+        for (id, data) in entries {
+            let record = Record {
+                collection_id: *collection_id,
+                hash: *id,
+                data: data.bytes.clone(),
+            };
+
+            let (shard_id, offset) = match self.shards.put_record(&record) {
+                Ok(location) => location,
+                // Earlier entries may already be complete on disk. Write a
+                // checkpoint for the old generation before returning, so a
+                // crash after this error cannot make a restart's
+                // fingerprint-matched scan publish the failed prefix.
+                Err(error) => rollback_and_fail!(error.into()),
+            };
+            if staged.is_none() {
+                if let Err(error) = self.publish_mutation(|| JournalMutation::Put {
+                    collection_id: *collection_id,
+                    node_id: *id,
+                    payload: data.bytes.to_vec(),
+                }) {
+                    rollback_and_fail!(error);
+                }
+            }
+
+            if index_needs_rebuild {
+                continue;
+            }
+
+            // Whichever index is authoritative for this insert: the owned
+            // copy once one exists, else the collection's live, still-shared
+            // index — only reachable here when it's neither mmap-backed nor
+            // absent, both of which already forced `owned_index` above.
+            let live: &LossyIndex = match owned_index.as_ref() {
+                Some(index) => index,
+                None => {
+                    &old_gen
+                        .as_ref()
+                        .expect("live path implies an existing generation")
+                        .index
+                }
+            };
+
+            let insert_result =
+                match self.insert_index_undoable(collection_id, live, id, shard_id, offset) {
+                    Ok(result) => result,
+                    Err(error) => rollback_and_fail!(error),
+                };
+            let inserted = if let Ok((bucket, slot, undo)) = insert_result {
+                pending_deltas.push((bucket, slot));
+                // Only writes against the still-live (uncloned) index need
+                // an undo entry -- once `owned_index` exists, a failure
+                // just discards that private clone, same as before.
+                if owned_index.is_none() {
+                    undo_log.push(undo);
+                }
+                true
+            } else {
+                // Growth (either flavor) materializes a fresh owned index; the
+                // O(n) copy is exactly what the steady-append scaler tracks,
+                // so bag its time alongside the up-front materialization.
+                let grow_started = std::time::Instant::now();
+                let grown = if let Some(grown) = live.grow() {
+                    // `insert_tracked` leaves the table unchanged on
+                    // TableFull, so retrying with the record's
+                    // still-available location is sufficient; no pack scan is
+                    // needed for pure growth. The grow changes the
+                    // collection's shape, so the delta log is invalidated and
+                    // no frame is recorded for this (or any later)
+                    // overwrite in the batch.
+                    invalidate_delta = true;
+                    structural_change = true;
+                    grown
+                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, live) {
+                    // The checkpoint does not retain homes, but its slots
+                    // retain locations. Recover only those identities and
+                    // retry; do not scan every pack in the store.
+                    invalidate_delta = true;
+                    structural_change = true;
+                    grown
+                } else {
+                    index_needs_rebuild = true;
+                    structural_change = true;
+                    invalidate_delta = true;
+                    continue;
+                };
+                self.index_grow_count.fetch_add(1, Ordering::Relaxed);
+                self.index_clone_time_ns.fetch_add(
+                    u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                let inserted = grown.insert(id, shard_id, offset).is_ok();
+                owned_index = Some(grown);
+                inserted
+            };
+            if inserted {
+                let pack_id = self
+                    .shards
+                    .get_shard(shard_id)
+                    .map_or(u64::from(shard_id), |s| s.pack_id);
+                pending_shard_collections.push(pack_id);
+            }
+        }
+
+        if index_needs_rebuild {
+            let rebuilt = match self.rebuild_index(collection_id) {
+                Ok(index) => index,
+                Err(error) => rollback_and_fail!(error),
+            };
+            // rebuild_index automatically discovers all the records we just appended
+            self.replace_collection_shard_counts(
+                collection_id,
+                &self.slot_counts_to_pack_id_counts(&rebuilt.shard_counts()),
+            );
+            owned_index = Some(rebuilt);
+        }
+
+        // All fallible work is complete. Only now make the batch visible to
+        // the shared index, delta state, and shard bookkeeping.
+        if invalidate_delta {
+            self.invalidate_delta_log(collection_id);
+        } else {
+            for (bucket, slot) in pending_deltas {
+                self.record_delta(collection_id, generation, bucket, slot);
+            }
+        }
+        for pack_id in pending_shard_collections {
+            self.record_new_shard_collection(pack_id, collection_id);
+        }
+
+        // Apply cache mutations only after all disk writes succeed, so a
+        // failed batch does not leak partial state into the shared cache.
+        // Resolve and insert one entry at a time: retaining a prepared clone
+        // of the entire batch here would defeat the cache's size bound.
+        for (id, data) in entries {
+            let mut data_to_cache = data.clone();
+            for child in &mut data_to_cache.children {
+                if let NodeRef::Lazy(child_id) = child {
+                    if let Some(child_data) = self.pinned.get(child_id) {
+                        *child = NodeRef::Resolved(*child_id, child_data);
+                    }
+                }
+            }
+            cache.insert(*id, Arc::new(data_to_cache));
+        }
+
+        if structural_change {
+            let index = owned_index
+                .expect("structural_change is only set once owned_index is materialized");
+            if let Err(error) = self.store_generation(collection_id, index, Some(cache), false) {
+                rollback_and_fail!(error);
+            }
+        } else {
+            // Every record landed on the live, already-published index in
+            // place -- no new generation to publish, matching `put`'s
+            // in-place success path.
+            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
+
+        if let Some((stage, pool)) = staged {
+            let staged_entries: Vec<(NodeId, Vec<u8>)> = entries
+                .iter()
+                .map(|(id, data)| (*id, data.bytes.to_vec()))
+                .collect();
+            stage.stage_puts(pool, *collection_id, &staged_entries)?;
+        }
+        Ok(entries.len())
     }
 }
 
@@ -5776,428 +6386,15 @@ impl StorageEngine for PackfileStorage {
         id: &NodeId,
         data: &NodeData,
     ) -> Result<(), StorageError> {
-        self.put_calls.fetch_add(1, Ordering::Relaxed);
-        self.put_bytes
-            .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
-        let collection_arc = self.put_mutex(collection_id);
-        let _collection_guard = collection_arc.lock();
-
-        // New-collection puts must not interleave their record flush with a
-        // concurrent checkpoint's fingerprint→snapshot window (see
-        // `persist_index_checkpoint`). Existing collections are already gated
-        // by their `put_mutex`; a brand-new one isn't in that set yet, so we
-        // hold the publication lock shared for the whole put instead — the
-        // checkpoint holds it exclusive, excluding this put from the window.
-        let _create_guard = if self.generation(collection_id).is_none() {
-            Some(self.collection_creation.read())
-        } else {
-            None
-        };
-
-        let record = Record {
-            collection_id: *collection_id,
-            hash: *id,
-            data: data.bytes.clone(),
-        };
-        let (shard_id, offset) = self.shards.put_record(&record)?;
-        self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
-        })?;
-        if let Some(gen) = self.generation(collection_id) {
-            if !gen.index.is_mmap_backed() {
-                if let Ok((bucket, slot)) =
-                    self.insert_index(collection_id, &gen.index, id, shard_id, offset)?
-                {
-                    self.record_delta(collection_id, gen.generation, bucket, slot);
-                    let pack_id = self
-                        .shards
-                        .get_shard(shard_id)
-                        .map_or(u64::from(shard_id), |shard| shard.pack_id);
-                    self.record_new_shard_collection(pack_id, collection_id);
-
-                    let mut data_to_cache = data.clone();
-                    for child in &mut data_to_cache.children {
-                        if let NodeRef::Lazy(child_id) = child {
-                            if let Some(child_data) = self.pinned.get(child_id) {
-                                *child = NodeRef::Resolved(*child_id, child_data);
-                            }
-                        }
-                    }
-                    gen.cache.insert(*id, Arc::new(data_to_cache));
-                    self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-                    return Ok(());
-                }
-            }
-        }
-        let (index, cache) = {
-            let old_gen = self.generation(collection_id);
-            let mut index = match &old_gen {
-                Some(g) => g.index.clone(),
-                // A brand-new collection's first insert: no count hint to
-                // size from (unlike `put_many`, which knows `entries.len()`),
-                // so start at a small fixed floor and let `grow()` size it
-                // up as real entries land. Previously this was a flat
-                // 4096-slot (32 KiB) floor per collection regardless of how
-                // many records it would ever hold -- workloads with many
-                // small/near-empty collections (e.g. per-room collections
-                // holding a handful of records each) paid that 32 KiB up
-                // front per collection, dwarfing the actual data by orders
-                // of magnitude.
-                //
-                // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
-                // index's own smaller hard floor.
-                None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
-            };
-            let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
-            if let Ok((bucket, slot)) = inserted {
-                let generation = old_gen.as_ref().map_or(1, |g| g.generation);
-                self.record_delta(collection_id, generation, bucket, slot);
-                let pack_id = self
-                    .shards
-                    .get_shard(shard_id)
-                    .map_or(u64::from(shard_id), |s| s.pack_id);
-                self.record_new_shard_collection(pack_id, collection_id);
-            } else {
-                // The insert was rejected (table full). The collection's shape
-                // is about to change, so any delta frames would no longer be
-                // replayable against a checkpoint at this generation.
-                self.invalidate_delta_log(collection_id);
-                if let Some(grown) = index.grow() {
-                    // The failed insert did not mutate the table, so retry it
-                    // after the in-memory rehash. This is the normal capacity
-                    // path and must not turn into a full-pack scan.
-                    let _ = grown.insert(id, shard_id, offset);
-                    index = grown;
-                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
-                    // A checkpoint-backed index has locations but not homes.
-                    // Recovering the hashes from those locations is bounded
-                    // by this collection, unlike `rebuild_index`'s pack scan.
-                    let _ = grown.insert(id, shard_id, offset);
-                    index = grown;
-                } else {
-                    index = self.rebuild_index(collection_id)?;
-                    let _ = index.insert(id, shard_id, offset);
-                }
-                // The rebuild re-derived the collection's entire live set from
-                // scratch, so its shard distribution needs a full
-                // recompute too, not just crediting this one record.
-                self.replace_collection_shard_counts(
-                    collection_id,
-                    &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
-                );
-            }
-            let cache = match &old_gen {
-                Some(g) => g.cache.clone(),
-                None => Arc::new(NodeCache::new(self.cache_capacity)),
-            };
-
-            let mut data_to_cache = data.clone();
-            for child in &mut data_to_cache.children {
-                if let NodeRef::Lazy(child_id) = child {
-                    if let Some(child_data) = self.pinned.get(child_id) {
-                        *child = NodeRef::Resolved(*child_id, child_data);
-                    }
-                }
-            }
-            cache.insert(*id, Arc::new(data_to_cache));
-
-            (index, cache)
-        };
-
-        self.store_generation(collection_id, index, Some(cache), false)?;
-
-        Ok(())
+        self.put_internal(collection_id, id, data, None)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the live-index fast path and its clone-on-demand fallback read clearest \
-                  kept together rather than split across helpers that would each need most \
-                  of the same state (old_gen, owned_index, structural_change) threaded through"
-    )]
     fn put_many(
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
-        // Validate every frame before appending the first one. In particular,
-        // an oversized or otherwise unencodable later entry must not leave an
-        // earlier prefix physically present for crash recovery to rediscover.
-        // I/O failures still use the append-only storage's dirty/recovery path.
-        for (id, data) in entries {
-            ShardPool::validate_record(&Record {
-                collection_id: *collection_id,
-                hash: *id,
-                data: data.bytes.clone(),
-            })?;
-        }
-
-        self.put_many_calls.fetch_add(1, Ordering::Relaxed);
-        self.put_many_records
-            .fetch_add(entries.len() as u64, Ordering::Relaxed);
-        self.put_many_bytes.fetch_add(
-            entries
-                .iter()
-                .map(|(_, data)| data.bytes.len() as u64)
-                .sum::<u64>(),
-            Ordering::Relaxed,
-        );
-
-        let collection_arc = self.put_mutex(collection_id);
-        let collection_guard = collection_arc.lock();
-
-        // Same comment as in `put`: a brand-new collection must be excluded
-        // from a concurrent checkpoint's fingerprint→snapshot window.
-        let create_guard = if self.generation(collection_id).is_none() {
-            Some(self.collection_creation.read())
-        } else {
-            None
-        };
-
-        let old_gen = self.generation(collection_id);
-        let generation = old_gen.as_ref().map_or(1, |g| g.generation);
-        let cache = match &old_gen {
-            Some(g) => g.cache.clone(),
-            None => Arc::new(NodeCache::new(self.cache_capacity)),
-        };
-
-        // Batches use copy-on-write even when their current index is already
-        // materialized. That is deliberately unlike `put`: a batch can fail
-        // after an earlier record append, so its index changes must remain
-        // private until every fallible operation has succeeded.
-        let materialize_started = std::time::Instant::now();
-        // A batch is published as one generation. In particular, never
-        // insert directly into the currently published index: a later shard
-        // append can fail, and callers must not observe the successful prefix
-        // of that failed batch.
-        let mut owned_index: Option<LossyIndex> = match &old_gen {
-            // A batch against an already-materialized (non-mmap) index can
-            // mutate it in place instead of paying a full clone: each write
-            // is captured in `undo_log` below and rolled back in reverse if
-            // a later entry's shard append fails, so the live index never
-            // ends up observably holding a failed batch's partial prefix.
-            Some(g) if !g.index.is_mmap_backed() => None,
-            Some(g) => Some(g.index.clone()),
-            // Unlike `put`'s single-record path, we know exactly how many
-            // records this brand-new collection is about to receive -- size
-            // from that instead of the old flat 4096-slot (32 KiB) floor,
-            // matching the `records.len().saturating_mul(2).max(16)` pattern
-            // used elsewhere in this file (e.g. checkpoint/pack rebuild).
-            // Floor is 64, not 16 -- see the matching comment on `put`'s
-            // `None` arm above: a small batch (e.g. a single-event
-            // `put_many` call) would otherwise still hit `grow()` almost
-            // immediately and require a full collection snapshot on sync.
-            None => Some(LossyIndex::with_config(
-                entries
-                    .len()
-                    .saturating_mul(2)
-                    .max(NEW_COLLECTION_INDEX_FLOOR),
-                self.index_config,
-            )),
-        };
-        // Every non-empty batch materializes an owned index up front so its
-        // contents can be published atomically.
-        if owned_index.is_some() {
-            self.put_many_clone_path_calls
-                .fetch_add(1, Ordering::Relaxed);
-            self.index_clone_time_ns.fetch_add(
-                u64::try_from(materialize_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-        } else {
-            self.put_many_fast_path_calls
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        // The owned index is always published after a successful batch.
-        let mut structural_change = owned_index.is_some();
-        let mut index_needs_rebuild = false;
-        let mut pending_deltas = Vec::with_capacity(entries.len());
-        let mut pending_shard_collections = Vec::with_capacity(entries.len());
-        let mut invalidate_delta = false;
-        // Undo entries for writes made directly to `old_gen`'s live index
-        // (only populated while `owned_index` is still `None`). Replayed in
-        // reverse on any later failure so the live index never ends up
-        // observably holding a failed batch's partial prefix -- the
-        // property the unconditional clone used to provide for free.
-        let mut undo_log: Vec<SlotUndo> = Vec::new();
-
-        macro_rules! rollback_and_fail {
-            ($error:expr) => {{
-                if let Some(g) = &old_gen {
-                    for undo in undo_log.iter().rev() {
-                        g.index.rollback_slot(undo);
-                    }
-                }
-                drop(create_guard);
-                drop(collection_guard);
-                return Err(self.persist_failed_batch_boundary($error));
-            }};
-        }
-
-        for (id, data) in entries {
-            let record = Record {
-                collection_id: *collection_id,
-                hash: *id,
-                data: data.bytes.clone(),
-            };
-
-            let (shard_id, offset) = match self.shards.put_record(&record) {
-                Ok(location) => location,
-                // Earlier entries may already be complete on disk. Write a
-                // checkpoint for the old generation before returning, so a
-                // crash after this error cannot make a restart's
-                // fingerprint-matched scan publish the failed prefix.
-                Err(error) => rollback_and_fail!(error.into()),
-            };
-            if let Err(error) = self.publish_mutation(|| JournalMutation::Put {
-                collection_id: *collection_id,
-                node_id: *id,
-                payload: data.bytes.to_vec(),
-            }) {
-                rollback_and_fail!(error);
-            }
-
-            if index_needs_rebuild {
-                continue;
-            }
-
-            // Whichever index is authoritative for this insert: the owned
-            // copy once one exists, else the collection's live, still-shared
-            // index — only reachable here when it's neither mmap-backed nor
-            // absent, both of which already forced `owned_index` above.
-            let live: &LossyIndex = match owned_index.as_ref() {
-                Some(index) => index,
-                None => {
-                    &old_gen
-                        .as_ref()
-                        .expect("live path implies an existing generation")
-                        .index
-                }
-            };
-
-            let insert_result =
-                match self.insert_index_undoable(collection_id, live, id, shard_id, offset) {
-                    Ok(result) => result,
-                    Err(error) => rollback_and_fail!(error),
-                };
-            let inserted = if let Ok((bucket, slot, undo)) = insert_result {
-                pending_deltas.push((bucket, slot));
-                // Only writes against the still-live (uncloned) index need
-                // an undo entry -- once `owned_index` exists, a failure
-                // just discards that private clone, same as before.
-                if owned_index.is_none() {
-                    undo_log.push(undo);
-                }
-                true
-            } else {
-                // Growth (either flavor) materializes a fresh owned index; the
-                // O(n) copy is exactly what the steady-append scaler tracks,
-                // so bag its time alongside the up-front materialization.
-                let grow_started = std::time::Instant::now();
-                let grown = if let Some(grown) = live.grow() {
-                    // `insert_tracked` leaves the table unchanged on
-                    // TableFull, so retrying with the record's
-                    // still-available location is sufficient; no pack scan is
-                    // needed for pure growth. The grow changes the
-                    // collection's shape, so the delta log is invalidated and
-                    // no frame is recorded for this (or any later)
-                    // overwrite in the batch.
-                    invalidate_delta = true;
-                    structural_change = true;
-                    grown
-                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, live) {
-                    // The checkpoint does not retain homes, but its slots
-                    // retain locations. Recover only those identities and
-                    // retry; do not scan every pack in the store.
-                    invalidate_delta = true;
-                    structural_change = true;
-                    grown
-                } else {
-                    index_needs_rebuild = true;
-                    structural_change = true;
-                    invalidate_delta = true;
-                    continue;
-                };
-                self.index_grow_count.fetch_add(1, Ordering::Relaxed);
-                self.index_clone_time_ns.fetch_add(
-                    u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-                let inserted = grown.insert(id, shard_id, offset).is_ok();
-                owned_index = Some(grown);
-                inserted
-            };
-            if inserted {
-                let pack_id = self
-                    .shards
-                    .get_shard(shard_id)
-                    .map_or(u64::from(shard_id), |s| s.pack_id);
-                pending_shard_collections.push(pack_id);
-            }
-        }
-
-        if index_needs_rebuild {
-            let rebuilt = match self.rebuild_index(collection_id) {
-                Ok(index) => index,
-                Err(error) => rollback_and_fail!(error),
-            };
-            // rebuild_index automatically discovers all the records we just appended
-            self.replace_collection_shard_counts(
-                collection_id,
-                &self.slot_counts_to_pack_id_counts(&rebuilt.shard_counts()),
-            );
-            owned_index = Some(rebuilt);
-        }
-
-        // All fallible work is complete. Only now make the batch visible to
-        // the shared index, delta state, and shard bookkeeping.
-        if invalidate_delta {
-            self.invalidate_delta_log(collection_id);
-        } else {
-            for (bucket, slot) in pending_deltas {
-                self.record_delta(collection_id, generation, bucket, slot);
-            }
-        }
-        for pack_id in pending_shard_collections {
-            self.record_new_shard_collection(pack_id, collection_id);
-        }
-
-        // Apply cache mutations only after all disk writes succeed, so a
-        // failed batch does not leak partial state into the shared cache.
-        // Resolve and insert one entry at a time: retaining a prepared clone
-        // of the entire batch here would defeat the cache's size bound.
-        for (id, data) in entries {
-            let mut data_to_cache = data.clone();
-            for child in &mut data_to_cache.children {
-                if let NodeRef::Lazy(child_id) = child {
-                    if let Some(child_data) = self.pinned.get(child_id) {
-                        *child = NodeRef::Resolved(*child_id, child_data);
-                    }
-                }
-            }
-            cache.insert(*id, Arc::new(data_to_cache));
-        }
-
-        if structural_change {
-            let index = owned_index
-                .expect("structural_change is only set once owned_index is materialized");
-            if let Err(error) = self.store_generation(collection_id, index, Some(cache), false) {
-                rollback_and_fail!(error);
-            }
-        } else {
-            // Every record landed on the live, already-published index in
-            // place -- no new generation to publish, matching `put`'s
-            // in-place success path.
-            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-        }
-
-        Ok(entries.len())
+        self.put_many_internal(collection_id, entries, None)
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -7456,6 +7653,85 @@ mod tests {
         assert!(
             store.get_read_committed(&collection, &[node]).is_err(),
             "a reclaimed segment base beyond the reader's covered LSN must error"
+        );
+    }
+
+    #[test]
+    fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
+        let dir = test_dir("read_committed_reclaim_reload");
+        let wal = dir.join("wal.bin");
+        let collection = [0x49u8; 16];
+        let first = [0x11u8; 16];
+        let second = [0x12u8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x94u8; 16],
+            &[0x94u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: first,
+                payload: b"first".to_vec(),
+            }])
+            .unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: second,
+                payload: b"second".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        // The writer checkpoints LSN 1 and reclaims through it, so the segment
+        // now begins at LSN 2 while the reader's index incorporated only
+        // coverage 0. Reloading the checkpoint must advance the pair and let
+        // the surviving group stay readable, rather than erroring forever.
+        store.write_journal_lsn(1).unwrap();
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal.reclaim_through(1).unwrap();
+        drop(journal);
+
+        let read_committed = store
+            .get_read_committed(&collection, &[first, second])
+            .unwrap();
+        assert!(
+            read_committed[0].is_none(),
+            "the reclaimed group must not be resurrected"
+        );
+        assert_eq!(
+            read_committed[1].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"second"[..]),
+            "the surviving group must remain readable after the reload"
+        );
+    }
+
+    #[test]
+    fn reset_has_coverage_gap_flags_a_header_only_segment() {
+        // A fully reclaimed segment carries no groups, only a moved base LSN.
+        // Keying the gap check off the first group would miss it entirely.
+        let header_only = crate::journal::Scan {
+            groups: Vec::new(),
+            valid_len: 0,
+            truncated_tail: false,
+            base_lsn: 3,
+        };
+        assert!(ReadJournal::reset_has_coverage_gap(&header_only, 1));
+        assert!(!ReadJournal::reset_has_coverage_gap(&header_only, 2));
+        assert!(
+            !ReadJournal::reset_has_coverage_gap(&crate::journal::Scan::empty(), 0),
+            "a missing/short segment reports base 0 and is not a gap"
         );
     }
 

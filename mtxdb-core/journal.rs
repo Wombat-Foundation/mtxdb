@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::layout::ShardType;
+
 use crc32fast::Hasher;
 
 const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
@@ -50,6 +52,280 @@ pub enum Mutation {
         /// Collection to remove.
         collection_id: [u8; 16],
     },
+}
+
+/// Upper bound for one SQL transaction's staged journal payloads.
+///
+/// Kept below the journal's 256 MiB group limit to leave room for framing and
+/// other transactions sharing the process.
+pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
+
+/// Lifecycle of a transaction's staged journal mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnStageState {
+    /// The SQL transaction attempt is active and may add mutations.
+    Active,
+    /// The SQL attempt failed; retained callbacks must not publish its data.
+    Discarded,
+    /// Every per-pool group was appended successfully.
+    Published,
+}
+
+#[derive(Debug)]
+struct TxnStageData {
+    pools: [Vec<Mutation>; 3],
+    bytes: usize,
+    /// Successful pool appends. Retrying a callback after a partial error
+    /// resumes at the failed pool instead of duplicating earlier groups.
+    appended: [bool; 3],
+}
+
+/// Transaction-local journal publication buffer.
+///
+/// Packfile writes may remain eager for immutable/content-addressed records,
+/// while their journal entries are kept here until the SQL transaction's
+/// post-commit callback. Call [`Self::discard`] from the transaction's error
+/// callback. That is required because Synapse retains after-callbacks across
+/// retry attempts.
+pub struct TxnStage {
+    state: std::sync::atomic::AtomicU8,
+    data: Mutex<TxnStageData>,
+}
+
+impl Default for TxnStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TxnStage {
+    const ACTIVE: u8 = 0;
+    const DISCARDED: u8 = 1;
+    const PUBLISHED: u8 = 2;
+
+    /// Create an empty stage for one transaction attempt.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
+            data: Mutex::new(TxnStageData {
+                pools: std::array::from_fn(|_| Vec::new()),
+                bytes: 0,
+                appended: [false; 3],
+            }),
+        }
+    }
+
+    /// Current lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> TxnStageState {
+        match self.state.load(Ordering::Acquire) {
+            Self::DISCARDED => TxnStageState::Discarded,
+            Self::PUBLISHED => TxnStageState::Published,
+            _ => TxnStageState::Active,
+        }
+    }
+
+    /// Discard an active attempt. Safe to call more than once.
+    pub fn discard(&self) {
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) == Self::ACTIVE {
+            data.pools.iter_mut().for_each(Vec::clear);
+            data.bytes = 0;
+            self.state.store(Self::DISCARDED, Ordering::Release);
+        }
+    }
+
+    /// Ensure an estimated batch fits before beginning eager packfile writes.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if the stage is not active or the estimated
+    /// total exceeds [`MAX_TXN_STAGE_BYTES`].
+    pub fn ensure_capacity(&self, additional: usize) -> io::Result<()> {
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let data = self.data.lock();
+        let total = data.bytes.checked_add(additional).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        if total > MAX_TXN_STAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction journal stage exceeds its 64 MiB limit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Add an immutable put to this attempt's pool-ordered journal batch.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if adding the payload would exceed the stage
+    /// limit, or another error if the stage has already been discarded or
+    /// published.
+    pub fn stage_put(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+        payload: Vec<u8>,
+    ) -> io::Result<()> {
+        let charge = payload.len().saturating_add(64);
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let total = data.bytes.checked_add(charge).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        if total > MAX_TXN_STAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction journal stage exceeds its 64 MiB limit",
+            ));
+        }
+        data.pools[pool_index(pool)].push(Mutation::Put {
+            collection_id,
+            node_id,
+            payload,
+        });
+        data.bytes = total;
+        Ok(())
+    }
+
+    /// Add a batch of immutable puts atomically after its packfile/index write
+    /// has succeeded.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if the batch would exceed the stage limit, or
+    /// another error if the stage has already been discarded or published.
+    pub fn stage_puts(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        entries: &[([u8; 16], Vec<u8>)],
+    ) -> io::Result<()> {
+        let charge = entries
+            .iter()
+            .try_fold(0usize, |total, (_, payload)| {
+                total.checked_add(payload.len().saturating_add(64))
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transaction stage size overflow",
+                )
+            })?;
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let total = data.bytes.checked_add(charge).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        if total > MAX_TXN_STAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction journal stage exceeds its 64 MiB limit",
+            ));
+        }
+        let pool_mutations = &mut data.pools[pool_index(pool)];
+        pool_mutations.extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
+            collection_id,
+            node_id: *node_id,
+            payload: payload.clone(),
+        }));
+        data.bytes = total;
+        Ok(())
+    }
+
+    /// Add a collection delete to this attempt. Callers must not eagerly
+    /// mutate the live index for a delete that can still roll back.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if adding the mutation would exceed the stage
+    /// limit, or another error if the stage has already been discarded or
+    /// published.
+    pub fn stage_delete_collection(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+    ) -> io::Result<()> {
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let total = data.bytes.checked_add(64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        if total > MAX_TXN_STAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction journal stage exceeds its 64 MiB limit",
+            ));
+        }
+        data.pools[pool_index(pool)].push(Mutation::DeleteCollection { collection_id });
+        data.bytes = total;
+        Ok(())
+    }
+
+    /// Append staged pool groups in dependency order: auth-chain, event-DAG,
+    /// then state. Does not fsync; the ordinary coalesced sync remains the
+    /// durability boundary. Repeated calls are safe, including after a
+    /// partial error.
+    ///
+    /// # Errors
+    /// Returns an error if a staged pool has no coordinator or its journal
+    /// cannot append the group's complete framing and trailer.
+    pub fn publish(
+        &self,
+        auth_chain: Option<&JournalCoordinator>,
+        event_dag: Option<&JournalCoordinator>,
+        state: Option<&JournalCoordinator>,
+    ) -> io::Result<()> {
+        let mut data = self.data.lock();
+        match self.state.load(Ordering::Acquire) {
+            Self::DISCARDED | Self::PUBLISHED => return Ok(()),
+            _ => {}
+        }
+        let coordinators = [auth_chain, event_dag, state];
+        let pools = [ShardType::AuthChain, ShardType::EventDag, ShardType::State];
+        for (ordered_index, pool) in pools.into_iter().enumerate() {
+            let index = pool_index(pool);
+            if data.appended[index] || data.pools[index].is_empty() {
+                data.appended[index] = true;
+                continue;
+            }
+            let coordinator = coordinators[ordered_index].ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "staged pool has no journal")
+            })?;
+            coordinator.append_pending(&data.pools[index])?;
+            data.appended[index] = true;
+        }
+        self.state.store(Self::PUBLISHED, Ordering::Release);
+        Ok(())
+    }
+}
+
+const fn pool_index(pool: ShardType) -> usize {
+    match pool {
+        ShardType::State => 0,
+        ShardType::EventDag => 1,
+        ShardType::AuthChain => 2,
+    }
 }
 
 /// One decoded mutation frame, with the byte range it occupied in the segment
@@ -103,6 +379,11 @@ pub struct Scan {
     pub valid_len: u64,
     /// True when bytes after `valid_len` were an incomplete final append.
     pub truncated_tail: bool,
+    /// LSN the segment's first group would carry — the file header's base LSN.
+    /// Lets a reader detect a reclaimed segment that is now header-only, where
+    /// there are no groups to compare but the base still moved past what the
+    /// reader's index incorporated.
+    pub base_lsn: u64,
 }
 
 impl Scan {
@@ -114,6 +395,7 @@ impl Scan {
             groups: Vec::new(),
             valid_len: 0,
             truncated_tail: false,
+            base_lsn: 0,
         }
     }
 }
@@ -305,6 +587,16 @@ impl JournalCoordinator {
         if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
             return Ok(None);
         }
+        // Transaction-staged groups are already complete in the segment, so
+        // the coalesced sync only needs to make their bytes durable.
+        if target_lsn <= self.visible_lsn.load(Ordering::Acquire) {
+            if let Err(error) = journal.make_durable() {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+            self.committed_lsn.store(target_lsn, Ordering::Release);
+            return Ok(None);
+        }
         let batch = {
             let mut pending = self.pending.lock();
             let covered_count = pending
@@ -335,6 +627,15 @@ impl JournalCoordinator {
             }
             pending.drain(..covered_count).collect::<Vec<_>>()
         };
+        self.append_and_sync_batch(&mut journal, batch, target_lsn)
+    }
+
+    fn append_and_sync_batch(
+        &self,
+        journal: &mut Journal,
+        batch: Vec<(u64, Mutation)>,
+        target_lsn: u64,
+    ) -> io::Result<Option<CommitReceipt>> {
         let mutations: Vec<Mutation> = batch.iter().map(|(_, mutation)| mutation.clone()).collect();
         let sequence = self
             .sequence
@@ -383,6 +684,70 @@ impl JournalCoordinator {
             ));
         }
         Ok(Some(receipt))
+    }
+
+    /// Append a complete transaction group without fsyncing it.
+    ///
+    /// Unlike [`Self::publish`], this does not add mutations to the legacy
+    /// queue: it writes the group and trailer immediately, then advances the
+    /// visible boundary. It requires that no legacy queued mutations are
+    /// outstanding, because mixing pre-transaction queued writes with a
+    /// post-commit group would violate transaction isolation.
+    ///
+    /// # Errors
+    /// Returns an error if queued mutations exist, the journal is poisoned,
+    /// or the append fails. A partial append poisons the underlying journal;
+    /// subsequent publication is rejected until reopen/recovery.
+    pub fn append_pending(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
+        if mutations.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot append an empty transaction group",
+            ));
+        }
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "journal is poisoned after a failed append",
+            ));
+        }
+        let mut journal = self.journal.lock();
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "journal is poisoned after a failed append",
+            ));
+        }
+        // Hold the queue lock through the append so a concurrent legacy
+        // publisher cannot assign the same next LSN after this check.
+        let pending = self.pending.lock();
+        if !pending.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cannot append a staged transaction while legacy journal mutations are pending",
+            ));
+        }
+        let sequence = self
+            .sequence
+            .as_ref()
+            .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
+        let receipt = match journal.append_group_with_sequence(mutations, sequence) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if journal.poisoned {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
+        let next_lsn = receipt
+            .last_lsn
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
+        self.next_lsn.store(next_lsn, Ordering::Relaxed);
+        self.published_lsn
+            .store(receipt.last_lsn, Ordering::Release);
+        self.visible_lsn.store(receipt.last_lsn, Ordering::Release);
+        drop(pending);
+        Ok(receipt)
     }
 
     /// Capture the current boundary and wait for a durable group covering it.
@@ -477,6 +842,7 @@ impl Journal {
                 groups: Vec::new(),
                 valid_len: start.min(len),
                 truncated_tail: false,
+                base_lsn: 0,
             });
         }
         file.seek(SeekFrom::Start(start))?;
@@ -1061,6 +1427,9 @@ fn scan_groups_from(
     mut expected_sequence: u64,
     mut expected_lsn: u64,
 ) -> io::Result<Scan> {
+    // The first group's LSN is the segment's base; captured before the loop
+    // advances `expected_lsn`.
+    let segment_base_lsn = expected_lsn;
     let mut cursor = 0usize;
     let mut valid_len = base_offset;
     let mut groups = Vec::new();
@@ -1131,6 +1500,7 @@ fn scan_groups_from(
         groups,
         valid_len,
         truncated_tail,
+        base_lsn: segment_base_lsn,
     })
 }
 
