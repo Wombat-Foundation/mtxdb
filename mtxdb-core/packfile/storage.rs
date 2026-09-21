@@ -8326,6 +8326,74 @@ mod tests {
         assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
     }
 
+    /// A checkpoint must bound journal replay by the LSN that is actually
+    /// *committed*, never the published one. A concurrent put can publish
+    /// above the last WAL commit, and LSNs above `committed_lsn` are discarded
+    /// and reused after a crash -- recording one as covered would make a
+    /// reopen skip a future mutation that reuses it. Drive the full-checkpoint
+    /// path directly so a pending (published, uncommitted) put is live without
+    /// the barrier commit that a real `sync` would have done first.
+    #[test]
+    fn checkpoint_records_the_committed_journal_lsn() {
+        let dir = test_dir("journal_checkpoint_committed_lsn");
+        let journal_path = dir.join("wal.bin");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(&journal_path).unwrap();
+
+        // Commit one mutation so the journal has a non-zero durable prefix.
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(41),
+                &NodeData::new(bytes::Bytes::from_static(b"committed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        let journal = store.journal().expect("journal enabled");
+        let committed = journal.committed_lsn();
+        assert_eq!(
+            journal.published_lsn(),
+            committed,
+            "test setup: a completed sync leaves nothing published-but-uncommitted"
+        );
+        assert!(
+            committed > 0,
+            "test setup: the first sync must commit an LSN"
+        );
+
+        // Publish a second mutation into a new collection WITHOUT committing:
+        // this is the state a concurrent `put` leaves behind after a barrier.
+        store
+            .put(
+                &SECOND_COLLECTION,
+                &distinct_id(42),
+                &NodeData::new(bytes::Bytes::from_static(b"pending")),
+            )
+            .unwrap();
+        let journal = store.journal().expect("journal enabled");
+        let published = journal.published_lsn();
+        assert!(
+            published > journal.committed_lsn(),
+            "test setup: the second put must be published but uncommitted"
+        );
+
+        // Run the full-checkpoint path as a sync would, but without the
+        // barrier that would advance `committed_lsn` past the pending put.
+        store
+            .persist_index_checkpoint()
+            .expect("checkpoint must succeed");
+
+        let covered = PackfileStorage::read_journal_lsn(&dir);
+        assert_eq!(
+            covered, committed,
+            "the checkpoint must record the committed LSN, not a published-only one"
+        );
+        assert!(
+            covered < published,
+            "recording the published LSN would let a reopen skip a reused LSN"
+        );
+    }
+
     #[test]
     fn test_swizzle_callback() {
         static SWIZZLE_CALLS: AtomicU64 = AtomicU64::new(0);
