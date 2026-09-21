@@ -26,6 +26,34 @@ mod tests {
         })
     }
 
+    fn assert_delete_then_recreate_in_log(
+        operations: &[mtxdb_core::index::delta::DeltaOperation],
+        collection: [u8; 16],
+    ) {
+        use mtxdb_core::index::delta::DeltaOperation;
+        let tombstone = operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    DeltaOperation::CollectionTombstone { collection_id, .. }
+                        if *collection_id == collection
+                )
+            })
+            .expect("delete tombstone is present");
+        let snapshot = operations
+            .iter()
+            .rposition(|operation| {
+                matches!(
+                    operation,
+                    DeltaOperation::CollectionSnapshot { collection_id, .. }
+                        if *collection_id == collection
+                )
+            })
+            .expect("recreation snapshot is present");
+        assert!(tombstone < snapshot);
+    }
+
     fn collection_id(seed: u8) -> [u8; 16] {
         let mut id = [0u8; 16];
         id[15] = seed;
@@ -940,9 +968,6 @@ mod tests {
             DeltaOperation::CollectionTombstone { collection_id, .. }
                 if *collection_id == deleted_collection
         )));
-        drop(reopened);
-
-        let reopened = PackfileStorage::open(dir.clone()).unwrap();
         assert!(!reopened.collection_ids().contains(&deleted_collection));
         let restored_node = node_id(2, 901);
         let restored_payload = payload_for(2, 901);
@@ -954,6 +979,9 @@ mod tests {
             )
             .unwrap();
         reopened.sync_all().unwrap();
+        let path = current_delta_path(&dir).expect("recreation leaves v3 log");
+        let log = read_delta_log_v3(&path).expect("delete and recreation log decodes");
+        assert_delete_then_recreate_in_log(&log.operations, deleted_collection);
         drop(reopened);
 
         let reopened = PackfileStorage::open(dir.clone()).unwrap();

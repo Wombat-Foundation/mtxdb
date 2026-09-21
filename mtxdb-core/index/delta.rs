@@ -3,8 +3,9 @@
 //! Packfiles stay authoritative and the checkpoint stays a rebuildable
 //! acceleration structure; this log is a further acceleration on top of the
 //! checkpoint. Between full checkpoint rewrites, a session's index changes are
-//! recorded as fixed-width [`DeltaFrame`] records so that `sync()` can append
-//! a few kilobyte batch instead of rewriting the whole checkpoint. A crash at
+//! recorded as fixed-width [`DeltaFrame`] records in v2 logs, or as
+//! collection-level operations in v3 logs, so `sync()` can append a small
+//! batch instead of rewriting the whole checkpoint. A crash at
 //! any point degrades to the fingerprint gates below and an ordinary rescan.
 //!
 //! # Trusted gates (all must pass, else the log is ignored and the opener
@@ -13,27 +14,25 @@
 //! - The log's `base_fingerprint` must equal the checkpoint it continues.
 //! - The log's `tail_fingerprint` must equal the fingerprint of the packs
 //!   currently on disk (the state the frames were written against).
-//! - Every frame's `generation` must match the checkpoint's recorded
-//!   generation for that collection (guards against a delta for a pre-resize
-//!   table being applied to a resized/repacked one).
+//! - V2 frame generations must match the checkpoint's recorded generation.
+//!   V3 collection snapshots rebase one collection at a new generation, after
+//!   which incremental frames must match that generation in file order.
 //!
-//! # Layout (all little-endian, fixed width — see [`crate::index::format`]):
+//! # Layout (all little-endian):
 //!
 //! ```text
 //!   [DeltaLogHeader 16B]       magic "MDLG" | version | reserved | base_fingerprint
 //!   [DeltaBatchHeader 8B]      magic "MDLB" | frame_count
-//!   [DeltaFrame * frame_count] fixed 36B records
+//!   [v2: DeltaFrame * frame_count] fixed 36B records
+//!   [v3: framed collection operations] variable-width records
 //!   [DeltaLogTrailer 16B]      magic "DLTR" | reserved | tail_fingerprint
 //!   [DeltaBatchHeader ..]*     -- further batches, each count-framed and trailer-terminated
 //! ```
 //!
-//! Framing is arithmetic, not magic-sniffed: a reader advances by exactly
-//! `frame_count * DELTA_FRAME_LEN` bytes from each batch header, and only then
-//! expects the trailer. A batch header's `frame_count` (not any record's
-//! payload bytes) determines where the next record begins — a collection ID
-//! that happens to spell a magic value can never misdirect the parser. A torn
-//! suffix is exactly "not enough bytes remain for `frame_count` frames plus a
-//! trailer", and only complete batches are trusted.
+//! Framing is count-driven, not magic-sniffed: a reader consumes exactly the
+//! number of records named by each batch header, then expects the trailer. A
+//! collection ID that happens to spell a magic value can never misdirect the
+//! parser. A torn suffix is ignored and only complete batches are trusted.
 
 use std::fs;
 use std::io::{Read as _, Seek as _, Write as _};
@@ -52,15 +51,14 @@ pub const DELTA_BATCH_HEADER_LEN: usize = 8;
 /// Bytes in one batch trailer: magic(4) + reserved(4) + tail fingerprint(8).
 pub const DELTA_LOG_TRAILER_LEN: usize = 16;
 
-/// Hard ceiling on the delta log file size this reader will allocate for.
-/// The writer (`storage.rs`) forces a full checkpoint rewrite well before
-/// this — its own cap is 8 MiB — so a well-behaved log never approaches this
-/// value; it exists purely so a corrupted or maliciously oversized
+/// Hard ceiling on the delta log file size accepted by the readers. The
+/// writer's cap is the same size, large enough for a whole-collection v3
+/// snapshot while still bounding replay memory; it exists so a corrupted or maliciously oversized
 /// `index.delta` (e.g. a truncated-looking length field, or the file
 /// replaced wholesale) can't make an opener allocate an unbounded buffer
 /// before any structural validation runs. Generous relative to the writer's
 /// own cap so it never rejects a real log.
-const MAX_DELTA_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DELTA_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
 /// Current wire version (see the header's version byte).
@@ -73,9 +71,7 @@ const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
 /// state. A v1 log fails the version check below and falls back to a full
 /// rescan, same as any other structurally rejected log.
 const DELTA_LOG_VERSION: u8 = 2;
-/// Next delta-log version. Its frame codec is introduced independently of
-/// the production v2 writer so the existing recovery path stays unchanged
-/// until the v3 reader and writer are integrated together.
+/// Current v3 delta-log version, with variable-length collection operations.
 const DELTA_LOG_VERSION_V3: u8 = 3;
 const DELTA_BATCH_MAGIC: &[u8; 4] = b"MDLB";
 const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"DLTR";
@@ -365,6 +361,192 @@ pub(crate) fn io_error(
     }
 }
 
+fn read_v3_tail_fingerprint(
+    file: &mut fs::File,
+    path: &Path,
+    len: u64,
+    header: &[u8; DELTA_LOG_HEADER_LEN],
+) -> Result<DeltaTailFingerprint, DeltaFingerprintError> {
+    let base_fingerprint = u64::from_le_bytes(
+        header[BASE_FINGERPRINT_OFFSET..DELTA_LOG_HEADER_LEN]
+            .try_into()
+            .map_err(|_| invalid(path, "invalid base fingerprint"))?,
+    );
+    let mut pos = u64::try_from(DELTA_LOG_HEADER_LEN)
+        .map_err(|_| invalid(path, "log header length overflows u64"))?;
+    let mut last_tail = None;
+
+    while pos < len {
+        let batch_header_end = pos
+            .checked_add(u64::try_from(DELTA_BATCH_HEADER_LEN).unwrap_or(u64::MAX))
+            .ok_or_else(|| invalid(path, "batch header offset overflow"))?;
+        if batch_header_end > len {
+            break;
+        }
+        file.seek(std::io::SeekFrom::Start(pos))
+            .map_err(|error| io_error(path, "seek v3 batch header", error))?;
+        let mut batch_header = [0u8; DELTA_BATCH_HEADER_LEN];
+        if let Err(error) = file.read_exact(&mut batch_header) {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(io_error(path, "read v3 batch header", error));
+        }
+        if &batch_header[..4] != DELTA_BATCH_MAGIC {
+            break;
+        }
+        let operation_count = u32::from_le_bytes(
+            batch_header[4..8]
+                .try_into()
+                .map_err(|_| invalid(path, "invalid v3 operation count"))?,
+        );
+        let Some((cursor, mut batch_crc)) =
+            scan_v3_frames(file, path, len, batch_header_end, operation_count)?
+        else {
+            break;
+        };
+        let trailer_end = cursor
+            .checked_add(u64::try_from(DELTA_LOG_TRAILER_LEN).unwrap_or(u64::MAX))
+            .ok_or_else(|| invalid(path, "v3 batch trailer boundary overflow"))?;
+        if trailer_end > len {
+            break;
+        }
+        file.seek(std::io::SeekFrom::Start(cursor))
+            .map_err(|error| io_error(path, "seek v3 batch trailer", error))?;
+        let mut trailer = [0u8; DELTA_LOG_TRAILER_LEN];
+        file.read_exact(&mut trailer)
+            .map_err(|error| io_error(path, "read v3 batch trailer", error))?;
+        if &trailer[..4] != DELTA_LOG_TRAILER_MAGIC {
+            break;
+        }
+        let tail_fingerprint = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
+        batch_crc.update(&trailer[8..16]);
+        let stored_crc = u32::from_le_bytes(trailer[4..8].try_into().unwrap());
+        if batch_crc.finalize() != stored_crc {
+            break;
+        }
+        last_tail = Some(tail_fingerprint);
+        pos = trailer_end;
+    }
+
+    let Some(tail_fingerprint) = last_tail else {
+        return Err(invalid(path, "no committed v3 delta batch"));
+    };
+    Ok(DeltaTailFingerprint {
+        base_fingerprint,
+        tail_fingerprint,
+        torn_tail: pos < len,
+    })
+}
+
+fn scan_v3_frames(
+    file: &mut fs::File,
+    path: &Path,
+    file_len: u64,
+    mut cursor: u64,
+    operation_count: u32,
+) -> Result<Option<(u64, crc32fast::Hasher)>, DeltaFingerprintError> {
+    let mut batch_crc = crc32fast::Hasher::new();
+    for _ in 0..operation_count {
+        let Some(next) = scan_v3_frame(file, path, file_len, cursor, &mut batch_crc)? else {
+            return Ok(None);
+        };
+        cursor = next;
+    }
+    Ok(Some((cursor, batch_crc)))
+}
+
+fn scan_v3_frame(
+    file: &mut fs::File,
+    path: &Path,
+    file_len: u64,
+    cursor: u64,
+    batch_crc: &mut crc32fast::Hasher,
+) -> Result<Option<u64>, DeltaFingerprintError> {
+    let header_len = u64::try_from(V3_FRAME_HEADER_LEN)
+        .map_err(|_| invalid(path, "v3 frame header length overflows u64"))?;
+    let Some(header_end) = cursor
+        .checked_add(header_len)
+        .filter(|end| *end <= file_len)
+    else {
+        return Ok(None);
+    };
+    file.seek(std::io::SeekFrom::Start(cursor))
+        .map_err(|error| io_error(path, "seek v3 frame header", error))?;
+    let mut header = [0u8; V3_FRAME_HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|error| io_error(path, "read v3 frame header", error))?;
+    let payload_len = u64::from(u32::from_le_bytes(
+        header[1..5]
+            .try_into()
+            .map_err(|_| invalid(path, "invalid v3 frame length"))?,
+    ));
+    let payload_end = header_end
+        .checked_add(payload_len)
+        .ok_or_else(|| invalid(path, "v3 frame payload boundary overflow"))?;
+    let checksum_end = payload_end
+        .checked_add(u64::try_from(V3_FRAME_TRAILER_LEN).unwrap_or(u64::MAX))
+        .ok_or_else(|| invalid(path, "v3 frame length overflow"))?;
+    if checksum_end > file_len {
+        return Ok(None);
+    }
+    let fixed_len = match header[0] {
+        V3_INCREMENTAL if payload_len == u64::try_from(DELTA_FRAME_LEN).unwrap_or(u64::MAX) => 0,
+        V3_COLLECTION_SNAPSHOT
+            if payload_len >= u64::try_from(V3_SNAPSHOT_FIXED_LEN).unwrap_or(u64::MAX) =>
+        {
+            V3_SNAPSHOT_FIXED_LEN
+        }
+        V3_COLLECTION_TOMBSTONE
+            if payload_len == u64::try_from(V3_TOMBSTONE_LEN).unwrap_or(u64::MAX) =>
+        {
+            0
+        }
+        _ => return Ok(None),
+    };
+    let mut frame_crc = crc32fast::Hasher::new();
+    frame_crc.update(&header);
+    batch_crc.update(&header);
+    let mut remaining = payload_len;
+    if fixed_len > 0 {
+        let mut fixed = [0u8; V3_SNAPSHOT_FIXED_LEN];
+        file.read_exact(&mut fixed)
+            .map_err(|error| io_error(path, "read v3 snapshot header", error))?;
+        let blob_len = u64::from(u32::from_le_bytes(
+            fixed[32..36]
+                .try_into()
+                .map_err(|_| invalid(path, "invalid v3 snapshot length"))?,
+        ));
+        if u64::try_from(fixed_len)
+            .unwrap_or(u64::MAX)
+            .checked_add(blob_len)
+            != Some(payload_len)
+        {
+            return Ok(None);
+        }
+        frame_crc.update(&fixed);
+        batch_crc.update(&fixed);
+        remaining = remaining.saturating_sub(u64::try_from(fixed_len).unwrap_or(u64::MAX));
+    }
+    let mut chunk = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let chunk_size = usize::try_from(remaining.min(chunk.len() as u64)).unwrap_or(chunk.len());
+        file.read_exact(&mut chunk[..chunk_size])
+            .map_err(|error| io_error(path, "read v3 frame payload", error))?;
+        frame_crc.update(&chunk[..chunk_size]);
+        batch_crc.update(&chunk[..chunk_size]);
+        remaining = remaining.saturating_sub(u64::try_from(chunk_size).unwrap_or(u64::MAX));
+    }
+    let mut stored_crc = [0u8; V3_FRAME_TRAILER_LEN];
+    file.read_exact(&mut stored_crc)
+        .map_err(|error| io_error(path, "read v3 frame checksum", error))?;
+    if u32::from_le_bytes(stored_crc) != frame_crc.finalize() {
+        return Ok(None);
+    }
+    batch_crc.update(&stored_crc);
+    Ok(Some(checksum_end))
+}
+
 /// Lightweight forward scan of the delta log's last committed
 /// `tail_fingerprint`.
 ///
@@ -428,14 +610,7 @@ pub fn read_delta_tail_fingerprint(
         return Err(invalid(path, "unrecognized magic"));
     }
     if log_hdr[4] == DELTA_LOG_VERSION_V3 {
-        let Some(log) = read_delta_log_v3(path) else {
-            return Err(invalid(path, "invalid v3 delta log"));
-        };
-        return Ok(Some(DeltaTailFingerprint {
-            base_fingerprint: log.base_fingerprint,
-            tail_fingerprint: log.tail_fingerprint,
-            torn_tail: log.torn_tail,
-        }));
+        return read_v3_tail_fingerprint(&mut file, path, len, &log_hdr).map(Some);
     }
     if log_hdr[4] != DELTA_LOG_VERSION {
         return Err(invalid(path, "unrecognized version"));
@@ -560,20 +735,31 @@ pub fn batch_len(frame_count: usize) -> Option<usize> {
 }
 
 /// Length in bytes of one framed v3 batch carrying `operations`, or `None` if a
-/// frame fails to encode or the total does not fit `usize`.
+/// payload does not fit the frame's `u32` length or the total overflows `usize`.
 #[must_use]
 pub fn v3_batch_len(operations: &[DeltaOperation]) -> Option<usize> {
     let mut total = DELTA_BATCH_HEADER_LEN.checked_add(DELTA_LOG_TRAILER_LEN)?;
     for operation in operations {
-        total = total.checked_add(encode_v3_frame(operation).ok()?.len())?;
+        let payload_len = match operation {
+            DeltaOperation::Incremental(_) => DELTA_FRAME_LEN,
+            DeltaOperation::CollectionSnapshot { index_blob, .. } => {
+                V3_SNAPSHOT_FIXED_LEN.checked_add(index_blob.len())?
+            }
+            DeltaOperation::CollectionTombstone { .. } => V3_TOMBSTONE_LEN,
+        };
+        u32::try_from(payload_len).ok()?;
+        let frame_len = V3_FRAME_HEADER_LEN
+            .checked_add(payload_len)?
+            .checked_add(V3_FRAME_TRAILER_LEN)?;
+        total = total.checked_add(frame_len)?;
     }
     Some(total)
 }
 
-/// Read and structurally validate the delta log. Returns `None` for a missing
-/// file, a bad header, a log with no complete committed batch (entirely torn),
-/// or any other structural inconsistency — the caller treats that as "no
-/// delta".
+/// Read and structurally validate a v2 delta log. Returns `None` for a missing
+/// file, a bad header, a v3 log (use [`read_delta_log_v3`] for those), a log
+/// with no complete committed batch (entirely torn), or any other structural
+/// inconsistency — the caller treats that as "no delta".
 ///
 /// Batch boundaries come from each batch header's `frame_count`, never from
 /// scanning for magic, so no frame payload can redirect the parse. A torn
@@ -603,8 +789,8 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
         return None;
     }
     if buf[4] == DELTA_LOG_VERSION_V3 {
-        // V3 frames collection operations this reader does not replay yet, so
-        // recovery must fall back to a packfile rescan.
+        // This API returns the v2 fixed-frame representation. V3 callers use
+        // `read_delta_log_v3` instead.
         return None;
     }
     if buf[4] != DELTA_LOG_VERSION {
@@ -1222,6 +1408,12 @@ mod tests {
         assert_eq!(decoded.operations, operations);
         assert!(!decoded.torn_tail);
         assert_eq!(decoded.file_len, u64::try_from(log.len()).unwrap());
+        let tail = read_delta_tail_fingerprint(&path)
+            .unwrap()
+            .expect("v3 tail scan succeeds");
+        assert_eq!(tail.base_fingerprint, decoded.base_fingerprint);
+        assert_eq!(tail.tail_fingerprint, decoded.tail_fingerprint);
+        assert_eq!(tail.torn_tail, decoded.torn_tail);
         // The v2 reader must not misread a v3 epoch.
         assert!(read_delta_log(&path).is_none());
 
@@ -1248,6 +1440,11 @@ mod tests {
         assert_eq!(decoded.tail_fingerprint, 0x111);
         assert_eq!(decoded.file_len, committed_len);
         assert!(decoded.torn_tail);
+        let tail = read_delta_tail_fingerprint(&path)
+            .unwrap()
+            .expect("tail scan keeps the committed prefix");
+        assert_eq!(tail.tail_fingerprint, decoded.tail_fingerprint);
+        assert!(tail.torn_tail);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
