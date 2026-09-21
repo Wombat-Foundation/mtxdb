@@ -732,10 +732,12 @@ pub struct PackfileStorage {
     /// Whether [`Self::get_many_with_refresh`] may rescan a collection when
     /// the caller's in-memory snapshot misses. On by default. A single-writer
     /// store sets this `false`: its in-memory index is authoritative for every
-    /// key it has written, so a negative lookup is a true miss and refreshing
-    /// can only spend a durable-fingerprint probe -- and, after each
-    /// checkpoint, a full rescan -- to rediscover nothing. Multi-process
-    /// readers leave it on to observe records the writer process appends.
+    /// key it has written -- the lossy index only yields false-positive
+    /// candidate collisions, never false negatives -- so a negative lookup is
+    /// a true miss and refreshing can only spend a durable-fingerprint probe
+    /// -- and, after each checkpoint, a full rescan -- to rediscover nothing.
+    /// Multi-process readers leave it on to observe records the writer process
+    /// appends.
     refresh_on_miss: AtomicBool,
     /// Number of times this class of store was assembled in this process — 1
     /// for a fresh open. Not reset by `reset_stats` (it counts stores, not work).
