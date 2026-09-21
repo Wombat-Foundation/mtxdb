@@ -1695,7 +1695,6 @@ impl PackfileStorage {
     /// the rescan path and the checkpoint fast path produce, so the two share
     /// one field-for-field constructor.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn assemble(
         shards: ShardPool,
         scan_out: RoomScanOutput,
@@ -5758,6 +5757,93 @@ impl PackfileStorage {
         self.put_many_internal(collection_id, entries, Some((stage, pool)))
     }
 
+    fn append_put_many_entry(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        old_gen: Option<&RoomGeneration>,
+        progress: &mut PutManyProgress,
+        publish_legacy: bool,
+    ) -> Result<(), StorageError> {
+        let record = Record {
+            collection_id: *collection_id,
+            hash: *id,
+            data: data.bytes.clone(),
+        };
+        let (shard_id, offset) = self.shards.put_record(&record)?;
+        if publish_legacy {
+            self.publish_mutation(|| JournalMutation::Put {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+            })?;
+        }
+        if progress.index_needs_rebuild {
+            return Ok(());
+        }
+        self.index_put_many_entry(collection_id, id, old_gen, shard_id, offset, progress)
+    }
+
+    fn index_put_many_entry(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        old_gen: Option<&RoomGeneration>,
+        shard_id: u16,
+        offset: u64,
+        progress: &mut PutManyProgress,
+    ) -> Result<(), StorageError> {
+        let live = match progress.owned_index.as_ref() {
+            Some(index) => index,
+            None => {
+                &old_gen
+                    .expect("live path implies an existing generation")
+                    .index
+            }
+        };
+        let insert_result =
+            self.insert_index_undoable(collection_id, live, id, shard_id, offset)?;
+        let inserted = if let Ok((bucket, slot, undo)) = insert_result {
+            progress.pending_deltas.push((bucket, slot));
+            if progress.owned_index.is_none() {
+                progress.undo_log.push(undo);
+            }
+            true
+        } else {
+            let grow_started = std::time::Instant::now();
+            let grown = if let Some(grown) = live.grow() {
+                Some(grown)
+            } else {
+                self.grow_checkpoint_index(collection_id, live)?
+            };
+            let Some(grown) = grown else {
+                progress.index_needs_rebuild = true;
+                progress.structural_change = true;
+                progress.invalidate_delta = true;
+                return Ok(());
+            };
+            progress.invalidate_delta = true;
+            progress.structural_change = true;
+            self.index_grow_count.fetch_add(1, Ordering::Relaxed);
+            self.index_clone_time_ns.fetch_add(
+                u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            let inserted = grown.insert(id, shard_id, offset).is_ok();
+            progress.owned_index = Some(grown);
+            inserted
+        };
+        if inserted {
+            let pack_id = self
+                .shards
+                .get_shard(shard_id)
+                .map_or(u64::from(shard_id), |shard| shard.pack_id);
+            progress.pending_shard_collections.push(pack_id);
+        }
+        Ok(())
+    }
+
     fn append_put_record(
         &self,
         collection_id: &[u8; 16],
@@ -5784,6 +5870,80 @@ impl PackfileStorage {
             })?;
         }
         Ok(location)
+    }
+
+    fn prepare_put_many_progress(
+        &self,
+        old_gen: Option<&RoomGeneration>,
+        entries_len: usize,
+    ) -> PutManyProgress {
+        let started = std::time::Instant::now();
+        let owned_index = match old_gen {
+            Some(generation) if !generation.index.is_mmap_backed() => None,
+            Some(generation) => Some(generation.index.clone()),
+            None => Some(LossyIndex::with_config(
+                entries_len
+                    .saturating_mul(2)
+                    .max(NEW_COLLECTION_INDEX_FLOOR),
+                self.index_config,
+            )),
+        };
+        if owned_index.is_some() {
+            self.put_many_clone_path_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.index_clone_time_ns.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        } else {
+            self.put_many_fast_path_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        PutManyProgress {
+            generation: old_gen.map_or(1, |generation| generation.generation),
+            structural_change: owned_index.is_some(),
+            owned_index,
+            index_needs_rebuild: false,
+            pending_deltas: Vec::with_capacity(entries_len),
+            pending_shard_collections: Vec::with_capacity(entries_len),
+            invalidate_delta: false,
+            undo_log: Vec::new(),
+        }
+    }
+
+    fn validate_put_many_inputs(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        staged: Option<(&TxnStage, ShardType)>,
+    ) -> Result<bool, StorageError> {
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        if let Some((stage, _)) = staged {
+            let charge = entries.iter().fold(0usize, |total, (_, data)| {
+                total.saturating_add(data.bytes.len().saturating_add(64))
+            });
+            stage.ensure_capacity(charge)?;
+        }
+        for (id, data) in entries {
+            ShardPool::validate_record(&Record {
+                collection_id: *collection_id,
+                hash: *id,
+                data: data.bytes.clone(),
+            })?;
+        }
+        self.put_many_calls.fetch_add(1, Ordering::Relaxed);
+        self.put_many_records
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.put_many_bytes.fetch_add(
+            entries
+                .iter()
+                .map(|(_, data)| data.bytes.len() as u64)
+                .sum::<u64>(),
+            Ordering::Relaxed,
+        );
+        Ok(true)
     }
 
     fn put_internal(
@@ -5840,6 +6000,7 @@ impl PackfileStorage {
         }
         let (index, cache) = {
             let old_gen = self.generation(collection_id);
+            let generation = old_gen.as_ref().map_or(1, |g| g.generation);
             let mut index = match &old_gen {
                 Some(g) => g.index.clone(),
                 // A brand-new collection's first insert: no count hint to
@@ -5859,7 +6020,6 @@ impl PackfileStorage {
             };
             let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
             if let Ok((bucket, slot)) = inserted {
-                let generation = old_gen.as_ref().map_or(1, |g| g.generation);
                 self.record_delta(collection_id, generation, bucket, slot);
                 let pack_id = self
                     .shards
@@ -5918,51 +6078,15 @@ impl PackfileStorage {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the live-index fast path and its clone-on-demand fallback read clearest \
-                  kept together rather than split across helpers that would each need most \
-                  of the same state (old_gen, owned_index, structural_change) threaded through"
-    )]
     fn put_many_internal(
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
         staged: Option<(&TxnStage, ShardType)>,
     ) -> Result<usize, StorageError> {
-        if entries.is_empty() {
+        if !self.validate_put_many_inputs(collection_id, entries, staged)? {
             return Ok(0);
         }
-        if let Some((stage, _)) = staged {
-            let charge = entries.iter().fold(0usize, |total, (_, data)| {
-                total.saturating_add(data.bytes.len().saturating_add(64))
-            });
-            stage.ensure_capacity(charge)?;
-        }
-
-        // Validate every frame before appending the first one. In particular,
-        // an oversized or otherwise unencodable later entry must not leave an
-        // earlier prefix physically present for crash recovery to rediscover.
-        // I/O failures still use the append-only storage's dirty/recovery path.
-        for (id, data) in entries {
-            ShardPool::validate_record(&Record {
-                collection_id: *collection_id,
-                hash: *id,
-                data: data.bytes.clone(),
-            })?;
-        }
-
-        self.put_many_calls.fetch_add(1, Ordering::Relaxed);
-        self.put_many_records
-            .fetch_add(entries.len() as u64, Ordering::Relaxed);
-        self.put_many_bytes.fetch_add(
-            entries
-                .iter()
-                .map(|(_, data)| data.bytes.len() as u64)
-                .sum::<u64>(),
-            Ordering::Relaxed,
-        );
-
         let collection_arc = self.put_mutex(collection_id);
         let collection_guard = collection_arc.lock();
 
@@ -5975,76 +6099,24 @@ impl PackfileStorage {
         };
 
         let old_gen = self.generation(collection_id);
-        let generation = old_gen.as_ref().map_or(1, |g| g.generation);
         let cache = match &old_gen {
             Some(g) => g.cache.clone(),
             None => Arc::new(NodeCache::new(self.cache_capacity)),
         };
 
-        // Batches use copy-on-write even when their current index is already
-        // materialized. That is deliberately unlike `put`: a batch can fail
-        // after an earlier record append, so its index changes must remain
-        // private until every fallible operation has succeeded.
-        let materialize_started = std::time::Instant::now();
-        // A batch is published as one generation. In particular, never
-        // insert directly into the currently published index: a later shard
-        // append can fail, and callers must not observe the successful prefix
-        // of that failed batch.
-        let mut owned_index: Option<LossyIndex> = match &old_gen {
-            // A batch against an already-materialized (non-mmap) index can
-            // mutate it in place instead of paying a full clone: each write
-            // is captured in `undo_log` below and rolled back in reverse if
-            // a later entry's shard append fails, so the live index never
-            // ends up observably holding a failed batch's partial prefix.
-            Some(g) if !g.index.is_mmap_backed() => None,
-            Some(g) => Some(g.index.clone()),
-            // Unlike `put`'s single-record path, we know exactly how many
-            // records this brand-new collection is about to receive -- size
-            // from that instead of the old flat 4096-slot (32 KiB) floor,
-            // matching the `records.len().saturating_mul(2).max(16)` pattern
-            // used elsewhere in this file (e.g. checkpoint/pack rebuild).
-            // Floor is 64, not 16 -- see the matching comment on `put`'s
-            // `None` arm above: a small batch (e.g. a single-event
-            // `put_many` call) would otherwise still hit `grow()` almost
-            // immediately and require a full collection snapshot on sync.
-            None => Some(LossyIndex::with_config(
-                entries
-                    .len()
-                    .saturating_mul(2)
-                    .max(NEW_COLLECTION_INDEX_FLOOR),
-                self.index_config,
-            )),
-        };
-        // Every non-empty batch materializes an owned index up front so its
-        // contents can be published atomically.
-        if owned_index.is_some() {
-            self.put_many_clone_path_calls
-                .fetch_add(1, Ordering::Relaxed);
-            self.index_clone_time_ns.fetch_add(
-                u64::try_from(materialize_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-        } else {
-            self.put_many_fast_path_calls
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        // The owned index is always published after a successful batch.
-        let mut structural_change = owned_index.is_some();
-        let mut index_needs_rebuild = false;
-        let mut pending_deltas = Vec::with_capacity(entries.len());
-        let mut pending_shard_collections = Vec::with_capacity(entries.len());
-        let mut invalidate_delta = false;
+        let mut progress = self.prepare_put_many_progress(
+            old_gen.as_deref().map(|generation| &**generation),
+            entries.len(),
+        );
         // Undo entries for writes made directly to `old_gen`'s live index
         // (only populated while `owned_index` is still `None`). Replayed in
         // reverse on any later failure so the live index never ends up
         // observably holding a failed batch's partial prefix -- the
         // property the unconditional clone used to provide for free.
-        let mut undo_log: Vec<SlotUndo> = Vec::new();
-
         macro_rules! rollback_and_fail {
             ($error:expr) => {{
                 if let Some(g) = &old_gen {
-                    for undo in undo_log.iter().rev() {
+                    for undo in progress.undo_log.iter().rev() {
                         g.index.rollback_slot(undo);
                     }
                 }
@@ -6055,110 +6127,19 @@ impl PackfileStorage {
         }
 
         for (id, data) in entries {
-            let record = Record {
-                collection_id: *collection_id,
-                hash: *id,
-                data: data.bytes.clone(),
-            };
-
-            let (shard_id, offset) = match self.shards.put_record(&record) {
-                Ok(location) => location,
-                // Earlier entries may already be complete on disk. Write a
-                // checkpoint for the old generation before returning, so a
-                // crash after this error cannot make a restart's
-                // fingerprint-matched scan publish the failed prefix.
-                Err(error) => rollback_and_fail!(error.into()),
-            };
-            if staged.is_none() {
-                if let Err(error) = self.publish_mutation(|| JournalMutation::Put {
-                    collection_id: *collection_id,
-                    node_id: *id,
-                    payload: data.bytes.to_vec(),
-                }) {
-                    rollback_and_fail!(error);
-                }
-            }
-
-            if index_needs_rebuild {
-                continue;
-            }
-
-            // Whichever index is authoritative for this insert: the owned
-            // copy once one exists, else the collection's live, still-shared
-            // index — only reachable here when it's neither mmap-backed nor
-            // absent, both of which already forced `owned_index` above.
-            let live: &LossyIndex = match owned_index.as_ref() {
-                Some(index) => index,
-                None => {
-                    &old_gen
-                        .as_ref()
-                        .expect("live path implies an existing generation")
-                        .index
-                }
-            };
-
-            let insert_result =
-                match self.insert_index_undoable(collection_id, live, id, shard_id, offset) {
-                    Ok(result) => result,
-                    Err(error) => rollback_and_fail!(error),
-                };
-            let inserted = if let Ok((bucket, slot, undo)) = insert_result {
-                pending_deltas.push((bucket, slot));
-                // Only writes against the still-live (uncloned) index need
-                // an undo entry -- once `owned_index` exists, a failure
-                // just discards that private clone, same as before.
-                if owned_index.is_none() {
-                    undo_log.push(undo);
-                }
-                true
-            } else {
-                // Growth (either flavor) materializes a fresh owned index; the
-                // O(n) copy is exactly what the steady-append scaler tracks,
-                // so bag its time alongside the up-front materialization.
-                let grow_started = std::time::Instant::now();
-                let grown = if let Some(grown) = live.grow() {
-                    // `insert_tracked` leaves the table unchanged on
-                    // TableFull, so retrying with the record's
-                    // still-available location is sufficient; no pack scan is
-                    // needed for pure growth. The grow changes the
-                    // collection's shape, so the delta log is invalidated and
-                    // no frame is recorded for this (or any later)
-                    // overwrite in the batch.
-                    invalidate_delta = true;
-                    structural_change = true;
-                    grown
-                } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, live) {
-                    // The checkpoint does not retain homes, but its slots
-                    // retain locations. Recover only those identities and
-                    // retry; do not scan every pack in the store.
-                    invalidate_delta = true;
-                    structural_change = true;
-                    grown
-                } else {
-                    index_needs_rebuild = true;
-                    structural_change = true;
-                    invalidate_delta = true;
-                    continue;
-                };
-                self.index_grow_count.fetch_add(1, Ordering::Relaxed);
-                self.index_clone_time_ns.fetch_add(
-                    u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-                let inserted = grown.insert(id, shard_id, offset).is_ok();
-                owned_index = Some(grown);
-                inserted
-            };
-            if inserted {
-                let pack_id = self
-                    .shards
-                    .get_shard(shard_id)
-                    .map_or(u64::from(shard_id), |s| s.pack_id);
-                pending_shard_collections.push(pack_id);
+            if let Err(error) = self.append_put_many_entry(
+                collection_id,
+                id,
+                data,
+                old_gen.as_deref().map(|generation| &**generation),
+                &mut progress,
+                staged.is_none(),
+            ) {
+                rollback_and_fail!(error);
             }
         }
 
-        if index_needs_rebuild {
+        if progress.index_needs_rebuild {
             let rebuilt = match self.rebuild_index(collection_id) {
                 Ok(index) => index,
                 Err(error) => rollback_and_fail!(error),
@@ -6168,19 +6149,19 @@ impl PackfileStorage {
                 collection_id,
                 &self.slot_counts_to_pack_id_counts(&rebuilt.shard_counts()),
             );
-            owned_index = Some(rebuilt);
+            progress.owned_index = Some(rebuilt);
         }
 
         // All fallible work is complete. Only now make the batch visible to
         // the shared index, delta state, and shard bookkeeping.
-        if invalidate_delta {
+        if progress.invalidate_delta {
             self.invalidate_delta_log(collection_id);
         } else {
-            for (bucket, slot) in pending_deltas {
-                self.record_delta(collection_id, generation, bucket, slot);
+            for (bucket, slot) in progress.pending_deltas {
+                self.record_delta(collection_id, progress.generation, bucket, slot);
             }
         }
-        for pack_id in pending_shard_collections {
+        for pack_id in progress.pending_shard_collections {
             self.record_new_shard_collection(pack_id, collection_id);
         }
 
@@ -6200,8 +6181,9 @@ impl PackfileStorage {
             cache.insert(*id, Arc::new(data_to_cache));
         }
 
-        if structural_change {
-            let index = owned_index
+        if progress.structural_change {
+            let index = progress
+                .owned_index
                 .expect("structural_change is only set once owned_index is materialized");
             if let Err(error) = self.store_generation(collection_id, index, Some(cache), false) {
                 rollback_and_fail!(error);
