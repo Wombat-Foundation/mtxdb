@@ -7807,7 +7807,10 @@ mod tests {
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
         reopened.enable_journal(&journal_path).unwrap();
         let replayed = reopened.replay_journal().unwrap();
-        assert!(replayed >= 1, "the post-checkpoint mutation must be replayed");
+        assert!(
+            replayed >= 1,
+            "the post-checkpoint mutation must be replayed"
+        );
         assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
     }
 
