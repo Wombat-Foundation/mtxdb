@@ -562,6 +562,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crc32fast",
+ "getrandom",
  "memmap2",
  "parking_lot",
  "sha2",
