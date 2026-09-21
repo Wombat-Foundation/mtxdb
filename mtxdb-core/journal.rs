@@ -110,18 +110,16 @@ pub struct Journal {
 
 /// Serializes mutation publication and durable commits for one journal.
 ///
-/// Mutations are assigned LSNs and published under one mutex. A sync caller
-/// captures the published LSN before taking that mutex; once it acquires the
-/// mutex, it either observes that LSN already committed or commits all pending
-/// mutations through it as one durable group. Concurrent callers therefore
-/// share a completed covering commit without acknowledging a later write by
-/// mistake.
+/// Mutations are assigned LSNs under a short queue lock. A sync caller captures
+/// the published LSN, detaches the covered mutations, then commits them while
+/// holding the journal lock. Publishers can queue later mutations during the
+/// fsync, and concurrent sync callers recheck the committed LSN after taking
+/// the journal lock.
 pub struct JournalCoordinator {
     journal: Mutex<Journal>,
     pending: Mutex<Vec<(u64, Mutation)>>,
-    /// Next LSN the journal will commit (the journal's own `next_lsn`). Read
-    /// and advanced under `pending` only, never under `journal`, so a publish
-    /// never blocks behind a sync's fsync.
+    /// Next LSN to assign. Advanced under `pending`, independently of journal
+    /// I/O, so a publish never blocks behind a sync's fsync.
     next_lsn: AtomicU64,
     published_lsn: AtomicU64,
     committed_lsn: AtomicU64,
@@ -180,16 +178,13 @@ impl JournalCoordinator {
             ));
         }
         let mut pending = self.pending.lock();
-        let lsn = self
-            .next_lsn
-            .load(Ordering::Acquire)
-            .checked_add(
-                u64::try_from(pending.len())
-                    .map_err(|_| io::Error::other("journal pending LSN space exhausted"))?,
-            )
+        let lsn = self.next_lsn.load(Ordering::Relaxed);
+        let next_lsn = lsn
+            .checked_add(1)
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
         publish_overlay(lsn);
         pending.push((lsn, mutation));
+        self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn.store(lsn, Ordering::Release);
         Ok(lsn)
     }
@@ -232,53 +227,74 @@ impl JournalCoordinator {
         }
 
         let mut journal = self.journal.lock();
-        let mut pending = self.pending.lock();
-        let covered_count = pending
-            .iter()
-            .take_while(|(lsn, _)| *lsn <= target_lsn)
-            .count();
-        if covered_count == 0 {
-            // A concurrent sync may have committed and drained this exact
-            // target between our early committed-LSN check and acquiring the
-            // locks above. Re-check under the locks: if it is covered now,
-            // this caller shares that completed group.
-            if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-                return Ok(None);
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "journal is poisoned after a failed commit",
+            ));
+        }
+        if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let batch = {
+            let mut pending = self.pending.lock();
+            let covered_count = pending
+                .iter()
+                .take_while(|(lsn, _)| *lsn <= target_lsn)
+                .count();
+            if covered_count == 0 {
+                // Another sync may have committed and drained this target
+                // after our first check but before we acquired the journal
+                // lock. In that case its durable group covers this caller.
+                if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                return Err(io::Error::other(
+                    "published sync target has no pending journal mutations",
+                ));
             }
-            return Err(io::Error::other(
-                "published sync target has no pending journal mutations",
-            ));
-        }
-        let expected_first_lsn = journal.next_lsn;
-        if pending
-            .first()
-            .map_or(true, |(lsn, _)| *lsn != expected_first_lsn)
-        {
-            return Err(io::Error::other(
-                "journal pending LSN sequence is discontinuous",
-            ));
-        }
-        let mutations: Vec<Mutation> = pending
-            .iter()
-            .take(covered_count)
-            .map(|(_, mutation)| mutation.clone())
-            .collect();
+            let first_lsn = pending[0].0;
+            let last_lsn = covered_count
+                .checked_sub(1)
+                .and_then(|last_index| pending.get(last_index))
+                .map(|(lsn, _)| *lsn)
+                .ok_or_else(|| io::Error::other("pending journal batch is incomplete"))?;
+            if first_lsn != journal.next_lsn || last_lsn != target_lsn {
+                return Err(io::Error::other(
+                    "journal pending LSN sequence does not cover sync target",
+                ));
+            }
+            pending.drain(..covered_count).collect::<Vec<_>>()
+        };
+        let mutations: Vec<Mutation> = batch.iter().map(|(_, mutation)| mutation.clone()).collect();
         let receipt = match journal.commit_group(&mutations) {
             Ok(receipt) => receipt,
             Err(error) => {
-                self.poisoned.store(true, Ordering::Release);
+                if journal.poisoned {
+                    self.poisoned.store(true, Ordering::Release);
+                } else {
+                    let mut pending = self.pending.lock();
+                    pending.splice(0..0, batch);
+                }
                 return Err(error);
             }
         };
-        // The covering group is durable. Record its extent for the covered
-        // prefix *before* any invariant check can return, so a retry can never
-        // re-commit mutations that are already on disk.
-        pending.drain(..covered_count);
-        self.next_lsn
-            .store(receipt.last_lsn.saturating_add(1), Ordering::Release);
+        // The group is durable, so record its extent before checking the
+        // receipt. This prevents a retry from re-appending committed entries.
         self.committed_lsn
             .store(receipt.last_lsn, Ordering::Release);
-        if receipt.last_lsn < target_lsn {
+        let committed_count = usize::try_from(
+            receipt
+                .last_lsn
+                .saturating_sub(receipt.first_lsn)
+                .saturating_add(1),
+        )
+        .unwrap_or(batch.len())
+        .min(batch.len());
+        if committed_count < batch.len() {
+            let mut pending = self.pending.lock();
+            pending.splice(0..0, batch.into_iter().skip(committed_count));
+        }
+        if receipt.last_lsn != target_lsn || committed_count != mutations.len() {
             return Err(io::Error::other(
                 "durable journal group did not cover requested sync target",
             ));
