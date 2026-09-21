@@ -8,7 +8,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -119,8 +119,15 @@ pub struct Journal {
 pub struct JournalCoordinator {
     journal: Mutex<Journal>,
     pending: Mutex<Vec<(u64, Mutation)>>,
+    /// Next LSN the journal will commit (the journal's own `next_lsn`). Read
+    /// and advanced under `pending` only, never under `journal`, so a publish
+    /// never blocks behind a sync's fsync.
+    next_lsn: AtomicU64,
     published_lsn: AtomicU64,
     committed_lsn: AtomicU64,
+    /// Mirrors the journal's poison bit, so `publish` can reject without
+    /// taking the `journal` mutex (which a sync holds across its fsync).
+    poisoned: AtomicBool,
 }
 
 impl JournalCoordinator {
@@ -128,12 +135,27 @@ impl JournalCoordinator {
     #[must_use]
     pub fn new(journal: Journal, scan: &Scan) -> Self {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
+        let next_lsn = journal.next_lsn;
         Self {
             journal: Mutex::new(journal),
             pending: Mutex::new(Vec::new()),
+            next_lsn: AtomicU64::new(next_lsn),
             published_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
+            poisoned: AtomicBool::new(false),
         }
+    }
+
+    /// Highest durably committed LSN. Everything at or below this is on disk.
+    #[must_use]
+    pub fn committed_lsn(&self) -> u64 {
+        self.committed_lsn.load(Ordering::Acquire)
+    }
+
+    /// Highest published (assigned) LSN, committed or not.
+    #[must_use]
+    pub fn published_lsn(&self) -> u64 {
+        self.published_lsn.load(Ordering::Acquire)
     }
 
     /// Assign an LSN, publish the mutation to the caller's live overlay, and
@@ -152,15 +174,15 @@ impl JournalCoordinator {
         mutation: Mutation,
         publish_overlay: impl FnOnce(u64),
     ) -> io::Result<u64> {
-        let journal = self.journal.lock();
-        if journal.poisoned {
+        if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed commit",
             ));
         }
         let mut pending = self.pending.lock();
-        let lsn = journal
+        let lsn = self
             .next_lsn
+            .load(Ordering::Acquire)
             .checked_add(
                 u64::try_from(pending.len())
                     .map_err(|_| io::Error::other("journal pending LSN space exhausted"))?,
@@ -183,8 +205,9 @@ impl JournalCoordinator {
     ///
     /// Calls with the same or an earlier target are covered by an already
     /// completed group. Later published mutations are left for a later group.
-    /// The mutex serializes the disk commit; concurrent sync callers wait for
-    /// it and then recheck the committed LSN before deciding whether to write.
+    /// The journal mutex serializes the disk commit; concurrent sync callers
+    /// wait for it and then recheck the committed LSN before deciding whether
+    /// to write.
     ///
     /// # Errors
     /// Returns an error if the target was never published, the journal is
@@ -193,7 +216,6 @@ impl JournalCoordinator {
         if target_lsn == 0 {
             return Ok(None);
         }
-        let mut journal = self.journal.lock();
         if target_lsn > self.published_lsn.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -203,7 +225,13 @@ impl JournalCoordinator {
         if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
             return Ok(None);
         }
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "journal is poisoned after a failed commit",
+            ));
+        }
 
+        let mut journal = self.journal.lock();
         let mut pending = self.pending.lock();
         let covered_count = pending
             .iter()
@@ -228,15 +256,26 @@ impl JournalCoordinator {
             .take(covered_count)
             .map(|(_, mutation)| mutation.clone())
             .collect();
-        let receipt = journal.commit_group(&mutations)?;
+        let receipt = match journal.commit_group(&mutations) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        // The covering group is durable. Record its extent for the covered
+        // prefix *before* any invariant check can return, so a retry can never
+        // re-commit mutations that are already on disk.
+        pending.drain(..covered_count);
+        self.next_lsn
+            .store(receipt.last_lsn.saturating_add(1), Ordering::Release);
+        self.committed_lsn
+            .store(receipt.last_lsn, Ordering::Release);
         if receipt.last_lsn < target_lsn {
             return Err(io::Error::other(
                 "durable journal group did not cover requested sync target",
             ));
         }
-        pending.drain(..covered_count);
-        self.committed_lsn
-            .store(receipt.last_lsn, Ordering::Release);
         Ok(Some(receipt))
     }
 
