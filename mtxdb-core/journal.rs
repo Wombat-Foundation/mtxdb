@@ -663,7 +663,8 @@ impl JournalCoordinator {
         // yet durable. Publish the visibility boundary before the fsync so
         // workers can observe it. A crash before `make_durable` may lose it,
         // which is safe: an unfsynced group is never acknowledged.
-        self.visible_lsn.store(receipt.last_lsn, Ordering::Release);
+        self.visible_lsn
+            .fetch_max(receipt.last_lsn, Ordering::Release);
         if let Err(error) = journal.make_durable() {
             self.poisoned.store(true, Ordering::Release);
             return Err(error);
@@ -741,6 +742,8 @@ impl JournalCoordinator {
             group_mutations.push(mutation.clone());
         }
         group_mutations.extend_from_slice(mutations);
+        let expected_first_lsn = journal.next_lsn;
+        let expected_count = u64::try_from(group_mutations.len()).unwrap_or(u64::MAX);
         let sequence = self
             .sequence
             .as_ref()
@@ -754,6 +757,18 @@ impl JournalCoordinator {
                 return Err(error);
             }
         };
+        debug_assert_eq!(
+            receipt.first_lsn, expected_first_lsn,
+            "appended group must start at the journal tail"
+        );
+        debug_assert_eq!(
+            receipt
+                .last_lsn
+                .saturating_sub(receipt.first_lsn)
+                .saturating_add(1),
+            expected_count,
+            "appended group must cover every queued and staged mutation"
+        );
         let next_lsn = receipt
             .last_lsn
             .checked_add(1)
@@ -762,7 +777,8 @@ impl JournalCoordinator {
         self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
-        self.visible_lsn.store(receipt.last_lsn, Ordering::Release);
+        self.visible_lsn
+            .fetch_max(receipt.last_lsn, Ordering::Release);
         drop(pending);
         Ok(receipt)
     }
@@ -854,18 +870,25 @@ impl Journal {
             Err(error) => return Err(error),
         };
         let len = file.metadata()?.len();
+        if len < u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX) {
+            return Ok(Scan::empty());
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut header = vec![0; FILE_HEADER_LEN];
+        file.read_exact(&mut header)?;
+        let (_, base_lsn) = validate_file_header(&header)?;
         if start >= len {
             return Ok(Scan {
                 groups: Vec::new(),
                 valid_len: start.min(len),
                 truncated_tail: false,
-                base_lsn: 0,
+                base_lsn,
             });
         }
         file.seek(SeekFrom::Start(start))?;
         let mut tail = Vec::new();
         file.read_to_end(&mut tail)?;
-        scan_groups_from(&tail, start, 0, expected_lsn)
+        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn)
     }
 
     /// Open a journal and recover its committed groups.
@@ -1428,6 +1451,7 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
         u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX),
         base_sequence,
         base_lsn,
+        base_lsn,
     )
 }
 
@@ -1443,10 +1467,8 @@ fn scan_groups_from(
     base_offset: u64,
     mut expected_sequence: u64,
     mut expected_lsn: u64,
+    segment_base_lsn: u64,
 ) -> io::Result<Scan> {
-    // The first group's LSN is the segment's base; captured before the loop
-    // advances `expected_lsn`.
-    let segment_base_lsn = expected_lsn;
     let mut cursor = 0usize;
     let mut valid_len = base_offset;
     let mut groups = Vec::new();

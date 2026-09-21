@@ -3144,21 +3144,11 @@ impl PackfileStorage {
         // silently omits it. Keep new-collection publication excluded until
         // the checkpoint is durably renamed.
 
-        let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
-            .iter()
-            .map(|(collection_id, generation, room)| {
-                (*collection_id, *generation, room.index.serialize())
-            })
-            .collect();
-        let blobs: Vec<([u8; 16], u64, &[u8])> = entries
-            .iter()
-            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
-            .collect();
-        crate::index::checkpoint::write_checkpoint(
+        Self::write_checkpoint_snapshot(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             wal_lsn.unwrap_or(0),
-            &blobs,
+            &snapshots,
         )
         .map_err(StorageError::Io)?;
         // `write_checkpoint` fsyncs the new checkpoint's own bytes before
@@ -3220,6 +3210,28 @@ impl PackfileStorage {
         }
         drop(guards);
         Ok(())
+    }
+
+    /// Serialize one immutable generation snapshot and write its checkpoint.
+    /// Shared by the production writer and test mirrors so they use identical
+    /// collection, generation, and coverage encoding.
+    fn write_checkpoint_snapshot(
+        path: &Path,
+        fingerprint: u64,
+        covered_lsn: u64,
+        snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
+    ) -> std::io::Result<()> {
+        let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
+            .iter()
+            .map(|(collection_id, generation, room)| {
+                (*collection_id, *generation, room.index.serialize())
+            })
+            .collect();
+        let blobs: Vec<([u8; 16], u64, &[u8])> = entries
+            .iter()
+            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
+            .collect();
+        crate::index::checkpoint::write_checkpoint(path, fingerprint, covered_lsn, &blobs)
     }
 
     /// Switch the live delta-log state onto a fresh epoch named for
@@ -3310,21 +3322,11 @@ impl PackfileStorage {
 
         std::thread::sleep(delay);
 
-        let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
-            .iter()
-            .map(|(collection_id, generation, room)| {
-                (*collection_id, *generation, room.index.serialize())
-            })
-            .collect();
-        let blobs: Vec<([u8; 16], u64, &[u8])> = entries
-            .iter()
-            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
-            .collect();
-        crate::index::checkpoint::write_checkpoint(
+        Self::write_checkpoint_snapshot(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             covered_lsn,
-            &blobs,
+            &snapshots,
         )
         .map_err(StorageError::Io)?;
         let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
@@ -3402,21 +3404,11 @@ impl PackfileStorage {
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
         drop(guards);
-        let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
-            .iter()
-            .map(|(collection_id, generation, room)| {
-                (*collection_id, *generation, room.index.serialize())
-            })
-            .collect();
-        let blobs: Vec<([u8; 16], u64, &[u8])> = entries
-            .iter()
-            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
-            .collect();
-        crate::index::checkpoint::write_checkpoint(
+        Self::write_checkpoint_snapshot(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             covered_lsn,
-            &blobs,
+            &snapshots,
         )
         .map_err(StorageError::Io)?;
         let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
@@ -5678,7 +5670,14 @@ impl PackfileStorage {
     /// Without a usable checkpoint the read fails closed.
     fn refresh_read_journal(&self) -> Result<(), StorageError> {
         const RELOAD_ATTEMPTS: usize = 8;
-        for _ in 0..RELOAD_ATTEMPTS {
+        const MAX_BACKOFF_MS: u64 = 64;
+        // Capture coverage once, before the first attempt. Comparing the final
+        // value against a per-iteration snapshot would only detect coverage that
+        // advanced on the *last* attempt, misreporting a moving checkpoint as a
+        // genuine gap. Reloads only ever advance `read_covered_lsn`, so a strict
+        // increase across the whole loop is exactly the retryable signal.
+        let coverage_before_attempts = self.read_covered_lsn.load(Ordering::Acquire);
+        for attempt in 0..RELOAD_ATTEMPTS {
             let mut guard = self.read_journal.lock();
             let Some(overlay) = guard.as_mut() else {
                 return Ok(());
@@ -5688,17 +5687,35 @@ impl PackfileStorage {
             }
             if !self.reload_index_from_checkpoint() {
                 drop(guard);
-                std::thread::yield_now();
+                let delay_ms = 1_u64
+                    .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
+                    .unwrap_or(MAX_BACKOFF_MS)
+                    .min(MAX_BACKOFF_MS);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 continue;
             }
             overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
             overlay.reset_overlay();
             drop(guard);
+            if attempt.saturating_add(1) < RELOAD_ATTEMPTS {
+                let delay_ms = 1_u64
+                    .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
+                    .unwrap_or(MAX_BACKOFF_MS)
+                    .min(MAX_BACKOFF_MS);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
         }
-        Err(StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "read-committed journal/checkpoint changed during reload; retry the read",
-        )))
+        if self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts {
+            Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "read-committed checkpoint coverage advanced during reload; retry the read",
+            )))
+        } else {
+            Err(StorageError::Corrupt(
+                "read-committed journal segment skips LSNs not covered by the loaded checkpoint"
+                    .to_owned(),
+            ))
+        }
     }
 
     /// Enable a read-only journal overlay for the read-committed API.
@@ -5886,7 +5903,12 @@ impl PackfileStorage {
             let grown = if let Some(grown) = live.grow() {
                 Some(grown)
             } else {
-                self.grow_checkpoint_index(collection_id, live)?
+                // Match the single-put fallback: if recovering the
+                // checkpoint-backed hashes fails, rebuild this collection
+                // from pack records below instead of aborting a valid batch.
+                self.grow_checkpoint_index(collection_id, live)
+                    .ok()
+                    .flatten()
             };
             let Some(grown) = grown else {
                 progress.index_needs_rebuild = true;
