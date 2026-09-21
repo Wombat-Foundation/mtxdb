@@ -7570,16 +7570,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_get_retries_when_a_repack_retires_the_shard_mid_lookup() {
-        // Regression test for the shard-retirement race: a repack that swaps
-        // the generation and retires the shards a lookup just read its
-        // candidates from must not turn a live record into a miss. The hook
-        // fires in the exact window (after candidates are collected, before
-        // they are pinned), so this does not rely on timing luck.
-        let dir = test_dir("get_retry_mid_repack");
+    fn setup_repack_mid_lookup(
+        test_name: &str,
+        id: NodeId,
+    ) -> (Arc<PackfileStorage>, u16, Arc<AtomicBool>) {
+        // Put the repack in the exact window between candidate collection and
+        // shard pinning, and force its output onto a new shard so the original
+        // candidate shard is actually retired.
+        let dir = test_dir(test_name);
         let store = Arc::new(PackfileStorage::open(dir).unwrap());
-        let id = distinct_id(0x77);
         store
             .put(
                 &TEST_COLLECTION,
@@ -7603,9 +7602,6 @@ mod tests {
         let hook_store = Arc::clone(&store);
         PackfileStorage::set_test_before_pin(Some(Box::new(move || {
             if !hook_fired.swap(true, Ordering::Relaxed) {
-                // Force the repack's output onto a new shard so the record's
-                // original shard is actually retired, not reused as the live
-                // write shard.
                 hook_store.shards.active_shard().file_len.store(
                     shard::MAX_SHARD_BYTES - 10,
                     std::sync::atomic::Ordering::Release,
@@ -7616,6 +7612,13 @@ mod tests {
                     .unwrap();
             }
         })));
+        (store, old_shard, fired)
+    }
+
+    #[test]
+    fn test_get_retries_when_a_repack_retires_the_shard_mid_lookup() {
+        let id = distinct_id(0x77);
+        let (store, old_shard, fired) = setup_repack_mid_lookup("get_retry_mid_repack", id);
         let result = store.get(&TEST_COLLECTION, &id).unwrap();
         PackfileStorage::set_test_before_pin(None);
 
@@ -7632,42 +7635,8 @@ mod tests {
 
     #[test]
     fn test_get_many_retries_when_a_repack_retires_the_shard_mid_lookup() {
-        let dir = test_dir("get_many_retry_mid_repack");
-        let store = Arc::new(PackfileStorage::open(dir).unwrap());
         let id = distinct_id(0x78);
-        store
-            .put(
-                &TEST_COLLECTION,
-                &id,
-                &NodeData::new(bytes::Bytes::from_static(b"payload")),
-            )
-            .unwrap();
-        store.sync().unwrap();
-        store.generation(&TEST_COLLECTION).unwrap().cache.clear();
-        let old_shard = store
-            .generation(&TEST_COLLECTION)
-            .unwrap()
-            .index
-            .lookup_all(&id)
-            .next()
-            .expect("id is indexed")
-            .0;
-
-        let fired = Arc::new(AtomicBool::new(false));
-        let hook_fired = Arc::clone(&fired);
-        let hook_store = Arc::clone(&store);
-        PackfileStorage::set_test_before_pin(Some(Box::new(move || {
-            if !hook_fired.swap(true, Ordering::Relaxed) {
-                hook_store.shards.active_shard().file_len.store(
-                    shard::MAX_SHARD_BYTES - 10,
-                    std::sync::atomic::Ordering::Release,
-                );
-                hook_store.set_live_roots(&TEST_COLLECTION, vec![id]);
-                hook_store
-                    .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
-                    .unwrap();
-            }
-        })));
+        let (store, old_shard, fired) = setup_repack_mid_lookup("get_many_retry_mid_repack", id);
         let results = store.get_many(&TEST_COLLECTION, &[id]).unwrap();
         PackfileStorage::set_test_before_pin(None);
 
