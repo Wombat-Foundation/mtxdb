@@ -136,14 +136,17 @@ fn fmt_disk_megabytes(bytes: u64) -> String {
     format!("{whole}.{fraction:03} MB")
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().fold(
-        String::with_capacity(bytes.len().saturating_mul(2)),
-        |mut s, b| {
-            let _ = write!(s, "{b:02X}");
-            s
-        },
-    )
+/// Render a logical id (collection, node, or record) in the CLI's canonical
+/// form: `0x` followed by uppercase hex. Every id the CLI prints uses this form,
+/// and every id selector it accepts must be written in this form — there is no
+/// bare-hex shorthand.
+fn format_id(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2usize.saturating_add(bytes.len().saturating_mul(2)));
+    s.push_str("0x");
+    for b in bytes {
+        let _ = write!(s, "{b:02X}");
+    }
+    s
 }
 
 /// Ask the user to explicitly approve a destructive operation.
@@ -288,13 +291,18 @@ fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_collection_id(hex: &str) -> anyhow::Result<[u8; 16]> {
-    let hex = hex
+fn parse_collection_id(value: &str) -> anyhow::Result<[u8; 16]> {
+    let hex = value
         .strip_prefix("0x")
-        .or_else(|| hex.strip_prefix("0X"))
-        .unwrap_or(hex);
+        .or_else(|| value.strip_prefix("0X"))
+        .with_context(|| {
+            format!("collection ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
+        })?;
     if hex.len() != 32 {
-        bail!("collection ID must be 32 hex characters, got {}", hex.len());
+        bail!(
+            "collection ID must be 32 hex characters after `0x`, got {}",
+            hex.len()
+        );
     }
     let bytes = hex::decode(hex).context("invalid hex in collection ID")?;
     let mut id = [0u8; 16];
@@ -302,13 +310,18 @@ fn parse_collection_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
-    let hex = hex
+fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
+    let hex = value
         .strip_prefix("0x")
-        .or_else(|| hex.strip_prefix("0X"))
-        .unwrap_or(hex);
+        .or_else(|| value.strip_prefix("0X"))
+        .with_context(|| {
+            format!("node ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
+        })?;
     if hex.len() != 32 {
-        bail!("node ID must be 32 hex characters, got {}", hex.len());
+        bail!(
+            "node ID must be 32 hex characters after `0x`, got {}",
+            hex.len()
+        );
     }
     let bytes = hex::decode(hex).context("invalid hex in node ID")?;
     let mut id = [0u8; 16];
@@ -316,8 +329,10 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-/// Resolve either the fixed-width storage key or a Matrix event ID. `$id`
-/// is hashed exactly the way Synapse's embedded mirror derives it (see
+/// Resolve a node selector: a `0x`-prefixed logical ID (the engine's
+/// template-independent form), or a Matrix event ID carrying the Matrix
+/// profile's event sigil `$` — a *template* property, not an engine constant.
+/// `$id` is hashed exactly the way Synapse's embedded mirror derives it (see
 /// `synapse_event_node_id`), since the point of this sigil is finding data
 /// Synapse itself wrote — not CLI-imported data, which uses the import
 /// template's own (SHA-256) identity rule instead (`matrix_event_node_id`).
@@ -377,9 +392,11 @@ fn matrix_room_collection_id(namespace: &str, room_id: &str) -> [u8; 16] {
     id
 }
 
-/// Resolve either the fixed-width collection ID or a `!room_id`, the latter
+/// Resolve a collection selector: a `0x`-prefixed logical ID (the engine's
+/// template-independent form), or a canonical ID carrying the Matrix profile's
+/// room sigil `!` — a *template* property, not an engine constant — which is
 /// hashed the same way Synapse's embedded mirror derives a room's `EventDag`
-/// collection (see `matrix_room_collection_id`).
+/// collection (see `matrix_room_collection_id`). Bare hex is rejected.
 fn parse_collection_selector(selector: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
     if let Some(room_id) = selector.strip_prefix('!') {
         let namespace = namespace.context(
@@ -518,8 +535,8 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     let node_data = NodeData::new(bytes::Bytes::from(data.as_bytes().to_vec()));
     store.put(&collection_id, &node_id, &node_data)?;
     store.sync()?;
-    let collection_hex = hex_encode(&collection_id);
-    let id_hex = hex_encode(&node_id);
+    let collection_hex = format_id(&collection_id);
+    let id_hex = format_id(&node_id);
     eprintln!(
         "put {id_hex} into collection {collection_hex} ({} bytes)",
         data.len()
@@ -597,7 +614,7 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
                         format!(
                             "-t {} collection {}",
                             shard_type.as_str(),
-                            hex_encode(col_id)
+                            format_id(col_id)
                         )
                     })
                     .collect::<Vec<_>>()
@@ -617,7 +634,7 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
                 "node ID {id} is present in multiple collections ({}); specify --collection",
                 matches
                     .iter()
-                    .map(|(collection_id, _)| hex_encode(collection_id))
+                    .map(|(collection_id, _)| format_id(collection_id))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1201,7 +1218,7 @@ fn cmd_collections_in_dir(
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
     for (i, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
-        let hex = hex_encode(collection_id);
+        let hex = format_id(collection_id);
         let load = fmt_load_percent(*nodes, *capacity);
         let shards = collection_shards
             .as_ref()
@@ -2078,9 +2095,10 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// `info` accepts a collection selector (slot index or 32-hex collection ID)
-/// or a pack selector (`0x`-prefixed, 1–16 hex digits, as printed by
-/// `mtxdb shards`). Dispatch on the hex length the same way `scan` does.
+/// `info` accepts a collection selector (slot index, a canonical sigil, or a
+/// `0x`-prefixed 32-hex logical ID) or a pack selector (`0x`-prefixed, 1–16 hex
+/// digits, as printed by `mtxdb shards`). Dispatch on the hex length the same
+/// way `scan` does; bare hex is not accepted.
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     if selector
         .strip_prefix("0x")
@@ -2238,7 +2256,7 @@ fn print_pack_info(
                     };
                     println!(
                         "{:>34}  {:>10}  {}",
-                        hex_encode(&collection_id),
+                        format_id(&collection_id),
                         fmt_bytes(bytes),
                         note
                     );
@@ -2301,7 +2319,7 @@ fn print_collection_info(
     capacity: u32,
     shards: &[u64],
 ) {
-    let hex = hex_encode(collection_id);
+    let hex = format_id(collection_id);
     println!(
         "collection {hex}: {len} nodes, {} index ({})",
         fmt_megabytes(mem),
@@ -2352,7 +2370,7 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Re
         return Ok(false);
     };
     if let Some((len, mem, capacity)) = store.collection_index_info(collection_id) {
-        let hex = hex_encode(collection_id);
+        let hex = format_id(collection_id);
         println!(
             "collection {hex}: {len} nodes, {} index ({})",
             fmt_megabytes(mem),
@@ -2404,7 +2422,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
         }
         if !matched_any {
             let display = match parse_collection_selector(collection, cli.namespace.as_deref()) {
-                Ok(id) => hex_encode(&id),
+                Ok(id) => format_id(&id),
                 Err(_) => collection.to_owned(),
             };
             eprintln!("collection {display}: not found");
@@ -2422,7 +2440,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
         }
         Err(_) => parse_collection_selector(collection, cli.namespace.as_deref())?,
     };
-    let hex = hex_encode(&collection_id);
+    let hex = format_id(&collection_id);
     let dir = selected_pool_dir(cli)?;
 
     if inspect_collection_in_dir(&dir, &collection_id)? {
@@ -2818,11 +2836,10 @@ fn cmd_scan(
         reverse,
     };
     // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
-    // it's `0x`-prefixed with something other than 32 hex digits after it —
-    // everything else (bare 32 hex digits, or `0x` + 32 hex digits) is a
-    // collection ID. `info` and `scan` used to disagree here (`scan`
-    // required the `0x` prefix on a collection ID; `info` didn't), which
-    // made the same selector work for one command and not the other.
+    // it's `0x`-prefixed with something other than 32 hex digits after it;
+    // `0x` + 32 hex digits is a logical collection ID. Bare hex is rejected
+    // downstream. `info` and `scan` share this rule so the same selector works
+    // for both.
     let looks_like_pack_id = selector
         .strip_prefix("0x")
         .or_else(|| selector.strip_prefix("0X"))
@@ -2960,8 +2977,8 @@ fn scan_pack(
     }
     print_scan_table_header("COLLECTION", scan_payload_label(shard_type));
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
-        let collection_hex = hex_encode(collection_id);
-        let id_hex = hex_encode(node_id);
+        let collection_hex = format_id(collection_id);
+        let id_hex = format_id(node_id);
         let data = opts
             .verbose
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
@@ -3097,7 +3114,7 @@ fn cmd_scan_collection_in_pool(
             if opts.verbose {
                 eprintln!(
                     "collection {}: raw frame @ {offset} ({} bytes, checksum verified)",
-                    hex_encode(&collection_id),
+                    format_id(&collection_id),
                     data.data.len()
                 );
             }
@@ -3122,13 +3139,13 @@ fn cmd_scan_collection_in_pool(
         if bounded && frames >= max_rows {
             println!(
                 "collection {}: showing first {frames} physical records (at least {packs} pack{})",
-                hex_encode(&collection_id),
+                format_id(&collection_id),
                 if packs == 1 { "" } else { "s" },
             );
         } else {
             println!(
                 "collection {}: {frames} physical record{} across {packs} pack{}",
-                hex_encode(&collection_id),
+                format_id(&collection_id),
                 if frames == 1 { "" } else { "s" },
                 if packs == 1 { "" } else { "s" },
             );
@@ -3144,13 +3161,13 @@ fn cmd_scan_collection_in_pool(
     if bounded && frames >= max_rows {
         println!(
             "collection {}: showing first {frames} physical records (at least {packs} pack{})",
-            hex_encode(&collection_id),
+            format_id(&collection_id),
             if packs == 1 { "" } else { "s" },
         );
     } else {
         println!(
             "collection {}: {frames} physical record{} across {packs} pack{}",
-            hex_encode(&collection_id),
+            format_id(&collection_id),
             if frames == 1 { "" } else { "s" },
             if packs == 1 { "" } else { "s" },
         );
@@ -3345,7 +3362,7 @@ fn print_collection_record(
         "{}",
         scan_table_row(
             &format!("0x{:016x}", shard.pack_id),
-            &hex_encode(&record_id),
+            &format_id(&record_id),
             offset,
             payload.as_deref(),
         )
@@ -3880,7 +3897,7 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     output.flush()?;
     eprintln!(
         "exported {exported} records from collection {}",
-        hex_encode(&collection_id)
+        format_id(&collection_id)
     );
     Ok(())
 }
@@ -4024,7 +4041,7 @@ fn cmd_import_file(
                         if first_event_id != &incoming_event_id {
                             bail!(
                                 "node ID {} maps to multiple event IDs in the input; refusing to merge them",
-                                hex_encode(&id_bytes)
+                                format_id(&id_bytes)
                             );
                         }
                         continue;
@@ -4094,7 +4111,7 @@ fn reject_cross_record_collision(
     if existing_event_id.as_deref() != Some(incoming_event_id) {
         bail!(
             "node ID {} collides with a different event_id; refusing to overwrite it",
-            hex_encode(id_bytes)
+            format_id(id_bytes)
         );
     }
     Ok(())
@@ -4136,7 +4153,7 @@ fn import_pdu_events(
         established_collections,
     )?;
 
-    let collection_hex = hex_encode(&collection_id);
+    let collection_hex = format_id(&collection_id);
 
     // Decode and dedup in one pass, retaining the first occurrence of each
     // node ID directly — no intermediate full-size buffer, so a large
@@ -4164,7 +4181,7 @@ fn import_pdu_events(
                 if first_event_id != incoming_event_id {
                     bail!(
                         "node ID {} maps to multiple event IDs in the input; refusing to merge them",
-                        hex_encode(&id_bytes)
+                        format_id(&id_bytes)
                     );
                 }
                 already_present = already_present.saturating_add(1);
@@ -4998,7 +5015,7 @@ fn resolve_repack_target(
     match target {
         RepackTarget::Collection(collection_id) => {
             if store.collection_index_info(collection_id).is_none() {
-                bail!("collection {} not found", hex_encode(collection_id));
+                bail!("collection {} not found", format_id(collection_id));
             }
             Ok((
                 vec![*collection_id],
@@ -5190,7 +5207,7 @@ fn repack_collections(
                         "  copy progress: {nodes} nodes; output rotated {} → {} while copying collection {}",
                         pack_label(from),
                         pack_label(to),
-                        hex_encode(&collection_id),
+                        format_id(&collection_id),
                     );
                 }
             },
@@ -5208,7 +5225,7 @@ fn repack_collections(
                         "  copy progress: {nodes} nodes; output rotated {} → {} while copying collection {}",
                         pack_label(from),
                         pack_label(to),
-                        hex_encode(&collection_id),
+                        format_id(&collection_id),
                     );
                 }
             },
@@ -5334,7 +5351,7 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
             collection_ids.len()
         );
         for collection_id in &collection_ids {
-            println!("  {}", hex_encode(collection_id));
+            println!("  {}", format_id(collection_id));
         }
         if !confirm("Delete these collections?")? {
             println!("aborted");
@@ -5350,7 +5367,7 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
         store.delete_collection(&collection_id)?;
         println!(
             "deleted {count} nodes for collection {}",
-            hex_encode(&collection_id)
+            format_id(&collection_id)
         );
     }
     Ok(())
@@ -5397,8 +5414,8 @@ mod tests {
         cmd_stats, cmd_sync, compile_import_template, compute_state_groups,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
         default_matrix_import_template, derive_template_key, event_id, event_room_id,
-        event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, glob_pack_files,
-        import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
+        event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_id,
+        glob_pack_files, import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
         matrix_create_details, matrix_room_collection_id, parse_federation_input,
         parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
         resolve_import_collection, scan_payload_suffix, synapse_event_node_id,
@@ -5649,8 +5666,8 @@ mod tests {
         store.put(&col_id, &node_id, &data).unwrap();
         store.sync().unwrap();
 
-        let col_hex = hex::encode(col_id);
-        let node_hex = hex::encode(node_id);
+        let col_hex = format_id(&col_id);
+        let node_hex = format_id(&node_id);
 
         let cli = Cli {
             dir: Some(dir.clone()),
@@ -5681,7 +5698,7 @@ mod tests {
         store.put(&col_id, &node_id, &data).unwrap();
         store.sync().unwrap();
 
-        let col_hex = hex::encode(col_id);
+        let col_hex = format_id(&col_id);
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
@@ -5707,7 +5724,7 @@ mod tests {
         store.put(&col_id, &node_id, &data).unwrap();
         store.sync().unwrap();
 
-        let col_hex = hex::encode(col_id);
+        let col_hex = format_id(&col_id);
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,

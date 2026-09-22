@@ -347,9 +347,9 @@ fn sub_scan() -> Command {
                 .required(true)
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A 32-hex-digit collection ID (`0x`-prefix optional), or a pack ID from \
-                     `mtxdb shards` (1-16 hex digits, `0x`-prefix required) — e.g. `mtxdb scan \
-                     0102030405060708090a0b0c0d0e0f10` or `mtxdb scan 0x1`",
+                    "A `0x`-prefixed collection ID (32 hex digits after `0x`), or a pack ID \
+                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits) — e.g. `mtxdb \
+                     scan 0x0102030405060708090a0b0c0d0e0f10` or `mtxdb scan 0x1`",
                 ),
         )
         .arg(
@@ -395,9 +395,9 @@ fn sub_info() -> Command {
                 .required(true)
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A 32-hex-digit collection ID (`0x`-prefix optional), a collection's \
+                    "A `0x`-prefixed collection ID (32 hex digits after `0x`), a collection's \
                      slot index from `mtxdb collections`, or a pack ID from `mtxdb shards` \
-                     (1-16 hex digits, `0x`-prefix required) — e.g. `mtxdb info \
+                     (also `0x`-prefixed, 1-16 hex digits) — e.g. `mtxdb info \
                      0x0102030405060708090a0b0c0d0e0f10` or `mtxdb info 0x1`",
                 ),
         )
@@ -423,7 +423,7 @@ fn sub_import() -> Command {
             Arg::new("collection")
                 .short('r')
                 .long("collection")
-                .help("Collection ID (hex, 32 chars). Auto-detected if omitted"),
+                .help("Collection ID (0x-prefixed, 32 hex digits). Auto-detected if omitted"),
         )
         .arg(
             Arg::new("template")
@@ -444,7 +444,7 @@ fn sub_export() -> Command {
             Arg::new("collection")
                 .required(true)
                 .value_name("COLLECTION")
-                .help("Collection ID (hex, 32 chars)"),
+                .help("Collection ID (0x-prefixed, 32 hex digits)"),
         )
 }
 
@@ -521,14 +521,14 @@ fn sub_get() -> Command {
             Arg::new("id")
                 .index(1)
                 .required_unless_present("id_option")
-                .help("Node ID (32 hex characters) or Matrix event ID"),
+                .help("Node ID (0x-prefixed, 32 hex digits) or Matrix event ID"),
         )
         .arg(
             Arg::new("id_option")
                 .short('i')
                 .long("id")
                 .conflicts_with("id")
-                .help("Node ID (32 hex characters) or Matrix event ID"),
+                .help("Node ID (0x-prefixed, 32 hex digits) or Matrix event ID"),
         )
         .arg(
             Arg::new("raw")
