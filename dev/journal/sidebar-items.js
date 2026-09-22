@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["Mutation"],"struct":["CommitReceipt","CommittedGroup","Journal","JournalCoordinator","JournalEntry","Reclaim","Scan"]};
+window.SIDEBAR_ITEMS = {"constant":["MAX_TXN_STAGE_BYTES"],"enum":["Mutation","TxnStageState"],"struct":["CommitReceipt","CommittedGroup","Journal","JournalCoordinator","JournalEntry","Reclaim","Scan","TxnStage"]};
