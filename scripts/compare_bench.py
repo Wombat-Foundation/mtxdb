@@ -112,7 +112,10 @@ ROW_IMPORT = re.compile(
 # parameter set is what `main()` always runs; when a family is present it must
 # cover those defaults so a truncated capture is never published as complete.
 DEFAULT_LOCALITY_LABELS = {"small", "medium", "large", "pressure"}
-DEFAULT_INTENT_EVENTS = {"20000"}
+# `run_intent_benchmark(20_000)` reports the generated DAG size, which includes
+# the generator's genesis node and is therefore 20,001 rather than the
+# requested event count.
+DEFAULT_INTENT_EVENTS = {"20001"}
 DEFAULT_SWARM_COMBOS = {
     ("get_many", "adversarial"),
     ("get_many", "organic"),
@@ -603,11 +606,14 @@ def import_scenario(output: str) -> Scenario:
         "checkpoint_ms",
     )
     for match in ROW_IMPORT.finditer(output):
-        row = {
-            key: (float(value) if "." in value else int(value))
-            for key, value in match.groupdict().items()
-        }
-        row["mode"] = match["mode"]
+        # MODE is a categorical label (currently "old" or "batched"), not
+        # a numeric metric. Convert only the measurements; converting every
+        # capture first makes the parser fail on the first valid mode value.
+        row = {"mode": match["mode"]}
+        for key, value in match.groupdict().items():
+            if key == "mode":
+                continue
+            row[key] = float(value) if "." in value else int(value)
         base = f"import/{match['mode']}/"
         for metric in tracked_metrics:
             scenario.tracked[base + metric] = float(row[metric])
