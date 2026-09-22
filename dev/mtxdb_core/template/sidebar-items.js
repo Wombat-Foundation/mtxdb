@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["COLLECTION_TEMPLATE_FORMAT_V1"],"enum":["PayloadPolicy"],"struct":["CollectionKeyRule","CollectionTemplate","RecordIdentityRule"]};

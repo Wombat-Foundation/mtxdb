@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["auxiliary","cache","csr","dag","frontier","index","journal","layout","matrix_policy","packfile","shard","storage","template"]};

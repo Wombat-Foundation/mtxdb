@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["MAX_SHARDS","MAX_SHARD_BYTES"],"enum":["AppendPolicy"],"fn":["store_created_by_version"],"struct":["Shard","ShardOpenTimings","ShardPool","ShardStats","ShardSummary"],"type":["ShardEntry"]};

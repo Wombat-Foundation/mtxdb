@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["NodeRef","StorageError"],"struct":["InMemoryStorage","NodeData"],"trait":["StorageEngine"],"type":["NodeId"]};
