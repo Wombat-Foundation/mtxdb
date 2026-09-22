@@ -8245,9 +8245,8 @@ mod tests {
             (second, &b"second"[..]),
             (third, &b"third"[..]),
         ] {
-            match reader.get(&collection, &id).unwrap() {
-                Some(data) => assert_eq!(data.bytes.as_ref(), expected),
-                None => {}
+            if let Some(data) = reader.get(&collection, &id).unwrap() {
+                assert_eq!(data.bytes.as_ref(), expected);
             }
         }
     }
