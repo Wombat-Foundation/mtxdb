@@ -13,8 +13,7 @@ use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::{InsertError, LossyIndex, SlotUndo};
-use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation, TxnStage};
-use crate::layout::ShardType;
+use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
 use crate::packfile::{self, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -5881,62 +5880,6 @@ impl PackfileStorage {
 }
 
 impl PackfileStorage {
-    /// Eagerly write an immutable record to the packfile and live index while
-    /// staging its journal mutation for the SQL transaction's post-commit
-    /// callback. This bypasses the legacy queue-on-put path.
-    ///
-    /// The packfile and live-index mutation happen immediately and
-    /// unconditionally, regardless of `stage`'s eventual `discard()` or
-    /// publish outcome — only *journal* visibility (the mechanism other
-    /// processes normally use to observe new writes) is deferred to publish.
-    /// The packfile bytes and this process's live index are updated eagerly,
-    /// so a reader that refreshes or rebuilds its durable index, or an
-    /// in-process reader, can observe the record even before the journal
-    /// entry is published. `TxnStage::discard()` cannot undo this write —
-    /// and neither can a `stage_puts` failure after the eager mutation has
-    /// already happened, so a failed staged write is not rollback-safe
-    /// either. On SQL rollback the record remains visible to in-process
-    /// reads and, if an index checkpoint runs before the rollback is
-    /// handled, the checkpoint can retain the record across a reopen;
-    /// whether a later repack removes it then depends on the collection's
-    /// live-root policy. Do not use this API where SQL
-    /// transaction atomicity is required until the index mutation itself is
-    /// deferred to commit (a private write set / transaction-local overlay).
-    ///
-    /// # Errors
-    /// Returns a storage or staging error if the record cannot be written or
-    /// the transaction stage is inactive or full.
-    pub fn put_staged(
-        &self,
-        stage: &TxnStage,
-        pool: ShardType,
-        collection_id: &[u8; 16],
-        id: &NodeId,
-        data: &NodeData,
-    ) -> Result<(), StorageError> {
-        self.put_internal(collection_id, id, data, Some((stage, pool)))
-    }
-
-    /// Batch variant of [`Self::put_staged`]. The group's mutations enter the
-    /// stage only after the full eager packfile/index batch succeeds.
-    ///
-    /// See [`Self::put_staged`]: the same "not rollback" caveat applies here
-    /// — a `discard()` on `stage` does not undo this batch's packfile/index
-    /// writes.
-    ///
-    /// # Errors
-    /// Returns a storage or staging error if the batch cannot be written or
-    /// the transaction stage is inactive or full.
-    pub fn put_many_staged(
-        &self,
-        stage: &TxnStage,
-        pool: ShardType,
-        collection_id: &[u8; 16],
-        entries: &[(NodeId, NodeData)],
-    ) -> Result<usize, StorageError> {
-        self.put_many_internal(collection_id, entries, Some((stage, pool)))
-    }
-
     fn append_put_many_entry(
         &self,
         collection_id: &[u8; 16],
@@ -5944,7 +5887,6 @@ impl PackfileStorage {
         data: &NodeData,
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
-        publish_legacy: bool,
     ) -> Result<(), StorageError> {
         let record = Record {
             collection_id: *collection_id,
@@ -5952,13 +5894,11 @@ impl PackfileStorage {
             data: data.bytes.clone(),
         };
         let (shard_id, offset) = self.shards.put_record(&record)?;
-        if publish_legacy {
-            self.publish_mutation(|| JournalMutation::Put {
-                collection_id: *collection_id,
-                node_id: *id,
-                payload: data.bytes.to_vec(),
-            })?;
-        }
+        self.publish_mutation(|| JournalMutation::Put {
+            collection_id: *collection_id,
+            node_id: *id,
+            payload: data.bytes.to_vec(),
+        })?;
         if progress.index_needs_rebuild {
             return Ok(());
         }
@@ -6034,26 +5974,18 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
-        staged: Option<(&TxnStage, ShardType)>,
     ) -> Result<(u16, u64), StorageError> {
-        if let Some((stage, _)) = staged {
-            stage.ensure_capacity(data.bytes.len().saturating_add(64))?;
-        }
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
             data: data.bytes.clone(),
         };
         let location = self.shards.put_record(&record)?;
-        if let Some((stage, pool)) = staged {
-            stage.stage_put(pool, *collection_id, *id, data.bytes.to_vec())?;
-        } else {
-            self.publish_mutation(|| JournalMutation::Put {
-                collection_id: *collection_id,
-                node_id: *id,
-                payload: data.bytes.to_vec(),
-            })?;
-        }
+        self.publish_mutation(|| JournalMutation::Put {
+            collection_id: *collection_id,
+            node_id: *id,
+            payload: data.bytes.to_vec(),
+        })?;
         Ok(location)
     }
 
@@ -6100,16 +6032,9 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
-        staged: Option<(&TxnStage, ShardType)>,
     ) -> Result<bool, StorageError> {
         if entries.is_empty() {
             return Ok(false);
-        }
-        if let Some((stage, _)) = staged {
-            let charge = entries.iter().fold(0usize, |total, (_, data)| {
-                total.saturating_add(data.bytes.len().saturating_add(64))
-            });
-            stage.ensure_capacity(charge)?;
         }
         for (id, data) in entries {
             ShardPool::validate_record(&Record {
@@ -6136,7 +6061,6 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
-        staged: Option<(&TxnStage, ShardType)>,
     ) -> Result<(), StorageError> {
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
@@ -6156,7 +6080,7 @@ impl PackfileStorage {
             None
         };
 
-        let (shard_id, offset) = self.append_put_record(collection_id, id, data, staged)?;
+        let (shard_id, offset) = self.append_put_record(collection_id, id, data)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
                 if let Ok((bucket, slot)) =
@@ -6267,9 +6191,8 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
-        staged: Option<(&TxnStage, ShardType)>,
     ) -> Result<usize, StorageError> {
-        if !self.validate_put_many_inputs(collection_id, entries, staged)? {
+        if !self.validate_put_many_inputs(collection_id, entries)? {
             return Ok(0);
         }
         let collection_arc = self.put_mutex(collection_id);
@@ -6318,7 +6241,6 @@ impl PackfileStorage {
                 data,
                 old_gen.as_deref().map(|generation| &**generation),
                 &mut progress,
-                staged.is_none(),
             ) {
                 rollback_and_fail!(error);
             }
@@ -6380,13 +6302,6 @@ impl PackfileStorage {
             self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
 
-        if let Some((stage, pool)) = staged {
-            let staged_entries: Vec<(NodeId, Vec<u8>)> = entries
-                .iter()
-                .map(|(id, data)| (*id, data.bytes.to_vec()))
-                .collect();
-            stage.stage_puts(pool, *collection_id, &staged_entries)?;
-        }
         Ok(entries.len())
     }
 }
@@ -6553,7 +6468,7 @@ impl StorageEngine for PackfileStorage {
         id: &NodeId,
         data: &NodeData,
     ) -> Result<(), StorageError> {
-        self.put_internal(collection_id, id, data, None)
+        self.put_internal(collection_id, id, data)
     }
 
     fn put_many(
@@ -6561,7 +6476,7 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError> {
-        self.put_many_internal(collection_id, entries, None)
+        self.put_many_internal(collection_id, entries)
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -11310,69 +11225,6 @@ mod tests {
                 .expect("record missing after topo repack");
             assert_eq!(got.bytes.as_ref(), expected);
         }
-    }
-
-    /// TEMPORARY CHARACTERIZATION TEST — pins the current (unsafe-for-SQL-
-    /// atomicity) behavior described in the doc comments on
-    /// `put_staged`/`put_many_staged`/`TxnStage::discard`, so that a future
-    /// deferred-transaction-buffer fix (see the "Wiring precondition"
-    /// section on [`TxnStage`]) changes this test deliberately rather than
-    /// by accident. This test should be deleted or rewritten once
-    /// `put_staged`/`put_many_staged` defer the index mutation to commit.
-    ///
-    /// `TxnStage::discard()` is journal-publication discard, not rollback:
-    /// it does not undo the eager packfile/live-index write made through
-    /// `put_staged`, and a checkpoint taken in the window before the caller
-    /// notices the SQL rollback can retain the record durably across a
-    /// reopen (whether a later repack removes it then depends on the
-    /// collection's live-root policy — not exercised here).
-    #[test]
-    fn discard_is_not_rollback() {
-        let dir = test_dir("discard_no_rollback");
-        let id = distinct_id(0x11);
-
-        {
-            let store = PackfileStorage::open(dir.clone()).unwrap();
-            let stage = TxnStage::new();
-            store
-                .put_staged(
-                    &stage,
-                    ShardType::EventDag,
-                    &TEST_COLLECTION,
-                    &id,
-                    &NodeData::new(bytes::Bytes::from_static(b"staged")),
-                )
-                .unwrap();
-
-            // Simulate the SQL transaction's error callback.
-            stage.discard();
-
-            // The eager write is still visible to an ordinary read: discard()
-            // only suppressed journal publication, not the index/packfile
-            // mutation.
-            let got = store
-                .get(&TEST_COLLECTION, &id)
-                .unwrap()
-                .expect("discard() must not undo the eager packfile/index write");
-            assert_eq!(got.bytes.as_ref(), b"staged".as_slice());
-
-            // A checkpoint taken after the discard captures the orphan into
-            // the on-disk checkpoint state; `sync()` then fsyncs the shard
-            // and checkpoint so the reopen below reads genuinely durable
-            // state, not just an OS page-cache artifact of the same process.
-            store.persist_index_checkpoint().unwrap();
-            store.sync().unwrap();
-        }
-
-        // Reopen from scratch: this proves the checkpoint actually captured
-        // the record durably on disk, rather than the earlier read having
-        // been served from the still-live in-memory index.
-        let reopened = PackfileStorage::open(dir).unwrap();
-        let got_after_reopen = reopened
-            .get(&TEST_COLLECTION, &id)
-            .unwrap()
-            .expect("checkpoint must not have dropped the discarded record across reopen");
-        assert_eq!(got_after_reopen.bytes.as_ref(), b"staged".as_slice());
     }
 
     #[test]
