@@ -5,9 +5,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
@@ -321,7 +319,7 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
 /// is hashed exactly the way Synapse's embedded mirror derives it (see
 /// `synapse_event_node_id`), since the point of this sigil is finding data
 /// Synapse itself wrote — not CLI-imported data, which uses the import
-/// template's own (BLAKE3) identity rule instead (`matrix_event_node_id`).
+/// template's own (SHA-256) identity rule instead (`matrix_event_node_id`).
 fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
     if let Some(event_id) = id.strip_prefix('$') {
         let namespace = namespace.context(
@@ -334,12 +332,12 @@ fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
     }
 }
 
-/// The Matrix import template's accepted identity algorithm: BLAKE3 truncated
+/// The Matrix import template's accepted identity algorithm: SHA-256 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,
 /// `--root`, and CLI-imported collections use this same derivation — distinct
 /// from `synapse_event_node_id`, which matches Synapse's own live mirror.
 fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
-    derive_template_key("blake3-128", event_id)
+    derive_template_key("sha2-256", event_id)
 }
 
 /// Matches `event_node_id` in Synapse's `rust/src/database/mtxdb.rs` byte
@@ -780,7 +778,7 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     let room_id = core::str::from_utf8(bytes.get(room_id_start..root_hash_start)?).ok()?;
     let room_prefix = bytes.get(prefix_start..room_id_len_offset)?;
     let root_hash = bytes.get(root_hash_start..lattice_start)?;
-    let mut lattice_hasher = Blake2b::<U32>::new();
+    let mut lattice_hasher = Sha256::new();
     lattice_hasher.update(bytes.get(lattice_start..end)?);
     let lattice_digest = lattice_hasher.finalize();
 
@@ -792,7 +790,7 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     writeln!(out, "// lattice: {LATTICE_LEN} bytes (1024 u16 lanes)").unwrap();
     writeln!(
         out,
-        "// lattice digest (BLAKE2b-256): {}",
+        "// lattice digest (SHA-256): {}",
         hex::encode(lattice_digest)
     )
     .unwrap();
@@ -3466,12 +3464,12 @@ fn default_matrix_import_template() -> CollectionTemplate {
         collection_kind: "room".into(),
         record_identity: RecordIdentityRule {
             pointer: "/event_id".into(),
-            node_id_algorithm: "blake3-128".into(),
+            node_id_algorithm: "sha2-256".into(),
         },
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: "/room_id".into(),
-            collection_id_algorithm: "blake3-128".into(),
+            collection_id_algorithm: "sha2-256".into(),
             display_id_pointer: "/room_id".into(),
         },
     }
@@ -3599,14 +3597,14 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         &template,
         ["record", "identity", "internal_key", "algorithm"].as_slice(),
     )
-    .unwrap_or("blake3-128");
+    .unwrap_or("sha2-256");
     validate_digest_algorithm(node_id_algorithm)
         .with_context(|| format!("template {} record identity internal_key", path.display()))?;
     let collection_id_algorithm = template_string_at(
         &template,
         ["collection", "internal_key", "algorithm"].as_slice(),
     )
-    .unwrap_or("blake3-128");
+    .unwrap_or("sha2-256");
     validate_digest_algorithm(collection_id_algorithm)
         .with_context(|| format!("template {} collection internal_key", path.display()))?;
     if let Some(policy) = template
@@ -3659,7 +3657,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
 /// rather than surfacing mid-import on the first record that needs it.
 fn validate_digest_algorithm(algorithm: &str) -> anyhow::Result<()> {
     match algorithm {
-        "blake3-128" => Ok(()),
+        "sha2-256" => Ok(()),
         other => bail!("unsupported internal-key algorithm `{other}`"),
     }
 }
@@ -3721,15 +3719,22 @@ fn parse_array_index(segment: &str) -> Option<usize> {
     segment.parse::<usize>().ok()
 }
 
-/// Derive mtxdb's internal 128-bit key for one template-extracted value.
-/// The algorithm is assumed already validated by
+/// Derive mtxdb's internal 128-bit lookup key for one template-extracted value
+/// using the named algorithm. The algorithm is assumed already validated by
 /// [`validate_digest_algorithm`] (either at template-compile time or in
 /// [`default_matrix_import_template`]).
+///
+/// # Key width
+///
+/// For `"sha2-256"` the full 32-byte SHA-256 digest is computed but only the
+/// first 16 bytes are returned as the [`crate::storage::NodeId`]. The current
+/// `NodeId` cannot provide a 256-bit payload digest; a full payload digest
+/// belongs in pack-record metadata, computed by the storage layer on write.
 fn derive_template_key(algorithm: &str, extracted: &str) -> anyhow::Result<[u8; 16]> {
     validate_digest_algorithm(algorithm)?;
-    let hash = blake3::hash(extracted.as_bytes());
+    let hash = Sha256::digest(extracted.as_bytes());
     let mut id = [0u8; 16];
-    id.copy_from_slice(&hash.as_bytes()[..16]);
+    id.copy_from_slice(&hash[..16]);
     Ok(id)
 }
 
@@ -4411,8 +4416,24 @@ fn verify_auth_chain_edges(
 
 /// Build an in-memory event DAG from a set of events.
 ///
-/// Each event is hashed to a `u64` `short_id` via BLAKE3-128 of its `event_id`,
-/// then inserted into an [`ActiveRoomFrontier`] with its `prev_events` and
+/// Derive the in-memory DAG `short_id` for an event: the first 8 bytes of
+/// SHA-256(`event_id`) read as a little-endian `u64`.
+///
+/// This is a purely local, dense-ish key for the in-memory frontier. It is
+/// independent of the on-disk [`mtxdb::NodeId`] (which is the first 16 bytes
+/// of SHA-256 of the extracted identity) and need not be stable across
+/// algorithm changes.
+fn event_short_id(event_id: &str) -> u64 {
+    let hash = Sha256::digest(event_id.as_bytes());
+    let mut short_id_bytes = [0u8; 8];
+    short_id_bytes.copy_from_slice(&hash[..8]);
+    u64::from_le_bytes(short_id_bytes)
+}
+
+/// Build an in-memory event DAG from a set of events.
+///
+/// Each event is hashed to a `u64` `short_id` via [`event_short_id`], then
+/// inserted into an [`ActiveRoomFrontier`] with its `prev_events` and
 /// `auth_events` edges resolved to the same `short_id` space.
 ///
 /// Returns the frontier and the bidirectional id maps.
@@ -4429,10 +4450,7 @@ fn build_event_dag(
     let mut id_map: HashMap<String, u64> = HashMap::new();
     for ev in events {
         if let Some(eid) = event_id(ev) {
-            let hash = blake3::hash(eid.as_bytes());
-            let mut short_id_bytes = [0u8; 8];
-            short_id_bytes.copy_from_slice(&hash.as_bytes()[..8]);
-            let short_id = u64::from_le_bytes(short_id_bytes);
+            let short_id = event_short_id(eid);
             id_map.insert(eid.to_owned(), short_id);
         }
     }
@@ -4561,7 +4579,7 @@ fn topo_sort_dag(
 /// events contribute to the state set.
 ///
 /// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
-/// BLAKE3 digest of the state set). Each event inherits the state from
+/// SHA-256 digest of the state set). Each event inherits the state from
 /// its `prev_events` and applies its own state change (if it is a state
 /// event with `state_key`).
 ///
@@ -4662,7 +4680,7 @@ impl StateSet {
 
     /// Deterministic hash of the state set for use as a state-group ID.
     ///
-    /// The digest is BLAKE3-256 over the sorted `(type, state_key,
+    /// The digest is SHA-256 over the sorted `(type, state_key,
     /// event_id)` entries. This is **not** an `LtHash`; it is a standard
     /// collision-resistant hash suitable for identifying state sets.
     fn digest_base64url(&self) -> String {
@@ -4681,8 +4699,8 @@ impl StateSet {
             hasher_input.extend_from_slice(event_id.as_bytes());
             hasher_input.push(0);
         }
-        let hash = blake3::hash(&hasher_input);
-        URL_SAFE_NO_PAD.encode(hash.as_bytes())
+        let hash = Sha256::digest(&hasher_input);
+        URL_SAFE_NO_PAD.encode(&hash[..])
     }
 }
 
@@ -5241,7 +5259,7 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
                 None
             };
             if let Some(s) = event_id {
-                // Matrix template compilation currently permits blake3-128,
+                // Matrix template compilation currently permits sha2-256,
                 // so edge extraction uses the same derivation as import. The
                 // storage callback cannot return an error; if that supported
                 // identity configuration ever changes, omit this edge rather
@@ -5331,13 +5349,14 @@ mod tests {
         build_event_dag, cmd_collections, cmd_get, cmd_import_file, cmd_info, cmd_scan, cmd_shards,
         cmd_stats, cmd_sync, compile_import_template, compute_state_groups,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
-        default_matrix_import_template, event_id, event_room_id, extract_pointer_string,
-        fmt_disk_megabytes, fmt_megabytes, glob_pack_files, import_pdu_events,
-        interleaving_worth_noting, matrix_batch_has_create, matrix_create_details,
-        matrix_room_collection_id, parse_federation_input, parse_pack_id_selector,
-        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
-        synapse_event_node_id, template_collection_id, template_node_id, verify_auth_chain_edges,
-        CollectionTemplate, StateSet,
+        default_matrix_import_template, derive_template_key, event_id, event_room_id,
+        event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, glob_pack_files,
+        import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
+        matrix_create_details, matrix_room_collection_id, parse_federation_input,
+        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        resolve_import_collection, scan_payload_suffix, synapse_event_node_id,
+        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
+        StateSet,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -5345,6 +5364,7 @@ mod tests {
     use mtxdb::storage::{NodeData, StorageEngine};
     use mtxdb::template::{CollectionKeyRule, PayloadPolicy, RecordIdentityRule};
     use mtxdb::{DatabaseLayout, ShardType};
+    use sha2::{Digest, Sha256};
     use simd_json::prelude::Writable;
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -5671,12 +5691,12 @@ mod tests {
             collection_kind: "federation".into(),
             record_identity: RecordIdentityRule {
                 pointer: "/sender".into(),
-                node_id_algorithm: "blake3-128".into(),
+                node_id_algorithm: "sha2-256".into(),
             },
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/room_id".into(),
-                collection_id_algorithm: "blake3-128".into(),
+                collection_id_algorithm: "sha2-256".into(),
                 display_id_pointer: "/room_id".into(),
             },
         }
@@ -6160,7 +6180,7 @@ mod tests {
             "record": {
                 "identity": {
                     "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "blake3-128"}
+                    "internal_key": {"algorithm": "sha2-256"}
                 },
                 "payload": {"policy": "projection", "include": ["/type", "/sender"]}
             },
@@ -6186,7 +6206,7 @@ mod tests {
             "record": {
                 "identity": {
                     "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "blake3-128"}
+                    "internal_key": {"algorithm": "sha2-256"}
                 },
                 "payload": {"policy": 42}
             },
@@ -6212,7 +6232,7 @@ mod tests {
             "record": {
                 "identity": {
                     "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "blake3-128"}
+                    "internal_key": {"algorithm": "sha2-256"}
                 },
                 "payload": {"policy": "retain-source"}
             },
@@ -6239,7 +6259,7 @@ mod tests {
             "record": {
                 "identity": {
                     "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "blake3-128"}
+                    "internal_key": {"algorithm": "sha2-256"}
                 },
                 "payload": {"policy": "retain-source"}
             },
@@ -6275,7 +6295,7 @@ mod tests {
                 "record": {{
                     "identity": {{
                         "extract": {{"kind": "json-pointer-rfc-6901", "path": "/event_id"}},
-                        "internal_key": {{"algorithm": "blake3-128"}}
+                        "internal_key": {{"algorithm": "sha2-256"}}
                     }},
                     "payload": {{"policy": "retain-source"}}
                 }},
@@ -6457,7 +6477,7 @@ mod tests {
         assert!(text.contains(room_id));
         assert!(text.contains("abababababababab"));
         assert!(text.contains("2048 bytes"));
-        assert!(text.contains("lattice digest (BLAKE2b-256): "));
+        assert!(text.contains("lattice digest (SHA-256): "));
     }
 
     #[test]
@@ -6774,10 +6794,50 @@ mod tests {
     fn state_set_empty_digest_is_empty_base64url() {
         let s = StateSet::new();
         let digest = s.digest_base64url();
-        let expected = blake3::hash(&[]);
+        let expected = Sha256::digest([]);
         assert_eq!(
             digest,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected.as_bytes())
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected[..])
+        );
+    }
+
+    /// Pins the SHA-256 state-set digest so switching algorithm (or changing
+    /// the `(type, state_key, event_id)` framing) is a visible, deliberate
+    /// format break rather than a silent re-identification of every state
+    /// group.
+    #[test]
+    fn state_set_digest_golden_vector() {
+        let mut s = StateSet::new();
+        s.set("m.room.name", "", "$old".into());
+        assert_eq!(
+            s.digest_base64url(),
+            "S8Afb--pNuREj_ps-f7RgFQbx0EWjWQQrS2pWiPKk28"
+        );
+    }
+
+    /// Pins `derive_template_key("sha2-256", ..)`: the first 16 bytes of
+    /// SHA-256 of the extracted value, with no domain separation. This is the
+    /// identity rule behind `matrix_event_node_id`, so the expected value is
+    /// hard-coded rather than recomputed with the same `sha2` calls.
+    #[test]
+    fn derive_template_key_golden_vector() {
+        let id = derive_template_key("sha2-256", "$abc123:example.org").unwrap();
+        assert_eq!(hex::encode(id), "8abcf87e5c91a02a1875014f69bb0747");
+        // Only the truncation width is under test here; a different input must
+        // produce a different id.
+        assert_ne!(
+            id,
+            derive_template_key("sha2-256", "$other:example.org").unwrap()
+        );
+    }
+
+    /// Pins the in-memory DAG `short_id` derivation: the first 8 bytes of
+    /// SHA-256(`event_id`) as a little-endian `u64`.
+    #[test]
+    fn event_short_id_golden_vector() {
+        assert_eq!(
+            event_short_id("$abc123:example.org"),
+            3_071_614_772_319_927_434
         );
     }
 

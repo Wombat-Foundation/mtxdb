@@ -68,12 +68,12 @@ mod tests {
             collection_kind: "notebook".into(),
             record_identity: RecordIdentityRule {
                 pointer: "/uuid".into(),
-                node_id_algorithm: "blake3-128".into(),
+                node_id_algorithm: "sha2-256".into(),
             },
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/notebook".into(),
-                collection_id_algorithm: "blake3-128".into(),
+                collection_id_algorithm: "sha2-256".into(),
                 display_id_pointer: "/notebook".into(),
             },
         };

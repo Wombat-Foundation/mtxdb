@@ -44,7 +44,7 @@ impl Rng {
 }
 
 /// Well-mixed 64-bit permutation (splitmix64). Real content-address hashes
-/// (BLAKE2b/SHA-256) are uniformly distributed, so the synthetic node IDs
+/// (SHA-256) are uniformly distributed, so the synthetic node IDs
 /// must be too — otherwise the lossy index's `hash[..8]` bucket selection
 /// collapses every entry into one linear-probe cluster.
 fn splitmix64(mut x: u64) -> u64 {

@@ -7,7 +7,7 @@
     "identity": {
       "extract": { "kind": "json-pointer-rfc-6901", "path": "/<record-id>" },
       "validate": { "kind": "scalar", "type": "string" },
-      "internal_key": { "kind": "digest", "algorithm": "blake3-128", "input": "extracted-value" }
+      "internal_key": { "kind": "digest", "algorithm": "sha2-256", "input": "extracted-value" }
     },
     "payload": { "policy": "retain-source" }
   },
@@ -17,7 +17,7 @@
       "extract": { "kind": "json-pointer-rfc-6901", "path": "/<collection-key>" },
       "validate": { "kind": "scalar", "type": "string" }
     },
-    "internal_key": { "kind": "digest", "algorithm": "blake3-128", "input": "membership-value" },
+    "internal_key": { "kind": "digest", "algorithm": "sha2-256", "input": "membership-value" },
     "labels": [{ "name": "display_id", "value": "membership-value" }]
   },
   "establishment": { "required": false, "selector": {}, "cardinality": "at-most-one" },
