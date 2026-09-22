@@ -83,56 +83,18 @@ struct TxnStageData {
 /// Transaction-local **journal** publication buffer -- not a storage
 /// transaction.
 ///
-/// Packfile writes may remain eager for immutable/content-addressed records,
-/// while their journal entries are kept here until the SQL transaction's
-/// post-commit callback. Call [`Self::discard`] from the transaction's error
-/// callback. That is required because Synapse retains after-callbacks across
-/// retry attempts.
+/// Journal entries for a SQL transaction are buffered here and published from
+/// its post-commit callback. Call [`Self::discard`] from the transaction's
+/// error callback; that is required because Synapse retains after-callbacks
+/// across retry attempts.
 ///
-/// # `discard` is not a rollback
+/// # Not a rollback
 ///
-/// [`Self::discard`] drops only the buffered journal mutations. It does **not**
-/// undo the eager packfile record or live-index entry that
-/// `PackfileStorage::put_staged`/`put_many_staged` wrote before staging: those
-/// mutate storage immediately, independent of the stage's later discard or
-/// publish outcome. A rolled-back attempt therefore leaves an *orphaned*
-/// record that this process's ordinary reads can still observe.
-///
-/// # Why an orphan is (conditionally) tolerable
-///
-/// Individual content-addressed records are append-only within a live
-/// collection: once put, a record is never mutated or individually deleted
-/// or tombstoned (whole-collection deletion is a separate, coarser
-/// operation — see `delete_collection`). Garbage collection is a background
-/// repack that rewrites only reachable data, so a record-level orphan is
-/// inert and is dropped the next time `repack_collection_reachable`
-/// rewrites its collection.
-///
-/// That reaping is **conditional, not blanket**. Repack keys on the
-/// collection's `live_roots`, and
-/// `test_repack_collection_reachable_without_live_roots_preserves_everything`
-/// pins that a collection with no live roots keeps *everything*, orphans
-/// included. So "a discarded staged write is eventually reaped" holds only
-/// where the collection's live roots exclude the orphan; for a rootless
-/// collection (`event_json`'s shape) the orphan is retained by repack and
-/// not reclaimed that way (though it may still be removed by other
-/// administrative action, e.g. collection deletion).
-///
-/// # Checkpoint hazard
-///
-/// `persist_index_checkpoint` snapshots the live `index_tables`, which already
-/// contains the eager staged insert. A checkpoint that runs between the eager
-/// write and the rollback bakes the orphan into the on-disk checkpoint, so it
-/// outlives a later repack that rebuilds from that (now stale) index.
-///
-/// # Wiring precondition
-///
-/// Do not route a caller that can roll back through
-/// `PackfileStorage::put_staged`/`put_many_staged` until either (a) the
-/// packfile/index mutation is deferred to commit (a private write set / MVCC
-/// layer), or (b) the target collection is guaranteed to have live roots that
-/// exclude a discarded write. Otherwise a discarded attempt trades a
-/// visibility bug for a phantom-record bug.
+/// [`Self::discard`] drops only the buffered journal mutations. It does not
+/// touch packs or the live index, because this buffer never writes them; the
+/// deferred-publication redesign (prepare/commit) will route the pack/index
+/// mutation through this buffer's commit path. Until that lands, no
+/// production caller stages through here.
 pub struct TxnStage {
     state: std::sync::atomic::AtomicU8,
     data: Mutex<TxnStageData>,
@@ -174,9 +136,8 @@ impl TxnStage {
 
     /// Discard an active attempt. Safe to call more than once.
     ///
-    /// See the "`discard` is not a rollback" section on [`TxnStage`]: this
-    /// drops only the buffered journal mutations, not the eager
-    /// packfile/live-index writes made through `put_staged`/`put_many_staged`.
+    /// See the "Not a rollback" section on [`TxnStage`]: this drops only the
+    /// buffered journal mutations and never touches packs or the live index.
     pub fn discard(&self) {
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) == Self::ACTIVE {
@@ -186,7 +147,7 @@ impl TxnStage {
         }
     }
 
-    /// Ensure an estimated batch fits before beginning eager packfile writes.
+    /// Ensure an estimated batch fits before buffering its journal mutations.
     ///
     /// # Errors
     /// Returns `InvalidInput` if the stage is not active or the estimated
@@ -250,8 +211,7 @@ impl TxnStage {
         Ok(())
     }
 
-    /// Add a batch of immutable puts atomically after its packfile/index write
-    /// has succeeded.
+    /// Add a batch of immutable puts atomically.
     ///
     /// # Errors
     /// Returns `InvalidInput` if the batch would exceed the stage limit, or
@@ -353,8 +313,8 @@ impl TxnStage {
         }
         let coordinators = [auth_chain, event_dag, state];
         if coordinators.iter().all(Option::is_none) {
-            // Journaling is disabled process-wide. The eager packfile/index
-            // writes remain authoritative, so there is nothing to publish.
+            // Journaling is disabled process-wide, so there is no journal to
+            // publish into.
             self.state.store(Self::PUBLISHED, Ordering::Release);
             return Ok(());
         }
