@@ -5182,8 +5182,14 @@ impl PackfileStorage {
         // checkpoint dirty (repack itself never does, since it never runs
         // through the put/sync paths that do) and persist it now so the
         // on-disk checkpoint matches what this repack just wrote.
+        //
+        // Best-effort: the repack itself already succeeded and its shard
+        // writes are durable (fsynced above). A checkpoint-write failure
+        // here shouldn't be reported as a repack failure — the packfiles
+        // stay authoritative and the dirty flag (left set on failure, see
+        // `persist_index_checkpoint`) means the next sync retries it.
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-        self.persist_index_checkpoint()?;
+        self.persist_index_checkpoint_best_effort();
 
         Ok((kept, dropped))
     }
@@ -5444,8 +5450,11 @@ impl PackfileStorage {
         // above may have unlinked packs this batch's old index entries
         // pointed at, so the on-disk checkpoint must be refreshed or a
         // reader's checkpoint reload can never match the live shard set.
+        // Best-effort for the same reason: the batch's shard writes are
+        // already durable, so a checkpoint-write failure here costs the
+        // next sync a retry, not correctness.
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-        self.persist_index_checkpoint()?;
+        self.persist_index_checkpoint_best_effort();
 
         Ok(results)
     }
@@ -7991,16 +8000,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "documents a pre-existing gap beyond this fix's scope: checkpoint \
-                index entries encode a raw local shard slot with no persisted \
-                slot<->pack_id table (see index/format.rs), so a fresh reader's \
-                discover_shards() can assign a retired-and-reused pack file a \
-                different slot than the writer had when it built the checkpoint. \
-                Persisting the checkpoint after repack (this fix) is still \
-                correct and necessary — it fixes the fingerprint/covered_lsn \
-                staleness — but does not by itself close this separate slot- \
-                stability gap. Needs a checkpoint-format change (store pack_id \
-                per slot, or key index entries by pack_id) before this can pass."]
     fn repack_persists_checkpoint_so_read_journal_reload_survives_retirement() {
         // Repack moves a collection's records into a fresh destination shard
         // and retires the old one once nothing else references it. A reader
@@ -8069,6 +8068,44 @@ mod tests {
             "reload must succeed against the checkpoint repack persisted, not a stale one \
              naming a shard repack already unlinked"
         );
+    }
+
+    #[test]
+    #[ignore = "documents a pre-existing gap beyond this fix's scope: checkpoint \
+                index entries encode a raw local shard slot with no persisted \
+                slot<->pack_id table (see index/format.rs), so a fresh reader's \
+                discover_shards() can assign a retired-and-reused pack file a \
+                different slot than the writer had when it built the checkpoint. \
+                Persisting the checkpoint after repack (repack_persists_checkpoint_\
+                so_read_journal_reload_survives_retirement) is still correct and \
+                necessary — it fixes the fingerprint/covered_lsn staleness, and the \
+                reload above succeeds — but does not by itself close this separate \
+                slot-stability gap, so the read below still fails. Needs a \
+                checkpoint-format change (store pack_id per slot, or key index \
+                entries by pack_id) before this can pass."]
+    fn repack_persisted_checkpoint_reload_resolves_record_by_post_repack_offset() {
+        let dir = test_dir("repack_persists_checkpoint_read");
+        let wal = dir.join("wal.bin");
+        let collection = [0x51u8; 16];
+        let node = [0x61u8; 16];
+
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer
+            .put(
+                &collection,
+                &node,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        writer
+            .repack_collection_reachable(&collection, |_hash, _data| Vec::new())
+            .unwrap();
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        assert!(store.reload_index_from_checkpoint());
 
         let got = store.get(&collection, &node).unwrap();
         assert_eq!(
