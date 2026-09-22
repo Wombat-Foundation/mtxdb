@@ -1,0 +1,84 @@
+---
+name: Rust Docs
+
+on:
+  push:
+    branches: ["master", "dev"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  docs:
+    if: github.ref_name == 'master' || github.ref_name == 'dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: dev
+          path: dev
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: master
+          path: master
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rustdoc for master
+        run: |
+          if [ -f "master/Cargo.toml" ]; then
+            make -C master doc
+          else
+            echo "master/Cargo.toml not found, skipping docs for master"
+            mkdir -p master/target/doc
+          fi
+
+      - name: Build rustdoc for dev
+        run: make -C dev doc
+
+      - name: Prepare flat deploy directory
+        run: |
+          prepare() {
+            local src="$1" dst="$2"
+            if [ ! -d "$src" ] || [ -z "$(ls -A "$src")" ]; then
+              echo "$src is empty or does not exist, skipping"
+              mkdir -p "$dst"
+              return 0
+            fi
+            cp -a "$src" "$dst"
+            # Depth-reduction: only files that are about to move out of
+            # mtxdb/ get one level shallower, so only rewrite those --
+            # dependency-crate docs and the src/ source-view mirrors stay
+            # at their original depth and must not have their `../` count
+            # touched.
+            if [ -d "$dst/mtxdb" ]; then
+              find "$dst"/mtxdb \( -name '*.html' -o -name '*.js' \) -print0 | xargs -0 perl -pi -e \
+                's{(href|src|content|data-[a-z-]+)="((?:\.\./)+)}{ my $n = length($2)/3; my $p = $n > 1 ? "../" x ($n-1) : "./"; $1 . "=" . "\"" . $p }ge'
+              cp -a "$dst"/mtxdb/. "$dst"/
+              rm -rf "$dst"/mtxdb
+            fi
+            # Crate-index rename: applies tree-wide regardless of whether
+            # the linking file moved -- any page anywhere may reference the
+            # crate's now-flattened index.
+            find "$dst" \( -name '*.html' -o -name '*.js' \) -print0 | xargs -0 sed -i 's|mtxdb/index\.html|index.html|g'
+          }
+          prepare master/target/doc _site
+          prepare dev/target/doc _site/dev
+
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: _site
+          destination_dir: .

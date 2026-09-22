@@ -1,0 +1,1 @@
+ASUSTeK COMPUTER INC. PRIME Z370-A | Intel(R) Core(TM) i5-8600K CPU @ 3.60GHz | Corsair 32GB (2133 MT/s) DDR4 1.2 V DIMM | Crucial_CT275MX300SSD4 256.2G SSD/sata [Encrypted] /, /boot | ST2000DM008-2FR102 1.8T HDD/sata [Encrypted] | ST4000NM0115-1YZ107 3.6T HDD/sata [Encrypted] /run/media/shane/shane4tb-ent | SPCC Solid State Disk 223.6G SSD/sata [Encrypted]

@@ -1,0 +1,75 @@
+{
+  "format": "mtxdb.collection-template/v1",
+  "name": "matrix-event-v1",
+  "version": 1,
+  "description": "Lossless archive mapping for Matrix event JSON.",
+  "input": { "decoder": "json", "framing": ["jsonl", "federation-response"] },
+  "record": {
+    "identity": {
+      "extract": { "kind": "json-pointer-rfc-6901", "path": "/event_id" },
+      "validate": { "kind": "scalar", "type": "string" },
+      "internal_key": { "kind": "digest", "algorithm": "blake3-128", "input": "extracted-value" }
+    },
+    "payload": { "policy": "retain-source" }
+  },
+  "collection": {
+    "kind": "room",
+    "membership": {
+      "extract": { "kind": "json-pointer-rfc-6901", "path": "/room_id" },
+      "validate": { "kind": "scalar", "type": "string" }
+    },
+    "internal_key": { "kind": "digest", "algorithm": "blake3-128", "input": "membership-value" },
+    "labels": [{ "name": "display_id", "value": "membership-value" }]
+  },
+  "establishment": {
+    "required": true,
+    "selector": {
+      "all": [
+        { "extract": { "kind": "json-pointer-rfc-6901", "path": "/type" }, "equals": "m.room.create" },
+        { "extract": { "kind": "json-pointer-rfc-6901", "path": "/state_key" }, "equals": "" }
+      ]
+    },
+    "cardinality": "exactly-one",
+    "association": { "kind": "same-membership-or-edge", "edge": "auth" }
+  },
+  "metadata": [
+    {
+      "name": "room_version",
+      "source": {
+        "kind": "establishment-value",
+        "extract": { "kind": "json-pointer-rfc-6901", "path": "/content/room_version" }
+      },
+      "default": "1"
+    },
+    {
+      "name": "creator",
+      "source": { "kind": "establishment-value", "extract": { "kind": "json-pointer-rfc-6901", "path": "/sender" } }
+    },
+    {
+      "name": "additional_creators",
+      "source": {
+        "kind": "establishment-value",
+        "extract": { "kind": "json-pointer-rfc-6901", "path": "/content/additional_creators" }
+      },
+      "default": []
+    }
+  ],
+  "edges": [
+    {
+      "name": "prev",
+      "targets": { "extract": { "kind": "json-pointer-rfc-6901", "path": "/prev_events" }, "each": true },
+      "target_identity": "record-identity",
+      "unresolved": "retain",
+      "index": "packed-adjacency"
+    },
+    {
+      "name": "auth",
+      "targets": { "extract": { "kind": "json-pointer-rfc-6901", "path": "/auth_events" }, "each": true },
+      "target_identity": "record-identity",
+      "unresolved": "retain",
+      "index": "packed-adjacency"
+    }
+  ],
+  "validation": { "on_missing_identity": "reject-record", "on_missing_membership": "allow-if-established" },
+  "extensions": { "matrix": { "room_version_policy": "mtxdb::MatrixRoomVersion" } }
+}

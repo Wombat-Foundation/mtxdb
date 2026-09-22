@@ -1,5 +1,6 @@
 [default.extend-words]
 mis = "mis"
+ede = "ede"
 
 [files]
 extend-exclude = []

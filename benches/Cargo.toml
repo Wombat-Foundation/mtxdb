@@ -1,0 +1,95 @@
+[package]
+name = "mtxdb-benches"
+version = "0.1.0-beta.1"
+edition = "2021"
+rust-version = "1.81"
+publish = false
+
+# Deliberately outside the root [workspace]'s `members` — same reasoning as
+# mtxdb-ffi/mtxdb-wasm (see the root Cargo.toml's [workspace] comment): a
+# standalone `[workspace]` table here stops Cargo's upward search, so this
+# crate is its own workspace root. That means `cargo build/check/clippy
+# --workspace --all-targets --all-features` from the repo root never touches
+# benches/ (and never pulls in libmdbx/rusqlite/fjall) -- passing
+# `--all-features` there is no longer enough to reach these targets. To
+# build, check, or lint the benches, `cd benches` (or pass
+# `--manifest-path benches/Cargo.toml`) explicitly.
+[workspace]
+
+[dependencies]
+# rusqlite deliberately omits `bundled`: bundling compiles SQLite's C
+# amalgamation from source on every build, on top of libsqlite3-sys's own
+# bindgen run. Linking the system libsqlite3 (found via pkg-config) skips that
+# compile step; it costs requiring sqlite3 dev headers to be installed where
+# benches are run.
+bytes = "1.5"
+crc32fast = "1.4"
+fjall = "2.11.2"
+libmdbx = "0.6"
+mtxdb = { path = ".." }
+rusqlite = "0.32"
+
+# LINTS — mirrors the root workspace's [workspace.lints]; this crate no
+# longer shares that table since it's its own workspace root.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(coverage)",
+    "cfg(coverage_nightly)",
+    "cfg(tarpaulin)",
+] }
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+get_unwrap = "warn"
+mutex_atomic = "warn"
+missing_assert_message = "warn"
+str_to_string = "warn"
+tests_outside_test_module = "warn"
+verbose_file_reads = "warn"
+
+[[bench]]
+name = "storage"
+path = "storage.rs"
+harness = false
+
+[[bench]]
+name = "locality"
+path = "locality.rs"
+harness = false
+
+[[bench]]
+name = "compression"
+path = "compression.rs"
+harness = false
+
+[[bench]]
+name = "repack_layout_measure"
+path = "repack_layout_measure.rs"
+harness = false
+
+# Four-way MDBX / SQLite / fjall / mtxdb comparison.
+[[bench]]
+name = "scan"
+path = "scan.rs"
+harness = false
+
+[[bench]]
+name = "compare_external"
+path = "compare_external.rs"
+harness = false

@@ -1,0 +1,133 @@
+[package]
+name = "mtxdb"
+version.workspace = true
+edition = "2021"
+rust-version = "1.81"
+publish = false
+# Without this, Cargo auto-discovers benches/*.rs as this package's own bench
+# targets purely by their being physically under benches/ (which is now
+# mtxdb-benches's directory, not this package's) -- explicit [[bench]] entries
+# aren't the only way in. See the BENCHES comment below.
+autobenches = false
+
+repository = "https://github.com/Wombat-Foundation/mtxdb"
+description = "mtxdb: write-once, content-addressed packfile storage engine for Matrix"
+license = "MIT OR Apache-2.0"
+authors = ["Shane Jaroch <chown_tee@proton.me>"]
+keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
+categories = ["database-implementations", "storage"]
+
+[workspace]
+resolver = "2"
+members = ["mtxdb-cli"]
+# mtxdb-ffi and mtxdb-wasm deliberately stay out: a workspace member's own
+# [profile.*] is ignored (only the workspace root's applies), and
+# mtxdb-wasm's release profile (opt-level "z", lto, panic="abort") is
+# load-bearing for wasm binary size — folding it in here silently
+# discards it. They stay standalone builds, each with their own
+# [workspace] table, depending on the mtxdb library via a path dependency.
+
+[workspace.package]
+version = "0.1.0-beta.1"
+
+# LINTS
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(coverage)",
+    "cfg(coverage_nightly)",
+    "cfg(tarpaulin)",
+] }
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Security / robustness concerns
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+get_unwrap = "warn"
+# Quality & correctness restrictions
+mutex_atomic = "warn"
+missing_assert_message = "warn"
+str_to_string = "warn"
+tests_outside_test_module = "warn"
+verbose_file_reads = "warn"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+arc-swap = "1"
+bytes = "1.5"
+crc32fast = "1.4"
+getrandom = "0.4"
+memmap2 = "0.9.11"
+parking_lot = "0.12"
+sha2 = "0.10"
+zstd = { version = "0.13", default-features = false }
+
+# Native builds link the system libzstd via pkg-config (already installed
+# at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
+# `zstd`/`zstd-safe` don't forward a "pkg-config" feature of their own, so
+# this reaches it by depending on `zstd-sys` directly at the same version
+# zstd-safe resolves to — Cargo unifies the two into one build.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zstd-sys = { version = "2.1", features = ["pkg-config"] }
+
+# wasm targets have no libzstd to pkg-config against. `zstd-sys` ships a
+# "vendored" feature that forces its bundled C sources to be compiled from
+# source instead (overriding "pkg-config" outright, whichever target
+# enabled it) using its own `wasm-shim` — minimal libc stubs — so `cc`
+# can target wasm32 directly without a full WASI sysroot.
+[target.'cfg(target_family = "wasm")'.dependencies]
+zstd-sys = { version = "2.1", features = ["vendored"] }
+
+[lints]
+workspace = true
+
+# BENCHES live in `benches/`, which is its own standalone crate (see that
+# directory's Cargo.toml) outside this `[workspace]`'s `members` -- exactly
+# like mtxdb-ffi/mtxdb-wasm below -- so `--workspace --all-targets
+# --all-features` from here never builds, lints, or ships them (nor their
+# libmdbx/rusqlite/fjall comparison deps). `cd benches` (or
+# `--manifest-path benches/Cargo.toml`) to reach them explicitly.
+
+# BUILD PROFILES — must be plain [profile.*], never nested under
+# [workspace.*]; Cargo only recognizes profiles at this exact table name
+# regardless of whether the manifest is virtual or a real package.
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+
+[profile.release-max-perf]
+inherits = "release"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256
+
+[profile.test]
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256

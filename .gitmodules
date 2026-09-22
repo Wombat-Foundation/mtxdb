@@ -1,0 +1,4 @@
+[submodule "docs"]
+	path = docs
+	url = gcrypt::https://gitlab.com/wombat-foundation/mtxdb-res.git
+	update = none
