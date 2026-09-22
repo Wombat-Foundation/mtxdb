@@ -315,4 +315,46 @@ mod tests {
         DatabaseLayout::open(root.clone()).unwrap();
         DatabaseLayout::open_read_only(root).unwrap();
     }
+
+    #[test]
+    fn read_only_open_rejects_a_missing_descriptor_without_creating_one() {
+        let root = test_dir("read_only_no_descriptor");
+        fs::create_dir_all(&root).unwrap();
+        let err = DatabaseLayout::open_read_only(root.clone()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("missing database descriptor"));
+        // A failed read-only open must not leave a descriptor behind — this is
+        // the `mtxdb collections` path and it must never mutate the store.
+        assert!(!root.join(DB_META_FILENAME).exists());
+    }
+
+    #[test]
+    fn read_only_open_rejects_a_corrupt_descriptor() {
+        let root = test_dir("read_only_corrupt_descriptor");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(DB_META_FILENAME), b"garbage, not a descriptor").unwrap();
+        let err = DatabaseLayout::open_read_only(root).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unrecognized"));
+    }
+
+    #[test]
+    fn read_only_open_rejects_a_legacy_flat_store() {
+        let root = test_dir("read_only_legacy");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(DB_META_FILENAME), super::db_meta_bytes()).unwrap();
+        fs::write(root.join("shard_0000_0000000000000000.pack"), b"legacy").unwrap();
+        let err = DatabaseLayout::open_read_only(root).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("legacy flat"));
+    }
+
+    #[test]
+    fn read_only_open_surfaces_a_read_error_without_panicking() {
+        let root = test_dir("read_only_descriptor_is_dir");
+        // A `db.meta` that is a directory makes `fs::read` fail; the error must
+        // propagate as `Err`, never panic or abort.
+        fs::create_dir_all(root.join(DB_META_FILENAME)).unwrap();
+        assert!(DatabaseLayout::open_read_only(root).is_err());
+    }
 }
