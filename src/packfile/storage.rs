@@ -121,6 +121,12 @@ pub struct OpenTimings {
     /// each affected collection (checkpoint path only; ZERO when there is no
     /// committed log to replay).
     pub delta_replay: std::time::Duration,
+    /// Number of delta-log operations validated and applied during this open:
+    /// v3 slot frames, collection snapshots, and tombstones, or v2 frames
+    /// (checkpoint path only; zero when no committed log was replayed). A
+    /// deterministic replay-path signal, unlike the `delta_replay` duration,
+    /// which can round to zero on a fast machine.
+    pub delta_replay_operations: u64,
     /// The full packfile scan + torn-tail recovery pass (fallback only).
     pub full_scan: std::time::Duration,
     /// Total synchronous wall time of the open.
@@ -155,6 +161,7 @@ impl Default for OpenTimings {
             fingerprint: std::time::Duration::ZERO,
             index_materialization: std::time::Duration::ZERO,
             delta_replay: std::time::Duration::ZERO,
+            delta_replay_operations: 0,
             full_scan: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
             path: OpenPath::FullScan,
@@ -2159,6 +2166,11 @@ impl PackfileStorage {
                 }
             }
             timings.delta_replay = delta_started.elapsed();
+            // Reachable only after a log validated against both fingerprints,
+            // so a nonzero count means operations were actually replayed.
+            timings.delta_replay_operations = u64::try_from(replay_operations.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(replay_frames.len()).unwrap_or(u64::MAX));
         }
 
         // Group the (gated) frames by target collection once, so the
@@ -8166,22 +8178,29 @@ mod tests {
         );
     }
 
-    /// Delta frames carry the same raw, process-local `shard_id` that the
-    /// checkpoint does (`DeltaFrame.slot` is a packed `IndexSlot`, see
-    /// `index/format.rs`). The checkpoint path remaps those through its v6
-    /// pack table (`LossyIndex::remap_shard_ids`), but `replay_frames` stores
-    /// `frame.slot` verbatim, so a delta replayed onto a pool whose slots were
-    /// renumbered by a retirement can still point at the wrong shard.
+    /// Coverage for a post-repack delta epoch over *existing* pack identities:
+    /// a delta written after repack's fresh checkpoint must replay for a cold
+    /// reader and resolve through the checkpoint's v6 pack table, not the
+    /// reader's own shard numbering.
     ///
-    /// This test asks the narrow question that decides whether a delta-side
-    /// identity binding (a `SlotBinding` operation) is required: can a delta
-    /// log written before a retirement actually be replayed by a fresh reader
-    /// after it? The fingerprint gates are expected to reject such a log — the
-    /// epoch is named by the pre-retirement checkpoint fingerprint and its
-    /// `tail_fingerprint` names the pre-retirement pack set — in which case
-    /// replay never happens and this gap is latent rather than exploitable.
+    /// `repack_collection_reachable` persists a checkpoint (C1) naming the
+    /// post-retirement pack set, so the pre-retirement delta epoch is retired
+    /// with it. A later `sync_all` appends a fresh epoch continuing C1; this
+    /// test pins that a cold open *replays* that epoch (nonzero `delta_replay`,
+    /// not a checkpoint rewrite that already included `third`) and returns all
+    /// three records.
+    ///
+    /// `third` must be durably synced, not merely shard-flushed: only a sync
+    /// persists the index. An uncommitted record is invisible to checkpoint
+    /// replay and recoverable only by a fallback full scan — a different
+    /// property, and the one the previous version of this test accidentally
+    /// measured.
+    ///
+    /// Out of scope: a delta frame referencing a pack created *after* C1 (a
+    /// pack absent from C1's pack table), and any claim that a delta-side
+    /// `SlotBinding` is unnecessary.
     #[test]
-    fn delta_epoch_written_before_retirement_is_not_replayed_after() {
+    fn post_repack_delta_epoch_replays_for_a_cold_reader() {
         let dir = test_dir("delta_across_retirement");
         let wal = dir.join("wal.bin");
         let collection = [0x71u8; 16];
@@ -8202,7 +8221,7 @@ mod tests {
             .unwrap();
         writer.sync().unwrap();
 
-        // A post-checkpoint write leaves a delta epoch (D1) whose base is the
+        // A post-checkpoint write leaves a delta epoch whose base is the
         // current checkpoint and whose tail names the current pack set.
         writer
             .put(
@@ -8213,16 +8232,16 @@ mod tests {
             .unwrap();
         writer.sync_all().unwrap();
 
-        // Retire a shard without re-checkpointing: repack moves the collection's
-        // records into a fresh destination shard and unlinks the source. The
-        // writer's slot table now has a hole, so a fresh reader's
-        // `discover_shards` will not reproduce the writer's numbering.
+        // Repack moves the collection's records into a fresh destination shard
+        // and unlinks the source. The writer's slot table now has a hole, so a
+        // fresh reader's `discover_shards` will not reproduce the writer's
+        // numbering. Repack persists a checkpoint for the new layout.
         writer
             .repack_collection_reachable(&collection, |_hash, _data| Vec::new())
             .unwrap();
 
-        // A third record after the repack, flushed but never checkpointed,
-        // would be recoverable only through a delta replay.
+        // Commit `third` into the delta epoch continuing the post-repack
+        // checkpoint. A shard flush alone would not persist the index.
         writer
             .put(
                 &collection,
@@ -8230,25 +8249,48 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"third")),
             )
             .unwrap();
-        writer.shards.flush_all().unwrap();
+        writer.sync_all().unwrap();
         drop(writer);
 
         let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
         reader.enable_read_journal(&wal).unwrap();
-        reader.reload_index_from_checkpoint();
 
-        // Every record must either resolve correctly or not at all. A wrong
-        // shard would surface as a hash mismatch (verified in
-        // `resolve_from_pinned`), never as wrong bytes.
+        let timings = reader
+            .stats()
+            .last_open_timings
+            .expect("open must record timings");
+        // The post-repack checkpoint and its delta epoch must both validate, so
+        // the cold open takes the checkpoint fast path rather than a full scan.
+        assert_eq!(
+            timings.path,
+            OpenPath::Checkpoint,
+            "the post-repack checkpoint and the epoch continuing it must be usable"
+        );
+        // Prove the records below come from a gated delta replay, not from a
+        // checkpoint rewrite that already included `third`. This is a
+        // deterministic count, unlike the `delta_replay` duration.
+        assert!(
+            timings.delta_replay_operations > 0,
+            "cold open must have replayed the post-repack delta epoch: {timings:?}"
+        );
+        assert_eq!(
+            timings.full_scan,
+            Duration::ZERO,
+            "cold open must not have fallen back to a full scan"
+        );
+
+        // All three records must resolve to their exact bytes through the
+        // replayed delta — never to a wrong shard's bytes.
         for (id, expected) in [
             (first, &b"first"[..]),
             (second, &b"second"[..]),
             (third, &b"third"[..]),
         ] {
-            match reader.get(&collection, &id).unwrap() {
-                Some(data) => assert_eq!(data.bytes.as_ref(), expected),
-                None => {}
-            }
+            let data = reader
+                .get(&collection, &id)
+                .unwrap()
+                .expect("record must exist");
+            assert_eq!(data.bytes.as_ref(), expected);
         }
     }
 
