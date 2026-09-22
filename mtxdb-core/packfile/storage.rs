@@ -897,6 +897,15 @@ pub struct PackfileStorage {
     /// this pair requires loading the corresponding checkpoint, not a live
     /// packfile rescan. See [`Self::get_read_committed`].
     read_covered_lsn: AtomicU64,
+    /// Successful checkpoint-bound index reloads triggered by the
+    /// read-committed overlay, because a writer's reclaim outran the coverage
+    /// this handle's index incorporated. A WAL-cell failure on the reload path
+    /// is visible here instead of looking like an ordinary miss. See
+    /// [`Self::refresh_read_journal`].
+    read_reloads: AtomicU64,
+    /// Reload attempts that could not load a checkpoint matching the current
+    /// packs, so the read-committed overlay failed closed.
+    read_reload_failures: AtomicU64,
 }
 
 /// One committed value in the read-journal overlay: payload and its LSN.
@@ -1391,6 +1400,38 @@ impl PackfileStorage {
         )
     }
 
+    /// Open a read-only observer with the read-committed journal overlay
+    /// enabled, in one call.
+    ///
+    /// This is the intended constructor for an authoritative read-only worker
+    /// handle. The durable read APIs ([`StorageEngine::get_many`],
+    /// [`Self::get_many_with_refresh`]) deliberately hide a writer's
+    /// unflushed and not-yet-checkpointed mutations, so a worker that must
+    /// observe another process's committed writes has to read through
+    /// [`Self::get_read_committed`] — and that only consults an overlay once
+    /// [`Self::enable_read_journal`] has attached a writer's segment. Pairing
+    /// the two here makes this the only supported way to obtain such a handle,
+    /// so a caller cannot open one that silently falls back to the durable
+    /// API.
+    ///
+    /// `wal_path` is the writer's journal segment. See
+    /// [`Self::enable_read_journal`] for the read-only safety contract and
+    /// [`Self::open_read_only`] for the writer-coexistence contract.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the store cannot be opened read-only (same
+    /// as [`Self::open_read_only`]), or if the segment is unreadable, a
+    /// committed group fails validation, or a coverage gap cannot be resolved
+    /// by reloading the checkpoint (same as [`Self::enable_read_journal`]).
+    pub fn open_read_committed(
+        base_dir: PathBuf,
+        wal_path: impl AsRef<Path>,
+    ) -> Result<Self, StorageError> {
+        let store = Self::open_read_only(base_dir)?;
+        store.enable_read_journal(wal_path)?;
+        Ok(store)
+    }
+
     /// Open a packfile storage with a custom per-collection cache capacity.
     ///
     /// # Errors
@@ -1784,6 +1825,8 @@ impl PackfileStorage {
             replaying: AtomicBool::new(false),
             read_journal: parking_lot::Mutex::new(None),
             read_covered_lsn,
+            read_reloads: AtomicU64::new(0),
+            read_reload_failures: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
@@ -5612,6 +5655,7 @@ impl PackfileStorage {
         // checkpoint it wrote names that new pack set. Rediscover before
         // building the fingerprint, or the reload can never match.
         if self.shards.discover_shards().is_err() {
+            self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         // Rebuild the fingerprint from files that still exist. This worker's
@@ -5627,7 +5671,10 @@ impl PackfileStorage {
                     open_shards.push((id, shard.pack_id, shard.path.clone(), metadata.len()));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return false,
+                Err(_) => {
+                    self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
             }
         }
         let deleted_collections = self.deleted_collections.lock().clone();
@@ -5644,6 +5691,7 @@ impl PackfileStorage {
                 &mut timings,
             )
         else {
+            self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         {
@@ -5658,6 +5706,7 @@ impl PackfileStorage {
         // already have advanced past this index.
         self.read_covered_lsn
             .store(checkpoint_covered, Ordering::Release);
+        self.read_reloads.fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -7168,6 +7217,8 @@ impl PackfileStorage {
             checkpoint_writes: self.checkpoint_writes.load(Ordering::Relaxed),
             checkpoint_skips: self.checkpoint_skips.load(Ordering::Relaxed),
             delta_appends: self.delta_appends.load(Ordering::Relaxed),
+            read_reloads: self.read_reloads.load(Ordering::Relaxed),
+            read_reload_failures: self.read_reload_failures.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
             last_open_timings: self.open_timings(),
@@ -7226,6 +7277,8 @@ impl PackfileStorage {
             &self.checkpoint_writes,
             &self.checkpoint_skips,
             &self.delta_appends,
+            &self.read_reloads,
+            &self.read_reload_failures,
             &self.sidecar_writes,
             &self.sync_calls,
         ] {
@@ -7367,6 +7420,12 @@ pub struct RuntimeStats {
     pub checkpoint_skips: u64,
     /// Syncs that appended the incremental delta log instead.
     pub delta_appends: u64,
+    /// Successful checkpoint-bound index reloads by the read-committed overlay
+    /// (a writer's reclaim outran this handle's incorporated coverage).
+    pub read_reloads: u64,
+    /// Read-committed overlay reload attempts that failed to load a checkpoint
+    /// matching the current packs, so the read failed closed.
+    pub read_reload_failures: u64,
     /// Writes of the shard→collection inspection sidecar (every one counts,
     /// whichever caller triggered it).
     pub sidecar_writes: u64,
@@ -7444,6 +7503,8 @@ impl Default for RuntimeStats {
             checkpoint_writes: 0,
             checkpoint_skips: 0,
             delta_appends: 0,
+            read_reloads: 0,
+            read_reload_failures: 0,
             sidecar_writes: 0,
             sync_calls: 0,
             last_open_timings: None,
@@ -7866,6 +7927,10 @@ mod tests {
             .get_read_committed(&collection, &[first, second])
             .unwrap();
         assert_eq!(store.read_covered_lsn.load(Ordering::Acquire), 1);
+        assert!(
+            store.stats().read_reloads >= 1,
+            "the reclaim must have driven at least one checkpoint-bound reload"
+        );
         assert_eq!(
             read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
             Some(&b"first"[..]),
@@ -7875,6 +7940,53 @@ mod tests {
             read_committed[1].as_ref().map(|data| data.bytes.as_ref()),
             Some(&b"second"[..]),
             "the post-checkpoint group must be served from the overlay"
+        );
+    }
+
+    #[test]
+    fn open_read_committed_serves_the_overlay_in_one_call() {
+        let dir = test_dir("open_read_committed");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Au8; 16];
+        let node = [0x21u8; 16];
+
+        // A shard must exist before a read-only open will succeed.
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x96u8; 16],
+            &[0x96u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        // A committed group in the writer's segment that was never synced into
+        // the packs: the durable API cannot see it, only the overlay can.
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"committed".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let plain = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        assert!(
+            plain.get(&collection, &node).unwrap().is_none(),
+            "a plain read-only handle must not see the unsynced committed group"
+        );
+        drop(plain);
+
+        let store = PackfileStorage::open_read_committed(dir.clone(), &wal).unwrap();
+        assert_eq!(
+            store.get_read_committed(&collection, &[node]).unwrap()[0]
+                .as_ref()
+                .map(|data| data.bytes.as_ref()),
+            Some(&b"committed"[..]),
+            "the one-call handle must serve the committed group from the overlay"
         );
     }
 
@@ -10666,6 +10778,105 @@ mod tests {
         assert_eq!(stats.miss_refreshes, 1);
         assert_eq!(stats.miss_refresh_recovered, 1);
         assert_eq!(stats.miss_refresh_retry_ids, 1);
+    }
+
+    /// Regression for the deferred-checkpoint reader window.
+    ///
+    /// A writer that owes a *structurally needed* full checkpoint rewrite
+    /// (`pending` is empty while the index is dirty — the shape a
+    /// `refresh_collection` that pulled in another process's appends leaves
+    /// behind) will skip that rewrite under
+    /// [`PackfileStorage::set_checkpoint_rewrite_budget`]. The packs are still
+    /// flushed and fsynced, so the record is durable; but with no checkpoint
+    /// rewrite and no delta frame, the durable fingerprint does not advance.
+    /// A reader handle that opened at the previous fingerprint therefore treats
+    /// its negative as confirmed and never refreshes: a *synced* record stays
+    /// invisible to [`PackfileStorage::get_many_with_refresh`] for as long as
+    /// the budget defers the rewrite.
+    ///
+    /// Ignored because WAL-off cross-process reads are no longer a supported
+    /// shape. The journal's [`PackfileStorage::get_read_committed`] overlay is
+    /// the authoritative cross-process visibility path and serves the committed
+    /// record before the checkpoint advances, independent of the rewrite
+    /// budget. This pins the unsupported window so a future change that makes
+    /// WAL-off reads appear to work by accident (rather than by the overlay) is
+    /// noticed.
+    ///
+    /// Known issue, not exercised here: `post_refresh_fingerprint` records the
+    /// *post*-refresh durable fingerprint as the collection's refresh baseline,
+    /// so a sync racing between `refresh_collection` and that read can store a
+    /// baseline the index never actually incorporated — over-claiming coverage
+    /// and suppressing a refresh that was needed. A fix must capture the
+    /// fingerprint the refresh itself observed rather than re-reading it.
+    #[test]
+    #[ignore = "WAL-off cross-process reads are unsupported; the journal overlay is authoritative (see test docs)"]
+    fn deferred_checkpoint_rewrite_leaves_synced_write_invisible() {
+        let dir = test_dir("deferred_checkpoint_reader_window");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+
+        // Baseline checkpoint, so the writer has a prior rewrite timestamp for
+        // the budget's time headroom to measure against.
+        let seed = distinct_id(0xC0);
+        writer
+            .put(
+                &TEST_COLLECTION,
+                &seed,
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+
+        // Reader opens bound to the baseline checkpoint's fingerprint.
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+
+        // Once a rewrite has run, defer the next for an hour; no size budget.
+        writer.set_checkpoint_rewrite_budget(Duration::from_secs(3600), 0);
+
+        let id = distinct_id(0xC1);
+        writer
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"deferred")),
+            )
+            .unwrap();
+        // The record is eagerly in the pack, but leave no local delta frame:
+        // this is the `pending.is_empty()` + dirty shape that makes the next
+        // sync structurally need a full rewrite (as a refresh of external
+        // appends does).
+        writer.delta_state.lock().pending.clear();
+        writer.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+
+        let before = writer.stats();
+        writer.sync().unwrap();
+        let after = writer.stats();
+        assert_eq!(
+            after.checkpoint_writes - before.checkpoint_writes,
+            0,
+            "the structurally-needed rewrite must be deferred, not written"
+        );
+        assert_eq!(
+            after.checkpoint_skips - before.checkpoint_skips,
+            1,
+            "the sync must have taken the deferred branch"
+        );
+
+        // The pack bytes are durable, but the durable fingerprint is unchanged,
+        // so the reader's gate confirms the negative without refreshing.
+        reader.reset_stats();
+        let result = reader
+            .get_many_with_refresh(&TEST_COLLECTION, &[id])
+            .unwrap();
+        assert!(
+            result[0].is_none(),
+            "a synced record stays invisible while the checkpoint rewrite is deferred"
+        );
+        let reader_stats = reader.stats();
+        assert_eq!(
+            reader_stats.miss_refreshes, 0,
+            "an unchanged durable fingerprint suppresses the refresh entirely"
+        );
+        assert_eq!(reader_stats.miss_refresh_skips, 1);
     }
 
     #[test]
