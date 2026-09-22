@@ -12,7 +12,7 @@ use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
-use crate::index::{InsertError, LossyIndex, SlotUndo};
+use crate::index::{EntryUndo, InsertError, LossyIndex};
 use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
 use crate::packfile::{self, Record};
 use crate::shard;
@@ -369,7 +369,7 @@ type RepackOffsets = Vec<([u8; 16], u16, u64)>;
 /// that the adjacency helpers need to skip re-reading already-seen nodes.
 type RepackScanResult = (RepackRecordMap, Option<RepackIncrementalState>);
 
-/// One scanned record's `(shard_id, hash, offset)`, as accumulated per
+/// One scanned record's `(slot, hash, offset)`, as accumulated per
 /// collection during `PackfileStorage::open_with_options`'s initial scan.
 type ShardRecord = (u16, [u8; 16], u64, u64);
 /// `(collection_id, entry count, index memory usage in bytes, index capacity)`.
@@ -393,7 +393,7 @@ struct RoomScanOutput {
 /// `read_persisted_shard_collections`) — reset or let the next sync
 /// regenerate it, not a format this reader tries to still understand.
 /// This sidecar has changed shape three times already (adding insertion
-/// order, switching `shard_id` for `pack_id`, then v4 adding the
+/// order, switching `slot` for `pack_id`, then v4 adding the
 /// pack-fingerprint gate); none of that carries forward, since nothing
 /// depends on reading a store from before the current format existed.
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
@@ -406,12 +406,12 @@ const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
 /// collection's stable insertion ordinal(8).
 const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8;
 
-/// The largest record offset `IndexSlot` can represent: its 32-bit offset
+/// The largest record offset `IndexEntry` can represent: its 32-bit offset
 /// field stores `offset + 1`, reserving the all-zeros encoding for the empty
 /// sentinel. Offsets beyond this can only come from legacy or externally
 /// created oversized packs — this engine's own writes rotate long before
 /// reaching it (`MAX_SHARD_BYTES` caps each shard's file size).
-const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexSlot::MAX_OFFSET;
+const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexEntry::MAX_OFFSET;
 
 /// Byte ceiling for the incremental index delta log. Once a session's
 /// accumulated frames exceed this, the next `sync()` stops appending and does
@@ -430,13 +430,13 @@ const DELTA_LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// adjacency (that would require a per-candidate frame-length probe).
 const READ_RUN_GAP_BYTES: u64 = 128;
 
-/// Reject a record whose in-shard offset the 32-bit `IndexSlot` field cannot
+/// Reject a record whose in-shard offset the 32-bit `IndexEntry` field cannot
 /// represent, so the caller surfaces a `StorageError::Corrupt` instead of
-/// silently dropping the record (or panicking in `IndexSlot::new`).
-fn check_index_offset(shard_id: u16, hash: &[u8; 16], offset: u64) -> Result<(), StorageError> {
+/// silently dropping the record (or panicking in `IndexEntry::new`).
+fn check_index_offset(slot: u16, hash: &[u8; 16], offset: u64) -> Result<(), StorageError> {
     if offset > PACK_INDEX_OFFSET_LIMIT {
         return Err(StorageError::Corrupt(format!(
-            "shard {shard_id} holds record {hash:?} at offset {offset}, beyond the index offset limit {PACK_INDEX_OFFSET_LIMIT}"
+            "shard {slot} holds record {hash:?} at offset {offset}, beyond the index offset limit {PACK_INDEX_OFFSET_LIMIT}"
         )));
     }
     Ok(())
@@ -557,7 +557,7 @@ struct PutManyProgress {
     pending_deltas: Vec<(u32, u64)>,
     pending_shard_collections: Vec<u64>,
     invalidate_delta: bool,
-    undo_log: Vec<SlotUndo>,
+    undo_log: Vec<EntryUndo>,
 }
 
 /// Index tables that must advance together when a reader reloads a checkpoint.
@@ -701,7 +701,7 @@ pub struct PackfileStorage {
     repack_counts_by_collection: RwLock<HashMap<[u8; 16], u64>>,
     /// Per-collection incremental repack state. Each entry tracks the byte
     /// offset up to which each shard has been scanned for this collection and
-    /// the deduplicated hash → (`shard_id`, offset) map from the last repack.
+    /// the deduplicated hash → (`slot`, offset) map from the last repack.
     /// On the next repack, only bytes after these offsets are scanned and
     /// merged into the existing map — turning O(n²) full rescan into
     /// O(n) total work across all repack calls.
@@ -710,7 +710,7 @@ pub struct PackfileStorage {
     /// and how many. Maintained incrementally (a plain `put` just
     /// increments one counter; a full index rebuild/repack/initial scan
     /// replaces one collection's contribution wholesale via
-    /// `LossyIndex::shard_counts`) rather than ever re-derived by
+    /// `LossyIndex::slot_counts`) rather than ever re-derived by
     /// scanning a shard file, which is what made `collections_referencing_shard`
     /// and a `collections`-style listing expensive before this existed.
     /// Reverse index of `shard_collections`: which shards a given collection currently
@@ -1130,7 +1130,7 @@ struct RepackIncrementalState {
     // pack_id beside the cursor so an offset from the old incarnation is
     // never applied to the replacement file.
     scan_offsets: HashMap<u16, (u64, u64)>,
-    /// The deduplicated hash → (`shard_id`, offset) map from the last repack.
+    /// The deduplicated hash → (`slot`, offset) map from the last repack.
     /// The next repack merges newly-scanned entries into this map.
     live_map: HashMap<[u8; 16], (u16, u64)>,
     /// Cached edge lists for every node that survived the last repack.
@@ -1608,7 +1608,7 @@ impl PackfileStorage {
         }
 
         let scan_started = std::time::Instant::now();
-        for (shard_id, shard_pack_id, path, _file_len) in open_shards {
+        for (slot, shard_pack_id, path, _file_len) in open_shards {
             // A read-only open must never touch the file at all — the
             // truncating recovery scan below is only safe when we're the
             // sole writer (guaranteed by the writer lock); a read-only
@@ -1638,7 +1638,7 @@ impl PackfileStorage {
                     std::io::Error::new(
                         error.kind(),
                         format!(
-                            "read-only scan failed for shard {shard_id:02x} ({}): {error}",
+                            "read-only scan failed for shard {slot:02x} ({}): {error}",
                             path.display()
                         ),
                     )
@@ -1649,7 +1649,7 @@ impl PackfileStorage {
                     collection_order.push(collection_id);
                 }
                 collection_entries.entry(collection_id).or_default().push((
-                    shard_id,
+                    slot,
                     hash,
                     offset,
                     shard_pack_id,
@@ -1717,8 +1717,8 @@ impl PackfileStorage {
         // shards, but enough to keep a resumed collection's writes landing near
         // its existing data instead of restarting at whatever the pool's
         // active shard happens to be.
-        if let Some(&(last_shard_id, _, _, _)) = records.last() {
-            shards.set_collection_home(collection_id, last_shard_id);
+        if let Some(&(last_slot, _, _, _)) = records.last() {
+            shards.set_collection_home(collection_id, last_slot);
         }
         let index = LossyIndex::with_config(
             records
@@ -1727,11 +1727,11 @@ impl PackfileStorage {
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             index_config,
         );
-        for (shard_id, hash, offset, _pack_id) in records {
-            check_index_offset(*shard_id, hash, *offset)?;
-            let _ = index.insert(hash, *shard_id, *offset);
+        for (slot, hash, offset, _pack_id) in records {
+            check_index_offset(*slot, hash, *offset)?;
+            let _ = index.insert(hash, *slot, *offset);
         }
-        let counts = index.shard_counts();
+        let counts = index.slot_counts();
 
         // Build slot→pack_id lookup from the records for this collection.
         let slot_to_pack_id: HashMap<u16, u64> = records
@@ -1739,11 +1739,11 @@ impl PackfileStorage {
             .map(|(slot, _, _, pack_id)| (*slot, *pack_id))
             .collect();
 
-        for (&shard_id, &count) in &counts {
+        for (&slot, &count) in &counts {
             let pack_id = slot_to_pack_id
-                .get(&shard_id)
+                .get(&slot)
                 .copied()
-                .unwrap_or(u64::from(shard_id));
+                .unwrap_or(u64::from(slot));
             out.shard_collections
                 .entry(pack_id)
                 .or_default()
@@ -2294,7 +2294,7 @@ impl PackfileStorage {
             .map(|(slot, pack_id, _, _)| (*slot, *pack_id))
             .collect();
 
-        // Translate every shard_id this checkpoint's index entries (and any
+        // Translate every slot this checkpoint's index entries (and any
         // delta frame continuing it) encode — the writer's own local slot at
         // checkpoint-write time — to this reader's own local slot for the
         // same pack_id. Slot numbers are a process-local handle, not a
@@ -2304,13 +2304,13 @@ impl PackfileStorage {
         // `CHECKPOINT_VERSION`'s v6 doc comment). A checkpoint_slot with no
         // entry here (its pack_id isn't among this reader's currently-open
         // packs) is left unmapped; any index entry that actually needs it
-        // makes `remap_shard_ids` fail closed below, forcing a full rescan
+        // makes `remap_slots` fail closed below, forcing a full rescan
         // rather than serving an unresolvable slot.
         let pack_id_to_local_slot: HashMap<u64, u16> = open_shards
             .iter()
             .map(|(slot, pack_id, _, _)| (*pack_id, *slot))
             .collect();
-        let shard_id_remap: HashMap<u16, u16> = checkpoint
+        let slot_remap: HashMap<u16, u16> = checkpoint
             .pack_table
             .iter()
             .filter_map(|&(checkpoint_slot, pack_id)| {
@@ -2385,7 +2385,7 @@ impl PackfileStorage {
                 };
                 (index, loaded.generation)
             };
-            if !index.remap_shard_ids(&shard_id_remap) {
+            if !index.remap_slots(&slot_remap) {
                 return None;
             }
             current_len.insert(loaded.collection_id, u32::try_from(index.len()).ok()?);
@@ -2403,7 +2403,7 @@ impl PackfileStorage {
             if deleted_collections.contains(&collection_id) {
                 continue;
             }
-            if !index.remap_shard_ids(&shard_id_remap) {
+            if !index.remap_slots(&slot_remap) {
                 return None;
             }
             current_len.insert(collection_id, u32::try_from(index.len()).ok()?);
@@ -2443,7 +2443,7 @@ impl PackfileStorage {
                 let mut out = HashMap::with_capacity(collection_order.len());
                 for collection_id in &collection_order {
                     if let Some(gen) = scan_out.collections.get(collection_id) {
-                        out.insert(*collection_id, gen.load().index.shard_counts());
+                        out.insert(*collection_id, gen.load().index.slot_counts());
                     }
                 }
                 out
@@ -2457,11 +2457,11 @@ impl PackfileStorage {
             if let Some(&home_shard) = counts.keys().max() {
                 shards.set_collection_home(collection_id, home_shard);
             }
-            for (&shard_id, &count) in counts {
+            for (&slot, &count) in counts {
                 let pack_id = slot_to_pack_id
-                    .get(&shard_id)
+                    .get(&slot)
                     .copied()
-                    .unwrap_or(u64::from(shard_id));
+                    .unwrap_or(u64::from(slot));
                 scan_out
                     .shard_collections
                     .entry(pack_id)
@@ -2530,7 +2530,7 @@ impl PackfileStorage {
     }
 
     /// Collection IDs whose live index currently references at least one record
-    /// physically stored in `shard_id`.
+    /// physically stored in `slot`.
     ///
     /// Shards are shared, so this is normally more than one collection; it's the
     /// set `repack_shard` needs to touch before that shard can retire.
@@ -2546,15 +2546,12 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` if the shard's file can't be read, or if
-    /// `shard_id` doesn't correspond to a currently-open shard.
-    pub fn collections_referencing_shard(
-        &self,
-        shard_id: u16,
-    ) -> Result<Vec<[u8; 16]>, StorageError> {
-        let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
+    /// `slot` doesn't correspond to a currently-open shard.
+    pub fn collections_referencing_shard(&self, slot: u16) -> Result<Vec<[u8; 16]>, StorageError> {
+        let shard = self.shards.get_shard(slot).ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("no open shard with id {shard_id}"),
+                format!("no open shard with id {slot}"),
             ))
         })?;
         // O(1) against the incrementally-maintained shard→collection directory
@@ -2568,7 +2565,7 @@ impl PackfileStorage {
             .unwrap_or_default())
     }
 
-    /// Repack every collection that still references `shard_id`.
+    /// Repack every collection that still references `slot`.
     ///
     /// A shard only ever retires once *every* collection referencing it has
     /// repacked past its data there (see `retire_empty_shards`) — there's
@@ -2592,10 +2589,10 @@ impl PackfileStorage {
     /// collections in this call are not rolled back.
     pub fn repack_shard(
         &self,
-        shard_id: u16,
+        slot: u16,
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
-        let collections = self.collections_referencing_shard(shard_id)?;
+        let collections = self.collections_referencing_shard(slot)?;
         let mut results = Vec::with_capacity(collections.len());
         for collection_id in collections {
             let (kept, dropped) = self
@@ -2703,7 +2700,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
     ) -> Result<Vec<ScannedShard>, StorageError> {
         let mut scanned: Vec<ScannedShard> = Vec::new();
-        for (shard_id, shard) in self.shards.all_shards() {
+        for (slot, shard) in self.shards.all_shards() {
             match packfile::scan_packfile(&shard.path) {
                 Ok(entries) => {
                     let collection_entries: Vec<([u8; 16], u64)> = entries
@@ -2712,7 +2709,7 @@ impl PackfileStorage {
                         .map(|(_, hash, offset)| (hash, offset))
                         .collect();
                     if !collection_entries.is_empty() {
-                        scanned.push((shard_id, collection_entries));
+                        scanned.push((slot, collection_entries));
                     }
                 }
                 Err(e) => {
@@ -2737,12 +2734,12 @@ impl PackfileStorage {
             .copied()
             .map(|collection_id| (collection_id, HashMap::new()))
             .collect();
-        for (shard_id, shard) in self.shards.all_shards() {
+        for (slot, shard) in self.shards.all_shards() {
             for (collection_id, hash, offset) in packfile::scan_packfile(&shard.path)? {
                 if wanted.contains(&collection_id) {
                     maps.entry(collection_id)
                         .or_default()
-                        .insert(hash, (shard_id, offset));
+                        .insert(hash, (slot, offset));
                 }
             }
         }
@@ -2760,14 +2757,14 @@ impl PackfileStorage {
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             index_config,
         );
-        for (hash, shard_id, offset) in offsets {
-            check_index_offset(*shard_id, hash, *offset)?;
-            let _ = index.insert(hash, *shard_id, *offset);
+        for (hash, slot, offset) in offsets {
+            check_index_offset(*slot, hash, *offset)?;
+            let _ = index.insert(hash, *slot, *offset);
         }
         Ok(index)
     }
 
-    /// Convert a slot-keyed `shard_counts` from `LossyIndex` to a pack_id-keyed
+    /// Convert a slot-keyed `slot_counts` from `LossyIndex` to a pack_id-keyed
     /// `HashMap<u64, u64>` for use with `replace_collection_shard_counts`.
     fn slot_counts_to_pack_id_counts(&self, counts: &HashMap<u16, u64>) -> HashMap<u64, u64> {
         let shards = self.shards.all_shards();
@@ -2836,7 +2833,7 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Records one new record landing in `shard_id` for `collection_id` — the
+    /// Records one new record landing in `slot` for `collection_id` — the
     /// cheap, O(1) path for a plain `put` that only appends, never moves
     /// or drops anything. Kept separate from
     /// [`Self::replace_collection_shard_counts`], which pays for a full
@@ -2860,7 +2857,7 @@ impl PackfileStorage {
     }
 
     /// Replaces `collection_id`'s entire contribution to `shard_collections` with
-    /// `counts` (typically `LossyIndex::shard_counts()` converted to `pack_id` keys)
+    /// `counts` (typically `LossyIndex::slot_counts()` converted to `pack_id` keys)
     /// — clears it out of any shard it no longer occupies and installs the fresh
     /// per-shard counts. Used wherever a collection's index is replaced wholesale
     /// rather than incrementally appended to, since only then can its distribution
@@ -3203,7 +3200,7 @@ impl PackfileStorage {
             .collect();
         let fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
         // Every pack live right now, keyed by this writer's own local slot —
-        // lets a reader translate this checkpoint's shard_id-encoded index
+        // lets a reader translate this checkpoint's slot-encoded index
         // entries to its own local slot for the same pack_id, rather than
         // trusting the writer's raw slot number (see CHECKPOINT_VERSION's
         // doc comment on the v6 bump for why that's unsafe after a
@@ -3969,8 +3966,8 @@ impl PackfileStorage {
     /// writes* just retired-and-recreated at the same path, turning a
     /// stale-but-valid offset into a read into unrelated, freshly-written
     /// bytes.
-    fn pin_shards(&self, shard_ids: impl Iterator<Item = u16>) -> HashMap<u16, Arc<Shard>> {
-        let unique: HashSet<u16> = shard_ids.collect();
+    fn pin_shards(&self, slots: impl Iterator<Item = u16>) -> HashMap<u16, Arc<Shard>> {
+        let unique: HashSet<u16> = slots.collect();
         unique
             .into_iter()
             .filter_map(|id| self.shards.get_shard(id).map(|shard| (id, shard)))
@@ -3991,25 +3988,25 @@ impl PackfileStorage {
     }
 
     /// Copy a record from an old (pinned) shard to the active shard.
-    /// Returns the new `(hash, shard_id, offset)` or None if `old_shard_id`
+    /// Returns the new `(hash, slot, offset)` or None if `old_slot`
     /// isn't in `pinned`.
     fn copy_record_to_shard(
         &self,
         collection_id: &[u8; 16],
         pinned: &HashMap<u16, Arc<Shard>>,
-        old_shard_id: u16,
+        old_slot: u16,
         old_offset: u64,
     ) -> Result<Option<([u8; 16], u16, u64)>, StorageError> {
-        let Some(old_shard) = pinned.get(&old_shard_id) else {
+        let Some(old_shard) = pinned.get(&old_slot) else {
             return Ok(None);
         };
         let record = self.read_at(old_shard, old_offset, true)?;
-        let (new_shard_id, new_offset) = self.shards.put_record(&Record {
+        let (new_slot, new_offset) = self.shards.put_record(&Record {
             collection_id: *collection_id,
             hash: record.hash,
             data: record.data,
         })?;
-        Ok(Some((record.hash, new_shard_id, new_offset)))
+        Ok(Some((record.hash, new_slot, new_offset)))
     }
     fn swap_generation(
         &self,
@@ -4141,9 +4138,9 @@ impl PackfileStorage {
             total.saturating_mul(2).max(NEW_COLLECTION_INDEX_FLOOR),
             self.index_config,
         );
-        for (shard_id, entries) in scanned {
+        for (slot, entries) in scanned {
             for (hash, offset) in entries {
-                // `IndexSlot` can only represent offsets up to
+                // `IndexEntry` can only represent offsets up to
                 // `PACK_INDEX_OFFSET_LIMIT`. Offsets a legacy or externally
                 // created oversized shard can no longer fit are rejected
                 // rather than silently skipped: writes are already capped at
@@ -4151,8 +4148,8 @@ impl PackfileStorage {
                 // shard did not come from this engine, and silently indexing
                 // around it would make its data unreachable while reporting a
                 // successful rebuild.
-                check_index_offset(shard_id, &hash, offset)?;
-                let _ = index.insert(&hash, shard_id, offset);
+                check_index_offset(slot, &hash, offset)?;
+                let _ = index.insert(&hash, slot, offset);
             }
         }
         Ok(index)
@@ -4172,21 +4169,19 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         index: &LossyIndex,
     ) -> Result<Option<LossyIndex>, StorageError> {
-        index.grow_by_recovering_hashes(|shard_id, offset, slot_tag| {
-            let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
-                StorageError::Corrupt(format!(
-                    "checkpoint index refers to missing shard {shard_id}"
-                ))
+        index.grow_by_recovering_hashes(|slot, offset, slot_tag| {
+            let shard = self.shards.get_shard(slot).ok_or_else(|| {
+                StorageError::Corrupt(format!("checkpoint index refers to missing shard {slot}"))
             })?;
             let (found_collection, hash) = self.shards.record_identity_at(&shard, offset)?;
             if &found_collection != collection_id {
                 return Err(StorageError::Corrupt(format!(
-                    "checkpoint index offset {offset} in shard {shard_id} belongs to another collection"
+                    "checkpoint index offset {offset} in shard {slot} belongs to another collection"
                 )));
             }
             if index.tag_for_hash(&hash) != slot_tag {
                 return Err(StorageError::Corrupt(format!(
-                    "checkpoint index tag does not match frame at offset {offset} in shard {shard_id}"
+                    "checkpoint index tag does not match frame at offset {offset} in shard {slot}"
                 )));
             }
             Ok(hash)
@@ -4204,15 +4199,15 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         index: &LossyIndex,
         hash: &NodeId,
-        shard_id: u16,
+        slot: u16,
         offset: u64,
     ) -> Result<Result<(u32, u64), InsertError>, StorageError> {
         Ok(self
-            .insert_index_undoable(collection_id, index, hash, shard_id, offset)?
+            .insert_index_undoable(collection_id, index, hash, slot, offset)?
             .map(|(bucket, slot, _undo)| (bucket, slot)))
     }
 
-    /// Like [`Self::insert_index`], but also returns the [`SlotUndo`]
+    /// Like [`Self::insert_index`], but also returns the [`EntryUndo`]
     /// needed to reverse this one write, for callers mutating a still-live
     /// (not cloned) index across a multi-record batch.
     fn insert_index_undoable(
@@ -4220,21 +4215,21 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         index: &LossyIndex,
         hash: &NodeId,
-        shard_id: u16,
+        slot: u16,
         offset: u64,
-    ) -> Result<Result<(u32, u64, SlotUndo), InsertError>, StorageError> {
+    ) -> Result<Result<(u32, u64, EntryUndo), InsertError>, StorageError> {
         loop {
-            match index.insert_undoable(hash, shard_id, offset) {
+            match index.insert_undoable(hash, slot, offset) {
                 Ok(written) => return Ok(Ok(written)),
                 Err(InsertError::TableFull) => return Ok(Err(InsertError::TableFull)),
                 Err(InsertError::NeedsIdentity {
                     bucket,
-                    shard_id,
+                    slot,
                     offset,
                 }) => {
-                    let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
+                    let shard = self.shards.get_shard(slot).ok_or_else(|| {
                         StorageError::Corrupt(format!(
-                            "index refers to missing shard {shard_id} while resolving a tag collision"
+                            "index refers to missing shard {slot} while resolving a tag collision"
                         ))
                     })?;
                     let (found_collection, found_hash) =
@@ -4243,7 +4238,7 @@ impl PackfileStorage {
                         || !index.hydrate_slot_identity(bucket, &found_hash)
                     {
                         return Err(StorageError::Corrupt(format!(
-                            "index tag candidate at offset {offset} in shard {shard_id} is inconsistent"
+                            "index tag candidate at offset {offset} in shard {slot} is inconsistent"
                         )));
                     }
                 }
@@ -4298,8 +4293,8 @@ impl PackfileStorage {
         track: bool,
     ) -> Result<Option<NodeData>, StorageError> {
         let mut last_err: Option<StorageError> = None;
-        for &(shard_id, offset) in candidates {
-            let Some(shard) = pinned.get(&shard_id) else {
+        for &(slot, offset) in candidates {
+            let Some(shard) = pinned.get(&slot) else {
                 continue;
             };
 
@@ -4379,10 +4374,10 @@ impl PackfileStorage {
         }
 
         while let Some(hash) = queue.pop_front() {
-            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
+            let Some(&(slot, offset)) = hash_to_shard_offset.get(&hash) else {
                 continue;
             };
-            let Some(old_shard) = pinned.get(&shard_id) else {
+            let Some(old_shard) = pinned.get(&slot) else {
                 continue;
             };
             let record = pool.read_at(old_shard, offset, true)?;
@@ -4456,7 +4451,7 @@ impl PackfileStorage {
         // would miss even though it is still live. See `pin_shards`.
         let pinned = self.pin_shards(
             gen.index
-                .referenced_shard_ids()
+                .referenced_slot_ids()
                 .into_iter()
                 .enumerate()
                 .filter(|&(_, referenced)| referenced)
@@ -4536,8 +4531,8 @@ impl PackfileStorage {
         let mut all_hashes: Vec<[u8; 16]> = hash_to_shard_offset.keys().copied().collect();
         all_hashes.sort_unstable();
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
-        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
-            if let Some(shard) = pinned.get(&shard_id) {
+        for (hash, &(slot, offset)) in hash_to_shard_offset {
+            if let Some(shard) = pinned.get(&slot) {
                 let record = pool.read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
@@ -4573,7 +4568,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption.
-    /// Builds this repack's deduped `hash → (shard_id, offset)` map,
+    /// Builds this repack's deduped `hash → (slot, offset)` map,
     /// incrementally where possible, and returns the previous
     /// [`RepackIncrementalState`] (moved out, not cloned) so the caller can
     /// reuse its `adjacency` cache when deciding which nodes need fresh disk
@@ -4610,7 +4605,7 @@ impl PackfileStorage {
             let shards = self.shards.all_shards();
             let current_pack_ids: HashMap<u16, u64> = shards
                 .iter()
-                .map(|(shard_id, shard)| (*shard_id, shard.pack_id))
+                .map(|(slot, shard)| (*slot, shard.pack_id))
                 .collect();
             // Slot IDs are recyclable.  A cursor (and every entry in the
             // carried live_map) is meaningful only for the pack incarnation
@@ -4619,13 +4614,13 @@ impl PackfileStorage {
             let pack_changed = prev
                 .scan_offsets
                 .iter()
-                .any(|(shard_id, (pack_id, _))| current_pack_ids.get(shard_id) != Some(pack_id));
+                .any(|(slot, (pack_id, _))| current_pack_ids.get(slot) != Some(pack_id));
             if pack_changed {
                 let scanned = self.scan_collection_records(collection_id)?;
                 let mut map = HashMap::new();
-                for (shard_id, entries) in scanned {
+                for (slot, entries) in scanned {
                     for (hash, offset) in entries {
-                        map.insert(hash, (shard_id, offset));
+                        map.insert(hash, (slot, offset));
                     }
                 }
                 return Ok((map, None));
@@ -4634,17 +4629,17 @@ impl PackfileStorage {
             // Scan only bytes appended since the last repack, merging into
             // the stolen live_map in-place — O(delta) work, not O(total).
             let mut map = prev.live_map.clone();
-            for (shard_id, shard) in shards {
+            for (slot, shard) in shards {
                 let start = prev
                     .scan_offsets
-                    .get(&shard_id)
+                    .get(&slot)
                     .filter(|(pack_id, _)| *pack_id == shard.pack_id)
                     .map_or(0, |(_, offset)| *offset);
                 let entries =
                     packfile::scan_packfile_from(&shard.path, start).map_err(StorageError::Io)?;
                 for (rid, hash, offset) in entries {
                     if rid == *collection_id {
-                        map.insert(hash, (shard_id, offset));
+                        map.insert(hash, (slot, offset));
                     }
                 }
             }
@@ -4653,9 +4648,9 @@ impl PackfileStorage {
             // First repack: full scan of every shard.
             let scanned = self.scan_collection_records(collection_id)?;
             let mut map = HashMap::new();
-            for (shard_id, entries) in &scanned {
+            for (slot, entries) in &scanned {
                 for (hash, offset) in entries {
-                    map.insert(*hash, (*shard_id, *offset));
+                    map.insert(*hash, (*slot, *offset));
                 }
             }
             Ok((map, None))
@@ -4720,10 +4715,10 @@ impl PackfileStorage {
             }
 
             // Slow path: new node, must read from disk.
-            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
+            let Some(&(slot, offset)) = hash_to_shard_offset.get(&hash) else {
                 continue;
             };
-            let Some(old_shard) = pinned.get(&shard_id) else {
+            let Some(old_shard) = pinned.get(&slot) else {
                 continue;
             };
             let record = pool.read_at(old_shard, offset, true)?;
@@ -4772,14 +4767,14 @@ impl PackfileStorage {
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> =
             HashMap::with_capacity(hash_to_shard_offset.len());
 
-        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
+        for (hash, &(slot, offset)) in hash_to_shard_offset {
             // Fast path: node was live last time, edge list is cached.
             if let Some(edges) = prev.adjacency.get(hash) {
                 adjacency.insert(*hash, edges.clone());
                 continue;
             }
             // Slow path: new node, must read from disk.
-            if let Some(shard) = pinned.get(&shard_id) {
+            if let Some(shard) = pinned.get(&slot) {
                 let record = pool.read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
@@ -4808,12 +4803,12 @@ impl PackfileStorage {
         let surviving: HashSet<[u8; 16]> = new_offsets.iter().map(|&(h, _, _)| h).collect();
 
         let mut scan_offsets = HashMap::new();
-        for (shard_id, shard) in self.shards.all_shards() {
-            scan_offsets.insert(shard_id, (shard.pack_id, shard.file_len()));
+        for (slot, shard) in self.shards.all_shards() {
+            scan_offsets.insert(slot, (shard.pack_id, shard.file_len()));
         }
         let next_live_map: HashMap<[u8; 16], (u16, u64)> = new_offsets
             .iter()
-            .map(|&(hash, shard_id, offset)| (hash, (shard_id, offset)))
+            .map(|&(hash, slot, offset)| (hash, (slot, offset)))
             .collect();
         // Evict dropped nodes from the adjacency cache so they can't
         // re-enter the live set on a future incremental BFS pass.
@@ -4901,15 +4896,15 @@ impl PackfileStorage {
         let mut kept_bytes: u64 = 0;
         let mut dropped_bytes: u64 = 0;
         let mut shards_touched: HashSet<u16> = HashSet::new();
-        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
-            if let Some(shard) = pinned.get(&shard_id) {
+        for (hash, &(slot, offset)) in hash_to_shard_offset {
+            if let Some(shard) = pinned.get(&slot) {
                 // Actual on-disk bytes, not the uncompressed upper bound —
                 // a repack preflight should report what will really be
                 // reclaimed/kept, which is smaller than plaintext size for
                 // any frame that compressed.
                 if let Ok(bytes) = Self::record_disk_len_at(shard, offset) {
                     if live_set.contains(hash) {
-                        shards_touched.insert(shard_id);
+                        shards_touched.insert(slot);
                         kept_bytes = kept_bytes.saturating_add(bytes);
                     } else {
                         dropped_bytes = dropped_bytes.saturating_add(bytes);
@@ -4984,18 +4979,18 @@ impl PackfileStorage {
         let mut collection_queue: Vec<[u8; 16]> = Vec::new();
 
         loop {
-            if let Some(shard_id) = shard_queue.pop() {
-                if shards.insert(shard_id) {
-                    for collection_id in self.collections_referencing_shard(shard_id)? {
+            if let Some(slot) = shard_queue.pop() {
+                if shards.insert(slot) {
+                    for collection_id in self.collections_referencing_shard(slot)? {
                         if collections.insert(collection_id) {
                             collection_queue.push(collection_id);
                         }
                     }
                 }
             } else if let Some(collection_id) = collection_queue.pop() {
-                for shard_id in self.collection_referenced_shards(&collection_id) {
-                    if !shards.contains(&shard_id) {
-                        shard_queue.push(shard_id);
+                for slot in self.collection_referenced_shards(&collection_id) {
+                    if !shards.contains(&slot) {
+                        shard_queue.push(slot);
                     }
                 }
             } else {
@@ -5018,7 +5013,7 @@ impl PackfileStorage {
             return Vec::new();
         };
         gen.index
-            .referenced_shard_ids()
+            .referenced_slot_ids()
             .iter()
             .enumerate()
             .filter_map(|(i, &referenced)| referenced.then(|| u16::try_from(i).ok()).flatten())
@@ -5045,12 +5040,12 @@ impl PackfileStorage {
             .read()
             .shard_collections
             .iter()
-            .map(|(&shard_id, collections)| {
+            .map(|(&slot, collections)| {
                 let count = collections
                     .values()
                     .copied()
                     .fold(0u64, u64::saturating_add);
-                (shard_id, count)
+                (slot, count)
             })
             .collect()
     }
@@ -5190,7 +5185,7 @@ impl PackfileStorage {
         // them.
         let source_shards: HashSet<u16> = hash_to_shard_offset
             .values()
-            .map(|&(shard_id, _)| shard_id)
+            .map(|&(slot, _)| slot)
             .collect();
         self.shards
             .prepare_collection_repack(collection_id, &source_shards)?;
@@ -5200,11 +5195,11 @@ impl PackfileStorage {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");
-            let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
+            let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
             if let Some(entry) =
-                self.copy_record_to_shard(collection_id, &pinned, old_shard_id, old_offset)?
+                self.copy_record_to_shard(collection_id, &pinned, old_slot, old_offset)?
             {
                 new_offsets.push(entry);
             }
@@ -5215,7 +5210,7 @@ impl PackfileStorage {
         let index = Self::build_index(&new_offsets, self.index_config)?;
         self.replace_collection_shard_counts(
             collection_id,
-            &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+            &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
         );
         self.swap_generation(collection_id, index)?;
         self.retire_empty_shards(collection_id);
@@ -5386,11 +5381,11 @@ impl PackfileStorage {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");
-            let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
+            let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
             if let Some(entry) =
-                self.copy_record_to_shard(collection_id, pinned, old_shard_id, old_offset)?
+                self.copy_record_to_shard(collection_id, pinned, old_slot, old_offset)?
             {
                 output_state.1 = output_state.1.saturating_add(1);
                 let current_active_shard = self.shards.active_shard().slot;
@@ -5451,7 +5446,7 @@ impl PackfileStorage {
         let maps = self.scan_collection_record_maps(&collection_ids)?;
         let source_shards: HashSet<u16> = maps
             .values()
-            .flat_map(|map| map.values().map(|&(shard_id, _)| shard_id))
+            .flat_map(|map| map.values().map(|&(slot, _)| slot))
             .collect();
         let pinned = self.pin_shards(source_shards.iter().copied());
 
@@ -5479,7 +5474,7 @@ impl PackfileStorage {
             let index = Self::build_index(&new_offsets, self.index_config)?;
             self.replace_collection_shard_counts(
                 collection_id,
-                &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+                &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
             );
             self.swap_generation(collection_id, index)?;
             // The batch path does a full cold-start scan (scan_collection_record_maps),
@@ -5672,7 +5667,7 @@ impl PackfileStorage {
         let mut referenced = [false; shard::MAX_SHARDS];
         for gen_swap in collections.values() {
             let gen = gen_swap.load();
-            let ids = gen.index.referenced_shard_ids();
+            let ids = gen.index.referenced_slot_ids();
             for (i, &has_refs) in ids.iter().enumerate() {
                 referenced[i] |= has_refs;
             }
@@ -6003,7 +5998,7 @@ impl PackfileStorage {
             hash: *id,
             data: data.bytes.clone(),
         };
-        let (shard_id, offset) = self.shards.put_record(&record)?;
+        let (slot, offset) = self.shards.put_record(&record)?;
         self.publish_mutation(|| JournalMutation::Put {
             collection_id: *collection_id,
             node_id: *id,
@@ -6012,7 +6007,7 @@ impl PackfileStorage {
         if progress.index_needs_rebuild {
             return Ok(());
         }
-        self.index_put_many_entry(collection_id, id, old_gen, shard_id, offset, progress)
+        self.index_put_many_entry(collection_id, id, old_gen, slot, offset, progress)
     }
 
     fn index_put_many_entry(
@@ -6020,7 +6015,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         old_gen: Option<&RoomGeneration>,
-        shard_id: u16,
+        slot: u16,
         offset: u64,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
@@ -6032,8 +6027,7 @@ impl PackfileStorage {
                     .index
             }
         };
-        let insert_result =
-            self.insert_index_undoable(collection_id, live, id, shard_id, offset)?;
+        let insert_result = self.insert_index_undoable(collection_id, live, id, slot, offset)?;
         let inserted = if let Ok((bucket, slot, undo)) = insert_result {
             progress.pending_deltas.push((bucket, slot));
             if progress.owned_index.is_none() {
@@ -6065,15 +6059,15 @@ impl PackfileStorage {
                 u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            let inserted = grown.insert(id, shard_id, offset).is_ok();
+            let inserted = grown.insert(id, slot, offset).is_ok();
             progress.owned_index = Some(grown);
             inserted
         };
         if inserted {
             let pack_id = self
                 .shards
-                .get_shard(shard_id)
-                .map_or(u64::from(shard_id), |shard| shard.pack_id);
+                .get_shard(slot)
+                .map_or(u64::from(slot), |shard| shard.pack_id);
             progress.pending_shard_collections.push(pack_id);
         }
         Ok(())
@@ -6190,17 +6184,17 @@ impl PackfileStorage {
             None
         };
 
-        let (shard_id, offset) = self.append_put_record(collection_id, id, data)?;
+        let (slot, offset) = self.append_put_record(collection_id, id, data)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
-                if let Ok((bucket, slot)) =
-                    self.insert_index(collection_id, &gen.index, id, shard_id, offset)?
+                if let Ok((bucket, entry)) =
+                    self.insert_index(collection_id, &gen.index, id, slot, offset)?
                 {
-                    self.record_delta(collection_id, gen.generation, bucket, slot);
+                    self.record_delta(collection_id, gen.generation, bucket, entry);
                     let pack_id = self
                         .shards
-                        .get_shard(shard_id)
-                        .map_or(u64::from(shard_id), |shard| shard.pack_id);
+                        .get_shard(slot)
+                        .map_or(u64::from(slot), |shard| shard.pack_id);
                     self.record_new_shard_collection(pack_id, collection_id);
 
                     let mut data_to_cache = data.clone();
@@ -6237,13 +6231,13 @@ impl PackfileStorage {
                 // index's own smaller hard floor.
                 None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
             };
-            let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
-            if let Ok((bucket, slot)) = inserted {
-                self.record_delta(collection_id, generation, bucket, slot);
+            let inserted = self.insert_index(collection_id, &index, id, slot, offset)?;
+            if let Ok((bucket, entry)) = inserted {
+                self.record_delta(collection_id, generation, bucket, entry);
                 let pack_id = self
                     .shards
-                    .get_shard(shard_id)
-                    .map_or(u64::from(shard_id), |s| s.pack_id);
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |s| s.pack_id);
                 self.record_new_shard_collection(pack_id, collection_id);
             } else {
                 // The insert was rejected (table full). The collection's shape
@@ -6254,24 +6248,24 @@ impl PackfileStorage {
                     // The failed insert did not mutate the table, so retry it
                     // after the in-memory rehash. This is the normal capacity
                     // path and must not turn into a full-pack scan.
-                    let _ = grown.insert(id, shard_id, offset);
+                    let _ = grown.insert(id, slot, offset);
                     index = grown;
                 } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
                     // A checkpoint-backed index has locations but not homes.
                     // Recovering the hashes from those locations is bounded
                     // by this collection, unlike `rebuild_index`'s pack scan.
-                    let _ = grown.insert(id, shard_id, offset);
+                    let _ = grown.insert(id, slot, offset);
                     index = grown;
                 } else {
                     index = self.rebuild_index(collection_id)?;
-                    let _ = index.insert(id, shard_id, offset);
+                    let _ = index.insert(id, slot, offset);
                 }
                 // The rebuild re-derived the collection's entire live set from
                 // scratch, so its shard distribution needs a full
                 // recompute too, not just crediting this one record.
                 self.replace_collection_shard_counts(
                     collection_id,
-                    &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+                    &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
                 );
             }
             let cache = match &old_gen {
@@ -6364,7 +6358,7 @@ impl PackfileStorage {
             // rebuild_index automatically discovers all the records we just appended
             self.replace_collection_shard_counts(
                 collection_id,
-                &self.slot_counts_to_pack_id_counts(&rebuilt.shard_counts()),
+                &self.slot_counts_to_pack_id_counts(&rebuilt.slot_counts()),
             );
             progress.owned_index = Some(rebuilt);
         }
@@ -6442,7 +6436,7 @@ impl StorageEngine for PackfileStorage {
             let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
             #[cfg(test)]
             Self::run_test_before_pin();
-            let pinned = self.pin_shards(candidates.iter().map(|&(shard_id, _)| shard_id));
+            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
             let still_current = match gen_guard.as_ref() {
                 Some(loaded) => {
                     let current = self.generation(collection_id);
@@ -6505,7 +6499,7 @@ impl StorageEngine for PackfileStorage {
             let pinned = self.pin_shards(
                 to_fetch
                     .iter()
-                    .flat_map(|(_, candidates)| candidates.iter().map(|&(shard_id, _)| shard_id)),
+                    .flat_map(|(_, candidates)| candidates.iter().map(|&(slot, _)| slot)),
             );
             let still_current = match gen_guard.as_ref() {
                 Some(loaded) => {
@@ -6525,15 +6519,15 @@ impl StorageEngine for PackfileStorage {
                     .fetch_add(candidates_seen, Ordering::Relaxed);
                 let touched: HashSet<u16> = to_fetch
                     .iter()
-                    .flat_map(|(_, candidates)| candidates.iter().map(|(shard_id, _)| *shard_id))
+                    .flat_map(|(_, candidates)| candidates.iter().map(|(slot, _)| *slot))
                     .collect();
                 self.get_many_shards_touched
                     .fetch_add(touched.len() as u64, Ordering::Relaxed);
 
                 let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
                 for (_, candidates) in &to_fetch {
-                    for (shard_id, offset) in candidates {
-                        per_shard.entry(*shard_id).or_default().push(*offset);
+                    for (slot, offset) in candidates {
+                        per_shard.entry(*slot).or_default().push(*offset);
                     }
                 }
                 let mut runs: u64 = 0;
@@ -7131,8 +7125,8 @@ impl PackfileStorage {
 
     /// Get IO/sync stats for a single shard by ID.
     #[must_use]
-    pub fn shard_stats_for(&self, shard_id: u16) -> Option<crate::shard::ShardStats> {
-        self.shards.stats(shard_id)
+    pub fn shard_stats_for(&self, slot: u16) -> Option<crate::shard::ShardStats> {
+        self.shards.stats(slot)
     }
 
     /// Total number of shards retired (garbage-collected after a repack)
@@ -8699,7 +8693,7 @@ mod tests {
                         &NodeData::new(bytes::Bytes::from_static(b"tamper target")),
                     )
                     .unwrap();
-                let (shard_id, offset) = store
+                let (slot, offset) = store
                     .generation(&TEST_COLLECTION)
                     .unwrap()
                     .index
@@ -8708,7 +8702,7 @@ mod tests {
                 // Tampering happens on-disk: commit the buffered frame so the
                 // tamper site computed from `offset` actually lands in the file.
                 store.sync_all().unwrap();
-                let path = store.shards.get_shard(shard_id).unwrap().path.clone();
+                let path = store.shards.get_shard(slot).unwrap().path.clone();
                 drop(store);
 
                 let mut bytes = fs::read(&path).unwrap();
@@ -12535,7 +12529,7 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"pin me")),
             )
             .unwrap();
-        let (shard_id, offset) = store
+        let (slot, offset) = store
             .generation(&TEST_COLLECTION)
             .unwrap()
             .index
@@ -12543,11 +12537,11 @@ mod tests {
             .expect("just-written record must be indexed");
 
         // Duplicate ids in the input must collapse to one pinned entry.
-        let pinned = store.pin_shards([shard_id, shard_id, shard_id].into_iter());
+        let pinned = store.pin_shards([slot, slot, slot].into_iter());
         assert_eq!(pinned.len(), 1);
 
         let record = store
-            .read_at(&pinned[&shard_id], offset, true)
+            .read_at(&pinned[&slot], offset, true)
             .expect("pinned shard must resolve the real on-disk record");
         assert_eq!(record.data.as_ref(), b"pin me");
     }

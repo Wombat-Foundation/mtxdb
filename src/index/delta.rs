@@ -1098,7 +1098,7 @@ pub enum DeltaReplayError {
     RequiresOwnedIndex,
     /// A frame carried the empty-slot sentinel (`0`). A legitimate insert
     /// never produces one — `record_delta` only ever logs a freshly built,
-    /// non-empty `IndexSlot` — so this can only be log corruption or a
+    /// non-empty `IndexEntry` — so this can only be log corruption or a
     /// structurally invalid frame. Storing it as-is would silently erase
     /// whatever live entry currently occupies that bucket and truncate the
     /// probe chain past it, stranding any entries beyond it.

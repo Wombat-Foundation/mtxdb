@@ -22,12 +22,12 @@ pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 
 /// Maximum shard size before rotation: `2^32 - 2` bytes (~4 GiB), the
 /// largest value for which every offset a shard can ever produce still
-/// fits `IndexSlot`'s 32-bit offset field (which reserves its all-zero
+/// fits `IndexEntry`'s 32-bit offset field (which reserves its all-zero
 /// encoding as the empty-slot sentinel, capping the max representable
-/// offset at `2^32 - 2` — see `index::IndexSlot`). Do not round this up
+/// offset at `2^32 - 2` — see `index::IndexEntry`). Do not round this up
 /// to a clean `4 * 1024 * 1024 * 1024`: that's one byte over the ceiling and
-/// lets a shard produce an offset `IndexSlot::new` panics on.
-pub const MAX_SHARD_BYTES: u64 = crate::index::IndexSlot::MAX_OFFSET;
+/// lets a shard produce an offset `IndexEntry::new` panics on.
+pub const MAX_SHARD_BYTES: u64 = crate::index::IndexEntry::MAX_OFFSET;
 
 /// Default in-memory threshold before a shard's buffered frames are written
 /// to disk as one positioned write. Keeps bulk writes from paying a
@@ -457,7 +457,7 @@ pub struct ShardPool {
     /// Per-pool rotation threshold, in bytes. Defaults to `MAX_SHARD_BYTES`
     /// but may be set lower (e.g. by a benchmark that wants many small
     /// packs to exercise repack/locality behavior) — never higher, since
-    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexSlot`'s 32-bit
+    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexEntry`'s 32-bit
     /// offset field.
     max_shard_bytes: u64,
     /// Per-pool seed mixed into index bucket/tag derivation. Generated once
@@ -4168,14 +4168,14 @@ mod tests {
     }
 
     /// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
-    /// `IndexSlot` stores as `offset + 1`, so the maximum valid offset must
+    /// `IndexEntry` stores as `offset + 1`, so the maximum valid offset must
     /// never reach the empty-slot sentinel boundary.
     #[test]
     fn max_shard_bytes_fits_index_slot() {
         // The largest offset a shard can ever present must survive
-        // IndexSlot::new without panicking.
+        // IndexEntry::new without panicking.
         let max_offset = MAX_SHARD_BYTES - 1;
-        let slot = crate::index::IndexSlot::new(0, 0, max_offset);
+        let slot = crate::index::IndexEntry::new(0, 0, max_offset);
         assert_eq!(slot.offset(), max_offset);
     }
 

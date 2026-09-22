@@ -45,7 +45,7 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Current wire version (see [`CheckpointHeader::version`]).
 ///
 /// Bumped to 6: the header carries a pack table (`slot -> pack_id`
-/// bindings for every pack live at checkpoint-write time). `shard_id` in a
+/// bindings for every pack live at checkpoint-write time). `slot` in a
 /// checkpoint's raw index slots (and in `DeltaFrame.slot`) is the writer's
 /// local, process-scoped `ShardPool` slot, not a stable identity — a fresh
 /// reader's `discover_shards` reassigns slots by first-free-in-`pack_id`-order,
@@ -125,7 +125,7 @@ pub struct LoadedCheckpoint {
     /// this checkpoint.
     pub mmap: Arc<Mmap>,
     /// `(writer's local shard slot, pack_id)` for every pack live at
-    /// checkpoint-write time. Every `shard_id` embedded in this checkpoint's
+    /// checkpoint-write time. Every `slot` embedded in this checkpoint's
     /// raw index slots (and in any delta frame that continues it) refers to
     /// one of these slots — translate through this table to a reader's own
     /// local slot rather than trusting the slot number directly. See the
