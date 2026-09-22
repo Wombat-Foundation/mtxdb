@@ -400,12 +400,12 @@ const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
 /// collection's stable insertion ordinal(8).
 const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8;
 
-/// The largest record offset `IndexSlot` can represent: its 28-bit offset
+/// The largest record offset `IndexSlot` can represent: its 32-bit offset
 /// field stores `offset + 1`, reserving the all-zeros encoding for the empty
 /// sentinel. Offsets beyond this can only come from legacy or externally
 /// created oversized packs — this engine's own writes rotate long before
 /// reaching it (`MAX_SHARD_BYTES` caps each shard's file size).
-const PACK_INDEX_OFFSET_LIMIT: u64 = (1u64 << 28) - 2;
+const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexSlot::MAX_OFFSET;
 
 /// Byte ceiling for the incremental index delta log. Once a session's
 /// accumulated frames exceed this, the next `sync()` stops appending and does
@@ -424,7 +424,7 @@ const DELTA_LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// adjacency (that would require a per-candidate frame-length probe).
 const READ_RUN_GAP_BYTES: u64 = 128;
 
-/// Reject a record whose in-shard offset the 28-bit `IndexSlot` field cannot
+/// Reject a record whose in-shard offset the 32-bit `IndexSlot` field cannot
 /// represent, so the caller surfaces a `StorageError::Corrupt` instead of
 /// silently dropping the record (or panicking in `IndexSlot::new`).
 fn check_index_offset(shard_id: u16, hash: &[u8; 16], offset: u64) -> Result<(), StorageError> {
@@ -10688,6 +10688,7 @@ mod tests {
     fn test_index_offset_gate_rejects_unrepresentable_offsets() {
         let hash = [0x5A; 16];
         assert!(check_index_offset(0, &hash, PACK_INDEX_OFFSET_LIMIT).is_ok());
+        assert!(check_index_offset(0, &hash, (1u64 << 28) + 1).is_ok());
         assert!(check_index_offset(0, &hash, PACK_INDEX_OFFSET_LIMIT + 1).is_err());
         assert!(check_index_offset(0, &hash, u64::MAX).is_err());
     }

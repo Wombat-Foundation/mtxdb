@@ -27,7 +27,7 @@ pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 /// offset at `2^32 - 2` — see `index::IndexSlot`). Do not round this up
 /// to a clean `4 * 1024 * 1024 * 1024`: that's one byte over the ceiling and
 /// lets a shard produce an offset `IndexSlot::new` panics on.
-pub const MAX_SHARD_BYTES: u64 = (1u64 << 32) - 2;
+pub const MAX_SHARD_BYTES: u64 = crate::index::IndexSlot::MAX_OFFSET;
 
 /// Default in-memory threshold before a shard's buffered frames are written
 /// to disk as one positioned write. Keeps bulk writes from paying a
@@ -4166,10 +4166,9 @@ mod tests {
         assert!(pool.get_shard(3).is_none());
     }
 
-    /// Regression: `MAX_SHARD_BYTES` was 2^28 exactly, but `IndexSlot` stores
-    /// `offset + 1` in 28 bits, so offset 2^28 - 1 would overflow. The
-    /// shard cap must be ≤ (1u64 << 28) - 1 to guarantee no offset
-    /// reaches the sentinel boundary.
+    /// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
+    /// `IndexSlot` stores as `offset + 1`, so the maximum valid offset must
+    /// never reach the empty-slot sentinel boundary.
     #[test]
     fn max_shard_bytes_fits_index_slot() {
         // The largest offset a shard can ever present must survive
