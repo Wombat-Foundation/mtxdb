@@ -73,7 +73,7 @@ path = "src/lib.rs"
 arc-swap = "1"
 bytes = "1.5"
 crc32fast = "1.4"
-getrandom = "0.4"
+getrandom = { version = "0.2", features = ["std"] }
 memmap2 = "0.9.11"
 parking_lot = "0.12"
 sha2 = "0.10"

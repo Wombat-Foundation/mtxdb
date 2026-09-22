@@ -303,7 +303,8 @@ pub fn store_created_by_version(base_dir: &Path) -> Option<String> {
         return None;
     }
     let version_len = usize::from(data[6]);
-    let version_bytes = data.get(7..7 + version_len)?;
+    let version_end = 7usize.checked_add(version_len)?;
+    let version_bytes = data.get(7..version_end)?;
     String::from_utf8(version_bytes.to_vec()).ok()
 }
 
@@ -925,7 +926,7 @@ impl ShardPool {
 
         if bucket_seed == 0 {
             let mut seed_bytes = [0u8; 8];
-            getrandom::fill(&mut seed_bytes).map_err(io::Error::other)?;
+            getrandom::getrandom(&mut seed_bytes).map_err(io::Error::other)?;
             bucket_seed = u64::from_ne_bytes(seed_bytes);
         }
 
@@ -2095,7 +2096,7 @@ impl ShardPool {
                 return Err(StorageError::Corrupt("truncated frame body or CRC".into()));
             }
 
-            return Ok(u64::from(frame_len) + 8);
+            return Ok(u64::from(frame_len).saturating_add(8));
         }
         unreachable!("record_disk_len_at remap-retry is bounded to two iterations")
     }

@@ -8,7 +8,7 @@ test-all = "!cargo test && cargo test-ffi && cargo test-wasm"
 
 [build]
 # target-dir = "target"
-# rustc-wrapper = ".cargo/cargo-wrapper.sh"
+rustc-wrapper = ".cargo/cargo-wrapper.sh"
 
 [env]
 # RUSTC_WRAPPER = { value = "sccache", force = false }

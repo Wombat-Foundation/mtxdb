@@ -631,7 +631,7 @@ impl LossyIndex {
         if !self.can_grow || self.capacity > u32::MAX / 2 {
             return None;
         }
-        let grown = Self::with_config(self.capacity as usize * 2, self.config);
+        let grown = Self::with_config((self.capacity as usize).saturating_mul(2), self.config);
         let homes = self.homes.lock();
         let tails = self.tails.lock();
         for (index, home) in homes.iter().copied().enumerate() {
@@ -687,7 +687,7 @@ impl LossyIndex {
         }
         locations.sort_unstable_by_key(|(slot, offset, _)| (*slot, *offset));
 
-        let grown = Self::with_config(self.capacity as usize * 2, self.config);
+        let grown = Self::with_config((self.capacity as usize).saturating_mul(2), self.config);
         for (slot, offset, slot_tag) in locations {
             let hash = hash_at(slot, offset, slot_tag)?;
             // A doubled table is at most 37.5% full because insertion only

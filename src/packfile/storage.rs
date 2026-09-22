@@ -8580,7 +8580,7 @@ mod tests {
             .map(|i| {
                 let mut id = [0u8; 16];
                 id[0] = i;
-                id[8..12].copy_from_slice(&(u32::from(i) + 1).to_le_bytes());
+                id[8..12].copy_from_slice(&u32::from(i).saturating_add(1).to_le_bytes());
                 (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
             })
             .collect()

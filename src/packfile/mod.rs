@@ -1049,7 +1049,9 @@ fn read_record_metadata_skip_payload_with_end(
             .checked_sub(FRAME_FIXED_LEN)
             .and_then(|len| len.checked_sub(u32::try_from(header.metadata_block.len()).ok()?))
             .expect("frame_len >= FRAME_FIXED_LEN + metadata_len, checked in read_frame_header"),
-    ) + 4;
+    )
+    .checked_add(4)
+    .expect("frame payload length fits u64");
     let payload_start = reader.stream_position()?;
     let frame_end = payload_start
         .checked_add(skip)
