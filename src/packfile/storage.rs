@@ -4995,7 +4995,7 @@ impl PackfileStorage {
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<(usize, usize), StorageError> {
         let collection_arc = self.put_mutex(collection_id);
-        let _collection_guard = collection_arc.lock();
+        let collection_guard = collection_arc.lock();
 
         // The scan below reads packfiles directly, so any records still
         // sitting in a shard's append buffer would be invisible to it and
@@ -5166,6 +5166,24 @@ impl PackfileStorage {
         // lose durability for data this repack itself just wrote, nor
         // leave the persisted stats stale relative to what's on disk.
         self.shards.sync_dirty()?;
+
+        // Release this collection's put_mutex before persisting the
+        // checkpoint: persist_index_checkpoint acquires every collection's
+        // put_mutex itself (parking_lot's Mutex is non-reentrant), and this
+        // repack still holds this collection's.
+        drop(collection_guard);
+
+        // retire_empty_shards may have unlinked packs this collection's old
+        // index entries pointed at. A reader that reloads from the
+        // checkpoint after this point must see the new shard layout, not
+        // the stale one — otherwise reload_index_from_checkpoint rebuilds a
+        // fingerprint that can never match a checkpoint naming retired
+        // packs, and the read-journal reload path fails closed. Mark the
+        // checkpoint dirty (repack itself never does, since it never runs
+        // through the put/sync paths that do) and persist it now so the
+        // on-disk checkpoint matches what this repack just wrote.
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        self.persist_index_checkpoint()?;
 
         Ok((kept, dropped))
     }
@@ -5421,6 +5439,14 @@ impl PackfileStorage {
         drop(collection_guards);
         self.retire_empty_shards_after_batch();
         self.shards.sync_dirty()?;
+
+        // See the matching comment in repack_collection_reachable: retirement
+        // above may have unlinked packs this batch's old index entries
+        // pointed at, so the on-disk checkpoint must be refreshed or a
+        // reader's checkpoint reload can never match the live shard set.
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        self.persist_index_checkpoint()?;
+
         Ok(results)
     }
 
@@ -7962,6 +7988,94 @@ mod tests {
                 "every committed record must be visible after a gated reload"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "documents a pre-existing gap beyond this fix's scope: checkpoint \
+                index entries encode a raw local shard slot with no persisted \
+                slot<->pack_id table (see index/format.rs), so a fresh reader's \
+                discover_shards() can assign a retired-and-reused pack file a \
+                different slot than the writer had when it built the checkpoint. \
+                Persisting the checkpoint after repack (this fix) is still \
+                correct and necessary — it fixes the fingerprint/covered_lsn \
+                staleness — but does not by itself close this separate slot- \
+                stability gap. Needs a checkpoint-format change (store pack_id \
+                per slot, or key index entries by pack_id) before this can pass."]
+    fn repack_persists_checkpoint_so_read_journal_reload_survives_retirement() {
+        // Repack moves a collection's records into a fresh destination shard
+        // and retires the old one once nothing else references it. A reader
+        // reloading from the checkpoint afterward must see the new shard
+        // layout — otherwise it reloads a checkpoint whose index still names
+        // a shard repack already unlinked, and the read fails closed.
+        let dir = test_dir("repack_persists_checkpoint");
+        let wal = dir.join("wal.bin");
+        let collection = [0x51u8; 16];
+        let node = [0x61u8; 16];
+
+        // `collection` is the only collection in this store, so its shard is
+        // never shared with anything else: repack's retirement of the
+        // now-empty source shard actually unlinks the file, rather than
+        // leaving it alive because another collection still references it.
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer
+            .put(
+                &collection,
+                &node,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let before = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+        assert_eq!(before.covered_lsn, 1);
+
+        // Repack `collection`: it moves `node` into a fresh non-source shard
+        // and, since no other collection references the old one, retires
+        // (unlinks) it.
+        writer
+            .repack_collection_reachable(&collection, |_hash, _data| Vec::new())
+            .unwrap();
+
+        let after = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+        assert_eq!(
+            after.covered_lsn, before.covered_lsn,
+            "repack must carry the checkpoint's covered_lsn forward unchanged, not reset it"
+        );
+
+        // Open a reader only now, after retirement already unlinked the
+        // source shard: it must never hold an open handle to the retired
+        // file, or the read would trivially keep succeeding through the
+        // stale-but-still-open fd (Linux keeps an unlinked file's bytes
+        // readable through any fd opened before the unlink) and the test
+        // would not actually exercise the checkpoint staleness at all.
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        // Drive the checkpoint reload directly rather than through
+        // get_read_committed: the journal overlay can serve a still-covered
+        // record straight from its segment without ever touching the index,
+        // which would leave this test unable to distinguish a correct reload
+        // from a mismatched one. reload_index_from_checkpoint is what
+        // discovers the live shard set and must succeed against the
+        // checkpoint repack just wrote.
+        assert!(
+            store.reload_index_from_checkpoint(),
+            "reload must succeed against the checkpoint repack persisted, not a stale one \
+             naming a shard repack already unlinked"
+        );
+
+        let got = store.get(&collection, &node).unwrap();
+        assert_eq!(
+            got.map(|data| data.bytes.to_vec()),
+            Some(b"first".to_vec()),
+            "the reloaded index must resolve the record through its post-repack shard offset"
+        );
     }
 
     #[test]
