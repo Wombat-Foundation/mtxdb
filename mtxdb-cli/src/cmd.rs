@@ -13,8 +13,8 @@ use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{
     derive_collection_id, frame_digest, CollectionKeyRule, CollectionTemplate, DatabaseLayout,
-    DigestAlgorithm, FrameIdInput, FrameIdPolicy, PackfileStorage, PayloadPolicy,
-    RecordIdentityRule, ShardType, COLLECTION_TYPE_PROTOCOL_BASE,
+    DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, PackfileStorage,
+    PayloadPolicy, RecordIdentityRule, ShardType, COLLECTION_TYPE_PROTOCOL_BASE,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -3480,6 +3480,10 @@ fn default_matrix_import_template() -> CollectionTemplate {
             collection_type: MATRIX_ROOM_COLLECTION_TYPE,
             display_id_pointer: "/room_id".into(),
         },
+        establishment: Some(EstablishmentRule {
+            selector: "type == m.room.create && state_key == ''".into(),
+            cardinality: "exactly-one".into(),
+        }),
     }
 }
 
@@ -3601,6 +3605,14 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
             path.display()
         );
     }
+    let establishment = EstablishmentRule {
+        selector: template_string_at(&template, &["establishment", "selector"])
+            .unwrap_or_default()
+            .to_owned(),
+        cardinality: template_string_at(&template, &["establishment", "cardinality"])
+            .unwrap_or("exactly-one")
+            .to_owned(),
+    };
     let node_id_algorithm = template_string_at(
         &template,
         ["record", "identity", "internal_key", "algorithm"].as_slice(),
@@ -3656,6 +3668,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
             collection_type,
             display_id_pointer: display_id_pointer.to_owned(),
         },
+        establishment: Some(establishment),
     })
 }
 
@@ -5735,6 +5748,7 @@ mod tests {
                 collection_type: MATRIX_ROOM_COLLECTION_TYPE,
                 display_id_pointer: "/room_id".into(),
             },
+            establishment: None,
         }
     }
 

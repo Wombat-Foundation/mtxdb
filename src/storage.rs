@@ -66,6 +66,21 @@ impl DigestAlgorithm {
         }
     }
 
+    /// Begin a streaming hash.
+    ///
+    /// Lets callers feed input in parts — a domain separator, a fixed field, a
+    /// variable key — without concatenating into a temporary buffer first.
+    #[must_use]
+    pub fn hasher(self) -> DigestHasher {
+        match self {
+            Self::Sha256 => {
+                use sha2::Digest as _;
+                DigestHasher::Sha256(sha2::Sha256::new())
+            }
+            Self::Unknown(id) => DigestHasher::Unknown(id),
+        }
+    }
+
     /// Hash `data`, producing a [`Digest32`].
     ///
     /// # Panics
@@ -73,11 +88,49 @@ impl DigestAlgorithm {
     /// implementation in this build.
     #[must_use]
     pub fn digest(self, data: &[u8]) -> Digest32 {
+        let mut hasher = self.hasher();
+        hasher.update(data);
+        hasher.finalize()
+    }
+}
+
+/// A streaming hasher for a [`DigestAlgorithm`].
+///
+/// Obtained from [`DigestAlgorithm::hasher`]; feed input with [`Self::update`]
+/// and finish with [`Self::finalize`].
+pub enum DigestHasher {
+    /// SHA-256 state.
+    Sha256(sha2::Sha256),
+    /// An algorithm this build cannot hash; every operation panics.
+    Unknown(u8),
+}
+
+impl DigestHasher {
+    /// Feed `data` into the hash state.
+    ///
+    /// # Panics
+    /// Panics if this hasher is [`DigestHasher::Unknown`].
+    pub fn update(&mut self, data: &[u8]) {
         match self {
-            Self::Sha256 => {
+            Self::Sha256(hasher) => {
                 use sha2::Digest as _;
-                let mut hasher = sha2::Sha256::new();
                 hasher.update(data);
+            }
+            Self::Unknown(id) => {
+                panic!("cannot hash with unimplemented digest algorithm id {id:#04x}")
+            }
+        }
+    }
+
+    /// Finish the hash, producing a [`Digest32`].
+    ///
+    /// # Panics
+    /// Panics if this hasher is [`DigestHasher::Unknown`].
+    #[must_use]
+    pub fn finalize(self) -> Digest32 {
+        match self {
+            Self::Sha256(hasher) => {
+                use sha2::Digest as _;
                 hasher.finalize().into()
             }
             Self::Unknown(id) => {

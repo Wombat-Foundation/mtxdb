@@ -116,22 +116,34 @@ pub const COLLECTION_TYPE_APP_BASE: u16 = 0x8000;
 /// distinct keys can collide in 128 bits. A collection's genesis record stores
 /// the full `canonical_preimage`, and a reader verifies it before trusting the
 /// id — a bare 128-bit id is never sufficient to resolve a collision.
+///
+/// # Panics
+/// Never in practice: a 16-byte prefix of a 32-byte digest always converts.
 #[must_use]
 pub fn derive_collection_id(collection_type: u16, canonical_key: &[u8]) -> [u8; 16] {
-    let mut input = Vec::with_capacity(
-        COLLECTION_ID_DOMAIN
-            .len()
-            .saturating_add(2)
-            .saturating_add(canonical_key.len()),
-    );
-    input.extend_from_slice(COLLECTION_ID_DOMAIN);
-    input.extend_from_slice(&collection_type.to_be_bytes());
-    input.extend_from_slice(canonical_key);
-    let digest = DigestAlgorithm::Sha256.digest(&input);
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&digest[..16]);
-    id
+    // Stream directly into the hasher — no temporary concatenation buffer on
+    // this hot path.
+    let mut hasher = DigestAlgorithm::Sha256.hasher();
+    hasher.update(COLLECTION_ID_DOMAIN);
+    hasher.update(&collection_type.to_be_bytes());
+    hasher.update(canonical_key);
+    hasher.finalize()[..16]
+        .try_into()
+        .expect("16-byte prefix of a 32-byte digest")
 }
+
+/// Domain separator for the collection genesis (establishment) frame's
+/// reserved node id.
+pub const GENESIS_SENTINEL_DOMAIN: &[u8] = b"mtxdb:sentinel:genesis_frame";
+
+/// The reserved node id under which a collection's genesis/establishment
+/// metadata frame is stored: `SHA-256(GENESIS_SENTINEL_DOMAIN)[..16]`.
+///
+/// Domain-separated from every user record id, so a real frame can never
+/// collide with it (asserted by a test).
+pub const GENESIS_FRAME_NODE_ID: [u8; 16] = [
+    0x79, 0xad, 0xa1, 0x33, 0x02, 0x69, 0x39, 0x76, 0xa1, 0x3f, 0x5c, 0xd9, 0x6c, 0xc2, 0x43, 0x22,
+];
 
 /// Current wire format of a [`CollectionMetadata`] genesis record.
 pub const COLLECTION_METADATA_FORMAT_V1: u16 = 1;
@@ -175,6 +187,17 @@ pub struct CollectionKeyRule {
     pub display_id_pointer: String,
 }
 
+/// The template's establishment (genesis) rule: which source record defines a
+/// collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstablishmentRule {
+    /// Application-defined selector for the establishment record, e.g. a
+    /// Matrix `m.room.create` event.
+    pub selector: String,
+    /// Expected cardinality, e.g. `exactly-one`.
+    pub cardinality: String,
+}
+
 /// Format-neutral, executable description of a collection template.
 ///
 /// Protocol rules such as Matrix redaction and authorization deliberately do
@@ -192,6 +215,8 @@ pub struct CollectionTemplate {
     pub payload: PayloadPolicy,
     /// Collection membership and internal collection-key derivation rule.
     pub collection_key: CollectionKeyRule,
+    /// Establishment (genesis) rule, when the collection has a defining record.
+    pub establishment: Option<EstablishmentRule>,
 }
 
 #[cfg(test)]
@@ -219,6 +244,7 @@ mod tests {
                 collection_type: 0x0001,
                 display_id_pointer: "/notebook".into(),
             },
+            establishment: None,
         };
 
         assert_eq!(
@@ -308,6 +334,14 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn genesis_sentinel_matches_its_domain_hash() {
+        let mut hasher = DigestAlgorithm::Sha256.hasher();
+        hasher.update(GENESIS_SENTINEL_DOMAIN);
+        let digest = hasher.finalize();
+        assert_eq!(&GENESIS_FRAME_NODE_ID[..], &digest[..16]);
     }
 
     #[test]
