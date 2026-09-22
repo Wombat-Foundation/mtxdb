@@ -12,8 +12,8 @@ use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{
-    CollectionKeyRule, CollectionTemplate, DatabaseLayout, PackfileStorage, PayloadPolicy,
-    RecordIdentityRule, ShardType,
+    frame_digest, CollectionKeyRule, CollectionTemplate, DatabaseLayout, DigestAlgorithm,
+    FrameIdInput, FrameIdPolicy, PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -3463,8 +3463,10 @@ fn default_matrix_import_template() -> CollectionTemplate {
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
         record_identity: RecordIdentityRule {
-            pointer: "/event_id".into(),
-            node_id_algorithm: "sha2-256".into(),
+            policy: FrameIdPolicy::Pointer {
+                pointer: "/event_id".into(),
+            },
+            digest_algorithm: DigestAlgorithm::Sha256,
         },
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
@@ -3598,7 +3600,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         ["record", "identity", "internal_key", "algorithm"].as_slice(),
     )
     .unwrap_or("sha2-256");
-    validate_digest_algorithm(node_id_algorithm)
+    let record_digest_algorithm = digest_algorithm_for(node_id_algorithm)
         .with_context(|| format!("template {} record identity internal_key", path.display()))?;
     let collection_id_algorithm = template_string_at(
         &template,
@@ -3640,8 +3642,10 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
         record_identity: RecordIdentityRule {
-            pointer: identity_pointer.to_owned(),
-            node_id_algorithm: node_id_algorithm.to_owned(),
+            policy: FrameIdPolicy::Pointer {
+                pointer: identity_pointer.to_owned(),
+            },
+            digest_algorithm: record_digest_algorithm,
         },
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
@@ -3652,14 +3656,19 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     })
 }
 
+/// Resolve a template's digest-algorithm name to the engine's [`DigestAlgorithm`].
+fn digest_algorithm_for(algorithm: &str) -> anyhow::Result<DigestAlgorithm> {
+    match algorithm {
+        "sha2-256" => Ok(DigestAlgorithm::Sha256),
+        other => bail!("unsupported internal-key algorithm `{other}`"),
+    }
+}
+
 /// Digest algorithms `derive_template_key` knows how to compute. Checked at
 /// template-compile time so an unsupported algorithm is rejected up front,
 /// rather than surfacing mid-import on the first record that needs it.
 fn validate_digest_algorithm(algorithm: &str) -> anyhow::Result<()> {
-    match algorithm {
-        "sha2-256" => Ok(()),
-        other => bail!("unsupported internal-key algorithm `{other}`"),
-    }
+    digest_algorithm_for(algorithm).map(|_| ())
 }
 
 /// Resolve an RFC 6901 JSON pointer against a parsed event, returning the
@@ -3744,10 +3753,36 @@ fn template_node_id(
     template: &CollectionTemplate,
     event: &OwnedValue,
 ) -> anyhow::Result<Option<[u8; 16]>> {
-    let Some(extracted) = extract_pointer_string(event, &template.record_identity.pointer) else {
+    // The importer only derives identities from a source pointer today. Any
+    // other policy must fail loudly rather than hash empty input and mint a
+    // meaningless key.
+    if !matches!(
+        &template.record_identity.policy,
+        FrameIdPolicy::Pointer { .. }
+    ) {
+        bail!(
+            "record identity policy {:?} is not supported by the importer",
+            template.record_identity.policy
+        );
+    }
+    let resolve =
+        |pointer: &str| extract_pointer_string(event, pointer).map(|s| s.as_bytes().to_vec());
+    let input = FrameIdInput {
+        payload: &[],
+        descriptor: &[],
+        canonical: None,
+        resolve: &resolve,
+    };
+    let Some(digest) = frame_digest(
+        &template.record_identity.policy,
+        template.record_identity.digest_algorithm,
+        &input,
+    ) else {
         return Ok(None);
     };
-    derive_template_key(&template.record_identity.node_id_algorithm, extracted).map(Some)
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    Ok(Some(id))
 }
 
 /// Run a template's collection-key rule against an already-extracted
@@ -5362,8 +5397,8 @@ mod tests {
     use bytes::Bytes;
     use mtxdb::packfile::storage::PackfileStorage;
     use mtxdb::storage::{NodeData, StorageEngine};
-    use mtxdb::template::{CollectionKeyRule, PayloadPolicy, RecordIdentityRule};
-    use mtxdb::{DatabaseLayout, ShardType};
+    use mtxdb::template::{CollectionKeyRule, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
+    use mtxdb::{DatabaseLayout, DigestAlgorithm, ShardType};
     use sha2::{Digest, Sha256};
     use simd_json::prelude::Writable;
     use simd_json::OwnedValue;
@@ -5690,8 +5725,10 @@ mod tests {
             name: "collisions".into(),
             collection_kind: "federation".into(),
             record_identity: RecordIdentityRule {
-                pointer: "/sender".into(),
-                node_id_algorithm: "sha2-256".into(),
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/sender".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
             },
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
