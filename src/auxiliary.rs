@@ -7,8 +7,8 @@
 use sha2::{Digest, Sha256};
 
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
+use crate::template::{derive_collection_id, COLLECTION_TYPE_INTERNAL_BASE};
 
-const STORE_DOMAIN: &[u8] = b"mtxdb:aux:v1:";
 const VALUE_MAGIC: &[u8; 4] = b"AUX1";
 const DIGEST_LEN: usize = 32;
 
@@ -23,18 +23,13 @@ pub fn auxiliary_key_digest(key: &[u8]) -> AuxiliaryKeyDigest {
 
 /// Derive the logical collection identity for a named auxiliary index.
 ///
-/// The returned 16-byte value is the compatibility collection ID required by
-/// the current storage engine. It is not the canonical identity of a key;
-/// key identities remain the full 32-byte digests stored in each envelope.
+/// Auxiliary indexes are core-internal collections, so they use the shared
+/// [`derive_collection_id`] with the internal type discriminator rather than a
+/// private domain string. The returned 16-byte value is the routing id; key
+/// identities remain the full 32-byte digests stored in each envelope.
 #[must_use]
 pub fn auxiliary_collection_id(name: &str) -> [u8; 16] {
-    let mut hasher = Sha256::new();
-    hasher.update(STORE_DOMAIN);
-    hasher.update(name.as_bytes());
-    let digest = hasher.finalize();
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&digest[..16]);
-    id
+    derive_collection_id(COLLECTION_TYPE_INTERNAL_BASE, name.as_bytes())
 }
 
 fn physical_id(digest: &AuxiliaryKeyDigest) -> NodeId {

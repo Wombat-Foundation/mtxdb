@@ -94,6 +94,65 @@ pub fn frame_digest(
     Some(algorithm.digest(&bytes))
 }
 
+/// Domain separator for the v1 collection-id derivation.
+pub const COLLECTION_ID_DOMAIN: &[u8] = b"mtxdb:collection:v1:";
+
+/// Collection-type value meaning "unset"; never a valid collection.
+pub const COLLECTION_TYPE_UNSET: u16 = 0x0000;
+/// First collection-type value reserved for core-internal collections (e.g.
+/// auxiliary indexes). The range `0x0001..=0x00FF` is core-owned.
+pub const COLLECTION_TYPE_INTERNAL_BASE: u16 = 0x0001;
+/// First collection-type value available to protocol extensions (e.g. Matrix
+/// rooms). The range `0x0100..=0x7FFF` is protocol-owned.
+pub const COLLECTION_TYPE_PROTOCOL_BASE: u16 = 0x0100;
+/// First collection-type value available to applications. The range
+/// `0x8000..=0xFFFF` is application-owned.
+pub const COLLECTION_TYPE_APP_BASE: u16 = 0x8000;
+
+/// Derive a collection's 128-bit id from its type discriminator and canonical
+/// external key (e.g. `b"!room:server"`).
+///
+/// The result is a **router, not an identity**: it is a truncated digest, so two
+/// distinct keys can collide in 128 bits. A collection's genesis record stores
+/// the full `canonical_preimage`, and a reader verifies it before trusting the
+/// id — a bare 128-bit id is never sufficient to resolve a collision.
+#[must_use]
+pub fn derive_collection_id(collection_type: u16, canonical_key: &[u8]) -> [u8; 16] {
+    let mut input = Vec::with_capacity(
+        COLLECTION_ID_DOMAIN
+            .len()
+            .saturating_add(2)
+            .saturating_add(canonical_key.len()),
+    );
+    input.extend_from_slice(COLLECTION_ID_DOMAIN);
+    input.extend_from_slice(&collection_type.to_be_bytes());
+    input.extend_from_slice(canonical_key);
+    let digest = DigestAlgorithm::Sha256.digest(&input);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    id
+}
+
+/// Current wire format of a [`CollectionMetadata`] genesis record.
+pub const COLLECTION_METADATA_FORMAT_V1: u16 = 1;
+
+/// A collection's first-class, immutable definition, written once as its
+/// genesis/establishment record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionMetadata {
+    /// Wire format version of this record.
+    pub format_version: u16,
+    /// The type discriminator used in [`derive_collection_id`].
+    pub collection_type: u16,
+    /// The full canonical external key — the derivation pre-image — retained so
+    /// a 128-bit collection-id collision can be detected and rejected.
+    pub canonical_preimage: Vec<u8>,
+    /// Record identity rule for frames in this collection.
+    pub record_identity: RecordIdentityRule,
+    /// Source payload retention rule.
+    pub payload: PayloadPolicy,
+}
+
 /// Generic identity rule for an application record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordIdentityRule {
@@ -108,8 +167,10 @@ pub struct RecordIdentityRule {
 pub struct CollectionKeyRule {
     /// RFC 6901 pointer to the source-level collection key.
     pub pointer: String,
-    /// Digest algorithm used to derive mtxdb's internal collection key.
-    pub collection_id_algorithm: String,
+    /// Compact 2-byte type discriminator mixed into the collection-id
+    /// derivation. Replaces a duplicated type string; the value space is owned
+    /// by the protocol extension (e.g. `0x0001` for a Matrix room).
+    pub collection_type: u16,
     /// RFC 6901 pointer to the user-facing collection identifier.
     pub display_id_pointer: String,
 }
@@ -155,7 +216,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/notebook".into(),
-                collection_id_algorithm: "sha2-256".into(),
+                collection_type: 0x0001,
                 display_id_pointer: "/notebook".into(),
             },
         };
@@ -246,6 +307,25 @@ mod tests {
                 &input
             ),
             None
+        );
+    }
+
+    #[test]
+    fn collection_id_is_deterministic_and_type_separated() {
+        let room = b"!room:matrix.org";
+        assert_eq!(
+            derive_collection_id(0x0001, room),
+            derive_collection_id(0x0001, room)
+        );
+        // A different type discriminator yields a different id for the same key.
+        assert_ne!(
+            derive_collection_id(0x0001, room),
+            derive_collection_id(0x0002, room)
+        );
+        // A different key yields a different id for the same type.
+        assert_ne!(
+            derive_collection_id(0x0001, room),
+            derive_collection_id(0x0001, b"!other:matrix.org")
         );
     }
 }

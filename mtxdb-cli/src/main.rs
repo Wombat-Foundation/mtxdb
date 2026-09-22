@@ -83,7 +83,7 @@ pub(crate) enum Commands {
     },
     Repack {
         collection: Option<String>,
-        shards: Vec<String>,
+        packs: Vec<String>,
         all: bool,
         root: Vec<String>,
         topo: bool,
@@ -145,8 +145,8 @@ fn build_cli() -> Command {
         )
         .about("CLI for the mtxdb content-addressed storage engine")
         .subcommand(sub_shards())
-        .subcommand(sub_stats())
         .subcommand(sub_collections())
+        .subcommand(sub_stats())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
         .subcommand(sub_import())
@@ -455,21 +455,21 @@ fn sub_repack() -> Command {
             Arg::new("collection")
                 .short('r')
                 .long("collection")
-                .conflicts_with("shard"),
+                .conflicts_with("pack"),
         )
         .arg(
-            Arg::new("shard")
-                .short('s')
-                .long("shard")
+            Arg::new("pack")
+                .short('p')
+                .long("pack")
                 .conflicts_with("collection")
                 .num_args(1..)
                 .value_name("PACK_ID")
-                .help("Repack collections referencing packs (repeat -s for multiple pack IDs)"),
+                .help("Repack collections referencing packs (repeat -p for multiple pack IDs)"),
         )
         .arg(
             Arg::new("all")
                 .long("all")
-                .conflicts_with_all(["collection", "shard"])
+                .conflicts_with_all(["collection", "pack"])
                 .action(ArgAction::SetTrue)
                 .help("Repack every collection in every active pack"),
         )
@@ -624,8 +624,8 @@ fn parse_cli() -> Cli {
         },
         Some(("repack", m)) => Commands::Repack {
             collection: m.get_one::<String>("collection").cloned(),
-            shards: m
-                .get_many::<String>("shard")
+            packs: m
+                .get_many::<String>("pack")
                 .into_iter()
                 .flatten()
                 .cloned()
@@ -685,7 +685,12 @@ fn parse_cli() -> Cli {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+// `main` deliberately does not return `Result`: std's `Termination` prints the
+// error via `Debug`, and anyhow's `Debug` includes a backtrace whenever
+// `RUST_BACKTRACE` is set in the environment — for release builds too. A
+// missing database is an expected user error, so we render the chain with
+// `Display` instead and let the profile/env decide nothing.
+fn main() -> std::process::ExitCode {
     let cli = parse_cli();
     if let Commands::Completions { shell } = &cli.command {
         let shell = match shell.as_str() {
@@ -709,7 +714,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
         clap_complete::generate(shell, &mut command, "mtxdb", &mut std::io::stdout());
-        return Ok(());
+        return std::process::ExitCode::SUCCESS;
     }
-    cmd::run(&cli)
+    match cmd::run(&cli) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }

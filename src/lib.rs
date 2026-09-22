@@ -54,6 +54,8 @@ pub use packfile::{storage::PackfileStorage, FrameMetadata, Record};
 pub use shard::ShardPool;
 pub use storage::{content_digest, Digest32, DigestAlgorithm, NodeData, NodeId, StorageEngine};
 pub use template::{
-    frame_digest, CollectionKeyRule, CollectionTemplate, FrameIdInput, FrameIdPolicy,
-    PayloadPolicy, RecordIdentityRule, COLLECTION_TEMPLATE_FORMAT_V1,
+    derive_collection_id, frame_digest, CollectionKeyRule, CollectionMetadata, CollectionTemplate,
+    FrameIdInput, FrameIdPolicy, PayloadPolicy, RecordIdentityRule, COLLECTION_ID_DOMAIN,
+    COLLECTION_METADATA_FORMAT_V1, COLLECTION_TEMPLATE_FORMAT_V1, COLLECTION_TYPE_APP_BASE,
+    COLLECTION_TYPE_INTERNAL_BASE, COLLECTION_TYPE_PROTOCOL_BASE, COLLECTION_TYPE_UNSET,
 };

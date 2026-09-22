@@ -12,8 +12,9 @@ use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{
-    frame_digest, CollectionKeyRule, CollectionTemplate, DatabaseLayout, DigestAlgorithm,
-    FrameIdInput, FrameIdPolicy, PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
+    derive_collection_id, frame_digest, CollectionKeyRule, CollectionTemplate, DatabaseLayout,
+    DigestAlgorithm, FrameIdInput, FrameIdPolicy, PackfileStorage, PayloadPolicy,
+    RecordIdentityRule, ShardType, COLLECTION_TYPE_PROTOCOL_BASE,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -206,11 +207,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Export { collection } => cmd_export(cli, collection),
         Commands::Repack {
             collection,
-            shards,
+            packs,
             all,
             root,
             topo,
-        } => cmd_repack(cli, collection.as_deref(), shards, *all, root, *topo),
+        } => cmd_repack(cli, collection.as_deref(), packs, *all, root, *topo),
         Commands::Delete { collections, yes } => cmd_delete(cli, collections, *yes),
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync { all } => cmd_sync(cli, *all),
@@ -331,6 +332,11 @@ fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
         parse_node_id(id)
     }
 }
+
+/// Collection type discriminator for Matrix room collections, mixed into
+/// [`derive_collection_id`]. Matrix is a protocol extension, so it draws from
+/// the protocol-owned range rather than a core-internal value.
+const MATRIX_ROOM_COLLECTION_TYPE: u16 = COLLECTION_TYPE_PROTOCOL_BASE;
 
 /// The Matrix import template's accepted identity algorithm: SHA-256 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,
@@ -3471,7 +3477,7 @@ fn default_matrix_import_template() -> CollectionTemplate {
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: "/room_id".into(),
-            collection_id_algorithm: "sha2-256".into(),
+            collection_type: MATRIX_ROOM_COLLECTION_TYPE,
             display_id_pointer: "/room_id".into(),
         },
     }
@@ -3602,13 +3608,10 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     .unwrap_or("sha2-256");
     let record_digest_algorithm = digest_algorithm_for(node_id_algorithm)
         .with_context(|| format!("template {} record identity internal_key", path.display()))?;
-    let collection_id_algorithm = template_string_at(
-        &template,
-        ["collection", "internal_key", "algorithm"].as_slice(),
-    )
-    .unwrap_or("sha2-256");
-    validate_digest_algorithm(collection_id_algorithm)
-        .with_context(|| format!("template {} collection internal_key", path.display()))?;
+    // The collection-id derivation is now a fixed, core-owned function of a
+    // compact type discriminator rather than a template-selected digest
+    // algorithm. The Matrix import profile is the room type.
+    let collection_type = MATRIX_ROOM_COLLECTION_TYPE;
     if let Some(policy) = template
         .get("record")
         .and_then(|r| r.get("payload"))
@@ -3650,7 +3653,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: membership_pointer.to_owned(),
-            collection_id_algorithm: collection_id_algorithm.to_owned(),
+            collection_type,
             display_id_pointer: display_id_pointer.to_owned(),
         },
     })
@@ -3787,13 +3790,10 @@ fn template_node_id(
 
 /// Run a template's collection-key rule against an already-extracted
 /// membership value (e.g. a Matrix `room_id`), producing the collection ID.
-fn template_collection_id(
-    template: &CollectionTemplate,
-    membership_value: &str,
-) -> anyhow::Result<[u8; 16]> {
-    derive_template_key(
-        &template.collection_key.collection_id_algorithm,
-        membership_value,
+fn template_collection_id(template: &CollectionTemplate, membership_value: &str) -> [u8; 16] {
+    derive_collection_id(
+        template.collection_key.collection_type,
+        membership_value.as_bytes(),
     )
 }
 
@@ -3989,10 +3989,9 @@ fn cmd_import_file(
                     auth_skipped = auth_skipped.saturating_add(1);
                     continue;
                 };
-                let collection_id = event_room_id(ev)
-                    .map(|room_id| template_collection_id(template, room_id))
-                    .transpose()?
-                    .unwrap_or([0u8; 16]);
+                let collection_id = event_room_id(ev).map_or([0u8; 16], |room_id| {
+                    template_collection_id(template, room_id)
+                });
                 let event_bytes = ev.encode().into_bytes();
                 by_collection.entry(collection_id).or_default().push((
                     id_bytes,
@@ -4272,7 +4271,7 @@ fn resolve_import_collection(
     let collection_id = if let Some(value) = collection_override {
         let collection_id = parse_collection_id(value)?;
         if let Some(room_id) = room_id {
-            let expected = template_collection_id(template, room_id)?;
+            let expected = template_collection_id(template, room_id);
             if collection_id != expected {
                 bail!(
                     "--collection {value} does not match Matrix room_id {room_id}; refusing to mix room data into another collection"
@@ -4290,7 +4289,7 @@ fn resolve_import_collection(
                 "could not detect collection_id (first event: {first_event}); pass --collection for this input"
             )
         })?;
-        template_collection_id(template, room_id)?
+        template_collection_id(template, room_id)
     };
     let batch_has_create = room_id.is_some_and(|room_id| matrix_batch_has_create(events, room_id));
     if !batch_has_create && !established_collections.contains(&collection_id) {
@@ -4890,22 +4889,22 @@ fn matrix_create_details(event: &OwnedValue) -> Option<String> {
 fn cmd_repack(
     cli: &Cli,
     collection: Option<&str>,
-    shards: &[String],
+    packs: &[String],
     all: bool,
     roots: &[String],
     topo: bool,
 ) -> anyhow::Result<()> {
-    let target = match (collection, shards.is_empty(), all) {
+    let target = match (collection, packs.is_empty(), all) {
         (Some(collection), true, false) => {
             RepackTarget::Collection(parse_collection_id(collection)?)
         }
-        (None, false, false) => RepackTarget::Packs(parse_pack_selectors(shards)?),
+        (None, false, false) => RepackTarget::Packs(parse_pack_selectors(packs)?),
         (None, true, true) => RepackTarget::All,
         // Clap rejects the both-targets case through `conflicts_with`; this
         // branch gives the missing-target case a readable diagnostic.
         _ => {
             return Err(anyhow!(
-                "exactly one of --collection <collection> | --shard <shard> | --all is required"
+                "exactly one of --collection <collection> | --pack <pack> | --all is required"
             ))
         }
     };
@@ -4914,7 +4913,7 @@ fn cmd_repack(
         match &target {
             RepackTarget::Packs(_) | RepackTarget::All => {
                 bail!(
-                    "--root requires --collection — live roots are per-collection, not meaningful for --shard"
+                    "--root requires --collection — live roots are per-collection, not meaningful for --pack"
                 );
             }
             RepackTarget::Collection(_) if !topo => {
@@ -5391,7 +5390,7 @@ mod tests {
         parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
         resolve_import_collection, scan_payload_suffix, synapse_event_node_id,
         template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        StateSet,
+        StateSet, MATRIX_ROOM_COLLECTION_TYPE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -5733,7 +5732,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/room_id".into(),
-                collection_id_algorithm: "sha2-256".into(),
+                collection_type: MATRIX_ROOM_COLLECTION_TYPE,
                 display_id_pointer: "/room_id".into(),
             },
         }
@@ -5753,7 +5752,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = PackfileStorage::open(dir.clone()).unwrap();
         let template = sender_identity_template();
-        let collection_id = template_collection_id(&template, "!room").unwrap();
+        let collection_id = template_collection_id(&template, "!room");
         let path = dir.join("fixture.json");
         (store, dir, path, template, collection_id)
     }
@@ -6170,7 +6169,7 @@ mod tests {
             resolve_import_collection(&[create], None, None, &template, &HashSet::new()).unwrap();
         assert_eq!(
             collection_id,
-            template_collection_id(&template, "!room:example.org").unwrap()
+            template_collection_id(&template, "!room:example.org")
         );
         assert!(batch_has_create);
     }
