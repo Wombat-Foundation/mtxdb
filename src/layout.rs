@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 /// same way `pool.meta` carries a version byte. Not deployed anywhere yet,
 /// so the descriptor is parsed (magic + version + pool list), not compared
 /// byte-for-byte — a mismatched version is rejected with a specific error
-/// rather than silently misparsed.
+/// rather than silently misparsed. The shipped CLI, C ABI, and WASI entry
+/// points validate this root and open their selected named pool through this
+/// type; [`PackfileStorage`](crate::PackfileStorage) remains available as a
+/// lower-level single-pool API.
 const DB_META_MAGIC: &[u8; 4] = b"MDBD";
 const DB_META_VERSION: u8 = 1;
 const DB_META_RESERVED_LEN: usize = 8;

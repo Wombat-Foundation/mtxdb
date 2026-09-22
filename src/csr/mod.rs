@@ -1,5 +1,4 @@
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{HashMap, VecDeque};
 
 const CSR_VERSION: u8 = 1;
 
@@ -98,7 +97,9 @@ impl Csr {
 
     /// Kahn's algorithm: topological order over local IDs.
     ///
-    /// Deterministic for a given graph (in-degree tie-break by local ID).
+    /// Deterministic for a given graph: initially ready nodes are visited in
+    /// local-ID order, and subsequently ready nodes are appended in CSR
+    /// adjacency order.
     /// Returns fewer nodes than `node_count()` if cycles exist.
     #[must_use]
     pub fn topo_order(&self) -> Vec<u32> {
@@ -113,22 +114,22 @@ impl Csr {
             i = i.wrapping_add(1);
         }
 
-        let mut queue: BinaryHeap<Reverse<u32>> = BinaryHeap::new();
+        let mut queue: VecDeque<u32> = VecDeque::new();
         i = 0;
         while (i as usize) < n {
             if in_degree[i as usize] == 0 {
-                queue.push(Reverse(i));
+                queue.push_back(i);
             }
             i = i.wrapping_add(1);
         }
 
         let mut order = Vec::with_capacity(n);
-        while let Some(Reverse(node)) = queue.pop() {
+        while let Some(node) = queue.pop_front() {
             order.push(node);
             for &target in self.neighbors(node) {
                 in_degree[target as usize] = in_degree[target as usize].wrapping_sub(1);
                 if in_degree[target as usize] == 0 {
-                    queue.push(Reverse(target));
+                    queue.push_back(target);
                 }
             }
         }
@@ -387,10 +388,9 @@ mod tests {
     }
 
     #[test]
-    fn test_topo_order_tie_break_by_local_id() {
-        // Node 0 -> Node 3, Node 3 -> Node 1, Node 3 -> Node 2
-        // When Node 3 is processed, both 1 and 2 become ready simultaneously.
-        // Local-ID tie-break: 1 before 2. Expected order: [0, 3, 1, 2].
+    fn test_topo_order_ready_queue_is_deterministic() {
+        // Initial ready nodes are queued by local ID, then newly ready nodes
+        // follow the FIFO queue in CSR adjacency order.
         let nodes = vec![h(0), h(1), h(2), h(3)];
         let mut adj = HashMap::new();
         adj.insert(h(0), vec![h(3)]);
@@ -399,6 +399,20 @@ mod tests {
         let csr = Csr::build_from_edges(&nodes, &adj);
         let order = csr.topo_order();
         assert_eq!(order, vec![0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn test_topo_order_uses_fifo_for_newly_ready_nodes() {
+        // A min-heap would choose 2 before 3 after processing node 1. The
+        // linear-time FIFO traversal preserves the order in which nodes
+        // become ready: 3 is discovered before 2.
+        let nodes = vec![h(0), h(1), h(2), h(3)];
+        let mut adj = HashMap::new();
+        adj.insert(h(0), vec![h(3)]);
+        adj.insert(h(1), vec![h(2)]);
+
+        let csr = Csr::build_from_edges(&nodes, &adj);
+        assert_eq!(csr.topo_order(), vec![0, 1, 3, 2]);
     }
 
     #[test]

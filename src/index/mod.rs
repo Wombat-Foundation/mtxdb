@@ -90,6 +90,10 @@ pub struct IndexSlot(u64);
 impl IndexSlot {
     const EMPTY: Self = Self(0);
 
+    /// Largest byte offset representable by the 32-bit offset field while
+    /// reserving the all-zeros encoding for the empty-slot sentinel.
+    pub const MAX_OFFSET: u64 = (1u64 << 32) - 2;
+
     const TAG_SHIFT: u64 = 48; // SHARD_BITS + OFFSET_BITS
     const SHARD_SHIFT: u64 = 32; // OFFSET_BITS
     const OFFSET_MASK: u64 = 0xFFFF_FFFF;
@@ -101,12 +105,12 @@ impl IndexSlot {
     /// stored as 1 in the slot.
     ///
     /// # Panics
-    /// Panics if `tag` exceeds 16 bits or `offset` exceeds `2^32 - 2`.
+    /// Panics if `tag` exceeds 16 bits or `offset` exceeds [`Self::MAX_OFFSET`].
     #[must_use]
     pub fn new(tag: u32, shard_id: u16, offset: u64) -> Self {
         assert!(tag <= 0xFFFF, "tag must fit in 16 bits");
         assert!(
-            offset <= (1u64 << 32) - 2,
+            offset <= Self::MAX_OFFSET,
             "offset must fit in 32 bits minus 1 (reserved for empty sentinel)"
         );
         Self(
