@@ -36,6 +36,7 @@ use memmap2::Mmap;
 
 use super::format::{
     CheckpointHeader, CollectionDirEntry, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN,
+    PACK_TABLE_ENTRY_LEN,
 };
 
 /// Magic identifying the persisted-index checkpoint format.
