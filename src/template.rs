@@ -132,24 +132,19 @@ pub fn derive_collection_id(collection_type: u16, canonical_key: &[u8]) -> [u8; 
         .expect("16-byte prefix of a 32-byte digest")
 }
 
-/// Domain separator for the collection genesis (establishment) frame's
-/// reserved node id.
-pub const GENESIS_SENTINEL_DOMAIN: &[u8] = b"mtxdb:sentinel:genesis_frame";
-
-/// The reserved node id under which a collection's genesis/establishment
-/// metadata frame is stored: `SHA-256(GENESIS_SENTINEL_DOMAIN)[..16]`.
+/// The reserved node id under which a collection's metadata (genesis) record
+/// is stored.
 ///
-/// Domain-separated from every user record id, so a real frame can never
-/// collide with it (asserted by a test).
-pub const GENESIS_FRAME_NODE_ID: [u8; 16] = [
-    0x79, 0xad, 0xa1, 0x33, 0x02, 0x69, 0x39, 0x76, 0xa1, 0x3f, 0x5c, 0xd9, 0x6c, 0xc2, 0x43, 0x22,
-];
+/// Reserved by construction: it is the only frame ever written under this id,
+/// so it needs no derived-hash ceremony — a value we control is exactly as
+/// collision-safe as a hash of a reserved string.
+pub const COLLECTION_METADATA_RECORD_ID: [u8; 16] = *b"mtxdb:metadata\0\0";
 
 /// Current wire format of a [`CollectionMetadata`] genesis record.
 pub const COLLECTION_METADATA_FORMAT_V1: u16 = 1;
 
 /// A collection's first-class, immutable definition, written once as its
-/// genesis/establishment record.
+/// metadata (genesis) record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionMetadata {
     /// Wire format version of this record.
@@ -159,10 +154,295 @@ pub struct CollectionMetadata {
     /// The full canonical external key — the derivation pre-image — retained so
     /// a 128-bit collection-id collision can be detected and rejected.
     pub canonical_preimage: Vec<u8>,
+    /// Digest of the canonical establishment (genesis) record, if any.
+    pub establishment_digest: Option<Digest32>,
     /// Record identity rule for frames in this collection.
     pub record_identity: RecordIdentityRule,
     /// Source payload retention rule.
     pub payload: PayloadPolicy,
+    /// Tags this build does not interpret, preserved verbatim so a read/rewrite
+    /// cycle never drops a newer writer's fields.
+    pub unknown: Vec<(u8, Vec<u8>)>,
+}
+
+/// `CollectionMetadata` TLV tags.
+const META_TAG_FORMAT_VERSION: u8 = 0x01;
+const META_TAG_COLLECTION_TYPE: u8 = 0x02;
+const META_TAG_CANONICAL_PREIMAGE: u8 = 0x03;
+const META_TAG_ESTABLISHMENT_DIGEST: u8 = 0x04;
+const META_TAG_RECORD_IDENTITY: u8 = 0x05;
+const META_TAG_PAYLOAD: u8 = 0x06;
+
+/// `RecordIdentityRule` nested tags.
+const IDENTITY_TAG_DIGEST_ALGORITHM: u8 = 0x01;
+const IDENTITY_TAG_POLICY: u8 = 0x02;
+
+/// [`FrameIdPolicy`] nested tags.
+const POLICY_TAG_POINTER: u8 = 0x01;
+const POLICY_TAG_PAYLOAD: u8 = 0x02;
+const POLICY_TAG_HEADER_DESCRIPTOR: u8 = 0x03;
+const POLICY_TAG_CANONICAL: u8 = 0x04;
+const POLICY_TAG_EXTERNAL: u8 = 0x05;
+
+/// [`FrameIdPolicy::Canonical`] nested tags.
+const CANONICAL_TAG_INCLUDE: u8 = 0x01;
+const CANONICAL_TAG_EXCLUDE_PREFIXES: u8 = 0x02;
+
+/// Append one `[tag:1][len:4 LE][value]` record.
+fn push_tlv(out: &mut Vec<u8>, tag: u8, value: &[u8]) {
+    out.push(tag);
+    out.extend_from_slice(
+        &u32::try_from(value.len())
+            .expect("collection-metadata field fits u32")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(value);
+}
+
+/// Encode a list of strings as repeated `[len:4 LE][utf8]`.
+fn encode_string_list(list: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in list {
+        out.extend_from_slice(
+            &u32::try_from(item.len())
+                .expect("string fits u32")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(item.as_bytes());
+    }
+    out
+}
+
+/// Cursor over a TLV block.
+struct TlvReader<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> TlvReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+
+    fn next(&mut self) -> Option<(u8, &'a [u8])> {
+        let tag = *self.bytes.get(self.cursor)?;
+        let len_start = self.cursor.checked_add(1)?;
+        let len_end = self.cursor.checked_add(5)?;
+        let len: [u8; 4] = self.bytes.get(len_start..len_end)?.try_into().ok()?;
+        let value_end = len_end.checked_add(u32::from_le_bytes(len) as usize)?;
+        let value = self.bytes.get(len_end..value_end)?;
+        self.cursor = value_end;
+        Some((tag, value))
+    }
+}
+
+/// Decode repeated `[len:4 LE][utf8]` into a string list.
+fn decode_string_list(mut bytes: &[u8]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let len: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+        let end = 4usize.checked_add(u32::from_le_bytes(len) as usize)?;
+        out.push(std::str::from_utf8(bytes.get(4..end)?).ok()?.to_owned());
+        bytes = bytes.get(end..)?;
+    }
+    Some(out)
+}
+
+fn encode_frame_id_policy(policy: &FrameIdPolicy) -> Vec<u8> {
+    let mut out = Vec::new();
+    match policy {
+        FrameIdPolicy::Pointer { pointer } => {
+            push_tlv(&mut out, POLICY_TAG_POINTER, pointer.as_bytes());
+        }
+        FrameIdPolicy::Payload => push_tlv(&mut out, POLICY_TAG_PAYLOAD, &[]),
+        FrameIdPolicy::HeaderDescriptor { fields } => {
+            push_tlv(
+                &mut out,
+                POLICY_TAG_HEADER_DESCRIPTOR,
+                &encode_string_list(fields),
+            );
+        }
+        FrameIdPolicy::Canonical {
+            include,
+            exclude_prefixes,
+        } => {
+            let mut inner = Vec::new();
+            push_tlv(
+                &mut inner,
+                CANONICAL_TAG_INCLUDE,
+                &encode_string_list(include),
+            );
+            push_tlv(
+                &mut inner,
+                CANONICAL_TAG_EXCLUDE_PREFIXES,
+                &encode_string_list(exclude_prefixes),
+            );
+            push_tlv(&mut out, POLICY_TAG_CANONICAL, &inner);
+        }
+        FrameIdPolicy::ExternalCanonicalIdToCrosscheck => {
+            push_tlv(&mut out, POLICY_TAG_EXTERNAL, &[]);
+        }
+    }
+    out
+}
+
+fn decode_frame_id_policy(bytes: &[u8]) -> Option<FrameIdPolicy> {
+    let (tag, value) = TlvReader::new(bytes).next()?;
+    Some(match tag {
+        POLICY_TAG_POINTER => FrameIdPolicy::Pointer {
+            pointer: std::str::from_utf8(value).ok()?.to_owned(),
+        },
+        POLICY_TAG_PAYLOAD => FrameIdPolicy::Payload,
+        POLICY_TAG_HEADER_DESCRIPTOR => FrameIdPolicy::HeaderDescriptor {
+            fields: decode_string_list(value)?,
+        },
+        POLICY_TAG_CANONICAL => {
+            let mut include = Vec::new();
+            let mut exclude_prefixes = Vec::new();
+            let mut reader = TlvReader::new(value);
+            while let Some((inner_tag, inner_value)) = reader.next() {
+                match inner_tag {
+                    CANONICAL_TAG_INCLUDE => include = decode_string_list(inner_value)?,
+                    CANONICAL_TAG_EXCLUDE_PREFIXES => {
+                        exclude_prefixes = decode_string_list(inner_value)?;
+                    }
+                    _ => {}
+                }
+            }
+            FrameIdPolicy::Canonical {
+                include,
+                exclude_prefixes,
+            }
+        }
+        POLICY_TAG_EXTERNAL => FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+        _ => return None,
+    })
+}
+
+fn encode_record_identity(rule: &RecordIdentityRule) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_tlv(
+        &mut out,
+        IDENTITY_TAG_DIGEST_ALGORITHM,
+        &[rule.digest_algorithm.id()],
+    );
+    push_tlv(
+        &mut out,
+        IDENTITY_TAG_POLICY,
+        &encode_frame_id_policy(&rule.policy),
+    );
+    out
+}
+
+fn decode_record_identity(bytes: &[u8]) -> Option<RecordIdentityRule> {
+    let mut rule = RecordIdentityRule {
+        policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+        digest_algorithm: DigestAlgorithm::Sha256,
+    };
+    let mut reader = TlvReader::new(bytes);
+    while let Some((tag, value)) = reader.next() {
+        match tag {
+            IDENTITY_TAG_DIGEST_ALGORITHM => {
+                rule.digest_algorithm = DigestAlgorithm::from_id(*value.first()?);
+            }
+            IDENTITY_TAG_POLICY => rule.policy = decode_frame_id_policy(value)?,
+            _ => {}
+        }
+    }
+    Some(rule)
+}
+
+fn encode_payload(payload: &PayloadPolicy) -> Vec<u8> {
+    match payload {
+        PayloadPolicy::Source => vec![0x00],
+        PayloadPolicy::Projection { include } => {
+            let mut out = vec![0x01];
+            out.extend_from_slice(&encode_string_list(include));
+            out
+        }
+    }
+}
+
+fn decode_payload(bytes: &[u8]) -> Option<PayloadPolicy> {
+    match bytes.split_first()? {
+        (0x00, _) => Some(PayloadPolicy::Source),
+        (0x01, rest) => Some(PayloadPolicy::Projection {
+            include: decode_string_list(rest)?,
+        }),
+        _ => None,
+    }
+}
+
+impl CollectionMetadata {
+    /// Encode this record as a TLV block.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_tlv(
+            &mut out,
+            META_TAG_FORMAT_VERSION,
+            &self.format_version.to_le_bytes(),
+        );
+        push_tlv(
+            &mut out,
+            META_TAG_COLLECTION_TYPE,
+            &self.collection_type.to_le_bytes(),
+        );
+        push_tlv(
+            &mut out,
+            META_TAG_CANONICAL_PREIMAGE,
+            &self.canonical_preimage,
+        );
+        if let Some(digest) = &self.establishment_digest {
+            push_tlv(&mut out, META_TAG_ESTABLISHMENT_DIGEST, digest);
+        }
+        push_tlv(
+            &mut out,
+            META_TAG_RECORD_IDENTITY,
+            &encode_record_identity(&self.record_identity),
+        );
+        push_tlv(&mut out, META_TAG_PAYLOAD, &encode_payload(&self.payload));
+        for (tag, value) in &self.unknown {
+            push_tlv(&mut out, *tag, value);
+        }
+        out
+    }
+
+    /// Decode a TLV block, preserving unrecognized tags in [`Self::unknown`].
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut meta = Self {
+            format_version: 0,
+            collection_type: 0,
+            canonical_preimage: Vec::new(),
+            establishment_digest: None,
+            record_identity: RecordIdentityRule {
+                policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            unknown: Vec::new(),
+        };
+        let mut reader = TlvReader::new(bytes);
+        while let Some((tag, value)) = reader.next() {
+            match tag {
+                META_TAG_FORMAT_VERSION => {
+                    meta.format_version = u16::from_le_bytes(value.try_into().ok()?);
+                }
+                META_TAG_COLLECTION_TYPE => {
+                    meta.collection_type = u16::from_le_bytes(value.try_into().ok()?);
+                }
+                META_TAG_CANONICAL_PREIMAGE => meta.canonical_preimage = value.to_vec(),
+                META_TAG_ESTABLISHMENT_DIGEST => {
+                    meta.establishment_digest = Some(value.try_into().ok()?);
+                }
+                META_TAG_RECORD_IDENTITY => meta.record_identity = decode_record_identity(value)?,
+                META_TAG_PAYLOAD => meta.payload = decode_payload(value)?,
+                _ => meta.unknown.push((tag, value.to_vec())),
+            }
+        }
+        Some(meta)
+    }
 }
 
 /// Generic identity rule for an application record.
@@ -337,14 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn genesis_sentinel_matches_its_domain_hash() {
-        let mut hasher = DigestAlgorithm::Sha256.hasher();
-        hasher.update(GENESIS_SENTINEL_DOMAIN);
-        let digest = hasher.finalize();
-        assert_eq!(&GENESIS_FRAME_NODE_ID[..], &digest[..16]);
-    }
-
-    #[test]
     fn collection_id_is_deterministic_and_type_separated() {
         let room = b"!room:matrix.org";
         assert_eq!(
@@ -361,5 +633,25 @@ mod tests {
             derive_collection_id(0x0001, room),
             derive_collection_id(0x0001, b"!other:matrix.org")
         );
+    }
+
+    #[test]
+    fn collection_metadata_round_trips_through_tlv() {
+        let meta = CollectionMetadata {
+            format_version: COLLECTION_METADATA_FORMAT_V1,
+            collection_type: 0x0100,
+            canonical_preimage: b"!room:matrix.org".to_vec(),
+            establishment_digest: Some([0xAB; 32]),
+            record_identity: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            // An unrecognized tag must survive a decode/encode cycle.
+            unknown: vec![(0x7F, vec![1, 2, 3])],
+        };
+        assert_eq!(CollectionMetadata::decode(&meta.encode()).unwrap(), meta);
     }
 }
