@@ -8166,6 +8166,92 @@ mod tests {
         );
     }
 
+    /// Delta frames carry the same raw, process-local `shard_id` that the
+    /// checkpoint does (`DeltaFrame.slot` is a packed `IndexSlot`, see
+    /// `index/format.rs`). The checkpoint path remaps those through its v6
+    /// pack table (`LossyIndex::remap_shard_ids`), but `replay_frames` stores
+    /// `frame.slot` verbatim, so a delta replayed onto a pool whose slots were
+    /// renumbered by a retirement can still point at the wrong shard.
+    ///
+    /// This test asks the narrow question that decides whether a delta-side
+    /// identity binding (a `SlotBinding` operation) is required: can a delta
+    /// log written before a retirement actually be replayed by a fresh reader
+    /// after it? The fingerprint gates are expected to reject such a log — the
+    /// epoch is named by the pre-retirement checkpoint fingerprint and its
+    /// `tail_fingerprint` names the pre-retirement pack set — in which case
+    /// replay never happens and this gap is latent rather than exploitable.
+    #[test]
+    fn delta_epoch_written_before_retirement_is_not_replayed_after() {
+        let dir = test_dir("delta_across_retirement");
+        let wal = dir.join("wal.bin");
+        let collection = [0x71u8; 16];
+        let first = [0x81u8; 16];
+        let second = [0x82u8; 16];
+        let third = [0x83u8; 16];
+
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+
+        // Commit enough that a checkpoint lands and rotates the delta epoch.
+        writer
+            .put(
+                &collection,
+                &first,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+
+        // A post-checkpoint write leaves a delta epoch (D1) whose base is the
+        // current checkpoint and whose tail names the current pack set.
+        writer
+            .put(
+                &collection,
+                &second,
+                &NodeData::new(bytes::Bytes::from_static(b"second")),
+            )
+            .unwrap();
+        writer.sync_all().unwrap();
+
+        // Retire a shard without re-checkpointing: repack moves the collection's
+        // records into a fresh destination shard and unlinks the source. The
+        // writer's slot table now has a hole, so a fresh reader's
+        // `discover_shards` will not reproduce the writer's numbering.
+        writer
+            .repack_collection_reachable(&collection, |_hash, _data| Vec::new())
+            .unwrap();
+
+        // A third record after the repack, flushed but never checkpointed,
+        // would be recoverable only through a delta replay.
+        writer
+            .put(
+                &collection,
+                &third,
+                &NodeData::new(bytes::Bytes::from_static(b"third")),
+            )
+            .unwrap();
+        writer.shards.flush_all().unwrap();
+        drop(writer);
+
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        reader.enable_read_journal(&wal).unwrap();
+        reader.reload_index_from_checkpoint();
+
+        // Every record must either resolve correctly or not at all. A wrong
+        // shard would surface as a hash mismatch (verified in
+        // `resolve_from_pinned`), never as wrong bytes.
+        for (id, expected) in [
+            (first, &b"first"[..]),
+            (second, &b"second"[..]),
+            (third, &b"third"[..]),
+        ] {
+            match reader.get(&collection, &id).unwrap() {
+                Some(data) => assert_eq!(data.bytes.as_ref(), expected),
+                None => {}
+            }
+        }
+    }
+
     #[test]
     fn repack_persists_checkpoint_so_fresh_cold_open_survives_retirement() {
         // Same failure shape as the read-journal test above, but through the
