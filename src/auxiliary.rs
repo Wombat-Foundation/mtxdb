@@ -29,7 +29,7 @@ pub fn auxiliary_key_digest(key: &[u8]) -> AuxiliaryKeyDigest {
 /// identities remain the full 32-byte digests stored in each envelope.
 #[must_use]
 pub fn auxiliary_collection_id(name: &str) -> [u8; 16] {
-    derive_collection_id(POOL_DST_INTERNAL, name.as_bytes())
+    derive_collection_id(Some(POOL_DST_INTERNAL), name.as_bytes())
 }
 
 fn physical_id(digest: &AuxiliaryKeyDigest) -> NodeId {

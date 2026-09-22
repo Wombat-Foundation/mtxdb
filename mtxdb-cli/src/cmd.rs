@@ -336,7 +336,7 @@ fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
 /// Pool namespace discriminator for Matrix room collections, mixed into
 /// [`derive_collection_id`]. Matrix room events live in the `EventDag` pool, so
 /// they use that pool's DST.
-const MATRIX_ROOM_POOL_DST: [u8; 4] = ShardType::EventDag.pool_dst();
+const MATRIX_ROOM_POOL_DST: Option<[u8; 4]> = Some(ShardType::EventDag.pool_dst());
 
 /// The Matrix import template's accepted identity algorithm: SHA-256 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,

@@ -109,20 +109,23 @@ pub const POOL_DST_INTERNAL: [u8; 4] = *b"INTL";
 /// `collection_canonical_id`, and a reader recomputes this before trusting the
 /// id — a bare 128-bit id is never sufficient to resolve a collision.
 ///
-/// `pool_dst` is the 4-byte pool namespace (see `ShardType::pool_dst`) that keeps
-/// the same canonical id distinct across pools, e.g. `!room` in the `EventDag`
-/// pool versus the State pool. Collection and record logical ids are separated
-/// only by the caller's canonical-id namespacing (Matrix uses `!` for
-/// collections, `$` for records); there is deliberately no extra domain tag.
+/// `pool_dst` is an optional, template-opt-in domain-separation tag (4 bytes).
+/// When `Some`, it is mixed into the pre-image so the same canonical id in
+/// different namespaces (e.g. `!room` in the `EventDag` pool versus the State
+/// pool) derives different logical ids. When `None` the derivation is exactly
+/// `SHA(collection_canonical_id)` with no tag, so callers must not assume
+/// collection logical ids are globally unique across pools.
 ///
 /// # Panics
 /// Never in practice: a 16-byte prefix of a 32-byte digest always converts.
 #[must_use]
-pub fn derive_collection_id(pool_dst: [u8; 4], collection_canonical_id: &[u8]) -> [u8; 16] {
+pub fn derive_collection_id(pool_dst: Option<[u8; 4]>, collection_canonical_id: &[u8]) -> [u8; 16] {
     // Stream directly into the hasher — no temporary concatenation buffer on
     // this hot path.
     let mut hasher = DigestAlgorithm::Sha256.hasher();
-    hasher.update(&pool_dst);
+    if let Some(dst) = pool_dst {
+        hasher.update(&dst);
+    }
     hasher.update(collection_canonical_id);
     hasher.finalize()[..16]
         .try_into()
@@ -142,9 +145,10 @@ pub const COLLECTION_METADATA_RECORD_ID: [u8; 16] = *b"mtxdb:metadata\0\0";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionMetadata {
     // --- Identity pre-image (hashed into `collection_logical_id`) ---
-    /// The physical pool discriminator (e.g. `*b"EVNT"`). Ensures `!room` in
-    /// the `EventDag` pool does not collide with `!room` in the `State` pool.
-    pub pool_dst: [u8; 4],
+    /// Optional, template-opt-in domain-separation tag hashed into
+    /// `collection_logical_id` (see [`derive_collection_id`]). `None` means the
+    /// derivation is `SHA(collection_canonical_id)`.
+    pub pool_dst: Option<[u8; 4]>,
     /// The collection's **canonical** id — the caller-defined external key
     /// (e.g. `!room:server`), canonicalized. Retained so a reader can recompute
     /// [`derive_collection_id`] and verify the logical id rather than trusting a
@@ -368,7 +372,9 @@ impl CollectionMetadata {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        push_tlv(&mut out, META_TAG_POOL_DST, &self.pool_dst);
+        if let Some(dst) = &self.pool_dst {
+            push_tlv(&mut out, META_TAG_POOL_DST, dst);
+        }
         push_tlv(
             &mut out,
             META_TAG_COLLECTION_CANONICAL_ID,
@@ -389,7 +395,7 @@ impl CollectionMetadata {
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut meta = Self {
-            pool_dst: [0; 4],
+            pool_dst: None,
             collection_canonical_id: Vec::new(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -400,7 +406,7 @@ impl CollectionMetadata {
         let mut reader = TlvReader::new(bytes);
         while let Some((tag, value)) = reader.next() {
             match tag {
-                META_TAG_POOL_DST => meta.pool_dst = value.try_into().ok()?,
+                META_TAG_POOL_DST => meta.pool_dst = Some(value.try_into().ok()?),
                 META_TAG_COLLECTION_CANONICAL_ID => meta.collection_canonical_id = value.to_vec(),
                 META_TAG_RECORD_ID_RULE => meta.record_id_rule = decode_record_id_rule(value)?,
                 META_TAG_PAYLOAD => meta.payload = decode_payload(value)?,
@@ -425,11 +431,11 @@ pub struct RecordIdentityRule {
 pub struct CollectionKeyRule {
     /// RFC 6901 pointer to the source-level collection key.
     pub pointer: String,
-    /// The 4-byte pool namespace discriminator mixed into the collection-id
-    /// derivation (see `ShardType::pool_dst`). Keeps the same canonical id
-    /// distinct across pools; e.g. a Matrix room event collection uses the
-    /// `EventDag` pool's DST.
-    pub pool_dst: [u8; 4],
+    /// Optional, template-opt-in 4-byte domain-separation tag mixed into the
+    /// collection-id derivation (see [`derive_collection_id`]). `None` derives
+    /// `SHA(collection_canonical_id)`; a Matrix room event collection opts in
+    /// with the `EventDag` pool's DST.
+    pub pool_dst: Option<[u8; 4]>,
     /// RFC 6901 pointer to the user-facing collection identifier.
     pub display_id_pointer: String,
 }
@@ -488,7 +494,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/notebook".into(),
-                pool_dst: POOL_DST_INTERNAL,
+                pool_dst: Some(POOL_DST_INTERNAL),
                 display_id_pointer: "/notebook".into(),
             },
             establishment: None,
@@ -586,28 +592,37 @@ mod tests {
     #[test]
     fn collection_id_is_deterministic_and_pool_separated() {
         let room = b"!room:matrix.org";
-        let event_dag = *b"EVNT";
-        let state = *b"STAT";
+        let event_dag = Some(*b"EVNT");
+        let state = Some(*b"STAT");
         assert_eq!(
             derive_collection_id(event_dag, room),
             derive_collection_id(event_dag, room)
         );
-        // A different pool namespace yields a different id for the same key.
+        // A different namespace tag yields a different id for the same key.
         assert_ne!(
             derive_collection_id(event_dag, room),
             derive_collection_id(state, room)
         );
-        // A different key yields a different id for the same pool.
+        // A different key yields a different id for the same tag.
         assert_ne!(
             derive_collection_id(event_dag, room),
             derive_collection_id(event_dag, b"!other:matrix.org")
+        );
+        // No tag is a valid, deterministic derivation of its own.
+        assert_eq!(
+            derive_collection_id(None, room),
+            derive_collection_id(None, room)
+        );
+        assert_ne!(
+            derive_collection_id(None, room),
+            derive_collection_id(event_dag, room)
         );
     }
 
     #[test]
     fn collection_metadata_round_trips_through_tlv() {
         let meta = CollectionMetadata {
-            pool_dst: *b"EVNT",
+            pool_dst: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
