@@ -26,6 +26,7 @@
 //! with a gated delta replay continuing it); any append, rotation, or repack
 //! changes it and forces a rescan.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -35,13 +36,28 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use super::format::{
-    CheckpointHeader, CollectionDirEntry, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN,
-    PACK_TABLE_ENTRY_LEN,
+    CheckpointHeader, CollectionDirEntry, PackTableEntry, CHECKPOINT_HEADER_LEN,
+    COLLECTION_DIR_ENTRY_LEN, PACK_TABLE_ENTRY_LEN,
 };
 
 /// Magic identifying the persisted-index checkpoint format.
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Current wire version (see [`CheckpointHeader::version`]).
+///
+/// Bumped to 6: the header carries a pack table (`slot -> pack_id`
+/// bindings for every pack live at checkpoint-write time). `shard_id` in a
+/// checkpoint's raw index slots (and in `DeltaFrame.slot`) is the writer's
+/// local, process-scoped `ShardPool` slot, not a stable identity — a fresh
+/// reader's `discover_shards` reassigns slots by first-free-in-`pack_id`-order,
+/// which does not reproduce the writer's numbering once any shard has ever
+/// been retired (retirement leaves a permanent hole in the writer's table).
+/// The pack table lets a reader translate every checkpoint-encoded slot to
+/// its own local slot for the same `pack_id` (stable: `ShardPool::next_pack_id`
+/// is persisted and monotonic-only within a pool, never reused) instead of
+/// trusting the writer's raw slot number. A v5 checkpoint has no pack table
+/// and is rejected outright by the strict magic/version check below,
+/// forcing the normal full-rescan fallback — never a partial/best-effort
+/// read of a v5 file under the v6 reader.
 ///
 /// Bumped to 5: the header now carries the journal `covered_lsn` the index
 /// snapshot incorporates, so a read-committed reader binds its overlay
@@ -53,7 +69,7 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// with empty identity side tables (cold-start tag-collision verification
 /// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
 /// reads for tag collisions on cold start.
-pub const CHECKPOINT_VERSION: u32 = 5;
+pub const CHECKPOINT_VERSION: u32 = 6;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 
@@ -108,6 +124,13 @@ pub struct LoadedCheckpoint {
     /// Keeps the raw slot arrays alive for mmap-backed indexes built from
     /// this checkpoint.
     pub mmap: Arc<Mmap>,
+    /// `(writer's local shard slot, pack_id)` for every pack live at
+    /// checkpoint-write time. Every `shard_id` embedded in this checkpoint's
+    /// raw index slots (and in any delta frame that continues it) refers to
+    /// one of these slots — translate through this table to a reader's own
+    /// local slot rather than trusting the slot number directly. See the
+    /// `CHECKPOINT_VERSION` doc comment for why.
+    pub pack_table: Vec<(u16, u64)>,
 }
 
 /// One collection's raw slots, homes, and tails in the checkpoint mapping.
@@ -206,7 +229,15 @@ pub fn write_checkpoint(
     fingerprint: u64,
     covered_lsn: u64,
     collections: &[([u8; 16], u64, &[u8])],
+    pack_table: &[(u16, u64)],
 ) -> std::io::Result<()> {
+    let pack_table_count = u32::try_from(pack_table.len())
+        .map_err(|_| std::io::Error::other("too many packs for checkpoint pack table u32"))?;
+    let pack_table_bytes = u64::try_from(pack_table.len())
+        .ok()
+        .and_then(|n| n.checked_mul(PACK_TABLE_ENTRY_LEN as u64))
+        .ok_or_else(|| std::io::Error::other("checkpoint pack table size overflow"))?;
+
     let count = u32::try_from(collections.len())
         .map_err(|_| std::io::Error::other("too many collections for checkpoint u32"))?;
     let directory_bytes = u64::try_from(collections.len())
@@ -247,7 +278,8 @@ pub fn write_checkpoint(
         .ok_or_else(|| std::io::Error::other("checkpoint body size overflow"))?;
     let total_len = CHECKPOINT_HEADER_LEN
         .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(body_bytes).unwrap_or(usize::MAX));
+        .saturating_add(usize::try_from(body_bytes).unwrap_or(usize::MAX))
+        .saturating_add(usize::try_from(pack_table_bytes).unwrap_or(usize::MAX));
     // Reserve the header first, then build the body directly into the final
     // buffer. This avoids retaining a second checkpoint-sized body merely to
     // calculate the CRC carried by the header.
@@ -335,6 +367,13 @@ pub fn write_checkpoint(
         }
     }
 
+    // Phase 4: write the pack table (slot -> pack_id bindings), one fixed-
+    // width entry per currently-live pack. Appended after the slots/homes/
+    // tails body so existing offset math above is untouched.
+    for &(slot, pack_id) in pack_table {
+        buf.extend_from_slice(&PackTableEntry { slot, pack_id }.encode());
+    }
+
     let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
 
     let header = CheckpointHeader {
@@ -348,6 +387,8 @@ pub fn write_checkpoint(
         homes_bytes,
         tails_bytes,
         covered_lsn,
+        pack_table_count,
+        pack_table_bytes,
     };
     buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
@@ -395,6 +436,10 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
 /// As [`read_checkpoint`], with an explicit integrity policy for callers that
 /// need deterministic configuration rather than the process environment.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "split across branches, too lazy to consolidate right now"
+)]
 pub fn read_checkpoint_with_policy(
     path: &Path,
     checksum_policy: CheckpointChecksumPolicy,
@@ -422,7 +467,13 @@ pub fn read_checkpoint_with_policy(
         .slots_bytes
         .checked_add(header.homes_bytes)
         .and_then(|v| v.checked_add(header.tails_bytes))?;
-    if buf.len() != slot_base.checked_add(usize::try_from(body_bytes).ok()?)? {
+    if header.pack_table_bytes
+        != u64::from(header.pack_table_count).checked_mul(PACK_TABLE_ENTRY_LEN as u64)?
+    {
+        return None;
+    }
+    let pack_table_base = slot_base.checked_add(usize::try_from(body_bytes).ok()?)?;
+    if buf.len() != pack_table_base.checked_add(usize::try_from(header.pack_table_bytes).ok()?)? {
         return None;
     }
 
@@ -500,11 +551,28 @@ pub fn read_checkpoint_with_policy(
         });
     }
 
+    let mut pack_table = Vec::with_capacity(header.pack_table_count as usize);
+    let mut seen_slots = HashSet::with_capacity(header.pack_table_count as usize);
+    let mut seen_pack_ids = HashSet::with_capacity(header.pack_table_count as usize);
+    for i in 0..header.pack_table_count as usize {
+        let entry_offset = pack_table_base.checked_add(i.checked_mul(PACK_TABLE_ENTRY_LEN)?)?;
+        let entry_bytes: [u8; PACK_TABLE_ENTRY_LEN] = buf
+            .get(entry_offset..entry_offset.saturating_add(PACK_TABLE_ENTRY_LEN))?
+            .try_into()
+            .ok()?;
+        let entry = PackTableEntry::decode(&entry_bytes)?;
+        if !seen_slots.insert(entry.slot) || !seen_pack_ids.insert(entry.pack_id) {
+            return None;
+        }
+        pack_table.push((entry.slot, entry.pack_id));
+    }
+
     Some(LoadedCheckpoint {
         fingerprint: header.pack_fingerprint,
         covered_lsn: header.covered_lsn,
         collections,
         mmap,
+        pack_table,
     })
 }
 
@@ -662,6 +730,7 @@ mod tests {
                 .iter()
                 .map(|(id, blob)| (*id, 0, blob.as_slice()))
                 .collect::<Vec<_>>(),
+            &[],
         )
         .unwrap();
 
@@ -734,7 +803,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
-        write_checkpoint(&path, pack_fingerprint(&[]), 0, &[]).unwrap();
+        write_checkpoint(&path, pack_fingerprint(&[]), 0, &[], &[]).unwrap();
         let loaded = read_checkpoint(&path).expect("empty checkpoint is still a valid file");
         assert_eq!(loaded.fingerprint, pack_fingerprint(&[]));
         assert!(loaded.collections.is_empty());
@@ -761,6 +830,7 @@ mod tests {
                 .iter()
                 .map(|(id, b)| (*id, 0, b.as_slice()))
                 .collect::<Vec<_>>(),
+            &[],
         )
         .unwrap();
         let full = std::fs::read(&path).unwrap();
@@ -781,6 +851,7 @@ mod tests {
                 .iter()
                 .map(|(id, b)| (*id, 0, b.as_slice()))
                 .collect::<Vec<_>>(),
+            &[],
         )
         .unwrap();
         let full = std::fs::read(&path).unwrap();
@@ -820,6 +891,7 @@ mod tests {
                 .iter()
                 .map(|(id, b)| (*id, 0, b.as_slice()))
                 .collect::<Vec<_>>(),
+            &[],
         )
         .unwrap();
         assert!(
@@ -913,6 +985,8 @@ mod tests {
             homes_bytes: 0,
             tails_bytes: 0,
             covered_lsn: 0,
+            pack_table_count: 0,
+            pack_table_bytes: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 
@@ -951,6 +1025,8 @@ mod tests {
             homes_bytes: 0,
             tails_bytes: 0,
             covered_lsn: 0,
+            pack_table_count: 0,
+            pack_table_bytes: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 

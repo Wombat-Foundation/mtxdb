@@ -118,6 +118,8 @@ impl CheckpointHeader {
         bytes[44..52].copy_from_slice(&self.homes_bytes.to_le_bytes());
         bytes[52..60].copy_from_slice(&self.tails_bytes.to_le_bytes());
         bytes[60..68].copy_from_slice(&self.covered_lsn.to_le_bytes());
+        bytes[68..72].copy_from_slice(&self.pack_table_count.to_le_bytes());
+        bytes[72..80].copy_from_slice(&self.pack_table_bytes.to_le_bytes());
         bytes
     }
 
@@ -136,6 +138,48 @@ impl CheckpointHeader {
             homes_bytes: u64::from_le_bytes(bytes[44..52].try_into().ok()?),
             tails_bytes: u64::from_le_bytes(bytes[52..60].try_into().ok()?),
             covered_lsn: u64::from_le_bytes(bytes[60..68].try_into().ok()?),
+            pack_table_count: u32::from_le_bytes(bytes[68..72].try_into().ok()?),
+            pack_table_bytes: u64::from_le_bytes(bytes[72..80].try_into().ok()?),
+        })
+    }
+}
+
+/// One `(slot, pack_id)` binding in a checkpoint's pack table: the writer's
+/// local `ShardPool` slot for a live pack at checkpoint-write time, and that
+/// pack's stable, monotonically-allocated identity (`ShardPool::next_pack_id`
+/// is persisted and never decremented or reused within a pool — see
+/// `shard.rs`). A reader translates every checkpoint-encoded `shard_id`
+/// through this table into its own local slot for the same `pack_id`,
+/// rather than trusting the writer's raw slot number directly — slot
+/// numbers are a process-local, ephemeral handle, not identity, and drift
+/// after any shard retirement leaves a hole in the writer's slot table that
+/// a fresh reader's `discover_shards` (first-free-slot in `pack_id` order)
+/// does not reproduce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackTableEntry {
+    /// The writer's local shard slot at checkpoint-write time.
+    pub slot: u16,
+    /// The pack's stable identity.
+    pub pack_id: u64,
+}
+
+impl PackTableEntry {
+    #[must_use]
+    /// Encodes this entry in its fixed-width little-endian representation.
+    pub fn encode(self) -> [u8; PACK_TABLE_ENTRY_LEN] {
+        let mut bytes = [0; PACK_TABLE_ENTRY_LEN];
+        bytes[..2].copy_from_slice(&self.slot.to_le_bytes());
+        bytes[4..12].copy_from_slice(&self.pack_id.to_le_bytes());
+        bytes
+    }
+
+    #[must_use]
+    /// Decodes exactly one fixed-width pack table entry, rejecting other lengths.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; PACK_TABLE_ENTRY_LEN] = bytes.try_into().ok()?;
+        Some(Self {
+            slot: u16::from_le_bytes(bytes[..2].try_into().ok()?),
+            pack_id: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
         })
     }
 }
@@ -217,6 +261,8 @@ mod tests {
             homes_bytes: 0,
             tails_bytes: 0,
             covered_lsn: 11,
+            pack_table_count: 2,
+            pack_table_bytes: 24,
         };
         assert_eq!(CheckpointHeader::decode(&header.encode()), Some(header));
 
@@ -230,5 +276,14 @@ mod tests {
             slot_count: 9,
         };
         assert_eq!(CollectionDirEntry::decode(&entry.encode()), Some(entry));
+
+        let pack_entry = PackTableEntry {
+            slot: 3,
+            pack_id: 0xDEAD_BEEF_0000_0001,
+        };
+        assert_eq!(
+            PackTableEntry::decode(&pack_entry.encode()),
+            Some(pack_entry)
+        );
     }
 }

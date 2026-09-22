@@ -847,6 +847,74 @@ impl LossyIndex {
         })
     }
 
+    /// Rewrites every occupied slot's `shard_id` through `remap`, in place.
+    ///
+    /// A checkpoint-loaded index's `shard_id`s were encoded by the writer's
+    /// own local `ShardPool` slots at checkpoint-write time — a process-local
+    /// handle, not a stable identity. `remap` (built by the caller from the
+    /// checkpoint's persisted pack table, translated through this reader's
+    /// own currently-open packs) reconciles that against this reader's own
+    /// slot numbering, which can differ once any shard has ever been retired
+    /// (see `CHECKPOINT_VERSION`'s v6 doc comment).
+    ///
+    /// Checks first without touching storage: the common case (no shard has
+    /// ever been retired, so a fresh reader's slot numbering already agrees
+    /// with the checkpoint's) needs no rewrite at all, and mmap-backed
+    /// indexes must stay mmap-backed when nothing actually changes — callers
+    /// and tests depend on an unmodified checkpoint-loaded index staying
+    /// zero-copy until its first real write. Only materializes into an owned
+    /// copy (writes are never applied to the mmap) when at least one
+    /// occupied slot's `shard_id` actually needs to change.
+    ///
+    /// Returns `false`, leaving the index unmodified, if any occupied slot's
+    /// `shard_id` has no entry in `remap` — the checkpoint's pack table
+    /// should cover every `shard_id` any of its own index entries use, so a
+    /// miss means the checkpoint is internally inconsistent and the caller
+    /// should fall back to a full rescan rather than serve unresolvable
+    /// slots.
+    #[must_use]
+    pub fn remap_shard_ids(&mut self, remap: &std::collections::HashMap<u16, u16>) -> bool {
+        let capacity = self.capacity as usize;
+        let mut needs_rewrite = false;
+        for index in 0..capacity {
+            let slot = IndexSlot(self.slots.get(index));
+            if slot.is_empty() {
+                continue;
+            }
+            let Some(&new_shard_id) = remap.get(&slot.shard_id()) else {
+                return false;
+            };
+            if new_shard_id != slot.shard_id() {
+                needs_rewrite = true;
+            }
+        }
+        if !needs_rewrite {
+            return true;
+        }
+        if !matches!(self.slots, SlotStorage::Owned(_)) {
+            self.slots = SlotStorage::Owned(self.slots.materialize(capacity));
+        }
+        let SlotStorage::Owned(slots) = &self.slots else {
+            unreachable!("just materialized to Owned above");
+        };
+        for cell in slots {
+            let raw = cell.load(Ordering::Acquire);
+            let slot = IndexSlot(raw);
+            if slot.is_empty() {
+                continue;
+            }
+            let Some(&new_shard_id) = remap.get(&slot.shard_id()) else {
+                return false;
+            };
+            if new_shard_id == slot.shard_id() {
+                continue;
+            }
+            let remapped = IndexSlot::new(slot.tag(), new_shard_id, slot.offset()).0;
+            cell.store(remapped, Ordering::Relaxed);
+        }
+        true
+    }
+
     /// Serialize the index to bytes for persistence.
     ///
     /// Format (all little-endian):

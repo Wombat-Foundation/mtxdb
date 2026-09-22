@@ -2282,6 +2282,32 @@ impl PackfileStorage {
             .map(|(slot, pack_id, _, _)| (*slot, *pack_id))
             .collect();
 
+        // Translate every shard_id this checkpoint's index entries (and any
+        // delta frame continuing it) encode — the writer's own local slot at
+        // checkpoint-write time — to this reader's own local slot for the
+        // same pack_id. Slot numbers are a process-local handle, not a
+        // stable identity: a fresh reader's `discover_shards` reassigns
+        // slots by first-free-in-pack_id-order, which does not reproduce
+        // the writer's numbering once any shard has ever been retired (see
+        // `CHECKPOINT_VERSION`'s v6 doc comment). A checkpoint_slot with no
+        // entry here (its pack_id isn't among this reader's currently-open
+        // packs) is left unmapped; any index entry that actually needs it
+        // makes `remap_shard_ids` fail closed below, forcing a full rescan
+        // rather than serving an unresolvable slot.
+        let pack_id_to_local_slot: HashMap<u64, u16> = open_shards
+            .iter()
+            .map(|(slot, pack_id, _, _)| (*pack_id, *slot))
+            .collect();
+        let shard_id_remap: HashMap<u16, u16> = checkpoint
+            .pack_table
+            .iter()
+            .filter_map(|&(checkpoint_slot, pack_id)| {
+                pack_id_to_local_slot
+                    .get(&pack_id)
+                    .map(|&local_slot| (checkpoint_slot, local_slot))
+            })
+            .collect();
+
         // The inspection sidecar is the same reduced per-(pack, collection)
         // bookkeeping the loop below would recover by walking every slot of
         // every collection index. Accept it only when it is gated to the pack
@@ -2309,7 +2335,7 @@ impl PackfileStorage {
             // The checkpoint reader has already validated this range. Keep it
             // mmap-backed through the read-only fast path; the first writer
             // copy-on-writes it into the normal atomic slot array.
-            let (index, generation) = if let Some((generation, index)) =
+            let (mut index, generation) = if let Some((generation, index)) =
                 snapshot_indexes.remove(&loaded.collection_id)
             {
                 (index, generation)
@@ -2347,6 +2373,9 @@ impl PackfileStorage {
                 };
                 (index, loaded.generation)
             };
+            if !index.remap_shard_ids(&shard_id_remap) {
+                return None;
+            }
             current_len.insert(loaded.collection_id, u32::try_from(index.len()).ok()?);
             scan_out.collections.insert(
                 loaded.collection_id,
@@ -2358,9 +2387,12 @@ impl PackfileStorage {
             );
             collection_order.push(loaded.collection_id);
         }
-        for (collection_id, (generation, index)) in snapshot_indexes {
+        for (collection_id, (generation, mut index)) in snapshot_indexes {
             if deleted_collections.contains(&collection_id) {
                 continue;
+            }
+            if !index.remap_shard_ids(&shard_id_remap) {
+                return None;
             }
             current_len.insert(collection_id, u32::try_from(index.len()).ok()?);
             scan_out.collections.insert(
@@ -3152,13 +3184,22 @@ impl PackfileStorage {
         } else {
             self.shards.flush_all()?;
         }
-        let packs: Vec<(u64, u64)> = self
-            .shards
-            .all_shards()
-            .into_iter()
+        let live_shards = self.shards.all_shards();
+        let packs: Vec<(u64, u64)> = live_shards
+            .iter()
             .map(|(_, shard)| (shard.pack_id, shard.file_len()))
             .collect();
         let fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
+        // Every pack live right now, keyed by this writer's own local slot —
+        // lets a reader translate this checkpoint's shard_id-encoded index
+        // entries to its own local slot for the same pack_id, rather than
+        // trusting the writer's raw slot number (see CHECKPOINT_VERSION's
+        // doc comment on the v6 bump for why that's unsafe after a
+        // retirement).
+        let pack_table: Vec<(u16, u64)> = live_shards
+            .iter()
+            .map(|(slot, shard)| (*slot, shard.pack_id))
+            .collect();
 
         let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
             let tables = self.index_tables.read();
@@ -3211,6 +3252,7 @@ impl PackfileStorage {
             fingerprint,
             wal_lsn.unwrap_or(0),
             &snapshots,
+            &pack_table,
         )
         .map_err(StorageError::Io)?;
         // `write_checkpoint` fsyncs the new checkpoint's own bytes before
@@ -3282,6 +3324,7 @@ impl PackfileStorage {
         fingerprint: u64,
         covered_lsn: u64,
         snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
+        pack_table: &[(u16, u64)],
     ) -> std::io::Result<()> {
         let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
             .iter()
@@ -3293,7 +3336,13 @@ impl PackfileStorage {
             .iter()
             .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
             .collect();
-        crate::index::checkpoint::write_checkpoint(path, fingerprint, covered_lsn, &blobs)
+        crate::index::checkpoint::write_checkpoint(
+            path,
+            fingerprint,
+            covered_lsn,
+            &blobs,
+            pack_table,
+        )
     }
 
     /// Switch the live delta-log state onto a fresh epoch named for
@@ -3384,11 +3433,18 @@ impl PackfileStorage {
 
         std::thread::sleep(delay);
 
+        let pack_table: Vec<(u16, u64)> = self
+            .shards
+            .all_shards()
+            .iter()
+            .map(|(slot, shard)| (*slot, shard.pack_id))
+            .collect();
         Self::write_checkpoint_snapshot(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             covered_lsn,
             &snapshots,
+            &pack_table,
         )
         .map_err(StorageError::Io)?;
         let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
@@ -3466,11 +3522,18 @@ impl PackfileStorage {
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
         drop(guards);
+        let pack_table: Vec<(u16, u64)> = self
+            .shards
+            .all_shards()
+            .iter()
+            .map(|(slot, shard)| (*slot, shard.pack_id))
+            .collect();
         Self::write_checkpoint_snapshot(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             covered_lsn,
             &snapshots,
+            &pack_table,
         )
         .map_err(StorageError::Io)?;
         let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
@@ -8071,18 +8134,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "documents a pre-existing gap beyond this fix's scope: checkpoint \
-                index entries encode a raw local shard slot with no persisted \
-                slot<->pack_id table (see index/format.rs), so a fresh reader's \
-                discover_shards() can assign a retired-and-reused pack file a \
-                different slot than the writer had when it built the checkpoint. \
-                Persisting the checkpoint after repack (repack_persists_checkpoint_\
-                so_read_journal_reload_survives_retirement) is still correct and \
-                necessary — it fixes the fingerprint/covered_lsn staleness, and the \
-                reload above succeeds — but does not by itself close this separate \
-                slot-stability gap, so the read below still fails. Needs a \
-                checkpoint-format change (store pack_id per slot, or key index \
-                entries by pack_id) before this can pass."]
     fn repack_persisted_checkpoint_reload_resolves_record_by_post_repack_offset() {
         let dir = test_dir("repack_persists_checkpoint_read");
         let wal = dir.join("wal.bin");
@@ -8112,6 +8163,51 @@ mod tests {
             got.map(|data| data.bytes.to_vec()),
             Some(b"first".to_vec()),
             "the reloaded index must resolve the record through its post-repack shard offset"
+        );
+    }
+
+    #[test]
+    fn repack_persists_checkpoint_so_fresh_cold_open_survives_retirement() {
+        // Same failure shape as the read-journal test above, but through the
+        // *plain* open() path and no journal at all. After repack, the
+        // checkpoint's pack set is exactly the live pack set (one pack), so
+        // a fresh open's fingerprint matches exactly and the exact-pack gate
+        // takes no action (replay_needed is false) — the checkpoint's raw
+        // index slots are trusted directly. A brand-new reader's own
+        // discover_shards, seeing only that one surviving pack from an
+        // empty slot table, assigns it local slot 0; the checkpoint's index
+        // still names the writer's slot 1 (assigned before the original
+        // slot-0 shard was retired). Without the pack-table remap, get()
+        // resolves against the wrong (nonexistent, for this reader) slot.
+        let dir = test_dir("repack_persists_checkpoint_cold_open");
+        let collection = [0x52u8; 16];
+        let node = [0x62u8; 16];
+
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer
+            .put(
+                &collection,
+                &node,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+
+        writer
+            .repack_collection_reachable(&collection, |_hash, _data| Vec::new())
+            .unwrap();
+        drop(writer);
+
+        // Fresh process-equivalent open: no history, no shard ever open
+        // before this point, so this reader's own discover_shards renumbers
+        // from scratch.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let got = reopened.get(&collection, &node).unwrap();
+        assert_eq!(
+            got.map(|data| data.bytes.to_vec()),
+            Some(b"first".to_vec()),
+            "a fresh cold open after repack must resolve the record through \
+             the checkpoint's pack table, not the writer's raw (unstable) slot number"
         );
     }
 
