@@ -198,6 +198,7 @@ mod tests {
                         collection_id,
                         hash: [u8::try_from(index).expect("fixture index fits in u8"); 16],
                         data: Bytes::from_static(b"payload"),
+                        metadata: None,
                     },
                 )
                 .unwrap();

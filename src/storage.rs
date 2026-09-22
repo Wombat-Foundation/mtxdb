@@ -20,6 +20,82 @@ use parking_lot::RwLock;
 /// lookup ID matches the requested ID.
 pub type NodeId = [u8; 16];
 
+/// A 256-bit content digest.
+///
+/// This is the general-purpose digest type used for full logical identities
+/// and content hashes. It is deliberately algorithm-agnostic: which function
+/// produced the bytes is recorded separately (see [`DigestAlgorithm`]), so the
+/// storage layer is not pinned to SHA-256 and a template or configuration can
+/// select SHA-512, BLAKE3, or another 256-bit output without changing record
+/// layout.
+pub type Digest32 = [u8; 32];
+
+/// The hash function used to produce a [`Digest32`].
+///
+/// Only [`DigestAlgorithm::Sha256`] is implemented today; the enum exists so
+/// the on-disk metadata can name the algorithm per record and so adding a new
+/// one is additive rather than a format break. Unknown algorithm ids decoded
+/// from disk are preserved as [`DigestAlgorithm::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DigestAlgorithm {
+    /// SHA-256 (FIPS 180-4). The default and currently the only implemented
+    /// algorithm.
+    #[default]
+    Sha256,
+    /// An algorithm this build does not recognize, preserved so a newer
+    /// writer's digests round-trip without being reinterpreted.
+    Unknown(u8),
+}
+
+impl DigestAlgorithm {
+    /// The stable on-disk identifier for this algorithm.
+    #[must_use]
+    pub fn id(self) -> u8 {
+        match self {
+            Self::Sha256 => 0x01,
+            Self::Unknown(id) => id,
+        }
+    }
+
+    /// Reconstruct an algorithm from its on-disk identifier.
+    #[must_use]
+    pub fn from_id(id: u8) -> Self {
+        match id {
+            0x01 => Self::Sha256,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Hash `data`, producing a [`Digest32`].
+    ///
+    /// # Panics
+    /// Panics if called on [`DigestAlgorithm::Unknown`], which has no
+    /// implementation in this build.
+    #[must_use]
+    pub fn digest(self, data: &[u8]) -> Digest32 {
+        match self {
+            Self::Sha256 => {
+                use sha2::Digest as _;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(data);
+                hasher.finalize().into()
+            }
+            Self::Unknown(id) => {
+                panic!("cannot hash with unimplemented digest algorithm id {id:#04x}")
+            }
+        }
+    }
+}
+
+/// Compute the content digest of `data` under `algorithm`.
+///
+/// # Panics
+/// Panics if `algorithm` is [`DigestAlgorithm::Unknown`].
+#[must_use]
+pub fn content_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Digest32 {
+    algorithm.digest(data)
+}
+
 /// Opaque node data as raw bytes (the encoded HAMT node or PDU).
 #[derive(Debug, Clone)]
 pub struct NodeData {
@@ -321,6 +397,31 @@ mod tests {
     use std::error::Error;
 
     const TEST_COLLECTION: [u8; 16] = [0x01; 16];
+
+    #[test]
+    fn digest_algorithm_ids_roundtrip_and_hash() {
+        // The default id is stable and round-trips.
+        assert_eq!(DigestAlgorithm::Sha256.id(), 0x01);
+        assert_eq!(DigestAlgorithm::from_id(0x01), DigestAlgorithm::Sha256);
+
+        // An unknown id is preserved rather than reinterpreted.
+        assert_eq!(
+            DigestAlgorithm::from_id(0x7f),
+            DigestAlgorithm::Unknown(0x7f)
+        );
+        assert_eq!(DigestAlgorithm::from_id(0x7f).id(), 0x7f);
+
+        // SHA-256 matches the reference digest for a known vector.
+        let digest = content_digest(DigestAlgorithm::Sha256, b"abc");
+        assert_eq!(
+            digest,
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+    }
 
     #[test]
     fn test_in_memory_roundtrip() {
