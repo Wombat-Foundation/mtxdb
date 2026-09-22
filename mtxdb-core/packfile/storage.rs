@@ -1571,6 +1571,7 @@ impl PackfileStorage {
                 &open_shards,
                 &deleted_collections,
                 writable,
+                false,
                 index_config,
                 &mut timings,
             )
@@ -2026,6 +2027,20 @@ impl PackfileStorage {
     /// delta log's base fingerprint (the checkpoint's) and each collection's
     /// checkpoint generation. A malformed or semantically inconsistent log
     /// makes this function return `None`, selecting the full rescan path.
+    ///
+    /// `read_journal_reload` selects the read-committed overlay's reload mode
+    /// (see `reload_index_from_checkpoint`): the caller is a read-only worker
+    /// advancing its index/coverage pair to a writer's checkpoint, not a
+    /// session opening the store. In that mode the exact-pack fingerprint gate
+    /// and the delta-log replay are skipped. A writer that is still appending
+    /// has already grown the live packs past the checkpoint, and the delta log
+    /// may not yet cover that growth, so the gate would reject the checkpoint
+    /// and fail the read closed — the failure mode that otherwise looks like a
+    /// persistent miss. The overlay is authoritative for the post-checkpoint
+    /// suffix, so the durable index only needs the checkpoint's base, and its
+    /// coverage binds to exactly that base. The checkpoint itself must still be
+    /// valid; only the "packs match exactly / log bridges to live" checks are
+    /// dropped.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
     fn checkpoint_scan_out(
@@ -2035,6 +2050,7 @@ impl PackfileStorage {
         open_shards: &[(u16, u64, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
         writable: bool,
+        read_journal_reload: bool,
         index_config: crate::index::IndexConfig,
         timings: &mut OpenTimings,
     ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
@@ -2079,7 +2095,11 @@ impl PackfileStorage {
         // any leftover log is stale — likely a crashed full rewrite that had
         // already committed the new checkpoint but not yet deleted its
         // predecessor log. Never replayed; removed on a writable open.
-        let replay_needed = local_fingerprint != checkpoint.fingerprint;
+        // A read-journal reload deliberately skips the exact-pack gate and the
+        // delta replay (see this function's doc): the overlay supplies the
+        // committed suffix, and requiring the live pack set to match would fail
+        // the read closed while a writer is still appending.
+        let replay_needed = !read_journal_reload && local_fingerprint != checkpoint.fingerprint;
         if !replay_needed && writable {
             let _ = std::fs::remove_file(&delta_path);
         }
@@ -5687,6 +5707,7 @@ impl PackfileStorage {
                 &open_shards,
                 &deleted_collections,
                 false,
+                true,
                 self.index_config,
                 &mut timings,
             )
@@ -7941,6 +7962,91 @@ mod tests {
             Some(&b"second"[..]),
             "the post-checkpoint group must be served from the overlay"
         );
+    }
+
+    #[test]
+    fn read_committed_reload_skips_the_exact_pack_gate() {
+        let dir = test_dir("read_committed_reload_skip_gate");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Bu8; 16];
+        let first = [0x31u8; 16];
+        let second = [0x32u8; 16];
+        let third = [0x33u8; 16];
+
+        // Durable seed, then an empty segment the reader can attach to.
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x97u8; 16],
+            &[0x97u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+        let (journal, _) = Journal::open(&wal).unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        // Force the writer's next sync to write a full checkpoint so coverage
+        // advances and the segment is reclaimed through it.
+        fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer
+            .put(
+                &collection,
+                &first,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let checkpoint = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+        assert_eq!(checkpoint.covered_lsn, 1);
+
+        // A synced second record extends the delta log.
+        writer
+            .put(
+                &collection,
+                &second,
+                &NodeData::new(bytes::Bytes::from_static(b"second")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+
+        // A third record is appended (eagerly) but never synced, so the live
+        // packs grow past the delta log's tail. An exact-pack gate would reject
+        // the checkpoint here and fail the read closed; the read-journal reload
+        // must skip that gate and let the overlay supply the suffix.
+        writer
+            .put(
+                &collection,
+                &third,
+                &NodeData::new(bytes::Bytes::from_static(b"third")),
+            )
+            .unwrap();
+
+        let read_committed = store
+            .get_read_committed(&collection, &[first, second, third])
+            .unwrap();
+        assert!(
+            store.stats().read_reloads >= 1,
+            "the reclaim must have driven the read-journal reload path"
+        );
+        for (value, expected) in read_committed
+            .iter()
+            .zip([&b"first"[..], b"second", b"third"])
+        {
+            assert_eq!(
+                value.as_ref().map(|data| data.bytes.as_ref()),
+                Some(expected),
+                "every committed record must be visible after a gated reload"
+            );
+        }
     }
 
     #[test]
