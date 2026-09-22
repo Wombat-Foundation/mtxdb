@@ -3,7 +3,21 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-/// A node ID is a 16-byte structural hash.
+/// A 128-bit lookup identity for a record within a collection.
+///
+/// A `NodeId` is an opaque key chosen by the caller — it is not necessarily a
+/// hash of [`NodeData::bytes`], and not all `NodeId` values are derived from
+/// a digest algorithm. Some are fixed constants (e.g. auxiliary-index
+/// sentinels), protocol-level identities (e.g. Matrix event IDs hashed by
+/// Synapse's own derivation), or application-defined keys.
+///
+/// # 256-bit payload digest
+///
+/// The current `NodeId` is 128-bit and cannot double as a full payload digest.
+/// A 256-bit payload digest belongs in pack-record metadata and should be
+/// computed by the storage layer on write, not supplied by application callers.
+/// Until that metadata field exists, reads verify only that the stored 128-bit
+/// lookup ID matches the requested ID.
 pub type NodeId = [u8; 16];
 
 /// Opaque node data as raw bytes (the encoded HAMT node or PDU).
