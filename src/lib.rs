@@ -50,9 +50,9 @@ pub use matrix_policy::{
     EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
 };
-pub use packfile::{storage::PackfileStorage, Record};
+pub use packfile::{storage::PackfileStorage, FrameMetadata, Record};
 pub use shard::ShardPool;
-pub use storage::{NodeData, NodeId, StorageEngine};
+pub use storage::{content_digest, Digest32, DigestAlgorithm, NodeData, NodeId, StorageEngine};
 pub use template::{
     CollectionKeyRule, CollectionTemplate, PayloadPolicy, RecordIdentityRule,
     COLLECTION_TEMPLATE_FORMAT_V1,

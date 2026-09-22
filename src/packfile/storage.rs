@@ -14,14 +14,26 @@ use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELT
 use crate::index::format::DeltaFrame;
 use crate::index::{InsertError, LossyIndex, SlotUndo};
 use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
-use crate::packfile::{self, Record};
+use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
-use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
+use crate::storage::{
+    Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef, StorageEngine, StorageError,
+};
 
 /// Callback that rewrites a node's child references given resolved child data,
 /// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
+
+/// Lowercase hex rendering of a 32-byte digest, for error messages.
+fn hex32(digest: &Digest32) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
 /// Result of [`PackfileStorage::plan_collection_repack`] — what a real repack
 /// of this collection would do, computed exactly (same scan + reachability
@@ -4008,6 +4020,7 @@ impl PackfileStorage {
             collection_id: *collection_id,
             hash: record.hash,
             data: record.data,
+            metadata: record.metadata,
         })?;
         Ok(Some((record.hash, new_shard_id, new_offset)))
     }
@@ -5995,6 +6008,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
+        metadata: Option<FrameMetadata>,
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
@@ -6002,6 +6016,7 @@ impl PackfileStorage {
             collection_id: *collection_id,
             hash: *id,
             data: data.bytes.clone(),
+            metadata,
         };
         let (shard_id, offset) = self.shards.put_record(&record)?;
         self.publish_mutation(|| JournalMutation::Put {
@@ -6084,11 +6099,13 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
+        metadata: Option<FrameMetadata>,
     ) -> Result<(u16, u64), StorageError> {
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
             data: data.bytes.clone(),
+            metadata,
         };
         let location = self.shards.put_record(&record)?;
         self.publish_mutation(|| JournalMutation::Put {
@@ -6097,6 +6114,59 @@ impl PackfileStorage {
             payload: data.bytes.to_vec(),
         })?;
         Ok(location)
+    }
+
+    /// Store a record after verifying that its bytes hash to `expected_digest`,
+    /// attaching versioned metadata (logical id, content digest, role) to the
+    /// frame so readers can recover it without decoding a caller-supplied
+    /// addressing scheme.
+    ///
+    /// This is the verify-on-write entry point for callers that already know
+    /// the content digest they expect (e.g. a Matrix event's canonical
+    /// content hash). The digest is recomputed over the exact bytes being
+    /// stored; a mismatch is rejected *before* anything is appended, so a
+    /// corrupt or mis-addressed write never becomes durable.
+    ///
+    /// `logical_id` is the full 256-bit logical identity (e.g. the digest of
+    /// the event id) stored in the metadata; it is independent of the
+    /// 16-byte `id` used as the index key, which survives redaction.
+    ///
+    /// The digest function is caller-selectable via `algorithm` so a template
+    /// or configuration can choose SHA-256 today and BLAKE3/SHA-512 later
+    /// without a format break; the chosen algorithm is recorded in the frame
+    /// metadata.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] when the digest of `data` under
+    /// `algorithm` does not equal `expected_digest`, and propagates any error
+    /// from the underlying put.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_verified(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        logical_id: &Digest32,
+        algorithm: DigestAlgorithm,
+        expected_digest: &Digest32,
+        role: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
+        let digest = crate::storage::content_digest(algorithm, &data.bytes);
+        if &digest != expected_digest {
+            return Err(StorageError::Corrupt(format!(
+                "content digest mismatch: expected {}, got {}",
+                hex32(expected_digest),
+                hex32(&digest)
+            )));
+        }
+        let metadata = FrameMetadata {
+            logical_id: Some(*logical_id),
+            content_digest: Some(digest),
+            digest_algorithm: algorithm,
+            role: role.map(<[u8]>::to_vec),
+            unknown: Vec::new(),
+        };
+        self.put_internal(collection_id, id, data, Some(metadata))
     }
 
     fn prepare_put_many_progress(
@@ -6151,6 +6221,7 @@ impl PackfileStorage {
                 collection_id: *collection_id,
                 hash: *id,
                 data: data.bytes.clone(),
+                metadata: None,
             })?;
         }
         self.put_many_calls.fetch_add(1, Ordering::Relaxed);
@@ -6171,6 +6242,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
+        metadata: Option<FrameMetadata>,
     ) -> Result<(), StorageError> {
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
@@ -6190,7 +6262,7 @@ impl PackfileStorage {
             None
         };
 
-        let (shard_id, offset) = self.append_put_record(collection_id, id, data)?;
+        let (shard_id, offset) = self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
                 if let Ok((bucket, slot)) =
@@ -6301,7 +6373,15 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
+        if let Some(metadatas) = metadatas {
+            debug_assert_eq!(
+                metadatas.len(),
+                entries.len(),
+                "per-entry metadata must align with entries"
+            );
+        }
         if !self.validate_put_many_inputs(collection_id, entries)? {
             return Ok(0);
         }
@@ -6344,11 +6424,13 @@ impl PackfileStorage {
             }};
         }
 
-        for (id, data) in entries {
+        for (index, (id, data)) in entries.iter().enumerate() {
+            let metadata = metadatas.and_then(|m| m.get(index)).cloned().flatten();
             if let Err(error) = self.append_put_many_entry(
                 collection_id,
                 id,
                 data,
+                metadata,
                 old_gen.as_deref().map(|generation| &**generation),
                 &mut progress,
             ) {
@@ -6578,7 +6660,7 @@ impl StorageEngine for PackfileStorage {
         id: &NodeId,
         data: &NodeData,
     ) -> Result<(), StorageError> {
-        self.put_internal(collection_id, id, data)
+        self.put_internal(collection_id, id, data, None)
     }
 
     fn put_many(
@@ -6586,7 +6668,7 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError> {
-        self.put_many_internal(collection_id, entries)
+        self.put_many_internal(collection_id, entries, None)
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -11489,6 +11571,7 @@ mod tests {
                 collection_id: [0x01; 16],
                 hash: [0xAA; 16],
                 data: bytes::Bytes::from_static(b"hello"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -12620,5 +12703,118 @@ mod tests {
             found, total,
             "lost writes during concurrent put+reachable-repack"
         );
+    }
+
+    /// Collect the metadata of every record in every pack file under `dir`.
+    fn all_record_metadata(dir: &std::path::Path) -> Vec<FrameMetadata> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "pack") {
+                let mut file = fs::File::open(&path).unwrap();
+                file.seek(SeekFrom::Start(packfile::HEADER_LEN as u64))
+                    .unwrap();
+                while let Some(record) = packfile::read_record_metadata(&mut file).unwrap() {
+                    if let Some(metadata) = record.metadata {
+                        found.push(metadata);
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// `put_verified` must reject a mismatched digest before writing anything,
+    /// and accept a matching digest while attaching the full logical id,
+    /// content digest, algorithm, and role to the on-disk frame.
+    #[test]
+    fn put_verified_checks_digest_and_attaches_metadata() {
+        let dir = test_dir("put_verified_metadata");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x31; 16];
+        let id = [0x32; 16];
+        let payload = b"canonical event bytes";
+        let data = NodeData::new(bytes::Bytes::from_static(payload));
+        let logical_id = [0x77; 32];
+        let digest = crate::storage::content_digest(DigestAlgorithm::Sha256, payload);
+
+        // A wrong expected digest is rejected and leaves no record behind.
+        let mut wrong = digest;
+        wrong[0] ^= 0xff;
+        let error = store
+            .put_verified(
+                &collection,
+                &id,
+                &data,
+                &logical_id,
+                DigestAlgorithm::Sha256,
+                &wrong,
+                Some(b"event"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Corrupt(_)), "got {error:?}");
+        assert!(store.get(&collection, &id).unwrap().is_none());
+        assert_eq!(all_record_metadata(&dir), Vec::new());
+
+        // The matching digest succeeds.
+        store
+            .put_verified(
+                &collection,
+                &id,
+                &data,
+                &logical_id,
+                DigestAlgorithm::Sha256,
+                &digest,
+                Some(b"event"),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(
+            store.get(&collection, &id).unwrap().map(|d| d.bytes),
+            Some(bytes::Bytes::from_static(payload))
+        );
+
+        let metadatas = all_record_metadata(&dir);
+        assert_eq!(metadatas.len(), 1);
+        let metadata = &metadatas[0];
+        assert_eq!(metadata.logical_id, Some(logical_id));
+        assert_eq!(metadata.content_digest, Some(digest));
+        assert_eq!(metadata.digest_algorithm, DigestAlgorithm::Sha256);
+        assert_eq!(metadata.role.as_deref(), Some(&b"event"[..]));
+
+        // Read path reconstructs metadata too (via `read_record_metadata`).
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.get(&collection, &id).unwrap().map(|d| d.bytes),
+            Some(bytes::Bytes::from_static(payload))
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A generic `put` (metadata `None`) must not grow frames or set the
+    /// metadata flag, so existing workloads see byte-identical records.
+    #[test]
+    fn plain_put_writes_no_metadata() {
+        let dir = test_dir("plain_put_no_metadata");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x41; 16];
+        let id = [0x42; 16];
+        store
+            .put(
+                &collection,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"plain")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(all_record_metadata(&dir), Vec::new());
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
     }
 }

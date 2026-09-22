@@ -8,6 +8,8 @@ use std::path::Path;
 
 use bytes::Bytes;
 
+use crate::storage::DigestAlgorithm;
+
 /// Magic bytes identifying an mtxdb packfile: "MTDB"
 pub const MAGIC: [u8; 4] = *b"MTDB";
 
@@ -68,6 +70,40 @@ pub const MAX_RECORD_LEN: u32 = 64 * 1024;
 /// (which duplicates this module's frame layout for zero-copy reads) shares
 /// the same flag bit instead of hardcoding it.
 pub const FLAG_COMPRESSED: u8 = 0x01;
+
+/// Per-frame flag: a versioned, length-delimited metadata area follows the
+/// fixed header and precedes the node bytes (see [`FrameMetadata`]).
+///
+/// Metadata is stored **outside** the (possibly compressed) node bytes so a
+/// reader can inspect identity/role without decompressing, and so generic
+/// records with no metadata are byte-for-byte unchanged. A reader that does
+/// not understand this flag MUST reject the frame rather than misparse it;
+/// the byte layout differs from the flag's absence.
+pub const FLAG_METADATA: u8 = 0x04;
+
+/// Any flag bit a v4 reader understands. A frame carrying a bit outside this
+/// mask is rejected rather than misparsed.
+const KNOWN_FLAGS: u8 = FLAG_COMPRESSED | FLAG_CRC_DISABLED | FLAG_METADATA;
+
+/// Version byte for the optional per-frame metadata area.
+pub const METADATA_VERSION: u8 = 0x01;
+
+/// TLV type: the full 256-bit logical identity digest. The value is exactly
+/// 32 bytes.
+pub const META_TAG_LOGICAL_ID: u8 = 0x01;
+
+/// TLV type: the optional 256-bit content digest of the stored bytes. The
+/// value is exactly 32 bytes. Distinct from [`META_TAG_LOGICAL_ID`]: a
+/// content digest is an attribute of a stored version, not an identity.
+pub const META_TAG_CONTENT_DIGEST: u8 = 0x02;
+
+/// TLV type: a role/schema identifier (UTF-8 bytes, length-delimited).
+pub const META_TAG_ROLE: u8 = 0x03;
+
+/// TLV type: the algorithm that produced [`META_TAG_CONTENT_DIGEST`]. The
+/// value is exactly 1 byte, matching [`DigestAlgorithm::id`]. Absent means the
+/// reader should assume the default algorithm (SHA-256) for older writers.
+pub const META_TAG_DIGEST_ALGORITHM: u8 = 0x04;
 
 /// Per-frame flag: the 4-byte checksum field holds zeros, not a real CRC32,
 /// and must not be verified by any reader. Written when the store was
@@ -226,6 +262,192 @@ pub struct Record {
     pub hash: [u8; 16],
     /// The opaque node payload.
     pub data: Bytes,
+    /// Optional versioned per-record metadata (see [`FrameMetadata`]). `None`
+    /// for a generic frame, which is byte-for-byte identical to a v4 record
+    /// with no metadata area.
+    pub metadata: Option<FrameMetadata>,
+}
+
+/// Optional, versioned metadata carried in a frame when [`FLAG_METADATA`] is
+/// set. Stored between the fixed header and the node bytes, outside any
+/// compression, so it can be inspected without decompressing.
+///
+/// The layout on disk is:
+///
+/// ```text
+/// [u8 metadata_version]  — must equal METADATA_VERSION
+/// [u32 metadata_len]     — byte length of the TLV block below (little-endian)
+/// [TLV block]            — metadata_len bytes, each entry:
+///     [u8 tag][u32 value_len][value_len bytes]
+/// ```
+///
+/// The metadata bytes and the `metadata_len` field are inside the frame's
+/// CRC-covered region. Unknown tags are preserved by the codec so a reader
+/// built against a newer writer can round-trip fields it does not interpret.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FrameMetadata {
+    /// Full 256-bit logical identity digest, if the template supplies one.
+    pub logical_id: Option<[u8; 32]>,
+    /// 256-bit digest of the stored bytes for this version, if supplied.
+    pub content_digest: Option<[u8; 32]>,
+    /// The hash function that produced [`Self::content_digest`]. Defaults to
+    /// SHA-256; recorded per record so a template or configuration can choose
+    /// another 256-bit algorithm without a format break.
+    pub digest_algorithm: DigestAlgorithm,
+    /// Role/schema identifier, if supplied.
+    pub role: Option<Vec<u8>>,
+    /// Tags this build does not interpret, preserved verbatim so a
+    /// read/rewrite cycle does not discard a newer writer's fields.
+    pub unknown: Vec<(u8, Vec<u8>)>,
+}
+
+impl FrameMetadata {
+    /// Whether this metadata carries no fields at all. A frame with empty
+    /// metadata is encoded without [`FLAG_METADATA`], so it stays
+    /// byte-identical to a generic record.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.logical_id.is_none()
+            && self.content_digest.is_none()
+            && self.role.is_none()
+            && self.unknown.is_empty()
+    }
+
+    /// Encode the `[metadata_version][metadata_len][TLV...]` block.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if the TLV block exceeds `u32::MAX` bytes.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut tlv = Vec::new();
+        if let Some(id) = &self.logical_id {
+            push_tlv(&mut tlv, META_TAG_LOGICAL_ID, id)?;
+        }
+        if let Some(digest) = &self.content_digest {
+            push_tlv(&mut tlv, META_TAG_CONTENT_DIGEST, digest)?;
+            // The algorithm is only meaningful alongside a digest. Emit it
+            // even for the default so the on-disk record is self-describing
+            // rather than relying on a reader-side default.
+            push_tlv(
+                &mut tlv,
+                META_TAG_DIGEST_ALGORITHM,
+                &[self.digest_algorithm.id()],
+            )?;
+        }
+        if let Some(role) = &self.role {
+            push_tlv(&mut tlv, META_TAG_ROLE, role)?;
+        }
+        for (tag, value) in &self.unknown {
+            push_tlv(&mut tlv, *tag, value)?;
+        }
+        let len = u32::try_from(tlv.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame metadata too large"))?;
+        let mut out = Vec::with_capacity(1usize.saturating_add(4).saturating_add(tlv.len()));
+        out.push(METADATA_VERSION);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&tlv);
+        Ok(out)
+    }
+
+    /// Decode a metadata block from `bytes`, returning the metadata and the
+    /// number of bytes consumed.
+    ///
+    /// # Errors
+    /// Returns `InvalidData` on an unsupported version, a truncated block, a
+    /// mismatched declared length, or a duplicate/known-tag length violation.
+    pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let version = *bytes
+            .first()
+            .ok_or_else(|| invalid_data("frame metadata: missing version byte"))?;
+        if version != METADATA_VERSION {
+            return Err(invalid_data(&format!(
+                "frame metadata: unsupported version {version}"
+            )));
+        }
+        let len_bytes: [u8; 4] = bytes
+            .get(1..5)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| invalid_data("frame metadata: truncated length"))?;
+        let tlv_len = u32::from_le_bytes(len_bytes) as usize;
+        let tlv_start = 5usize;
+        let tlv_end = tlv_start
+            .checked_add(tlv_len)
+            .ok_or_else(|| invalid_data("frame metadata: length overflow"))?;
+        let tlv = bytes
+            .get(tlv_start..tlv_end)
+            .ok_or_else(|| invalid_data("frame metadata: truncated TLV block"))?;
+
+        let mut metadata = Self::default();
+        let mut cursor = 0usize;
+        while cursor < tlv.len() {
+            let tag = *tlv
+                .get(cursor)
+                .ok_or_else(|| invalid_data("frame metadata: truncated tag"))?;
+            let value_len_start = cursor
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("frame metadata: cursor overflow"))?;
+            let value_len_end = cursor
+                .checked_add(5)
+                .ok_or_else(|| invalid_data("frame metadata: cursor overflow"))?;
+            let value_len_bytes: [u8; 4] = tlv
+                .get(value_len_start..value_len_end)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid_data("frame metadata: truncated value length"))?;
+            let value_len = u32::from_le_bytes(value_len_bytes) as usize;
+            let value_start = value_len_end;
+            let value_end = value_start
+                .checked_add(value_len)
+                .ok_or_else(|| invalid_data("frame metadata: value length overflow"))?;
+            let value = tlv
+                .get(value_start..value_end)
+                .ok_or_else(|| invalid_data("frame metadata: truncated value"))?;
+            match tag {
+                META_TAG_LOGICAL_ID => {
+                    metadata.logical_id = Some(expect_32(value, "logical_id")?);
+                }
+                META_TAG_CONTENT_DIGEST => {
+                    metadata.content_digest = Some(expect_32(value, "content_digest")?);
+                }
+                META_TAG_DIGEST_ALGORITHM => {
+                    let id = *value
+                        .first()
+                        .ok_or_else(|| invalid_data("frame metadata: empty digest_algorithm"))?;
+                    if value.len() != 1 {
+                        return Err(invalid_data(
+                            "frame metadata: digest_algorithm must be 1 byte",
+                        ));
+                    }
+                    metadata.digest_algorithm = DigestAlgorithm::from_id(id);
+                }
+                META_TAG_ROLE => metadata.role = Some(value.to_vec()),
+                _ => metadata.unknown.push((tag, value.to_vec())),
+            }
+            cursor = value_end;
+        }
+
+        Ok((metadata, tlv_end))
+    }
+}
+
+fn push_tlv(out: &mut Vec<u8>, tag: u8, value: &[u8]) -> io::Result<()> {
+    let len = u32::try_from(value.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame metadata value too large",
+        )
+    })?;
+    out.push(tag);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn expect_32(value: &[u8], field: &str) -> io::Result<[u8; 32]> {
+    <[u8; 32]>::try_from(value)
+        .map_err(|_| invalid_data(&format!("frame metadata: {field} must be 32 bytes")))
+}
+
+fn invalid_data(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
 /// Read a record length prefix, distinguishing clean EOF from a torn prefix.
@@ -365,7 +587,16 @@ pub(crate) fn encode_record_with_options(
 ) -> io::Result<Vec<u8>> {
     let uncompressed_len =
         u32::try_from(record.data.len()).expect("record payload exceeds u32::MAX");
+    let metadata_block = match &record.metadata {
+        Some(metadata) if !metadata.is_empty() => Some(metadata.encode()?),
+        _ => None,
+    };
+    let metadata_len = metadata_block.as_ref().map_or(0, |block| {
+        u32::try_from(block.len()).expect("bounded below")
+    });
     let plaintext_frame_len = FRAME_FIXED_LEN
+        .checked_add(metadata_len)
+        .expect("record frame length exceeds u32::MAX")
         .checked_add(uncompressed_len)
         .expect("record frame length exceeds u32::MAX");
     if plaintext_frame_len > MAX_RECORD_LEN {
@@ -382,13 +613,18 @@ pub(crate) fn encode_record_with_options(
         Some(c) if c.len() < record.data.len() => (FLAG_COMPRESSED, c.as_slice()),
         _ => (0, &record.data),
     };
-    let flags = if write_checksum {
+    let mut flags = if write_checksum {
         base_flags
     } else {
         base_flags | FLAG_CRC_DISABLED
     };
+    if metadata_block.is_some() {
+        flags |= FLAG_METADATA;
+    }
 
     let frame_len = FRAME_FIXED_LEN
+        .checked_add(metadata_len)
+        .expect("bounded by MAX_RECORD_LEN")
         .checked_add(u32::try_from(node_bytes.len()).expect("bounded by MAX_RECORD_LEN"))
         .expect("bounded by MAX_RECORD_LEN");
     let total_len = 4_u64.wrapping_add(u64::from(frame_len)).wrapping_add(4);
@@ -406,15 +642,19 @@ pub(crate) fn encode_record_with_options(
     buf.extend_from_slice(&uncompressed_len.to_le_bytes());
     buf.extend_from_slice(&record.collection_id);
     buf.extend_from_slice(&record.hash);
+    if let Some(block) = &metadata_block {
+        buf.extend_from_slice(block);
+    }
     buf.extend_from_slice(node_bytes);
 
-    // CRC covers len + flags + uncompressed_len + collection_id + hash + node_bytes,
-    // i.e. the bytes as written to disk (compressed, when compressed) —
-    // exactly `buf`'s contents so far, hashed in one pass since CRC32
-    // over one contiguous buffer is identical to the same bytes hashed
-    // via several `update` calls. Under a period of `write_checksum ==
-    // false` the field is written as zeros (with FLAG_CRC_DISABLED set
-    // above) and no hashing pass happens at all.
+    // CRC covers len + flags + uncompressed_len + collection_id + hash +
+    // metadata + node_bytes, i.e. the bytes as written to disk (metadata
+    // included, node bytes compressed when compressed) — exactly `buf`'s
+    // contents so far, hashed in one pass since CRC32 over one contiguous
+    // buffer is identical to the same bytes hashed via several `update`
+    // calls. Under a period of `write_checksum == false` the field is
+    // written as zeros (with FLAG_CRC_DISABLED set above) and no hashing
+    // pass happens at all.
     let checksum = if write_checksum {
         let mut crc = crc32fast::Hasher::new();
         crc.update(&buf);
@@ -463,7 +703,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     reader.read_exact(&mut crc_buf)?;
 
     let flags = payload[0];
-    if flags & !(FLAG_COMPRESSED | FLAG_CRC_DISABLED) != 0 {
+    if flags & !KNOWN_FLAGS != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported record flags: {flags:#04x}"),
@@ -493,7 +733,18 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     collection_id.copy_from_slice(&payload[5..21]);
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&payload[21..37]);
-    let node_bytes = &payload[37..];
+
+    // Optional metadata sits between the fixed header and the node bytes.
+    let rest = &payload[37..];
+    let (metadata, node_bytes) = if flags & FLAG_METADATA != 0 {
+        let (metadata, consumed) = FrameMetadata::decode(rest)?;
+        let node_bytes = rest
+            .get(consumed..)
+            .ok_or_else(|| invalid_data("frame metadata consumes past payload"))?;
+        (Some(metadata), node_bytes)
+    } else {
+        (None, rest)
+    };
 
     let data = if flags & FLAG_COMPRESSED != 0 {
         if uncompressed_len > MAX_DATA_LEN {
@@ -540,18 +791,21 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
         collection_id,
         hash,
         data,
+        metadata,
     }))
 }
 
 /// A frame's `collection_id`/`hash` metadata, without its node payload — what
 /// [`scan_packfile`]/[`scan_packfile_from`]/[`scan_and_recover_packfile`]
 /// actually need. See [`read_record_metadata`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordMetadata {
     /// The collection this record belongs to.
     pub collection_id: [u8; 16],
     /// The structural hash framed alongside the record.
     pub hash: [u8; 16],
+    /// Optional per-record metadata, if the frame carried [`FLAG_METADATA`].
+    pub metadata: Option<FrameMetadata>,
 }
 
 /// Buffer size for streaming node bytes through [`read_record_metadata`]
@@ -572,6 +826,13 @@ struct FrameHeader {
     fixed: [u8; FRAME_FIXED_LEN as usize],
     collection_id: [u8; 16],
     hash: [u8; 16],
+    /// Optional metadata parsed from the frame, if [`FLAG_METADATA`] was set.
+    metadata: Option<FrameMetadata>,
+    /// The raw on-disk metadata block (`[version][len][TLV...]`), empty when
+    /// absent. Retained so callers can feed it into the frame CRC (the block
+    /// is covered by the checksum) and subtract its length from `frame_len`
+    /// to find the node-bytes region.
+    metadata_block: Vec<u8>,
 }
 
 /// Read and validate the frame length prefix and fixed header, returning the
@@ -594,12 +855,46 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
     reader.read_exact(&mut fixed)?;
 
     let flags = fixed[0];
-    if flags & !(FLAG_COMPRESSED | FLAG_CRC_DISABLED) != 0 {
+    if flags & !KNOWN_FLAGS != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported record flags: {flags:#04x}"),
         ));
     }
+
+    // Read the optional metadata block (version byte + u32 length + TLV).
+    let (metadata, metadata_block) = if flags & FLAG_METADATA != 0 {
+        let mut prefix = [0u8; 5];
+        reader.read_exact(&mut prefix)?;
+        let version = prefix[0];
+        if version != METADATA_VERSION {
+            return Err(invalid_data(&format!(
+                "frame metadata: unsupported version {version}"
+            )));
+        }
+        let tlv_len = u32::from_le_bytes(prefix[1..5].try_into().expect("fixed slice"));
+        let block_len = 5u32
+            .checked_add(tlv_len)
+            .ok_or_else(|| invalid_data("frame metadata: length overflow"))?;
+        let mut block = vec![0u8; usize::try_from(block_len).expect("u32 fits in usize")];
+        block[..5].copy_from_slice(&prefix);
+        reader.read_exact(&mut block[5..])?;
+        let (metadata, consumed) = FrameMetadata::decode(&block)?;
+        if consumed != block.len() {
+            return Err(invalid_data(
+                "frame metadata: trailing bytes after TLV block",
+            ));
+        }
+        (Some(metadata), block)
+    } else {
+        (None, Vec::new())
+    };
+    let metadata_len = u32::try_from(metadata_block.len()).expect("bounded by frame length");
+
+    let node_region_len = frame_len
+        .checked_sub(FRAME_FIXED_LEN)
+        .and_then(|len| len.checked_sub(metadata_len))
+        .ok_or_else(|| invalid_data("frame metadata overruns the frame"))?;
     let uncompressed_len = u32::from_le_bytes(fixed[1..5].try_into().unwrap());
     if flags & FLAG_COMPRESSED != 0 {
         if uncompressed_len > MAX_DATA_LEN {
@@ -608,18 +903,13 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
                 format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
             ));
         }
-    } else {
-        let node_bytes_len = frame_len
-            .checked_sub(FRAME_FIXED_LEN)
-            .expect("frame_len >= FRAME_FIXED_LEN, checked above");
-        if uncompressed_len != node_bytes_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "raw node length {node_bytes_len} != framed uncompressed_len {uncompressed_len}"
-                ),
-            ));
-        }
+    } else if uncompressed_len != node_region_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "raw node length {node_region_len} != framed uncompressed_len {uncompressed_len}"
+            ),
+        ));
     }
 
     let mut collection_id = [0u8; 16];
@@ -634,6 +924,8 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
         fixed,
         collection_id,
         hash,
+        metadata,
+        metadata_block,
     }))
 }
 
@@ -668,16 +960,19 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
         let mut crc = crc32fast::Hasher::new();
         crc.update(&header.len_buf);
         crc.update(&header.fixed);
+        crc.update(&header.metadata_block);
         Some(crc)
     } else {
         None
     };
 
-    // frame_len >= FRAME_FIXED_LEN is guaranteed by the range check above.
+    // frame_len >= FRAME_FIXED_LEN is guaranteed by the range check above;
+    // subtract the metadata block already consumed by read_frame_header.
     let mut remaining: usize = header
         .frame_len
         .checked_sub(FRAME_FIXED_LEN)
-        .expect("frame_len >= FRAME_FIXED_LEN, checked above")
+        .and_then(|len| len.checked_sub(u32::try_from(header.metadata_block.len()).ok()?))
+        .expect("frame_len >= FRAME_FIXED_LEN + metadata_len, checked in read_frame_header")
         as usize;
 
     // For a CRC-disabled frame the checksum field is zero and unused; the
@@ -711,6 +1006,7 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
     Ok(Some(RecordMetadata {
         collection_id: header.collection_id,
         hash: header.hash,
+        metadata: header.metadata,
     }))
 }
 
@@ -745,12 +1041,14 @@ fn read_record_metadata_skip_payload_with_end(
     };
 
     // The frame length excludes the four-byte CRC, while the fixed portion
-    // includes the metadata and flags but not the payload.
+    // includes the metadata and flags but not the node bytes or the
+    // already-consumed metadata block.
     let skip = u64::from(
         header
             .frame_len
             .checked_sub(FRAME_FIXED_LEN)
-            .expect("frame_len >= FRAME_FIXED_LEN, checked above"),
+            .and_then(|len| len.checked_sub(u32::try_from(header.metadata_block.len()).ok()?))
+            .expect("frame_len >= FRAME_FIXED_LEN + metadata_len, checked in read_frame_header"),
     ) + 4;
     let payload_start = reader.stream_position()?;
     let frame_end = payload_start
@@ -766,6 +1064,7 @@ fn read_record_metadata_skip_payload_with_end(
     Ok(Some(RecordMetadata {
         collection_id: header.collection_id,
         hash: header.hash,
+        metadata: header.metadata,
     }))
 }
 
@@ -1213,6 +1512,7 @@ mod tests {
             collection_id,
             hash,
             data: Bytes::copy_from_slice(data),
+            metadata: None,
         }
     }
 
@@ -1230,6 +1530,7 @@ mod tests {
             collection_id: [0xAA; 16],
             hash,
             data: Bytes::copy_from_slice(data),
+            metadata: None,
         }
     }
 
@@ -1284,6 +1585,87 @@ mod tests {
             assert_eq!(meta.collection_id, full.collection_id);
             assert_eq!(meta.hash, full.hash);
         }
+    }
+
+    /// A metadata-bearing frame must round-trip its metadata through both the
+    /// full `read_record` path and the metadata-only scan path, including
+    /// zero-copy-preserving structural fields.
+    #[test]
+    fn test_metadata_roundtrip() {
+        let metadata = FrameMetadata {
+            logical_id: Some([0x11; 32]),
+            content_digest: Some([0x22; 32]),
+            digest_algorithm: DigestAlgorithm::Sha256,
+            role: Some(b"canonical_event".to_vec()),
+            unknown: vec![(0x7f, vec![1, 2, 3])],
+        };
+        let record = Record {
+            collection_id: [0xAA; 16],
+            hash: [0xBB; 16],
+            data: Bytes::from_static(b"hello metadata"),
+            metadata: Some(metadata.clone()),
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &record).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let read = read_record(&mut cursor).unwrap().unwrap();
+        assert_eq!(read.data, record.data);
+        assert_eq!(read.metadata.as_ref(), Some(&metadata));
+
+        let mut cursor = Cursor::new(&buf);
+        let meta = read_record_metadata(&mut cursor).unwrap().unwrap();
+        assert_eq!(meta.metadata.as_ref(), Some(&metadata));
+
+        let mut cursor = Cursor::new(&buf);
+        let skipped = read_record_metadata_skip_payload(&mut cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.metadata.as_ref(), Some(&metadata));
+    }
+
+    /// The metadata flag must be set only when metadata is present; a record
+    /// with `None` (or empty) metadata stays byte-identical to a v4 frame with
+    /// no metadata area, so generic records pay nothing.
+    #[test]
+    fn test_no_metadata_frame_is_unchanged() {
+        let plain = test_record_raw([0xCC; 16], b"payload");
+        let mut plain_buf = Vec::new();
+        write_record(&mut plain_buf, &plain).unwrap();
+        assert_eq!(plain_buf[4] & FLAG_METADATA, 0);
+
+        let empty = Record {
+            metadata: Some(FrameMetadata::default()),
+            ..plain.clone()
+        };
+        let mut empty_buf = Vec::new();
+        write_record(&mut empty_buf, &empty).unwrap();
+        assert_eq!(empty_buf, plain_buf);
+    }
+
+    /// A metadata-bearing frame with a CRC-disabled policy must still write,
+    /// parse, and skip correctly (the metadata block is inside the frame's
+    /// CRC region, but CRC-disabled frames simply carry no checksum).
+    #[test]
+    fn test_metadata_with_crc_disabled() {
+        let record = Record {
+            collection_id: [0x01; 16],
+            hash: [0x02; 16],
+            data: Bytes::from_static(b"body"),
+            metadata: Some(FrameMetadata {
+                logical_id: Some([0x09; 32]),
+                ..FrameMetadata::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        encode_record_with_options(&record, true, false)
+            .map(|bytes| buf.extend_from_slice(&bytes))
+            .unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let read = read_record(&mut cursor).unwrap().unwrap();
+        assert_eq!(read.metadata, record.metadata);
+        assert_eq!(read.data, record.data);
     }
 
     /// A frame spanning multiple `SCAN_DISCARD_BUF_LEN`-sized chunks must
@@ -1500,6 +1882,7 @@ mod tests {
             collection_id: [0u8; 16],
             hash: [0u8; 16],
             data: Bytes::from_static(b"hello"),
+            metadata: None,
         };
         assert_eq!(r.serialized_len(), 4 + FRAME_FIXED_LEN as usize + 5 + 4);
     }
@@ -1510,6 +1893,7 @@ mod tests {
             collection_id: [0u8; 16],
             hash: [0u8; 16],
             data: Bytes::from(vec![0u8; MAX_RECORD_LEN as usize + 1]),
+            metadata: None,
         };
         let mut buf = Vec::new();
         let err = write_record(&mut buf, &r).unwrap_err();

@@ -2308,15 +2308,8 @@ impl ShardPool {
                 &mem[prefix_end..crc_pos],
                 mem[crc_pos..frame_end].try_into().unwrap(),
                 verify,
-                MmapRange {
-                    mmap: Arc::clone(&mapping),
-                    // `frame_len >= FRAME_FIXED_LEN` was checked above, so
-                    // the fixed 37-byte metadata prefix fits in the frame.
-                    start: prefix_end
-                        .checked_add(37)
-                        .expect("validated frame metadata prefix fits in usize"),
-                    end: crc_pos,
-                },
+                Arc::clone(&mapping),
+                prefix_end,
             );
         }
         unreachable!("read_at remap-retry is bounded to two iterations")
@@ -2326,17 +2319,25 @@ impl ShardPool {
     /// When `verify` is false — or the frame carries
     /// [`packfile::FLAG_CRC_DISABLED`] — the checksum is skipped, not
     /// compared; structural validation (lengths, flags, node bytes) still runs.
+    ///
+    /// `frame_base` is the absolute mmap offset of `payload[0]` (the flags
+    /// byte), used to build the zero-copy `MmapRange` for the node bytes after
+    /// any metadata block has been located.
     fn decode_record_frame(
         frame_len: [u8; 4],
         payload: &[u8],
         checksum: [u8; 4],
         verify: bool,
-        node_bytes_owner: MmapRange,
+        mmap: Arc<Mmap>,
+        frame_base: usize,
     ) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
         let flags = payload[0];
-        if flags & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED) != 0 {
+        if flags
+            & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED | packfile::FLAG_METADATA)
+            != 0
+        {
             return Err(StorageError::Corrupt(format!(
                 "unsupported record flags: {flags:#04x}"
             )));
@@ -2360,13 +2361,42 @@ impl ShardPool {
         collection_id.copy_from_slice(&payload[5..21]);
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&payload[21..37]);
-        let data =
-            Self::decode_node_bytes(flags, uncompressed_len, &payload[37..], node_bytes_owner)?;
+
+        let rest = &payload[37..];
+        let (metadata, node_offset, node_bytes) = if flags & packfile::FLAG_METADATA != 0 {
+            let (metadata, consumed) = packfile::FrameMetadata::decode(rest)
+                .map_err(|e| StorageError::Corrupt(format!("frame metadata: {e}")))?;
+            let node_bytes = rest.get(consumed..).ok_or_else(|| {
+                StorageError::Corrupt("frame metadata consumes past payload".into())
+            })?;
+            let node_offset = 37usize
+                .checked_add(consumed)
+                .ok_or_else(|| StorageError::Corrupt("frame node offset overflow".into()))?;
+            (Some(metadata), node_offset, node_bytes)
+        } else {
+            (None, 37, rest)
+        };
+
+        let data = Self::decode_node_bytes(
+            flags,
+            uncompressed_len,
+            node_bytes,
+            MmapRange {
+                mmap,
+                start: frame_base
+                    .checked_add(node_offset)
+                    .ok_or_else(|| StorageError::Corrupt("frame node offset overflow".into()))?,
+                end: frame_base
+                    .checked_add(payload.len())
+                    .ok_or_else(|| StorageError::Corrupt("frame end overflow".into()))?,
+            },
+        )?;
 
         Ok(Record {
             collection_id,
             hash,
             data,
+            metadata,
         })
     }
 
@@ -2861,6 +2891,7 @@ mod tests {
             collection_id,
             hash,
             data: bytes::Bytes::copy_from_slice(data),
+            metadata: None,
         }
     }
 
@@ -3706,6 +3737,7 @@ mod tests {
                 collection_id: [0x22; 16],
                 hash: [0x33; 16],
                 data: bytes::Bytes::from_static(b"pre-cutover data"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -3983,6 +4015,7 @@ mod tests {
                 collection_id: [0x01; 16],
                 hash: [0xAA; 16],
                 data: bytes::Bytes::from_static(b"live data"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -3997,6 +4030,7 @@ mod tests {
                 collection_id: [0xFF; 16],
                 hash: [0xBB; 16],
                 data: bytes::Bytes::from_static(b"stale leftover"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -4133,6 +4167,7 @@ mod tests {
                     },
                     hash: [0xAA; 16],
                     data: bytes::Bytes::from_static(b"payload"),
+                    metadata: None,
                 },
             )
             .unwrap();
