@@ -1067,6 +1067,7 @@ impl ShardPool {
             ));
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let writer_lock_started = Instant::now();
         #[cfg(not(target_arch = "wasm32"))]
         let writer_lock = writable
