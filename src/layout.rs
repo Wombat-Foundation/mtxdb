@@ -82,6 +82,18 @@ impl ShardType {
             Self::AuthChain => "auth-chain",
         }
     }
+
+    /// Stable 4-byte namespace discriminator mixed into collection and record
+    /// logical-id derivation. Keeps the same canonical id distinct across pools
+    /// (e.g. `!room` in the `EventDag` pool versus the State pool).
+    #[must_use]
+    pub const fn pool_dst(self) -> [u8; 4] {
+        match self {
+            Self::State => *b"STAT",
+            Self::EventDag => *b"EVNT",
+            Self::AuthChain => *b"AUTH",
+        }
+    }
 }
 
 /// Validated database root from which named pool paths can be derived.

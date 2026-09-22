@@ -14,7 +14,7 @@ use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{
     derive_collection_id, frame_digest, CollectionKeyRule, CollectionTemplate, DatabaseLayout,
     DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, PackfileStorage,
-    PayloadPolicy, RecordIdentityRule, ShardType, COLLECTION_TYPE_PROTOCOL_BASE,
+    PayloadPolicy, RecordIdentityRule, ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -333,10 +333,10 @@ fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
     }
 }
 
-/// Collection type discriminator for Matrix room collections, mixed into
-/// [`derive_collection_id`]. Matrix is a protocol extension, so it draws from
-/// the protocol-owned range rather than a core-internal value.
-const MATRIX_ROOM_COLLECTION_TYPE: u16 = COLLECTION_TYPE_PROTOCOL_BASE;
+/// Pool namespace discriminator for Matrix room collections, mixed into
+/// [`derive_collection_id`]. Matrix room events live in the `EventDag` pool, so
+/// they use that pool's DST.
+const MATRIX_ROOM_POOL_DST: [u8; 4] = ShardType::EventDag.pool_dst();
 
 /// The Matrix import template's accepted identity algorithm: SHA-256 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,
@@ -3468,7 +3468,7 @@ fn default_matrix_import_template() -> CollectionTemplate {
     CollectionTemplate {
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
-        record_identity: RecordIdentityRule {
+        record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::Pointer {
                 pointer: "/event_id".into(),
             },
@@ -3477,7 +3477,7 @@ fn default_matrix_import_template() -> CollectionTemplate {
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: "/room_id".into(),
-            collection_type: MATRIX_ROOM_COLLECTION_TYPE,
+            pool_dst: MATRIX_ROOM_POOL_DST,
             display_id_pointer: "/room_id".into(),
         },
         establishment: Some(EstablishmentRule {
@@ -3620,10 +3620,10 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     .unwrap_or("sha2-256");
     let record_digest_algorithm = digest_algorithm_for(node_id_algorithm)
         .with_context(|| format!("template {} record identity internal_key", path.display()))?;
-    // The collection-id derivation is now a fixed, core-owned function of a
-    // compact type discriminator rather than a template-selected digest
-    // algorithm. The Matrix import profile is the room type.
-    let collection_type = MATRIX_ROOM_COLLECTION_TYPE;
+    // The collection-id derivation is a fixed, core-owned function of a pool
+    // namespace discriminator rather than a template-selected digest algorithm.
+    // The Matrix import profile targets the EventDag pool.
+    let pool_dst = MATRIX_ROOM_POOL_DST;
     if let Some(policy) = template
         .get("record")
         .and_then(|r| r.get("payload"))
@@ -3656,7 +3656,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     Ok(CollectionTemplate {
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
-        record_identity: RecordIdentityRule {
+        record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::Pointer {
                 pointer: identity_pointer.to_owned(),
             },
@@ -3665,7 +3665,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: membership_pointer.to_owned(),
-            collection_type,
+            pool_dst,
             display_id_pointer: display_id_pointer.to_owned(),
         },
         establishment: Some(establishment),
@@ -3773,12 +3773,12 @@ fn template_node_id(
     // other policy must fail loudly rather than hash empty input and mint a
     // meaningless key.
     if !matches!(
-        &template.record_identity.policy,
+        &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { .. }
     ) {
         bail!(
             "record identity policy {:?} is not supported by the importer",
-            template.record_identity.policy
+            template.record_id_rule.policy
         );
     }
     let resolve =
@@ -3790,8 +3790,8 @@ fn template_node_id(
         resolve: &resolve,
     };
     let Some(digest) = frame_digest(
-        &template.record_identity.policy,
-        template.record_identity.digest_algorithm,
+        &template.record_id_rule.policy,
+        template.record_id_rule.digest_algorithm,
         &input,
     ) else {
         return Ok(None);
@@ -3805,7 +3805,7 @@ fn template_node_id(
 /// membership value (e.g. a Matrix `room_id`), producing the collection ID.
 fn template_collection_id(template: &CollectionTemplate, membership_value: &str) -> [u8; 16] {
     derive_collection_id(
-        template.collection_key.collection_type,
+        template.collection_key.pool_dst,
         membership_value.as_bytes(),
     )
 }
@@ -5403,7 +5403,7 @@ mod tests {
         parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
         resolve_import_collection, scan_payload_suffix, synapse_event_node_id,
         template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        StateSet, MATRIX_ROOM_COLLECTION_TYPE,
+        StateSet, MATRIX_ROOM_POOL_DST,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -5736,7 +5736,7 @@ mod tests {
         CollectionTemplate {
             name: "collisions".into(),
             collection_kind: "federation".into(),
-            record_identity: RecordIdentityRule {
+            record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
                     pointer: "/sender".into(),
                 },
@@ -5745,7 +5745,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/room_id".into(),
-                collection_type: MATRIX_ROOM_COLLECTION_TYPE,
+                pool_dst: MATRIX_ROOM_POOL_DST,
                 display_id_pointer: "/room_id".into(),
             },
             establishment: None,

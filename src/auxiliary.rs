@@ -7,7 +7,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
-use crate::template::{derive_collection_id, COLLECTION_TYPE_INTERNAL_BASE};
+use crate::template::{derive_collection_id, POOL_DST_INTERNAL};
 
 const VALUE_MAGIC: &[u8; 4] = b"AUX1";
 const DIGEST_LEN: usize = 32;
@@ -24,12 +24,12 @@ pub fn auxiliary_key_digest(key: &[u8]) -> AuxiliaryKeyDigest {
 /// Derive the logical collection identity for a named auxiliary index.
 ///
 /// Auxiliary indexes are core-internal collections, so they use the shared
-/// [`derive_collection_id`] with the internal type discriminator rather than a
+/// [`derive_collection_id`] with the core-internal pool namespace rather than a
 /// private domain string. The returned 16-byte value is the routing id; key
 /// identities remain the full 32-byte digests stored in each envelope.
 #[must_use]
 pub fn auxiliary_collection_id(name: &str) -> [u8; 16] {
-    derive_collection_id(COLLECTION_TYPE_INTERNAL_BASE, name.as_bytes())
+    derive_collection_id(POOL_DST_INTERNAL, name.as_bytes())
 }
 
 fn physical_id(digest: &AuxiliaryKeyDigest) -> NodeId {
