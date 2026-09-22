@@ -10,9 +10,11 @@ compile_error!("the persisted index cache is currently supported only on little-
 /// Bytes in one [`DeltaFrame`].
 pub const DELTA_FRAME_LEN: usize = 36;
 /// Bytes in the checkpoint header.
-pub const CHECKPOINT_HEADER_LEN: usize = 72;
+pub const CHECKPOINT_HEADER_LEN: usize = 80;
 /// Bytes in one collection directory entry.
 pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
+/// Bytes in one [`PackTableEntry`].
+pub const PACK_TABLE_ENTRY_LEN: usize = 12;
 
 /// One slot overwrite after a checkpoint.
 ///
@@ -94,6 +96,11 @@ pub struct CheckpointHeader {
     /// a separately-read `journal.lsn` that may have advanced past it. Zero
     /// when the checkpoint was written without a journal.
     pub covered_lsn: u64,
+    /// Number of [`PackTableEntry`] records in the pack table.
+    pub pack_table_count: u32,
+    /// Total byte length of the pack table section
+    /// (`pack_table_count * PACK_TABLE_ENTRY_LEN`).
+    pub pack_table_bytes: u64,
 }
 
 impl CheckpointHeader {
