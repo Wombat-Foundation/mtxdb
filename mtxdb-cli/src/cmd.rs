@@ -333,12 +333,13 @@ fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-/// Resolve a `0x`-prefixed logical ID or hash the part of a `$`-prefixed
-/// Matrix event selector after its sigil with BLAKE3, truncating to 128 bits.
-/// A malformed logical ID returns the error from [`parse_node_id`].
+/// Resolve a `0x`-prefixed logical ID, or derive the node ID import stores a
+/// `$`-prefixed Matrix event under. The `$` is part of the hashed event ID, so
+/// the selector is passed to [`matrix_event_node_id`] unchanged. A malformed
+/// logical ID returns the error from [`parse_node_id`].
 fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
-    if let Some(event_id) = id.strip_prefix('$') {
-        matrix_event_node_id(event_id)
+    if id.starts_with('$') {
+        matrix_event_node_id(id)
     } else {
         parse_node_id(id)
     }
@@ -5539,6 +5540,20 @@ mod tests {
         cmd_stats(&cli, false).unwrap();
         cmd_stats(&cli, true).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn get_event_selector_matches_the_imported_record_id() {
+        let template = default_matrix_import_template();
+        let event = owned_value(
+            r#"{"event_id":"$abc:example.org","room_id":"!r:example.org","type":"m.room.message"}"#,
+        );
+        let imported = template_node_id(&template, &event).unwrap().unwrap();
+        assert_eq!(
+            super::parse_get_id("$abc:example.org").unwrap(),
+            imported,
+            "`get $event_id` must resolve to the id import stored the record under"
+        );
     }
 
     #[test]
