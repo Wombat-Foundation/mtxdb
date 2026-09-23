@@ -1818,6 +1818,15 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+        // A frame shorter than the fixed header cannot hold any metadata.
+        // Production callers reject it earlier via the `FRAME_FIXED_LEN
+        // ..= MAX_RECORD_LEN` range check; this pins the helper's own behavior.
+        assert_eq!(
+            checked_metadata_block_len(0, FRAME_FIXED_LEN - 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     /// The bound is inclusive end to end: a metadata block that exactly fills
