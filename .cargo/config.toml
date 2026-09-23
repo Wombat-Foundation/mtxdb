@@ -8,7 +8,10 @@ test-all = "!cargo test && cargo test-ffi && cargo test-wasm"
 
 [build]
 # target-dir = "target"
-# rustc-wrapper = ".cargo/cargo-wrapper.sh"
+rustc-wrapper = ".cargo/cargo-wrapper.sh"
 
 [env]
+# Left commented: cargo-wrapper.sh already wraps sccache itself
+# (sandbox-aware — skips it under Codex, where the sandbox can't reach the
+# host daemon). Setting this too would double-wrap rustc through sccache.
 # RUSTC_WRAPPER = { value = "sccache", force = false }
