@@ -6116,6 +6116,12 @@ impl StorageEngine for PackfileStorage {
         self.generation(collection_id).is_some()
     }
 
+    fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
+        Ok(self
+            .generation(collection_id)
+            .map(|generation| generation.index.len()))
+    }
+
     fn ensure_collection_metadata(
         &self,
         collection_id: &[u8; 16],
@@ -12600,6 +12606,65 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn collection_len_counts_genesis_and_distinct_ids() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+
+        let dir = test_dir("collection_len");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x7Au8; 16];
+        assert_eq!(store.collection_len(&collection).unwrap(), None);
+
+        let metadata = CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+        };
+        store
+            .ensure_collection_metadata(&collection, &metadata)
+            .unwrap();
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
+
+        let a = [0xA1u8; 16];
+        let b = [0xB2u8; 16];
+        store
+            .put(
+                &collection,
+                &a,
+                &NodeData::new(bytes::Bytes::from_static(b"one")),
+            )
+            .unwrap();
+        store
+            .put(
+                &collection,
+                &b,
+                &NodeData::new(bytes::Bytes::from_static(b"two")),
+            )
+            .unwrap();
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+
+        // Overwriting an id appends a frame but does not add a record.
+        store
+            .put(
+                &collection,
+                &a,
+                &NodeData::new(bytes::Bytes::from_static(b"uno")),
+            )
+            .unwrap();
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Concurrent genesis establishment on a real packfile-backed store must
     /// serialize on the collection `put_mutex`: without it, two writers can
     /// both observe an absent metadata record and append conflicting genesis
@@ -12656,6 +12721,7 @@ mod tests {
             store.get_collection_metadata(&collection).unwrap(),
             Some((*metadata).clone())
         );
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
         drop(store);
         fs::remove_dir_all(&dir).ok();
     }
@@ -12719,6 +12785,7 @@ mod tests {
             .unwrap()
             .expect("the winner's genesis record is stored");
         assert!(candidates.contains(&stored));
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
         drop(store);
         fs::remove_dir_all(&dir).ok();
     }

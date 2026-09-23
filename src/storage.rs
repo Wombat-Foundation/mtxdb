@@ -321,6 +321,22 @@ pub trait StorageEngine: Send + Sync {
         false
     }
 
+    /// Number of records currently indexed for `collection_id`, or `None` if
+    /// the collection does not exist.
+    ///
+    /// This counts distinct record ids, not physical frames: overwriting an id
+    /// does not change the count. It includes the genesis metadata record
+    /// (`COLLECTION_METADATA_RECORD_ID`) written by
+    /// [`Self::ensure_collection_metadata`], so a collection with N application
+    /// records reports N + 1, and it includes tombstones (a deleted record's
+    /// empty payload is still an indexed record). The count reflects what this
+    /// handle can see, so a read-only or checkpoint-backed handle can lag the
+    /// writer until its index refreshes.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] on I/O failure.
+    fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError>;
+
     /// Write a collection's genesis metadata record if it has none, or verify
     /// that an existing record matches `metadata`. Idempotent: a caller may
     /// invoke it before every batch.
@@ -480,6 +496,14 @@ impl StorageEngine for InMemoryStorage {
 
     fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
         self.collections.read().contains_key(collection_id)
+    }
+
+    fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
+        Ok(self
+            .collections
+            .read()
+            .get(collection_id)
+            .map(std::collections::HashMap::len))
     }
 
     fn ensure_collection_metadata(
@@ -759,6 +783,62 @@ mod tests {
             store.get_collection_metadata(&collection).unwrap(),
             Some(metadata)
         );
+    }
+
+    #[test]
+    fn collection_len_counts_genesis_and_distinct_ids() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+
+        let store = InMemoryStorage::new();
+        let collection = [0x7Bu8; 16];
+        assert_eq!(store.collection_len(&collection).unwrap(), None);
+
+        let metadata = CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+        };
+        store
+            .ensure_collection_metadata(&collection, &metadata)
+            .unwrap();
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
+
+        let a = [0xA1u8; 16];
+        let b = [0xB2u8; 16];
+        store
+            .put(
+                &collection,
+                &a,
+                &NodeData::new(bytes::Bytes::from_static(b"one")),
+            )
+            .unwrap();
+        store
+            .put(
+                &collection,
+                &b,
+                &NodeData::new(bytes::Bytes::from_static(b"two")),
+            )
+            .unwrap();
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+
+        // Overwriting an id does not add a record.
+        store
+            .put(
+                &collection,
+                &a,
+                &NodeData::new(bytes::Bytes::from_static(b"uno")),
+            )
+            .unwrap();
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
     }
 
     #[test]
