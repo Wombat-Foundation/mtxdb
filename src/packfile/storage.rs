@@ -1527,6 +1527,13 @@ impl PackfileStorage {
             DeltaLogState::default(),
             read_covered,
         );
+        // A writer that had to rescan has no checkpoint describing this pack
+        // set. Mark it dirty so the next sync persists one; otherwise a store
+        // opened and synced without further writes (e.g. after an aborted
+        // import) would rescan every packfile on every open forever.
+        if writable {
+            store.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
         timings.total = started.elapsed();
         *store.last_open_timings.lock() = Some(timings);
         Ok(store)
@@ -12591,6 +12598,37 @@ mod tests {
         store.sync().unwrap();
 
         assert_eq!(all_record_metadata(&dir), Vec::new());
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A writer that opens without a usable checkpoint (e.g. after an aborted
+    /// import that never synced) must persist one on its next sync even though
+    /// it wrote nothing itself; otherwise every later open rescans every pack.
+    #[test]
+    fn rescan_open_persists_a_checkpoint_on_the_next_sync() {
+        let dir = test_dir("rescan_open_checkpoint");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &[0x11u8; 16],
+                    &NodeData::new(bytes::Bytes::from_static(b"payload")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+        }
+        let checkpoint = PackfileStorage::index_checkpoint_path(&dir);
+        fs::remove_file(&checkpoint).unwrap();
+
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        assert!(!checkpoint.exists(), "the rescan open alone writes none");
+        store.sync_all().unwrap();
+        assert!(
+            checkpoint.exists(),
+            "a sync after a rescan open must persist the checkpoint"
+        );
         drop(store);
         fs::remove_dir_all(&dir).ok();
     }
