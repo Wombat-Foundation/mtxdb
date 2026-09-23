@@ -1281,11 +1281,6 @@ fn cmd_collections_in_dir(
             .checked_add(*memory)
             .context("total collection index memory overflow")?;
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
-        let disk_display = if physical_needed {
-            fmt_disk_megabytes(disk)
-        } else {
-            "?".to_owned()
-        };
         total_disk_bytes = total_disk_bytes.saturating_add(disk);
     }
     let max_rows = if limit <= 0 {
@@ -1311,6 +1306,11 @@ fn cmd_collections_in_dir(
                 },
             );
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
+        let disk_display = if physical_needed {
+            fmt_disk_megabytes(disk)
+        } else {
+            "?".to_owned()
+        };
         if layout {
             let stats = physical
                 .as_ref()
@@ -2444,32 +2444,34 @@ fn print_collection_info(
         fmt_load_factor(len, capacity)
     );
     print_collection_shards(shards);
-    match physical_layout(dir) {
-        Ok(physical) => {
-            if let Some(layout) = physical.collections.get(collection_id) {
-                println!("  physical (includes superseded frames):");
-                println!("    disk:             {}", fmt_bytes(layout.disk_bytes));
-                println!("    packs:            {}", layout.pack_bytes.len());
-                println!("    segments:         {}", layout.segments);
-                println!(
-                    "    largest run:      {}",
-                    fmt_bytes(layout.largest_segment_bytes)
-                );
-                println!(
-                    "    avoidable spread: {}",
-                    fmt_bytes(layout.avoidable_spread_bytes())
-                );
-                if layout.pack_bytes.len() > 1 {
-                    let mut pack_bytes: Vec<_> = layout.pack_bytes.iter().collect();
-                    pack_bytes.sort_unstable_by_key(|(pack_id, _)| **pack_id);
-                    println!("    per pack:");
-                    for (pack_id, bytes) in pack_bytes {
-                        println!("      0x{pack_id:016x}: {}", fmt_bytes(*bytes));
+    if deep {
+        match physical_layout(dir) {
+            Ok(physical) => {
+                if let Some(layout) = physical.collections.get(collection_id) {
+                    println!("  physical (includes superseded frames):");
+                    println!("    disk:             {}", fmt_bytes(layout.disk_bytes));
+                    println!("    packs:            {}", layout.pack_bytes.len());
+                    println!("    segments:         {}", layout.segments);
+                    println!(
+                        "    largest run:      {}",
+                        fmt_bytes(layout.largest_segment_bytes)
+                    );
+                    println!(
+                        "    avoidable spread: {}",
+                        fmt_bytes(layout.avoidable_spread_bytes())
+                    );
+                    if layout.pack_bytes.len() > 1 {
+                        let mut pack_bytes: Vec<_> = layout.pack_bytes.iter().collect();
+                        pack_bytes.sort_unstable_by_key(|(pack_id, _)| **pack_id);
+                        println!("    per pack:");
+                        for (pack_id, bytes) in pack_bytes {
+                            println!("      0x{pack_id:016x}: {}", fmt_bytes(*bytes));
+                        }
                     }
                 }
             }
+            Err(error) => eprintln!("  physical: unavailable ({error})"),
         }
-        Err(error) => eprintln!("  physical: unavailable ({error})"),
     }
     match PackfileStorage::open_read_only(dir.to_path_buf())
         .ok()
@@ -6040,6 +6042,7 @@ mod tests {
             command: Commands::Collections {
                 all: false,
                 layout: false,
+                canonical: false,
                 sort: None,
                 limit: -1,
             },
@@ -6058,6 +6061,7 @@ mod tests {
             command: Commands::Collections {
                 all: false,
                 layout: false,
+                canonical: false,
                 sort: None,
                 limit: -1,
             },
@@ -6076,6 +6080,7 @@ mod tests {
             command: Commands::Collections {
                 all: true,
                 layout: false,
+                canonical: false,
                 sort: None,
                 limit: -1,
             },
@@ -6097,12 +6102,13 @@ mod tests {
             command: Commands::Collections {
                 all: false,
                 layout: false,
+                canonical: false,
                 sort: None,
                 limit: -1,
             },
         };
 
-        cmd_collections(&cli, false, false, None, -1).unwrap();
+        cmd_collections(&cli, false, false, false, None, -1).unwrap();
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -6139,12 +6145,13 @@ mod tests {
             command: Commands::Collections {
                 all: false,
                 layout: false,
+                canonical: false,
                 sort: None,
                 limit: -1,
             },
         };
 
-        cmd_collections(&cli, false, false, None, -1).unwrap();
+        cmd_collections(&cli, false, false, false, None, -1).unwrap();
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
