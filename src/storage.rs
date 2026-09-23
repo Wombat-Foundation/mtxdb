@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
+
 /// A 128-bit lookup identity for a record within a collection.
 ///
 /// A `NodeId` is an opaque key chosen by the caller — it is not necessarily a
@@ -299,6 +301,64 @@ pub trait StorageEngine: Send + Sync {
     fn refresh_collection(&self, _collection_id: &[u8; 16]) -> Result<(), StorageError> {
         Ok(())
     }
+
+    /// Write a collection's genesis metadata record if it has none, or verify
+    /// that an existing record matches `metadata`. Idempotent: a caller may
+    /// invoke it before every batch.
+    ///
+    /// The record is stored as an ordinary frame under the reserved
+    /// [`COLLECTION_METADATA_RECORD_ID`] key, so it rides the same append,
+    /// checkpoint, and crash-recovery paths as application records. It is
+    /// always written before (and therefore durable with, or before) the
+    /// collection's first application record.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] on I/O failure, [`StorageError::Corrupt`]
+    /// if an existing record cannot be decoded, or [`StorageError::Internal`]
+    /// if an existing record decodes but differs from `metadata`.
+    fn ensure_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+    ) -> Result<(), StorageError> {
+        match self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
+            Some(existing) => {
+                let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+                    StorageError::Corrupt("malformed collection metadata record".to_owned())
+                })?;
+                if found != *metadata {
+                    return Err(StorageError::Internal(
+                        "collection metadata mismatch: existing genesis record differs".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            None => self.put(
+                collection_id,
+                &COLLECTION_METADATA_RECORD_ID,
+                &NodeData::new(metadata.encode().into()),
+            ),
+        }
+    }
+
+    /// Fetch and decode a collection's genesis metadata record, if present.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] on I/O failure or
+    /// [`StorageError::Corrupt`] if a present record cannot be decoded.
+    fn get_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<Option<CollectionMetadata>, StorageError> {
+        match self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
+            Some(data) => CollectionMetadata::decode(&data.bytes)
+                .map(Some)
+                .ok_or_else(|| {
+                    StorageError::Corrupt("malformed collection metadata record".to_owned())
+                }),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Errors returned by [`StorageEngine`] operations.
@@ -491,6 +551,55 @@ mod tests {
     fn test_in_memory_not_found() {
         let store = InMemoryStorage::new();
         assert!(store.get(&TEST_COLLECTION, &[0x00; 16]).unwrap().is_none());
+    }
+
+    #[test]
+    fn collection_metadata_roundtrips_and_verifies() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+
+        let store = InMemoryStorage::new();
+        let collection = [0x5Au8; 16];
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            None,
+            "a fresh collection has no genesis metadata"
+        );
+
+        let metadata = CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+        };
+        store
+            .ensure_collection_metadata(&collection, &metadata)
+            .unwrap();
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            Some(metadata.clone())
+        );
+
+        // Idempotent: repeating the same metadata is a no-op.
+        store
+            .ensure_collection_metadata(&collection, &metadata)
+            .unwrap();
+
+        // A different record is rejected rather than silently ignored.
+        let conflicting = CollectionMetadata {
+            collection_canonical_id: b"!other:matrix.org".to_vec(),
+            ..metadata
+        };
+        assert!(matches!(
+            store.ensure_collection_metadata(&collection, &conflicting),
+            Err(StorageError::Internal(_))
+        ));
     }
 
     #[test]
