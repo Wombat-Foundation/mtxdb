@@ -693,28 +693,40 @@ fn parse_cli() -> Cli {
 fn main() -> std::process::ExitCode {
     let cli = parse_cli();
     if let Commands::Completions { shell } = &cli.command {
-        let shell = match shell.as_str() {
-            "bash" => clap_complete::Shell::Bash,
-            "elvish" => clap_complete::Shell::Elvish,
-            "fish" => clap_complete::Shell::Fish,
-            "powershell" => clap_complete::Shell::PowerShell,
-            "zsh" => clap_complete::Shell::Zsh,
-            _ => unreachable!("Clap validates the shell name"),
-        };
-        // Rebuild without the hidden `completions` subcommand —
-        // `.hide(true)` only suppresses --help, not shell completions.
-        let base = build_cli();
-        let mut command = clap::Command::new("mtxdb");
-        for arg in base.get_arguments() {
-            command = command.arg(arg.clone());
-        }
-        for sub in base.get_subcommands() {
-            if sub.get_name() != "completions" {
-                command = command.subcommand(sub.clone());
+        #[cfg(feature = "completions")]
+        {
+            let shell = match shell.as_str() {
+                "bash" => clap_complete::Shell::Bash,
+                "elvish" => clap_complete::Shell::Elvish,
+                "fish" => clap_complete::Shell::Fish,
+                "powershell" => clap_complete::Shell::PowerShell,
+                "zsh" => clap_complete::Shell::Zsh,
+                _ => unreachable!("Clap validates the shell name"),
+            };
+            // Rebuild without the hidden `completions` subcommand —
+            // `.hide(true)` only suppresses --help, not shell completions.
+            let base = build_cli();
+            let mut command = clap::Command::new("mtxdb");
+            for arg in base.get_arguments() {
+                command = command.arg(arg.clone());
             }
+            for sub in base.get_subcommands() {
+                if sub.get_name() != "completions" {
+                    command = command.subcommand(sub.clone());
+                }
+            }
+            clap_complete::generate(shell, &mut command, "mtxdb", &mut std::io::stdout());
+            return std::process::ExitCode::SUCCESS;
         }
-        clap_complete::generate(shell, &mut command, "mtxdb", &mut std::io::stdout());
-        return std::process::ExitCode::SUCCESS;
+        #[cfg(not(feature = "completions"))]
+        {
+            let _ = shell;
+            eprintln!(
+                "Error: this build was compiled without shell-completion support \
+                 (enable the `completions` feature)"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
     }
     match cmd::run(&cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,

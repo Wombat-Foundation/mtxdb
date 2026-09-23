@@ -17,12 +17,18 @@ readme = "../README.md"
 name = "mtxdb"
 path = "src/main.rs"
 
+[features]
+default = ["completions"]
+# Shell-completion script generation. On by default; disable with
+# `default-features = false` to drop `clap_complete` from a lean CLI build.
+completions = ["dep:clap_complete"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.23.1"
 bytes = "1.5"
 clap = { version = "=4.6.6", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
-clap_complete = "=4.6.9"
+clap_complete = { version = "=4.6.9", optional = true }
 hex = "0.4"
 mtxdb = { path = ".." }
 simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
