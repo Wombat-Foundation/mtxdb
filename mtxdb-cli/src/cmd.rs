@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 
@@ -4568,9 +4569,17 @@ fn compute_state_groups(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
 ) -> Result<HashMap<String, String>, Vec<String>> {
-    let all_events: Vec<&OwnedValue> = events.iter().chain(auth_chain.iter()).collect();
-    let all_owned: Vec<OwnedValue> = all_events.into_iter().cloned().collect();
-    let (frontier, id_map, reverse_map) = build_event_dag(&all_owned);
+    // Borrow the input when there is no auth chain to merge in; cloning every
+    // parsed event just to concatenate two slices doubles peak memory on large
+    // rooms.
+    let combined: Vec<OwnedValue>;
+    let all_owned: &[OwnedValue] = if auth_chain.is_empty() {
+        events
+    } else {
+        combined = events.iter().chain(auth_chain.iter()).cloned().collect();
+        &combined
+    };
+    let (frontier, id_map, reverse_map) = build_event_dag(all_owned);
     if frontier.is_empty() {
         return Ok(HashMap::new());
     }
@@ -4578,7 +4587,7 @@ fn compute_state_groups(
     let sorted = topo_sort_dag(&frontier, &reverse_map)?;
 
     let mut events_by_sid: HashMap<u64, &OwnedValue> = HashMap::new();
-    for ev in &all_owned {
+    for ev in all_owned {
         if let Some(eid) = event_id(ev) {
             if let Some(&sid) = id_map.get(eid) {
                 events_by_sid.insert(sid, ev);
@@ -4586,44 +4595,107 @@ fn compute_state_groups(
         }
     }
 
-    let mut state_at: HashMap<u64, StateSet> = HashMap::new();
+    // How many resident children still need each event's state. Once the last
+    // child is processed the state is dropped, so memory follows the DAG's
+    // frontier width instead of holding one state per event for the whole run.
+    let mut remaining_children: HashMap<u64, usize> = HashMap::new();
+    for &idx in &sorted {
+        for edge in frontier.prev_edges(idx) {
+            if edge.is_resident() {
+                *remaining_children
+                    .entry(frontier.nodes[edge.arena_index()].short_id)
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    let empty = SharedState::new(StateSet::new());
+    let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
     let mut result: HashMap<String, String> = HashMap::new();
 
     for &idx in &sorted {
-        let node = &frontier.nodes[idx];
-        let short_id = node.short_id;
+        let short_id = frontier.nodes[idx].short_id;
 
-        // Merge state from all prev_events.
-        let mut merged = StateSet::new();
+        let mut parent_ids: Vec<u64> = Vec::new();
+        let mut parents: Vec<Arc<SharedState>> = Vec::new();
         for edge in frontier.prev_edges(idx) {
-            let parent_id = if edge.is_resident() {
-                frontier.nodes[edge.arena_index()].short_id
-            } else {
+            if !edge.is_resident() {
                 continue;
-            };
+            }
+            let parent_id = frontier.nodes[edge.arena_index()].short_id;
+            parent_ids.push(parent_id);
             if let Some(parent_state) = state_at.get(&parent_id) {
-                merged.merge(parent_state);
+                parents.push(Arc::clone(parent_state));
             }
         }
 
-        // If this is a state event, apply the state change.
-        if let Some(ev) = events_by_sid.get(&short_id) {
-            if is_state_event(ev) {
+        // Union of the parents' states, first parent winning on conflict. An
+        // event whose parents all agree shares their state instead of copying
+        // it, so a plain message event costs no allocation.
+        let base: Arc<SharedState> = match parents.as_slice() {
+            [] => Arc::clone(&empty),
+            [only] => Arc::clone(only),
+            [first, rest @ ..] => {
+                if rest
+                    .iter()
+                    .all(|p| Arc::ptr_eq(p, first) || p.digest == first.digest)
+                {
+                    Arc::clone(first)
+                } else {
+                    let mut merged = StateSet::new();
+                    for parent in &parents {
+                        merged.merge(&parent.set);
+                    }
+                    SharedState::new(merged)
+                }
+            }
+        };
+
+        // Only a state event produces a new state set.
+        let state = match events_by_sid.get(&short_id) {
+            Some(ev) if is_state_event(ev) => {
                 let key = state_key(ev);
                 let state_type = event_string_field(ev, "type").unwrap_or("");
                 let eid = event_id(ev).unwrap_or("").to_owned();
-                merged.set(state_type, &key, eid);
+                let mut set = base.set.clone();
+                set.set(state_type, &key, eid);
+                SharedState::new(set)
             }
+            _ => base,
+        };
+
+        if let Some(eid) = reverse_map.get(&short_id) {
+            result.insert(eid.clone(), state.digest.clone());
         }
 
-        let state_group_id = merged.digest_base64url();
-        if let Some(eid) = reverse_map.get(&short_id) {
-            result.insert(eid.clone(), state_group_id);
+        for parent_id in parent_ids {
+            if let Some(count) = remaining_children.get_mut(&parent_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state_at.remove(&parent_id);
+                }
+            }
         }
-        state_at.insert(short_id, merged);
+        if remaining_children.get(&short_id).copied().unwrap_or(0) > 0 {
+            state_at.insert(short_id, state);
+        }
     }
 
     Ok(result)
+}
+
+/// A state set with its state-group digest computed once, so events that share
+/// a state also share the digest instead of re-sorting and re-hashing it.
+struct SharedState {
+    set: StateSet,
+    digest: String,
+}
+
+impl SharedState {
+    fn new(set: StateSet) -> Arc<Self> {
+        let digest = set.digest_base64url();
+        Arc::new(Self { set, digest })
+    }
 }
 
 /// A set of state events keyed by (type, `state_key`).
@@ -5271,7 +5343,7 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
                 continue;
             }
             let store = PackfileStorage::open(dir).context("failed to open store")?;
-            store.sync_all()?;
+            store.sync()?;
             eprintln!(
                 "{}: synced: persisted shard IO stats and shard\u{2192}collection directory",
                 shard_type.as_str()
@@ -5280,7 +5352,7 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let store = open_store(cli)?;
-    store.sync_all()?;
+    store.sync()?;
     eprintln!("synced: persisted shard IO stats and shard\u{2192}collection directory");
     Ok(())
 }
@@ -6911,6 +6983,69 @@ mod tests {
         let msg_node = &frontier.nodes[2];
         assert_eq!(msg_node.prev.1, 1); // 1 prev_events
         assert_eq!(msg_node.auth.1, 2); // 2 auth_events
+    }
+
+    #[test]
+    fn compute_state_groups_shares_state_across_events_and_merges_forks() {
+        // Reference: what each event's state group must be, computed by
+        // materializing the full state set for every event.
+        let mut events = Vec::new();
+        events.push(owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
+        ));
+        let mut prev = "$create".to_owned();
+        let mut expected_state = StateSet::new();
+        expected_state.set("m.room.create", "", "$create".to_owned());
+        let mut expected: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        expected.insert("$create".into(), expected_state.digest_base64url());
+        // A long chain: every 50th event is a state event, the rest messages.
+        for i in 0..5000u32 {
+            let id = format!("$e{i}");
+            let json = if i % 50 == 0 {
+                expected_state.set("m.room.member", &format!("@u{i}:x"), id.clone());
+                format!(
+                    r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.member","state_key":"@u{i}:x","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
+                )
+            } else {
+                format!(
+                    r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
+                )
+            };
+            expected.insert(id.clone(), expected_state.digest_base64url());
+            events.push(owned_value(&json));
+            prev = id;
+        }
+        // Fork off the tip: two branches set the same key differently, then a
+        // merge event lists both parents. The first parent must win.
+        let mut left_state = StateSet::new();
+        left_state.entries = expected_state.entries.clone();
+        left_state.set("m.room.topic", "", "$left".to_owned());
+        let mut right_state = StateSet::new();
+        right_state.entries = expected_state.entries.clone();
+        right_state.set("m.room.topic", "", "$right".to_owned());
+        events.push(owned_value(&format!(
+            r#"{{"event_id":"$left","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
+        )));
+        events.push(owned_value(&format!(
+            r#"{{"event_id":"$right","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
+        )));
+        events.push(owned_value(
+            r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$left","$right"],"content":{}}"#,
+        ));
+        expected.insert("$left".into(), left_state.digest_base64url());
+        expected.insert("$right".into(), right_state.digest_base64url());
+        expected.insert("$merge".into(), left_state.digest_base64url());
+
+        let groups = compute_state_groups(&events, &[]).unwrap();
+        assert_eq!(groups.len(), expected.len());
+        for (event_id, want) in &expected {
+            assert_eq!(&groups[event_id], want, "state group for {event_id}");
+        }
+        // Messages between two state events share one group; a state event
+        // starts a new one.
+        assert_eq!(groups["$e1"], groups["$e49"]);
+        assert_ne!(groups["$e49"], groups["$e50"]);
     }
 
     #[test]
