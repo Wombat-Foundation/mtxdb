@@ -6316,6 +6316,74 @@ mod tests {
     }
 
     #[test]
+    fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
+        let root = unique_temp_dir();
+        let pool_dir = root.join("pools").join("event-dag");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let mut established = HashSet::new();
+
+        // A real v12 room exported from the external dag-toolkit corpus: a
+        // DAG-complete prefix (depth 1..20) rooted at the create event, so
+        // every `prev_events`/`auth_events` reference resolves inside the
+        // batch. The create id is `$kgoc...` and ordinary events reference
+        // `!kgoc...` -- MSC4291's room-id form -- which the importer must
+        // normalize back to the create's identity.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/v12-room-slice.jsonl");
+        cmd_import_file(
+            &store,
+            &pool_dir,
+            &fixture,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+
+        let create_id = "$kgoc2ebwy1GOVtzOr5_-tXVTvzSHgtGaMSI_i59vogs";
+        let room_id = "!kgoc2ebwy1GOVtzOr5_-tXVTvzSHgtGaMSI_i59vogs";
+        assert_eq!(
+            MatrixRoomVersion::V12.normalize_collection_identity(create_id),
+            room_id,
+            "the fixture's room id must be the create id with the sigil swapped"
+        );
+
+        let collection_id = template_collection_id(&template, room_id);
+        assert!(
+            store
+                .get_collection_metadata(&collection_id)
+                .unwrap()
+                .is_some(),
+            "the real v12 room must land in the create event's normalized collection"
+        );
+
+        // Every fixture PDU is retained, plus the collection's genesis
+        // metadata record. State groups live in a separate auxiliary index,
+        // so they do not inflate this room collection's entry count.
+        let fixture_events = std::fs::read_to_string(&fixture)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        let (entries, _, _) = store
+            .collection_index_info(&collection_id)
+            .expect("collection index must be present after import");
+        assert_eq!(
+            entries,
+            fixture_events + 1,
+            "the collection must retain all {fixture_events} fixture events plus its metadata record"
+        );
+
+        assert_eq!(
+            established,
+            HashSet::from([collection_id]),
+            "the whole slice must resolve to exactly one collection"
+        );
+    }
+
+    #[test]
     fn collection_canonical_id_honours_the_template_membership_pointer() {
         let mut template = sender_identity_template();
         template.collection_key.pointer = "/scope".into();
