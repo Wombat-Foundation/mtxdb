@@ -425,7 +425,6 @@ dependencies = [
  "hex",
  "mtxdb",
  "rezzy",
- "sha2",
  "simd-json",
 ]
 

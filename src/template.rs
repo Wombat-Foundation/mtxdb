@@ -159,6 +159,14 @@ pub struct CollectionMetadata {
     pub record_id_rule: RecordIdentityRule,
     /// Source payload retention rule.
     pub payload: PayloadPolicy,
+    /// Optional, opaque application payload owned by the template/protocol
+    /// layer — for example a self-describing Matrix room blob
+    /// (`{"ext":"matrix.room","fmt":1,"room_version":"10",...}`). Core never
+    /// interprets it; it is written once with the genesis metadata and handed
+    /// back to the application on open, so a reader can learn protocol
+    /// configuration (room version, creator) from the header without seeking
+    /// to and parsing the establishment record.
+    pub extension: Option<Vec<u8>>,
 }
 
 /// `CollectionMetadata` TLV tags.
@@ -166,6 +174,7 @@ const META_TAG_POOL_DST: u8 = 0x01;
 const META_TAG_COLLECTION_CANONICAL_ID: u8 = 0x02;
 const META_TAG_RECORD_ID_RULE: u8 = 0x03;
 const META_TAG_PAYLOAD: u8 = 0x04;
+const META_TAG_EXTENSION: u8 = 0x05;
 
 /// `RecordIdentityRule` nested tags.
 const IDENTITY_TAG_DIGEST_ALGORITHM: u8 = 0x01;
@@ -386,6 +395,9 @@ impl CollectionMetadata {
             &encode_record_id_rule(&self.record_id_rule),
         );
         push_tlv(&mut out, META_TAG_PAYLOAD, &encode_payload(&self.payload));
+        if let Some(extension) = &self.extension {
+            push_tlv(&mut out, META_TAG_EXTENSION, extension);
+        }
         out
     }
 
@@ -402,6 +414,7 @@ impl CollectionMetadata {
                 digest_algorithm: DigestAlgorithm::Sha256,
             },
             payload: PayloadPolicy::Source,
+            extension: None,
         };
         let mut reader = TlvReader::new(bytes);
         while let Some((tag, value)) = reader.next() {
@@ -410,6 +423,7 @@ impl CollectionMetadata {
                 META_TAG_COLLECTION_CANONICAL_ID => meta.collection_canonical_id = value.to_vec(),
                 META_TAG_RECORD_ID_RULE => meta.record_id_rule = decode_record_id_rule(value)?,
                 META_TAG_PAYLOAD => meta.payload = decode_payload(value)?,
+                META_TAG_EXTENSION => meta.extension = Some(value.to_vec()),
                 _ => {}
             }
         }
@@ -630,6 +644,7 @@ mod tests {
                 digest_algorithm: DigestAlgorithm::Sha256,
             },
             payload: PayloadPolicy::Source,
+            extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
         };
         assert_eq!(CollectionMetadata::decode(&meta.encode()).unwrap(), meta);
     }

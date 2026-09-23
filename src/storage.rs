@@ -577,6 +577,7 @@ mod tests {
                 digest_algorithm: DigestAlgorithm::Sha256,
             },
             payload: PayloadPolicy::Source,
+            extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
         };
         store
             .ensure_collection_metadata(&collection, &metadata)

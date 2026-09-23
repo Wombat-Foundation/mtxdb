@@ -25,7 +25,6 @@ clap = { version = "=4.6.6", default-features = false, features = ["std", "env",
 clap_complete = "=4.6.9"
 hex = "0.4"
 mtxdb = { path = ".." }
-sha2 = "0.10"
 simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
 [dev-dependencies]
