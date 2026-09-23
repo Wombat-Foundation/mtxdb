@@ -114,7 +114,7 @@ build: ##H Build all
 
 .PHONY: install
 install:	##H Install CLI from source
-	$(CARGO) install --timings --locked --path mtxdb-cli
+	$(CARGO) install --profile dev --timings --locked --path mtxdb-cli
 
 
 .PHONY: clean
