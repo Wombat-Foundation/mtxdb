@@ -61,9 +61,11 @@ doc: ##H Build docs
 # Test & bench
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+MTXDB_TEST_PROFILE ?=
+
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(CARGO) test --workspace --all-features --lib --tests --timings
+	$(CARGO) test --profile $(MTXDB_INSTALL_PROFILE) --workspace --all-features --lib --tests --timings
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
@@ -72,7 +74,8 @@ LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 cov: ##H Run code coverage and generate HTML report
 	# TODO: include `src/bin/` in coverage
 	# Run coverage
-	$(CARGO) llvm-cov -p mtxdb --lib --tests \
+	$(CARGO) llvm-cov --profile $(MTXDB_TEST_PROFILE) \
+		-p mtxdb --lib --tests \
 		--html --output-dir .coverage \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Print per-file summary to the terminal (functions/lines only)
