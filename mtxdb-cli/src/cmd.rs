@@ -5291,11 +5291,11 @@ mod tests {
         decode_hamt_root, default_matrix_import_template, derive_template_key, event_id,
         event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
         format_id, glob_pack_files, import_pdu_events, interleaving_worth_noting,
-        matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
-        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        resolve_import_collection, scan_payload_suffix, template_collection_id, template_node_id,
-        verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, StateSet,
-        MATRIX_ROOM_POOL_DST,
+        listing_shard_types, matrix_batch_has_create, matrix_room_collection_id,
+        matrix_room_extension_from_store, parse_federation_input, parse_pack_id_selector,
+        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
+        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
+        MatrixRoomExtension, StateSet, MATRIX_ROOM_POOL_DST,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
