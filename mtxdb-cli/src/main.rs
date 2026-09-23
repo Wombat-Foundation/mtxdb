@@ -44,10 +44,12 @@ pub(crate) enum Commands {
         collection: Option<String>,
         id: String,
         raw: bool,
+        verbose: bool,
     },
     Collections {
         all: bool,
         layout: bool,
+        canonical: bool,
         sort: Option<String>,
         limit: i64,
     },
@@ -61,6 +63,7 @@ pub(crate) enum Commands {
     },
     Info {
         collection: String,
+        stats: bool,
     },
     Scan {
         selector: String,
@@ -227,6 +230,12 @@ fn sub_collections() -> Command {
                 .help("List collections in every independent pool"),
         )
         .arg(layout_arg())
+        .arg(
+            Arg::new("canonical")
+                .long("canonical")
+                .action(ArgAction::SetTrue)
+                .help("Show each collection's canonical ID"),
+        )
         .arg(limit_arg())
         .arg(sort_arg("collection, nodes, load, shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
@@ -386,6 +395,15 @@ fn sub_info() -> Command {
                      0x0102030405060708090a0b0c0d0e0f10` or `mtxdb info 0x1`",
                 ),
         )
+        .arg(
+            Arg::new("stats")
+                .long("stats")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "For a collection, also scan every record for event statistics (room \
+                     state, members, DAG health, activity, senders). Slower on large rooms.",
+                ),
+        )
 }
 
 fn sub_import() -> Command {
@@ -521,6 +539,12 @@ fn sub_get() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Emit payload bytes verbatim instead of pretty-printing JSON"),
         )
+        .arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .action(ArgAction::SetTrue)
+                .help("Print record and Matrix event metadata to stderr"),
+        )
 }
 
 #[allow(
@@ -562,10 +586,12 @@ fn parse_cli() -> Cli {
                 .expect("clap requires either positional ID or --id")
                 .clone(),
             raw: m.get_flag("raw"),
+            verbose: m.get_flag("verbose"),
         },
         Some(("collections", m)) => Commands::Collections {
             all: m.get_flag("all"),
             layout: m.get_flag("layout"),
+            canonical: m.get_flag("canonical"),
             sort: m.get_one::<String>("sort").cloned(),
             limit: *m
                 .get_one::<i64>("limit")
@@ -581,6 +607,7 @@ fn parse_cli() -> Cli {
         },
         Some(("info", m)) => Commands::Info {
             collection: m.get_one::<String>("collection").unwrap().clone(),
+            stats: m.get_flag("stats"),
         },
         Some(("scan", m)) => Commands::Scan {
             selector: m.get_one::<String>("selector").unwrap().clone(),

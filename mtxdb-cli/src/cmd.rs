@@ -173,16 +173,18 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection,
             id,
             raw,
-        } => cmd_get(cli, collection.as_deref(), id, *raw),
+            verbose,
+        } => cmd_get(cli, collection.as_deref(), id, *raw, *verbose),
         Commands::Collections {
             all,
             layout,
+            canonical,
             sort,
             limit,
-        } => cmd_collections(cli, *all, *layout, sort.as_deref(), *limit),
+        } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
-        Commands::Info { collection } => cmd_info(cli, collection),
+        Commands::Info { collection, .. } => cmd_info(cli, collection),
         Commands::Scan {
             selector,
             verbose,
@@ -529,6 +531,50 @@ fn emit_get_data(data: &NodeData, raw: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_get_verbose(
+    requested_id: &str,
+    node_id: &[u8; 16],
+    shard_type: ShardType,
+    collection_id: &[u8; 16],
+    data: &NodeData,
+) {
+    eprintln!("record:");
+    eprintln!("  requested:  {requested_id}");
+    eprintln!("  node:       {}", format_id(node_id));
+    eprintln!("  collection: {}", format_id(collection_id));
+    eprintln!("  pool:       {}", shard_type.as_str());
+    eprintln!("  payload:    {} bytes", data.bytes.len());
+
+    let mut bytes = data.bytes.to_vec();
+    let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
+        eprintln!("  format:     binary/non-JSON");
+        return;
+    };
+    let Some(kind) = event_string_field(&event, "type") else {
+        eprintln!("  format:     JSON");
+        return;
+    };
+    eprintln!("  type:       {kind}");
+    for (label, field) in [
+        ("event", "event_id"),
+        ("room", "room_id"),
+        ("sender", "sender"),
+        ("state key", "state_key"),
+    ] {
+        if let Some(value) = event_string_field(&event, field) {
+            eprintln!("  {label:<11}{value}");
+        }
+    }
+    if let OwnedValue::Object(fields) = &event {
+        if let Some(depth) = fields.get("depth").and_then(OwnedValue::as_i64) {
+            eprintln!("  depth:      {depth}");
+        }
+        if let Some(timestamp) = fields.get("origin_server_ts").and_then(OwnedValue::as_i64) {
+            eprintln!("  origin ts:  {timestamp}");
+        }
+    }
+}
+
 fn get_matches_in_store(
     store: &PackfileStorage,
     collection: Option<&str>,
@@ -555,7 +601,13 @@ fn get_matches_in_store(
     }
 }
 
-fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::Result<()> {
+fn cmd_get(
+    cli: &Cli,
+    collection: Option<&str>,
+    id: &str,
+    raw: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let node_id = parse_get_id(id)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
@@ -571,7 +623,12 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
         }
         match matches.as_slice() {
             [] => bail!("not found"),
-            [(_, _, data)] => emit_get_data(data, raw),
+            [(shard_type, collection_id, data)] => {
+                if verbose {
+                    print_get_verbose(id, &node_id, *shard_type, collection_id, data);
+                }
+                emit_get_data(data, raw)
+            }
             _ => {
                 let locations = matches
                     .iter()
@@ -594,7 +651,12 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
         let matches = get_matches_in_store(&store, collection, &node_id)?;
         match matches.as_slice() {
             [] => bail!("not found{}", other_shard_type_node_hint(cli, &node_id)),
-            [(_, data)] => emit_get_data(data, raw),
+            [(collection_id, data)] => {
+                if verbose {
+                    print_get_verbose(id, &node_id, cli.require_shard_type()?, collection_id, data);
+                }
+                emit_get_data(data, raw)
+            }
             _ => bail!(
                 "node ID {id} is present in multiple collections ({}); specify --collection",
                 matches
@@ -1025,6 +1087,7 @@ fn cmd_collections(
     cli: &Cli,
     all: bool,
     layout: bool,
+    canonical: bool,
     sort: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<()> {
@@ -1039,11 +1102,17 @@ fn cmd_collections(
                 println!();
             }
             print_section_header(shard_type);
-            cmd_collections_in_dir(&pool_dir(&db_layout, shard_type)?, layout, sort, limit)?;
+            cmd_collections_in_dir(
+                &pool_dir(&db_layout, shard_type)?,
+                layout,
+                canonical,
+                sort,
+                limit,
+            )?;
         }
         return Ok(());
     }
-    cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, sort, limit)
+    cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, canonical, sort, limit)
 }
 
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
@@ -1055,6 +1124,7 @@ fn cmd_collections(
 fn cmd_collections_in_dir(
     dir: &Path,
     layout: bool,
+    canonical: bool,
     sort: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<()> {
@@ -1078,12 +1148,53 @@ fn cmd_collections_in_dir(
             .collection_summaries(),
     };
     let collection_shards = PackfileStorage::collection_shards_from_disk(dir);
-    let physical = physical_layout(dir)?;
+    let canonical_ids: HashMap<[u8; 16], String> = if canonical {
+        PackfileStorage::open_read_only(dir.to_path_buf())
+            .ok()
+            .map(|store| {
+                collections
+                    .iter()
+                    .filter_map(|(id, _, _, _)| {
+                        store
+                            .get_collection_metadata(id)
+                            .ok()
+                            .flatten()
+                            .map(|metadata| {
+                                (
+                                    *id,
+                                    String::from_utf8_lossy(&metadata.collection_canonical_id)
+                                        .into_owned(),
+                                )
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let physical_needed = layout
+        || sort.is_some_and(|column| {
+            matches!(
+                column,
+                "disk" | "packs" | "avoidable" | "segments" | "fragmentation"
+            )
+        });
+    let physical = if physical_needed {
+        Some(physical_layout(dir)?)
+    } else {
+        None
+    };
     let disk_bytes: HashMap<_, _> = physical
-        .collections
-        .iter()
-        .map(|(id, stats)| (*id, stats.disk_bytes))
-        .collect();
+        .as_ref()
+        .map(|layout| {
+            layout
+                .collections
+                .iter()
+                .map(|(id, stats)| (*id, stats.disk_bytes))
+                .collect()
+        })
+        .unwrap_or_default();
 
     if collections.is_empty() {
         println!("no collections found");
@@ -1109,8 +1220,8 @@ fn cmd_collections_in_dir(
     }
     let mut ordered: Vec<_> = collections.iter().enumerate().collect();
     ordered.sort_by(|(left_order, left), (right_order, right)| {
-        let left_layout = physical.collections.get(&left.0);
-        let right_layout = physical.collections.get(&right.0);
+        let left_layout = physical.as_ref().and_then(|p| p.collections.get(&left.0));
+        let right_layout = physical.as_ref().and_then(|p| p.collections.get(&right.0));
         let score = |stats: Option<&CollectionPhysicalLayout>| {
             stats.map_or(0, |s| s.segments.saturating_sub(s.pack_bytes.len() as u64))
         };
@@ -1136,8 +1247,21 @@ fn cmd_collections_in_dir(
     });
     if layout {
         println!(
-            "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-            "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
+            "  {:<34}  {:<36}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "collection",
+            "canonical",
+            "nodes",
+            "load",
+            "packs",
+            "disk",
+            "runs",
+            "largest",
+            "avoidable"
+        );
+    } else if canonical {
+        println!(
+            "  {:<34}  {:<36}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "collection", "canonical", "nodes", "load", "shards", "index", "disk"
         );
     } else {
         println!(
@@ -1157,6 +1281,11 @@ fn cmd_collections_in_dir(
             .checked_add(*memory)
             .context("total collection index memory overflow")?;
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
+        let disk_display = if physical_needed {
+            fmt_disk_megabytes(disk)
+        } else {
+            "?".to_owned()
+        };
         total_disk_bytes = total_disk_bytes.saturating_add(disk);
     }
     let max_rows = if limit <= 0 {
@@ -1166,6 +1295,7 @@ fn cmd_collections_in_dir(
     };
     for (_, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
         let hex = format_id(collection_id);
+        let canonical_id = canonical_ids.get(collection_id).map_or("-", String::as_str);
         let load = fmt_load_percent(*nodes, *capacity);
         let shards = collection_shards
             .as_ref()
@@ -1182,22 +1312,26 @@ fn cmd_collections_in_dir(
             );
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
         if layout {
-            let stats = physical.collections.get(collection_id);
+            let stats = physical
+                .as_ref()
+                .and_then(|p| p.collections.get(collection_id));
             let packs = stats.map_or(0, |s| s.pack_bytes.len());
             let runs = stats.map_or(0, |s| s.segments);
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
             let avoidable = avoidable_spread_bytes(stats);
             println!(
-                "  {hex}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
-                fmt_disk_megabytes(disk),
+                "  {hex:<34}  {canonical_id:<36}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
+                disk_display,
                 fmt_bytes(largest),
                 fmt_bytes(avoidable)
             );
+        } else if canonical {
+            println!("  {hex:<34}  {canonical_id:<36}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}", fmt_index_kilobytes(*memory), disk_display);
         } else {
             println!(
                 "  {hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
                 fmt_index_kilobytes(*memory),
-                fmt_disk_megabytes(disk),
+                disk_display
             );
         }
     }
@@ -1209,7 +1343,11 @@ fn cmd_collections_in_dir(
             total_nodes,
             "",
             "",
-            fmt_disk_megabytes(total_disk_bytes),
+            if physical_needed {
+                fmt_disk_megabytes(total_disk_bytes)
+            } else {
+                "?".to_owned()
+            },
             "",
             "",
             ""
@@ -1225,6 +1363,7 @@ fn cmd_collections_in_dir(
         );
     }
     if layout {
+        let physical = physical.as_ref().expect("layout requires physical scan");
         let total_segments: u64 = physical.collections.values().map(|s| s.segments).sum();
         let spread = physical
             .collections
@@ -2081,9 +2220,10 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
 }
 
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    let deep = matches!(cli.command, Commands::Info { stats: true, .. });
     match classify_info_selector(selector)? {
         InfoTarget::Pack => cmd_info_pack(cli, selector),
-        InfoTarget::Collection => cmd_info_collection(cli, selector),
+        InfoTarget::Collection => cmd_info_collection(cli, selector, deep),
     }
 }
 
@@ -2295,6 +2435,7 @@ fn print_collection_info(
     mem: usize,
     capacity: u32,
     shards: &[u64],
+    deep: bool,
 ) {
     let hex = format_id(collection_id);
     println!(
@@ -2337,9 +2478,10 @@ fn print_collection_info(
         Some(extension) => print_matrix_room_extension(&extension),
         None => println!("  {:<12} not found", "create:"),
     }
+    print_collection_details(dir, collection_id, deep);
 }
 
-fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> bool {
+fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16], deep: bool) -> bool {
     if let (Some(summaries), Some(collection_shards)) = (
         PackfileStorage::collection_summaries_from_disk(dir),
         PackfileStorage::collection_shards_from_disk(dir),
@@ -2352,7 +2494,7 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> bool {
                 .get(collection_id)
                 .cloned()
                 .unwrap_or_default();
-            print_collection_info(dir, collection_id, len, mem, capacity, &shards);
+            print_collection_info(dir, collection_id, len, mem, capacity, &shards, deep);
             return true;
         }
         return false;
@@ -2374,12 +2516,13 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> bool {
             Some(extension) => print_matrix_room_extension(&extension),
             None => println!("  {:<12} not found", "create:"),
         }
+        print_collection_details(dir, collection_id, deep);
         return true;
     }
     false
 }
 
-fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
+fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Result<()> {
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
@@ -2400,7 +2543,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
                     println!();
                 }
                 print_section_header(shard_type);
-                inspect_collection_in_dir(&dir, &collection_id);
+                inspect_collection_in_dir(&dir, &collection_id, deep);
                 matched_any = true;
             }
         }
@@ -2417,7 +2560,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     let hex = format_id(&collection_id);
     let dir = selected_pool_dir(cli)?;
 
-    if inspect_collection_in_dir(&dir, &collection_id) {
+    if inspect_collection_in_dir(&dir, &collection_id, deep) {
         return Ok(());
     }
 
@@ -2564,6 +2707,409 @@ fn print_matrix_room_extension(extension: &MatrixRoomExtension) {
         let _ = write!(create, "; room version {room_version}");
     }
     println!("  {:<12} {create}", "create:");
+}
+
+/// Live-record statistics for a collection whose records are Matrix events,
+/// gathered by one pass over the packs that hold it.
+#[derive(Default)]
+struct RoomEventStats {
+    /// Physical frames for this collection, including superseded rewrites.
+    frames: usize,
+    /// Distinct live records excluding the genesis metadata record.
+    records: usize,
+    /// Records whose payload is empty (tombstones).
+    tombstones: usize,
+    /// Records whose payload is not a JSON object.
+    unparsed: usize,
+    state_events: usize,
+    payload_bytes: u64,
+    types: HashMap<String, usize>,
+    senders: HashMap<String, usize>,
+    servers: HashMap<String, usize>,
+    months: HashMap<String, usize>,
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
+    min_depth: Option<i64>,
+    max_depth: Option<i64>,
+    event_ids: HashSet<String>,
+    prev_refs: HashSet<String>,
+    auth_refs: HashSet<String>,
+    /// Latest (by timestamp) empty-state-key event content per room-config type.
+    room_state: HashMap<String, (i64, OwnedValue)>,
+    /// Latest membership per user: (timestamp, membership).
+    members: HashMap<String, (i64, String)>,
+    /// Largest payloads: (bytes, event id, type).
+    largest: Vec<(usize, String, String)>,
+}
+
+/// Room-config state types worth summarizing in `info --stats`.
+const ROOM_CONFIG_TYPES: [&str; 6] = [
+    "m.room.name",
+    "m.room.topic",
+    "m.room.canonical_alias",
+    "m.room.join_rules",
+    "m.room.history_visibility",
+    "m.room.encryption",
+];
+
+fn string_array(fields: &simd_json::owned::Object, key: &str) -> Vec<String> {
+    match fields.get(key) {
+        Some(OwnedValue::Array(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                OwnedValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass gathers every statistic; splitting would only thread the accumulator"
+)]
+fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result<RoomEventStats> {
+    let pool =
+        ShardPool::open_read_only(dir.to_path_buf()).context("failed to open shard store")?;
+    let mut shards = pool.all_shards();
+    shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
+    let collection_packs = PackfileStorage::collection_shards_from_disk(dir)
+        .and_then(|mut collections| collections.remove(collection_id))
+        .map(|packs| packs.into_iter().collect::<HashSet<_>>());
+
+    let mut stats = RoomEventStats::default();
+    // Later frames supersede earlier ones for the same record id.
+    let mut latest: HashMap<[u8; 16], (Arc<mtxdb::shard::Shard>, u64)> = HashMap::new();
+    for (_, shard) in shards {
+        if let Some(packs) = &collection_packs {
+            if !packs.contains(&shard.pack_id) {
+                continue;
+            }
+        }
+        for record in mtxdb::packfile::scan_packfile_iter(&shard.path, false)? {
+            let (record_collection, record_id, offset) = record?;
+            if &record_collection != collection_id {
+                continue;
+            }
+            stats.frames = stats.frames.saturating_add(1);
+            latest.insert(record_id, (Arc::clone(&shard), offset));
+        }
+    }
+    for (record_id, (shard, offset)) in latest {
+        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+            continue;
+        }
+        let record = ShardPool::read_at_committed(&shard, offset, false)?;
+        stats.records = stats.records.saturating_add(1);
+        if record.data.is_empty() {
+            stats.tombstones = stats.tombstones.saturating_add(1);
+            continue;
+        }
+        let size = record.data.len();
+        stats.payload_bytes = stats
+            .payload_bytes
+            .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+        let mut bytes = record.data.to_vec();
+        let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
+            stats.unparsed = stats.unparsed.saturating_add(1);
+            continue;
+        };
+        let OwnedValue::Object(fields) = &event else {
+            stats.unparsed = stats.unparsed.saturating_add(1);
+            continue;
+        };
+        let kind = event_string_field(&event, "type").unwrap_or("");
+        let ts = fields
+            .get("origin_server_ts")
+            .and_then(ValueAsScalar::as_i64);
+        let event_id = event_id(&event).unwrap_or("").to_owned();
+        if is_state_event(&event) {
+            stats.state_events = stats.state_events.saturating_add(1);
+            let state_key = event_string_field(&event, "state_key").unwrap_or("");
+            let when = ts.unwrap_or(0);
+            if kind == "m.room.member" {
+                let membership =
+                    nested_event_string_field(&event, "content", "membership").unwrap_or("?");
+                let newer = stats
+                    .members
+                    .get(state_key)
+                    .map_or(true, |(seen, _)| when >= *seen);
+                if newer {
+                    stats
+                        .members
+                        .insert(state_key.to_owned(), (when, membership.to_owned()));
+                }
+            } else if state_key.is_empty() && ROOM_CONFIG_TYPES.contains(&kind) {
+                let newer = stats
+                    .room_state
+                    .get(kind)
+                    .map_or(true, |(seen, _)| when >= *seen);
+                if newer {
+                    if let Some(content) = fields.get("content") {
+                        stats
+                            .room_state
+                            .insert(kind.to_owned(), (when, content.clone()));
+                    }
+                }
+            }
+        }
+        let bump = |map: &mut HashMap<String, usize>, key: &str| {
+            let count = map.entry(key.to_owned()).or_default();
+            *count = count.saturating_add(1);
+        };
+        bump(&mut stats.types, kind);
+        if let Some(sender) = event_string_field(&event, "sender") {
+            bump(&mut stats.senders, sender);
+            if let Some((_, server)) = sender.split_once(':') {
+                bump(&mut stats.servers, server);
+            }
+        }
+        if let Some(ts) = ts {
+            stats.min_ts = Some(stats.min_ts.map_or(ts, |m| m.min(ts)));
+            stats.max_ts = Some(stats.max_ts.map_or(ts, |m| m.max(ts)));
+            bump(&mut stats.months, &format_utc_ms(ts)[..7]);
+        }
+        if let Some(depth) = fields.get("depth").and_then(ValueAsScalar::as_i64) {
+            stats.min_depth = Some(stats.min_depth.map_or(depth, |m| m.min(depth)));
+            stats.max_depth = Some(stats.max_depth.map_or(depth, |m| m.max(depth)));
+        }
+        stats.prev_refs.extend(string_array(fields, "prev_events"));
+        stats.auth_refs.extend(string_array(fields, "auth_events"));
+        stats
+            .largest
+            .push((size, event_id.clone(), kind.to_owned()));
+        stats
+            .largest
+            .sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        stats.largest.truncate(3);
+        stats.event_ids.insert(event_id);
+    }
+    Ok(stats)
+}
+
+/// Format a millisecond Unix timestamp as `YYYY-MM-DD HH:MM` UTC.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "calendar arithmetic on one i64 timestamp; every intermediate is bounded by it"
+)]
+fn format_utc_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let minutes_of_day = secs.rem_euclid(86_400) / 60;
+    // Civil-from-days (proleptic Gregorian), after Howard Hinnant.
+    let z = days.saturating_add(719_468);
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        minutes_of_day / 60,
+        minutes_of_day % 60
+    )
+}
+
+fn top_counts(counts: &HashMap<String, usize>, limit: usize) -> String {
+    let mut entries: Vec<_> = counts.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    entries
+        .into_iter()
+        .take(limit)
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat list of independent report lines"
+)]
+fn print_room_event_stats(stats: &RoomEventStats) {
+    let live = stats.records.saturating_sub(stats.tombstones);
+    println!(
+        "  {:<12} {live} live, {} state, {} tombstoned, {} superseded frames",
+        "events:",
+        stats.state_events,
+        stats.tombstones,
+        stats.frames.saturating_sub(stats.records.saturating_add(1)),
+    );
+    let text = |kind: &str, field: &str| {
+        stats
+            .room_state
+            .get(kind)
+            .and_then(|(_, content)| match content {
+                OwnedValue::Object(fields) => match fields.get(field) {
+                    Some(OwnedValue::String(value)) if !value.is_empty() => Some(value.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+    };
+    let mut config = Vec::new();
+    if let Some(name) = text("m.room.name", "name") {
+        config.push(format!("name {name:?}"));
+    }
+    if let Some(topic) = text("m.room.topic", "topic") {
+        let topic: String = topic.chars().take(80).collect();
+        config.push(format!("topic {topic:?}"));
+    }
+    if let Some(alias) = text("m.room.canonical_alias", "alias") {
+        config.push(format!("alias {alias}"));
+    }
+    if let Some(rule) = text("m.room.join_rules", "join_rule") {
+        config.push(format!("join rule {rule}"));
+    }
+    if let Some(visibility) = text("m.room.history_visibility", "history_visibility") {
+        config.push(format!("history {visibility}"));
+    }
+    if let Some(algorithm) = text("m.room.encryption", "algorithm") {
+        config.push(format!("encrypted ({algorithm})"));
+    }
+    if !config.is_empty() {
+        println!(
+            "  {:<12} {} (latest by timestamp)",
+            "room state:",
+            config.join("; ")
+        );
+    }
+    if !stats.members.is_empty() {
+        let mut by_membership: HashMap<String, usize> = HashMap::new();
+        for (_, membership) in stats.members.values() {
+            let count = by_membership.entry(membership.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        println!(
+            "  {:<12} {} users: {}",
+            "members:",
+            stats.members.len(),
+            top_counts(&by_membership, 6)
+        );
+    }
+    if let (Some(min), Some(max)) = (stats.min_ts, stats.max_ts) {
+        println!(
+            "  {:<12} {} \u{2192} {} UTC ({} active months; busiest {})",
+            "time span:",
+            format_utc_ms(min),
+            format_utc_ms(max),
+            stats.months.len(),
+            top_counts(&stats.months, 3)
+        );
+    }
+    if let (Some(min), Some(max)) = (stats.min_depth, stats.max_depth) {
+        println!("  {:<12} {min} \u{2192} {max}", "depth:");
+    }
+    let missing_prev = stats.prev_refs.difference(&stats.event_ids).count();
+    let missing_auth = stats.auth_refs.difference(&stats.event_ids).count();
+    let extremities = stats.event_ids.difference(&stats.prev_refs).count();
+    println!(
+        "  {:<12} {extremities} forward extremities; {missing_prev} missing prev_events; {missing_auth} missing auth_events",
+        "dag:"
+    );
+    if stats.unparsed > 0 {
+        println!("  {:<12} {} not JSON objects", "unparsed:", stats.unparsed);
+    }
+    if !stats.types.is_empty() {
+        println!(
+            "  {:<12} {} distinct; {}",
+            "types:",
+            stats.types.len(),
+            top_counts(&stats.types, 8)
+        );
+    }
+    if !stats.senders.is_empty() {
+        println!(
+            "  {:<12} {} distinct; {}",
+            "senders:",
+            stats.senders.len(),
+            top_counts(&stats.senders, 5)
+        );
+    }
+    if !stats.servers.is_empty() {
+        println!(
+            "  {:<12} {} distinct; {}",
+            "servers:",
+            stats.servers.len(),
+            top_counts(&stats.servers, 5)
+        );
+    }
+    if !stats.largest.is_empty() {
+        let largest = stats
+            .largest
+            .iter()
+            .map(|(bytes, id, kind)| {
+                format!(
+                    "{} {kind} {id}",
+                    fmt_bytes(u64::try_from(*bytes).unwrap_or(u64::MAX))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        println!("  {:<12} {largest}", "largest:");
+    }
+    if stats.records > 0 {
+        println!(
+            "  {:<12} {} average payload",
+            "size:",
+            fmt_bytes(
+                stats
+                    .payload_bytes
+                    .checked_div(u64::try_from(stats.records).unwrap_or(0))
+                    .unwrap_or(0)
+            )
+        );
+    }
+}
+
+/// Print a collection's identity rules from its genesis record (cheap), and,
+/// with `deep`, event statistics from a full pass over its records.
+fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
+    if let Ok(store) = PackfileStorage::open_read_only(dir.to_path_buf()) {
+        if let Ok(Some(metadata)) = store.get_collection_metadata(collection_id) {
+            let pool = metadata.pool_dst.map_or_else(
+                || "none".to_owned(),
+                |dst| String::from_utf8_lossy(&dst).into_owned(),
+            );
+            println!(
+                "  {:<12} pool {pool}; canonical id {}",
+                "identity:",
+                String::from_utf8_lossy(&metadata.collection_canonical_id)
+            );
+            let policy = match &metadata.record_id_rule.policy {
+                FrameIdPolicy::Pointer { pointer } => format!("{pointer} value"),
+                other => format!("{other:?}"),
+            };
+            println!(
+                "  {:<12} {:?} of {policy}; payload {:?}",
+                "record id:", metadata.record_id_rule.digest_algorithm, metadata.payload
+            );
+        }
+    }
+    if !deep {
+        println!("  (run with --stats for event statistics; this scans every record)");
+        return;
+    }
+    let started = std::time::Instant::now();
+    match scan_room_event_stats(dir, collection_id) {
+        Ok(stats) => {
+            print_room_event_stats(&stats);
+            println!(
+                "  {:<12} {:.1}s",
+                "scan time:",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Err(error) => println!("  {:<12} failed: {error:#}", "stats:"),
+    }
 }
 
 fn print_collection_shards(shards: &[u64]) {
@@ -5624,6 +6170,7 @@ mod tests {
             shard_type: None,
             command: Commands::Info {
                 collection: String::new(),
+                stats: false,
             },
         };
         let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63").unwrap_err();
@@ -5736,11 +6283,12 @@ mod tests {
                 collection: None,
                 id: node_hex.clone(),
                 raw: false,
+                verbose: false,
             },
         };
 
-        cmd_get(&cli, None, &node_hex, false).unwrap();
-        cmd_get(&cli, Some(&col_hex), &node_hex, true).unwrap();
+        cmd_get(&cli, None, &node_hex, false, false).unwrap();
+        cmd_get(&cli, Some(&col_hex), &node_hex, true, false).unwrap();
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -5763,6 +6311,7 @@ mod tests {
             shard_type: None,
             command: Commands::Info {
                 collection: col_hex.clone(),
+                stats: false,
             },
         };
 
