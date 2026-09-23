@@ -65,7 +65,7 @@ MTXDB_TEST_PROFILE ?=
 
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(CARGO) test --profile $(MTXDB_INSTALL_PROFILE) --workspace --all-features --lib --tests --timings
+	$(CARGO) test --profile $(MTXDB_TEST_PROFILE) --workspace --all-features --lib --tests --timings
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
