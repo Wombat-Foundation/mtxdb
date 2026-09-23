@@ -2444,7 +2444,10 @@ fn print_collection_info(
         fmt_load_factor(len, capacity)
     );
     print_collection_shards(shards);
-    if deep {
+    let room_extension = PackfileStorage::open_read_only(dir.to_path_buf())
+        .ok()
+        .and_then(|store| matrix_room_extension_from_store(&store, collection_id));
+    if deep && room_extension.is_some() {
         match physical_layout(dir) {
             Ok(physical) => {
                 if let Some(layout) = physical.collections.get(collection_id) {
@@ -2473,10 +2476,7 @@ fn print_collection_info(
             Err(error) => eprintln!("  physical: unavailable ({error})"),
         }
     }
-    match PackfileStorage::open_read_only(dir.to_path_buf())
-        .ok()
-        .and_then(|store| matrix_room_extension_from_store(&store, collection_id))
-    {
+    match room_extension {
         Some(extension) => print_matrix_room_extension(&extension),
         None => println!("  {:<12} not found", "create:"),
     }
@@ -2721,8 +2721,12 @@ struct RoomEventStats {
     records: usize,
     /// Records whose payload is empty (tombstones).
     tombstones: usize,
-    /// Records whose payload is not a JSON object.
-    unparsed: usize,
+    /// Records whose payload parsed as a JSON object.
+    json_events: usize,
+    /// Live records by recognized payload kind.
+    kinds: HashMap<String, usize>,
+    min_size: Option<usize>,
+    max_size: usize,
     state_events: usize,
     payload_bytes: u64,
     types: HashMap<String, usize>,
@@ -2812,15 +2816,22 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
         stats.payload_bytes = stats
             .payload_bytes
             .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+        stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
+        stats.max_size = stats.max_size.max(size);
         let mut bytes = record.data.to_vec();
-        let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
-            stats.unparsed = stats.unparsed.saturating_add(1);
+        let parsed = simd_json::to_owned_value(&mut bytes).ok();
+        let Some(event @ OwnedValue::Object(_)) = parsed else {
+            let kind = classify_record_payload(&record.data);
+            let count = stats.kinds.entry(kind.to_owned()).or_default();
+            *count = count.saturating_add(1);
             continue;
         };
         let OwnedValue::Object(fields) = &event else {
-            stats.unparsed = stats.unparsed.saturating_add(1);
             continue;
         };
+        stats.json_events = stats.json_events.saturating_add(1);
+        let count = stats.kinds.entry("JSON event".to_owned()).or_default();
+        *count = count.saturating_add(1);
         let kind = event_string_field(&event, "type").unwrap_or("");
         let ts = fields
             .get("origin_server_ts")
@@ -2932,6 +2943,27 @@ fn top_counts(counts: &HashMap<String, usize>, limit: usize) -> String {
         .join(", ")
 }
 
+/// Name a non-JSON-object payload by its recognizable wire format.
+fn classify_record_payload(data: &[u8]) -> &'static str {
+    if data.starts_with(b"MTHN") {
+        "HAMT node"
+    } else if data.starts_with(b"MTHR") {
+        "HAMT state-group root"
+    } else if data.starts_with(b"AUX1") {
+        "auxiliary index value"
+    } else if decode_event_json_record(data).is_some() {
+        "Synapse event_json mirror"
+    } else if data
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| matches!(byte, b'{' | b'['))
+    {
+        "malformed JSON"
+    } else {
+        "opaque binary"
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "a flat list of independent report lines"
@@ -2939,11 +2971,34 @@ fn top_counts(counts: &HashMap<String, usize>, limit: usize) -> String {
 fn print_room_event_stats(stats: &RoomEventStats) {
     let live = stats.records.saturating_sub(stats.tombstones);
     println!(
-        "  {:<12} {live} live, {} state, {} tombstoned, {} superseded frames",
-        "events:",
-        stats.state_events,
+        "  {:<12} {live} live, {} tombstoned, {} superseded frames",
+        "records:",
         stats.tombstones,
         stats.frames.saturating_sub(stats.records.saturating_add(1)),
+    );
+    if !stats.kinds.is_empty() {
+        println!("  {:<12} {}", "kinds:", top_counts(&stats.kinds, 6));
+    }
+    if let Some(min) = stats.min_size {
+        println!(
+            "  {:<12} min {}; avg {}; max {}",
+            "payload:",
+            fmt_bytes(u64::try_from(min).unwrap_or(u64::MAX)),
+            fmt_bytes(
+                stats
+                    .payload_bytes
+                    .checked_div(u64::try_from(live).unwrap_or(0))
+                    .unwrap_or(0)
+            ),
+            fmt_bytes(u64::try_from(stats.max_size).unwrap_or(u64::MAX))
+        );
+    }
+    if stats.json_events == 0 {
+        return;
+    }
+    println!(
+        "  {:<12} {} JSON, {} state",
+        "events:", stats.json_events, stats.state_events
     );
     let text = |kind: &str, field: &str| {
         stats
@@ -3017,9 +3072,6 @@ fn print_room_event_stats(stats: &RoomEventStats) {
         "  {:<12} {extremities} forward extremities; {missing_prev} missing prev_events; {missing_auth} missing auth_events",
         "dag:"
     );
-    if stats.unparsed > 0 {
-        println!("  {:<12} {} not JSON objects", "unparsed:", stats.unparsed);
-    }
     if !stats.types.is_empty() {
         println!(
             "  {:<12} {} distinct; {}",
@@ -3058,25 +3110,19 @@ fn print_room_event_stats(stats: &RoomEventStats) {
             .join("; ");
         println!("  {:<12} {largest}", "largest:");
     }
-    if stats.records > 0 {
-        println!(
-            "  {:<12} {} average payload",
-            "size:",
-            fmt_bytes(
-                stats
-                    .payload_bytes
-                    .checked_div(u64::try_from(stats.records).unwrap_or(0))
-                    .unwrap_or(0)
-            )
-        );
-    }
 }
 
 /// Print a collection's identity rules from its genesis record (cheap), and,
 /// with `deep`, event statistics from a full pass over its records.
 fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
+    let mut matrix_room = false;
     if let Ok(store) = PackfileStorage::open_read_only(dir.to_path_buf()) {
         if let Ok(Some(metadata)) = store.get_collection_metadata(collection_id) {
+            matrix_room = metadata
+                .extension
+                .as_deref()
+                .and_then(MatrixRoomExtension::decode_blob)
+                .is_some();
             let pool = metadata.pool_dst.map_or_else(
                 || "none".to_owned(),
                 |dst| String::from_utf8_lossy(&dst).into_owned(),
@@ -3098,6 +3144,13 @@ fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
     }
     if !deep {
         println!("  (run with --stats for event statistics; this scans every record)");
+        return;
+    }
+    if !matrix_room {
+        println!(
+            "  {:<12} skipped (collection has no Matrix room metadata)",
+            "stats:"
+        );
         return;
     }
     let started = std::time::Instant::now();
