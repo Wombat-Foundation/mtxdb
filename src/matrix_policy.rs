@@ -250,6 +250,26 @@ impl MatrixRoomVersion {
         }
     }
 
+    /// Normalize an establishment record's collection-key value into the form
+    /// ordinary events reference it.
+    ///
+    /// Pre-v12 the create event carries its server-assigned `room_id`, which
+    /// later events reference verbatim. Room version 12 derives the room id
+    /// from the create event's id by replacing the `$` event sigil with `!`
+    /// (MSC4291), so the raw `/event_id` value must be normalized before a
+    /// later batch of ordinary events — whose `room_id` is `!<hash>` —
+    /// derives the same collection identity.
+    #[must_use]
+    pub fn normalize_collection_identity(self, source: &str) -> String {
+        match self {
+            Self::V12 => match source.strip_prefix('$') {
+                Some(rest) => format!("!{rest}"),
+                None => source.to_owned(),
+            },
+            _ => source.to_owned(),
+        }
+    }
+
     /// Whether verification must use strict canonical-number validation.
     #[must_use]
     pub const fn requires_strict_canonical_numbers(self) -> bool {
@@ -406,5 +426,25 @@ mod tests {
             RoomIdPolicy::CreateEventId
         );
         assert_eq!(MatrixRoomVersion::V12.collection_key_pointer(), "/event_id");
+    }
+
+    /// A v12 create event id and the `room_id` ordinary events carry name the
+    /// same collection; the sigil swap is what makes the follow-up batch route.
+    #[test]
+    fn v12_normalizes_the_create_event_id_into_the_room_id_form() {
+        assert_eq!(
+            MatrixRoomVersion::V12.normalize_collection_identity("$DGMOhash"),
+            "!DGMOhash"
+        );
+        // A server-assigned room id is already the referenced form.
+        assert_eq!(
+            MatrixRoomVersion::V10.normalize_collection_identity("!room:server"),
+            "!room:server"
+        );
+        // Already-normalized or unexpected input is left untouched.
+        assert_eq!(
+            MatrixRoomVersion::V12.normalize_collection_identity("!already"),
+            "!already"
+        );
     }
 }

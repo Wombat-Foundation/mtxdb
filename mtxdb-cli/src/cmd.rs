@@ -4096,6 +4096,25 @@ fn event_room_version(event: &OwnedValue) -> Option<MatrixRoomVersion> {
     MatrixRoomVersion::parse(nested_event_string_field(event, "content", "room_version")?)
 }
 
+/// The collection identity an establishment record assigns, normalized to the
+/// form later batches reference.
+///
+/// [`MatrixRoomVersion::collection_key_pointer`] selects the source field
+/// (`/event_id` for v12, `/room_id` otherwise), and
+/// [`MatrixRoomVersion::normalize_collection_identity`] maps v12's create
+/// event id (`$<hash>`) onto the `!<hash>` room id ordinary events carry, so
+/// an establishment batch and a later batch of ordinary events derive the same
+/// collection.
+fn establishment_identity(create: &OwnedValue) -> Option<String> {
+    let version = event_room_version(create);
+    let pointer = version.map_or("/room_id", MatrixRoomVersion::collection_key_pointer);
+    let value = extract_pointer_string(create, pointer)?;
+    Some(match version {
+        Some(version) => version.normalize_collection_identity(value),
+        None => value.to_owned(),
+    })
+}
+
 /// The canonical external identity of the collection an import batch belongs
 /// to, under the template's membership pointer and the Matrix room-version
 /// policy.
@@ -4104,9 +4123,11 @@ fn event_room_version(event: &OwnedValue) -> Option<MatrixRoomVersion> {
 /// membership field (the Matrix template uses `/room_id`). A version can move
 /// that field onto the establishment record: room version 12 derives the room
 /// identity from the accepted create event, so
-/// [`MatrixRoomVersion::collection_key_pointer`] selects `/event_id` there.
-/// A batch carrying more than one membership value is rejected rather than
-/// silently coalesced. Returns `None` when no event carries a usable value.
+/// [`MatrixRoomVersion::collection_key_pointer`] selects `/event_id` there and
+/// [`MatrixRoomVersion::normalize_collection_identity`] converts it to the
+/// `!<hash>` room id ordinary events carry. A batch carrying more than one
+/// membership value is rejected rather than silently coalesced. Returns `None`
+/// when no event carries a usable value.
 fn collection_canonical_id(
     events: &[OwnedValue],
     template: &CollectionTemplate,
@@ -4125,10 +4146,8 @@ fn collection_canonical_id(
         .iter()
         .find(|event| matrix_create_event_id(event).is_some())
     {
-        if let Some(version) = event_room_version(create) {
-            if let Some(value) = extract_pointer_string(create, version.collection_key_pointer()) {
-                return Ok(Some(value.to_owned()));
-            }
+        if let Some(identity) = establishment_identity(create) {
+            return Ok(Some(identity));
         }
     }
     Ok(membership.into_iter().next().map(str::to_owned))
@@ -4726,8 +4745,9 @@ fn matrix_batch_has_create(events: &[OwnedValue], collection_canonical_id: &str)
             return false;
         };
         // Room version 12 carries the collection identity in the create
-        // event's own `event_id`; earlier versions store it as `room_id`.
-        create_id == collection_canonical_id
+        // event's own `event_id` (normalized to `!<hash>`); earlier versions
+        // store it as `room_id`.
+        establishment_identity(event).as_deref() == Some(collection_canonical_id)
             || event_room_id(event) == Some(collection_canonical_id)
             || events.iter().any(|candidate| {
                 event_room_id(candidate) == Some(collection_canonical_id)
@@ -6140,16 +6160,17 @@ mod tests {
         let template = default_matrix_import_template();
         // Room version 12 derives room identity from the accepted create
         // event, so a create without `room_id` still establishes its
-        // collection: the create event's own id is the canonical identity.
+        // collection. The canonical id is normalized to the `!<hash>` room id
+        // ordinary v12 events carry (MSC4291), not the raw `$<hash>` id.
         let create = owned_value(
             r#"{"type":"m.room.create","state_key":"","event_id":"$v12create","content":{"room_version":"12"}}"#,
         );
         let resolved =
             resolve_import_collection(&[create], None, None, &template, &HashSet::new()).unwrap();
-        assert_eq!(resolved.canonical_id, "$v12create");
+        assert_eq!(resolved.canonical_id, "!v12create");
         assert_eq!(
             resolved.collection_id,
-            template_collection_id(&template, "$v12create")
+            template_collection_id(&template, "!v12create")
         );
         assert!(resolved.batch_has_create);
     }
@@ -6157,11 +6178,12 @@ mod tests {
     #[test]
     fn import_admission_reuses_v12_create_identity_for_followup_events() {
         let template = default_matrix_import_template();
-        let canonical_id = "$v12create";
+        let canonical_id = "!v12create";
         let collection_id = template_collection_id(&template, canonical_id);
         let established = HashSet::from([collection_id]);
+        // Ordinary v12 events reference the room as `!<create-id>` (MSC4291).
         let message = owned_value(
-            r#"{"type":"m.room.message","event_id":"$message","room_id":"$v12create"}"#,
+            r#"{"type":"m.room.message","event_id":"$message","room_id":"!v12create"}"#,
         );
 
         let resolved =
@@ -6182,7 +6204,8 @@ mod tests {
         let mut established = HashSet::new();
 
         // Batch 1: the v12 create event alone. It carries no `room_id`; the
-        // collection identity is the create event's own id.
+        // collection identity is the create event's id, normalized to the
+        // `!<hash>` room-id form ordinary events reference.
         let create_path = root.join("create.json");
         std::fs::write(
             &create_path,
@@ -6199,25 +6222,26 @@ mod tests {
         )
         .unwrap();
 
-        let collection_id = template_collection_id(&template, "$v12create");
+        let collection_id = template_collection_id(&template, "!v12create");
         assert!(
             store
                 .get_collection_metadata(&collection_id)
                 .unwrap()
                 .is_some(),
-            "a v12 create must establish a collection keyed by the create event id"
+            "a v12 create must establish a collection keyed by the normalized room id"
         );
 
-        // Batch 2: a separate ordinary v12 event. Per v12 an ordinary PDU's
-        // `room_id` is the create event's own id, so it must resolve to the
-        // same collection rather than spawn a second one.
+        // Batch 2: a separate ordinary v12 event. Per MSC4291 an ordinary
+        // PDU's `room_id` is the create event's id with the `$` sigil
+        // replaced by `!`, so it must resolve to the same collection rather
+        // than spawn a second one.
         let message_value = owned_value(
-            r#"{"event_id":"$m1","room_id":"$v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}"#,
+            r#"{"event_id":"$m1","room_id":"!v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}"#,
         );
         let message_path = root.join("message.json");
         std::fs::write(
             &message_path,
-            r#"{"pdus":[{"event_id":"$m1","room_id":"$v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}]}"#,
+            r#"{"pdus":[{"event_id":"$m1","room_id":"!v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}]}"#,
         )
         .unwrap();
         cmd_import_file(
