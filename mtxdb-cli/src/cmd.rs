@@ -333,9 +333,8 @@ fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
 /// template-independent form), or a Matrix event ID carrying the Matrix
 /// profile's event sigil `$` — a *template* property, not an engine constant.
 /// `$id` uses the same BLAKE3-128 identity rule as CLI-imported records.
-fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
+fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
     if let Some(event_id) = id.strip_prefix('$') {
-        let _ = namespace;
         matrix_event_node_id(event_id)
     } else {
         parse_node_id(id)
@@ -369,9 +368,8 @@ fn matrix_room_collection_id(room_id: &str) -> [u8; 16] {
 /// room sigil `!` — a *template* property, not an engine constant — which is
 /// hashed the same way Synapse's embedded mirror derives a room's `EventDag`
 /// collection (see `matrix_room_collection_id`). Bare hex is rejected.
-fn parse_collection_selector(selector: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
+fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
     if selector.starts_with('!') {
-        let _ = namespace;
         Ok(matrix_room_collection_id(selector))
     } else {
         parse_collection_id(selector)
@@ -534,11 +532,10 @@ fn get_matches_in_store(
     store: &PackfileStorage,
     collection: Option<&str>,
     node_id: &[u8; 16],
-    namespace: Option<&str>,
 ) -> anyhow::Result<Vec<([u8; 16], NodeData)>> {
     match collection {
         Some(collection) => {
-            let collection_id = parse_collection_selector(collection, namespace)?;
+            let collection_id = parse_collection_selector(collection)?;
             Ok(store
                 .get(&collection_id, node_id)?
                 .map(|data| vec![(collection_id, data)])
@@ -558,7 +555,7 @@ fn get_matches_in_store(
 }
 
 fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::Result<()> {
-    let node_id = parse_get_id(id, cli.namespace.as_deref())?;
+    let node_id = parse_get_id(id)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matches: Vec<(ShardType, [u8; 16], NodeData)> = Vec::new();
@@ -567,9 +564,7 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
             let Ok(store) = PackfileStorage::open_read_only(dir) else {
                 continue;
             };
-            for (col_id, data) in
-                get_matches_in_store(&store, collection, &node_id, cli.namespace.as_deref())?
-            {
+            for (col_id, data) in get_matches_in_store(&store, collection, &node_id)? {
                 matches.push((shard_type, col_id, data));
             }
         }
@@ -595,7 +590,7 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
         }
     } else {
         let store = open_store_read_only(cli)?;
-        let matches = get_matches_in_store(&store, collection, &node_id, cli.namespace.as_deref())?;
+        let matches = get_matches_in_store(&store, collection, &node_id)?;
         match matches.as_slice() {
             [] => bail!("not found{}", other_shard_type_node_hint(cli, &node_id)),
             [(_, data)] => emit_get_data(data, raw),
@@ -2358,7 +2353,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
                         None => continue,
                     }
                 }
-                Err(_) => parse_collection_selector(collection, cli.namespace.as_deref())?,
+                Err(_) => parse_collection_selector(collection)?,
             };
             let has_collection =
                 if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir) {
@@ -2379,7 +2374,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
             }
         }
         if !matched_any {
-            let display = match parse_collection_selector(collection, cli.namespace.as_deref()) {
+            let display = match parse_collection_selector(collection) {
                 Ok(id) => format_id(&id),
                 Err(_) => collection.to_owned(),
             };
@@ -2396,7 +2391,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
                 .copied()
                 .with_context(|| format!("collection slot {slot} not found"))?
         }
-        Err(_) => parse_collection_selector(collection, cli.namespace.as_deref())?,
+        Err(_) => parse_collection_selector(collection)?,
     };
     let hex = format_id(&collection_id);
     let dir = selected_pool_dir(cli)?;
@@ -2639,9 +2634,7 @@ fn cmd_scan(
         bail!("scan sorting requires --verbose and cannot be combined with --raw");
     }
     let node_id = id.map(parse_node_id).transpose()?;
-    let collection_filter = collection
-        .map(|value| parse_collection_selector(value, cli.namespace.as_deref()))
-        .transpose()?;
+    let collection_filter = collection.map(parse_collection_selector).transpose()?;
     let opts = ScanOptions {
         verbose,
         limit,
@@ -2995,7 +2988,7 @@ fn cmd_scan_collection_in_pool(
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
 fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
-    let collection_id = parse_collection_selector(selector, cli.namespace.as_deref())?;
+    let collection_id = parse_collection_selector(selector)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
@@ -5295,7 +5288,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: Some(ShardType::State),
-            namespace: None,
             command: Commands::Sync { all: true },
         };
 
@@ -5322,7 +5314,6 @@ mod tests {
         let cli = Cli {
             dir: None,
             shard_type: None,
-            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -5341,7 +5332,6 @@ mod tests {
         let cli = Cli {
             dir: None,
             shard_type: Some(ShardType::State),
-            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -5366,7 +5356,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
-            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -5387,7 +5376,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
-            namespace: None,
             command: Commands::Shards {
                 all: false,
                 layout: false,
@@ -5410,7 +5398,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: Some(ShardType::State),
-            namespace: None,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -5431,7 +5418,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
-            namespace: None,
             command: Commands::Stats { json: false },
         };
         cmd_stats(&cli, false).unwrap();
@@ -5457,7 +5443,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
-            namespace: None,
             command: Commands::Get {
                 collection: None,
                 id: node_hex.clone(),
@@ -5487,7 +5472,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
-            namespace: None,
             command: Commands::Info {
                 collection: col_hex.clone(),
             },
@@ -5513,7 +5497,6 @@ mod tests {
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
-            namespace: None,
             command: Commands::Scan {
                 selector: col_hex.clone(),
                 verbose: false,
