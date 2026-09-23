@@ -366,8 +366,8 @@ fn matrix_room_collection_id(room_id: &str) -> [u8; 16] {
 /// Resolve a collection selector: a `0x`-prefixed logical ID (the engine's
 /// template-independent form), or a canonical ID carrying the Matrix profile's
 /// room sigil `!` — a *template* property, not an engine constant — which is
-/// hashed the same way Synapse's embedded mirror derives a room's `EventDag`
-/// collection (see `matrix_room_collection_id`). Bare hex is rejected.
+/// routed with the BLAKE3 pool-scoped collection identity rule. Bare hex is
+/// rejected.
 fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
     if selector.starts_with('!') {
         Ok(matrix_room_collection_id(selector))
@@ -2506,18 +2506,22 @@ fn matrix_room_extension_from_store(
 }
 
 /// Build the genesis metadata record for a just-established Matrix room.
+///
+/// `collection_canonical_id` is the resolved external identity — the room id,
+/// or the create event's event id for room version 12 — which a v12
+/// establishment record need not carry as an `extension.room_id`.
 fn collection_metadata_for(
     template: &CollectionTemplate,
     extension: &MatrixRoomExtension,
-) -> Option<CollectionMetadata> {
-    let room_id = extension.room_id.as_ref()?;
-    Some(CollectionMetadata {
+    collection_canonical_id: &str,
+) -> CollectionMetadata {
+    CollectionMetadata {
         pool_dst: template.collection_key.pool_dst,
-        collection_canonical_id: room_id.as_bytes().to_vec(),
+        collection_canonical_id: collection_canonical_id.as_bytes().to_vec(),
         record_id_rule: template.record_id_rule.clone(),
         payload: template.payload.clone(),
         extension: Some(extension.encode_blob()),
-    })
+    }
 }
 
 fn print_matrix_room_extension(extension: &MatrixRoomExtension) {
@@ -3927,13 +3931,14 @@ fn import_pdu_events(
     let mut already_present = 0u64;
     let mut already_present_ids = Vec::with_capacity(3);
 
-    let (collection_id, batch_has_create) = resolve_import_collection(
+    let resolved = resolve_import_collection(
         events,
         detected_collection,
         collection_override,
         template,
         established_collections,
     )?;
+    let collection_id = resolved.collection_id;
 
     let collection_hex = format_id(&collection_id);
 
@@ -4006,12 +4011,11 @@ fn import_pdu_events(
     // first frame and is durable no later than any application record. A
     // failure here aborts the batch: proceeding would write records into a
     // collection with no genesis record. The engine enforces this ordering.
-    if batch_has_create {
+    if resolved.batch_has_create {
         established_collections.insert(collection_id);
         let extension = MatrixRoomExtension::from_events(events);
-        if let Some(metadata) = collection_metadata_for(template, &extension) {
-            store.ensure_collection_metadata(&collection_id, &metadata)?;
-        }
+        let metadata = collection_metadata_for(template, &extension, &resolved.canonical_id);
+        store.ensure_collection_metadata(&collection_id, &metadata)?;
     }
 
     if !to_write.is_empty() {
@@ -4072,31 +4076,83 @@ fn import_pdu_events(
 
 /// Resolve a Matrix input's room collection and prove that it is established
 /// before any record from the input is written.
+/// A resolved target collection for an import batch.
+#[derive(Debug)]
+struct ResolvedCollection {
+    /// 128-bit routing key the batch's records are written under.
+    collection_id: [u8; 16],
+    /// Canonical external identity the routing key was derived from.
+    canonical_id: String,
+    /// Whether this batch carries the collection's establishment record.
+    batch_has_create: bool,
+}
+
+/// Parse the room version declared by an establishment record's
+/// `content.room_version`.
+fn event_room_version(event: &OwnedValue) -> Option<MatrixRoomVersion> {
+    MatrixRoomVersion::parse(nested_event_string_field(event, "content", "room_version")?)
+}
+
+/// The canonical external identity of the collection an import batch belongs
+/// to, under the template's membership pointer and the Matrix room-version
+/// policy.
+///
+/// The template's `collection.membership.extract` pointer names the default
+/// membership field (the Matrix template uses `/room_id`). A version can move
+/// that field onto the establishment record: room version 12 derives the room
+/// identity from the accepted create event, so
+/// [`MatrixRoomVersion::collection_key_pointer`] selects `/event_id` there.
+/// A batch carrying more than one membership value is rejected rather than
+/// silently coalesced. Returns `None` when no event carries a usable value.
+fn collection_canonical_id(
+    events: &[OwnedValue],
+    template: &CollectionTemplate,
+) -> anyhow::Result<Option<String>> {
+    let membership: HashSet<&str> = events
+        .iter()
+        .filter_map(|event| extract_pointer_string(event, &template.collection_key.pointer))
+        .collect();
+    if membership.len() > 1 {
+        bail!(
+            "input contains events for multiple {} values; split it into one collection per input",
+            template.collection_key.pointer
+        );
+    }
+    if let Some(create) = events
+        .iter()
+        .find(|event| matrix_create_event_id(event).is_some())
+    {
+        if let Some(version) = event_room_version(create) {
+            if let Some(value) = extract_pointer_string(create, version.collection_key_pointer()) {
+                return Ok(Some(value.to_owned()));
+            }
+        }
+    }
+    Ok(membership.into_iter().next().map(str::to_owned))
+}
+
 fn resolve_import_collection(
     events: &[OwnedValue],
     detected_collection: Option<&str>,
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &HashSet<[u8; 16]>,
-) -> anyhow::Result<([u8; 16], bool)> {
-    let room_ids: HashSet<_> = events.iter().filter_map(event_room_id).collect();
-    if room_ids.len() > 1 {
-        bail!("input contains events for multiple room IDs; split it into one room per input");
-    }
-    let room_id = room_ids.into_iter().next();
+) -> anyhow::Result<ResolvedCollection> {
+    let canonical_id = collection_canonical_id(events, template)?
+        .or_else(|| detected_collection.map(str::to_owned));
     let collection_id = if let Some(value) = collection_override {
         let collection_id = parse_collection_id(value)?;
-        if let Some(room_id) = room_id {
-            let expected = template_collection_id(template, room_id);
+        if let Some(canonical_id) = &canonical_id {
+            let expected = template_collection_id(template, canonical_id);
             if collection_id != expected {
                 bail!(
-                    "--collection {value} does not match Matrix room_id {room_id}; refusing to mix room data into another collection"
+                    "--collection {value} does not match collection identity {canonical_id}; refusing to mix room data into another collection"
                 );
             }
         }
         collection_id
     } else {
-        let room_id = room_id.or(detected_collection).with_context(|| {
+        let canonical_id = canonical_id.clone().with_context(|| {
             let first_event = events
                 .first()
                 .and_then(event_id)
@@ -4105,19 +4161,25 @@ fn resolve_import_collection(
                 "could not detect collection_id (first event: {first_event}); pass --collection for this input"
             )
         })?;
-        template_collection_id(template, room_id)
+        template_collection_id(template, &canonical_id)
     };
-    let batch_has_create = room_id.is_some_and(|room_id| matrix_batch_has_create(events, room_id));
+    let batch_has_create = canonical_id
+        .as_deref()
+        .is_some_and(|canonical| matrix_batch_has_create(events, canonical));
     if batch_has_create {
         validate_establishment_room_version(events)?;
     }
     if !batch_has_create && !established_collections.contains(&collection_id) {
-        let room = room_id.unwrap_or("the selected collection");
+        let room = canonical_id.as_deref().unwrap_or("the selected collection");
         bail!(
             "refusing to import events for {room}: no valid m.room.create event is in this input or already on disk"
         );
     }
-    Ok((collection_id, batch_has_create))
+    Ok(ResolvedCollection {
+        collection_id,
+        canonical_id: canonical_id.unwrap_or_default(),
+        batch_has_create,
+    })
 }
 
 /// Enforce the room-version floor on the batch's establishment record.
@@ -4655,14 +4717,17 @@ fn event_auth_references(event: &OwnedValue, target: &str) -> bool {
 /// A v1–v11 create event normally carries `room_id`; v12 permits the create
 /// event to omit it, so associate that create through an auth edge from a room
 /// event in the same batch.
-fn matrix_batch_has_create(events: &[OwnedValue], room_id: &str) -> bool {
+fn matrix_batch_has_create(events: &[OwnedValue], collection_canonical_id: &str) -> bool {
     events.iter().any(|event| {
         let Some(create_id) = matrix_create_event_id(event) else {
             return false;
         };
-        event_room_id(event) == Some(room_id)
+        // Room version 12 carries the collection identity in the create
+        // event's own `event_id`; earlier versions store it as `room_id`.
+        create_id == collection_canonical_id
+            || event_room_id(event) == Some(collection_canonical_id)
             || events.iter().any(|candidate| {
-                event_room_id(candidate) == Some(room_id)
+                event_room_id(candidate) == Some(collection_canonical_id)
                     && event_auth_references(candidate, create_id)
             })
     })
@@ -5190,13 +5255,13 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 mod tests {
     use super::{
         blake3_digest, build_event_dag, cmd_collections, cmd_get, cmd_import_file, cmd_info,
-        cmd_scan, cmd_shards, cmd_stats, cmd_sync, compile_import_template, compute_state_groups,
-        decode_event_json_record, decode_hamt_node, decode_hamt_root,
-        default_matrix_import_template, derive_template_key, event_id, event_room_id,
-        event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_id,
-        glob_pack_files, import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
-        matrix_room_collection_id, matrix_room_extension_from_store, parse_federation_input,
-        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        cmd_scan, cmd_shards, cmd_stats, cmd_sync, collection_canonical_id,
+        compile_import_template, compute_state_groups, decode_event_json_record, decode_hamt_node,
+        decode_hamt_root, default_matrix_import_template, derive_template_key, event_id,
+        event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
+        format_id, glob_pack_files, import_pdu_events, interleaving_worth_noting,
+        matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
+        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
         resolve_import_collection, scan_payload_suffix, template_collection_id, template_node_id,
         verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, StateSet,
         MATRIX_ROOM_POOL_DST,
@@ -6029,13 +6094,14 @@ mod tests {
             r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org","content":{"room_version":"10"}}"#,
         );
         let template = default_matrix_import_template();
-        let (collection_id, batch_has_create) =
+        let resolved =
             resolve_import_collection(&[create], None, None, &template, &HashSet::new()).unwrap();
         assert_eq!(
-            collection_id,
+            resolved.collection_id,
             template_collection_id(&template, "!room:example.org")
         );
-        assert!(batch_has_create);
+        assert_eq!(resolved.canonical_id, "!room:example.org");
+        assert!(resolved.batch_has_create);
     }
 
     #[test]
@@ -6064,6 +6130,45 @@ mod tests {
             error.to_string().contains("v4 or later"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn import_admission_resolves_v12_collections_from_the_create_event_id() {
+        let template = default_matrix_import_template();
+        // Room version 12 derives room identity from the accepted create
+        // event, so a create without `room_id` still establishes its
+        // collection: the create event's own id is the canonical identity.
+        let create = owned_value(
+            r#"{"type":"m.room.create","state_key":"","event_id":"$v12create","content":{"room_version":"12"}}"#,
+        );
+        let resolved =
+            resolve_import_collection(&[create], None, None, &template, &HashSet::new()).unwrap();
+        assert_eq!(resolved.canonical_id, "$v12create");
+        assert_eq!(
+            resolved.collection_id,
+            template_collection_id(&template, "$v12create")
+        );
+        assert!(resolved.batch_has_create);
+    }
+
+    #[test]
+    fn collection_canonical_id_honours_the_template_membership_pointer() {
+        let mut template = sender_identity_template();
+        template.collection_key.pointer = "/scope".into();
+        let events = vec![owned_value(r#"{"event_id":"$a","scope":"tenant-a"}"#)];
+        assert_eq!(
+            collection_canonical_id(&events, &template)
+                .unwrap()
+                .as_deref(),
+            Some("tenant-a")
+        );
+        // Events disagreeing on the membership value are rejected, not
+        // silently coalesced into one collection.
+        let mixed = vec![
+            owned_value(r#"{"event_id":"$a","scope":"tenant-a"}"#),
+            owned_value(r#"{"event_id":"$b","scope":"tenant-b"}"#),
+        ];
+        assert!(collection_canonical_id(&mixed, &template).is_err());
     }
 
     #[test]
@@ -6772,6 +6877,10 @@ mod tests {
     #[test]
     fn matrix_room_collection_id_matches_internal_derivation() {
         let room_id = "!roomid:example.org";
+        assert_eq!(
+            hex::encode(matrix_room_collection_id(room_id)),
+            "e0828dba265372f79ef010da2c83cd96"
+        );
         assert_eq!(
             matrix_room_collection_id(room_id),
             derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
