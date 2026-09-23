@@ -316,6 +316,8 @@ impl PackfileStorage {
         // A failed reload attempt makes the outcome retryable even if coverage
         // never advanced: a concurrent writer may simply not have written the
         // checkpoint yet, so the same gap can resolve on a later read.
+        // Deliberately sticky: any failed reload makes the whole refresh
+        // retryable, even if a later attempt's reload succeeds.
         let mut reload_failed = false;
         for attempt in 0..RELOAD_ATTEMPTS {
             let mut guard = self.read_journal.lock();
