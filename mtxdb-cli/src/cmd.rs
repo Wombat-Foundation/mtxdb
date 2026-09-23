@@ -2074,29 +2074,47 @@ fn fmt_duration(secs: u64) -> String {
 /// `0x`-prefixed 32-hex logical ID) or a pack selector (`0x`-prefixed, 1–16 hex
 /// digits, as printed by `mtxdb shards`). Dispatch on the hex length the same
 /// way `scan` does; bare hex is not accepted.
-fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
-    if let Some(hex) = selector
+/// What an `info` selector names.
+#[derive(Debug, PartialEq, Eq)]
+enum InfoTarget {
+    Pack,
+    Collection,
+}
+
+/// Classify an `info` selector by the digits after its `0x` prefix: 1-16 name
+/// a pack, exactly 32 name a collection, and any other count is an error. A
+/// selector without a `0x` prefix is a collection slot index from
+/// `mtxdb collections`.
+fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
+    let Some(hex) = selector
         .strip_prefix("0x")
         .or_else(|| selector.strip_prefix("0X"))
-    {
-        if (1..=16).contains(&hex.len()) {
-            return cmd_info_pack(cli, selector);
-        }
-        if hex.len() != 32 {
+    else {
+        return Ok(InfoTarget::Collection);
+    };
+    match hex.len() {
+        1..=16 => Ok(InfoTarget::Pack),
+        32 => Ok(InfoTarget::Collection),
+        found => {
             let doubled = hex.starts_with("0x") || hex.starts_with("0X");
             bail!(
                 "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection) or \
-                 1-16 (a pack), found {} characters{}",
-                hex.len(),
+                 1-16 (a pack), found {found} characters{}",
                 if doubled {
                     " (the `0x` prefix is doubled)"
                 } else {
                     ""
                 }
-            );
+            )
         }
     }
-    cmd_info_collection(cli, selector)
+}
+
+fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    match classify_info_selector(selector)? {
+        InfoTarget::Pack => cmd_info_pack(cli, selector),
+        InfoTarget::Collection => cmd_info_collection(cli, selector),
+    }
 }
 
 /// Print a pack's age (header `created_at`) and how long it stayed the
@@ -2592,7 +2610,10 @@ fn print_collection_shards(shards: &[u64]) {
 /// accepted here: they are recycled implementation details, while a pack ID
 /// is the permanent identity printed by `mtxdb shards`.
 fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
-    let Some(hex) = selector.strip_prefix("0x") else {
+    let Some(hex) = selector
+        .strip_prefix("0x")
+        .or_else(|| selector.strip_prefix("0X"))
+    else {
         bail!("invalid pack ID `{selector}`; use the 0x-prefixed ID shown by `mtxdb shards`");
     };
     if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -2677,15 +2698,9 @@ fn cmd_scan(
         sort: sort_column,
         reverse,
     };
-    // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
-    // it's `0x`-prefixed with something other than 32 hex digits after it;
-    // `0x` + 32 hex digits is a logical collection ID. Bare hex is rejected
-    // downstream. `info` and `scan` share this rule so the same selector works
-    // for both.
-    let looks_like_pack_id = selector
-        .strip_prefix("0x")
-        .or_else(|| selector.strip_prefix("0X"))
-        .is_some_and(|hex| hex.len() != 32);
+    // `info` and `scan` share `classify_info_selector`, so the same selector
+    // works for both and a malformed one gets the same explanation.
+    let looks_like_pack_id = classify_info_selector(selector)? == InfoTarget::Pack;
     if !looks_like_pack_id {
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
@@ -5642,6 +5657,55 @@ mod tests {
         assert!(doubled.to_string().contains("doubled"), "{doubled}");
         let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF").unwrap_err();
         assert!(short.to_string().contains("found 30 characters"), "{short}");
+    }
+
+    #[test]
+    fn info_selector_boundary_between_pack_and_collection() {
+        let digits = |n: usize| format!("0x{}", "a".repeat(n));
+        assert_eq!(
+            super::classify_info_selector("7").unwrap(),
+            super::InfoTarget::Collection
+        );
+        assert_eq!(
+            super::classify_info_selector(&digits(1)).unwrap(),
+            super::InfoTarget::Pack
+        );
+        assert_eq!(
+            super::classify_info_selector(&digits(16)).unwrap(),
+            super::InfoTarget::Pack
+        );
+        assert_eq!(
+            super::classify_info_selector("0X1").unwrap(),
+            super::InfoTarget::Pack,
+            "the prefix is case-insensitive"
+        );
+        assert_eq!(
+            super::classify_info_selector(&digits(32)).unwrap(),
+            super::InfoTarget::Collection
+        );
+        for n in [0, 17, 31, 33] {
+            assert!(
+                super::classify_info_selector(&digits(n)).is_err(),
+                "{n} digits after 0x must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_selector_accepts_either_prefix_case() {
+        assert_eq!(super::parse_pack_id_selector("0x1f").unwrap(), 0x1f);
+        assert_eq!(super::parse_pack_id_selector("0X1f").unwrap(), 0x1f);
+        // Every selector `info` routes to a pack must parse as one.
+        for selector in ["0x1", "0X1", "0xffffffffffffffff", "0XFFFFFFFFFFFFFFFF"] {
+            assert_eq!(
+                super::classify_info_selector(selector).unwrap(),
+                super::InfoTarget::Pack
+            );
+            assert!(
+                super::parse_pack_id_selector(selector).is_ok(),
+                "{selector}"
+            );
+        }
     }
 
     #[test]

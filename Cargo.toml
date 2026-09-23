@@ -132,6 +132,16 @@ workspace = true
 strip = "symbols"
 lto = "thin"
 
+# Fast compile time with decent runtime performance and full debuginfo.
+[profile.release-quick]
+debug = "full"
+debug-assertions = false
+incremental = true
+inherits = "release"
+lto = "off"
+opt-level = 1
+strip = "none"
+
 [profile.release-max-perf]
 inherits = "release"
 strip = "symbols"
@@ -145,8 +155,16 @@ strip = "debuginfo"
 incremental = true
 codegen-units = 256
 
-[profile.test]
-debug = 0
-strip = "debuginfo"
-incremental = true
+# Fast compile-time development/testing profile. "quick" refers to compile
+# time, not runtime speed.
+[profile.dev-quick]
 codegen-units = 256
+debug = "line-tables-only"
+incremental = true
+inherits = "dev"
+lto = "off"
+opt-level = 0
+strip = "symbols"
+
+[profile.test]
+inherits = "dev"
