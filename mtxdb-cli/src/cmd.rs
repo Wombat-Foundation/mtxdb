@@ -2508,8 +2508,11 @@ fn matrix_room_extension_from_store(
 /// Build the genesis metadata record for a just-established Matrix room.
 ///
 /// `collection_canonical_id` is the resolved external identity — the room id,
-/// or the create event's event id for room version 12 — which a v12
-/// establishment record need not carry as an `extension.room_id`.
+/// or the create event's event id for room version 12. It is always present:
+/// callers only reach this after [`resolve_import_collection`] accepted the
+/// batch as an establishment, which requires a resolved canonical identity.
+/// The v12 create-event-only case is exactly where `extension.room_id` is
+/// `None` yet a canonical id (the create event's id) still exists.
 fn collection_metadata_for(
     template: &CollectionTemplate,
     extension: &MatrixRoomExtension,
@@ -6167,6 +6170,73 @@ mod tests {
         assert_eq!(resolved.canonical_id, canonical_id);
         assert_eq!(resolved.collection_id, collection_id);
         assert!(!resolved.batch_has_create);
+    }
+
+    #[test]
+    fn import_v12_followup_batch_lands_in_the_create_collection() {
+        let root = unique_temp_dir();
+        let pool_dir = root.join("pools").join("event-dag");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let mut established = HashSet::new();
+
+        // Batch 1: the v12 create event alone. It carries no `room_id`; the
+        // collection identity is the create event's own id.
+        let create_path = root.join("create.json");
+        std::fs::write(
+            &create_path,
+            r#"{"pdus":[{"event_id":"$v12create","sender":"@server","type":"m.room.create","state_key":"","content":{"creator":"@server","room_version":"12"},"auth_events":[]}]}"#,
+        )
+        .unwrap();
+        cmd_import_file(
+            &store,
+            &pool_dir,
+            &create_path,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+
+        let collection_id = template_collection_id(&template, "$v12create");
+        assert!(
+            store
+                .get_collection_metadata(&collection_id)
+                .unwrap()
+                .is_some(),
+            "a v12 create must establish a collection keyed by the create event id"
+        );
+
+        // Batch 2: a separate ordinary v12 event. Per v12 an ordinary PDU's
+        // `room_id` is the create event's own id, so it must resolve to the
+        // same collection rather than spawn a second one.
+        let message_value = owned_value(
+            r#"{"event_id":"$m1","room_id":"$v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}"#,
+        );
+        let message_path = root.join("message.json");
+        std::fs::write(
+            &message_path,
+            r#"{"pdus":[{"event_id":"$m1","room_id":"$v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}]}"#,
+        )
+        .unwrap();
+        cmd_import_file(
+            &store,
+            &pool_dir,
+            &message_path,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+
+        let node_id = template_node_id(&template, &message_value)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store.get(&collection_id, &node_id).unwrap().is_some(),
+            "the follow-up event must be stored under the create event's collection"
+        );
     }
 
     #[test]
