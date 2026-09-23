@@ -293,14 +293,12 @@ fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
 }
 
 /// Parse a collection's 128-bit logical ID from 32 hex digits prefixed by
-/// `0x` or `0X`. Reject missing prefixes, wrong lengths, and invalid hex.
+/// the canonical lowercase `0x`. Reject other prefixes, wrong lengths, and
+/// invalid hex.
 fn parse_collection_id(value: &str) -> anyhow::Result<[u8; 16]> {
-    let hex = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .with_context(|| {
-            format!("collection ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
-        })?;
+    let hex = value.strip_prefix("0x").with_context(|| {
+        format!("collection ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
+    })?;
     if hex.len() != 32 {
         bail!(
             "collection ID must be 32 hex characters after `0x`, got {}",
@@ -313,15 +311,13 @@ fn parse_collection_id(value: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-/// Parse a node's 128-bit logical ID from 32 hex digits prefixed by `0x` or
-/// `0X`. Reject missing prefixes, wrong lengths, and invalid hex.
+/// Parse a node's 128-bit logical ID from 32 hex digits prefixed by the
+/// canonical lowercase `0x`. Reject other prefixes, wrong lengths, and
+/// invalid hex.
 fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
-    let hex = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .with_context(|| {
-            format!("node ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
-        })?;
+    let hex = value.strip_prefix("0x").with_context(|| {
+        format!("node ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
+    })?;
     if hex.len() != 32 {
         bail!(
             "node ID must be 32 hex characters after `0x`, got {}",
@@ -2081,26 +2077,26 @@ enum InfoTarget {
     Collection,
 }
 
-/// Classify an `info` selector by the digits after its `0x` prefix: 1-16 name
-/// a pack, exactly 32 name a collection, and any other count is an error. A
-/// selector without a `0x` prefix is a collection slot index from
-/// `mtxdb collections`.
+/// Classify an `info` selector by the digits after its canonical lowercase
+/// `0x` prefix: 1-16 name a pack, exactly 32 name a collection, and any other
+/// count is an error. A selector without a prefix is a collection slot index
+/// from `mtxdb collections`; an uppercase `0X` prefix is rejected rather than
+/// guessed at.
 fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
-    let Some(hex) = selector
-        .strip_prefix("0x")
-        .or_else(|| selector.strip_prefix("0X"))
-    else {
+    let Some(hex) = selector.strip_prefix("0x") else {
+        if selector.starts_with("0X") {
+            bail!("invalid ID `{selector}`: the prefix must be lowercase `0x`");
+        }
         return Ok(InfoTarget::Collection);
     };
     match hex.len() {
         1..=16 => Ok(InfoTarget::Pack),
         32 => Ok(InfoTarget::Collection),
         found => {
-            let doubled = hex.starts_with("0x") || hex.starts_with("0X");
             bail!(
                 "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection) or \
                  1-16 (a pack), found {found} characters{}",
-                if doubled {
+                if hex.starts_with("0x") {
                     " (the `0x` prefix is doubled)"
                 } else {
                     ""
@@ -2610,11 +2606,8 @@ fn print_collection_shards(shards: &[u64]) {
 /// accepted here: they are recycled implementation details, while a pack ID
 /// is the permanent identity printed by `mtxdb shards`.
 fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
-    let Some(hex) = selector
-        .strip_prefix("0x")
-        .or_else(|| selector.strip_prefix("0X"))
-    else {
-        bail!("invalid pack ID `{selector}`; use the 0x-prefixed ID shown by `mtxdb shards`");
+    let Some(hex) = selector.strip_prefix("0x") else {
+        bail!("invalid pack ID `{selector}`; use the lowercase 0x-prefixed ID shown by `mtxdb shards`");
     };
     if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         if hex.len() == 32 {
@@ -5674,11 +5667,8 @@ mod tests {
             super::classify_info_selector(&digits(16)).unwrap(),
             super::InfoTarget::Pack
         );
-        assert_eq!(
-            super::classify_info_selector("0X1").unwrap(),
-            super::InfoTarget::Pack,
-            "the prefix is case-insensitive"
-        );
+        let upper = super::classify_info_selector("0X1").unwrap_err();
+        assert!(upper.to_string().contains("lowercase"), "{upper}");
         assert_eq!(
             super::classify_info_selector(&digits(32)).unwrap(),
             super::InfoTarget::Collection
@@ -5692,11 +5682,16 @@ mod tests {
     }
 
     #[test]
-    fn pack_selector_accepts_either_prefix_case() {
+    fn only_the_canonical_lowercase_prefix_is_accepted() {
         assert_eq!(super::parse_pack_id_selector("0x1f").unwrap(), 0x1f);
-        assert_eq!(super::parse_pack_id_selector("0X1f").unwrap(), 0x1f);
+        let id = format_id(&[0xABu8; 16]);
+        let upper = id.replacen("0x", "0X", 1);
+        assert!(super::parse_pack_id_selector("0X1f").is_err());
+        assert!(super::parse_collection_id(&upper).is_err());
+        assert!(super::parse_node_id(&upper).is_err());
+        assert!(super::classify_info_selector(&upper).is_err());
         // Every selector `info` routes to a pack must parse as one.
-        for selector in ["0x1", "0X1", "0xffffffffffffffff", "0XFFFFFFFFFFFFFFFF"] {
+        for selector in ["0x1", "0xffffffffffffffff"] {
             assert_eq!(
                 super::classify_info_selector(selector).unwrap(),
                 super::InfoTarget::Pack
