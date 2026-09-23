@@ -13,8 +13,8 @@ use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{
     derive_collection_id, frame_digest, CollectionKeyRule, CollectionTemplate, DatabaseLayout,
-    DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, PackfileStorage,
-    PayloadPolicy, RecordIdentityRule, ShardType,
+    DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion,
+    PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -4307,6 +4307,9 @@ fn resolve_import_collection(
         template_collection_id(template, room_id)
     };
     let batch_has_create = room_id.is_some_and(|room_id| matrix_batch_has_create(events, room_id));
+    if batch_has_create {
+        validate_establishment_room_version(events)?;
+    }
     if !batch_has_create && !established_collections.contains(&collection_id) {
         let room = room_id.unwrap_or("the selected collection");
         bail!(
@@ -4314,6 +4317,35 @@ fn resolve_import_collection(
         );
     }
     Ok((collection_id, batch_has_create))
+}
+
+/// Enforce the room-version floor on the batch's establishment record.
+///
+/// mtxdb requires v4+: v1/v2 event IDs are server-assigned (not
+/// content-addressed, and not guaranteed unique), and v3 encodes reference
+/// hashes with non-URL-safe base64. A create event that omits
+/// `content.room_version` is v1 by the spec and is rejected rather than
+/// silently defaulted.
+fn validate_establishment_room_version(events: &[OwnedValue]) -> anyhow::Result<()> {
+    let Some(create) = events
+        .iter()
+        .find(|event| matrix_create_event_id(event).is_some())
+    else {
+        return Ok(());
+    };
+    let declared = nested_event_string_field(create, "content", "room_version");
+    let version = declared
+        .and_then(MatrixRoomVersion::parse)
+        .with_context(|| {
+            format!(
+                "m.room.create declares room version {:?}; mtxdb requires v4 or later",
+                declared.unwrap_or("<absent>")
+            )
+        })?;
+    if !version.is_supported() {
+        bail!("room version {version:?} is not supported; mtxdb requires v4 or later");
+    }
+    Ok(())
 }
 
 /// Return every collection that already contains a valid Matrix establishing
@@ -5957,7 +5989,7 @@ mod tests {
             r#"{
                 "pdus": [
                     {"event_id":"$c","room_id":"!room","sender":"@server",
-                     "type":"m.room.create","state_key":"","content":{"creator":"@server"},
+                     "type":"m.room.create","state_key":"","content":{"creator":"@server","room_version":"10"},
                      "auth_events":[]}
                 ],
                 "auth_chain": [
@@ -6178,7 +6210,7 @@ mod tests {
     #[test]
     fn import_admission_accepts_a_batch_that_establishes_its_room() {
         let create = owned_value(
-            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org"}"#,
+            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org","content":{"room_version":"10"}}"#,
         );
         let template = default_matrix_import_template();
         let (collection_id, batch_has_create) =
@@ -6188,6 +6220,34 @@ mod tests {
             template_collection_id(&template, "!room:example.org")
         );
         assert!(batch_has_create);
+    }
+
+    #[test]
+    fn import_admission_rejects_a_pre_v4_room() {
+        let template = default_matrix_import_template();
+        // v3 is content-addressed but not URL-safe; v1/v2 are server-assigned.
+        for version in ["1", "2", "3"] {
+            let create = owned_value(&format!(
+                r#"{{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org","content":{{"room_version":"{version}"}}}}"#
+            ));
+            let error =
+                resolve_import_collection(&[create], None, None, &template, &HashSet::new())
+                    .expect_err("a pre-v4 room must be rejected");
+            assert!(
+                error.to_string().contains("v4 or later"),
+                "unexpected error for v{version}: {error}"
+            );
+        }
+        // An absent room_version is v1 by the spec and must not be defaulted.
+        let create = owned_value(
+            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org"}"#,
+        );
+        let error = resolve_import_collection(&[create], None, None, &template, &HashSet::new())
+            .expect_err("an absent room_version must be rejected, not defaulted to v1");
+        assert!(
+            error.to_string().contains("v4 or later"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
