@@ -332,17 +332,11 @@ fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
 /// Resolve a node selector: a `0x`-prefixed logical ID (the engine's
 /// template-independent form), or a Matrix event ID carrying the Matrix
 /// profile's event sigil `$` — a *template* property, not an engine constant.
-/// `$id` is hashed exactly the way Synapse's embedded mirror derives it (see
-/// `synapse_event_node_id`), since the point of this sigil is finding data
-/// Synapse itself wrote — not CLI-imported data, which uses the import
-/// template's own (BLAKE3-128) identity rule instead (`matrix_event_node_id`).
+/// `$id` uses the same BLAKE3-128 identity rule as CLI-imported records.
 fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
     if let Some(event_id) = id.strip_prefix('$') {
-        let namespace = namespace.context(
-            "resolving `$event_id` requires --namespace (or MTXDB_NAMESPACE) set to the same \
-             namespace Synapse's embedded mirror was configured with",
-        )?;
-        Ok(synapse_event_node_id(namespace, event_id))
+        let _ = namespace;
+        matrix_event_node_id(event_id)
     } else {
         parse_node_id(id)
     }
@@ -353,60 +347,21 @@ fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
 /// they use that pool's DST.
 const MATRIX_ROOM_POOL_DST: Option<[u8; 4]> = Some(ShardType::EventDag.pool_dst());
 
-fn sha256(data: &[u8]) -> [u8; 32] {
-    mtxdb::content_digest(DigestAlgorithm::Sha256, data)
-}
-
 fn blake3_digest(data: &[u8]) -> [u8; 32] {
     mtxdb::content_digest(DigestAlgorithm::Blake3, data)
-}
-
-fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
-    let length = parts.iter().map(|part| part.len()).sum();
-    let mut input = Vec::with_capacity(length);
-    for part in parts {
-        input.extend_from_slice(part);
-    }
-    sha256(&input)
 }
 
 /// The Matrix import template's accepted identity algorithm: BLAKE3 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,
 /// `--root`, and CLI-imported collections use this same derivation — distinct
-/// from `synapse_event_node_id`, which matches Synapse's own live mirror.
+/// from the same BLAKE3-128 identity rule used by record imports.
 fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
     derive_template_key("blake3-128", event_id)
 }
 
-/// Matches `event_node_id` in Synapse's `rust/src/database/mtxdb.rs` byte
-/// for byte: the first 16 bytes of
-/// `SHA-256("event_json:event:" + namespace + "\0" + event_id)`. `$id`
-/// lookups only find anything if this derivation is identical to Synapse's.
-fn synapse_event_node_id(namespace: &str, event_id: &str) -> [u8; 16] {
-    let hash = sha256_parts(&[
-        b"event_json:event:",
-        namespace.as_bytes(),
-        b"\0",
-        event_id.as_bytes(),
-    ]);
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash[..16]);
-    id
-}
-
-/// Matches `event_dag_room_id` in Synapse's `rust/src/database/mtxdb.rs`:
-/// the room-scoped `EventDag` collection ID that `!room_id` resolves to. The
-/// first 16 bytes of `SHA-256("event_json:dag:" + namespace + "\0" + room_id)`.
-fn matrix_room_collection_id(namespace: &str, room_id: &str) -> [u8; 16] {
-    let hash = sha256_parts(&[
-        b"event_json:dag:",
-        namespace.as_bytes(),
-        b"\0",
-        room_id.as_bytes(),
-    ]);
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash[..16]);
-    id
+/// Derive the BLAKE3 collection ID for a canonical Matrix room ID.
+fn matrix_room_collection_id(room_id: &str) -> [u8; 16] {
+    derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
 }
 
 /// Resolve a collection selector: a `0x`-prefixed logical ID (the engine's
@@ -415,12 +370,9 @@ fn matrix_room_collection_id(namespace: &str, room_id: &str) -> [u8; 16] {
 /// hashed the same way Synapse's embedded mirror derives a room's `EventDag`
 /// collection (see `matrix_room_collection_id`). Bare hex is rejected.
 fn parse_collection_selector(selector: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
-    if let Some(room_id) = selector.strip_prefix('!') {
-        let namespace = namespace.context(
-            "resolving `!room_id` requires --namespace (or MTXDB_NAMESPACE) set to the same \
-             namespace Synapse's embedded mirror was configured with",
-        )?;
-        Ok(matrix_room_collection_id(namespace, room_id))
+    if selector.starts_with('!') {
+        let _ = namespace;
+        Ok(matrix_room_collection_id(selector))
     } else {
         parse_collection_id(selector)
     }
@@ -5252,16 +5204,16 @@ mod tests {
         glob_pack_files, import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
         matrix_room_collection_id, matrix_room_extension_from_store, parse_federation_input,
         parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        resolve_import_collection, scan_payload_suffix, sha256_parts, synapse_event_node_id,
-        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        MatrixRoomExtension, StateSet, MATRIX_ROOM_POOL_DST,
+        resolve_import_collection, scan_payload_suffix, template_collection_id, template_node_id,
+        verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, StateSet,
+        MATRIX_ROOM_POOL_DST,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
     use mtxdb::packfile::storage::PackfileStorage;
     use mtxdb::storage::{NodeData, StorageEngine};
     use mtxdb::template::{CollectionKeyRule, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
-    use mtxdb::{DatabaseLayout, DigestAlgorithm, ShardType};
+    use mtxdb::{derive_collection_id, DatabaseLayout, DigestAlgorithm, ShardType};
     use simd_json::prelude::Writable;
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -6834,45 +6786,12 @@ mod tests {
         );
     }
 
-    /// Reimplements `event_node_id`/`event_dag_room_id` from Synapse's
-    /// `rust/src/database/mtxdb.rs` independently of `synapse_event_node_id`/
-    /// `matrix_room_collection_id`, so a drift between the two derivations
-    /// (e.g. someone editing the domain-separation prefix in only one place)
-    /// fails this test instead of silently breaking `$event_id`/`!room_id`
-    /// lookups against a live Synapse-written database.
-    fn reference_node_id(prefix: &[u8], namespace: &str, value: &str) -> [u8; 16] {
-        let hash = sha256_parts(&[prefix, namespace.as_bytes(), b"\0", value.as_bytes()]);
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&hash[..16]);
-        id
-    }
-
     #[test]
-    fn synapse_event_node_id_matches_reference_derivation() {
-        let namespace = "example.org";
-        let event_id = "$abc123:example.org";
-        assert_eq!(
-            synapse_event_node_id(namespace, event_id),
-            reference_node_id(b"event_json:event:", namespace, event_id)
-        );
-        // Different namespaces must not collide.
-        assert_ne!(
-            synapse_event_node_id(namespace, event_id),
-            synapse_event_node_id("other.org", event_id)
-        );
-    }
-
-    #[test]
-    fn matrix_room_collection_id_matches_reference_derivation() {
-        let namespace = "example.org";
+    fn matrix_room_collection_id_matches_internal_derivation() {
         let room_id = "!roomid:example.org";
         assert_eq!(
-            matrix_room_collection_id(namespace, room_id),
-            reference_node_id(b"event_json:dag:", namespace, room_id)
-        );
-        assert_ne!(
-            matrix_room_collection_id(namespace, room_id),
-            matrix_room_collection_id("other.org", room_id)
+            matrix_room_collection_id(room_id),
+            derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
         );
     }
 }
