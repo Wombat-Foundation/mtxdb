@@ -92,11 +92,6 @@ multi-reader = []
 arc-swap = "1"
 bytes = "1.5"
 crc32fast = "1.4"
-# Pinned to 0.2: 0.4 declares `rust-version = "1.85"` and uses edition 2024,
-# which breaks this crate's 1.81 MSRV (the MSRV CI jobs could not even parse
-# its manifest). 0.2 keeps the 1.81 floor and the `getrandom()` free function
-# used in shard.rs. Re-check both before bumping with `cargo update`.
-getrandom = { version = "0.2", features = ["std"] }
 memmap2 = "0.9.11"
 parking_lot = "0.12"
 sha2 = "0.10"

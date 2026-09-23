@@ -925,9 +925,9 @@ impl ShardPool {
         let store_meta_write_time = t_store_meta.elapsed();
 
         if bucket_seed == 0 {
-            let mut seed_bytes = [0u8; 8];
-            getrandom::getrandom(&mut seed_bytes).map_err(io::Error::other)?;
-            bucket_seed = u64::from_ne_bytes(seed_bytes);
+            use std::collections::hash_map::RandomState;
+            use std::hash::{BuildHasher, Hasher};
+            bucket_seed = RandomState::new().build_hasher().finish();
         }
 
         let t_pool_meta_persist = Instant::now();
