@@ -65,7 +65,8 @@ pub use storage::{
     content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,
 };
 pub use template::{
-    derive_collection_id, frame_digest, CollectionKeyRule, CollectionMetadata, CollectionTemplate,
-    EstablishmentRule, FrameIdInput, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
-    COLLECTION_METADATA_RECORD_ID, COLLECTION_TEMPLATE_FORMAT_V1, POOL_DST_INTERNAL,
+    derive_collection_id, frame_digest, record_logical_id, CollectionKeyRule, CollectionMetadata,
+    CollectionTemplate, EstablishmentRule, FrameIdInput, FrameIdPolicy, PayloadPolicy,
+    RecordIdentityRule, COLLECTION_METADATA_RECORD_ID, COLLECTION_TEMPLATE_FORMAT_V1,
+    POOL_DST_INTERNAL,
 };

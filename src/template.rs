@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use crate::storage::{Digest32, DigestAlgorithm};
+use crate::storage::{Digest32, DigestAlgorithm, NodeId};
 
 /// Current generic collection-template format identifier.
 pub const COLLECTION_TEMPLATE_FORMAT_V1: &str = "mtxdb.collection-template/v1";
@@ -92,6 +92,18 @@ pub fn frame_digest(
         FrameIdPolicy::ExternalCanonicalIdToCrosscheck => return None,
     };
     Some(algorithm.digest(&bytes))
+}
+
+/// Derive the 128-bit record routing key from a full identity digest.
+///
+/// The full digest remains the authoritative identity when it is available;
+/// this fixed-width prefix is only the core index key. Keeping the truncation
+/// here prevents adapters from independently choosing different slices.
+#[must_use]
+pub fn record_logical_id(digest: &Digest32) -> NodeId {
+    digest[..16]
+        .try_into()
+        .expect("the first 16 bytes of Digest32 always fit NodeId")
 }
 
 /// Pool namespace discriminator for core-internal collections (auxiliary
@@ -599,6 +611,22 @@ mod tests {
                 &input
             ),
             None
+        );
+    }
+
+    #[test]
+    fn record_logical_id_uses_the_first_16_digest_bytes() {
+        let mut digest = [0u8; 32];
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::try_from(index).expect("test index fits in u8");
+        }
+
+        assert_eq!(
+            record_logical_id(&digest),
+            [
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f,
+            ]
         );
     }
 

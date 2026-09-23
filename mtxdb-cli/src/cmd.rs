@@ -11,9 +11,10 @@ use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{
-    derive_collection_id, frame_digest, CollectionKeyRule, CollectionMetadata, CollectionTemplate,
-    DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy,
-    MatrixRoomVersion, PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
+    derive_collection_id, frame_digest, record_logical_id, CollectionKeyRule, CollectionMetadata,
+    CollectionTemplate, DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput,
+    FrameIdPolicy, MatrixRoomVersion, PackfileStorage, PayloadPolicy, RecordIdentityRule,
+    ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -3670,9 +3671,7 @@ fn template_node_id(
     ) else {
         return Ok(None);
     };
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&digest[..16]);
-    Ok(Some(id))
+    Ok(Some(record_logical_id(&digest)))
 }
 
 /// Run a template's collection-key rule against an already-extracted
