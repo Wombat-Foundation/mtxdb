@@ -18,8 +18,8 @@ use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 /// The current `NodeId` is 128-bit and cannot double as a full payload digest.
 /// A 256-bit payload digest belongs in pack-record metadata and should be
 /// computed by the storage layer on write, not supplied by application callers.
-/// Until that metadata field exists, reads verify only that the stored 128-bit
-/// lookup ID matches the requested ID.
+/// Reads can verify the full digest from that metadata in addition to the
+/// 128-bit routing ID.
 pub type NodeId = [u8; 16];
 
 /// A 256-bit content digest.
@@ -34,16 +34,15 @@ pub type Digest32 = [u8; 32];
 
 /// The hash function used to produce a [`Digest32`].
 ///
-/// Only [`DigestAlgorithm::Sha256`] is implemented today; the enum exists so
-/// the on-disk metadata can name the algorithm per record and so adding a new
-/// one is additive rather than a format break. Unknown algorithm ids decoded
-/// from disk are preserved as [`DigestAlgorithm::Unknown`].
+/// The on-disk metadata names the algorithm per record. Unknown algorithm ids
+/// decoded from disk are preserved as [`DigestAlgorithm::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DigestAlgorithm {
-    /// SHA-256 (FIPS 180-4). The default and currently the only implemented
-    /// algorithm.
+    /// SHA-256 (FIPS 180-4), the default compatibility algorithm.
     #[default]
     Sha256,
+    /// BLAKE3 with its standard 256-bit output.
+    Blake3,
     /// An algorithm this build does not recognize, preserved so a newer
     /// writer's digests round-trip without being reinterpreted.
     Unknown(u8),
@@ -55,6 +54,7 @@ impl DigestAlgorithm {
     pub fn id(self) -> u8 {
         match self {
             Self::Sha256 => 0x01,
+            Self::Blake3 => 0x02,
             Self::Unknown(id) => id,
         }
     }
@@ -64,6 +64,7 @@ impl DigestAlgorithm {
     pub fn from_id(id: u8) -> Self {
         match id {
             0x01 => Self::Sha256,
+            0x02 => Self::Blake3,
             other => Self::Unknown(other),
         }
     }
@@ -79,6 +80,7 @@ impl DigestAlgorithm {
                 use sha2::Digest as _;
                 DigestHasher::Sha256(sha2::Sha256::new())
             }
+            Self::Blake3 => DigestHasher::Blake3(Box::new(blake3::Hasher::new())),
             Self::Unknown(id) => DigestHasher::Unknown(id),
         }
     }
@@ -103,6 +105,8 @@ impl DigestAlgorithm {
 pub enum DigestHasher {
     /// SHA-256 state.
     Sha256(sha2::Sha256),
+    /// BLAKE3 state.
+    Blake3(Box<blake3::Hasher>),
     /// An algorithm this build cannot hash; every operation panics.
     Unknown(u8),
 }
@@ -116,6 +120,9 @@ impl DigestHasher {
         match self {
             Self::Sha256(hasher) => {
                 use sha2::Digest as _;
+                hasher.update(data);
+            }
+            Self::Blake3(hasher) => {
                 hasher.update(data);
             }
             Self::Unknown(id) => {
@@ -135,6 +142,7 @@ impl DigestHasher {
                 use sha2::Digest as _;
                 hasher.finalize().into()
             }
+            Self::Blake3(hasher) => *hasher.finalize().as_bytes(),
             Self::Unknown(id) => {
                 panic!("cannot hash with unimplemented digest algorithm id {id:#04x}")
             }
@@ -538,6 +546,8 @@ mod tests {
         // The default id is stable and round-trips.
         assert_eq!(DigestAlgorithm::Sha256.id(), 0x01);
         assert_eq!(DigestAlgorithm::from_id(0x01), DigestAlgorithm::Sha256);
+        assert_eq!(DigestAlgorithm::Blake3.id(), 0x02);
+        assert_eq!(DigestAlgorithm::from_id(0x02), DigestAlgorithm::Blake3);
 
         // An unknown id is preserved rather than reinterpreted.
         assert_eq!(
@@ -555,6 +565,11 @@ mod tests {
                 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
                 0xf2, 0x00, 0x15, 0xad,
             ]
+        );
+
+        assert_eq!(
+            content_digest(DigestAlgorithm::Blake3, b"abc"),
+            *blake3::hash(b"abc").as_bytes()
         );
     }
 

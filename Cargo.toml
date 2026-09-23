@@ -90,6 +90,7 @@ multi-reader = []
 
 [dependencies]
 arc-swap = "1"
+blake3 = "1.8"
 bytes = "1.5"
 crc32fast = "1.4"
 memmap2 = "0.9.11"

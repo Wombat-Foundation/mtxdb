@@ -4,9 +4,7 @@
 //! use the normal [`StorageEngine`] so callers do not create one directory or
 //! file per room, namespace, or index name.
 
-use sha2::{Digest, Sha256};
-
-use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
+use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{derive_collection_id, POOL_DST_INTERNAL};
 
 const VALUE_MAGIC: &[u8; 4] = b"AUX1";
@@ -18,7 +16,7 @@ pub type AuxiliaryKeyDigest = [u8; DIGEST_LEN];
 /// Derive the canonical full digest for an auxiliary-index key.
 #[must_use]
 pub fn auxiliary_key_digest(key: &[u8]) -> AuxiliaryKeyDigest {
-    Sha256::digest(key).into()
+    DigestAlgorithm::Blake3.digest(key)
 }
 
 /// Derive the logical collection identity for a named auxiliary index.

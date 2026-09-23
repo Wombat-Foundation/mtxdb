@@ -99,6 +99,11 @@ pub fn frame_digest(
 /// The full digest remains the authoritative identity when it is available;
 /// this fixed-width prefix is only the core index key. Keeping the truncation
 /// here prevents adapters from independently choosing different slices.
+///
+/// # Panics
+///
+/// Never in practice: [`Digest32`] is exactly 32 bytes, so its first 16 bytes
+/// always fit [`NodeId`].
 #[must_use]
 pub fn record_logical_id(digest: &Digest32) -> NodeId {
     digest[..16]
@@ -134,7 +139,7 @@ pub const POOL_DST_INTERNAL: [u8; 4] = *b"INTL";
 pub fn derive_collection_id(pool_dst: Option<[u8; 4]>, collection_canonical_id: &[u8]) -> [u8; 16] {
     // Stream directly into the hasher — no temporary concatenation buffer on
     // this hot path.
-    let mut hasher = DigestAlgorithm::Sha256.hasher();
+    let mut hasher = DigestAlgorithm::Blake3.hasher();
     if let Some(dst) = pool_dst {
         hasher.update(&dst);
     }
@@ -159,7 +164,7 @@ pub struct CollectionMetadata {
     // --- Identity pre-image (hashed into `collection_logical_id`) ---
     /// Optional, template-opt-in domain-separation tag hashed into
     /// `collection_logical_id` (see [`derive_collection_id`]). `None` means the
-    /// derivation is `SHA(collection_canonical_id)`.
+    /// derivation is `BLAKE3(collection_canonical_id)`.
     pub pool_dst: Option<[u8; 4]>,
     /// The collection's **canonical** id — the caller-defined external key
     /// (e.g. `!room:server`), canonicalized. Retained so a reader can recompute
