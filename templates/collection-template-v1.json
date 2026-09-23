@@ -20,7 +20,7 @@
     "internal_key": { "kind": "digest", "algorithm": "sha2-256", "input": "membership-value" },
     "labels": [{ "name": "display_id", "value": "membership-value" }]
   },
-  "establishment": { "required": false, "selector": {}, "cardinality": "at-most-one" },
+  "establishment": { "selector": "<establishment-selector>" },
   "metadata": [],
   "edges": [],
   "validation": { "on_missing_identity": "reject-record", "on_missing_membership": "reject-record" },

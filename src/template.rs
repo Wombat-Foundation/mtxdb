@@ -445,10 +445,9 @@ pub struct CollectionKeyRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EstablishmentRule {
     /// Application-defined selector for the establishment record, e.g. a
-    /// Matrix `m.room.create` event.
+    /// Matrix `m.room.create` event. A collection has exactly one
+    /// establishment; there is no optional or multi-record cardinality.
     pub selector: String,
-    /// Expected cardinality, e.g. `exactly-one`.
-    pub cardinality: String,
 }
 
 /// Format-neutral, executable description of a collection template.

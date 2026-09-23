@@ -3499,7 +3499,6 @@ fn default_matrix_import_template() -> CollectionTemplate {
         },
         establishment: Some(EstablishmentRule {
             selector: "type == m.room.create && state_key == ''".into(),
-            cardinality: "exactly-one".into(),
         }),
     }
 }
@@ -3616,19 +3615,19 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     let template: OwnedValue = simd_json::to_owned_value(&mut bytes)
         .with_context(|| format!("template {} is not valid JSON", path.display()))?;
     let (identity_pointer, membership_pointer) = validate_required_keys(&template, path)?;
-    if template_bool_at(&template, &["establishment", "required"]) != Some(true) {
-        bail!(
-            "template {} must require an establishment record",
-            path.display()
-        );
-    }
+    // Every collection has exactly one establishment record; there is no
+    // optional or multi-record cardinality. A template that cannot name one is
+    // rejected rather than compiling to a collection with no genesis.
+    let selector = template_string_at(&template, &["establishment", "selector"])
+        .filter(|selector| !selector.is_empty())
+        .with_context(|| {
+            format!(
+                "template {} must define a non-empty establishment.selector",
+                path.display()
+            )
+        })?;
     let establishment = EstablishmentRule {
-        selector: template_string_at(&template, &["establishment", "selector"])
-            .unwrap_or_default()
-            .to_owned(),
-        cardinality: template_string_at(&template, &["establishment", "cardinality"])
-            .unwrap_or("exactly-one")
-            .to_owned(),
+        selector: selector.to_owned(),
     };
     let node_id_algorithm = template_string_at(
         &template,
@@ -3837,20 +3836,6 @@ fn template_string_at<'a>(value: &'a OwnedValue, keys: &[&str]) -> Option<&'a st
     }
     match value {
         OwnedValue::String(value) => Some(value),
-        _ => None,
-    }
-}
-
-fn template_bool_at(value: &OwnedValue, keys: &[&str]) -> Option<bool> {
-    let mut value = value;
-    for key in keys {
-        let OwnedValue::Object(object) = value else {
-            return None;
-        };
-        value = object.get(*key)?;
-    }
-    match value {
-        OwnedValue::Static(simd_json::StaticNode::Bool(value)) => Some(*value),
         _ => None,
     }
 }
@@ -6228,7 +6213,7 @@ mod tests {
             "collection": {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "an unsupported digest algorithm must be rejected at compile time, not mid-import",
@@ -6254,7 +6239,7 @@ mod tests {
             "collection": {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a projection payload policy must be rejected instead of degrading to full-source retention",
@@ -6280,7 +6265,7 @@ mod tests {
             "collection": {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a present non-string payload policy must be rejected instead of silently compiling to source retention",
@@ -6307,7 +6292,7 @@ mod tests {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
                 "labels": [{"name": "display_id", "value": "/canonical_alias"}]
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a distinct display label must be rejected since the importer cannot persist it",
@@ -6334,7 +6319,7 @@ mod tests {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
                 "labels": {"name": "display_id", "value": "membership-value"}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a present non-array collection.labels must not be silently treated as absent",
@@ -6370,7 +6355,7 @@ mod tests {
                     "membership": {{"extract": {{"kind": "json-pointer-rfc-6901", "path": "/room_id"}}}},
                     "labels": [{{"name": "display_id", "value": {label_value}}}]
                 }},
-                "establishment": {{"required": true}}
+                "establishment": {{"selector": "type == m.room.create && state_key == ''"}}
             }}"#
             );
             let error = compile_reject(template.as_bytes()).expect_err(
