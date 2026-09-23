@@ -157,6 +157,7 @@ fn run_case(kind: PayloadKind, payload_len: usize) {
             collection_id: COLLECTION_ID,
             hash: record_id(index),
             data: Bytes::from(payload(kind, payload_len, index)),
+            metadata: None,
         })
         .collect();
 

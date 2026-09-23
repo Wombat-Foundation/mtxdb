@@ -398,6 +398,7 @@ fn compact_shard_intra(
                 collection_id: *collection_id,
                 hash: *hash,
                 data: data.bytes,
+                metadata: None,
             };
             bytes_written += packfile::write_record(&mut buffered, &record)?;
             records_written += 1;
