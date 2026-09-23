@@ -520,7 +520,6 @@ fn sub_get() -> Command {
             Arg::new("raw")
                 .long("raw")
                 .action(ArgAction::SetTrue)
-                .conflicts_with("text")
                 .help("Emit payload bytes verbatim instead of pretty-printing JSON"),
         )
 }
