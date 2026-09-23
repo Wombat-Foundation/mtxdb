@@ -6152,6 +6152,24 @@ mod tests {
     }
 
     #[test]
+    fn import_admission_reuses_v12_create_identity_for_followup_events() {
+        let template = default_matrix_import_template();
+        let canonical_id = "$v12create";
+        let collection_id = template_collection_id(&template, canonical_id);
+        let established = HashSet::from([collection_id]);
+        let message = owned_value(
+            r#"{"type":"m.room.message","event_id":"$message","room_id":"$v12create"}"#,
+        );
+
+        let resolved =
+            resolve_import_collection(&[message], None, None, &template, &established).unwrap();
+
+        assert_eq!(resolved.canonical_id, canonical_id);
+        assert_eq!(resolved.collection_id, collection_id);
+        assert!(!resolved.batch_has_create);
+    }
+
+    #[test]
     fn collection_canonical_id_honours_the_template_membership_pointer() {
         let mut template = sender_identity_template();
         template.collection_key.pointer = "/scope".into();
