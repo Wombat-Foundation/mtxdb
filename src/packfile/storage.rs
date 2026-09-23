@@ -12665,6 +12665,22 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// An empty batch must be a no-op across every backend: no collection is
+    /// created, so `collection_exists`/`collection_len` report absence. This
+    /// mirrors the in-memory-backend test of the same name; the two backends
+    /// previously disagreed (`InMemoryStorage` left an empty entry behind).
+    #[test]
+    fn empty_put_many_is_a_noop_and_does_not_create_the_collection() {
+        let dir = test_dir("empty_put_many_noop");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x7Du8; 16];
+        assert_eq!(store.put_many(&collection, &[]).unwrap(), 0);
+        assert!(!store.collection_exists(&collection));
+        assert_eq!(store.collection_len(&collection).unwrap(), None);
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Concurrent genesis establishment on a real packfile-backed store must
     /// serialize on the collection `put_mutex`: without it, two writers can
     /// both observe an absent metadata record and append conflicting genesis

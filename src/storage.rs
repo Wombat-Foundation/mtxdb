@@ -271,6 +271,10 @@ pub trait StorageEngine: Send + Sync {
     /// partial count to report — callers retry the whole batch, which is safe
     /// because the writes are idempotent.
     ///
+    /// An empty batch commits nothing and is a no-op: it does not create the
+    /// collection, so [`Self::collection_exists`] stays `false` and
+    /// [`Self::collection_len`] stays `None` afterward.
+    ///
     /// # Errors
     /// Returns `StorageError::Io` on I/O failure.
     fn put_many(
@@ -568,6 +572,12 @@ impl StorageEngine for InMemoryStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError> {
+        // An empty batch writes nothing, so it must not create an empty
+        // collection entry: `collection_exists`/`collection_len` must report
+        // the collection as absent, matching `PackfileStorage`.
+        if entries.is_empty() {
+            return Ok(0);
+        }
         let mut collections = self.collections.write();
         let collection = collections.entry(*collection_id).or_default();
         for (id, data) in entries {
@@ -756,12 +766,13 @@ mod tests {
             CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
         };
 
-        // A prior empty batch leaves an empty collection entry behind. It holds
-        // no record, so it must not be mistaken for a non-empty collection when
-        // genesis metadata is established.
+        // An empty collection entry holds no record, so it must not be mistaken
+        // for a non-empty collection when genesis metadata is established.
+        // `put_many` no longer creates such an entry (an empty batch is a
+        // no-op), so build it directly to keep the guard covered.
         let store = InMemoryStorage::new();
         let collection = [0x7Cu8; 16];
-        assert_eq!(store.put_many(&collection, &[]).unwrap(), 0);
+        store.collections.write().entry(collection).or_default();
         assert!(store.collection_exists(&collection));
 
         let metadata = CollectionMetadata {
@@ -839,6 +850,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+    }
+
+    /// An empty batch must be a no-op across every backend: no collection is
+    /// created, so `collection_exists`/`collection_len` report absence. This
+    /// mirrors the packfile-backend test of the same name; the two backends
+    /// previously disagreed (`InMemoryStorage` left an empty entry behind).
+    #[test]
+    fn empty_put_many_is_a_noop_and_does_not_create_the_collection() {
+        let store = InMemoryStorage::new();
+        let collection = [0x7Du8; 16];
+        assert_eq!(store.put_many(&collection, &[]).unwrap(), 0);
+        assert!(!store.collection_exists(&collection));
+        assert_eq!(store.collection_len(&collection).unwrap(), None);
     }
 
     #[test]
