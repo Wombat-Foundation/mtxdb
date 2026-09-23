@@ -16,10 +16,9 @@ use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 /// # 256-bit payload digest
 ///
 /// The current `NodeId` is 128-bit and cannot double as a full payload digest.
-/// A 256-bit payload digest belongs in pack-record metadata and should be
-/// computed by the storage layer on write, not supplied by application callers.
-/// Reads can verify the full digest from that metadata in addition to the
-/// 128-bit routing ID.
+/// A 256-bit payload digest belongs in pack-record metadata: `put_verified`
+/// computes one and checks it on write, but no read path recomputes it, so
+/// reads today match only the stored 128-bit lookup ID.
 pub type NodeId = [u8; 16];
 
 /// A 256-bit content digest.

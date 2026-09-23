@@ -357,7 +357,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     mtxdb::content_digest(DigestAlgorithm::Sha256, data)
 }
 
-fn blake3(data: &[u8]) -> [u8; 32] {
+fn blake3_digest(data: &[u8]) -> [u8; 32] {
     mtxdb::content_digest(DigestAlgorithm::Blake3, data)
 }
 
@@ -818,7 +818,7 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     let room_id = core::str::from_utf8(bytes.get(room_id_start..root_hash_start)?).ok()?;
     let room_prefix = bytes.get(prefix_start..room_id_len_offset)?;
     let root_hash = bytes.get(root_hash_start..lattice_start)?;
-    let lattice_digest = blake3(bytes.get(lattice_start..end)?);
+    let lattice_digest = blake3_digest(bytes.get(lattice_start..end)?);
 
     let mut out = Vec::new();
     writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
@@ -4361,7 +4361,7 @@ fn verify_auth_chain_edges(
 /// of BLAKE3 of the extracted identity) and need not be stable across
 /// algorithm changes.
 fn event_short_id(event_id: &str) -> u64 {
-    let hash = blake3(event_id.as_bytes());
+    let hash = blake3_digest(event_id.as_bytes());
     let mut short_id_bytes = [0u8; 8];
     short_id_bytes.copy_from_slice(&hash[..8]);
     u64::from_le_bytes(short_id_bytes)
@@ -4636,7 +4636,7 @@ impl StateSet {
             hasher_input.extend_from_slice(event_id.as_bytes());
             hasher_input.push(0);
         }
-        let hash = blake3(&hasher_input);
+        let hash = blake3_digest(&hasher_input);
         URL_SAFE_NO_PAD.encode(&hash[..])
     }
 }
@@ -5244,8 +5244,8 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        blake3, build_event_dag, cmd_collections, cmd_get, cmd_import_file, cmd_info, cmd_scan,
-        cmd_shards, cmd_stats, cmd_sync, compile_import_template, compute_state_groups,
+        blake3_digest, build_event_dag, cmd_collections, cmd_get, cmd_import_file, cmd_info,
+        cmd_scan, cmd_shards, cmd_stats, cmd_sync, compile_import_template, compute_state_groups,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
         default_matrix_import_template, derive_template_key, event_id, event_room_id,
         event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_id,
@@ -6787,7 +6787,7 @@ mod tests {
     fn state_set_empty_digest_is_empty_base64url() {
         let s = StateSet::new();
         let digest = s.digest_base64url();
-        let expected = blake3(&[]);
+        let expected = blake3_digest(&[]);
         assert_eq!(
             digest,
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected[..])
