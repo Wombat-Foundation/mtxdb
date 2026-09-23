@@ -2366,24 +2366,13 @@ impl PackfileStorage {
         ids
     }
 
-    /// Collection IDs whose live index currently references at least one record
-    /// physically stored in `slot`.
-    ///
-    /// Shards are shared, so this is normally more than one collection; it's the
-    /// set `repack_shard` needs to touch before that shard can retire.
-    ///
-    /// Sweeps the shard's own file content (bounded by `MAX_SHARD_BYTES`,
-    /// not by how many unrelated collections happen to be loaded) rather than
-    /// scanning every collection's index to ask "does this touch shard N" — a
-    /// candidate set from the raw scan is then filtered against each
-    /// candidate collection's *current* live index, since the scan alone can't
-    /// tell a still-live reference from a collection that already repacked past
-    /// this shard (its old bytes just haven't been overwritten — they
-    /// never are, shards are append-only).
+    /// Collection IDs whose live indexes currently reference records in
+    /// `slot`. A collection repacked away from the slot is excluded even if
+    /// its old bytes remain in the append-only pack. Order is unspecified.
     ///
     /// # Errors
-    /// Returns `StorageError` if the shard's file can't be read, or if
-    /// `slot` doesn't correspond to a currently-open shard.
+    /// Returns [`StorageError::Io`] with `NotFound` if `slot` does not
+    /// correspond to an open shard.
     pub fn collections_referencing_shard(&self, slot: u16) -> Result<Vec<[u8; 16]>, StorageError> {
         let shard = self.shards.get_shard(slot).ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
