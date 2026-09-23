@@ -2950,16 +2950,16 @@ impl PackfileStorage {
             // checkpoint writer uses; no caller holds one when it persists)
             // across the flush, the scan, and the swap. This only runs on the
             // rare recovery path, so briefly stalling writers is acceptable.
+            // Take the creation lock first, then read the collection set: a
+            // collection created earlier is in the set, and none can appear
+            // while it is held. Sort so every mutex is acquired in one global
+            // order, whatever else locks several collections at once.
+            let create_guard = self.collection_creation.write();
             let mut collection_ids: Vec<[u8; 16]> =
                 self.collections_read().keys().copied().collect();
             collection_ids.sort_unstable();
-            let mut lock_arcs: Vec<_> =
-                collection_ids.iter().map(|id| self.put_mutex(id)).collect();
-            let create_guard = self.collection_creation.write();
-            let ids_now: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
-            for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
-                lock_arcs.push(self.put_mutex(id));
-            }
+            collection_ids.dedup();
+            let lock_arcs: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
             let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
             self.shards.flush_all().map_err(StorageError::Io)?;
             let physical = crate::packfile::layout::physical_layout(&self.base_dir)
@@ -6248,6 +6248,14 @@ impl PackfileStorage {
                     collection_id,
                     &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
                 );
+                // The recompute above covers live-node counts only. This frame
+                // was appended either way, so its bytes still have to be added
+                // (the branches above account for it themselves).
+                let pack_id = self
+                    .shards
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |s| s.pack_id);
+                self.record_disk_bytes(pack_id, collection_id, disk_bytes);
             }
             let cache = match &old_gen {
                 Some(g) => g.cache.clone(),
@@ -12655,6 +12663,131 @@ mod tests {
                 .get(&TEST_COLLECTION),
             Some(&expected),
             "the frame written around recovery must be in the persisted totals"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A put whose insert triggers index growth takes a different code path;
+    /// it must still account for its frame's bytes.
+    #[test]
+    fn puts_and_batches_that_grow_the_index_are_byte_accounted() {
+        let dir = test_dir("growth_byte_accounting");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x43u8; 16];
+        for i in 0..200u8 {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![b'x'; 64])),
+                )
+                .unwrap();
+        }
+        let batch: Vec<_> = (0..200u8)
+            .map(|i| {
+                (
+                    distinct_id(i),
+                    NodeData::new(bytes::Bytes::from(vec![b'y'; 64])),
+                )
+            })
+            .collect();
+        assert_eq!(store.put_many(&collection, &batch).unwrap(), 200);
+
+        // A batch into an EXISTING small collection is what grows its index
+        // mid-batch (a fresh collection is pre-sized for the batch).
+        let grown_collection = [0x44u8; 16];
+        store
+            .put(
+                &grown_collection,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        let (_, _, capacity_before) = store.collection_index_info(&grown_collection).unwrap();
+        let batch: Vec<_> = (1..250u8)
+            .map(|i| {
+                (
+                    distinct_id(i),
+                    NodeData::new(bytes::Bytes::from(vec![b'z'; 64])),
+                )
+            })
+            .collect();
+        assert_eq!(store.put_many(&grown_collection, &batch).unwrap(), 249);
+        let (_, _, capacity_after) = store.collection_index_info(&grown_collection).unwrap();
+        assert!(
+            capacity_after > capacity_before,
+            "the batch must grow the index ({capacity_before} -> {capacity_after})"
+        );
+        store.sync_all().unwrap();
+
+        let physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let sidecar = PackfileStorage::collection_disk_bytes_from_disk(&dir).unwrap();
+        for id in [TEST_COLLECTION, collection, grown_collection] {
+            assert_eq!(
+                sidecar.get(&id),
+                Some(&physical.collections[&id].disk_bytes),
+                "collection {id:02x?}: growth must not drop a frame's bytes"
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Recovery must be atomic with appends: frames written while it runs may
+    /// not be left out of (or double counted in) the totals it publishes.
+    #[test]
+    fn sidecar_recovery_is_consistent_with_concurrent_appends() {
+        let dir = test_dir("sidecar_recovery_concurrent");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        store.index_tables.write().collection_disk_bytes.clear();
+        store
+            .shard_collections_recovery_failed
+            .store(true, Ordering::Release);
+
+        let writer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for i in 1..200u8 {
+                    store
+                        .put(
+                            &TEST_COLLECTION,
+                            &distinct_id(i),
+                            &NodeData::new(bytes::Bytes::from(vec![b'x'; 64])),
+                        )
+                        .unwrap();
+                }
+            })
+        };
+        // Recover while the writer is appending.
+        while store
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire)
+        {
+            let _ = store.persist_shard_collections();
+        }
+        writer.join().unwrap();
+        store.sync_all().unwrap();
+
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "totals published by recovery must match the frames on disk"
         );
         drop(store);
         fs::remove_dir_all(&dir).ok();
