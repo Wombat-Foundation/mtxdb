@@ -421,6 +421,9 @@ struct RoomScanOutput {
     shard_collections: HashMap<u64, HashMap<[u8; 16], u64>>,
     collection_shards: HashMap<[u8; 16], HashSet<u64>>,
     collection_disk_bytes: HashMap<u64, HashMap<[u8; 16], u64>>,
+    /// A checkpoint-backed writable open found no valid shard→collection
+    /// sidecar, so the next sync must write one even if no index is dirty.
+    sidecar_missing: bool,
 }
 
 /// Magic bytes + version identifying the persisted shard→collection directory
@@ -915,6 +918,9 @@ pub struct PackfileStorage {
     /// cost, while a crash left a stale checkpoint is still always resolved by
     /// the fingerprint → rescan fallback.
     index_checkpoint_dirty: AtomicBool,
+    /// The shard→collection sidecar needs writing even though no index is
+    /// dirty (see `RoomScanOutput::sidecar_missing`).
+    shard_collections_dirty: AtomicBool,
     /// Session state for the incremental index delta log: the base checkpoint
     /// fingerprint + generations the log continues, and the frames accumulated
     /// since the last persist. See [`DeltaLogState`].
@@ -1691,6 +1697,7 @@ impl PackfileStorage {
             repack_incremental: RwLock::new(HashMap::new()),
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
+            shard_collections_dirty: AtomicBool::new(scan_out.sidecar_missing),
             journal: parking_lot::Mutex::new(None),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
@@ -2311,6 +2318,24 @@ impl PackfileStorage {
                         .or_default();
                     *total = total.saturating_add(record.disk_bytes);
                 }
+            }
+        } else if writable {
+            // No valid sidecar to seed the physical byte totals from. Rebuild
+            // them exactly (every appended frame, as `physical_layout`
+            // counts) rather than persisting zeros, and make the next sync
+            // rewrite the sidecar. This is a recovery path, so one pack scan
+            // is acceptable.
+            if let Ok(physical) = crate::packfile::layout::physical_layout(base_dir) {
+                for (collection_id, layout) in &physical.collections {
+                    for (pack_id, bytes) in &layout.pack_bytes {
+                        scan_out
+                            .collection_disk_bytes
+                            .entry(*pack_id)
+                            .or_default()
+                            .insert(*collection_id, *bytes);
+                    }
+                }
+                scan_out.sidecar_missing = true;
             }
         }
 
@@ -2956,6 +2981,7 @@ impl PackfileStorage {
         // fsync is issued, so "completed" stops short of claiming power-loss
         // durability for the directory entry itself).
         self.sidecar_writes.fetch_add(1, Ordering::Relaxed);
+        self.shard_collections_dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -6918,6 +6944,11 @@ impl PackfileStorage {
     fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         let _persist_guard = self.index_persist_lock.lock();
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
+            // Nothing to checkpoint, but a sidecar lost while the checkpoint
+            // survived still has to be regenerated.
+            if self.shard_collections_dirty.load(Ordering::Relaxed) {
+                self.persist_shard_collections_best_effort();
+            }
             return;
         }
         if self.delta_state_needs_full_rewrite() {
@@ -12309,6 +12340,52 @@ mod tests {
         assert!(PackfileStorage::collection_directory_persisted_at(&dir).is_some());
     }
 
+    /// A checkpoint that survives without its shard→collection sidecar must not
+    /// leave the sidecar missing (no write dirties the store to regenerate it)
+    /// nor persist zero byte totals for data that is already on disk.
+    #[test]
+    fn missing_sidecar_is_rewritten_with_exact_bytes_when_the_checkpoint_survives() {
+        let dir = test_dir("sidecar_missing_checkpoint_present");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            let id = distinct_id(0);
+            for payload in [&b"first"[..], &b"second!!"[..]] {
+                store
+                    .put(
+                        &TEST_COLLECTION,
+                        &id,
+                        &NodeData::new(bytes::Bytes::copy_from_slice(payload)),
+                    )
+                    .unwrap();
+            }
+            store.sync_all().unwrap();
+        }
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        fs::remove_file(&sidecar).unwrap();
+        assert!(PackfileStorage::index_checkpoint_path(&dir).exists());
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.sync_all().unwrap();
+        assert!(sidecar.exists(), "sync must regenerate the lost sidecar");
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)]
+        );
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "regenerated bytes must equal the physical layout, not zero"
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_collection_disk_bytes_track_overwrite_reopen_and_repack() {
         let dir = test_dir("collection_disk_bytes_semantics");
@@ -12350,8 +12427,25 @@ mod tests {
         );
 
         drop(store);
+        let checkpoint_reopened = PackfileStorage::open(dir.clone()).unwrap();
+        checkpoint_reopened.sync_all().unwrap();
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "checkpoint-backed reopen must preserve physical byte accounting"
+        );
+        drop(checkpoint_reopened);
+        fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+        fs::remove_file(PackfileStorage::shard_collections_path(&dir)).unwrap();
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
         reopened.sync_all().unwrap();
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)],
+            "a full rescan must preserve the live-node count"
+        );
         assert_eq!(
             PackfileStorage::collection_disk_bytes_from_disk(&dir)
                 .unwrap()
