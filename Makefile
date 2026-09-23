@@ -124,6 +124,7 @@ clean: ##H Clean build artifacts
 	cd mtxdb-ffi && $(CARGO) clean
 	cd mtxdb-wasm && $(CARGO) clean
 	cd benches && $(CARGO) clean
+	rm -rf .mypy_cache/ .ruff_cache/ __pycache__/
 	rm -rf .coverage/ lcov.info
 
 

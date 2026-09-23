@@ -130,7 +130,7 @@ pub const POOL_DST_INTERNAL: [u8; 4] = *b"INTL";
 /// When `Some`, it is mixed into the pre-image so the same canonical id in
 /// different namespaces (e.g. `!room` in the `EventDag` pool versus the State
 /// pool) derives different logical ids. When `None` the derivation is exactly
-/// `SHA(collection_canonical_id)` with no tag, so callers must not assume
+/// `BLAKE3(collection_canonical_id)` with no tag, so callers must not assume
 /// collection logical ids are globally unique across pools.
 ///
 /// # Panics
@@ -464,7 +464,7 @@ pub struct CollectionKeyRule {
     pub pointer: String,
     /// Optional, template-opt-in 4-byte domain-separation tag mixed into the
     /// collection-id derivation (see [`derive_collection_id`]). `None` derives
-    /// `SHA(collection_canonical_id)`; a Matrix room event collection opts in
+    /// `BLAKE3(collection_canonical_id)`; a Matrix room event collection opts in
     /// with the `EventDag` pool's DST.
     pub pool_dst: Option<[u8; 4]>,
     /// RFC 6901 pointer to the user-facing collection identifier.
