@@ -37,6 +37,10 @@ done
 # applied by cargo to *every* target, including cross targets, and cannot be
 # removed by config -- cargo appends RUSTFLAGS to the rustc command line, so
 # for cross builds the offending flags are stripped from "$@" here.
+#
+# If `rustc -vV` fails, HOST_TRIPLE is empty and IS_HOST stays 0: every build
+# then takes the cross-filtering path, so mold/target-cpu=native are silently
+# omitted. That is the intended fail-safe -- never emit host flags blindly.
 IS_HOST=0
 if [[ -n "$HOST_TRIPLE" && "$TARGET_TRIPLE" == "$HOST_TRIPLE" ]]; then
 	IS_HOST=1

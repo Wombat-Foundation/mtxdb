@@ -2096,7 +2096,9 @@ impl ShardPool {
                 return Err(StorageError::Corrupt("truncated frame body or CRC".into()));
             }
 
-            return Ok(u64::from(frame_len).saturating_add(8));
+            return u64::from(frame_len)
+                .checked_add(8)
+                .ok_or_else(|| StorageError::Corrupt("record length overflow".into()));
         }
         unreachable!("record_disk_len_at remap-retry is bounded to two iterations")
     }
