@@ -866,6 +866,28 @@ struct FrameHeader {
     metadata_block: Vec<u8>,
 }
 
+/// Resolve the on-disk metadata block length (`5 + tlv_len`) and bound it
+/// against the frame that must contain it, *before* the caller allocates.
+///
+/// `tlv_len` comes straight from disk. The metadata block (its 5-byte prefix
+/// plus the TLV bytes) shares the frame's post-header body with the node bytes,
+/// so it must satisfy `block_len <= frame_len - FRAME_FIXED_LEN`. Because
+/// `frame_len` is itself capped at [`MAX_RECORD_LEN`], this both rejects a
+/// frame whose metadata overruns it and caps the metadata allocation at the
+/// record-size limit instead of the `u32` field's ~4 GiB range.
+fn checked_metadata_block_len(tlv_len: u32, frame_len: u32) -> io::Result<u32> {
+    let block_len = 5u32
+        .checked_add(tlv_len)
+        .ok_or_else(|| invalid_data("frame metadata: length overflow"))?;
+    let remaining_frame_body = frame_len
+        .checked_sub(FRAME_FIXED_LEN)
+        .ok_or_else(|| invalid_data("frame metadata overruns the frame"))?;
+    if block_len > remaining_frame_body {
+        return Err(invalid_data("frame metadata exceeds frame length"));
+    }
+    Ok(block_len)
+}
+
 /// Read and validate the frame length prefix and fixed header, returning the
 /// parsed fields. The caller is responsible for consuming the payload and CRC
 /// (or seeking past them).
@@ -904,9 +926,10 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
             )));
         }
         let tlv_len = u32::from_le_bytes(prefix[1..5].try_into().expect("fixed slice"));
-        let block_len = 5u32
-            .checked_add(tlv_len)
-            .ok_or_else(|| invalid_data("frame metadata: length overflow"))?;
+        // Resolve and bound the metadata block *before* allocating: `tlv_len`
+        // is disk-controlled, so the allocation below must never be sized by it
+        // unchecked.
+        let block_len = checked_metadata_block_len(tlv_len, frame_len)?;
         let mut block = vec![0u8; usize::try_from(block_len).expect("u32 fits in usize")];
         block[..5].copy_from_slice(&prefix);
         reader.read_exact(&mut block[5..])?;
@@ -1745,6 +1768,98 @@ mod tests {
         assert!(err.to_string().contains("CRC mismatch"));
     }
 
+    /// A frame whose metadata block declares more bytes than the frame can
+    /// hold must be rejected *before* the reader allocates a buffer sized by
+    /// that disk-supplied length, rather than requesting an allocation far
+    /// larger than the frame (and the `MAX_RECORD_LEN` cap) permits.
+    #[test]
+    fn test_metadata_length_cannot_exceed_frame() {
+        let frame_len = FRAME_FIXED_LEN + 5;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame_len.to_le_bytes());
+        let mut fixed = [0u8; FRAME_FIXED_LEN as usize];
+        fixed[0] = FLAG_METADATA;
+        buf.extend_from_slice(&fixed);
+        // Metadata prefix: a valid version, then a `tlv_len` claiming the
+        // largest possible metadata block (a ~4 GiB allocation without the
+        // bound), far beyond the five bytes of metadata space the frame has.
+        buf.push(METADATA_VERSION);
+        buf.extend_from_slice(&(u32::MAX - 5).to_le_bytes());
+
+        let mut cursor = Cursor::new(&buf);
+        let Err(err) = read_frame_header(&mut cursor) else {
+            panic!("oversized metadata must be rejected");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("metadata"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `checked_metadata_block_len` is inclusive at the frame body and rejects
+    /// one byte past it, so the guard is verified independently of allocation.
+    #[test]
+    fn test_checked_metadata_block_len_boundary() {
+        let frame_len = FRAME_FIXED_LEN + 20;
+        // block_len = 5 + tlv_len; body = 20, so tlv_len = 15 is exactly full.
+        assert_eq!(checked_metadata_block_len(15, frame_len).unwrap(), 20);
+        // One byte past the body is rejected.
+        assert_eq!(
+            checked_metadata_block_len(16, frame_len)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        // A `tlv_len` that overflows the 5-byte prefix is rejected too.
+        assert_eq!(
+            checked_metadata_block_len(u32::MAX, frame_len)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    /// The bound is inclusive end to end: a metadata block that exactly fills
+    /// the frame's post-header body (zero node bytes) is a valid maximum-size
+    /// frame and must still decode, so the fix rejects only overrun.
+    #[test]
+    fn test_metadata_at_frame_body_boundary_decodes() {
+        // One unknown TLV entry sized so the block exactly fills the frame
+        // body: block = 5 (prefix) + 5 (tag + value_len) + value.
+        let value_len = 64usize;
+        let tlv_len = u32::try_from(5 + value_len).expect("test TLV length fits u32");
+        let block_len = 5 + tlv_len;
+        let frame_len = FRAME_FIXED_LEN + block_len;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame_len.to_le_bytes());
+        let mut fixed = [0u8; FRAME_FIXED_LEN as usize];
+        // `uncompressed_len` stays 0, matching the zero-length node region.
+        fixed[0] = FLAG_METADATA | FLAG_CRC_DISABLED;
+        buf.extend_from_slice(&fixed);
+        buf.push(METADATA_VERSION);
+        buf.extend_from_slice(&tlv_len.to_le_bytes());
+        buf.push(0x7f); // unknown tag, preserved verbatim
+        buf.extend_from_slice(
+            &u32::try_from(value_len)
+                .expect("test value length fits u32")
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(&vec![0xAB; value_len]);
+        // Zero node bytes, then the (unused) 4-byte checksum field.
+        buf.extend_from_slice(&[0u8; 4]);
+
+        let mut cursor = Cursor::new(&buf);
+        let meta = read_record_metadata(&mut cursor)
+            .expect("boundary-size frame must not error")
+            .expect("boundary-size frame must decode");
+        assert_eq!(
+            meta.metadata.expect("metadata present").unknown,
+            vec![(0x7f, vec![0xAB; value_len])]
+        );
+    }
+
     /// Without the `zstd` feature, a frame flagged compressed must be rejected
     /// with a clear error rather than silently misread as raw.
     #[cfg(not(feature = "zstd"))]
@@ -2295,5 +2410,45 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].2, HEADER_LEN as u64);
         assert!(buf.len() > complete_len);
+    }
+
+    /// The metadata bound must also hold on the on-disk scan paths: a packfile
+    /// whose frame declares a ~4 GiB metadata block is reported as corrupt,
+    /// not used to size an allocation, by both the full and skip-payload scans.
+    #[test]
+    fn test_scan_rejects_oversized_frame_metadata() {
+        let dir = test_dir("scan_oversized_metadata");
+        let path = dir.join("shard_00.pack");
+
+        let record = Record {
+            collection_id: [0x01; 16],
+            hash: [0xAA; 16],
+            data: Bytes::from_static(b"payload"),
+            metadata: Some(FrameMetadata {
+                logical_id: Some([0x09; 32]),
+                ..FrameMetadata::default()
+            }),
+        };
+        let mut frame = encode_record_with_options(&record, false, false).unwrap();
+        // The metadata block starts right after the fixed header; its
+        // `tlv_len` field is the u32 following the version byte.
+        let tlv_len_at = 4 + FRAME_FIXED_LEN as usize + 1;
+        frame[tlv_len_at..tlv_len_at + 4].copy_from_slice(&(u32::MAX - 5).to_le_bytes());
+
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        buf.extend_from_slice(&frame);
+        std::fs::write(&path, &buf).unwrap();
+
+        for err in [
+            scan_packfile(&path).unwrap_err(),
+            scan_packfile_skip_payload(&path).unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("metadata"),
+                "unexpected error: {err}"
+            );
+        }
     }
 }
