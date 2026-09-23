@@ -482,6 +482,36 @@ impl StorageEngine for InMemoryStorage {
         self.collections.read().contains_key(collection_id)
     }
 
+    fn ensure_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+    ) -> Result<(), StorageError> {
+        let mut collections = self.collections.write();
+        let collection = collections.entry(*collection_id).or_default();
+        if let Some(existing) = collection.get(&COLLECTION_METADATA_RECORD_ID) {
+            let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+                StorageError::Corrupt("malformed collection metadata record".to_owned())
+            })?;
+            if found != *metadata {
+                return Err(StorageError::Internal(
+                    "collection metadata mismatch: existing genesis record differs".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        if !collection.is_empty() {
+            return Err(StorageError::Internal(
+                "genesis metadata must be written before the collection's first record".to_owned(),
+            ));
+        }
+        collection.insert(
+            COLLECTION_METADATA_RECORD_ID,
+            NodeData::new(metadata.encode().into()),
+        );
+        Ok(())
+    }
+
     fn get_many(
         &self,
         collection_id: &[u8; 16],
@@ -694,6 +724,84 @@ mod tests {
             Err(StorageError::Internal(_))
         ));
         assert_eq!(late.get_collection_metadata(&collection).unwrap(), None);
+    }
+
+    #[test]
+    fn empty_collection_entry_does_not_block_genesis_metadata() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+
+        // A prior empty batch leaves an empty collection entry behind. It holds
+        // no record, so it must not be mistaken for a non-empty collection when
+        // genesis metadata is established.
+        let store = InMemoryStorage::new();
+        let collection = [0x7Cu8; 16];
+        assert_eq!(store.put_many(&collection, &[]).unwrap(), 0);
+        assert!(store.collection_exists(&collection));
+
+        let metadata = CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+        };
+        store
+            .ensure_collection_metadata(&collection, &metadata)
+            .unwrap();
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            Some(metadata)
+        );
+    }
+
+    #[test]
+    fn ensure_collection_metadata_is_atomic_under_concurrency() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemoryStorage::new());
+        let collection = [0x7Du8; 16];
+        let metadata = Arc::new(CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+        });
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let metadata = Arc::clone(&metadata);
+                std::thread::spawn(move || {
+                    store
+                        .ensure_collection_metadata(&collection, &metadata)
+                        .expect("concurrent genesis establishment must be idempotent");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            Some((*metadata).clone())
+        );
     }
 
     #[test]

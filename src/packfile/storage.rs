@@ -20,6 +20,7 @@ use crate::shard::{Shard, ShardPool};
 use crate::storage::{
     Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef, StorageEngine, StorageError,
 };
+use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
 #[cfg(feature = "multi-reader")]
 mod read_journal;
@@ -5847,12 +5848,21 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
     ) -> Result<(), StorageError> {
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+        self.put_internal_locked(collection_id, id, data, metadata)
+    }
+
+    fn put_internal_locked(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        metadata: Option<FrameMetadata>,
+    ) -> Result<(), StorageError> {
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
             .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
-        let collection_arc = self.put_mutex(collection_id);
-        let _collection_guard = collection_arc.lock();
-
         // New-collection puts must not interleave their record flush with a
         // concurrent checkpoint's fingerprint→snapshot window (see
         // `persist_index_checkpoint`). Existing collections are already gated
@@ -6104,6 +6114,45 @@ impl PackfileStorage {
 impl StorageEngine for PackfileStorage {
     fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
         self.generation(collection_id).is_some()
+    }
+
+    fn ensure_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+    ) -> Result<(), StorageError> {
+        // Hold the collection's put mutex across the metadata lookup, the
+        // collection-existence check, and the append. Otherwise two concurrent
+        // writers can both observe an absent genesis record and append
+        // conflicting metadata, or a put can land between the existence check
+        // and the append and make the genesis record non-first. The mutex is
+        // per-instance, so this serializes threads within one process; a second
+        // writer process cannot open the store at all (the shard pool holds an
+        // exclusive `.mtxdb.lock`), so there is no cross-process race to close.
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+        if let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
+            let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+                StorageError::Corrupt("malformed collection metadata record".to_owned())
+            })?;
+            if found != *metadata {
+                return Err(StorageError::Internal(
+                    "collection metadata mismatch: existing genesis record differs".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        if self.collection_exists(collection_id) {
+            return Err(StorageError::Internal(
+                "genesis metadata must be written before the collection's first record".to_owned(),
+            ));
+        }
+        self.put_internal_locked(
+            collection_id,
+            &COLLECTION_METADATA_RECORD_ID,
+            &NodeData::new(metadata.encode().into()),
+            None,
+        )
     }
 
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
@@ -7596,6 +7645,107 @@ mod tests {
         assert!(
             store.get_read_committed(&collection, &[node]).is_err(),
             "a reclaimed segment base beyond the reader's covered LSN must error"
+        );
+    }
+
+    /// A genuine coverage gap that reloads cannot close — the checkpoint
+    /// exists and matches, but never covers the reclaimed LSNs — is a
+    /// persistent corruption, not a transient condition.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_gap_with_matching_checkpoint_is_corrupt() {
+        let dir = test_dir("read_committed_gap_corrupt");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Cu8; 16];
+        let node = [0x0fu8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x96u8; 16],
+            &[0x96u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"first".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal.reclaim_through(1).unwrap();
+        drop(journal);
+
+        let error = store
+            .get_read_committed(&collection, &[node])
+            .expect_err("the unrecoverable gap must fail");
+        assert!(
+            matches!(error, StorageError::Corrupt(_)),
+            "a matching checkpoint that never covers the gap is corrupt, got {error:?}"
+        );
+    }
+
+    /// The same gap, but with no usable checkpoint to reload: every reload
+    /// attempt fails, so the read is retryable once the writer publishes a
+    /// checkpoint instead of being reported as permanent corruption.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_gap_without_checkpoint_is_retryable() {
+        let dir = test_dir("read_committed_gap_retry");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Du8; 16];
+        let node = [0x0fu8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x97u8; 16],
+            &[0x97u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"first".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        // Remove the checkpoint the reader would reload, so the reload path
+        // fails closed but retryably.
+        fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal.reclaim_through(1).unwrap();
+        drop(journal);
+
+        let error = store
+            .get_read_committed(&collection, &[node])
+            .expect_err("the unrecoverable gap must fail");
+        assert!(
+            matches!(
+                error,
+                StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "a missing checkpoint must be reported as retryable, got {error:?}"
         );
     }
 
@@ -12447,6 +12597,107 @@ mod tests {
 
         assert_eq!(all_record_metadata(&dir), Vec::new());
         drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Concurrent genesis establishment on a real packfile-backed store must
+    /// serialize on the collection `put_mutex`: without it, two writers can
+    /// both observe an absent metadata record and append conflicting genesis
+    /// frames. `InMemoryStorage`'s equivalent is trivially serialized by its
+    /// single map write lock; this exercises the locking path that is not.
+    ///
+    /// Scope: intra-process only. The `put_mutex` map is per-instance, so it
+    /// says nothing about writers in separate processes. Cross-process writers
+    /// are excluded by the shard pool's exclusive `.mtxdb.lock` writer lock
+    /// (`ShardPool::acquire_writer_lock`), which permits one writer process per
+    /// store; this test pins the thread-level race.
+    #[test]
+    fn ensure_collection_metadata_is_atomic_under_concurrency() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+
+        let dir = test_dir("ensure_metadata_concurrent");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        let collection = [0x7Eu8; 16];
+        let metadata = Arc::new(CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+        });
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let metadata = Arc::clone(&metadata);
+                std::thread::spawn(move || {
+                    store
+                        .ensure_collection_metadata(&collection, &metadata)
+                        .expect("concurrent genesis establishment must be idempotent");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            Some((*metadata).clone())
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Checkpoint-backed hash recovery must handle frames that carry metadata
+    /// (as `put_verified` writes do). `record_identity_at` previously rejected
+    /// `FLAG_METADATA` frames, so `grow_checkpoint_index` failed closed to a
+    /// full rescan instead of recovering their identity.
+    #[test]
+    fn checkpoint_growth_recovers_metadata_bearing_frames() {
+        let dir = test_dir("checkpoint_growth_metadata");
+        let collection = TEST_COLLECTION;
+        let id = [0x33u8; 16];
+        let payload = bytes::Bytes::from_static(b"metadata payload");
+        let digest = DigestAlgorithm::Sha256.digest(&payload);
+
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put_verified(
+                &collection,
+                &id,
+                &NodeData::new(payload),
+                &digest,
+                DigestAlgorithm::Sha256,
+                &digest,
+                None,
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let checkpoint_index = reopened
+            .generation(&collection)
+            .expect("checkpoint collection exists");
+        assert!(checkpoint_index.index.is_mmap_backed());
+        let grown = reopened
+            .grow_checkpoint_index(&collection, &checkpoint_index.index)
+            .unwrap()
+            .expect("checkpoint index can grow");
+        assert!(
+            grown.lookup(&id).is_some(),
+            "a metadata-bearing frame's identity must be recoverable"
+        );
+        drop(checkpoint_index);
+        drop(reopened);
         fs::remove_dir_all(&dir).ok();
     }
 }

@@ -2213,7 +2213,12 @@ impl ShardPool {
                 return Err(StorageError::Corrupt("truncated record metadata".into()));
             }
             let flags = mem[prefix_end];
-            if flags & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED) != 0 {
+            if flags
+                & !(packfile::FLAG_COMPRESSED
+                    | packfile::FLAG_CRC_DISABLED
+                    | packfile::FLAG_METADATA)
+                != 0
+            {
                 return Err(StorageError::Corrupt(format!(
                     "unsupported record flags: {flags:#04x}"
                 )));

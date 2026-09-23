@@ -254,6 +254,10 @@ impl<'a> TlvReader<'a> {
         self.cursor = value_end;
         Some((tag, value))
     }
+
+    fn is_exhausted(&self) -> bool {
+        self.cursor == self.bytes.len()
+    }
 }
 
 /// Decode repeated `[len:4 LE][utf8]` into a string list.
@@ -307,7 +311,11 @@ fn encode_frame_id_policy(policy: &FrameIdPolicy) -> Vec<u8> {
 }
 
 fn decode_frame_id_policy(bytes: &[u8]) -> Option<FrameIdPolicy> {
-    let (tag, value) = TlvReader::new(bytes).next()?;
+    let mut reader = TlvReader::new(bytes);
+    let (tag, value) = reader.next()?;
+    if !reader.is_exhausted() {
+        return None;
+    }
     Some(match tag {
         POLICY_TAG_POINTER => FrameIdPolicy::Pointer {
             pointer: std::str::from_utf8(value).ok()?.to_owned(),
@@ -328,6 +336,9 @@ fn decode_frame_id_policy(bytes: &[u8]) -> Option<FrameIdPolicy> {
                     }
                     _ => {}
                 }
+            }
+            if !reader.is_exhausted() {
+                return None;
             }
             FrameIdPolicy::Canonical {
                 include,
@@ -359,17 +370,23 @@ fn decode_record_id_rule(bytes: &[u8]) -> Option<RecordIdentityRule> {
         policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
         digest_algorithm: DigestAlgorithm::Sha256,
     };
+    let mut has_digest_algorithm = false;
+    let mut has_policy = false;
     let mut reader = TlvReader::new(bytes);
     while let Some((tag, value)) = reader.next() {
         match tag {
             IDENTITY_TAG_DIGEST_ALGORITHM => {
                 rule.digest_algorithm = DigestAlgorithm::from_id(*value.first()?);
+                has_digest_algorithm = true;
             }
-            IDENTITY_TAG_POLICY => rule.policy = decode_frame_id_policy(value)?,
+            IDENTITY_TAG_POLICY => {
+                rule.policy = decode_frame_id_policy(value)?;
+                has_policy = true;
+            }
             _ => {}
         }
     }
-    Some(rule)
+    (reader.is_exhausted() && has_digest_algorithm && has_policy).then_some(rule)
 }
 
 fn encode_payload(payload: &PayloadPolicy) -> Vec<u8> {
@@ -385,7 +402,7 @@ fn encode_payload(payload: &PayloadPolicy) -> Vec<u8> {
 
 fn decode_payload(bytes: &[u8]) -> Option<PayloadPolicy> {
     match bytes.split_first()? {
-        (0x00, _) => Some(PayloadPolicy::Source),
+        (0x00, []) => Some(PayloadPolicy::Source),
         (0x01, rest) => Some(PayloadPolicy::Projection {
             include: decode_string_list(rest)?,
         }),
@@ -433,18 +450,30 @@ impl CollectionMetadata {
             payload: PayloadPolicy::Source,
             extension: None,
         };
+        let mut has_canonical_id = false;
+        let mut has_record_id_rule = false;
         let mut reader = TlvReader::new(bytes);
         while let Some((tag, value)) = reader.next() {
             match tag {
                 META_TAG_POOL_DST => meta.pool_dst = Some(value.try_into().ok()?),
-                META_TAG_COLLECTION_CANONICAL_ID => meta.collection_canonical_id = value.to_vec(),
-                META_TAG_RECORD_ID_RULE => meta.record_id_rule = decode_record_id_rule(value)?,
+                META_TAG_COLLECTION_CANONICAL_ID => {
+                    meta.collection_canonical_id = value.to_vec();
+                    has_canonical_id = true;
+                }
+                META_TAG_RECORD_ID_RULE => {
+                    meta.record_id_rule = decode_record_id_rule(value)?;
+                    has_record_id_rule = true;
+                }
                 META_TAG_PAYLOAD => meta.payload = decode_payload(value)?,
                 META_TAG_EXTENSION => meta.extension = Some(value.to_vec()),
                 _ => {}
             }
         }
-        Some(meta)
+        (reader.is_exhausted()
+            && has_canonical_id
+            && !meta.collection_canonical_id.is_empty()
+            && has_record_id_rule)
+            .then_some(meta)
     }
 }
 
@@ -680,5 +709,120 @@ mod tests {
             extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
         };
         assert_eq!(CollectionMetadata::decode(&meta.encode()).unwrap(), meta);
+    }
+
+    fn sample_metadata() -> CollectionMetadata {
+        CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: Some(b"ext".to_vec()),
+        }
+    }
+
+    #[test]
+    fn collection_metadata_decode_rejects_truncation_and_trailing_bytes() {
+        let encoded = sample_metadata().encode();
+
+        // Dropping the final byte leaves the last TLV length prefix promising
+        // more bytes than remain.
+        assert!(CollectionMetadata::decode(&encoded[..encoded.len() - 1]).is_none());
+        // Truncated inside the first length prefix.
+        assert!(CollectionMetadata::decode(&encoded[..3]).is_none());
+        // A complete record followed by trailing bytes is not accepted.
+        let mut trailing = encoded;
+        trailing.push(0xAA);
+        assert!(CollectionMetadata::decode(&trailing).is_none());
+    }
+
+    #[test]
+    fn collection_metadata_decode_requires_mandatory_fields() {
+        let rule = sample_metadata().record_id_rule;
+
+        // No fields at all.
+        assert!(CollectionMetadata::decode(&[]).is_none());
+
+        // Canonical id present, record-id rule absent.
+        let mut missing_rule = Vec::new();
+        push_tlv(
+            &mut missing_rule,
+            META_TAG_COLLECTION_CANONICAL_ID,
+            b"!room:matrix.org",
+        );
+        assert!(CollectionMetadata::decode(&missing_rule).is_none());
+
+        // Record-id rule present, canonical id absent.
+        let mut missing_id = Vec::new();
+        push_tlv(
+            &mut missing_id,
+            META_TAG_RECORD_ID_RULE,
+            &encode_record_id_rule(&rule),
+        );
+        assert!(CollectionMetadata::decode(&missing_id).is_none());
+
+        // An empty canonical id does not count as present.
+        let mut empty_id = Vec::new();
+        push_tlv(&mut empty_id, META_TAG_COLLECTION_CANONICAL_ID, &[]);
+        push_tlv(
+            &mut empty_id,
+            META_TAG_RECORD_ID_RULE,
+            &encode_record_id_rule(&rule),
+        );
+        assert!(CollectionMetadata::decode(&empty_id).is_none());
+    }
+
+    #[test]
+    fn record_id_rule_decode_requires_both_fields_and_no_trailing_bytes() {
+        let rule = sample_metadata().record_id_rule;
+        assert_eq!(
+            decode_record_id_rule(&encode_record_id_rule(&rule)).unwrap(),
+            rule
+        );
+
+        let mut only_digest = Vec::new();
+        push_tlv(
+            &mut only_digest,
+            IDENTITY_TAG_DIGEST_ALGORITHM,
+            &[DigestAlgorithm::Sha256.id()],
+        );
+        assert!(decode_record_id_rule(&only_digest).is_none());
+
+        let mut trailing = encode_record_id_rule(&rule);
+        trailing.push(0x00);
+        assert!(decode_record_id_rule(&trailing).is_none());
+    }
+
+    #[test]
+    fn frame_id_policy_decode_rejects_trailing_bytes() {
+        let policy = FrameIdPolicy::Pointer {
+            pointer: "/event_id".into(),
+        };
+        let mut encoded = encode_frame_id_policy(&policy);
+        assert_eq!(decode_frame_id_policy(&encoded).unwrap(), policy);
+        encoded.push(0x7F);
+        assert!(decode_frame_id_policy(&encoded).is_none());
+    }
+
+    #[test]
+    fn payload_decode_rejects_trailing_bytes() {
+        assert_eq!(
+            decode_payload(&[0x00]).unwrap(),
+            PayloadPolicy::Source,
+            "a lone source marker is valid"
+        );
+        assert!(
+            decode_payload(&[0x00, 0xAA]).is_none(),
+            "trailing bytes after a source marker must be rejected"
+        );
+        assert_eq!(
+            decode_payload(&[0x01]).unwrap(),
+            PayloadPolicy::Projection { include: vec![] }
+        );
     }
 }

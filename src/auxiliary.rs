@@ -3,6 +3,13 @@
 //! Auxiliary indexes are logical stores, not additional packfile pools. They
 //! use the normal [`StorageEngine`] so callers do not create one directory or
 //! file per room, namespace, or index name.
+//!
+//! Identity note: auxiliary key digests and collection ids are intentionally
+//! BLAKE3 (via [`DigestAlgorithm::Blake3`] and [`derive_collection_id`]). These
+//! indexes are core-internal and unreleased, so there is no persisted SHA-256
+//! data to remain compatible with and no versioned dual-read or migration is
+//! required. Reverting these derivations to SHA-256 would be a regression, not
+//! a compatibility fix.
 
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{derive_collection_id, POOL_DST_INTERNAL};

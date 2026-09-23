@@ -112,9 +112,12 @@ build: ##H Build all
 	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
 	RUSTFLAGS= $(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 
+
+MTXDB_INSTALL_PROFILE ?= release
+
 .PHONY: install
 install:	##H Install CLI from source
-	$(CARGO) install --profile dev --timings --locked --path mtxdb-cli
+	$(CARGO) install --profile $(MTXDB_INSTALL_PROFILE) --timings --locked --path mtxdb-cli
 
 
 .PHONY: clean

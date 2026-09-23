@@ -298,7 +298,13 @@ impl PackfileStorage {
     /// cannot resolve from the segment alone; reloading the checkpoint advances
     /// the index/coverage pair together, after which the retry is consistent.
     /// Without a usable checkpoint the read fails closed.
-    fn refresh_read_journal(&self) -> Result<(), StorageError> {
+    ///
+    /// On success the held overlay guard is returned so the caller can read the
+    /// applied overlay without releasing and reacquiring the mutex, which could
+    /// otherwise expose an empty or partially rebuilt overlay to another reader.
+    fn refresh_read_journal(
+        &self,
+    ) -> Result<parking_lot::MutexGuard<'_, Option<ReadJournal>>, StorageError> {
         const RELOAD_ATTEMPTS: usize = 8;
         const MAX_BACKOFF_MS: u64 = 64;
         // Capture coverage once, before the first attempt. Comparing the final
@@ -307,15 +313,20 @@ impl PackfileStorage {
         // genuine gap. Reloads only ever advance `read_covered_lsn`, so a strict
         // increase across the whole loop is exactly the retryable signal.
         let coverage_before_attempts = self.read_covered_lsn.load(Ordering::Acquire);
+        // A failed reload attempt makes the outcome retryable even if coverage
+        // never advanced: a concurrent writer may simply not have written the
+        // checkpoint yet, so the same gap can resolve on a later read.
+        let mut reload_failed = false;
         for attempt in 0..RELOAD_ATTEMPTS {
             let mut guard = self.read_journal.lock();
             let Some(overlay) = guard.as_mut() else {
-                return Ok(());
+                return Ok(guard);
             };
             if overlay.refresh()? == ReadRefresh::Applied {
-                return Ok(());
+                return Ok(guard);
             }
             if !self.reload_index_from_checkpoint() {
+                reload_failed = true;
                 drop(guard);
                 let delay_ms = 1_u64
                     .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
@@ -326,6 +337,12 @@ impl PackfileStorage {
             }
             overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
             overlay.reset_overlay();
+            // Rebuild immediately while still holding the guard: returning the
+            // guard only once the overlay is applied keeps another reader from
+            // observing the just-cleared state.
+            if overlay.refresh()? == ReadRefresh::Applied {
+                return Ok(guard);
+            }
             drop(guard);
             if attempt.saturating_add(1) < RELOAD_ATTEMPTS {
                 let delay_ms = 1_u64
@@ -335,10 +352,11 @@ impl PackfileStorage {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             }
         }
-        if self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts {
+        let advanced = self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts;
+        if reload_failed || advanced {
             Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "read-committed checkpoint coverage advanced during reload; retry the read",
+                "read-committed reload failed or checkpoint coverage advanced; retry the read",
             )))
         } else {
             Err(StorageError::Corrupt(
@@ -401,11 +419,12 @@ impl PackfileStorage {
         let mut unresolved: Vec<usize> = Vec::new();
 
         // Refresh outside the read lock: this may reload the checkpoint-bound
-        // index if the writer reclaimed past this reader's coverage.
-        self.refresh_read_journal()?;
+        // index if the writer reclaimed past this reader's coverage. The
+        // returned guard keeps the applied overlay locked for the lookup below,
+        // so another reader cannot reset it in between.
+        let guard = self.refresh_read_journal()?;
 
         {
-            let guard = self.read_journal.lock();
             if let Some(overlay) = guard.as_ref() {
                 match overlay.puts.get(collection_id) {
                     Some(committed) => {
@@ -431,6 +450,7 @@ impl PackfileStorage {
                 unresolved.extend(0..ids.len());
             }
         }
+        drop(guard);
 
         if !unresolved.is_empty() {
             let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();

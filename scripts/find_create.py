@@ -104,7 +104,8 @@ def describe(path: str, hit: tuple[int, dict] | None) -> str:
     if hit is None:
         return f"{path}: no valid m.room.create"
     lineno, event = hit
-    version = (event.get("content") or {}).get("room_version", "?")
+    content = event.get("content")
+    version = content.get("room_version", "?") if isinstance(content, dict) else "?"
     room = event.get("room_id", "?")
     return f"{path}:{lineno}: {event['event_id']} room={room} version={version}"
 
