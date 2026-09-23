@@ -417,6 +417,11 @@ fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<Pa
         .with_context(|| format!("failed to open {} shard pool", shard_type.as_str()))
 }
 
+/// The directory of a specific pool, regardless of `--shard-type`.
+fn pool_dir_for(cli: &Cli, shard_type: ShardType) -> anyhow::Result<PathBuf> {
+    pool_dir(&open_layout(cli)?, shard_type)
+}
+
 fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
     pool_dir(&open_layout(cli)?, cli.require_shard_type()?)
 }
@@ -1185,6 +1190,11 @@ fn cmd_collections_in_dir(
     } else {
         None
     };
+    let cached_disk = if physical_needed {
+        None
+    } else {
+        read_disk_cache(dir)
+    };
     let disk_bytes: HashMap<_, _> = physical
         .as_ref()
         .map(|layout| {
@@ -1194,7 +1204,9 @@ fn cmd_collections_in_dir(
                 .map(|(id, stats)| (*id, stats.disk_bytes))
                 .collect()
         })
+        .or_else(|| cached_disk.clone())
         .unwrap_or_default();
+    let disk_known = physical_needed || cached_disk.is_some();
 
     if collections.is_empty() {
         println!("no collections found");
@@ -1308,7 +1320,7 @@ fn cmd_collections_in_dir(
                 },
             );
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
-        let disk_display = if physical_needed {
+        let disk_display = if disk_known {
             fmt_disk_megabytes(disk)
         } else {
             "?".to_owned()
@@ -1344,7 +1356,7 @@ fn cmd_collections_in_dir(
             total_nodes,
             "",
             "",
-            if physical_needed {
+            if disk_known {
                 fmt_disk_megabytes(total_disk_bytes)
             } else {
                 "?".to_owned()
@@ -1360,7 +1372,7 @@ fn cmd_collections_in_dir(
             "",
             "",
             fmt_index_kilobytes(total_memory),
-            if physical_needed {
+            if disk_known {
                 fmt_disk_megabytes(total_disk_bytes)
             } else {
                 "?".to_owned()
@@ -1989,6 +2001,76 @@ fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize
         }
     }
     Some((total, by_shard))
+}
+
+/// File name of the per-collection disk-size cache kept beside a pool's packs.
+const DISK_CACHE_FILE: &str = "collection_disk.cache";
+
+/// A cheap identity for the pool's current packs: each pack's id and length.
+/// Any append, new pack, or removal changes it, which invalidates the cache.
+fn pack_set_fingerprint(dir: &Path) -> anyhow::Result<u64> {
+    let mut input = Vec::new();
+    for (pack_id, len, _) in glob_pack_files(dir)? {
+        input.extend_from_slice(&pack_id.to_le_bytes());
+        input.extend_from_slice(&len.to_le_bytes());
+    }
+    let digest = blake3_digest(&input);
+    Ok(u64::from_le_bytes(digest[..8].try_into().expect("8 bytes")))
+}
+
+fn format_disk_cache(fingerprint: u64, entries: &[([u8; 16], u64)]) -> String {
+    let mut out = format!("fingerprint {fingerprint:016x}\n");
+    for (collection_id, bytes) in entries {
+        let _ = writeln!(out, "{} {bytes}", format_id(collection_id));
+    }
+    out
+}
+
+/// Parse a cache written by [`format_disk_cache`]; `None` if it is malformed
+/// or was written for a different pack set.
+fn parse_disk_cache(text: &str, fingerprint: u64) -> Option<HashMap<[u8; 16], u64>> {
+    let mut lines = text.lines();
+    let header = lines.next()?.strip_prefix("fingerprint ")?;
+    if u64::from_str_radix(header, 16).ok()? != fingerprint {
+        return None;
+    }
+    let mut sizes = HashMap::new();
+    for line in lines {
+        let (id, bytes) = line.split_once(' ')?;
+        sizes.insert(parse_collection_id(id).ok()?, bytes.parse().ok()?);
+    }
+    Some(sizes)
+}
+
+/// Per-collection on-disk bytes recorded by the last `mtxdb sync`, if the
+/// pool's packs still match it.
+fn read_disk_cache(dir: &Path) -> Option<HashMap<[u8; 16], u64>> {
+    let text = fs::read_to_string(dir.join(DISK_CACHE_FILE)).ok()?;
+    parse_disk_cache(&text, pack_set_fingerprint(dir).ok()?)
+}
+
+/// Scan the packs once and record each collection's on-disk bytes, unless the
+/// cache already matches. Best effort: the cache only speeds up listings.
+fn refresh_disk_cache(dir: &Path) {
+    if read_disk_cache(dir).is_some() {
+        return;
+    }
+    let Ok(fingerprint) = pack_set_fingerprint(dir) else {
+        return;
+    };
+    let Ok(physical) = physical_layout(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = physical
+        .collections
+        .iter()
+        .map(|(id, layout)| (*id, layout.disk_bytes))
+        .collect();
+    entries.sort_unstable();
+    let temporary = dir.join(format!("{DISK_CACHE_FILE}.tmp"));
+    if fs::write(&temporary, format_disk_cache(fingerprint, &entries)).is_ok() {
+        let _ = fs::rename(&temporary, dir.join(DISK_CACHE_FILE));
+    }
 }
 
 /// Discover only canonical v4 `pack_{pack_id:016x}.pack` files.
@@ -3887,6 +3969,18 @@ fn cmd_import(
     // the buffered append policy is meant for. A `put` command that syncs
     // per record stays on the default eager path.
     let store = open_store(cli)?.with_append_policy(mtxdb::shard::AppendPolicy::buffered());
+    // State-group mappings belong in the State pool, not the event pool.
+    let state_dir = pool_dir_for(cli, ShardType::State)?;
+    let separate_state_store = if state_dir == pool_dir {
+        None
+    } else {
+        Some(
+            PackfileStorage::open(state_dir)
+                .context("failed to open the state pool")?
+                .with_append_policy(mtxdb::shard::AppendPolicy::buffered()),
+        )
+    };
+    let state_store = separate_state_store.as_ref().unwrap_or(&store);
     let mut failures = 0_usize;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {
@@ -3894,6 +3988,7 @@ fn cmd_import(
         }
         if let Err(error) = cmd_import_file(
             &store,
+            state_store,
             &pool_dir,
             path,
             collection_override,
@@ -3907,6 +4002,11 @@ fn cmd_import(
     store
         .sync_all()
         .context("persisting import shard and collection summaries")?;
+    if separate_state_store.is_some() {
+        state_store
+            .sync_all()
+            .context("persisting state-group summaries")?;
+    }
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
     }
@@ -4318,6 +4418,7 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
 )]
 fn cmd_import_file(
     store: &PackfileStorage,
+    state_store: &PackfileStorage,
     dir: &Path,
     path: &Path,
     collection_override: Option<&str>,
@@ -4345,6 +4446,7 @@ fn cmd_import_file(
         }
         import_pdu_events(
             store,
+            state_store,
             dir,
             path,
             &events,
@@ -4383,6 +4485,7 @@ fn cmd_import_file(
         } else {
             import_pdu_events(
                 store,
+                state_store,
                 dir,
                 path,
                 &federation.pdus,
@@ -4538,6 +4641,7 @@ fn reject_cross_record_collision(
 )]
 fn import_pdu_events(
     store: &PackfileStorage,
+    state_store: &PackfileStorage,
     _dir: &Path,
     path: &Path,
     events: &[OwnedValue],
@@ -4660,7 +4764,7 @@ fn import_pdu_events(
     };
     if !state_groups.is_empty() {
         use mtxdb::auxiliary::AuxiliaryIndex;
-        let aux = AuxiliaryIndex::open(store, "matrix-state-groups");
+        let aux = AuxiliaryIndex::open(state_store, "matrix-state-groups");
         let mut state_count = 0u64;
         for (event_id, state_group_id) in &state_groups {
             // Key: event_id, Value: state_group_id (base64url).
@@ -5262,7 +5366,7 @@ fn compute_state_groups(
 
         // Only a state event produces a new state set.
         let state = match events_by_sid.get(&short_id) {
-            Some(ev) if is_state_event(ev) => {
+            Some(ev) if is_state_event(ev) && !is_rejected_or_soft_failed(ev) => {
                 let key = state_key(ev);
                 let state_type = event_string_field(ev, "type").unwrap_or("");
                 let eid = event_id(ev).unwrap_or("").to_owned();
@@ -5364,6 +5468,24 @@ impl StateSet {
 }
 
 /// Check if an event is a state event (has a `state_key` field).
+/// Whether an event is flagged as rejected or soft-failed by a top-level
+/// boolean `true`. Servers annotate this differently, so any leading
+/// underscores are ignored and `-` equals `_`: `__soft-failed`, `_soft-failed`,
+/// `soft-failed`, `soft_failed`, `__rejected`, `_rejected`, and `rejected` all
+/// count. Such an event stays in the DAG but never contributes state.
+fn is_rejected_or_soft_failed(event: &OwnedValue) -> bool {
+    let OwnedValue::Object(fields) = event else {
+        return false;
+    };
+    fields.iter().any(|(key, value)| {
+        matches!(value, OwnedValue::Static(simd_json::StaticNode::Bool(true)))
+            && matches!(
+                key.trim_start_matches('_').replace('-', "_").as_str(),
+                "rejected" | "soft_failed"
+            )
+    })
+}
+
 fn is_state_event(event: &OwnedValue) -> bool {
     let OwnedValue::Object(fields) = event else {
         return false;
@@ -5951,8 +6073,9 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
                 eprintln!("{}: skipped (no packfiles)", shard_type.as_str());
                 continue;
             }
-            let store = PackfileStorage::open(dir).context("failed to open store")?;
+            let store = PackfileStorage::open(dir.clone()).context("failed to open store")?;
             store.sync()?;
+            refresh_disk_cache(&dir);
             eprintln!(
                 "{}: synced: persisted shard IO stats and shard\u{2192}collection directory",
                 shard_type.as_str()
@@ -5962,7 +6085,10 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
     }
     let store = open_store(cli)?;
     store.sync()?;
-    eprintln!("synced: persisted shard IO stats and shard\u{2192}collection directory");
+    refresh_disk_cache(&selected_pool_dir(cli)?);
+    eprintln!(
+        "synced: persisted shard IO stats, shard\u{2192}collection directory, and disk sizes"
+    );
     Ok(())
 }
 
@@ -6306,6 +6432,19 @@ mod tests {
     }
 
     #[test]
+    fn disk_cache_round_trips_and_rejects_a_changed_pack_set() {
+        let a = [0xAAu8; 16];
+        let b = [0x01u8; 16];
+        let text = super::format_disk_cache(0xfeed, &[(a, 1234), (b, 0)]);
+        let parsed = super::parse_disk_cache(&text, 0xfeed).unwrap();
+        assert_eq!(parsed.get(&a), Some(&1234));
+        assert_eq!(parsed.get(&b), Some(&0));
+        // A different pack set (new fingerprint) must not reuse the sizes.
+        assert!(super::parse_disk_cache(&text, 0xbeef).is_none());
+        assert!(super::parse_disk_cache("garbage", 0xfeed).is_none());
+    }
+
+    #[test]
     fn displayed_collection_ids_are_accepted_as_selectors() {
         let id = [0xABu8; 16];
         assert_eq!(super::parse_collection_id(&format_id(&id)).unwrap(), id);
@@ -6476,6 +6615,7 @@ mod tests {
         ];
         import_pdu_events(
             &store,
+            &store,
             &dir,
             &path,
             &events,
@@ -6512,6 +6652,7 @@ mod tests {
             import_event("$b", "@alice", "!room"),
         ];
         let error = import_pdu_events(
+            &store,
             &store,
             &dir,
             &path,
@@ -6553,6 +6694,7 @@ mod tests {
         established.insert(collection_id);
         let error = import_pdu_events(
             &store,
+            &store,
             &dir,
             &path,
             &[incoming],
@@ -6592,6 +6734,7 @@ mod tests {
         let mut established = HashSet::new();
         established.insert(collection_id);
         import_pdu_events(
+            &store,
             &store,
             &dir,
             &path,
@@ -6657,9 +6800,27 @@ mod tests {
         let template = default_matrix_import_template();
         let mut established = HashSet::new();
 
-        cmd_import_file(&store, &pool_dir, &input, None, &template, &mut established).unwrap();
+        cmd_import_file(
+            &store,
+            &store,
+            &pool_dir,
+            &input,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
         // Declares the create so batch_has_create resolves for any follow-up.
-        cmd_import_file(&store, &pool_dir, &input, None, &template, &mut established).unwrap();
+        cmd_import_file(
+            &store,
+            &store,
+            &pool_dir,
+            &input,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
 
         let auth_dir = pool_dir.parent().unwrap().join("auth-chain");
         assert_eq!(
@@ -6697,7 +6858,16 @@ mod tests {
         .unwrap();
         let template = default_matrix_import_template();
         let mut established = HashSet::new();
-        cmd_import_file(&store, &pool_dir, &input, None, &template, &mut established).unwrap();
+        cmd_import_file(
+            &store,
+            &store,
+            &pool_dir,
+            &input,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
 
         let collection_id = template_collection_id(&template, "!room");
         let metadata = store
@@ -7054,6 +7224,7 @@ mod tests {
         .unwrap();
         cmd_import_file(
             &store,
+            &store,
             &pool_dir,
             &create_path,
             None,
@@ -7086,6 +7257,7 @@ mod tests {
         )
         .unwrap();
         cmd_import_file(
+            &store,
             &store,
             &pool_dir,
             &message_path,
@@ -7122,6 +7294,7 @@ mod tests {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/v12-room-slice.jsonl");
         cmd_import_file(
+            &store,
             &store,
             &pool_dir,
             &fixture,
@@ -7746,6 +7919,46 @@ mod tests {
         // starts a new one.
         assert_eq!(groups["$e1"], groups["$e49"]);
         assert_ne!(groups["$e49"], groups["$e50"]);
+    }
+
+    #[test]
+    fn rejected_and_soft_failed_events_never_contribute_state() {
+        let base = |flag: &str| {
+            let create = owned_value(
+                r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","content":{}}"#,
+            );
+            let flagged = owned_value(&format!(
+                r#"{{"event_id":"$bad","room_id":"!r:x","type":"m.room.name","state_key":"","prev_events":["$create"],{flag}"content":{{"name":"x"}}}}"#
+            ));
+            let after = owned_value(
+                r#"{"event_id":"$after","room_id":"!r:x","type":"m.room.message","prev_events":["$bad"],"content":{}}"#,
+            );
+            compute_state_groups(&[create, flagged, after], &[]).unwrap()
+        };
+        let unflagged = base("");
+        assert_ne!(
+            unflagged["$create"], unflagged["$bad"],
+            "an accepted state event changes the state group"
+        );
+        for key in [
+            "__soft-failed",
+            "_soft-failed",
+            "soft-failed",
+            "__soft_failed",
+            "__rejected",
+            "_rejected",
+            "rejected",
+        ] {
+            let groups = base(&format!(r#""{key}":true,"#));
+            assert_eq!(
+                groups["$create"], groups["$bad"],
+                "{key}: a flagged state event must not change state"
+            );
+            assert_eq!(groups["$bad"], groups["$after"], "{key}");
+        }
+        // `false` is not a flag.
+        let not_flagged = base(r#""__rejected":false,"#);
+        assert_ne!(not_flagged["$create"], not_flagged["$bad"]);
     }
 
     #[test]

@@ -435,12 +435,12 @@ struct RoomScanOutput {
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
 /// v4 pins the reduced bookkeeping to the exact `(pack_id, file_len)` set by
 /// carrying the same `pack_fingerprint` as the index checkpoint.
-const SHARD_ROOMS_VERSION: u8 = 4;
+const SHARD_ROOMS_VERSION: u8 = 5;
 /// Header size: magic(4) + version(1) + `pack_fingerprint(8)` + `persisted_at(8)`.
 const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
 /// One entry: `pack_id`(8) + `collection_id`(16) + count(8) + the
 /// collection's stable insertion ordinal(8).
-const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8;
+const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8 + 8;
 
 /// The largest record offset `IndexEntry` can represent: its 32-bit offset
 /// field stores `offset + 1`, reserving the all-zeros encoding for the empty
@@ -484,6 +484,7 @@ struct PersistedShardRoom {
     collection_id: [u8; 16],
     count: u64,
     insertion_order: u64,
+    disk_bytes: u64,
 }
 
 /// A decoded shard→collection directory: the pack set it was written
@@ -527,11 +528,13 @@ fn read_persisted_shard_collections(base_dir: &std::path::Path) -> Option<Persis
             collection_id.copy_from_slice(&chunk[8..24]);
             let count = u64::from_le_bytes(chunk[24..32].try_into().ok()?);
             let insertion_order = u64::from_le_bytes(chunk[32..40].try_into().ok()?);
+            let disk_bytes = u64::from_le_bytes(chunk[40..48].try_into().ok()?);
             Some(PersistedShardRoom {
                 pack_id,
                 collection_id,
                 count,
                 insertion_order,
+                disk_bytes,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -2787,6 +2790,7 @@ impl PackfileStorage {
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
         let tables = self.index_tables.read();
+        let physical = crate::packfile::layout::physical_layout(&self.base_dir).ok();
         let collection_order: HashMap<[u8; 16], u64> = tables
             .collection_order
             .iter()
@@ -2809,6 +2813,13 @@ impl PackfileStorage {
                     .copied()
                     .unwrap_or(u64::MAX);
                 buf.extend_from_slice(&order.to_le_bytes());
+                let disk_bytes = physical
+                    .as_ref()
+                    .and_then(|layout| layout.collections.get(collection_id))
+                    .and_then(|layout| layout.pack_bytes.get(pack_id))
+                    .copied()
+                    .unwrap_or(0);
+                buf.extend_from_slice(&disk_bytes.to_le_bytes());
             }
         }
 
@@ -3741,6 +3752,22 @@ impl PackfileStorage {
             collection_shards.dedup();
         }
         Some(shards)
+    }
+
+    /// Current physical bytes per collection from the persisted directory.
+    /// Values include superseded frames and are `None` for stores whose
+    /// sidecar predates persisted physical metrics.
+    #[must_use]
+    pub fn collection_disk_bytes_from_disk(
+        base_dir: &std::path::Path,
+    ) -> Option<HashMap<[u8; 16], u64>> {
+        let records = read_persisted_shard_collections(base_dir)?.records;
+        let mut bytes = HashMap::new();
+        for record in records {
+            let total = bytes.entry(record.collection_id).or_insert(0_u64);
+            *total = total.saturating_add(record.disk_bytes);
+        }
+        Some(bytes)
     }
 
     /// Current live-node count per shard from the persisted shard→collection
