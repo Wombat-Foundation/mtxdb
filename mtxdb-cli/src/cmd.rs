@@ -1245,22 +1245,24 @@ fn cmd_collections_in_dir(
         };
         ordering.then_with(|| left.0.cmp(&right.0))
     });
+    let canonical_width = canonical_ids
+        .values()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .max("canonical".len());
     if layout {
-        println!(
-            "  {:<34}  {:<36}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-            "collection",
-            "canonical",
-            "nodes",
-            "load",
-            "packs",
-            "disk",
-            "runs",
-            "largest",
-            "avoidable"
-        );
+        if canonical {
+            println!("  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
+        } else {
+            println!(
+                "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
+            );
+        }
     } else if canonical {
         println!(
-            "  {:<34}  {:<36}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
             "collection", "canonical", "nodes", "load", "shards", "index", "disk"
         );
     } else {
@@ -1319,14 +1321,13 @@ fn cmd_collections_in_dir(
             let runs = stats.map_or(0, |s| s.segments);
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
             let avoidable = avoidable_spread_bytes(stats);
-            println!(
-                "  {hex:<34}  {canonical_id:<36}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
-                disk_display,
-                fmt_bytes(largest),
-                fmt_bytes(avoidable)
-            );
+            if canonical {
+                println!("  {hex:<34}  {canonical_id:<canonical_width$}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}", disk_display, fmt_bytes(largest), fmt_bytes(avoidable));
+            } else {
+                println!("  {hex:<34}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}", disk_display, fmt_bytes(largest), fmt_bytes(avoidable));
+            }
         } else if canonical {
-            println!("  {hex:<34}  {canonical_id:<36}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}", fmt_index_kilobytes(*memory), disk_display);
+            println!("  {hex:<34}  {canonical_id:<canonical_width$}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}", fmt_index_kilobytes(*memory), disk_display);
         } else {
             println!(
                 "  {hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
@@ -1359,7 +1360,11 @@ fn cmd_collections_in_dir(
             "",
             "",
             fmt_index_kilobytes(total_memory),
-            fmt_disk_megabytes(total_disk_bytes),
+            if physical_needed {
+                fmt_disk_megabytes(total_disk_bytes)
+            } else {
+                "?".to_owned()
+            },
         );
     }
     if layout {
