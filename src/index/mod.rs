@@ -1166,6 +1166,15 @@ pub struct EntryUndo {
     was_empty: bool,
 }
 
+impl EntryUndo {
+    /// Whether the insertion occupied an empty slot rather than overwriting
+    /// an existing key.
+    #[must_use]
+    pub fn was_empty(&self) -> bool {
+        self.was_empty
+    }
+}
+
 /// Errors that can occur while inserting into a [`LossyIndex`].
 #[derive(Debug)]
 pub enum InsertError {

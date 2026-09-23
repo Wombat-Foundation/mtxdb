@@ -400,6 +400,7 @@ type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
 /// Replacement index entries produced while copying one repack collection.
 type RepackOffsets = Vec<([u8; 16], u16, u64)>;
+type RepackCopiedRecord = ([u8; 16], u16, u64, u64);
 /// Return type of [`PackfileStorage::repack_scan_incremental`]: the merged
 /// live-location map and (on the incremental path) the previous cursor state
 /// that the adjacency helpers need to skip re-reading already-seen nodes.
@@ -597,6 +598,7 @@ struct PutManyProgress {
     index_needs_rebuild: bool,
     pending_deltas: Vec<(u32, u64)>,
     pending_shard_collections: Vec<(u64, u64)>,
+    pending_shard_collection_counts: Vec<u64>,
     invalidate_delta: bool,
     undo_log: Vec<EntryUndo>,
 }
@@ -2730,6 +2732,70 @@ impl PackfileStorage {
         *bytes = bytes.saturating_add(disk_bytes);
     }
 
+    fn record_put_many_shard_collections(
+        &self,
+        collection_id: &[u8; 16],
+        count_packs: &[u64],
+        byte_packs: &[(u64, u64)],
+    ) {
+        let mut tables = self.index_tables.write();
+        for &pack_id in count_packs {
+            let count = tables
+                .shard_collections
+                .entry(pack_id)
+                .or_default()
+                .entry(*collection_id)
+                .or_insert(0);
+            *count = count.saturating_add(1);
+            tables
+                .collection_shards
+                .entry(*collection_id)
+                .or_default()
+                .insert(pack_id);
+        }
+        for &(pack_id, disk_bytes) in byte_packs {
+            let bytes = tables
+                .collection_disk_bytes
+                .entry(pack_id)
+                .or_default()
+                .entry(*collection_id)
+                .or_default();
+            *bytes = bytes.saturating_add(disk_bytes);
+        }
+    }
+
+    fn record_disk_bytes(&self, pack_id: u64, collection_id: &[u8; 16], disk_bytes: u64) {
+        let mut tables = self.index_tables.write();
+        let bytes = tables
+            .collection_disk_bytes
+            .entry(pack_id)
+            .or_default()
+            .entry(*collection_id)
+            .or_default();
+        *bytes = bytes.saturating_add(disk_bytes);
+    }
+
+    fn replace_collection_disk_bytes(
+        &self,
+        collection_id: &[u8; 16],
+        bytes_by_pack: &HashMap<u64, u64>,
+    ) {
+        let mut tables = self.index_tables.write();
+        for collections in tables.collection_disk_bytes.values_mut() {
+            collections.remove(collection_id);
+        }
+        for (&pack_id, &disk_bytes) in bytes_by_pack {
+            tables
+                .collection_disk_bytes
+                .entry(pack_id)
+                .or_default()
+                .insert(*collection_id, disk_bytes);
+        }
+        tables
+            .collection_disk_bytes
+            .retain(|_, collections| !collections.is_empty());
+    }
+
     /// Replaces `collection_id`'s entire contribution to `shard_collections` with
     /// `counts` (typically `LossyIndex::slot_counts()` converted to `pack_id` keys)
     /// — clears it out of any shard it no longer occupies and installs the fresh
@@ -3900,18 +3966,18 @@ impl PackfileStorage {
         pinned: &HashMap<u16, Arc<Shard>>,
         old_slot: u16,
         old_offset: u64,
-    ) -> Result<Option<([u8; 16], u16, u64)>, StorageError> {
+    ) -> Result<Option<RepackCopiedRecord>, StorageError> {
         let Some(old_shard) = pinned.get(&old_slot) else {
             return Ok(None);
         };
         let record = self.read_at(old_shard, old_offset, true)?;
-        let (new_slot, new_offset) = self.shards.put_record(&Record {
+        let (new_slot, new_offset, disk_bytes) = self.shards.put_record_with_len(&Record {
             collection_id: *collection_id,
             hash: record.hash,
             data: record.data,
             metadata: record.metadata,
         })?;
-        Ok(Some((record.hash, new_slot, new_offset)))
+        Ok(Some((record.hash, new_slot, new_offset, disk_bytes)))
     }
     fn swap_generation(
         &self,
@@ -4106,10 +4172,10 @@ impl PackfileStorage {
         hash: &NodeId,
         slot: u16,
         offset: u64,
-    ) -> Result<Result<(u32, u64), InsertError>, StorageError> {
+    ) -> Result<Result<(u32, u64, bool), InsertError>, StorageError> {
         Ok(self
             .insert_index_undoable(collection_id, index, hash, slot, offset)?
-            .map(|(bucket, slot, _undo)| (bucket, slot)))
+            .map(|(bucket, slot, undo)| (bucket, slot, undo.was_empty())))
     }
 
     /// Like [`Self::insert_index`], but also returns the [`EntryUndo`]
@@ -5096,6 +5162,7 @@ impl PackfileStorage {
             .prepare_collection_repack(collection_id, &source_shards)?;
 
         let mut new_offsets: Vec<([u8; 16], u16, u64)> = Vec::with_capacity(topo.len());
+        let mut new_disk_bytes = HashMap::new();
         for &local in &topo {
             let hash = csr
                 .hash_of(local)
@@ -5103,16 +5170,23 @@ impl PackfileStorage {
             let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            if let Some(entry) =
+            if let Some((hash, slot, offset, disk_bytes)) =
                 self.copy_record_to_shard(collection_id, &pinned, old_slot, old_offset)?
             {
-                new_offsets.push(entry);
+                let pack_id = self
+                    .shards
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |shard| shard.pack_id);
+                let total = new_disk_bytes.entry(pack_id).or_insert(0_u64);
+                *total = (*total).saturating_add(disk_bytes);
+                new_offsets.push((hash, slot, offset));
             }
         }
 
         let kept = new_offsets.len();
 
         let index = Self::build_index(&new_offsets, self.index_config)?;
+        self.replace_collection_disk_bytes(collection_id, &new_disk_bytes);
         self.replace_collection_shard_counts(
             collection_id,
             &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
@@ -5165,6 +5239,7 @@ impl PackfileStorage {
         // `persist_index_checkpoint`) means the next sync retries it.
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
+        self.persist_shard_collections_best_effort();
 
         Ok((kept, dropped))
     }
@@ -5241,7 +5316,7 @@ impl PackfileStorage {
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
         output_progress: &mut impl FnMut(Option<[u8; 16]>, u16, u16, usize, bool),
         output_state: &mut (u16, usize),
-    ) -> Result<(RepackOffsets, usize), StorageError> {
+    ) -> Result<(RepackOffsets, usize, HashMap<u64, u64>), StorageError> {
         let roots = self.live_roots.read().get(collection_id).cloned();
         let (live_hashes, adjacency) = match roots {
             Some(roots) if !roots.is_empty() => Self::bfs_live_set(
@@ -5282,6 +5357,7 @@ impl PackfileStorage {
         }
 
         let mut new_offsets = Vec::with_capacity(topo.len());
+        let mut new_disk_bytes = HashMap::new();
         for &local in &topo {
             let hash = csr
                 .hash_of(local)
@@ -5289,7 +5365,7 @@ impl PackfileStorage {
             let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            if let Some(entry) =
+            if let Some((hash, slot, offset, disk_bytes)) =
                 self.copy_record_to_shard(collection_id, pinned, old_slot, old_offset)?
             {
                 output_state.1 = output_state.1.saturating_add(1);
@@ -5301,11 +5377,17 @@ impl PackfileStorage {
                     collection_id,
                     output_state.1,
                 );
-                new_offsets.push(entry);
+                let pack_id = self
+                    .shards
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |shard| shard.pack_id);
+                let total = new_disk_bytes.entry(pack_id).or_insert(0_u64);
+                *total = (*total).saturating_add(disk_bytes);
+                new_offsets.push((hash, slot, offset));
             }
         }
 
-        Ok((new_offsets, dropped))
+        Ok((new_offsets, dropped, new_disk_bytes))
     }
 
     /// As [`Self::repack_collections_reachable`], with a callback whenever the
@@ -5367,7 +5449,7 @@ impl PackfileStorage {
             let hash_to_shard_offset = maps.get(collection_id).ok_or_else(|| {
                 StorageError::Corrupt("repack batch scan lost requested collection".to_owned())
             })?;
-            let (new_offsets, dropped) = self.copy_repack_batch_collection(
+            let (new_offsets, dropped, new_disk_bytes) = self.copy_repack_batch_collection(
                 collection_id,
                 hash_to_shard_offset,
                 &pinned,
@@ -5377,6 +5459,7 @@ impl PackfileStorage {
             )?;
             let kept = new_offsets.len();
             let index = Self::build_index(&new_offsets, self.index_config)?;
+            self.replace_collection_disk_bytes(collection_id, &new_disk_bytes);
             self.replace_collection_shard_counts(
                 collection_id,
                 &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
@@ -5430,6 +5513,7 @@ impl PackfileStorage {
         // next sync a retry, not correctness.
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
+        self.persist_shard_collections_best_effort();
 
         Ok(results)
     }
@@ -5584,6 +5668,16 @@ impl PackfileStorage {
                 self.shards.retire_slot(id);
             }
         }
+        drop(collections);
+        let mut tables = self.index_tables.write();
+        let live_pack_ids: HashSet<u64> = tables
+            .collection_shards
+            .values()
+            .flat_map(|packs| packs.iter().copied())
+            .collect();
+        tables
+            .collection_disk_bytes
+            .retain(|pack_id, _| live_pack_ids.contains(pack_id));
     }
 }
 
@@ -5726,12 +5820,13 @@ impl PackfileStorage {
             }
         };
         let insert_result = self.insert_index_undoable(collection_id, live, id, slot, offset)?;
-        let _inserted = if let Ok((bucket, slot, undo)) = insert_result {
+        let inserted = if let Ok((bucket, slot, undo)) = insert_result {
+            let was_empty = undo.was_empty();
             progress.pending_deltas.push((bucket, slot));
             if progress.owned_index.is_none() {
                 progress.undo_log.push(undo);
             }
-            true
+            was_empty
         } else {
             let grow_started = std::time::Instant::now();
             let grown = if let Some(grown) = live.grow() {
@@ -5761,6 +5856,13 @@ impl PackfileStorage {
             progress.owned_index = Some(grown);
             inserted
         };
+        if inserted {
+            let pack_id = self
+                .shards
+                .get_shard(slot)
+                .map_or(u64::from(slot), |shard| shard.pack_id);
+            progress.pending_shard_collection_counts.push(pack_id);
+        }
         Ok(())
     }
 
@@ -5873,6 +5975,7 @@ impl PackfileStorage {
             index_needs_rebuild: false,
             pending_deltas: Vec::with_capacity(entries_len),
             pending_shard_collections: Vec::with_capacity(entries_len),
+            pending_shard_collection_counts: Vec::with_capacity(entries_len),
             invalidate_delta: false,
             undo_log: Vec::new(),
         }
@@ -5945,7 +6048,7 @@ impl PackfileStorage {
             self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
-                if let Ok((bucket, entry)) =
+                if let Ok((bucket, entry, inserted)) =
                     self.insert_index(collection_id, &gen.index, id, slot, offset)?
                 {
                     self.record_delta(collection_id, gen.generation, bucket, entry);
@@ -5953,7 +6056,11 @@ impl PackfileStorage {
                         .shards
                         .get_shard(slot)
                         .map_or(u64::from(slot), |shard| shard.pack_id);
-                    self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+                    if inserted {
+                        self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+                    } else {
+                        self.record_disk_bytes(pack_id, collection_id, disk_bytes);
+                    }
 
                     let mut data_to_cache = data.clone();
                     for child in &mut data_to_cache.children {
@@ -5990,13 +6097,17 @@ impl PackfileStorage {
                 None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
             };
             let inserted = self.insert_index(collection_id, &index, id, slot, offset)?;
-            if let Ok((bucket, entry)) = inserted {
+            if let Ok((bucket, entry, is_new)) = inserted {
                 self.record_delta(collection_id, generation, bucket, entry);
                 let pack_id = self
                     .shards
                     .get_shard(slot)
                     .map_or(u64::from(slot), |s| s.pack_id);
-                self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+                if is_new {
+                    self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+                } else {
+                    self.record_disk_bytes(pack_id, collection_id, disk_bytes);
+                }
             } else {
                 // The insert was rejected (table full). The collection's shape
                 // is about to change, so any delta frames would no longer be
@@ -6140,9 +6251,11 @@ impl PackfileStorage {
                 self.record_delta(collection_id, progress.generation, bucket, slot);
             }
         }
-        for (pack_id, disk_bytes) in progress.pending_shard_collections {
-            self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
-        }
+        self.record_put_many_shard_collections(
+            collection_id,
+            &progress.pending_shard_collection_counts,
+            &progress.pending_shard_collections,
+        );
 
         // Apply cache mutations only after all disk writes succeed, so a
         // failed batch does not leak partial state into the shared cache.
@@ -12194,6 +12307,75 @@ mod tests {
         assert!(disk_bytes.get(&TEST_COLLECTION).copied().unwrap_or(0) > 0);
         assert!(disk_bytes.get(&OTHER_COLLECTION).copied().unwrap_or(0) > 0);
         assert!(PackfileStorage::collection_directory_persisted_at(&dir).is_some());
+    }
+
+    #[test]
+    fn test_collection_disk_bytes_track_overwrite_reopen_and_repack() {
+        let dir = test_dir("collection_disk_bytes_semantics");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let id = distinct_id(0);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"second")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)],
+            "overwriting a key must not inflate the live-node count"
+        );
+        let physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let expected = physical
+            .collections
+            .get(&TEST_COLLECTION)
+            .expect("collection in physical layout")
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "sidecar bytes must include both the original and overwrite frames"
+        );
+
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.sync_all().unwrap();
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "reopen must preserve physical byte accounting"
+        );
+        reopened
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .unwrap();
+        reopened.sync_all().unwrap();
+        let repacked_physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let repacked_expected = repacked_physical
+            .collections
+            .get(&TEST_COLLECTION)
+            .expect("collection after repack")
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&repacked_expected),
+            "repack must update physical byte accounting"
+        );
     }
 
     #[test]

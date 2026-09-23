@@ -1888,9 +1888,7 @@ impl ShardPool {
                 }
                 return Err(e);
             }
-            let disk_bytes = u64::try_from(frame_len)
-                .unwrap_or(u64::MAX)
-                .saturating_add(8);
+            let disk_bytes = u64::try_from(frame_len).unwrap_or(u64::MAX);
             return Ok((shard.slot, virtual_end, disk_bytes));
         }
     }
