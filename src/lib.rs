@@ -26,12 +26,20 @@ pub mod frontier;
 pub mod index;
 /// Checksummed append-only journal primitives for durable group commits.
 ///
-/// Gated behind the `multi-reader` feature: this exists to let a separate
-/// OS process observe a live writer's committed-but-not-yet-checkpointed
-/// data (see [`crate::packfile::storage`]'s `enable_journal`/
-/// `enable_read_journal`). A single-process embedded deployment never
-/// needs it.
-#[cfg(feature = "multi-reader")]
+/// Exists to let a separate OS process observe a live writer's committed-
+/// but-not-yet-checkpointed data (see [`crate::packfile::storage`]'s
+/// `enable_journal`/`enable_read_journal`) — a single-process embedded
+/// deployment never needs it, but this module is threaded through
+/// `packfile::storage`'s struct fields, `RuntimeStats`, and several
+/// always-on functions (not just its own dedicated methods) deeply enough
+/// that gating it behind the `multi-reader` feature is a real, scoped,
+/// not-yet-finished refactor — see docs/TODO.txt for the precise
+/// extraction plan (exact line ranges for every piece that needs to move
+/// into a new `packfile/storage/read_journal.rs` submodule) before
+/// re-attempting the `#[cfg(feature = "multi-reader")]` gate here. Gating
+/// only this module declaration without finishing that work breaks the
+/// default (no-`multi-reader`) build — confirmed by hitting exactly that
+/// break while scoping this.
 pub mod journal;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
