@@ -228,7 +228,7 @@ fn sub_collections() -> Command {
         )
         .arg(layout_arg())
         .arg(limit_arg())
-        .arg(sort_arg("slot, collection, nodes, load, shards, index, disk, packs, avoidable, segments, fragmentation"))
+        .arg(sort_arg("collection, nodes, load, shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
 
 fn layout_arg() -> Arg {
@@ -381,9 +381,8 @@ fn sub_info() -> Command {
                 .required(true)
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A `0x`-prefixed collection ID (32 hex digits after `0x`), a collection's \
-                     slot index from `mtxdb collections`, or a pack ID from `mtxdb shards` \
-                     (also `0x`-prefixed, 1-16 hex digits) — e.g. `mtxdb info \
+                    "A `0x`-prefixed collection ID (32 hex digits after `0x`) or a pack ID \
+                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits) — e.g. `mtxdb info \
                      0x0102030405060708090a0b0c0d0e0f10` or `mtxdb info 0x1`",
                 ),
         )

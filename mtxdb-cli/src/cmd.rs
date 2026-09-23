@@ -1010,29 +1010,6 @@ fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(output)
 }
 
-/// Enumerate live collections from the persisted directory. Stores created before
-/// that sidecar existed fall back to a one-time index rebuild; `mtxdb sync`
-/// makes future calls fast.
-fn collection_ids_in_dir(dir: &Path) -> anyhow::Result<Vec<[u8; 16]>> {
-    if PackfileStorage::collection_directory_persisted_at(dir).is_some() {
-        return Ok(PackfileStorage::collection_directory_from_disk(dir)
-            .into_iter()
-            .map(|(collection_id, _)| collection_id)
-            .collect());
-    }
-    let store =
-        PackfileStorage::open_read_only(dir.to_path_buf()).context("failed to open store")?;
-    Ok(store
-        .collection_summaries()
-        .into_iter()
-        .map(|(collection_id, _, _, _)| collection_id)
-        .collect())
-}
-
-fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
-    collection_ids_in_dir(&selected_pool_dir(cli)?)
-}
-
 /// Resolve the pool set for commands that can list every independent pool.
 /// An explicit `--all` must override the CLI's default `event-dag` selection;
 /// otherwise `collections --all`/`shards --all` silently list only one pool.
@@ -1116,8 +1093,7 @@ fn cmd_collections_in_dir(
     if let Some(column) = sort {
         if !matches!(
             column,
-            "slot"
-                | "collection"
+            "collection"
                 | "nodes"
                 | "shards"
                 | "index"
@@ -1132,13 +1108,13 @@ fn cmd_collections_in_dir(
         }
     }
     let mut ordered: Vec<_> = collections.iter().enumerate().collect();
-    ordered.sort_by(|(left_slot, left), (right_slot, right)| {
+    ordered.sort_by(|(left_order, left), (right_order, right)| {
         let left_layout = physical.collections.get(&left.0);
         let right_layout = physical.collections.get(&right.0);
         let score = |stats: Option<&CollectionPhysicalLayout>| {
             stats.map_or(0, |s| s.segments.saturating_sub(s.pack_bytes.len() as u64))
         };
-        let ordering = match sort.unwrap_or("slot") {
+        let ordering = match sort.unwrap_or("") {
             "collection" => left.0.cmp(&right.0),
             "nodes" => right.1.cmp(&left.1),
             "shards" | "packs" => right_layout
@@ -1154,19 +1130,19 @@ fn cmd_collections_in_dir(
                 avoidable_spread_bytes(right_layout).cmp(&avoidable_spread_bytes(left_layout))
             }
             "segments" | "fragmentation" => score(right_layout).cmp(&score(left_layout)),
-            _ => left_slot.cmp(right_slot),
+            _ => left_order.cmp(right_order),
         };
         ordering.then_with(|| left.0.cmp(&right.0))
     });
     if layout {
         println!(
-            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-            "slot", "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
+            "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
         );
     } else {
         println!(
-            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-            "slot", "collection", "nodes", "load", "shards", "index", "disk"
+            "  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "collection", "nodes", "load", "shards", "index", "disk"
         );
     }
     let mut total_nodes = 0_usize;
@@ -1188,7 +1164,7 @@ fn cmd_collections_in_dir(
     } else {
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
-    for (i, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
+    for (_, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
         let hex = format_id(collection_id);
         let load = fmt_load_percent(*nodes, *capacity);
         let shards = collection_shards
@@ -1212,14 +1188,14 @@ fn cmd_collections_in_dir(
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
             let avoidable = avoidable_spread_bytes(stats);
             println!(
-                "  {i:>5}  {hex}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
+                "  {hex}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
                 fmt_disk_megabytes(disk),
                 fmt_bytes(largest),
                 fmt_bytes(avoidable)
             );
         } else {
             println!(
-                "  {i:>5}  {hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
+                "  {hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
                 fmt_index_kilobytes(*memory),
                 fmt_disk_megabytes(disk),
             );
@@ -1228,8 +1204,7 @@ fn cmd_collections_in_dir(
     println!();
     if layout {
         println!(
-            "  {:>5}  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-            "",
+            "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
             "total",
             total_nodes,
             "",
@@ -1241,8 +1216,7 @@ fn cmd_collections_in_dir(
         );
     } else {
         println!(
-            "  {:>5}  {:<34}  {total_nodes:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-            "",
+            "  {:<34}  {total_nodes:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
             "total",
             "",
             "",
@@ -2066,7 +2040,7 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// `info` accepts a collection selector (slot index, a canonical sigil, or a
+/// `info` accepts a collection selector (a canonical sigil, or a
 /// `0x`-prefixed 32-hex logical ID) or a pack selector (`0x`-prefixed, 1–16 hex
 /// digits, as printed by `mtxdb shards`). Dispatch on the hex length the same
 /// way `scan` does; bare hex is not accepted.
@@ -2079,9 +2053,9 @@ enum InfoTarget {
 
 /// Classify an `info` selector by the digits after its canonical lowercase
 /// `0x` prefix: 1-16 name a pack, exactly 32 name a collection, and any other
-/// count is an error. A selector without a prefix is a collection slot index
-/// from `mtxdb collections`; an uppercase `0X` prefix is rejected rather than
-/// guessed at.
+/// count is an error. A selector without a `0x` prefix is handed to the
+/// collection parser (which accepts only a canonical sigil such as `!room`);
+/// an uppercase `0X` prefix is rejected rather than guessed at.
 fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
     let Some(hex) = selector.strip_prefix("0x") else {
         if selector.starts_with("0X") {
@@ -2329,6 +2303,33 @@ fn print_collection_info(
         fmt_load_factor(len, capacity)
     );
     print_collection_shards(shards);
+    match physical_layout(dir) {
+        Ok(physical) => {
+            if let Some(layout) = physical.collections.get(collection_id) {
+                println!("  physical (includes superseded frames):");
+                println!("    disk:             {}", fmt_bytes(layout.disk_bytes));
+                println!("    packs:            {}", layout.pack_bytes.len());
+                println!("    segments:         {}", layout.segments);
+                println!(
+                    "    largest run:      {}",
+                    fmt_bytes(layout.largest_segment_bytes)
+                );
+                println!(
+                    "    avoidable spread: {}",
+                    fmt_bytes(layout.avoidable_spread_bytes())
+                );
+                if layout.pack_bytes.len() > 1 {
+                    let mut pack_bytes: Vec<_> = layout.pack_bytes.iter().collect();
+                    pack_bytes.sort_unstable_by_key(|(pack_id, _)| **pack_id);
+                    println!("    per pack:");
+                    for (pack_id, bytes) in pack_bytes {
+                        println!("      0x{pack_id:016x}: {}", fmt_bytes(*bytes));
+                    }
+                }
+            }
+        }
+        Err(error) => eprintln!("  physical: unavailable ({error})"),
+    }
     match PackfileStorage::open_read_only(dir.to_path_buf())
         .ok()
         .and_then(|store| matrix_room_extension_from_store(&store, collection_id))
@@ -2384,18 +2385,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
-            let collection_id = match collection.parse::<usize>() {
-                Ok(slot) => {
-                    let Ok(collections) = collection_ids_in_dir(&dir) else {
-                        continue;
-                    };
-                    match collections.get(slot) {
-                        Some(&id) => id,
-                        None => continue,
-                    }
-                }
-                Err(_) => parse_collection_selector(collection)?,
-            };
+            let collection_id = parse_collection_selector(collection)?;
             let has_collection =
                 if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir) {
                     summaries.iter().any(|(id, _, _, _)| id == &collection_id)
@@ -2415,25 +2405,15 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
             }
         }
         if !matched_any {
-            let display = match parse_collection_selector(collection) {
-                Ok(id) => format_id(&id),
-                Err(_) => collection.to_owned(),
-            };
-            eprintln!("collection {display}: not found");
+            eprintln!(
+                "collection {}: not found",
+                format_id(&parse_collection_selector(collection)?)
+            );
         }
         return Ok(());
     }
 
-    let collection_id = match collection.parse::<usize>() {
-        Ok(slot) => {
-            let collections = collection_ids(cli)?;
-            collections
-                .get(slot)
-                .copied()
-                .with_context(|| format!("collection slot {slot} not found"))?
-        }
-        Err(_) => parse_collection_selector(collection)?,
-    };
+    let collection_id = parse_collection_selector(collection)?;
     let hex = format_id(&collection_id);
     let dir = selected_pool_dir(cli)?;
 
@@ -5700,6 +5680,16 @@ mod tests {
                 super::parse_pack_id_selector(selector).is_ok(),
                 "{selector}"
             );
+        }
+    }
+
+    #[test]
+    fn collection_selectors_are_never_positional() {
+        // A listing position names a different collection after a purge or
+        // repack, so a bare number must not resolve to one.
+        for selector in ["0", "3", "19"] {
+            let error = super::parse_collection_selector(selector).unwrap_err();
+            assert!(error.to_string().contains("0x-prefixed"), "{error}");
         }
     }
 
