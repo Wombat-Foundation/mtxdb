@@ -78,6 +78,16 @@ default = ["zstd"]
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
 
+# Cross-process write-ahead journal + read-committed overlay, for a
+# single-writer/multi-reader deployment where separate OS processes need to
+# read a live writer's committed-but-not-yet-checkpointed data (e.g. a
+# Synapse worker deployment). Off by default: a genuinely single-process
+# embedded deployment never needs this, and it costs real code (journal.rs,
+# the read-journal overlay, the refresh-on-miss read path) that a
+# single-process build shouldn't have to carry. See docs/TODO.txt's
+# "process model" entries for the deployment-shape reasoning.
+multi-reader = []
+
 [dependencies]
 arc-swap = "1"
 bytes = "1.5"

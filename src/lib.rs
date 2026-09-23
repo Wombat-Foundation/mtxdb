@@ -25,6 +25,13 @@ pub mod frontier;
 /// Lossy, append-only index mapping content hashes to packfile locations.
 pub mod index;
 /// Checksummed append-only journal primitives for durable group commits.
+///
+/// Gated behind the `multi-reader` feature: this exists to let a separate
+/// OS process observe a live writer's committed-but-not-yet-checkpointed
+/// data (see [`crate::packfile::storage`]'s `enable_journal`/
+/// `enable_read_journal`). A single-process embedded deployment never
+/// needs it.
+#[cfg(feature = "multi-reader")]
 pub mod journal;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
