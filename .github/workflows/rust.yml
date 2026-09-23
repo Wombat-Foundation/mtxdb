@@ -42,6 +42,14 @@ jobs:
           # or changing this bound.
           - rust: "1.81.0"
             label: "cli feature"
+          # The cross-process read-committed overlay (`multi-reader`) has its
+          # own submodule (`packfile::storage::read_journal`) gated out of the
+          # default build entirely, so it needs its own compiled-and-tested
+          # row rather than relying on the `all-features` job below to catch
+          # a break here -- `--all-features` compiling says nothing about
+          # `--no-default-features --features multi-reader` compiling.
+          - rust: "1.81.0"
+            label: "multi-reader feature"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,6 +94,14 @@ jobs:
       - name: Build CLI
         if: matrix.label == 'cli feature'
         run: cargo build --release --manifest-path mtxdb-cli/Cargo.toml
+
+      - name: Lint (multi-reader feature)
+        if: matrix.label == 'multi-reader feature'
+        run: cargo clippy --locked --no-default-features --features multi-reader,zstd --lib --tests -- -D warnings
+
+      - name: Test (multi-reader feature)
+        if: matrix.label == 'multi-reader feature'
+        run: cargo test --locked --no-default-features --features multi-reader,zstd --lib --tests
 
   all-features:
     name: Rust ${{ matrix.rust }} all features
