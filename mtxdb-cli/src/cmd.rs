@@ -1032,6 +1032,17 @@ fn collection_ids(cli: &Cli) -> anyhow::Result<Vec<[u8; 16]>> {
     collection_ids_in_dir(&selected_pool_dir(cli)?)
 }
 
+/// Resolve the pool set for commands that can list every independent pool.
+/// An explicit `--all` must override the CLI's default `event-dag` selection;
+/// otherwise `collections --all`/`shards --all` silently list only one pool.
+fn listing_shard_types(cli: &Cli, all: bool) -> Vec<ShardType> {
+    if all {
+        ShardType::ALL.to_vec()
+    } else {
+        cli.shard_types().collect()
+    }
+}
+
 fn cmd_collections(
     cli: &Cli,
     all: bool,
@@ -1040,13 +1051,10 @@ fn cmd_collections(
     limit: i64,
 ) -> anyhow::Result<()> {
     // `--all` explicitly asks for every pool; `-t all` (no specific shard
-    // type selected) means the same thing — without this, `-t all` fell
-    // through to `selected_pool_dir`'s `require_shard_type`, which always
-    // rejects an unselected type, even though `-t all` completes and parses
-    // as a legitimate value.
+    // type selected) means the same thing.
     if all || cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
-        let types: Vec<ShardType> = cli.shard_types().collect();
+        let types = listing_shard_types(cli, all);
         for (index, shard_type) in types.into_iter().enumerate() {
             if index != 0 {
                 println!();
@@ -1361,10 +1369,10 @@ fn print_pack_physical_layout(
 
 fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     // See the matching comment in `cmd_collections`: `-t all` must behave
-    // like `--all`, not fall through to `require_shard_type`'s rejection.
+    // like `--all`, not list only the default event-dag pool.
     if all || cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
-        let types: Vec<ShardType> = cli.shard_types().collect();
+        let types = listing_shard_types(cli, all);
         for (index, shard_type) in types.into_iter().enumerate() {
             if index != 0 {
                 println!();
@@ -5434,6 +5442,21 @@ mod tests {
             cli.shard_types().collect::<Vec<_>>(),
             vec![ShardType::State]
         );
+    }
+
+    #[test]
+    fn listing_all_overrides_the_default_pool_selection() {
+        let cli = Cli {
+            dir: None,
+            shard_type: Some(ShardType::EventDag),
+            command: Commands::Collections {
+                all: true,
+                layout: false,
+                sort: None,
+                limit: -1,
+            },
+        };
+        assert_eq!(listing_shard_types(&cli, true), ShardType::ALL.to_vec());
     }
 
     #[test]
