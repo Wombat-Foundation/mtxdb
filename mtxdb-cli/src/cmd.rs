@@ -1216,14 +1216,14 @@ fn cmd_collections_in_dir(
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
             let avoidable = avoidable_spread_bytes(stats);
             println!(
-                "  {i:>5}  0x{hex}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
+                "  {i:>5}  {hex}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}",
                 fmt_disk_megabytes(disk),
                 fmt_bytes(largest),
                 fmt_bytes(avoidable)
             );
         } else {
             println!(
-                "  {i:>5}  0x{hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
+                "  {i:>5}  {hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
                 fmt_index_kilobytes(*memory),
                 fmt_disk_megabytes(disk),
             );
@@ -2075,12 +2075,26 @@ fn fmt_duration(secs: u64) -> String {
 /// digits, as printed by `mtxdb shards`). Dispatch on the hex length the same
 /// way `scan` does; bare hex is not accepted.
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
-    if selector
+    if let Some(hex) = selector
         .strip_prefix("0x")
         .or_else(|| selector.strip_prefix("0X"))
-        .is_some_and(|hex| hex.len() != 32)
     {
-        return cmd_info_pack(cli, selector);
+        if (1..=16).contains(&hex.len()) {
+            return cmd_info_pack(cli, selector);
+        }
+        if hex.len() != 32 {
+            let doubled = hex.starts_with("0x") || hex.starts_with("0X");
+            bail!(
+                "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection) or \
+                 1-16 (a pack), found {} characters{}",
+                hex.len(),
+                if doubled {
+                    " (the `0x` prefix is doubled)"
+                } else {
+                    ""
+                }
+            );
+        }
     }
     cmd_info_collection(cli, selector)
 }
@@ -4602,9 +4616,10 @@ fn compute_state_groups(
     for &idx in &sorted {
         for edge in frontier.prev_edges(idx) {
             if edge.is_resident() {
-                *remaining_children
+                let count = remaining_children
                     .entry(frontier.nodes[edge.arena_index()].short_id)
-                    .or_default() += 1;
+                    .or_default();
+                *count = count.saturating_add(1);
             }
         }
     }
@@ -5612,6 +5627,28 @@ mod tests {
         cmd_stats(&cli, false).unwrap();
         cmd_stats(&cli, true).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn info_explains_a_malformed_hex_selector() {
+        let cli = Cli {
+            dir: None,
+            shard_type: None,
+            command: Commands::Info {
+                collection: String::new(),
+            },
+        };
+        let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63").unwrap_err();
+        assert!(doubled.to_string().contains("doubled"), "{doubled}");
+        let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF").unwrap_err();
+        assert!(short.to_string().contains("found 30 characters"), "{short}");
+    }
+
+    #[test]
+    fn displayed_collection_ids_are_accepted_as_selectors() {
+        let id = [0xABu8; 16];
+        assert_eq!(super::parse_collection_id(&format_id(&id)).unwrap(), id);
+        assert!(!format_id(&id).starts_with("0x0x"));
     }
 
     #[test]
