@@ -94,75 +94,341 @@ pub fn frame_digest(
     Some(algorithm.digest(&bytes))
 }
 
-/// Domain separator for the v1 collection-id derivation.
-pub const COLLECTION_ID_DOMAIN: &[u8] = b"mtxdb:collection:v1:";
+/// Pool namespace discriminator for core-internal collections (auxiliary
+/// indexes) that are not owned by one of the protocol pools.
+pub const POOL_DST_INTERNAL: [u8; 4] = *b"INTL";
 
-/// Collection-type value meaning "unset"; never a valid collection.
-pub const COLLECTION_TYPE_UNSET: u16 = 0x0000;
-/// First collection-type value reserved for core-internal collections (e.g.
-/// auxiliary indexes). The range `0x0001..=0x00FF` is core-owned.
-pub const COLLECTION_TYPE_INTERNAL_BASE: u16 = 0x0001;
-/// First collection-type value available to protocol extensions (e.g. Matrix
-/// rooms). The range `0x0100..=0x7FFF` is protocol-owned.
-pub const COLLECTION_TYPE_PROTOCOL_BASE: u16 = 0x0100;
-/// First collection-type value available to applications. The range
-/// `0x8000..=0xFFFF` is application-owned.
-pub const COLLECTION_TYPE_APP_BASE: u16 = 0x8000;
-
-/// Derive a collection's 128-bit id from its type discriminator and canonical
-/// external key (e.g. `b"!room:server"`).
+/// Derive a collection's 128-bit **logical** id from its pool namespace
+/// discriminator and **canonical** id (the caller-defined external key, e.g.
+/// `b"!room:server"`).
 ///
-/// The result is a **router, not an identity**: it is a truncated digest, so two
-/// distinct keys can collide in 128 bits. A collection's genesis record stores
-/// the full `canonical_preimage`, and a reader verifies it before trusting the
+/// Naming: a `*_canonical_id` is the caller-defined external identity; a
+/// `*_logical_id` is the engine-derived, truncated routing hash. The result here
+/// is a **router, not an identity**: it is a truncated digest, so two distinct
+/// canonical ids can collide in 128 bits. The genesis record stores the full
+/// `collection_canonical_id`, and a reader recomputes this before trusting the
 /// id — a bare 128-bit id is never sufficient to resolve a collision.
+///
+/// `pool_dst` is an optional, template-opt-in domain-separation tag (4 bytes).
+/// When `Some`, it is mixed into the pre-image so the same canonical id in
+/// different namespaces (e.g. `!room` in the `EventDag` pool versus the State
+/// pool) derives different logical ids. When `None` the derivation is exactly
+/// `SHA(collection_canonical_id)` with no tag, so callers must not assume
+/// collection logical ids are globally unique across pools.
 ///
 /// # Panics
 /// Never in practice: a 16-byte prefix of a 32-byte digest always converts.
 #[must_use]
-pub fn derive_collection_id(collection_type: u16, canonical_key: &[u8]) -> [u8; 16] {
+pub fn derive_collection_id(pool_dst: Option<[u8; 4]>, collection_canonical_id: &[u8]) -> [u8; 16] {
     // Stream directly into the hasher — no temporary concatenation buffer on
     // this hot path.
     let mut hasher = DigestAlgorithm::Sha256.hasher();
-    hasher.update(COLLECTION_ID_DOMAIN);
-    hasher.update(&collection_type.to_be_bytes());
-    hasher.update(canonical_key);
+    if let Some(dst) = pool_dst {
+        hasher.update(&dst);
+    }
+    hasher.update(collection_canonical_id);
     hasher.finalize()[..16]
         .try_into()
         .expect("16-byte prefix of a 32-byte digest")
 }
 
-/// Domain separator for the collection genesis (establishment) frame's
-/// reserved node id.
-pub const GENESIS_SENTINEL_DOMAIN: &[u8] = b"mtxdb:sentinel:genesis_frame";
-
-/// The reserved node id under which a collection's genesis/establishment
-/// metadata frame is stored: `SHA-256(GENESIS_SENTINEL_DOMAIN)[..16]`.
+/// The reserved node id under which a collection's metadata (genesis) record
+/// is stored.
 ///
-/// Domain-separated from every user record id, so a real frame can never
-/// collide with it (asserted by a test).
-pub const GENESIS_FRAME_NODE_ID: [u8; 16] = [
-    0x79, 0xad, 0xa1, 0x33, 0x02, 0x69, 0x39, 0x76, 0xa1, 0x3f, 0x5c, 0xd9, 0x6c, 0xc2, 0x43, 0x22,
-];
-
-/// Current wire format of a [`CollectionMetadata`] genesis record.
-pub const COLLECTION_METADATA_FORMAT_V1: u16 = 1;
+/// Reserved by construction: it is the only frame ever written under this id,
+/// so it needs no derived-hash ceremony — a value we control is exactly as
+/// collision-safe as a hash of a reserved string.
+pub const COLLECTION_METADATA_RECORD_ID: [u8; 16] = *b"mtxdb:metadata\0\0";
 
 /// A collection's first-class, immutable definition, written once as its
-/// genesis/establishment record.
+/// metadata (genesis) record under [`COLLECTION_METADATA_RECORD_ID`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionMetadata {
-    /// Wire format version of this record.
-    pub format_version: u16,
-    /// The type discriminator used in [`derive_collection_id`].
-    pub collection_type: u16,
-    /// The full canonical external key — the derivation pre-image — retained so
-    /// a 128-bit collection-id collision can be detected and rejected.
-    pub canonical_preimage: Vec<u8>,
-    /// Record identity rule for frames in this collection.
-    pub record_identity: RecordIdentityRule,
+    // --- Identity pre-image (hashed into `collection_logical_id`) ---
+    /// Optional, template-opt-in domain-separation tag hashed into
+    /// `collection_logical_id` (see [`derive_collection_id`]). `None` means the
+    /// derivation is `SHA(collection_canonical_id)`.
+    pub pool_dst: Option<[u8; 4]>,
+    /// The collection's **canonical** id — the caller-defined external key
+    /// (e.g. `!room:server`), canonicalized. Retained so a reader can recompute
+    /// [`derive_collection_id`] and verify the logical id rather than trusting a
+    /// bare 128-bit routing hash.
+    pub collection_canonical_id: Vec<u8>,
+    // --- Descriptive (NOT hashed; safe to change/extend) ---
+    /// How frames in this collection calculate their `record_logical_id`.
+    pub record_id_rule: RecordIdentityRule,
     /// Source payload retention rule.
     pub payload: PayloadPolicy,
+    /// Optional, opaque application payload owned by the template/protocol
+    /// layer — for example a self-describing Matrix room blob
+    /// (`{"ext":"matrix.room","fmt":1,"room_version":"10",...}`). Core never
+    /// interprets it; it is written once with the genesis metadata and handed
+    /// back to the application on open, so a reader can learn protocol
+    /// configuration (room version, creator) from the header without seeking
+    /// to and parsing the establishment record.
+    pub extension: Option<Vec<u8>>,
+}
+
+/// `CollectionMetadata` TLV tags.
+const META_TAG_POOL_DST: u8 = 0x01;
+const META_TAG_COLLECTION_CANONICAL_ID: u8 = 0x02;
+const META_TAG_RECORD_ID_RULE: u8 = 0x03;
+const META_TAG_PAYLOAD: u8 = 0x04;
+const META_TAG_EXTENSION: u8 = 0x05;
+
+/// `RecordIdentityRule` nested tags.
+const IDENTITY_TAG_DIGEST_ALGORITHM: u8 = 0x01;
+const IDENTITY_TAG_POLICY: u8 = 0x02;
+
+/// [`FrameIdPolicy`] nested tags.
+const POLICY_TAG_POINTER: u8 = 0x01;
+const POLICY_TAG_PAYLOAD: u8 = 0x02;
+const POLICY_TAG_HEADER_DESCRIPTOR: u8 = 0x03;
+const POLICY_TAG_CANONICAL: u8 = 0x04;
+const POLICY_TAG_EXTERNAL: u8 = 0x05;
+
+/// [`FrameIdPolicy::Canonical`] nested tags.
+const CANONICAL_TAG_INCLUDE: u8 = 0x01;
+const CANONICAL_TAG_EXCLUDE_PREFIXES: u8 = 0x02;
+
+/// Append one `[tag:1][len:4 LE][value]` record.
+fn push_tlv(out: &mut Vec<u8>, tag: u8, value: &[u8]) {
+    out.push(tag);
+    out.extend_from_slice(
+        &u32::try_from(value.len())
+            .expect("collection-metadata field fits u32")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(value);
+}
+
+/// Encode a list of strings as repeated `[len:4 LE][utf8]`.
+fn encode_string_list(list: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in list {
+        out.extend_from_slice(
+            &u32::try_from(item.len())
+                .expect("string fits u32")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(item.as_bytes());
+    }
+    out
+}
+
+/// Cursor over a TLV block.
+struct TlvReader<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> TlvReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+
+    fn next(&mut self) -> Option<(u8, &'a [u8])> {
+        let tag = *self.bytes.get(self.cursor)?;
+        let len_start = self.cursor.checked_add(1)?;
+        let len_end = self.cursor.checked_add(5)?;
+        let len: [u8; 4] = self.bytes.get(len_start..len_end)?.try_into().ok()?;
+        let value_end = len_end.checked_add(u32::from_le_bytes(len) as usize)?;
+        let value = self.bytes.get(len_end..value_end)?;
+        self.cursor = value_end;
+        Some((tag, value))
+    }
+}
+
+/// Decode repeated `[len:4 LE][utf8]` into a string list.
+fn decode_string_list(mut bytes: &[u8]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let len: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+        let end = 4usize.checked_add(u32::from_le_bytes(len) as usize)?;
+        out.push(std::str::from_utf8(bytes.get(4..end)?).ok()?.to_owned());
+        bytes = bytes.get(end..)?;
+    }
+    Some(out)
+}
+
+fn encode_frame_id_policy(policy: &FrameIdPolicy) -> Vec<u8> {
+    let mut out = Vec::new();
+    match policy {
+        FrameIdPolicy::Pointer { pointer } => {
+            push_tlv(&mut out, POLICY_TAG_POINTER, pointer.as_bytes());
+        }
+        FrameIdPolicy::Payload => push_tlv(&mut out, POLICY_TAG_PAYLOAD, &[]),
+        FrameIdPolicy::HeaderDescriptor { fields } => {
+            push_tlv(
+                &mut out,
+                POLICY_TAG_HEADER_DESCRIPTOR,
+                &encode_string_list(fields),
+            );
+        }
+        FrameIdPolicy::Canonical {
+            include,
+            exclude_prefixes,
+        } => {
+            let mut inner = Vec::new();
+            push_tlv(
+                &mut inner,
+                CANONICAL_TAG_INCLUDE,
+                &encode_string_list(include),
+            );
+            push_tlv(
+                &mut inner,
+                CANONICAL_TAG_EXCLUDE_PREFIXES,
+                &encode_string_list(exclude_prefixes),
+            );
+            push_tlv(&mut out, POLICY_TAG_CANONICAL, &inner);
+        }
+        FrameIdPolicy::ExternalCanonicalIdToCrosscheck => {
+            push_tlv(&mut out, POLICY_TAG_EXTERNAL, &[]);
+        }
+    }
+    out
+}
+
+fn decode_frame_id_policy(bytes: &[u8]) -> Option<FrameIdPolicy> {
+    let (tag, value) = TlvReader::new(bytes).next()?;
+    Some(match tag {
+        POLICY_TAG_POINTER => FrameIdPolicy::Pointer {
+            pointer: std::str::from_utf8(value).ok()?.to_owned(),
+        },
+        POLICY_TAG_PAYLOAD => FrameIdPolicy::Payload,
+        POLICY_TAG_HEADER_DESCRIPTOR => FrameIdPolicy::HeaderDescriptor {
+            fields: decode_string_list(value)?,
+        },
+        POLICY_TAG_CANONICAL => {
+            let mut include = Vec::new();
+            let mut exclude_prefixes = Vec::new();
+            let mut reader = TlvReader::new(value);
+            while let Some((inner_tag, inner_value)) = reader.next() {
+                match inner_tag {
+                    CANONICAL_TAG_INCLUDE => include = decode_string_list(inner_value)?,
+                    CANONICAL_TAG_EXCLUDE_PREFIXES => {
+                        exclude_prefixes = decode_string_list(inner_value)?;
+                    }
+                    _ => {}
+                }
+            }
+            FrameIdPolicy::Canonical {
+                include,
+                exclude_prefixes,
+            }
+        }
+        POLICY_TAG_EXTERNAL => FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+        _ => return None,
+    })
+}
+
+fn encode_record_id_rule(rule: &RecordIdentityRule) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_tlv(
+        &mut out,
+        IDENTITY_TAG_DIGEST_ALGORITHM,
+        &[rule.digest_algorithm.id()],
+    );
+    push_tlv(
+        &mut out,
+        IDENTITY_TAG_POLICY,
+        &encode_frame_id_policy(&rule.policy),
+    );
+    out
+}
+
+fn decode_record_id_rule(bytes: &[u8]) -> Option<RecordIdentityRule> {
+    let mut rule = RecordIdentityRule {
+        policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+        digest_algorithm: DigestAlgorithm::Sha256,
+    };
+    let mut reader = TlvReader::new(bytes);
+    while let Some((tag, value)) = reader.next() {
+        match tag {
+            IDENTITY_TAG_DIGEST_ALGORITHM => {
+                rule.digest_algorithm = DigestAlgorithm::from_id(*value.first()?);
+            }
+            IDENTITY_TAG_POLICY => rule.policy = decode_frame_id_policy(value)?,
+            _ => {}
+        }
+    }
+    Some(rule)
+}
+
+fn encode_payload(payload: &PayloadPolicy) -> Vec<u8> {
+    match payload {
+        PayloadPolicy::Source => vec![0x00],
+        PayloadPolicy::Projection { include } => {
+            let mut out = vec![0x01];
+            out.extend_from_slice(&encode_string_list(include));
+            out
+        }
+    }
+}
+
+fn decode_payload(bytes: &[u8]) -> Option<PayloadPolicy> {
+    match bytes.split_first()? {
+        (0x00, _) => Some(PayloadPolicy::Source),
+        (0x01, rest) => Some(PayloadPolicy::Projection {
+            include: decode_string_list(rest)?,
+        }),
+        _ => None,
+    }
+}
+
+impl CollectionMetadata {
+    /// Encode this record as a TLV block.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(dst) = &self.pool_dst {
+            push_tlv(&mut out, META_TAG_POOL_DST, dst);
+        }
+        push_tlv(
+            &mut out,
+            META_TAG_COLLECTION_CANONICAL_ID,
+            &self.collection_canonical_id,
+        );
+        push_tlv(
+            &mut out,
+            META_TAG_RECORD_ID_RULE,
+            &encode_record_id_rule(&self.record_id_rule),
+        );
+        push_tlv(&mut out, META_TAG_PAYLOAD, &encode_payload(&self.payload));
+        if let Some(extension) = &self.extension {
+            push_tlv(&mut out, META_TAG_EXTENSION, extension);
+        }
+        out
+    }
+
+    /// Decode a TLV block. Unrecognized tags are ignored: this record is
+    /// write-once and never re-encoded, so there is nothing to preserve them
+    /// for.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut meta = Self {
+            pool_dst: None,
+            collection_canonical_id: Vec::new(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+        };
+        let mut reader = TlvReader::new(bytes);
+        while let Some((tag, value)) = reader.next() {
+            match tag {
+                META_TAG_POOL_DST => meta.pool_dst = Some(value.try_into().ok()?),
+                META_TAG_COLLECTION_CANONICAL_ID => meta.collection_canonical_id = value.to_vec(),
+                META_TAG_RECORD_ID_RULE => meta.record_id_rule = decode_record_id_rule(value)?,
+                META_TAG_PAYLOAD => meta.payload = decode_payload(value)?,
+                META_TAG_EXTENSION => meta.extension = Some(value.to_vec()),
+                _ => {}
+            }
+        }
+        Some(meta)
+    }
 }
 
 /// Generic identity rule for an application record.
@@ -179,10 +445,11 @@ pub struct RecordIdentityRule {
 pub struct CollectionKeyRule {
     /// RFC 6901 pointer to the source-level collection key.
     pub pointer: String,
-    /// Compact 2-byte type discriminator mixed into the collection-id
-    /// derivation. Replaces a duplicated type string; the value space is owned
-    /// by the protocol extension (e.g. `0x0001` for a Matrix room).
-    pub collection_type: u16,
+    /// Optional, template-opt-in 4-byte domain-separation tag mixed into the
+    /// collection-id derivation (see [`derive_collection_id`]). `None` derives
+    /// `SHA(collection_canonical_id)`; a Matrix room event collection opts in
+    /// with the `EventDag` pool's DST.
+    pub pool_dst: Option<[u8; 4]>,
     /// RFC 6901 pointer to the user-facing collection identifier.
     pub display_id_pointer: String,
 }
@@ -192,10 +459,9 @@ pub struct CollectionKeyRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EstablishmentRule {
     /// Application-defined selector for the establishment record, e.g. a
-    /// Matrix `m.room.create` event.
+    /// Matrix `m.room.create` event. A collection has exactly one
+    /// establishment; there is no optional or multi-record cardinality.
     pub selector: String,
-    /// Expected cardinality, e.g. `exactly-one`.
-    pub cardinality: String,
 }
 
 /// Format-neutral, executable description of a collection template.
@@ -210,7 +476,7 @@ pub struct CollectionTemplate {
     /// Application-defined collection kind; opaque to storage.
     pub collection_kind: String,
     /// Stable record identity and internal node-key derivation rule.
-    pub record_identity: RecordIdentityRule,
+    pub record_id_rule: RecordIdentityRule,
     /// Source payload retention rule.
     pub payload: PayloadPolicy,
     /// Collection membership and internal collection-key derivation rule.
@@ -232,7 +498,7 @@ mod tests {
         let template = CollectionTemplate {
             name: "documents".into(),
             collection_kind: "notebook".into(),
-            record_identity: RecordIdentityRule {
+            record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
                     pointer: "/uuid".into(),
                 },
@@ -241,7 +507,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/notebook".into(),
-                collection_type: 0x0001,
+                pool_dst: Some(POOL_DST_INTERNAL),
                 display_id_pointer: "/notebook".into(),
             },
             establishment: None,
@@ -337,29 +603,49 @@ mod tests {
     }
 
     #[test]
-    fn genesis_sentinel_matches_its_domain_hash() {
-        let mut hasher = DigestAlgorithm::Sha256.hasher();
-        hasher.update(GENESIS_SENTINEL_DOMAIN);
-        let digest = hasher.finalize();
-        assert_eq!(&GENESIS_FRAME_NODE_ID[..], &digest[..16]);
+    fn collection_id_is_deterministic_and_pool_separated() {
+        let room = b"!room:matrix.org";
+        let event_dag = Some(*b"EVNT");
+        let state = Some(*b"STAT");
+        assert_eq!(
+            derive_collection_id(event_dag, room),
+            derive_collection_id(event_dag, room)
+        );
+        // A different namespace tag yields a different id for the same key.
+        assert_ne!(
+            derive_collection_id(event_dag, room),
+            derive_collection_id(state, room)
+        );
+        // A different key yields a different id for the same tag.
+        assert_ne!(
+            derive_collection_id(event_dag, room),
+            derive_collection_id(event_dag, b"!other:matrix.org")
+        );
+        // No tag is a valid, deterministic derivation of its own.
+        assert_eq!(
+            derive_collection_id(None, room),
+            derive_collection_id(None, room)
+        );
+        assert_ne!(
+            derive_collection_id(None, room),
+            derive_collection_id(event_dag, room)
+        );
     }
 
     #[test]
-    fn collection_id_is_deterministic_and_type_separated() {
-        let room = b"!room:matrix.org";
-        assert_eq!(
-            derive_collection_id(0x0001, room),
-            derive_collection_id(0x0001, room)
-        );
-        // A different type discriminator yields a different id for the same key.
-        assert_ne!(
-            derive_collection_id(0x0001, room),
-            derive_collection_id(0x0002, room)
-        );
-        // A different key yields a different id for the same type.
-        assert_ne!(
-            derive_collection_id(0x0001, room),
-            derive_collection_id(0x0001, b"!other:matrix.org")
-        );
+    fn collection_metadata_round_trips_through_tlv() {
+        let meta = CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
+        };
+        assert_eq!(CollectionMetadata::decode(&meta.encode()).unwrap(), meta);
     }
 }

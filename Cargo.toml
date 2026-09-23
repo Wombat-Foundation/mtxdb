@@ -69,6 +69,25 @@ verbose_file_reads = "warn"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["zstd"]
+# Record-payload compression. On by default, so stores keep writing and reading
+# zstd frames; disable (with `default-features = false`) for builds that must
+# not carry zstd — e.g. size-tuned wasm, where the vendored C sources and the
+# `zstd-safe`/`zstd-sys` stack dominate the artifact. A build without it always
+# writes raw frames and refuses to read compressed ones.
+zstd = ["dep:zstd", "dep:zstd-sys"]
+
+# Cross-process write-ahead journal + read-committed overlay, for a
+# single-writer/multi-reader deployment where separate OS processes need to
+# read a live writer's committed-but-not-yet-checkpointed data (e.g. a
+# Synapse worker deployment). Off by default: a genuinely single-process
+# embedded deployment never needs this, and it costs real code (journal.rs,
+# the read-journal overlay, the refresh-on-miss read path) that a
+# single-process build shouldn't have to carry. See docs/TODO.txt's
+# "process model" entries for the deployment-shape reasoning.
+multi-reader = []
+
 [dependencies]
 arc-swap = "1"
 bytes = "1.5"
@@ -77,7 +96,7 @@ getrandom = { version = "0.2", features = ["std"] }
 memmap2 = "0.9.11"
 parking_lot = "0.12"
 sha2 = "0.10"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13", default-features = false, optional = true }
 
 # Native builds link the system libzstd via pkg-config (already installed
 # at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
@@ -85,7 +104,7 @@ zstd = { version = "0.13", default-features = false }
 # this reaches it by depending on `zstd-sys` directly at the same version
 # zstd-safe resolves to — Cargo unifies the two into one build.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-zstd-sys = { version = "2.1", features = ["pkg-config"] }
+zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
 
 # wasm targets have no libzstd to pkg-config against. `zstd-sys` ships a
 # "vendored" feature that forces its bundled C sources to be compiled from
@@ -93,7 +112,7 @@ zstd-sys = { version = "2.1", features = ["pkg-config"] }
 # enabled it) using its own `wasm-shim` — minimal libc stubs — so `cc`
 # can target wasm32 directly without a full WASI sysroot.
 [target.'cfg(target_family = "wasm")'.dependencies]
-zstd-sys = { version = "2.1", features = ["vendored"] }
+zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
 [lints]
 workspace = true

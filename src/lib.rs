@@ -25,6 +25,15 @@ pub mod frontier;
 /// Lossy, append-only index mapping content hashes to packfile locations.
 pub mod index;
 /// Checksummed append-only journal primitives for durable group commits.
+///
+/// This module itself stays always-on: the write-ahead journal
+/// (`enable_journal`/`replay_journal`) is a same-process durability/group-
+/// commit accelerator any embedded deployment can opt into. Only the
+/// cross-process *read-committed overlay* built on top of it — letting a
+/// separate OS process observe a live writer's committed-but-not-yet-
+/// checkpointed data — is gated behind the `multi-reader` feature; see
+/// `packfile::storage::read_journal` and Cargo.toml's `multi-reader` doc
+/// comment.
 pub mod journal;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
@@ -58,7 +67,5 @@ pub use storage::{
 pub use template::{
     derive_collection_id, frame_digest, CollectionKeyRule, CollectionMetadata, CollectionTemplate,
     EstablishmentRule, FrameIdInput, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
-    COLLECTION_ID_DOMAIN, COLLECTION_METADATA_FORMAT_V1, COLLECTION_TEMPLATE_FORMAT_V1,
-    COLLECTION_TYPE_APP_BASE, COLLECTION_TYPE_INTERNAL_BASE, COLLECTION_TYPE_PROTOCOL_BASE,
-    COLLECTION_TYPE_UNSET, GENESIS_FRAME_NODE_ID, GENESIS_SENTINEL_DOMAIN,
+    COLLECTION_METADATA_RECORD_ID, COLLECTION_TEMPLATE_FORMAT_V1, POOL_DST_INTERNAL,
 };

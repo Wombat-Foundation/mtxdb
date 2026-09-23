@@ -521,7 +521,38 @@ pub fn map_pack(file: &File) -> io::Result<memmap2::Mmap> {
 /// frames are small (<= [`MAX_RECORD_LEN`]) and written on the hot append
 /// path, so this favors write throughput over squeezing out the last few
 /// percent of ratio.
+#[cfg(feature = "zstd")]
 const ZSTD_LEVEL: i32 = 3;
+
+/// Compress `data` at [`ZSTD_LEVEL`], or `None` if the compressor errors (the
+/// caller then stores the frame raw). Only built with the `zstd` feature.
+#[cfg(feature = "zstd")]
+fn zstd_maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
+    zstd::bulk::compress(data, ZSTD_LEVEL).ok()
+}
+
+/// Decompress a frame's node bytes to exactly `expected_len` (the framed
+/// `uncompressed_len`, already range-checked by the caller). Shared by the
+/// buffered [`read_record`] path and the shard zero-copy decode path.
+#[cfg(feature = "zstd")]
+pub(crate) fn zstd_decompress(node_bytes: &[u8], expected_len: usize) -> io::Result<Vec<u8>> {
+    let decompressed = zstd::bulk::decompress(node_bytes, expected_len).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("zstd decompress failed: {e}"),
+        )
+    })?;
+    if decompressed.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "decompressed length {} != framed uncompressed_len {expected_len}",
+                decompressed.len()
+            ),
+        ));
+    }
+    Ok(decompressed)
+}
 
 /// Write a single record into the packfile, compressing its payload with
 /// zstd when doing so makes the frame smaller (falls back to storing it
@@ -606,9 +637,15 @@ pub(crate) fn encode_record_with_options(
         ));
     }
 
+    #[cfg(feature = "zstd")]
     let compressed = compress
-        .then(|| zstd::bulk::compress(&record.data, ZSTD_LEVEL).ok())
+        .then(|| zstd_maybe_compress(&record.data))
         .flatten();
+    #[cfg(not(feature = "zstd"))]
+    let compressed: Option<Vec<u8>> = {
+        let _ = compress;
+        None
+    };
     let (base_flags, node_bytes): (u8, &[u8]) = match &compressed {
         Some(c) if c.len() < record.data.len() => (FLAG_COMPRESSED, c.as_slice()),
         _ => (0, &record.data),
@@ -753,26 +790,20 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
                 format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
             ));
         }
-        let decompressed = zstd::bulk::decompress(
-            node_bytes,
-            usize::try_from(uncompressed_len).expect("checked above"),
-        )
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("zstd decompress failed: {e}"),
-            )
-        })?;
-        if decompressed.len() != usize::try_from(uncompressed_len).expect("checked above") {
+        #[cfg(feature = "zstd")]
+        {
+            Bytes::from(zstd_decompress(
+                node_bytes,
+                usize::try_from(uncompressed_len).expect("checked above"),
+            )?)
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "decompressed length {} != framed uncompressed_len {uncompressed_len}",
-                    decompressed.len()
-                ),
+                "frame is zstd-compressed but this build was compiled without the `zstd` feature",
             ));
         }
-        Bytes::from(decompressed)
     } else {
         if usize::try_from(uncompressed_len).expect("u32 always fits in usize") != node_bytes.len()
         {
@@ -1549,6 +1580,7 @@ mod tests {
 
     /// Highly-compressible, well-above-threshold data should be stored
     /// with the compressed flag set and round-trip exactly.
+    #[cfg(feature = "zstd")]
     #[test]
     fn test_write_read_roundtrip_compressed() {
         let data = vec![0x42u8; 8192];
@@ -1713,8 +1745,29 @@ mod tests {
         assert!(err.to_string().contains("CRC mismatch"));
     }
 
+    /// Without the `zstd` feature, a frame flagged compressed must be rejected
+    /// with a clear error rather than silently misread as raw.
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn test_compressed_frame_rejected_without_zstd_feature() {
+        let record = test_record_raw([0xaa; 16], b"payload");
+        // Raw, checksum-less frame; flip the compressed flag on (the flags
+        // byte sits right after the u32 frame length). Checksum off so the
+        // flag flip doesn't trip the CRC check first.
+        let mut buf = encode_record_with_options(&record, false, false).unwrap();
+        buf[4] |= FLAG_COMPRESSED;
+
+        let mut cursor = Cursor::new(&buf);
+        let err = read_record(&mut cursor).unwrap_err();
+        assert!(
+            err.to_string().contains("without the `zstd` feature"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Data that doesn't shrink under zstd (tiny/incompressible) must fall
     /// back to being stored raw, not expanded on disk.
+    #[cfg(feature = "zstd")]
     #[test]
     fn test_write_record_falls_back_to_raw_when_incompressible() {
         let record = test_record_raw([0xaa; 16], b"hi");

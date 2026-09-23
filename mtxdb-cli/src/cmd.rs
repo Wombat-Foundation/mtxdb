@@ -5,16 +5,15 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use sha2::{Digest, Sha256};
 
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{
-    derive_collection_id, frame_digest, CollectionKeyRule, CollectionTemplate, DatabaseLayout,
-    DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, PackfileStorage,
-    PayloadPolicy, RecordIdentityRule, ShardType, COLLECTION_TYPE_PROTOCOL_BASE,
+    derive_collection_id, frame_digest, CollectionKeyRule, CollectionMetadata, CollectionTemplate,
+    DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy,
+    MatrixRoomVersion, PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -136,14 +135,17 @@ fn fmt_disk_megabytes(bytes: u64) -> String {
     format!("{whole}.{fraction:03} MB")
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().fold(
-        String::with_capacity(bytes.len().saturating_mul(2)),
-        |mut s, b| {
-            let _ = write!(s, "{b:02X}");
-            s
-        },
-    )
+/// Render a logical id (collection, node, or record) in the CLI's canonical
+/// form: `0x` followed by uppercase hex. Every id the CLI prints uses this form,
+/// and every id selector it accepts must be written in this form — there is no
+/// bare-hex shorthand.
+fn format_id(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2usize.saturating_add(bytes.len().saturating_mul(2)));
+    s.push_str("0x");
+    for b in bytes {
+        let _ = write!(s, "{b:02X}");
+    }
+    s
 }
 
 /// Ask the user to explicitly approve a destructive operation.
@@ -288,13 +290,18 @@ fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_collection_id(hex: &str) -> anyhow::Result<[u8; 16]> {
-    let hex = hex
+fn parse_collection_id(value: &str) -> anyhow::Result<[u8; 16]> {
+    let hex = value
         .strip_prefix("0x")
-        .or_else(|| hex.strip_prefix("0X"))
-        .unwrap_or(hex);
+        .or_else(|| value.strip_prefix("0X"))
+        .with_context(|| {
+            format!("collection ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
+        })?;
     if hex.len() != 32 {
-        bail!("collection ID must be 32 hex characters, got {}", hex.len());
+        bail!(
+            "collection ID must be 32 hex characters after `0x`, got {}",
+            hex.len()
+        );
     }
     let bytes = hex::decode(hex).context("invalid hex in collection ID")?;
     let mut id = [0u8; 16];
@@ -302,13 +309,18 @@ fn parse_collection_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
-    let hex = hex
+fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
+    let hex = value
         .strip_prefix("0x")
-        .or_else(|| hex.strip_prefix("0X"))
-        .unwrap_or(hex);
+        .or_else(|| value.strip_prefix("0X"))
+        .with_context(|| {
+            format!("node ID `{value}` must be 0x-prefixed (32 hex digits, e.g. `0x0123…`)")
+        })?;
     if hex.len() != 32 {
-        bail!("node ID must be 32 hex characters, got {}", hex.len());
+        bail!(
+            "node ID must be 32 hex characters after `0x`, got {}",
+            hex.len()
+        );
     }
     let bytes = hex::decode(hex).context("invalid hex in node ID")?;
     let mut id = [0u8; 16];
@@ -316,8 +328,10 @@ fn parse_node_id(hex: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-/// Resolve either the fixed-width storage key or a Matrix event ID. `$id`
-/// is hashed exactly the way Synapse's embedded mirror derives it (see
+/// Resolve a node selector: a `0x`-prefixed logical ID (the engine's
+/// template-independent form), or a Matrix event ID carrying the Matrix
+/// profile's event sigil `$` — a *template* property, not an engine constant.
+/// `$id` is hashed exactly the way Synapse's embedded mirror derives it (see
 /// `synapse_event_node_id`), since the point of this sigil is finding data
 /// Synapse itself wrote — not CLI-imported data, which uses the import
 /// template's own (SHA-256) identity rule instead (`matrix_event_node_id`).
@@ -333,10 +347,23 @@ fn parse_get_id(id: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
     }
 }
 
-/// Collection type discriminator for Matrix room collections, mixed into
-/// [`derive_collection_id`]. Matrix is a protocol extension, so it draws from
-/// the protocol-owned range rather than a core-internal value.
-const MATRIX_ROOM_COLLECTION_TYPE: u16 = COLLECTION_TYPE_PROTOCOL_BASE;
+/// Pool namespace discriminator for Matrix room collections, mixed into
+/// [`derive_collection_id`]. Matrix room events live in the `EventDag` pool, so
+/// they use that pool's DST.
+const MATRIX_ROOM_POOL_DST: Option<[u8; 4]> = Some(ShardType::EventDag.pool_dst());
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    mtxdb::content_digest(DigestAlgorithm::Sha256, data)
+}
+
+fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let length = parts.iter().map(|part| part.len()).sum();
+    let mut input = Vec::with_capacity(length);
+    for part in parts {
+        input.extend_from_slice(part);
+    }
+    sha256(&input)
+}
 
 /// The Matrix import template's accepted identity algorithm: SHA-256 truncated
 /// to the 128-bit node ID used by the packfile index. Repack edge extraction,
@@ -351,12 +378,12 @@ fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
 /// `SHA-256("event_json:event:" + namespace + "\0" + event_id)`. `$id`
 /// lookups only find anything if this derivation is identical to Synapse's.
 fn synapse_event_node_id(namespace: &str, event_id: &str) -> [u8; 16] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"event_json:event:");
-    hasher.update(namespace.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(event_id.as_bytes());
-    let hash = hasher.finalize();
+    let hash = sha256_parts(&[
+        b"event_json:event:",
+        namespace.as_bytes(),
+        b"\0",
+        event_id.as_bytes(),
+    ]);
     let mut id = [0u8; 16];
     id.copy_from_slice(&hash[..16]);
     id
@@ -366,20 +393,22 @@ fn synapse_event_node_id(namespace: &str, event_id: &str) -> [u8; 16] {
 /// the room-scoped `EventDag` collection ID that `!room_id` resolves to. The
 /// first 16 bytes of `SHA-256("event_json:dag:" + namespace + "\0" + room_id)`.
 fn matrix_room_collection_id(namespace: &str, room_id: &str) -> [u8; 16] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"event_json:dag:");
-    hasher.update(namespace.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(room_id.as_bytes());
-    let hash = hasher.finalize();
+    let hash = sha256_parts(&[
+        b"event_json:dag:",
+        namespace.as_bytes(),
+        b"\0",
+        room_id.as_bytes(),
+    ]);
     let mut id = [0u8; 16];
     id.copy_from_slice(&hash[..16]);
     id
 }
 
-/// Resolve either the fixed-width collection ID or a `!room_id`, the latter
+/// Resolve a collection selector: a `0x`-prefixed logical ID (the engine's
+/// template-independent form), or a canonical ID carrying the Matrix profile's
+/// room sigil `!` — a *template* property, not an engine constant — which is
 /// hashed the same way Synapse's embedded mirror derives a room's `EventDag`
-/// collection (see `matrix_room_collection_id`).
+/// collection (see `matrix_room_collection_id`). Bare hex is rejected.
 fn parse_collection_selector(selector: &str, namespace: Option<&str>) -> anyhow::Result<[u8; 16]> {
     if let Some(room_id) = selector.strip_prefix('!') {
         let namespace = namespace.context(
@@ -518,8 +547,8 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     let node_data = NodeData::new(bytes::Bytes::from(data.as_bytes().to_vec()));
     store.put(&collection_id, &node_id, &node_data)?;
     store.sync()?;
-    let collection_hex = hex_encode(&collection_id);
-    let id_hex = hex_encode(&node_id);
+    let collection_hex = format_id(&collection_id);
+    let id_hex = format_id(&node_id);
     eprintln!(
         "put {id_hex} into collection {collection_hex} ({} bytes)",
         data.len()
@@ -597,7 +626,7 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
                         format!(
                             "-t {} collection {}",
                             shard_type.as_str(),
-                            hex_encode(col_id)
+                            format_id(col_id)
                         )
                     })
                     .collect::<Vec<_>>()
@@ -617,7 +646,7 @@ fn cmd_get(cli: &Cli, collection: Option<&str>, id: &str, raw: bool) -> anyhow::
                 "node ID {id} is present in multiple collections ({}); specify --collection",
                 matches
                     .iter()
-                    .map(|(collection_id, _)| hex_encode(collection_id))
+                    .map(|(collection_id, _)| format_id(collection_id))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -784,9 +813,7 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     let room_id = core::str::from_utf8(bytes.get(room_id_start..root_hash_start)?).ok()?;
     let room_prefix = bytes.get(prefix_start..room_id_len_offset)?;
     let root_hash = bytes.get(root_hash_start..lattice_start)?;
-    let mut lattice_hasher = Sha256::new();
-    lattice_hasher.update(bytes.get(lattice_start..end)?);
-    let lattice_digest = lattice_hasher.finalize();
+    let lattice_digest = sha256(bytes.get(lattice_start..end)?);
 
     let mut out = Vec::new();
     writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
@@ -1201,7 +1228,7 @@ fn cmd_collections_in_dir(
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
     for (i, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
-        let hex = hex_encode(collection_id);
+        let hex = format_id(collection_id);
         let load = fmt_load_percent(*nodes, *capacity);
         let shards = collection_shards
             .as_ref()
@@ -2078,9 +2105,10 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// `info` accepts a collection selector (slot index or 32-hex collection ID)
-/// or a pack selector (`0x`-prefixed, 1–16 hex digits, as printed by
-/// `mtxdb shards`). Dispatch on the hex length the same way `scan` does.
+/// `info` accepts a collection selector (slot index, a canonical sigil, or a
+/// `0x`-prefixed 32-hex logical ID) or a pack selector (`0x`-prefixed, 1–16 hex
+/// digits, as printed by `mtxdb shards`). Dispatch on the hex length the same
+/// way `scan` does; bare hex is not accepted.
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     if selector
         .strip_prefix("0x")
@@ -2238,7 +2266,7 @@ fn print_pack_info(
                     };
                     println!(
                         "{:>34}  {:>10}  {}",
-                        hex_encode(&collection_id),
+                        format_id(&collection_id),
                         fmt_bytes(bytes),
                         note
                     );
@@ -2301,35 +2329,23 @@ fn print_collection_info(
     capacity: u32,
     shards: &[u64],
 ) {
-    let hex = hex_encode(collection_id);
+    let hex = format_id(collection_id);
     println!(
         "collection {hex}: {len} nodes, {} index ({})",
         fmt_megabytes(mem),
         fmt_load_factor(len, capacity)
     );
     print_collection_shards(shards);
-    if let Some(details) = matrix_room_details_from_cache(dir, collection_id) {
-        print_matrix_room_details(details, None);
-    } else {
-        println!(
-            "  {:<12} scanning {} shard{}...",
-            "metadata:",
-            shards.len(),
-            if shards.len() == 1 { "" } else { "s" }
-        );
-        let details =
-            matrix_room_details_from_shards(dir, collection_id, shards).unwrap_or_else(|error| {
-                eprintln!("warning: unable to inspect Matrix room metadata: {error}");
-                MatrixRoomDetails::default()
-            });
-        if let Err(error) = persist_matrix_room_details(dir, collection_id, &details) {
-            eprintln!("warning: unable to cache Matrix room metadata: {error}");
-        }
-        print_matrix_room_details(details, Some(shards.len()));
+    match PackfileStorage::open_read_only(dir.to_path_buf())
+        .ok()
+        .and_then(|store| matrix_room_extension_from_store(&store, collection_id))
+    {
+        Some(extension) => print_matrix_room_extension(&extension),
+        None => println!("  {:<12} not found", "create:"),
     }
 }
 
-fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result<bool> {
+fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> bool {
     if let (Some(summaries), Some(collection_shards)) = (
         PackfileStorage::collection_summaries_from_disk(dir),
         PackfileStorage::collection_shards_from_disk(dir),
@@ -2343,16 +2359,16 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Re
                 .cloned()
                 .unwrap_or_default();
             print_collection_info(dir, collection_id, len, mem, capacity, &shards);
-            return Ok(true);
+            return true;
         }
-        return Ok(false);
+        return false;
     }
 
     let Ok(store) = PackfileStorage::open_read_only(dir.to_path_buf()) else {
-        return Ok(false);
+        return false;
     };
     if let Some((len, mem, capacity)) = store.collection_index_info(collection_id) {
-        let hex = hex_encode(collection_id);
+        let hex = format_id(collection_id);
         println!(
             "collection {hex}: {len} nodes, {} index ({})",
             fmt_megabytes(mem),
@@ -2360,10 +2376,13 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Re
         );
         let shards = store.collection_referenced_pack_ids(collection_id);
         print_collection_shards(&shards);
-        print_matrix_room_details(matrix_room_details(&store, dir, collection_id)?, None);
-        return Ok(true);
+        match matrix_room_extension_from_store(&store, collection_id) {
+            Some(extension) => print_matrix_room_extension(&extension),
+            None => println!("  {:<12} not found", "create:"),
+        }
+        return true;
     }
-    Ok(false)
+    false
 }
 
 fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
@@ -2398,13 +2417,13 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
                     println!();
                 }
                 print_section_header(shard_type);
-                inspect_collection_in_dir(&dir, &collection_id)?;
+                inspect_collection_in_dir(&dir, &collection_id);
                 matched_any = true;
             }
         }
         if !matched_any {
             let display = match parse_collection_selector(collection, cli.namespace.as_deref()) {
-                Ok(id) => hex_encode(&id),
+                Ok(id) => format_id(&id),
                 Err(_) => collection.to_owned(),
             };
             eprintln!("collection {display}: not found");
@@ -2422,10 +2441,10 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
         }
         Err(_) => parse_collection_selector(collection, cli.namespace.as_deref())?,
     };
-    let hex = hex_encode(&collection_id);
+    let hex = format_id(&collection_id);
     let dir = selected_pool_dir(cli)?;
 
-    if inspect_collection_in_dir(&dir, &collection_id)? {
+    if inspect_collection_in_dir(&dir, &collection_id) {
         return Ok(());
     }
 
@@ -2436,265 +2455,135 @@ fn cmd_info_collection(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Default)]
-struct MatrixRoomDetails {
-    matrix_room_id: Option<String>,
-    create: Option<String>,
+/// Structured Matrix room configuration carried in a collection's
+/// [`CollectionMetadata::extension`] blob.
+///
+/// The blob is self-describing so a reader can learn the room version (which
+/// selects the redaction and reference-hash rules) from the header alone,
+/// without seeking to and parsing the establishment record. Core never
+/// interprets it; it is handed back to the CLI on open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MatrixRoomExtension {
+    room_id: Option<String>,
+    create_event_id: Option<String>,
+    room_version: Option<String>,
+    creator: Option<String>,
 }
 
-const MATRIX_ROOM_DETAILS_MAGIC: &[u8; 4] = b"MMRM";
-const MATRIX_ROOM_DETAILS_VERSION: u8 = 1;
-const MATRIX_ROOM_DETAILS_HEADER_LEN: usize = 4 + 1;
-const MATRIX_ROOM_DETAILS_RECORD_HEADER_LEN: usize = 16 + 2 + 2;
+const MATRIX_ROOM_EXT: &str = "matrix.room";
+const MATRIX_ROOM_EXT_FMT: u32 = 1;
 
-fn matrix_room_details_path(dir: &Path) -> PathBuf {
-    dir.join("matrix_room_details.bin")
-}
-
-/// Load one cached Matrix description. This cache is only presentation
-/// metadata; packfiles and the shard→collection directory remain authoritative.
-fn matrix_room_details_from_cache(
-    dir: &Path,
-    collection_id: &[u8; 16],
-) -> Option<MatrixRoomDetails> {
-    let buf = fs::read(matrix_room_details_path(dir)).ok()?;
-    if buf.len() < MATRIX_ROOM_DETAILS_HEADER_LEN
-        || &buf[0..4] != MATRIX_ROOM_DETAILS_MAGIC
-        || buf[4] != MATRIX_ROOM_DETAILS_VERSION
-    {
-        return None;
-    }
-    let mut offset = MATRIX_ROOM_DETAILS_HEADER_LEN;
-    while offset < buf.len() {
-        let header_end = offset.checked_add(MATRIX_ROOM_DETAILS_RECORD_HEADER_LEN)?;
-        let header = buf.get(offset..header_end)?;
-        let matrix_len = usize::from(u16::from_le_bytes(header[16..18].try_into().ok()?));
-        let create_len = usize::from(u16::from_le_bytes(header[18..20].try_into().ok()?));
-        let data_len = matrix_len.checked_add(create_len)?;
-        let data_end = header_end.checked_add(data_len)?;
-        let data = buf.get(header_end..data_end)?;
-        if &header[0..16] == collection_id {
-            let matrix_room_id = std::str::from_utf8(&data[..matrix_len])
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            let create = std::str::from_utf8(&data[matrix_len..])
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            return Some(MatrixRoomDetails {
-                matrix_room_id,
-                create,
-            });
+impl MatrixRoomExtension {
+    /// Read the extension out of an import batch. The caller already knows the
+    /// batch establishes the room, so no disk access is needed.
+    fn from_events(events: &[OwnedValue]) -> Self {
+        let mut extension = Self::default();
+        for event in events {
+            if extension.room_id.is_none() {
+                extension.room_id = event_room_id(event).map(str::to_owned);
+            }
+            if extension.create_event_id.is_none() {
+                if let Some(create_event_id) = matrix_create_event_id(event) {
+                    extension.create_event_id = Some(create_event_id.to_owned());
+                    extension.creator =
+                        nested_event_string_field(event, "content", "creator").map(str::to_owned);
+                    extension.room_version =
+                        nested_event_string_field(event, "content", "room_version")
+                            .map(str::to_owned);
+                }
+            }
+            if extension.room_id.is_some() && extension.create_event_id.is_some() {
+                break;
+            }
         }
-        offset = data_end;
+        extension
     }
-    None
+
+    /// Serialize the self-describing JSON blob stored in
+    /// [`CollectionMetadata::extension`].
+    fn encode_blob(&self) -> Vec<u8> {
+        use simd_json::prelude::Writable;
+        let mut fields = vec![
+            format!(
+                "\"ext\":{}",
+                simd_json::OwnedValue::from(MATRIX_ROOM_EXT).encode()
+            ),
+            format!("\"fmt\":{MATRIX_ROOM_EXT_FMT}"),
+        ];
+        for (key, value) in [
+            ("room_id", &self.room_id),
+            ("create_event_id", &self.create_event_id),
+            ("room_version", &self.room_version),
+            ("creator", &self.creator),
+        ] {
+            if let Some(value) = value {
+                fields.push(format!(
+                    "\"{key}\":{}",
+                    simd_json::OwnedValue::from(value.as_str()).encode()
+                ));
+            }
+        }
+        format!("{{{}}}", fields.join(",")).into_bytes()
+    }
+
+    fn decode_blob(blob: &[u8]) -> Option<Self> {
+        let mut bytes = blob.to_vec();
+        let value = simd_json::to_owned_value(&mut bytes).ok()?;
+        if event_string_field(&value, "ext") != Some(MATRIX_ROOM_EXT) {
+            return None;
+        }
+        Some(Self {
+            room_id: event_string_field(&value, "room_id").map(str::to_owned),
+            create_event_id: event_string_field(&value, "create_event_id").map(str::to_owned),
+            room_version: event_string_field(&value, "room_version").map(str::to_owned),
+            creator: event_string_field(&value, "creator").map(str::to_owned),
+        })
+    }
 }
 
-/// Atomically update the optional CLI metadata cache. It saves subsequent
-/// `info` calls from decoding arbitrary event payloads in large shards.
-fn persist_matrix_room_details(
-    dir: &Path,
-    collection_id: &[u8; 16],
-    details: &MatrixRoomDetails,
-) -> io::Result<()> {
-    if details.matrix_room_id.is_none() && details.create.is_none() {
-        return Ok(());
-    }
-    let mut entries = read_all_matrix_room_details(dir);
-    entries.insert(*collection_id, details.clone());
-
-    let mut buf = Vec::new();
-    buf.extend_from_slice(MATRIX_ROOM_DETAILS_MAGIC);
-    buf.push(MATRIX_ROOM_DETAILS_VERSION);
-    let mut entries: Vec<_> = entries.into_iter().collect();
-    entries.sort_unstable_by_key(|(collection_id, _)| *collection_id);
-    for (collection_id, details) in entries {
-        let matrix_room_id = details.matrix_room_id.clone().unwrap_or_default();
-        let create = details.create.unwrap_or_default();
-        let matrix_len = u16::try_from(matrix_room_id.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Matrix room ID exceeds cache limit",
-            )
-        })?;
-        let create_len = u16::try_from(create.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "create metadata exceeds cache limit",
-            )
-        })?;
-        buf.extend_from_slice(&collection_id);
-        buf.extend_from_slice(&matrix_len.to_le_bytes());
-        buf.extend_from_slice(&create_len.to_le_bytes());
-        buf.extend_from_slice(matrix_room_id.as_bytes());
-        buf.extend_from_slice(create.as_bytes());
-    }
-    let path = matrix_room_details_path(dir);
-    let tmp_path = path.with_extension(format!("bin.tmp.{}", std::process::id()));
-    fs::write(&tmp_path, buf)?;
-    fs::rename(tmp_path, path)
-}
-
-fn read_all_matrix_room_details(
-    dir: &Path,
-) -> std::collections::HashMap<[u8; 16], MatrixRoomDetails> {
-    let mut entries = std::collections::HashMap::new();
-    let Ok(buf) = fs::read(matrix_room_details_path(dir)) else {
-        return entries;
-    };
-    if buf.len() < MATRIX_ROOM_DETAILS_HEADER_LEN
-        || &buf[0..4] != MATRIX_ROOM_DETAILS_MAGIC
-        || buf[4] != MATRIX_ROOM_DETAILS_VERSION
-    {
-        return entries;
-    }
-    let mut offset = MATRIX_ROOM_DETAILS_HEADER_LEN;
-    while let Some(header_end) = offset.checked_add(MATRIX_ROOM_DETAILS_RECORD_HEADER_LEN) {
-        let Some(header) = buf.get(offset..header_end) else {
-            break;
-        };
-        let Ok(matrix_len) = <[u8; 2]>::try_from(&header[16..18]) else {
-            break;
-        };
-        let Ok(create_len) = <[u8; 2]>::try_from(&header[18..20]) else {
-            break;
-        };
-        let data_len = usize::from(u16::from_le_bytes(matrix_len))
-            .checked_add(usize::from(u16::from_le_bytes(create_len)));
-        let Some(data_end) = data_len.and_then(|length| header_end.checked_add(length)) else {
-            break;
-        };
-        let Some(data) = buf.get(header_end..data_end) else {
-            break;
-        };
-        let Ok(matrix_room_id) =
-            std::str::from_utf8(&data[..usize::from(u16::from_le_bytes(matrix_len))])
-        else {
-            break;
-        };
-        let Ok(create) = std::str::from_utf8(&data[usize::from(u16::from_le_bytes(matrix_len))..])
-        else {
-            break;
-        };
-        let mut collection_id = [0u8; 16];
-        collection_id.copy_from_slice(&header[0..16]);
-        entries.insert(
-            collection_id,
-            MatrixRoomDetails {
-                matrix_room_id: (!matrix_room_id.is_empty()).then(|| matrix_room_id.to_owned()),
-                create: (!create.is_empty()).then(|| create.to_owned()),
-            },
-        );
-        offset = data_end;
-    }
-    entries
-}
-
-/// Find the human-facing Matrix metadata carried by live JSON events. Pack
-/// scans can contain superseded frames, so every candidate is resolved through
-/// the collection's live index before being inspected.
-fn matrix_room_details(
+/// The Matrix room extension recorded on disk, if any.
+fn matrix_room_extension_from_store(
     store: &PackfileStorage,
-    dir: &Path,
     collection_id: &[u8; 16],
-) -> anyhow::Result<MatrixRoomDetails> {
-    let mut details = MatrixRoomDetails::default();
-    let mut seen = std::collections::HashSet::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if !path
-            .extension()
-            .is_some_and(|extension| extension == "pack")
-        {
-            continue;
-        }
-        for (record_collection_id, node_id, _) in mtxdb::packfile::scan_packfile(&path)? {
-            if &record_collection_id != collection_id || !seen.insert(node_id) {
-                continue;
-            }
-            let Some(data) = store.get(collection_id, &node_id)? else {
-                continue;
-            };
-            let mut bytes = data.bytes.to_vec();
-            let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
-                continue;
-            };
-            if details.matrix_room_id.is_none() {
-                details.matrix_room_id = event_room_id(&event).map(str::to_owned);
-            }
-            if details.create.is_none() {
-                details.create = matrix_create_details(&event);
-            }
-            if details.matrix_room_id.is_some() && details.create.is_some() {
-                return Ok(details);
-            }
-        }
-    }
-    Ok(details)
+) -> Option<MatrixRoomExtension> {
+    let metadata = store
+        .get_collection_metadata(collection_id)
+        .ok()
+        .flatten()?;
+    MatrixRoomExtension::decode_blob(metadata.extension.as_deref()?)
 }
 
-/// Read Matrix metadata from only the shards containing `collection_id`. This is
-/// deliberately streaming: common Matrix room IDs and create events occur
-/// near the beginning of topology-ordered data, so `info` can stop as soon
-/// as both fields are found rather than scanning unrelated shards or loading
-/// a full store index.
-fn matrix_room_details_from_shards(
-    dir: &Path,
-    collection_id: &[u8; 16],
-    pack_ids: &[u64],
-) -> anyhow::Result<MatrixRoomDetails> {
-    let pool = ShardPool::open_read_only(dir.into()).context("failed to open shard store")?;
-    let mut details = MatrixRoomDetails::default();
-    for &pack_id in pack_ids {
-        let Some(shard) = pool
-            .all_shards()
-            .into_iter()
-            .find(|(_, s)| s.pack_id == pack_id)
-            .map(|(_, s)| s)
-        else {
-            continue;
-        };
-        let file = fs::File::open(&shard.path)?;
-        let mut reader = BufReader::new(file);
-        if mtxdb::packfile::read_header(&mut reader)?.is_none() {
-            continue;
-        }
-        loop {
-            let record = match mtxdb::packfile::read_record(&mut reader) {
-                Ok(Some(record)) => record,
-                Ok(None) => break,
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error.into()),
-            };
-            if &record.collection_id != collection_id {
-                continue;
-            }
-            update_matrix_room_details(&mut details, &record.data);
-            if details.matrix_room_id.is_some() && details.create.is_some() {
-                return Ok(details);
-            }
-        }
-    }
-    Ok(details)
+/// Build the genesis metadata record for a just-established Matrix room.
+fn collection_metadata_for(
+    template: &CollectionTemplate,
+    extension: &MatrixRoomExtension,
+) -> Option<CollectionMetadata> {
+    let room_id = extension.room_id.as_ref()?;
+    Some(CollectionMetadata {
+        pool_dst: template.collection_key.pool_dst,
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: template.record_id_rule.clone(),
+        payload: template.payload.clone(),
+        extension: Some(extension.encode_blob()),
+    })
 }
 
-fn print_matrix_room_details(details: MatrixRoomDetails, scanned_shards: Option<usize>) {
-    if let Some(matrix_room_id) = details.matrix_room_id {
-        println!("  {:<12} {matrix_room_id}", "Matrix room:");
+fn print_matrix_room_extension(extension: &MatrixRoomExtension) {
+    if let Some(room_id) = &extension.room_id {
+        println!("  {:<12} {room_id}", "Matrix room:");
     }
-    if let Some(create) = details.create {
-        println!("  {:<12} {create}", "create:");
-    } else if let Some(shard_count) = scanned_shards {
-        println!(
-            "  {:<12} not found (scanned all {shard_count} shard{})",
-            "create:",
-            if shard_count == 1 { "" } else { "s" }
-        );
-    } else {
+    let Some(create_event_id) = &extension.create_event_id else {
         println!("  {:<12} not found", "create:");
+        return;
+    };
+    let mut create = create_event_id.clone();
+    if let Some(creator) = &extension.creator {
+        let _ = write!(create, "; creator {creator}");
     }
+    if let Some(room_version) = &extension.room_version {
+        let _ = write!(create, "; room version {room_version}");
+    }
+    println!("  {:<12} {create}", "create:");
 }
 
 fn print_collection_shards(shards: &[u64]) {
@@ -2710,19 +2599,6 @@ fn print_collection_shards(shards: &[u64]) {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-    }
-}
-
-fn update_matrix_room_details(details: &mut MatrixRoomDetails, data: &[u8]) {
-    let mut bytes = data.to_vec();
-    let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
-        return;
-    };
-    if details.matrix_room_id.is_none() {
-        details.matrix_room_id = event_room_id(&event).map(str::to_owned);
-    }
-    if details.create.is_none() {
-        details.create = matrix_create_details(&event);
     }
 }
 
@@ -2818,11 +2694,10 @@ fn cmd_scan(
         reverse,
     };
     // Mirror `cmd_info`'s routing exactly: a selector is a pack ID only when
-    // it's `0x`-prefixed with something other than 32 hex digits after it —
-    // everything else (bare 32 hex digits, or `0x` + 32 hex digits) is a
-    // collection ID. `info` and `scan` used to disagree here (`scan`
-    // required the `0x` prefix on a collection ID; `info` didn't), which
-    // made the same selector work for one command and not the other.
+    // it's `0x`-prefixed with something other than 32 hex digits after it;
+    // `0x` + 32 hex digits is a logical collection ID. Bare hex is rejected
+    // downstream. `info` and `scan` share this rule so the same selector works
+    // for both.
     let looks_like_pack_id = selector
         .strip_prefix("0x")
         .or_else(|| selector.strip_prefix("0X"))
@@ -2960,8 +2835,8 @@ fn scan_pack(
     }
     print_scan_table_header("COLLECTION", scan_payload_label(shard_type));
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
-        let collection_hex = hex_encode(collection_id);
-        let id_hex = hex_encode(node_id);
+        let collection_hex = format_id(collection_id);
+        let id_hex = format_id(node_id);
         let data = opts
             .verbose
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
@@ -3097,7 +2972,7 @@ fn cmd_scan_collection_in_pool(
             if opts.verbose {
                 eprintln!(
                     "collection {}: raw frame @ {offset} ({} bytes, checksum verified)",
-                    hex_encode(&collection_id),
+                    format_id(&collection_id),
                     data.data.len()
                 );
             }
@@ -3122,13 +2997,13 @@ fn cmd_scan_collection_in_pool(
         if bounded && frames >= max_rows {
             println!(
                 "collection {}: showing first {frames} physical records (at least {packs} pack{})",
-                hex_encode(&collection_id),
+                format_id(&collection_id),
                 if packs == 1 { "" } else { "s" },
             );
         } else {
             println!(
                 "collection {}: {frames} physical record{} across {packs} pack{}",
-                hex_encode(&collection_id),
+                format_id(&collection_id),
                 if frames == 1 { "" } else { "s" },
                 if packs == 1 { "" } else { "s" },
             );
@@ -3144,13 +3019,13 @@ fn cmd_scan_collection_in_pool(
     if bounded && frames >= max_rows {
         println!(
             "collection {}: showing first {frames} physical records (at least {packs} pack{})",
-            hex_encode(&collection_id),
+            format_id(&collection_id),
             if packs == 1 { "" } else { "s" },
         );
     } else {
         println!(
             "collection {}: {frames} physical record{} across {packs} pack{}",
-            hex_encode(&collection_id),
+            format_id(&collection_id),
             if frames == 1 { "" } else { "s" },
             if packs == 1 { "" } else { "s" },
         );
@@ -3345,7 +3220,7 @@ fn print_collection_record(
         "{}",
         scan_table_row(
             &format!("0x{:016x}", shard.pack_id),
-            &hex_encode(&record_id),
+            &format_id(&record_id),
             offset,
             payload.as_deref(),
         )
@@ -3468,7 +3343,7 @@ fn default_matrix_import_template() -> CollectionTemplate {
     CollectionTemplate {
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
-        record_identity: RecordIdentityRule {
+        record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::Pointer {
                 pointer: "/event_id".into(),
             },
@@ -3477,12 +3352,11 @@ fn default_matrix_import_template() -> CollectionTemplate {
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: "/room_id".into(),
-            collection_type: MATRIX_ROOM_COLLECTION_TYPE,
+            pool_dst: MATRIX_ROOM_POOL_DST,
             display_id_pointer: "/room_id".into(),
         },
         establishment: Some(EstablishmentRule {
             selector: "type == m.room.create && state_key == ''".into(),
-            cardinality: "exactly-one".into(),
         }),
     }
 }
@@ -3599,19 +3473,19 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     let template: OwnedValue = simd_json::to_owned_value(&mut bytes)
         .with_context(|| format!("template {} is not valid JSON", path.display()))?;
     let (identity_pointer, membership_pointer) = validate_required_keys(&template, path)?;
-    if template_bool_at(&template, &["establishment", "required"]) != Some(true) {
-        bail!(
-            "template {} must require an establishment record",
-            path.display()
-        );
-    }
+    // Every collection has exactly one establishment record; there is no
+    // optional or multi-record cardinality. A template that cannot name one is
+    // rejected rather than compiling to a collection with no genesis.
+    let selector = template_string_at(&template, &["establishment", "selector"])
+        .filter(|selector| !selector.is_empty())
+        .with_context(|| {
+            format!(
+                "template {} must define a non-empty establishment.selector",
+                path.display()
+            )
+        })?;
     let establishment = EstablishmentRule {
-        selector: template_string_at(&template, &["establishment", "selector"])
-            .unwrap_or_default()
-            .to_owned(),
-        cardinality: template_string_at(&template, &["establishment", "cardinality"])
-            .unwrap_or("exactly-one")
-            .to_owned(),
+        selector: selector.to_owned(),
     };
     let node_id_algorithm = template_string_at(
         &template,
@@ -3620,10 +3494,10 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     .unwrap_or("sha2-256");
     let record_digest_algorithm = digest_algorithm_for(node_id_algorithm)
         .with_context(|| format!("template {} record identity internal_key", path.display()))?;
-    // The collection-id derivation is now a fixed, core-owned function of a
-    // compact type discriminator rather than a template-selected digest
-    // algorithm. The Matrix import profile is the room type.
-    let collection_type = MATRIX_ROOM_COLLECTION_TYPE;
+    // The collection-id derivation is a fixed, core-owned function of a pool
+    // namespace discriminator rather than a template-selected digest algorithm.
+    // The Matrix import profile targets the EventDag pool.
+    let pool_dst = MATRIX_ROOM_POOL_DST;
     if let Some(policy) = template
         .get("record")
         .and_then(|r| r.get("payload"))
@@ -3656,7 +3530,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     Ok(CollectionTemplate {
         name: "matrix-event-v1".into(),
         collection_kind: "room".into(),
-        record_identity: RecordIdentityRule {
+        record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::Pointer {
                 pointer: identity_pointer.to_owned(),
             },
@@ -3665,7 +3539,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: membership_pointer.to_owned(),
-            collection_type,
+            pool_dst,
             display_id_pointer: display_id_pointer.to_owned(),
         },
         establishment: Some(establishment),
@@ -3757,7 +3631,7 @@ fn parse_array_index(segment: &str) -> Option<usize> {
 /// belongs in pack-record metadata, computed by the storage layer on write.
 fn derive_template_key(algorithm: &str, extracted: &str) -> anyhow::Result<[u8; 16]> {
     validate_digest_algorithm(algorithm)?;
-    let hash = Sha256::digest(extracted.as_bytes());
+    let hash = sha256(extracted.as_bytes());
     let mut id = [0u8; 16];
     id.copy_from_slice(&hash[..16]);
     Ok(id)
@@ -3773,12 +3647,12 @@ fn template_node_id(
     // other policy must fail loudly rather than hash empty input and mint a
     // meaningless key.
     if !matches!(
-        &template.record_identity.policy,
+        &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { .. }
     ) {
         bail!(
             "record identity policy {:?} is not supported by the importer",
-            template.record_identity.policy
+            template.record_id_rule.policy
         );
     }
     let resolve =
@@ -3790,8 +3664,8 @@ fn template_node_id(
         resolve: &resolve,
     };
     let Some(digest) = frame_digest(
-        &template.record_identity.policy,
-        template.record_identity.digest_algorithm,
+        &template.record_id_rule.policy,
+        template.record_id_rule.digest_algorithm,
         &input,
     ) else {
         return Ok(None);
@@ -3805,7 +3679,7 @@ fn template_node_id(
 /// membership value (e.g. a Matrix `room_id`), producing the collection ID.
 fn template_collection_id(template: &CollectionTemplate, membership_value: &str) -> [u8; 16] {
     derive_collection_id(
-        template.collection_key.collection_type,
+        template.collection_key.pool_dst,
         membership_value.as_bytes(),
     )
 }
@@ -3820,20 +3694,6 @@ fn template_string_at<'a>(value: &'a OwnedValue, keys: &[&str]) -> Option<&'a st
     }
     match value {
         OwnedValue::String(value) => Some(value),
-        _ => None,
-    }
-}
-
-fn template_bool_at(value: &OwnedValue, keys: &[&str]) -> Option<bool> {
-    let mut value = value;
-    for key in keys {
-        let OwnedValue::Object(object) = value else {
-            return None;
-        };
-        value = object.get(*key)?;
-    }
-    match value {
-        OwnedValue::Static(simd_json::StaticNode::Bool(value)) => Some(*value),
         _ => None,
     }
 }
@@ -3880,7 +3740,7 @@ fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
     output.flush()?;
     eprintln!(
         "exported {exported} records from collection {}",
-        hex_encode(&collection_id)
+        format_id(&collection_id)
     );
     Ok(())
 }
@@ -4024,7 +3884,7 @@ fn cmd_import_file(
                         if first_event_id != &incoming_event_id {
                             bail!(
                                 "node ID {} maps to multiple event IDs in the input; refusing to merge them",
-                                hex_encode(&id_bytes)
+                                format_id(&id_bytes)
                             );
                         }
                         continue;
@@ -4094,7 +3954,7 @@ fn reject_cross_record_collision(
     if existing_event_id.as_deref() != Some(incoming_event_id) {
         bail!(
             "node ID {} collides with a different event_id; refusing to overwrite it",
-            hex_encode(id_bytes)
+            format_id(id_bytes)
         );
     }
     Ok(())
@@ -4111,7 +3971,7 @@ fn reject_cross_record_collision(
 )]
 fn import_pdu_events(
     store: &PackfileStorage,
-    dir: &Path,
+    _dir: &Path,
     path: &Path,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
@@ -4136,7 +3996,7 @@ fn import_pdu_events(
         established_collections,
     )?;
 
-    let collection_hex = hex_encode(&collection_id);
+    let collection_hex = format_id(&collection_id);
 
     // Decode and dedup in one pass, retaining the first occurrence of each
     // node ID directly — no intermediate full-size buffer, so a large
@@ -4164,7 +4024,7 @@ fn import_pdu_events(
                 if first_event_id != incoming_event_id {
                     bail!(
                         "node ID {} maps to multiple event IDs in the input; refusing to merge them",
-                        hex_encode(&id_bytes)
+                        format_id(&id_bytes)
                     );
                 }
                 already_present = already_present.saturating_add(1);
@@ -4203,17 +4063,21 @@ fn import_pdu_events(
             to_write.push((id_bytes, data));
         }
     }
+    // Genesis metadata precedes the batch's records, so it is the collection's
+    // first frame and is durable no later than any application record. A
+    // failure here aborts the batch: proceeding would write records into a
+    // collection with no genesis record. The engine enforces this ordering.
+    if batch_has_create {
+        established_collections.insert(collection_id);
+        let extension = MatrixRoomExtension::from_events(events);
+        if let Some(metadata) = collection_metadata_for(template, &extension) {
+            store.ensure_collection_metadata(&collection_id, &metadata)?;
+        }
+    }
+
     if !to_write.is_empty() {
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
-    }
-
-    if batch_has_create {
-        established_collections.insert(collection_id);
-        let details = matrix_room_details_from_events(events);
-        if let Err(error) = persist_matrix_room_details(dir, &collection_id, &details) {
-            eprintln!("warning: unable to cache Matrix room metadata: {error}");
-        }
     }
 
     // Compute state groups from the event DAG and persist the mappings.
@@ -4305,6 +4169,9 @@ fn resolve_import_collection(
         template_collection_id(template, room_id)
     };
     let batch_has_create = room_id.is_some_and(|room_id| matrix_batch_has_create(events, room_id));
+    if batch_has_create {
+        validate_establishment_room_version(events)?;
+    }
     if !batch_has_create && !established_collections.contains(&collection_id) {
         let room = room_id.unwrap_or("the selected collection");
         bail!(
@@ -4312,6 +4179,35 @@ fn resolve_import_collection(
         );
     }
     Ok((collection_id, batch_has_create))
+}
+
+/// Enforce the room-version floor on the batch's establishment record.
+///
+/// mtxdb requires v4+: v1/v2 event IDs are server-assigned (not
+/// content-addressed, and not guaranteed unique), and v3 encodes reference
+/// hashes with non-URL-safe base64. A create event that omits
+/// `content.room_version` is v1 by the spec and is rejected rather than
+/// silently defaulted.
+fn validate_establishment_room_version(events: &[OwnedValue]) -> anyhow::Result<()> {
+    let Some(create) = events
+        .iter()
+        .find(|event| matrix_create_event_id(event).is_some())
+    else {
+        return Ok(());
+    };
+    let declared = nested_event_string_field(create, "content", "room_version");
+    let version = declared
+        .and_then(MatrixRoomVersion::parse)
+        .with_context(|| {
+            format!(
+                "m.room.create declares room version {:?}; mtxdb requires v4 or later",
+                declared.unwrap_or("<absent>")
+            )
+        })?;
+    if !version.is_supported() {
+        bail!("room version {version:?} is not supported; mtxdb requires v4 or later");
+    }
+    Ok(())
 }
 
 /// Return every collection that already contains a valid Matrix establishing
@@ -4471,7 +4367,7 @@ fn verify_auth_chain_edges(
 /// of SHA-256 of the extracted identity) and need not be stable across
 /// algorithm changes.
 fn event_short_id(event_id: &str) -> u64 {
-    let hash = Sha256::digest(event_id.as_bytes());
+    let hash = sha256(event_id.as_bytes());
     let mut short_id_bytes = [0u8; 8];
     short_id_bytes.copy_from_slice(&hash[..8]);
     u64::from_le_bytes(short_id_bytes)
@@ -4746,7 +4642,7 @@ impl StateSet {
             hasher_input.extend_from_slice(event_id.as_bytes());
             hasher_input.push(0);
         }
-        let hash = Sha256::digest(&hasher_input);
+        let hash = sha256(&hasher_input);
         URL_SAFE_NO_PAD.encode(&hash[..])
     }
 }
@@ -4860,45 +4756,6 @@ fn nested_event_string_field<'a>(
     }
 }
 
-/// Build `MatrixRoomDetails` directly from a parsed import batch, with no
-/// disk access: the caller already knows the batch establishes the room
-/// (`matrix_batch_has_create`), so both fields can be read out of the events
-/// already sitting in memory instead of round-tripping through a shard scan
-/// the way `matrix_room_details_from_shards` has to for pre-existing data.
-fn matrix_room_details_from_events(events: &[OwnedValue]) -> MatrixRoomDetails {
-    let mut details = MatrixRoomDetails::default();
-    for event in events {
-        if details.matrix_room_id.is_none() {
-            details.matrix_room_id = event_room_id(event).map(str::to_owned);
-        }
-        if details.create.is_none() {
-            details.create = matrix_create_details(event);
-        }
-        if details.matrix_room_id.is_some() && details.create.is_some() {
-            break;
-        }
-    }
-    details
-}
-
-fn matrix_create_details(event: &OwnedValue) -> Option<String> {
-    if event_string_field(event, "type") != Some("m.room.create") {
-        return None;
-    }
-    let event_id = event_id(event).unwrap_or("<missing event_id>");
-    let sender = event_string_field(event, "sender").unwrap_or("<missing sender>");
-    let creator = nested_event_string_field(event, "content", "creator");
-    let version = nested_event_string_field(event, "content", "room_version");
-    let mut create = format!("{event_id} by {sender}");
-    if let Some(creator) = creator {
-        let _ = write!(create, "; creator {creator}");
-    }
-    if let Some(version) = version {
-        let _ = write!(create, "; room version {version}");
-    }
-    Some(create)
-}
-
 fn cmd_repack(
     cli: &Cli,
     collection: Option<&str>,
@@ -4998,7 +4855,7 @@ fn resolve_repack_target(
     match target {
         RepackTarget::Collection(collection_id) => {
             if store.collection_index_info(collection_id).is_none() {
-                bail!("collection {} not found", hex_encode(collection_id));
+                bail!("collection {} not found", format_id(collection_id));
             }
             Ok((
                 vec![*collection_id],
@@ -5190,7 +5047,7 @@ fn repack_collections(
                         "  copy progress: {nodes} nodes; output rotated {} → {} while copying collection {}",
                         pack_label(from),
                         pack_label(to),
-                        hex_encode(&collection_id),
+                        format_id(&collection_id),
                     );
                 }
             },
@@ -5208,7 +5065,7 @@ fn repack_collections(
                         "  copy progress: {nodes} nodes; output rotated {} → {} while copying collection {}",
                         pack_label(from),
                         pack_label(to),
-                        hex_encode(&collection_id),
+                        format_id(&collection_id),
                     );
                 }
             },
@@ -5334,7 +5191,7 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
             collection_ids.len()
         );
         for collection_id in &collection_ids {
-            println!("  {}", hex_encode(collection_id));
+            println!("  {}", format_id(collection_id));
         }
         if !confirm("Delete these collections?")? {
             println!("aborted");
@@ -5350,7 +5207,7 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
         store.delete_collection(&collection_id)?;
         println!(
             "deleted {count} nodes for collection {}",
-            hex_encode(&collection_id)
+            format_id(&collection_id)
         );
     }
     Ok(())
@@ -5397,13 +5254,13 @@ mod tests {
         cmd_stats, cmd_sync, compile_import_template, compute_state_groups,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
         default_matrix_import_template, derive_template_key, event_id, event_room_id,
-        event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, glob_pack_files,
-        import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
-        matrix_create_details, matrix_room_collection_id, parse_federation_input,
+        event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_id,
+        glob_pack_files, import_pdu_events, interleaving_worth_noting, matrix_batch_has_create,
+        matrix_room_collection_id, matrix_room_extension_from_store, parse_federation_input,
         parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        resolve_import_collection, scan_payload_suffix, synapse_event_node_id,
-        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        StateSet, MATRIX_ROOM_COLLECTION_TYPE,
+        resolve_import_collection, scan_payload_suffix, sha256, sha256_parts,
+        synapse_event_node_id, template_collection_id, template_node_id, verify_auth_chain_edges,
+        CollectionTemplate, MatrixRoomExtension, StateSet, MATRIX_ROOM_POOL_DST,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -5411,7 +5268,6 @@ mod tests {
     use mtxdb::storage::{NodeData, StorageEngine};
     use mtxdb::template::{CollectionKeyRule, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
     use mtxdb::{DatabaseLayout, DigestAlgorithm, ShardType};
-    use sha2::{Digest, Sha256};
     use simd_json::prelude::Writable;
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -5649,8 +5505,8 @@ mod tests {
         store.put(&col_id, &node_id, &data).unwrap();
         store.sync().unwrap();
 
-        let col_hex = hex::encode(col_id);
-        let node_hex = hex::encode(node_id);
+        let col_hex = format_id(&col_id);
+        let node_hex = format_id(&node_id);
 
         let cli = Cli {
             dir: Some(dir.clone()),
@@ -5681,7 +5537,7 @@ mod tests {
         store.put(&col_id, &node_id, &data).unwrap();
         store.sync().unwrap();
 
-        let col_hex = hex::encode(col_id);
+        let col_hex = format_id(&col_id);
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
@@ -5707,7 +5563,7 @@ mod tests {
         store.put(&col_id, &node_id, &data).unwrap();
         store.sync().unwrap();
 
-        let col_hex = hex::encode(col_id);
+        let col_hex = format_id(&col_id);
         let cli = Cli {
             dir: Some(dir.clone()),
             shard_type: None,
@@ -5736,7 +5592,7 @@ mod tests {
         CollectionTemplate {
             name: "collisions".into(),
             collection_kind: "federation".into(),
-            record_identity: RecordIdentityRule {
+            record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
                     pointer: "/sender".into(),
                 },
@@ -5745,7 +5601,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/room_id".into(),
-                collection_type: MATRIX_ROOM_COLLECTION_TYPE,
+                pool_dst: MATRIX_ROOM_POOL_DST,
                 display_id_pointer: "/room_id".into(),
             },
             establishment: None,
@@ -5955,7 +5811,7 @@ mod tests {
             r#"{
                 "pdus": [
                     {"event_id":"$c","room_id":"!room","sender":"@server",
-                     "type":"m.room.create","state_key":"","content":{"creator":"@server"},
+                     "type":"m.room.create","state_key":"","content":{"creator":"@server","room_version":"10"},
                      "auth_events":[]}
                 ],
                 "auth_chain": [
@@ -5979,6 +5835,56 @@ mod tests {
             1,
             "the auth-chain pool must hold exactly the one imported auth event, unchanged by the reimport"
         );
+    }
+
+    #[test]
+    fn import_establishment_persists_the_matrix_extension() {
+        let root = unique_temp_dir();
+        let pool_dir = root.join("pools").join("event-dag");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        let input = root.join("export.json");
+        // The create and a user record share one batch, so the import writes
+        // metadata and records together. The genesis record must be written
+        // first: with the old (records-then-metadata) order the engine now
+        // rejects the late genesis write and the import fails.
+        std::fs::write(
+            &input,
+            r#"{
+                "pdus": [
+                    {"event_id":"$c","room_id":"!room","sender":"@server",
+                     "type":"m.room.create","state_key":"",
+                     "content":{"creator":"@server","room_version":"10"},
+                     "auth_events":[]},
+                    {"event_id":"$m","room_id":"!room","sender":"@server",
+                     "type":"m.room.message","content":{},
+                     "auth_events":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let template = default_matrix_import_template();
+        let mut established = HashSet::new();
+        cmd_import_file(&store, &pool_dir, &input, None, &template, &mut established).unwrap();
+
+        let collection_id = template_collection_id(&template, "!room");
+        let metadata = store
+            .get_collection_metadata(&collection_id)
+            .unwrap()
+            .expect("establishment must write the genesis metadata record");
+        assert_eq!(metadata.collection_canonical_id, b"!room");
+        assert_eq!(metadata.pool_dst, MATRIX_ROOM_POOL_DST);
+        let blob = metadata.extension.expect("Matrix room extension blob");
+
+        // The self-describing blob is readable back through the same path
+        // `info` uses, and carries the room version without touching a payload.
+        let extension = matrix_room_extension_from_store(&store, &collection_id)
+            .expect("extension read back from the header");
+        assert_eq!(extension.room_id.as_deref(), Some("!room"));
+        assert_eq!(extension.create_event_id.as_deref(), Some("$c"));
+        assert_eq!(extension.room_version.as_deref(), Some("10"));
+        assert_eq!(extension.creator.as_deref(), Some("@server"));
+        assert_eq!(extension.encode_blob(), blob, "blob is deterministic");
     }
 
     #[test]
@@ -6022,20 +5928,43 @@ mod tests {
     }
 
     #[test]
-    fn matrix_create_details_matches_the_real_event_type() {
-        let event = owned_value(
+    fn matrix_room_extension_reads_the_create_event() {
+        let create = owned_value(
             r#"{
                 "type": "m.room.create",
+                "state_key": "",
                 "event_id": "$create:example.org",
-                "sender": "@alice:example.org",
+                "room_id": "!room:example.org",
                 "content": {"creator": "@alice:example.org", "room_version": "10"}
             }"#,
         );
+        let message = owned_value(
+            r#"{"type":"m.room.message","event_id":"$m","room_id":"!room:example.org"}"#,
+        );
+        let extension = MatrixRoomExtension::from_events(&[message, create]);
+        assert_eq!(extension.room_id.as_deref(), Some("!room:example.org"));
         assert_eq!(
-            matrix_create_details(&event).as_deref(),
-            Some(
-                "$create:example.org by @alice:example.org; creator @alice:example.org; room version 10"
-            )
+            extension.create_event_id.as_deref(),
+            Some("$create:example.org")
+        );
+        assert_eq!(extension.room_version.as_deref(), Some("10"));
+        assert_eq!(extension.creator.as_deref(), Some("@alice:example.org"));
+    }
+
+    #[test]
+    fn matrix_room_extension_round_trips_through_its_blob() {
+        let extension = MatrixRoomExtension {
+            room_id: Some("!room:example.org".into()),
+            create_event_id: Some("$create".into()),
+            room_version: Some("10".into()),
+            creator: Some("@alice:example.org".into()),
+        };
+        let blob = extension.encode_blob();
+        assert_eq!(MatrixRoomExtension::decode_blob(&blob), Some(extension));
+        // A blob without the self-describing marker is rejected.
+        assert_eq!(
+            MatrixRoomExtension::decode_blob(br#"{"room_id":"!x"}"#),
+            None
         );
     }
 
@@ -6099,23 +6028,15 @@ mod tests {
     }
 
     #[test]
-    fn matrix_create_details_ignores_non_create_events() {
-        // A stray "m.collection.create" (a leftover from a bad room->collection rename)
-        // must never match — only the real Matrix wire event type does.
-        let wrong_type = owned_value(r#"{"type": "m.collection.create"}"#);
-        assert_eq!(matrix_create_details(&wrong_type), None);
-
-        let message = owned_value(r#"{"type": "m.room.message"}"#);
-        assert_eq!(matrix_create_details(&message), None);
-    }
-
-    #[test]
-    fn matrix_create_details_tolerates_missing_optional_fields() {
-        let event = owned_value(r#"{"type": "m.room.create"}"#);
-        assert_eq!(
-            matrix_create_details(&event).as_deref(),
-            Some("<missing event_id> by <missing sender>")
+    fn matrix_room_extension_ignores_non_create_events() {
+        // A stray "m.collection.create" (a leftover from a bad room->collection
+        // rename) must never match — only the real Matrix wire event type does.
+        let wrong_type = owned_value(
+            r#"{"type":"m.collection.create","state_key":"","event_id":"$x","room_id":"!r"}"#,
         );
+        let message = owned_value(r#"{"type":"m.room.message","event_id":"$m","room_id":"!r"}"#);
+        let extension = MatrixRoomExtension::from_events(&[wrong_type, message]);
+        assert_eq!(extension.create_event_id, None);
     }
 
     #[test]
@@ -6176,7 +6097,7 @@ mod tests {
     #[test]
     fn import_admission_accepts_a_batch_that_establishes_its_room() {
         let create = owned_value(
-            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org"}"#,
+            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org","content":{"room_version":"10"}}"#,
         );
         let template = default_matrix_import_template();
         let (collection_id, batch_has_create) =
@@ -6186,6 +6107,34 @@ mod tests {
             template_collection_id(&template, "!room:example.org")
         );
         assert!(batch_has_create);
+    }
+
+    #[test]
+    fn import_admission_rejects_a_pre_v4_room() {
+        let template = default_matrix_import_template();
+        // v3 is content-addressed but not URL-safe; v1/v2 are server-assigned.
+        for version in ["1", "2", "3"] {
+            let create = owned_value(&format!(
+                r#"{{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org","content":{{"room_version":"{version}"}}}}"#
+            ));
+            let error =
+                resolve_import_collection(&[create], None, None, &template, &HashSet::new())
+                    .expect_err("a pre-v4 room must be rejected");
+            assert!(
+                error.to_string().contains("v4 or later"),
+                "unexpected error for v{version}: {error}"
+            );
+        }
+        // An absent room_version is v1 by the spec and must not be defaulted.
+        let create = owned_value(
+            r#"{"type":"m.room.create","state_key":"","event_id":"$create","room_id":"!room:example.org"}"#,
+        );
+        let error = resolve_import_collection(&[create], None, None, &template, &HashSet::new())
+            .expect_err("an absent room_version must be rejected, not defaulted to v1");
+        assert!(
+            error.to_string().contains("v4 or later"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -6211,7 +6160,7 @@ mod tests {
             "collection": {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "an unsupported digest algorithm must be rejected at compile time, not mid-import",
@@ -6237,7 +6186,7 @@ mod tests {
             "collection": {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a projection payload policy must be rejected instead of degrading to full-source retention",
@@ -6263,7 +6212,7 @@ mod tests {
             "collection": {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a present non-string payload policy must be rejected instead of silently compiling to source retention",
@@ -6290,7 +6239,7 @@ mod tests {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
                 "labels": [{"name": "display_id", "value": "/canonical_alias"}]
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a distinct display label must be rejected since the importer cannot persist it",
@@ -6317,7 +6266,7 @@ mod tests {
                 "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
                 "labels": {"name": "display_id", "value": "membership-value"}
             },
-            "establishment": {"required": true}
+            "establishment": {"selector": "type == m.room.create && state_key == ''"}
         }"#;
         let error = compile_reject(template).expect_err(
             "a present non-array collection.labels must not be silently treated as absent",
@@ -6353,7 +6302,7 @@ mod tests {
                     "membership": {{"extract": {{"kind": "json-pointer-rfc-6901", "path": "/room_id"}}}},
                     "labels": [{{"name": "display_id", "value": {label_value}}}]
                 }},
-                "establishment": {{"required": true}}
+                "establishment": {{"selector": "type == m.room.create && state_key == ''"}}
             }}"#
             );
             let error = compile_reject(template.as_bytes()).expect_err(
@@ -6844,7 +6793,7 @@ mod tests {
     fn state_set_empty_digest_is_empty_base64url() {
         let s = StateSet::new();
         let digest = s.digest_base64url();
-        let expected = Sha256::digest([]);
+        let expected = sha256(&[]);
         assert_eq!(
             digest,
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected[..])
@@ -6898,13 +6847,7 @@ mod tests {
     /// fails this test instead of silently breaking `$event_id`/`!room_id`
     /// lookups against a live Synapse-written database.
     fn reference_node_id(prefix: &[u8], namespace: &str, value: &str) -> [u8; 16] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(prefix);
-        hasher.update(namespace.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(value.as_bytes());
-        let hash = hasher.finalize();
+        let hash = sha256_parts(&[prefix, namespace.as_bytes(), b"\0", value.as_bytes()]);
         let mut id = [0u8; 16];
         id.copy_from_slice(&hash[..16]);
         id

@@ -217,6 +217,39 @@ impl MatrixRoomVersion {
         }
     }
 
+    /// The oldest room version mtxdb will import.
+    ///
+    /// v1/v2 event IDs are server-assigned, so a logical id cannot be
+    /// re-derived from the payload and two distinct payloads may claim the
+    /// same id. v3 is content-addressed but encodes with standard
+    /// (non-URL-safe) base64, whose `/` and `+` break request paths and
+    /// reverse proxies. v4+ is content-addressed with URL-safe unpadded
+    /// base64, so the event id is always recomputable and collision-free.
+    pub const MIN_SUPPORTED: Self = Self::V4;
+
+    /// Whether this version meets [`Self::MIN_SUPPORTED`].
+    ///
+    /// Fail-open for future versions: only the three known-unsuitable
+    /// versions are rejected.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        !matches!(self, Self::V1 | Self::V2 | Self::V3)
+    }
+
+    /// RFC 6901 pointer to the field of a room's `m.room.create` event that
+    /// carries the collection's canonical (external) id.
+    ///
+    /// v12 derives the room id from the accepted create event's event id, so
+    /// the source is `/event_id`; every earlier version stores a server-
+    /// assigned `/room_id` on the create event itself.
+    #[must_use]
+    pub const fn collection_key_pointer(self) -> &'static str {
+        match self {
+            Self::V12 => "/event_id",
+            _ => "/room_id",
+        }
+    }
+
     /// Whether verification must use strict canonical-number validation.
     #[must_use]
     pub const fn requires_strict_canonical_numbers(self) -> bool {
@@ -328,5 +361,50 @@ mod tests {
                 ReferenceHashInputPolicy::V11Plus
             );
         }
+    }
+
+    /// The support floor is v4: v1/v2 are server-assigned and v3 uses
+    /// non-URL-safe base64. The base64url shift is exactly the v3/v4 boundary.
+    #[test]
+    fn support_floor_is_v4() {
+        assert_eq!(MatrixRoomVersion::MIN_SUPPORTED, MatrixRoomVersion::V4);
+        for version in [
+            MatrixRoomVersion::V1,
+            MatrixRoomVersion::V2,
+            MatrixRoomVersion::V3,
+        ] {
+            assert!(!version.is_supported());
+        }
+        for version in [
+            MatrixRoomVersion::V4,
+            MatrixRoomVersion::V11,
+            MatrixRoomVersion::V12,
+        ] {
+            assert!(version.is_supported());
+        }
+        assert_eq!(
+            MatrixRoomVersion::V3.reference_hash_encoding(),
+            ReferenceHashEncoding::StandardBase64NoPad
+        );
+        assert_eq!(
+            MatrixRoomVersion::V4.reference_hash_encoding(),
+            ReferenceHashEncoding::UrlSafeBase64NoPad
+        );
+    }
+
+    /// The collection key source switches exactly where the room-id policy
+    /// does: v12 reads the create event's `/event_id`, earlier versions read
+    /// its server-assigned `/room_id`.
+    #[test]
+    fn collection_key_source_switches_at_v12() {
+        for version in [MatrixRoomVersion::V4, MatrixRoomVersion::V11] {
+            assert_eq!(version.room_id_policy(), RoomIdPolicy::ServerAssigned);
+            assert_eq!(version.collection_key_pointer(), "/room_id");
+        }
+        assert_eq!(
+            MatrixRoomVersion::V12.room_id_policy(),
+            RoomIdPolicy::CreateEventId
+        );
+        assert_eq!(MatrixRoomVersion::V12.collection_key_pointer(), "/event_id");
     }
 }
