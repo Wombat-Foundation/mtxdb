@@ -947,6 +947,10 @@ pub struct PackfileStorage {
     /// A sidecar persist failure has already been logged; cleared on success so
     /// a persistent failure logs once per streak, not once per sync.
     shard_collections_failure_logged: AtomicBool,
+    /// Test-only: runs after the recovery scan and before its totals are
+    /// swapped in, so a test can hold recovery inside that window.
+    #[cfg(test)]
+    recovery_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Session state for the incremental index delta log: the base checkpoint
     /// fingerprint + generations the log continues, and the frames accumulated
     /// since the last persist. See [`DeltaLogState`].
@@ -1662,7 +1666,11 @@ impl PackfileStorage {
     /// Assemble a fully constructed store from the per-collection state both
     /// the rescan path and the checkpoint fast path produce, so the two share
     /// one field-for-field constructor.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one field-for-field constructor shared by both open paths"
+    )]
     fn assemble(
         shards: ShardPool,
         scan_out: RoomScanOutput,
@@ -1726,6 +1734,8 @@ impl PackfileStorage {
             shard_collections_dirty: AtomicBool::new(scan_out.sidecar_missing),
             shard_collections_recovery_failed: AtomicBool::new(scan_out.sidecar_recovery_failed),
             shard_collections_failure_logged: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_pause_hook: parking_lot::Mutex::new(None),
             journal: parking_lot::Mutex::new(None),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
@@ -2930,12 +2940,40 @@ impl PackfileStorage {
         {
             // The open-time recovery scan failed, so the byte totals are not
             // trustworthy. Retry it now; until it succeeds nothing is written,
-            // so zero-byte fallbacks are never published. Writes that land
-            // between this scan and the swap below are not counted until the
-            // next rebuild, which is acceptable for a recovery path.
+            // so zero-byte fallbacks are never published.
+            //
+            // The scan and the swap of the in-memory totals must not interleave
+            // with an append: a frame written after the scan would be missing
+            // from the totals while the persisted fingerprint already covers
+            // it, and nothing would ever correct that. So hold every
+            // collection's put mutex (the same sorted-lock pattern the
+            // checkpoint writer uses; no caller holds one when it persists)
+            // across the flush, the scan, and the swap. This only runs on the
+            // rare recovery path, so briefly stalling writers is acceptable.
+            let mut collection_ids: Vec<[u8; 16]> =
+                self.collections_read().keys().copied().collect();
+            collection_ids.sort_unstable();
+            let mut lock_arcs: Vec<_> =
+                collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+            let create_guard = self.collection_creation.write();
+            let ids_now: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
+            for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
+                lock_arcs.push(self.put_mutex(id));
+            }
+            let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
+            self.shards.flush_all().map_err(StorageError::Io)?;
             let physical = crate::packfile::layout::physical_layout(&self.base_dir)
                 .map_err(StorageError::Io)?;
+            #[cfg(test)]
+            {
+                let hook = self.recovery_pause_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             self.index_tables.write().collection_disk_bytes = disk_bytes_from_physical(&physical);
+            drop(guards);
+            drop(create_guard);
             self.shard_collections_recovery_failed
                 .store(false, Ordering::Release);
         }
@@ -12529,6 +12567,97 @@ mod tests {
                 .get(&TEST_COLLECTION),
             Some(&expected)
         );
+    }
+
+    /// Deterministic version of the recovery/append race: hold recovery between
+    /// its scan and the swap of its totals and force a writer into that window.
+    /// The writer must be blocked by the collection mutexes; without them its
+    /// frame would be appended after the scan and then be lost by the swap.
+    #[test]
+    fn a_writer_cannot_slip_into_the_recovery_scan_to_swap_window() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::time::Duration;
+
+        let wait = Duration::from_secs(10);
+        let dir = test_dir("sidecar_recovery_window");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.index_tables.write().collection_disk_bytes.clear();
+        store
+            .shard_collections_recovery_failed
+            .store(true, Ordering::Release);
+
+        let (scanned_tx, scanned_rx) = channel::<()>();
+        let (resume_tx, resume_rx) = channel::<()>();
+        let resume_rx = parking_lot::Mutex::new(resume_rx);
+        *store.recovery_pause_hook.lock() = Some(Arc::new(move || {
+            scanned_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }));
+
+        let recovery = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.persist_shard_collections().unwrap())
+        };
+        // Recovery has scanned and is paused, still holding its locks.
+        scanned_rx.recv_timeout(wait).unwrap();
+
+        let (started_tx, started_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let writer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                store
+                    .put(
+                        &TEST_COLLECTION,
+                        &distinct_id(1),
+                        &NodeData::new(bytes::Bytes::from_static(b"written during recovery")),
+                    )
+                    .unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        // Only start the clock once the writer is running, so the timeout
+        // measures lock blocking rather than thread scheduling.
+        started_rx.recv_timeout(wait).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Timeout),
+            "a writer must be blocked while recovery holds the collection locks"
+        );
+
+        resume_tx.send(()).unwrap();
+        recovery.join().unwrap();
+        done_rx
+            .recv_timeout(wait)
+            .expect("writer must finish once recovery ends");
+        writer.join().unwrap();
+
+        store.sync_all().unwrap();
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "the frame written around recovery must be in the persisted totals"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// A checkpoint that survives without its shard→collection sidecar must not
