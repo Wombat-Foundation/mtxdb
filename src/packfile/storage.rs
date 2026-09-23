@@ -63,6 +63,23 @@ pub enum OpenPath {
     FullScan,
 }
 
+/// How strictly `PackfileStorage::checkpoint_scan_out` validates the live pack
+/// set against a persisted checkpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReloadMode {
+    /// The live packs must match the checkpoint's fingerprint exactly, or a
+    /// delta log must bridge the checkpoint to them. Used by `open` and crash
+    /// recovery, where a mismatch means the checkpoint is stale and the caller
+    /// must rescan.
+    Strict,
+    /// Skip the exact-pack fingerprint gate and the delta-log replay; the
+    /// read-committed overlay is authoritative for the post-checkpoint suffix.
+    /// Used only by `reload_index_from_checkpoint`, where the writer is still
+    /// appending and its packs have already grown past the checkpoint (a strict
+    /// gate would fail the read closed).
+    JournalBound,
+}
+
 /// Where a checkpoint-path open sourced each collection's per-shard counts
 /// and home-shard assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1589,7 +1606,7 @@ impl PackfileStorage {
                 &open_shards,
                 &deleted_collections,
                 writable,
-                false,
+                ReloadMode::Strict,
                 index_config,
                 &mut timings,
             )
@@ -2046,7 +2063,8 @@ impl PackfileStorage {
     /// checkpoint generation. A malformed or semantically inconsistent log
     /// makes this function return `None`, selecting the full rescan path.
     ///
-    /// `read_journal_reload` selects the read-committed overlay's reload mode
+    /// `reload_mode` selects the caller's stance (see [`ReloadMode`]).
+    /// `ReloadMode::JournalBound` is for the read-committed overlay's reload
     /// (see `reload_index_from_checkpoint`): the caller is a read-only worker
     /// advancing its index/coverage pair to a writer's checkpoint, not a
     /// session opening the store. In that mode the exact-pack fingerprint gate
@@ -2068,7 +2086,7 @@ impl PackfileStorage {
         open_shards: &[(u16, u64, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
         writable: bool,
-        read_journal_reload: bool,
+        reload_mode: ReloadMode,
         index_config: crate::index::IndexConfig,
         timings: &mut OpenTimings,
     ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
@@ -2117,7 +2135,8 @@ impl PackfileStorage {
         // delta replay (see this function's doc): the overlay supplies the
         // committed suffix, and requiring the live pack set to match would fail
         // the read closed while a writer is still appending.
-        let replay_needed = !read_journal_reload && local_fingerprint != checkpoint.fingerprint;
+        let replay_needed =
+            reload_mode == ReloadMode::Strict && local_fingerprint != checkpoint.fingerprint;
         if !replay_needed && writable {
             let _ = std::fs::remove_file(&delta_path);
         }
@@ -5824,7 +5843,7 @@ impl PackfileStorage {
                 &open_shards,
                 &deleted_collections,
                 false,
-                true,
+                ReloadMode::JournalBound,
                 self.index_config,
                 &mut timings,
             )
@@ -8130,6 +8149,17 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"third")),
             )
             .unwrap();
+
+        // The relaxation is scoped to the read-journal reload: a normal open
+        // runs `ReloadMode::Strict` and must still reject the checkpoint the
+        // eager append has outgrown, falling back to a full rescan rather than
+        // trusting a stale fingerprint.
+        let strict_reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        assert_eq!(
+            strict_reader.open_timings().unwrap().path,
+            OpenPath::FullScan,
+            "a strict open must not accept a checkpoint the live packs have outgrown"
+        );
 
         let read_committed = store
             .get_read_committed(&collection, &[first, second, third])
