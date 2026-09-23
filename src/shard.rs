@@ -2745,6 +2745,33 @@ impl ShardPool {
     /// Commits any buffered frames first, so the fsync covers everything a
     /// caller believes it has put.
     ///
+    /// # Cross-process visibility
+    ///
+    /// This makes the dirty shard bytes durable, but it is not the
+    /// transaction-level durability or publication barrier: it does not commit
+    /// the journal/LSN boundary and does not advance the LSN a reader in
+    /// another process observes, so nothing about another process's view
+    /// follows from it returning `Ok`.
+    ///
+    /// * With a [journal](crate::journal) enabled, the transaction-level
+    ///   durability barrier is
+    ///   [`JournalCoordinator::sync_through`](crate::journal::JournalCoordinator::sync_through)
+    ///   (reached via the packfile storage sync path), and shard fsyncs are
+    ///   acceleration recovered from the journal on reopen. A separate process
+    ///   observes committed data through the read-committed overlay
+    ///   (`PackfileStorage::open_read_committed` / `get_read_committed`, the
+    ///   `multi-reader` feature), whose boundary is the journal's committed
+    ///   LSN. That boundary can advance *before* this call, and a
+    ///   visible-but-uncommitted group is not crash-durable.
+    /// * Without a journal, a peer sees shard bytes only after an explicit
+    ///   [`StorageEngine::refresh_collection`](crate::storage::StorageEngine::refresh_collection)
+    ///   re-scan; the engine has no ambient cross-process invalidation. A
+    ///   successful `sync_dirty` then guarantees those bytes survive a crash,
+    ///   not that a peer has picked them up.
+    ///
+    /// Same-process readers go through the live index; cross-process readers
+    /// go through the journal overlay (or an explicit rescan).
+    ///
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_dirty(&self) -> io::Result<()> {
