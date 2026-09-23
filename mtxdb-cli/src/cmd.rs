@@ -5198,11 +5198,10 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
                 None
             };
             if let Some(s) = event_id {
-                // Matrix template compilation currently permits sha2-256,
-                // so edge extraction uses the same derivation as import. The
-                // storage callback cannot return an error; if that supported
-                // identity configuration ever changes, omit this edge rather
-                // than panicking in the CLI.
+                // Edge extraction uses the same node-id derivation as import
+                // (`matrix_event_node_id`, BLAKE3-128). The storage callback
+                // cannot return an error, so if that derivation ever fails,
+                // omit this edge rather than panicking in the CLI.
                 if let Ok(id) = matrix_event_node_id(s) {
                     edges.push(id);
                 }

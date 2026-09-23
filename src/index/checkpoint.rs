@@ -467,6 +467,12 @@ pub fn read_checkpoint_with_policy(
         .slots_bytes
         .checked_add(header.homes_bytes)
         .and_then(|v| v.checked_add(header.tails_bytes))?;
+    // Slots are unique u16 values, so a valid pack table cannot exceed 65,536
+    // entries; reject before `pack_table` and its dedupe sets reserve capacity
+    // from `pack_table_count`.
+    if header.pack_table_count > u32::from(u16::MAX) + 1 {
+        return None;
+    }
     if header.pack_table_bytes
         != u64::from(header.pack_table_count).checked_mul(PACK_TABLE_ENTRY_LEN as u64)?
     {

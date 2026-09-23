@@ -12633,11 +12633,15 @@ mod tests {
             extension: None,
         });
 
+        // Release every thread at once so the lookup/append windows overlap.
+        let barrier = Arc::new(std::sync::Barrier::new(8));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let store = Arc::clone(&store);
                 let metadata = Arc::clone(&metadata);
+                let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
+                    barrier.wait();
                     store
                         .ensure_collection_metadata(&collection, &metadata)
                         .expect("concurrent genesis establishment must be idempotent");
@@ -12652,6 +12656,69 @@ mod tests {
             store.get_collection_metadata(&collection).unwrap(),
             Some((*metadata).clone())
         );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writers racing with *different* genesis metadata must not both win:
+    /// exactly one establishes the collection and every other writer sees the
+    /// mismatch. Without the collection's `put_mutex` held across the lookup
+    /// and append, several writers could each append their own genesis frame.
+    #[test]
+    fn ensure_collection_metadata_conflicting_writers_have_one_winner() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+
+        let dir = test_dir("ensure_metadata_conflict");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        let collection = [0x7Fu8; 16];
+        let candidates: Vec<CollectionMetadata> = (0..8)
+            .map(|i| CollectionMetadata {
+                pool_dst: Some(*b"EVNT"),
+                collection_canonical_id: format!("!room{i}:matrix.org").into_bytes(),
+                record_id_rule: RecordIdentityRule {
+                    policy: FrameIdPolicy::Pointer {
+                        pointer: "/event_id".into(),
+                    },
+                    digest_algorithm: DigestAlgorithm::Sha256,
+                },
+                payload: PayloadPolicy::Source,
+                extension: None,
+            })
+            .collect();
+
+        let barrier = Arc::new(std::sync::Barrier::new(candidates.len()));
+        let handles: Vec<_> = candidates
+            .iter()
+            .cloned()
+            .map(|metadata| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.ensure_collection_metadata(&collection, &metadata)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one conflicting genesis writer may succeed: {results:?}"
+        );
+        for result in results.iter().filter(|r| r.is_err()) {
+            assert!(
+                matches!(result, Err(StorageError::Internal(msg)) if msg.contains("mismatch")),
+                "losers must report a metadata mismatch, got {result:?}"
+            );
+        }
+        let stored = store
+            .get_collection_metadata(&collection)
+            .unwrap()
+            .expect("the winner's genesis record is stored");
+        assert!(candidates.contains(&stored));
         drop(store);
         fs::remove_dir_all(&dir).ok();
     }
