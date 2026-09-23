@@ -302,43 +302,61 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
+    /// Whether `collection_id` currently holds any record (including the
+    /// genesis metadata record).
+    ///
+    /// Defaults to `false`; engines that can answer cheaply override it. Used
+    /// by [`Self::ensure_collection_metadata`] to enforce that a protocol
+    /// collection's genesis metadata precedes its first application record.
+    /// Auxiliary/internal collections that carry no metadata are unaffected,
+    /// because they never call `ensure_collection_metadata`.
+    fn collection_exists(&self, _collection_id: &[u8; 16]) -> bool {
+        false
+    }
+
     /// Write a collection's genesis metadata record if it has none, or verify
     /// that an existing record matches `metadata`. Idempotent: a caller may
     /// invoke it before every batch.
     ///
     /// The record is stored as an ordinary frame under the reserved
     /// [`COLLECTION_METADATA_RECORD_ID`] key, so it rides the same append,
-    /// checkpoint, and crash-recovery paths as application records. It is
-    /// always written before (and therefore durable with, or before) the
-    /// collection's first application record.
+    /// checkpoint, and crash-recovery paths as application records. Callers
+    /// must invoke it before the collection's first application record, so the
+    /// genesis frame precedes (and is durable with or before) any application
+    /// record. The engine enforces this: writing genesis metadata for a
+    /// collection that already holds records is rejected.
     ///
     /// # Errors
     /// Returns [`StorageError::Io`] on I/O failure, [`StorageError::Corrupt`]
     /// if an existing record cannot be decoded, or [`StorageError::Internal`]
-    /// if an existing record decodes but differs from `metadata`.
+    /// if an existing record decodes but differs from `metadata`, or if the
+    /// collection already holds records (genesis metadata written too late).
     fn ensure_collection_metadata(
         &self,
         collection_id: &[u8; 16],
         metadata: &CollectionMetadata,
     ) -> Result<(), StorageError> {
-        match self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
-            Some(existing) => {
-                let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
-                    StorageError::Corrupt("malformed collection metadata record".to_owned())
-                })?;
-                if found != *metadata {
-                    return Err(StorageError::Internal(
-                        "collection metadata mismatch: existing genesis record differs".to_owned(),
-                    ));
-                }
-                Ok(())
+        if let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
+            let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+                StorageError::Corrupt("malformed collection metadata record".to_owned())
+            })?;
+            if found != *metadata {
+                return Err(StorageError::Internal(
+                    "collection metadata mismatch: existing genesis record differs".to_owned(),
+                ));
             }
-            None => self.put(
-                collection_id,
-                &COLLECTION_METADATA_RECORD_ID,
-                &NodeData::new(metadata.encode().into()),
-            ),
+            return Ok(());
         }
+        if self.collection_exists(collection_id) {
+            return Err(StorageError::Internal(
+                "genesis metadata must be written before the collection's first record".to_owned(),
+            ));
+        }
+        self.put(
+            collection_id,
+            &COLLECTION_METADATA_RECORD_ID,
+            &NodeData::new(metadata.encode().into()),
+        )
     }
 
     /// Fetch and decode a collection's genesis metadata record, if present.
@@ -451,6 +469,10 @@ impl StorageEngine for InMemoryStorage {
         Ok(collections
             .get(collection_id)
             .and_then(|r| r.get(id).cloned()))
+    }
+
+    fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
+        self.collections.read().contains_key(collection_id)
     }
 
     fn get_many(
@@ -601,6 +623,63 @@ mod tests {
             store.ensure_collection_metadata(&collection, &conflicting),
             Err(StorageError::Internal(_))
         ));
+    }
+
+    /// Genesis metadata must precede the collection's first application
+    /// record: a late genesis write is rejected, so a crash can never leave a
+    /// collection with records but no metadata.
+    #[test]
+    fn genesis_metadata_must_precede_the_first_record() {
+        use crate::template::{
+            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        };
+
+        let metadata = CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+        };
+
+        // Correct order: metadata first, then records.
+        let ordered = InMemoryStorage::new();
+        let collection = [0x6Bu8; 16];
+        ordered
+            .ensure_collection_metadata(&collection, &metadata)
+            .unwrap();
+        ordered
+            .put(
+                &collection,
+                &[0x01; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"e")),
+            )
+            .unwrap();
+        assert_eq!(
+            ordered.get_collection_metadata(&collection).unwrap(),
+            Some(metadata.clone())
+        );
+
+        // Wrong order: a record first, then genesis metadata is rejected, and
+        // the collection keeps no metadata rather than silently gaining a late
+        // genesis record.
+        let late = InMemoryStorage::new();
+        late.put(
+            &collection,
+            &[0x02; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"e")),
+        )
+        .unwrap();
+        assert!(matches!(
+            late.ensure_collection_metadata(&collection, &metadata),
+            Err(StorageError::Internal(_))
+        ));
+        assert_eq!(late.get_collection_metadata(&collection).unwrap(), None);
     }
 
     #[test]

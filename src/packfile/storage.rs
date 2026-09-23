@@ -6512,6 +6512,10 @@ impl PackfileStorage {
 }
 
 impl StorageEngine for PackfileStorage {
+    fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
+        self.generation(collection_id).is_some()
+    }
+
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
         let track = self.stats_enabled.load(Ordering::Relaxed);
         // A concurrent repack can swap the generation and retire the shard ids

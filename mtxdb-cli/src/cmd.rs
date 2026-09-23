@@ -4063,19 +4063,21 @@ fn import_pdu_events(
             to_write.push((id_bytes, data));
         }
     }
-    if !to_write.is_empty() {
-        store.put_many(&collection_id, &to_write)?;
-        event_count = event_count.saturating_add(to_write.len() as u64);
-    }
-
+    // Genesis metadata precedes the batch's records, so it is the collection's
+    // first frame and is durable no later than any application record. A
+    // failure here aborts the batch: proceeding would write records into a
+    // collection with no genesis record. The engine enforces this ordering.
     if batch_has_create {
         established_collections.insert(collection_id);
         let extension = MatrixRoomExtension::from_events(events);
         if let Some(metadata) = collection_metadata_for(template, &extension) {
-            if let Err(error) = store.ensure_collection_metadata(&collection_id, &metadata) {
-                eprintln!("warning: unable to persist collection metadata: {error}");
-            }
+            store.ensure_collection_metadata(&collection_id, &metadata)?;
         }
+    }
+
+    if !to_write.is_empty() {
+        store.put_many(&collection_id, &to_write)?;
+        event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
     // Compute state groups from the event DAG and persist the mappings.
@@ -5842,6 +5844,10 @@ mod tests {
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let input = root.join("export.json");
+        // The create and a user record share one batch, so the import writes
+        // metadata and records together. The genesis record must be written
+        // first: with the old (records-then-metadata) order the engine now
+        // rejects the late genesis write and the import fails.
         std::fs::write(
             &input,
             r#"{
@@ -5849,6 +5855,9 @@ mod tests {
                     {"event_id":"$c","room_id":"!room","sender":"@server",
                      "type":"m.room.create","state_key":"",
                      "content":{"creator":"@server","room_version":"10"},
+                     "auth_events":[]},
+                    {"event_id":"$m","room_id":"!room","sender":"@server",
+                     "type":"m.room.message","content":{},
                      "auth_events":[]}
                 ]
             }"#,
