@@ -2425,15 +2425,18 @@ impl ShardPool {
                 packfile::MAX_DATA_LEN
             )));
         }
-        let decompressed = zstd::bulk::decompress(node_bytes, expected_len)
-            .map_err(|e| StorageError::Corrupt(format!("zstd decompress failed: {e}")))?;
-        if decompressed.len() != expected_len {
-            return Err(StorageError::Corrupt(format!(
-                "decompressed length {} != framed uncompressed_len {uncompressed_len}",
-                decompressed.len()
-            )));
+        #[cfg(feature = "zstd")]
+        {
+            let decompressed = packfile::zstd_decompress(node_bytes, expected_len)
+                .map_err(|e| StorageError::Corrupt(e.to_string()))?;
+            Ok(bytes::Bytes::from(decompressed))
         }
-        Ok(bytes::Bytes::from(decompressed))
+        #[cfg(not(feature = "zstd"))]
+        {
+            Err(StorageError::Corrupt(
+                "compressed node but this build was compiled without the `zstd` feature".into(),
+            ))
+        }
     }
 
     /// Remap a shard to its current on-disk length.
