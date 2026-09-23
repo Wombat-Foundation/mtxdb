@@ -424,6 +424,26 @@ struct RoomScanOutput {
     /// A checkpoint-backed writable open found no valid shard→collection
     /// sidecar, so the next sync must write one even if no index is dirty.
     sidecar_missing: bool,
+    /// The physical scan needed to rebuild the sidecar's byte metrics failed.
+    /// Do not allow a sidecar containing zero-byte fallbacks to be persisted.
+    sidecar_recovery_failed: bool,
+}
+
+/// Per-pack, per-collection on-disk bytes as `physical_layout` reports them
+/// (every appended frame, superseded ones included).
+fn disk_bytes_from_physical(
+    physical: &crate::packfile::layout::PhysicalLayout,
+) -> HashMap<u64, HashMap<[u8; 16], u64>> {
+    let mut bytes: HashMap<u64, HashMap<[u8; 16], u64>> = HashMap::new();
+    for (collection_id, layout) in &physical.collections {
+        for (pack_id, pack_bytes) in &layout.pack_bytes {
+            bytes
+                .entry(*pack_id)
+                .or_default()
+                .insert(*collection_id, *pack_bytes);
+        }
+    }
+    bytes
 }
 
 /// Magic bytes + version identifying the persisted shard→collection directory
@@ -921,6 +941,12 @@ pub struct PackfileStorage {
     /// The shard→collection sidecar needs writing even though no index is
     /// dirty (see `RoomScanOutput::sidecar_missing`).
     shard_collections_dirty: AtomicBool,
+    /// A missing sidecar was observed, but its physical byte metrics could not
+    /// be rebuilt. Keep retrying rather than publishing misleading zeros.
+    shard_collections_recovery_failed: AtomicBool,
+    /// A sidecar persist failure has already been logged; cleared on success so
+    /// a persistent failure logs once per streak, not once per sync.
+    shard_collections_failure_logged: AtomicBool,
     /// Session state for the incremental index delta log: the base checkpoint
     /// fingerprint + generations the log continues, and the frames accumulated
     /// since the last persist. See [`DeltaLogState`].
@@ -1698,6 +1724,8 @@ impl PackfileStorage {
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
             shard_collections_dirty: AtomicBool::new(scan_out.sidecar_missing),
+            shard_collections_recovery_failed: AtomicBool::new(scan_out.sidecar_recovery_failed),
+            shard_collections_failure_logged: AtomicBool::new(false),
             journal: parking_lot::Mutex::new(None),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
@@ -2325,17 +2353,11 @@ impl PackfileStorage {
             // counts) rather than persisting zeros, and make the next sync
             // rewrite the sidecar. This is a recovery path, so one pack scan
             // is acceptable.
+            scan_out.sidecar_missing = true;
+            scan_out.sidecar_recovery_failed = true;
             if let Ok(physical) = crate::packfile::layout::physical_layout(base_dir) {
-                for (collection_id, layout) in &physical.collections {
-                    for (pack_id, bytes) in &layout.pack_bytes {
-                        scan_out
-                            .collection_disk_bytes
-                            .entry(*pack_id)
-                            .or_default()
-                            .insert(*collection_id, *bytes);
-                    }
-                }
-                scan_out.sidecar_missing = true;
+                scan_out.collection_disk_bytes = disk_bytes_from_physical(&physical);
+                scan_out.sidecar_recovery_failed = false;
             }
         }
 
@@ -2902,6 +2924,21 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `StorageError` on write or rename failure.
     pub fn persist_shard_collections(&self) -> Result<(), StorageError> {
+        if self
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire)
+        {
+            // The open-time recovery scan failed, so the byte totals are not
+            // trustworthy. Retry it now; until it succeeds nothing is written,
+            // so zero-byte fallbacks are never published. Writes that land
+            // between this scan and the swap below are not counted until the
+            // next rebuild, which is acceptable for a recovery path.
+            let physical = crate::packfile::layout::physical_layout(&self.base_dir)
+                .map_err(StorageError::Io)?;
+            self.index_tables.write().collection_disk_bytes = disk_bytes_from_physical(&physical);
+            self.shard_collections_recovery_failed
+                .store(false, Ordering::Release);
+        }
         let mut buf = Vec::new();
         buf.extend_from_slice(SHARD_ROOMS_MAGIC);
         buf.push(SHARD_ROOMS_VERSION);
@@ -2991,8 +3028,19 @@ impl PackfileStorage {
     /// data, not something worth failing an otherwise-successful sync
     /// over.
     fn persist_shard_collections_best_effort(&self) {
-        if let Err(e) = self.persist_shard_collections() {
-            eprintln!("mtxdb: failed to persist shard→collection directory: {e}");
+        match self.persist_shard_collections() {
+            Ok(()) => self
+                .shard_collections_failure_logged
+                .store(false, Ordering::Relaxed),
+            Err(e) => {
+                // A persistent failure would otherwise log on every sync.
+                if !self
+                    .shard_collections_failure_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    eprintln!("mtxdb: failed to persist shard→collection directory: {e}");
+                }
+            }
         }
     }
 
@@ -11897,7 +11945,7 @@ mod tests {
         const TEST_SHARDS: usize = 4;
 
         let dir = test_dir("repack_reclaims_slots");
-        let store = PackfileStorage::open(dir).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
 
         let mut root = [0u8; 16];
         root[0] = 0xFF;
@@ -11947,6 +11995,25 @@ mod tests {
         assert!(
             store.shards_retired() > 0,
             "retire_empty_shards should have retired at least one now-garbage-only shard"
+        );
+
+        // The collection occupied several packs, and repack retired the
+        // garbage-only source packs. The persisted byte total must follow the
+        // surviving physical layout rather than retaining bytes for retired
+        // packs.
+        store.sync_all().unwrap();
+        let physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let expected = physical
+            .collections
+            .get(&TEST_COLLECTION)
+            .expect("repacked collection remains on disk")
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "retired packs must not remain in collection byte accounting"
         );
 
         // Every shard except the current active one held nothing but
@@ -12338,6 +12405,130 @@ mod tests {
         assert!(disk_bytes.get(&TEST_COLLECTION).copied().unwrap_or(0) > 0);
         assert!(disk_bytes.get(&OTHER_COLLECTION).copied().unwrap_or(0) > 0);
         assert!(PackfileStorage::collection_directory_persisted_at(&dir).is_some());
+    }
+
+    #[test]
+    fn put_many_overwrites_keep_one_live_node_and_count_every_frame() {
+        let dir = test_dir("put_many_overwrites_accounting");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let id = distinct_id(0);
+        let entries = vec![
+            (id, NodeData::new(bytes::Bytes::from_static(b"first"))),
+            (id, NodeData::new(bytes::Bytes::from_static(b"second"))),
+        ];
+        assert_eq!(store.put_many(&TEST_COLLECTION, &entries).unwrap(), 2);
+        store.sync_all().unwrap();
+
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)],
+            "an overwrite inside one batch must not inflate live-node counts"
+        );
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "batch accounting must include both appended frames"
+        );
+    }
+
+    #[test]
+    fn put_verified_and_empty_records_are_accounted_as_physical_frames() {
+        let dir = test_dir("verified_and_empty_accounting");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let verified_id = distinct_id(0);
+        let verified = bytes::Bytes::from_static(b"verified");
+        let digest = DigestAlgorithm::Sha256.digest(&verified);
+        store
+            .put_verified(
+                &TEST_COLLECTION,
+                &verified_id,
+                &NodeData::new(verified),
+                &digest,
+                DigestAlgorithm::Sha256,
+                &digest,
+                None,
+            )
+            .unwrap();
+        let empty_id = distinct_id(1);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &empty_id,
+                &NodeData::new(bytes::Bytes::new()),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 2)],
+            "empty records still occupy live index slots"
+        );
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "verified and empty records must use their encoded frame lengths"
+        );
+    }
+
+    #[test]
+    fn failed_sidecar_recovery_is_retried_and_never_publishes_zero_metrics() {
+        let dir = test_dir("sidecar_recovery_failure");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"data")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        let before = fs::read(&sidecar).unwrap();
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+
+        // Model an open whose recovery scan failed: byte totals unknown, flag set.
+        store.index_tables.write().collection_disk_bytes.clear();
+        store
+            .shard_collections_recovery_failed
+            .store(true, Ordering::Release);
+
+        // While the scan still fails (an unreadable pack), nothing is written.
+        let junk = dir.join("pack_00000000000000ff.pack");
+        fs::write(&junk, b"not a packfile").unwrap();
+        assert!(store.persist_shard_collections().is_err());
+        assert!(store
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire));
+        assert_eq!(fs::read(&sidecar).unwrap(), before, "no zero-byte sidecar");
+
+        // Once the scan can succeed, the next persist retries it and recovers.
+        fs::remove_file(&junk).unwrap();
+        store.persist_shard_collections().unwrap();
+        assert!(!store
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire));
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected)
+        );
     }
 
     /// A checkpoint that survives without its shard→collection sidecar must not
