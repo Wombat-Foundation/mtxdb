@@ -1190,11 +1190,7 @@ fn cmd_collections_in_dir(
     } else {
         None
     };
-    let cached_disk = if physical_needed {
-        None
-    } else {
-        read_disk_cache(dir)
-    };
+    let sidecar_disk = PackfileStorage::collection_disk_bytes_from_disk(dir);
     let disk_bytes: HashMap<_, _> = physical
         .as_ref()
         .map(|layout| {
@@ -1204,9 +1200,9 @@ fn cmd_collections_in_dir(
                 .map(|(id, stats)| (*id, stats.disk_bytes))
                 .collect()
         })
-        .or_else(|| cached_disk.clone())
+        .or(sidecar_disk.clone())
         .unwrap_or_default();
-    let disk_known = physical_needed || cached_disk.is_some();
+    let disk_known = physical_needed || sidecar_disk.is_some();
 
     if collections.is_empty() {
         println!("no collections found");
@@ -2001,76 +1997,6 @@ fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize
         }
     }
     Some((total, by_shard))
-}
-
-/// File name of the per-collection disk-size cache kept beside a pool's packs.
-const DISK_CACHE_FILE: &str = "collection_disk.cache";
-
-/// A cheap identity for the pool's current packs: each pack's id and length.
-/// Any append, new pack, or removal changes it, which invalidates the cache.
-fn pack_set_fingerprint(dir: &Path) -> anyhow::Result<u64> {
-    let mut input = Vec::new();
-    for (pack_id, len, _) in glob_pack_files(dir)? {
-        input.extend_from_slice(&pack_id.to_le_bytes());
-        input.extend_from_slice(&len.to_le_bytes());
-    }
-    let digest = blake3_digest(&input);
-    Ok(u64::from_le_bytes(digest[..8].try_into().expect("8 bytes")))
-}
-
-fn format_disk_cache(fingerprint: u64, entries: &[([u8; 16], u64)]) -> String {
-    let mut out = format!("fingerprint {fingerprint:016x}\n");
-    for (collection_id, bytes) in entries {
-        let _ = writeln!(out, "{} {bytes}", format_id(collection_id));
-    }
-    out
-}
-
-/// Parse a cache written by [`format_disk_cache`]; `None` if it is malformed
-/// or was written for a different pack set.
-fn parse_disk_cache(text: &str, fingerprint: u64) -> Option<HashMap<[u8; 16], u64>> {
-    let mut lines = text.lines();
-    let header = lines.next()?.strip_prefix("fingerprint ")?;
-    if u64::from_str_radix(header, 16).ok()? != fingerprint {
-        return None;
-    }
-    let mut sizes = HashMap::new();
-    for line in lines {
-        let (id, bytes) = line.split_once(' ')?;
-        sizes.insert(parse_collection_id(id).ok()?, bytes.parse().ok()?);
-    }
-    Some(sizes)
-}
-
-/// Per-collection on-disk bytes recorded by the last `mtxdb sync`, if the
-/// pool's packs still match it.
-fn read_disk_cache(dir: &Path) -> Option<HashMap<[u8; 16], u64>> {
-    let text = fs::read_to_string(dir.join(DISK_CACHE_FILE)).ok()?;
-    parse_disk_cache(&text, pack_set_fingerprint(dir).ok()?)
-}
-
-/// Scan the packs once and record each collection's on-disk bytes, unless the
-/// cache already matches. Best effort: the cache only speeds up listings.
-fn refresh_disk_cache(dir: &Path) {
-    if read_disk_cache(dir).is_some() {
-        return;
-    }
-    let Ok(fingerprint) = pack_set_fingerprint(dir) else {
-        return;
-    };
-    let Ok(physical) = physical_layout(dir) else {
-        return;
-    };
-    let mut entries: Vec<_> = physical
-        .collections
-        .iter()
-        .map(|(id, layout)| (*id, layout.disk_bytes))
-        .collect();
-    entries.sort_unstable();
-    let temporary = dir.join(format!("{DISK_CACHE_FILE}.tmp"));
-    if fs::write(&temporary, format_disk_cache(fingerprint, &entries)).is_ok() {
-        let _ = fs::rename(&temporary, dir.join(DISK_CACHE_FILE));
-    }
 }
 
 /// Discover only canonical v4 `pack_{pack_id:016x}.pack` files.
@@ -6104,7 +6030,6 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
             }
             let store = PackfileStorage::open(dir.clone()).context("failed to open store")?;
             store.sync()?;
-            refresh_disk_cache(&dir);
             eprintln!(
                 "{}: synced: persisted shard IO stats and shard\u{2192}collection directory",
                 shard_type.as_str()
@@ -6114,7 +6039,6 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
     }
     let store = open_store(cli)?;
     store.sync()?;
-    refresh_disk_cache(&selected_pool_dir(cli)?);
     eprintln!(
         "synced: persisted shard IO stats, shard\u{2192}collection directory, and disk sizes"
     );
@@ -6458,19 +6382,6 @@ mod tests {
             let error = super::parse_collection_selector(selector).unwrap_err();
             assert!(error.to_string().contains("0x-prefixed"), "{error}");
         }
-    }
-
-    #[test]
-    fn disk_cache_round_trips_and_rejects_a_changed_pack_set() {
-        let a = [0xAAu8; 16];
-        let b = [0x01u8; 16];
-        let text = super::format_disk_cache(0xfeed, &[(a, 1234), (b, 0)]);
-        let parsed = super::parse_disk_cache(&text, 0xfeed).unwrap();
-        assert_eq!(parsed.get(&a), Some(&1234));
-        assert_eq!(parsed.get(&b), Some(&0));
-        // A different pack set (new fingerprint) must not reuse the sizes.
-        assert!(super::parse_disk_cache(&text, 0xbeef).is_none());
-        assert!(super::parse_disk_cache("garbage", 0xfeed).is_none());
     }
 
     #[test]

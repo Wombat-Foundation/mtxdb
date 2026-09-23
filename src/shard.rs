@@ -1751,6 +1751,16 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on write, flush, or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
+        self.put_record_with_len(record)
+            .map(|(slot, offset, _)| (slot, offset))
+    }
+
+    /// Append a record and return its exact encoded frame size as well as its
+    /// location. The extra size is used by incremental physical accounting.
+    ///
+    /// # Errors
+    /// Returns an I/O or encoding error if the record cannot be appended.
+    pub fn put_record_with_len(&self, record: &Record) -> io::Result<(u16, u64, u64)> {
         let mut shard = self.shard_for_collection(&record.collection_id);
         loop {
             if shard.is_poisoned() {
@@ -1878,7 +1888,10 @@ impl ShardPool {
                 }
                 return Err(e);
             }
-            return Ok((shard.slot, virtual_end));
+            let disk_bytes = u64::try_from(frame_len)
+                .unwrap_or(u64::MAX)
+                .saturating_add(8);
+            return Ok((shard.slot, virtual_end, disk_bytes));
         }
     }
 
