@@ -63,7 +63,7 @@ doc: ##H Build docs
 
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(CARGO) test --workspace --lib --tests --timings
+	$(CARGO) test --workspace --all-features --lib --tests --timings
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
