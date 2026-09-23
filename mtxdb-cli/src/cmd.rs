@@ -5294,7 +5294,10 @@ mod tests {
     use mtxdb::packfile::storage::PackfileStorage;
     use mtxdb::storage::{NodeData, StorageEngine};
     use mtxdb::template::{CollectionKeyRule, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
-    use mtxdb::{derive_collection_id, DatabaseLayout, DigestAlgorithm, ShardType};
+    use mtxdb::{
+        content_digest, derive_collection_id, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion,
+        ShardType,
+    };
     use simd_json::prelude::Writable;
     use simd_json::OwnedValue;
     use std::collections::HashSet;
@@ -6194,6 +6197,19 @@ mod tests {
         assert!(!resolved.batch_has_create);
     }
 
+    /// A v12 event id in the real wire shape: SHA-256 of the event, URL-safe
+    /// unpadded base64 (v12's `ReferenceHashEncoding`), prefixed with `$`.
+    ///
+    /// This stands in for the full reference hash, which is taken over the
+    /// redacted canonical event; it produces an id with the correct alphabet
+    /// so the sigil-normalization path is exercised with realistic data.
+    fn v12_reference_event_id(event: &OwnedValue) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let digest = content_digest(DigestAlgorithm::Sha256, &event.encode().into_bytes());
+        format!("${}", URL_SAFE_NO_PAD.encode(digest))
+    }
+
     #[test]
     fn import_v12_followup_batch_lands_in_the_create_collection() {
         let root = unique_temp_dir();
@@ -6203,13 +6219,25 @@ mod tests {
         let template = default_matrix_import_template();
         let mut established = HashSet::new();
 
+        // A v12 event id is a SHA-256 reference hash and its room id is that
+        // id with the `$` sigil swapped for `!` (MSC4291). Hash the create
+        // event and derive both forms through the real policy rather than a
+        // hand-written placeholder id.
+        let create_event = owned_value(
+            r#"{"event_id":"","sender":"@server","type":"m.room.create","state_key":"","content":{"creator":"@server","room_version":"12"},"auth_events":[]}"#,
+        );
+        let create_id = v12_reference_event_id(&create_event);
+        let room_id = MatrixRoomVersion::V12.normalize_collection_identity(&create_id);
+
         // Batch 1: the v12 create event alone. It carries no `room_id`; the
         // collection identity is the create event's id, normalized to the
         // `!<hash>` room-id form ordinary events reference.
         let create_path = root.join("create.json");
         std::fs::write(
             &create_path,
-            r#"{"pdus":[{"event_id":"$v12create","sender":"@server","type":"m.room.create","state_key":"","content":{"creator":"@server","room_version":"12"},"auth_events":[]}]}"#,
+            format!(
+                r#"{{"pdus":[{{"event_id":"{create_id}","sender":"@server","type":"m.room.create","state_key":"","content":{{"creator":"@server","room_version":"12"}},"auth_events":[]}}]}}"#
+            ),
         )
         .unwrap();
         cmd_import_file(
@@ -6222,7 +6250,7 @@ mod tests {
         )
         .unwrap();
 
-        let collection_id = template_collection_id(&template, "!v12create");
+        let collection_id = template_collection_id(&template, &room_id);
         assert!(
             store
                 .get_collection_metadata(&collection_id)
@@ -6231,17 +6259,18 @@ mod tests {
             "a v12 create must establish a collection keyed by the normalized room id"
         );
 
-        // Batch 2: a separate ordinary v12 event. Per MSC4291 an ordinary
-        // PDU's `room_id` is the create event's id with the `$` sigil
-        // replaced by `!`, so it must resolve to the same collection rather
-        // than spawn a second one.
-        let message_value = owned_value(
-            r#"{"event_id":"$m1","room_id":"!v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}"#,
-        );
+        // Batch 2: a separate ordinary v12 event. It references the room as
+        // `!<create-id>` and must resolve to the same collection rather than
+        // spawn a second one.
+        let message_value = owned_value(&format!(
+            r#"{{"event_id":"$m1","room_id":"{room_id}","sender":"@server","type":"m.room.message","content":{{}},"auth_events":[]}}"#
+        ));
         let message_path = root.join("message.json");
         std::fs::write(
             &message_path,
-            r#"{"pdus":[{"event_id":"$m1","room_id":"!v12create","sender":"@server","type":"m.room.message","content":{},"auth_events":[]}]}"#,
+            format!(
+                r#"{{"pdus":[{{"event_id":"$m1","room_id":"{room_id}","sender":"@server","type":"m.room.message","content":{{}},"auth_events":[]}}]}}"#
+            ),
         )
         .unwrap();
         cmd_import_file(
