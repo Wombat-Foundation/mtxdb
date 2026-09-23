@@ -5281,6 +5281,14 @@ fn compute_state_groups(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
 ) -> Result<HashMap<String, String>, Vec<String>> {
+    compute_state_groups_in_view(events, auth_chain, StateView::Federated)
+}
+
+fn compute_state_groups_in_view(
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    view: StateView,
+) -> Result<HashMap<String, String>, Vec<String>> {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
     // rooms.
@@ -5366,7 +5374,7 @@ fn compute_state_groups(
 
         // Only a state event produces a new state set.
         let state = match events_by_sid.get(&short_id) {
-            Some(ev) if is_state_event(ev) && !is_rejected_or_soft_failed(ev) => {
+            Some(ev) if is_state_event(ev) && !view.excludes(ev) => {
                 let key = state_key(ev);
                 let state_type = event_string_field(ev, "type").unwrap_or("");
                 let eid = event_id(ev).unwrap_or("").to_owned();
@@ -5468,22 +5476,43 @@ impl StateSet {
 }
 
 /// Check if an event is a state event (has a `state_key` field).
-/// Whether an event is flagged as rejected or soft-failed by a top-level
-/// boolean `true`. Servers annotate this differently, so any leading
-/// underscores are ignored and `-` equals `_`: `__soft-failed`, `_soft-failed`,
-/// `soft-failed`, `soft_failed`, `__rejected`, `_rejected`, and `rejected` all
-/// count. Such an event stays in the DAG but never contributes state.
-fn is_rejected_or_soft_failed(event: &OwnedValue) -> bool {
+/// Whether an event carries a top-level boolean `true` flag named `flag`
+/// (`"rejected"` or `"soft_failed"`). Servers annotate this differently, so
+/// leading underscores are ignored and `-` equals `_`: `__soft-failed`,
+/// `_soft-failed`, `soft-failed`, and `soft_failed` all name the same flag.
+fn has_event_flag(event: &OwnedValue, flag: &str) -> bool {
     let OwnedValue::Object(fields) = event else {
         return false;
     };
     fields.iter().any(|(key, value)| {
         matches!(value, OwnedValue::Static(simd_json::StaticNode::Bool(true)))
-            && matches!(
-                key.trim_start_matches('_').replace('-', "_").as_str(),
-                "rejected" | "soft_failed"
-            )
+            && key.trim_start_matches('_').replace('-', "_") == flag
     })
+}
+
+/// Which view of room state a state group describes.
+///
+/// Federated state is what servers agree on: a soft-failed event is still part
+/// of it. A client never sees soft-failed events, so its state can differ, and
+/// therefore so can its state group. A rejected event fails authorization and
+/// belongs to neither view. Redactions change an event's content but not its
+/// ID, and a state group is keyed by `(type, state_key, event_id)`, so they
+/// affect neither view's group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StateView {
+    Federated,
+    #[allow(
+        dead_code,
+        reason = "the client-visible view, for callers that need it"
+    )]
+    Client,
+}
+
+impl StateView {
+    fn excludes(self, event: &OwnedValue) -> bool {
+        has_event_flag(event, "rejected")
+            || (self == Self::Client && has_event_flag(event, "soft_failed"))
+    }
 }
 
 fn is_state_event(event: &OwnedValue) -> bool {
@@ -7922,8 +7951,8 @@ mod tests {
     }
 
     #[test]
-    fn rejected_and_soft_failed_events_never_contribute_state() {
-        let base = |flag: &str| {
+    fn rejected_events_never_contribute_state_and_soft_failed_only_in_the_client_view() {
+        let groups = |flag: &str, view: super::StateView| {
             let create = owned_value(
                 r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","content":{}}"#,
             );
@@ -7933,31 +7962,40 @@ mod tests {
             let after = owned_value(
                 r#"{"event_id":"$after","room_id":"!r:x","type":"m.room.message","prev_events":["$bad"],"content":{}}"#,
             );
-            compute_state_groups(&[create, flagged, after], &[]).unwrap()
+            super::compute_state_groups_in_view(&[create, flagged, after], &[], view).unwrap()
         };
-        let unflagged = base("");
-        assert_ne!(
-            unflagged["$create"], unflagged["$bad"],
-            "an accepted state event changes the state group"
-        );
+        let federated = super::StateView::Federated;
+        let client = super::StateView::Client;
+        let accepted = groups("", federated);
+        assert_ne!(accepted["$create"], accepted["$bad"]);
+
+        for key in ["__rejected", "_rejected", "rejected"] {
+            for view in [federated, client] {
+                let g = groups(&format!(r#""{key}":true,"#), view);
+                assert_eq!(g["$create"], g["$bad"], "{key} {view:?}");
+                assert_eq!(g["$bad"], g["$after"], "{key} {view:?}");
+            }
+        }
         for key in [
             "__soft-failed",
             "_soft-failed",
             "soft-failed",
+            "soft_failed",
             "__soft_failed",
-            "__rejected",
-            "_rejected",
-            "rejected",
         ] {
-            let groups = base(&format!(r#""{key}":true,"#));
-            assert_eq!(
-                groups["$create"], groups["$bad"],
-                "{key}: a flagged state event must not change state"
-            );
-            assert_eq!(groups["$bad"], groups["$after"], "{key}");
+            let flag = format!(r#""{key}":true,"#);
+            // Federated state keeps the soft-failed event...
+            let fed = groups(&flag, federated);
+            assert_ne!(fed["$create"], fed["$bad"], "{key} federated");
+            assert_eq!(fed["$bad"], fed["$after"], "{key} federated");
+            assert_eq!(fed["$after"], accepted["$after"], "{key} federated");
+            // ...the client view drops it, so the groups differ.
+            let cli = groups(&flag, client);
+            assert_eq!(cli["$create"], cli["$bad"], "{key} client");
+            assert_ne!(fed["$after"], cli["$after"], "{key}");
         }
         // `false` is not a flag.
-        let not_flagged = base(r#""__rejected":false,"#);
+        let not_flagged = groups(r#""__rejected":false,"#, federated);
         assert_ne!(not_flagged["$create"], not_flagged["$bad"]);
     }
 
