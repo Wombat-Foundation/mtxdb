@@ -410,8 +410,10 @@ impl PackfileStorage {
     /// [`Self::get_many_with_refresh`].
     ///
     /// # Errors
-    /// Returns [`StorageError`] if reading the durable index or scanning the
-    /// journal segment fails.
+    /// Propagates errors from the durable read or journal scan. An unresolved
+    /// gap after journal reclamation returns [`StorageError::Corrupt`], or
+    /// [`StorageError::Io`] with `WouldBlock` if checkpoint coverage advanced
+    /// during the reload attempts.
     pub fn get_read_committed(
         &self,
         collection_id: &[u8; 16],

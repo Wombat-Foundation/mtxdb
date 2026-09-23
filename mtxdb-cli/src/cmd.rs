@@ -291,6 +291,8 @@ fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse a collection's 128-bit logical ID from 32 hex digits prefixed by
+/// `0x` or `0X`. Reject missing prefixes, wrong lengths, and invalid hex.
 fn parse_collection_id(value: &str) -> anyhow::Result<[u8; 16]> {
     let hex = value
         .strip_prefix("0x")
@@ -310,6 +312,8 @@ fn parse_collection_id(value: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
+/// Parse a node's 128-bit logical ID from 32 hex digits prefixed by `0x` or
+/// `0X`. Reject missing prefixes, wrong lengths, and invalid hex.
 fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
     let hex = value
         .strip_prefix("0x")
@@ -329,10 +333,9 @@ fn parse_node_id(value: &str) -> anyhow::Result<[u8; 16]> {
     Ok(id)
 }
 
-/// Resolve a node selector: a `0x`-prefixed logical ID (the engine's
-/// template-independent form), or a Matrix event ID carrying the Matrix
-/// profile's event sigil `$` — a *template* property, not an engine constant.
-/// `$id` uses the same BLAKE3-128 identity rule as CLI-imported records.
+/// Resolve a `0x`-prefixed logical ID or hash the part of a `$`-prefixed
+/// Matrix event selector after its sigil with BLAKE3, truncating to 128 bits.
+/// A malformed logical ID returns the error from [`parse_node_id`].
 fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
     if let Some(event_id) = id.strip_prefix('$') {
         matrix_event_node_id(event_id)
@@ -350,10 +353,10 @@ fn blake3_digest(data: &[u8]) -> [u8; 32] {
     mtxdb::content_digest(DigestAlgorithm::Blake3, data)
 }
 
-/// The Matrix import template's accepted identity algorithm: BLAKE3 truncated
-/// to the 128-bit node ID used by the packfile index. Repack edge extraction,
-/// `--root`, and CLI-imported collections use this same derivation — distinct
-/// from the same BLAKE3-128 identity rule used by record imports.
+/// Derive a 128-bit lookup ID from the BLAKE3 digest of the complete event ID
+/// supplied by the caller, including any `$` sigil. Repack edge extraction,
+/// `--root`, and Matrix records imported with the bundled template use this
+/// same derivation.
 fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
     derive_template_key("blake3-128", event_id)
 }
