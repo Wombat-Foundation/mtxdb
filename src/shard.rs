@@ -51,6 +51,12 @@ pub const MAX_SHARD_BYTES: u64 = crate::index::IndexEntry::MAX_OFFSET;
 /// persistence once at commit). The default [`AppendPolicy`] is
 /// [`AppendPolicy::Eager`], so this threshold only applies to pools opened
 /// with [`AppendPolicy::Buffered`].
+///
+/// The buffer is per shard, so the pool's buffered-memory commitment is this
+/// threshold times the number of shards holding unflushed data. That product
+/// is a worst-case upper bound, not a standing footprint: only a shard whose
+/// buffer is currently near full contributes this much, and `MAX_SHARDS`
+/// bounds how many can do so at once.
 pub(crate) const PENDING_FLUSH_BYTES: usize = 1 << 20;
 
 /// When a shard's appended frames are written to its underlying pack file.
