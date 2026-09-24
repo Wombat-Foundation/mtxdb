@@ -1412,20 +1412,22 @@ impl Journal {
     }
 
     /// Like [`Self::open_shared`], but when the segment is first created its
-    /// LSN space begins at `base_lsn` rather than 1.
+    /// LSN space begins at `base_lsn` rather than 1. An existing segment
+    /// ignores `base_lsn` and keeps its own.
     ///
-    /// A database root that was previously driven through per-pool journals is
-    /// opened onto one fresh shared segment, but its pools carry durable
-    /// coverage (`journal.lsn`) in each per-pool LSN space. Starting the shared
-    /// segment above every one of those watermarks keeps all per-pool coverage
-    /// values meaningful in the new, single shared LSN space: a rebuilt shared
-    /// segment can neither replay past a pool's legacy coverage nor let reclaim
-    /// drop a fresh frame that only looks covered because the numbering
-    /// restarted. An existing segment ignores `base_lsn` and keeps its own.
+    /// Internal to the root-level open path: an arbitrary `base_lsn` would let
+    /// a caller create a segment whose numbering does not line up with the
+    /// pools' recorded coverage, so this is not public. Callers that open a
+    /// database root should go through
+    /// [`crate::database::SharedDatabase::open`], which computes the seed from
+    /// the pools' `journal.lsn` and passes it here.
     ///
     /// # Errors
     /// Same as [`Self::open_shared`].
-    pub fn open_shared_seeded(path: impl AsRef<Path>, base_lsn: u64) -> io::Result<(Self, Scan)> {
+    pub(crate) fn open_shared_with_base(
+        path: impl AsRef<Path>,
+        base_lsn: u64,
+    ) -> io::Result<(Self, Scan)> {
         Self::open_versioned(path, JournalVersion::shared(), base_lsn.max(1))
     }
 

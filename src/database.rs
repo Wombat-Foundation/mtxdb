@@ -12,7 +12,7 @@
 //! onto a fresh root-level shared segment, and its old `pools/*/wal.bin`
 //! files are assumed already checkpointed and are ignored. The fresh segment's
 //! LSN space is seeded above every per-pool `journal.lsn` so the legacy
-//! coverage values stay meaningful; see [`shared_wal_seed_lsn`]. Callers that
+//! coverage values stay meaningful; see `shared_wal_seed_lsn`. Callers that
 //! need to drive a single pool directly can still use
 //! [`crate::journal::SharedWalLock`] with
 //! [`PackfileStorage::enable_shared_journal`](crate::PackfileStorage::enable_shared_journal).
@@ -52,7 +52,7 @@ impl SharedDatabase {
         let wal_path = layout.shared_wal_path();
         let lock = SharedWalLock::acquire(layout.root())?;
         let seed_lsn = shared_wal_seed_lsn(&layout)?;
-        let (journal, scan) = Journal::open_shared_seeded(&wal_path, seed_lsn)?;
+        let (journal, scan) = Journal::open_shared_with_base(&wal_path, seed_lsn)?;
         let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
 
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
@@ -105,13 +105,14 @@ impl SharedDatabase {
 /// frame that only looks covered because numbering restarted. Returns `1` for a
 /// root with no recorded coverage (a brand-new database).
 ///
-/// This is the seed [`Journal::open_shared_seeded`] consumes; a caller that
-/// opens the shared segment itself (the Synapse binding) should use the same
-/// value rather than the default `open_shared` base of `1`.
+/// This is the seed `Journal::open_shared_with_base` consumes; it is kept
+/// internal so a caller cannot create a shared segment with an arbitrary base
+/// that disagrees with the pools' recorded coverage. Open a root through
+/// [`SharedDatabase::open`] instead.
 ///
 /// # Errors
 /// Returns an error if a pool directory cannot be created or read.
-pub fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> Result<u64, StorageError> {
+pub(crate) fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> Result<u64, StorageError> {
     let mut watermark = 0_u64;
     for shard in ShardType::ALL {
         let dir = layout.pool_dir(shard)?;
