@@ -41,7 +41,7 @@ use super::format::{
 };
 
 /// Magic identifying the persisted-index checkpoint format.
-pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
+pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// Current wire version (see [`CheckpointHeader::version`]).
 ///
 /// Bumped to 6: the header carries a pack table (`slot -> pack_id`

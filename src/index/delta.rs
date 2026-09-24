@@ -21,11 +21,11 @@
 //! # Layout (all little-endian):
 //!
 //! ```text
-//!   [DeltaLogHeader 16B]       magic "MDLG" | version | reserved | base_fingerprint
-//!   [DeltaBatchHeader 8B]      magic "MDLB" | frame_count
+//!   [DeltaLogHeader 16B]       magic "MTXL" | version | reserved | base_fingerprint
+//!   [DeltaBatchHeader 8B]      magic "MTXB" | frame_count
 //!   [v2: DeltaFrame * frame_count] fixed 36B records
 //!   [v3: framed collection operations] variable-width records
-//!   [DeltaLogTrailer 16B]      magic "DLTR" | reserved | tail_fingerprint
+//!   [DeltaLogTrailer 16B]      magic "MTXT" | reserved | tail_fingerprint
 //!   [DeltaBatchHeader ..]*     -- further batches, each count-framed and trailer-terminated
 //! ```
 //!
@@ -60,7 +60,7 @@ pub const DELTA_LOG_TRAILER_LEN: usize = 16;
 /// own cap so it never rejects a real log.
 const MAX_DELTA_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
-const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
+const DELTA_LOG_MAGIC: &[u8; 4] = b"MTXL";
 /// Current wire version (see the header's version byte).
 ///
 /// v2 repurposes the trailer's 4 reserved bytes as a CRC32 covering the
@@ -73,8 +73,8 @@ const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
 const DELTA_LOG_VERSION: u8 = 2;
 /// Current v3 delta-log version, with variable-length collection operations.
 const DELTA_LOG_VERSION_V3: u8 = 3;
-const DELTA_BATCH_MAGIC: &[u8; 4] = b"MDLB";
-const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"DLTR";
+const DELTA_BATCH_MAGIC: &[u8; 4] = b"MTXB";
+const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"MTXT";
 
 const BASE_FINGERPRINT_OFFSET: usize = 8;
 const TRAILER_FINGERPRINT_OFFSET: usize = 8;

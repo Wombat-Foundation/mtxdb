@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(DeltaFrame::decode(&delta.encode()), Some(delta));
 
         let header = CheckpointHeader {
-            magic: *b"MTXIDX01",
+            magic: *b"MTXI0001",
             version: 4,
             collection_count: 2,
             directory_bytes: 112,

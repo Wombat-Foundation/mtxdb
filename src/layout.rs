@@ -22,10 +22,10 @@ use std::path::{Path, PathBuf};
 /// points validate this root and open their selected named pool through this
 /// type; [`PackfileStorage`](crate::PackfileStorage) remains available as a
 /// lower-level single-pool API.
-const DB_META_MAGIC: &[u8; 4] = b"MDBD";
+const DB_META_MAGIC: &[u8; 4] = b"MTXD";
 const DB_META_VERSION: u8 = 1;
 const DB_META_RESERVED_LEN: usize = 8;
-const DB_META_POOL_LIST: &[u8] = b"state\nevent-dag\nedges\n";
+const DB_META_POOL_LIST: &[u8] = b"state\nevent\nedges\n";
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
@@ -183,7 +183,7 @@ impl ShardType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::State => "state",
-            Self::EventDag => "event-dag",
+            Self::EventDag => "event",
             Self::Edges => "edges",
         }
     }
@@ -426,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             layout.pool_dir(ShardType::EventDag).unwrap(),
-            root.join("pools/event-dag")
+            root.join("pools/event")
         );
         assert_eq!(
             layout.pool_dir(ShardType::Edges).unwrap(),
@@ -468,7 +468,7 @@ mod tests {
     fn rejects_a_truncated_descriptor() {
         let root = test_dir("truncated_descriptor");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(DB_META_FILENAME), b"MDBD").unwrap();
+        fs::write(root.join(DB_META_FILENAME), b"MTXD").unwrap();
         let err = DatabaseLayout::open(root).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }

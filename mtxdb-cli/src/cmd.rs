@@ -243,7 +243,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
-        Commands::Info { collection, .. } => cmd_info(cli, collection),
+        Commands::Info { collection, stats } => match collection {
+            Some(collection) => cmd_info(cli, collection),
+            None => cmd_info_default(cli, *stats),
+        },
         Commands::Scan {
             selector,
             verbose,
@@ -650,7 +653,7 @@ fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
 
 /// A collection ID not found under `cli.shard_type` is often just in one of
 /// the *other* independent shard-type pools (`-t`/`--shard-type` defaults
-/// to `event-dag`, so a `state`-only collection ID "not found" there is the
+/// to `event`, so a `state`-only collection ID "not found" there is the
 /// single most common `scan`/`info` support question). Cheaply checks each
 /// other pool's persisted sidecar (no full-scan fallback, no index rebuild)
 /// and, if any has it, returns a one-line hint naming them; `String::new()`
@@ -1576,7 +1579,7 @@ fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Resolve the pool set for commands that can list every independent pool.
-/// An explicit `--all` must override the CLI's default `event-dag` selection;
+/// An explicit `--all` must override the CLI's default `event` selection;
 /// otherwise `collections --all`/`shards --all` silently list only one pool.
 fn listing_shard_types(cli: &Cli, all: bool) -> Vec<ShardType> {
     if all {
@@ -2294,7 +2297,7 @@ const SECTION_RULE: &str =
 
 /// Prints one `--all` section's fenced header: a rule, an uppercased
 /// `-- NAME --` banner (hyphens in the pool's directory name become spaces,
-/// e.g. `event-dag` -> `EVENT DAG`), another rule, then a blank line.
+/// e.g. `event` -> `EVENT`), another rule, then a blank line.
 fn print_section_header(shard_type: ShardType) {
     let banner = shard_type.as_str().replace('-', " ").to_uppercase();
     println!("{SECTION_RULE}");
@@ -2615,7 +2618,7 @@ fn cmd_shards_coalesced(
 
 fn cmd_shards_single(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     // See the matching comment in `cmd_collections`: `-t all` must behave
-    // like `--all`, not list only the default event-dag pool.
+    // like `--all`, not list only the default event pool.
     if all || cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let types = listing_shard_types(cli, all);
@@ -3891,6 +3894,126 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Show the small, human-facing database and pool metadata summary used when
+/// `info` has no selector. This deliberately reads headers and sidecar sizes
+/// without opening a writer or scanning pack payloads.
+fn cmd_info_default(cli: &Cli, stats: bool) -> anyhow::Result<()> {
+    if cli.coalesce {
+        let valid_dirs = valid_database_dirs(cli)?;
+        if valid_dirs.len() > 1 {
+            for (index, dir) in valid_dirs.iter().enumerate() {
+                if index != 0 {
+                    println!();
+                    println!();
+                }
+                println!("=== Database: {} ===", dir.display());
+                cmd_info_default(&cli.with_dir(dir.clone()), stats)?;
+            }
+            return Ok(());
+        }
+    }
+    run_multi_dir(cli, |sub_cli| cmd_info_default_single(sub_cli, stats))
+}
+
+fn metadata_file_summary(path: &Path) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return "missing".to_owned();
+    };
+    let magic = bytes.get(..4).map_or_else(
+        || "<short>".to_owned(),
+        |raw| String::from_utf8_lossy(raw).into_owned(),
+    );
+    let version = bytes
+        .get(4)
+        .map_or_else(|| "?".to_owned(), std::string::ToString::to_string);
+    format!(
+        "valid-looking magic={magic:?} version={version} ({} bytes)",
+        bytes.len()
+    )
+}
+
+fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let root = cli.single_dir();
+    let db_meta = root.join(mtxdb::layout::DB_META_FILENAME);
+    let wal = match layout.wal_layout() {
+        mtxdb::layout::WalLayout::Shared => "shared",
+        mtxdb::layout::WalLayout::PerPool => "per-pool",
+    };
+
+    println!("database: {}", root.display());
+    println!("  db.meta:      {}", metadata_file_summary(&db_meta));
+    println!("  wal layout:   {wal}");
+    println!();
+
+    for (index, shard_type) in cli.shard_types().enumerate() {
+        if index != 0 {
+            println!();
+        }
+        let dir = pool_dir(&layout, shard_type)?;
+        let packs = glob_pack_files(&dir)?;
+        let pack_bytes = packs.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
+        let collection_count =
+            PackfileStorage::collection_summaries_from_disk(&dir).map(|summaries| summaries.len());
+        let checkpoint = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
+        let delta = dir.join(mtxdb::index::delta::INDEX_DELTA_FILE);
+
+        println!("pool: {} ({})", shard_type.as_str(), dir.display());
+        println!(
+            "  pool.meta:    {}",
+            metadata_file_summary(&dir.join("pool.meta"))
+        );
+        println!(
+            "  store.meta:   {}",
+            metadata_file_summary(&dir.join("store.meta"))
+        );
+        println!(
+            "  packs:        {} ({})",
+            packs.len(),
+            fmt_bytes(pack_bytes)
+        );
+        println!(
+            "  collections:  {}",
+            collection_count.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+        );
+        println!(
+            "  index:        checkpoint={} delta={}",
+            if checkpoint.is_file() {
+                fmt_bytes(fs::metadata(&checkpoint)?.len())
+            } else {
+                "missing".to_owned()
+            },
+            if delta.is_file() {
+                fmt_bytes(fs::metadata(&delta)?.len())
+            } else {
+                "missing".to_owned()
+            }
+        );
+        println!(
+            "  shard sidecars: stats={} collections={}",
+            if dir.join("shard_stats.bin").is_file() {
+                "present"
+            } else {
+                "missing"
+            },
+            if dir.join("shard_collections.bin").is_file() {
+                "present"
+            } else {
+                "missing"
+            }
+        );
+
+        if stats {
+            let (runtime, summaries) = read_stats_for_dir(&dir)?;
+            println!("  stats:        {} pack summaries", summaries.len());
+            if let Some(timing) = runtime.last_open_timings {
+                println!("  open path:    {}", open_path_label(timing.path));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
@@ -6410,8 +6533,8 @@ fn cmd_import_file(
 
         // Import auth chain events into the edges shard pool.
         if !federation.auth_chain.is_empty() {
-            // Derive the edges pool dir from the event-dag pool dir.
-            // pool_dir is {root}/pools/event-dag; edges is {root}/pools/edges.
+            // Derive the edges pool dir from the event pool dir.
+            // pool_dir is {root}/pools/event; edges is {root}/pools/edges.
             let edges_dir = dir
                 .parent()
                 .map(|p| p.join("edges"))
@@ -8745,7 +8868,7 @@ mod tests {
             shard_type: None,
             coalesce: false,
             command: Commands::Info {
-                collection: String::new(),
+                collection: Some(String::new()),
                 stats: false,
             },
         };
@@ -9001,7 +9124,7 @@ mod tests {
             shard_type: None,
             coalesce: false,
             command: Commands::Info {
-                collection: col_hex.clone(),
+                collection: Some(col_hex.clone()),
                 stats: false,
             },
         };
@@ -9270,7 +9393,7 @@ mod tests {
     #[test]
     fn auth_chain_reimport_writes_nothing_new() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let input = root.join("export.json");
@@ -9335,7 +9458,7 @@ mod tests {
     #[test]
     fn import_establishment_persists_the_matrix_extension() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let input = root.join("export.json");
@@ -9697,7 +9820,7 @@ mod tests {
     #[test]
     fn import_v12_followup_batch_lands_in_the_create_collection() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let template = default_matrix_import_template();
@@ -9781,7 +9904,7 @@ mod tests {
     #[test]
     fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let template = default_matrix_import_template();
@@ -11017,7 +11140,7 @@ mod tests {
             shard_type: Some(ShardType::EventDag),
             coalesce: true,
             command: Commands::Info {
-                collection: format_id(&col1),
+                collection: Some(format_id(&col1)),
                 stats: false,
             },
         };

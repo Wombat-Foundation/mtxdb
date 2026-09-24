@@ -104,7 +104,7 @@ pub(crate) enum Commands {
         json: bool,
     },
     Info {
-        collection: String,
+        collection: Option<String>,
         stats: bool,
     },
     Scan {
@@ -241,7 +241,7 @@ fn global_args(cmd: Command) -> Command {
             .env("MTXDB_SHARD_TYPE")
             .value_name("TYPE")
             .default_value("events")
-            .value_parser(["state", "events", "event-dag", "edges", "all"])
+            .value_parser(["state", "event", "events", "event-dag", "edges", "all"])
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on (use 'all' to target every pool)"),
@@ -322,11 +322,7 @@ fn sort_arg(help: &'static str) -> Arg {
 }
 
 fn sub_init() -> Command {
-    Command::new("init").about(
-        "Create a new mtxdb database root (db.meta + a directory per shard pool). \
-         The only command that creates a store -- every other command errors \
-         if it doesn't already exist.",
-    )
+    Command::new("init").about("Create a new mtxdb database root (db.meta + pools).")
 }
 
 fn sub_subprocess_writer() -> Command {
@@ -457,12 +453,12 @@ fn sub_info() -> Command {
         .about("Show storage info for a collection or a pack")
         .arg(
             Arg::new("collection")
-                .required(true)
+                .required(false)
                 .value_name("PACK_ID|COLLECTION")
                 .help(
                     "A `0x`-prefixed collection ID (32 hex digits after `0x`) or a pack ID \
-                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits) — e.g. `mtxdb info \
-                     0x0102030405060708090a0b0c0d0e0f10` or `mtxdb info 0x1`",
+                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits). Omit it to \
+                     show database and pool metadata.",
                 ),
         )
         .arg(
@@ -667,7 +663,7 @@ fn parse_cli() -> Cli {
         .expect("clap supplies the default shard type")
     {
         "state" => Some(ShardType::State),
-        "events" | "event-dag" => Some(ShardType::EventDag),
+        "event" | "events" | "event-dag" => Some(ShardType::EventDag),
         "edges" => Some(ShardType::Edges),
         "all" => None,
         _ => unreachable!("clap validates shard type"),
@@ -709,7 +705,7 @@ fn parse_cli() -> Cli {
             json: m.get_flag("json"),
         },
         Some(("info", m)) => Commands::Info {
-            collection: m.get_one::<String>("collection").unwrap().clone(),
+            collection: m.get_one::<String>("collection").cloned(),
             stats: m.get_flag("stats"),
         },
         Some(("scan", m)) => Commands::Scan {

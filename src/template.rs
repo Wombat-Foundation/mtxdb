@@ -377,10 +377,14 @@ pub fn try_derive_collection_id(
 /// Derive a collection's 128-bit logical ID from its optional member namespace
 /// and group canonical ID (e.g. `b"!room:server"`).
 ///
+/// Convenience helper intended for static, compile-time registered namespaces
+/// (such as `Some(MEMBER_NAMESPACE_EVNT)` or `None`).
+///
 /// # Panics
 /// Panics if `member_namespace` is `Some(ns)` and `ns` is not a registered member
 /// namespace (`EVNT`, `PREV`, `AUTH`, `STAT`, `INTL`).
 /// Physical pool tags like `b"EDGE"` must **never** be passed here.
+/// For fallible callers handling untrusted or dynamic input, use [`try_derive_collection_id`].
 #[must_use]
 pub fn derive_collection_id(
     member_namespace: Option<[u8; 4]>,
@@ -823,7 +827,11 @@ impl CollectionMetadata {
         let mut reader = TlvReader::new(bytes);
         while let Some((tag, value)) = reader.next() {
             match tag {
-                META_TAG_MEMBER_NAMESPACE => meta.member_namespace = Some(value.try_into().ok()?),
+                META_TAG_MEMBER_NAMESPACE => {
+                    let ns: [u8; 4] = value.try_into().ok()?;
+                    namespace_bias(ns)?;
+                    meta.member_namespace = Some(ns);
+                }
                 META_TAG_COLLECTION_CANONICAL_ID => {
                     meta.collection_canonical_id = value.to_vec();
                     has_canonical_id = true;
@@ -1659,6 +1667,7 @@ mod tests {
             try_derive_collection_id(Some(*b"EDGE"), b"!room:example.com"),
             None
         );
+        assert!(CollectionMetadata::decode(&meta_edge.encode()).is_none());
     }
 
     #[test]
