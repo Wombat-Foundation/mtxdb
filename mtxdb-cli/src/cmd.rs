@@ -168,13 +168,19 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection,
             id,
             data,
-        } => cmd_put(cli, collection, id, data),
+        } => {
+            cli.require_single_dir("put")?;
+            cmd_put(cli, collection, id, data)
+        }
         Commands::Get {
             collection,
             id,
             raw,
             verbose,
-        } => cmd_get(cli, collection.as_deref(), id, *raw, *verbose),
+        } => {
+            cli.require_single_dir("get")?;
+            cmd_get(cli, collection.as_deref(), id, *raw, *verbose)
+        }
         Commands::Collections {
             all,
             layout,
@@ -209,19 +215,34 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             paths,
             collection,
             template,
-        } => cmd_import(cli, paths, collection.as_deref(), template.as_deref()),
-        Commands::Export { collection } => cmd_export(cli, collection),
+        } => {
+            cli.require_single_dir("import")?;
+            cmd_import(cli, paths, collection.as_deref(), template.as_deref())
+        }
+        Commands::Export { collection } => {
+            cli.require_single_dir("export")?;
+            cmd_export(cli, collection)
+        }
         Commands::Repack {
             collection,
             packs,
             all,
             root,
             topo,
-        } => cmd_repack(cli, collection.as_deref(), packs, *all, root, *topo),
-        Commands::Delete { collections, yes } => cmd_delete(cli, collections, *yes),
+        } => {
+            cli.require_single_dir("repack")?;
+            cmd_repack(cli, collection.as_deref(), packs, *all, root, *topo)
+        }
+        Commands::Delete { collections, yes } => {
+            cli.require_single_dir("delete")?;
+            cmd_delete(cli, collections, *yes)
+        }
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         Commands::Sync { all } => cmd_sync(cli, *all),
-        Commands::Init => cmd_init(cli),
+        Commands::Init => {
+            cli.require_single_dir("init")?;
+            cmd_init(cli)
+        }
         Commands::SubprocessWriter { path } | Commands::SubprocessWriterAppend { path } => {
             cmd_subprocess_writer(path, true, false)
         }
@@ -275,7 +296,7 @@ fn cmd_subprocess_reader(path: &str) -> anyhow::Result<()> {
 /// into existence -- every other command resolves the root read-only (see
 /// `open_layout`) and errors instead of creating one on the fly.
 fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
-    let root = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    let root = cli.single_dir();
     let already_initialized = root.join("db.meta").is_file();
     DatabaseLayout::open(root.into()).with_context(|| {
         format!(
@@ -402,13 +423,68 @@ fn open_store_read_only(cli: &Cli) -> anyhow::Result<PackfileStorage> {
 /// pointing the CLI at a path (see `cmd_init`). A missing root is a clear
 /// error pointing at `mtxdb init`, not silent on-disk state.
 fn open_layout(cli: &Cli) -> anyhow::Result<DatabaseLayout> {
-    let root = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
+    let root = cli.single_dir();
     DatabaseLayout::open_read_only(root.into()).with_context(|| {
         format!(
             "no mtxdb database at `{}` -- run `mtxdb init` first",
             root.display()
         )
     })
+}
+
+/// Run a command over all targeted database roots.
+///
+/// When a single directory (or default `.`) is targeted, runs `f` directly.
+/// When multiple directories are targeted (e.g. `mtxdb shards -d *`), iterates over each,
+/// printing a section header for each database root and skipping non-databases with a note.
+fn run_multi_dir<F>(cli: &Cli, mut f: F) -> anyhow::Result<()>
+where
+    F: FnMut(&Cli) -> anyhow::Result<()>,
+{
+    let dirs = cli.dirs_or_default();
+    if dirs.len() <= 1 {
+        return f(cli);
+    }
+
+    let mut executed: usize = 0;
+    let mut failed: usize = 0;
+    for dir in &dirs {
+        if !dir.is_dir() {
+            eprintln!("skipping `{}`: not a directory", dir.display());
+            continue;
+        }
+        if !dir.join("db.meta").is_file() {
+            eprintln!(
+                "skipping `{}`: no db.meta found (not an mtxdb database)",
+                dir.display()
+            );
+            continue;
+        }
+
+        if executed > 0 {
+            println!();
+            println!();
+        }
+        println!("=== Database: {} ===", dir.display());
+        executed = executed.saturating_add(1);
+
+        let sub_cli = cli.with_dir(dir.clone());
+        if let Err(error) = f(&sub_cli) {
+            eprintln!("Error: {error:#}");
+            failed = failed.saturating_add(1);
+        }
+    }
+
+    if executed == 0 {
+        bail!(
+            "none of the {} specified targets are mtxdb databases",
+            dirs.len()
+        );
+    }
+    if failed == executed {
+        bail!("all {executed} database targets failed");
+    }
+    Ok(())
 }
 
 fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<PathBuf> {
@@ -1096,6 +1172,19 @@ fn cmd_collections(
     sort: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| {
+        cmd_collections_single(sub_cli, all, layout, canonical, sort, limit)
+    })
+}
+
+fn cmd_collections_single(
+    cli: &Cli,
+    all: bool,
+    layout: bool,
+    canonical: bool,
+    sort: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<()> {
     // `--all` explicitly asks for every pool; `-t all` (no specific shard
     // type selected) means the same thing.
     if all || cli.shard_type.is_none() {
@@ -1495,6 +1584,10 @@ fn print_pack_physical_layout(
 }
 
 fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_shards_single(sub_cli, all, layout, sort))
+}
+
+fn cmd_shards_single(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     // See the matching comment in `cmd_collections`: `-t all` must behave
     // like `--all`, not list only the default event-dag pool.
     if all || cli.shard_type.is_none() {
@@ -1547,6 +1640,10 @@ fn cmd_stats_in_dir(dir: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_stats_single(sub_cli, json))
+}
+
+fn cmd_stats_single(cli: &Cli, json: bool) -> anyhow::Result<()> {
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let types: Vec<ShardType> = cli.shard_types().collect();
@@ -2508,6 +2605,10 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
 }
 
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector))
+}
+
+fn cmd_info_single(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let deep = matches!(cli.command, Commands::Info { stats: true, .. });
     match classify_info_selector(selector)? {
         InfoTarget::Pack => cmd_info_pack(cli, selector),
@@ -3536,6 +3637,28 @@ impl ScanOptions {
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
 fn cmd_scan(
+    cli: &Cli,
+    selector: &str,
+    verbose: bool,
+    limit: i64,
+    id: Option<&str>,
+    collection: Option<&str>,
+    raw: bool,
+    sort: Option<&str>,
+    reverse: bool,
+) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| {
+        cmd_scan_single(
+            sub_cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+        )
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "maps 1:1 to CLI args before building ScanOptions"
+)]
+fn cmd_scan_single(
     cli: &Cli,
     selector: &str,
     verbose: bool,
@@ -6291,6 +6414,10 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
 /// writer process has never called `sync_all`, or just refreshing them
 /// on demand.
 fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_sync_single(sub_cli, all))
+}
+
+fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
     if all {
         let db_layout = open_layout(cli)?;
         for shard_type in ShardType::ALL {
@@ -6423,7 +6550,7 @@ mod tests {
         let dir = unique_temp_dir();
         let layout = DatabaseLayout::open(dir.clone()).unwrap();
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: Some(ShardType::State),
             command: Commands::Sync { all: true },
         };
@@ -6449,7 +6576,7 @@ mod tests {
         // `require_shard_type` reject `collections`/`shards` even though
         // `-t all` completes and parses as a legitimate value.
         let cli = Cli {
-            dir: None,
+            dirs: Vec::new(),
             shard_type: None,
             command: Commands::Collections {
                 all: false,
@@ -6468,7 +6595,7 @@ mod tests {
     #[test]
     fn shard_types_yields_just_the_selected_type() {
         let cli = Cli {
-            dir: None,
+            dirs: Vec::new(),
             shard_type: Some(ShardType::State),
             command: Commands::Collections {
                 all: false,
@@ -6487,7 +6614,7 @@ mod tests {
     #[test]
     fn listing_all_overrides_the_default_pool_selection() {
         let cli = Cli {
-            dir: None,
+            dirs: Vec::new(),
             shard_type: Some(ShardType::EventDag),
             command: Commands::Collections {
                 all: true,
@@ -6509,7 +6636,7 @@ mod tests {
         let dir = unique_temp_dir();
         DatabaseLayout::open(dir.clone()).unwrap();
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: None,
             command: Commands::Collections {
                 all: false,
@@ -6530,7 +6657,7 @@ mod tests {
         let dir = unique_temp_dir();
         DatabaseLayout::open(dir.clone()).unwrap();
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: None,
             command: Commands::Shards {
                 all: false,
@@ -6552,7 +6679,7 @@ mod tests {
         let dir = unique_temp_dir();
         DatabaseLayout::open(dir.clone()).unwrap();
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: Some(ShardType::State),
             command: Commands::Collections {
                 all: false,
@@ -6573,7 +6700,7 @@ mod tests {
         let dir = unique_temp_dir();
         DatabaseLayout::open(dir.clone()).unwrap();
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: None,
             command: Commands::Stats { json: false },
         };
@@ -6585,7 +6712,7 @@ mod tests {
     #[test]
     fn info_explains_a_malformed_hex_selector() {
         let cli = Cli {
-            dir: None,
+            dirs: Vec::new(),
             shard_type: None,
             command: Commands::Info {
                 collection: String::new(),
@@ -6696,7 +6823,7 @@ mod tests {
         let node_hex = format_id(&node_id);
 
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: None,
             command: Commands::Get {
                 collection: None,
@@ -6726,7 +6853,7 @@ mod tests {
 
         let col_hex = format_id(&col_id);
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: None,
             command: Commands::Info {
                 collection: col_hex.clone(),
@@ -6752,7 +6879,7 @@ mod tests {
 
         let col_hex = format_id(&col_id);
         let cli = Cli {
-            dir: Some(dir.clone()),
+            dirs: vec![dir.clone()],
             shard_type: None,
             command: Commands::Scan {
                 selector: col_hex.clone(),
@@ -8405,6 +8532,51 @@ mod tests {
         assert_eq!(
             matrix_room_collection_id(room_id),
             derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
+        );
+    }
+
+    #[test]
+    fn multi_dir_shards_iterates_all_databases() {
+        let dir1 = unique_temp_dir();
+        let dir2 = unique_temp_dir();
+        DatabaseLayout::open(dir1.clone()).unwrap();
+        DatabaseLayout::open(dir2.clone()).unwrap();
+
+        let cli = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: None,
+            command: Commands::Shards {
+                all: false,
+                layout: false,
+                sort: None,
+            },
+        };
+
+        cmd_shards(&cli, false, false, None).unwrap();
+
+        std::fs::remove_dir_all(&dir1).unwrap();
+        std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn mutating_command_rejects_multi_dir() {
+        let dir1 = unique_temp_dir();
+        let dir2 = unique_temp_dir();
+        let cli = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: None,
+            command: Commands::Put {
+                collection: "0x0102030405060708090a0b0c0d0e0f10".to_owned(),
+                id: "0x0102030405060708090a0b0c0d0e0f10".to_owned(),
+                data: "test".to_owned(),
+            },
+        };
+
+        let err = super::run(&cli).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("accepts only a single --dir target"),
+            "{err}"
         );
     }
 }

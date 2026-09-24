@@ -8,8 +8,9 @@ use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
 use mtxdb::ShardType;
 
+#[derive(Clone)]
 pub(crate) struct Cli {
-    pub(crate) dir: Option<PathBuf>,
+    pub(crate) dirs: Vec<PathBuf>,
     pub(crate) shard_type: Option<ShardType>,
     pub(crate) command: Commands,
 }
@@ -32,8 +33,45 @@ impl Cli {
                 .flatten(),
         )
     }
+
+    /// Return the single directory target or the default ".", bailing if multiple were specified.
+    pub(crate) fn require_single_dir(&self, cmd: &str) -> anyhow::Result<&std::path::Path> {
+        if self.dirs.len() > 1 {
+            anyhow::bail!(
+                "`mtxdb {cmd}` accepts only a single --dir target, but {} were provided",
+                self.dirs.len()
+            );
+        }
+        Ok(self.single_dir())
+    }
+
+    /// Return the first directory target or the default ".".
+    pub(crate) fn single_dir(&self) -> &std::path::Path {
+        self.dirs
+            .first()
+            .map_or_else(|| std::path::Path::new("."), PathBuf::as_path)
+    }
+
+    /// Return all target directories, defaulting to `["."]` if none were specified.
+    pub(crate) fn dirs_or_default(&self) -> Vec<PathBuf> {
+        if self.dirs.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            self.dirs.clone()
+        }
+    }
+
+    /// Create a clone targeting a single specific directory.
+    pub(crate) fn with_dir(&self, dir: PathBuf) -> Self {
+        Self {
+            dirs: vec![dir],
+            shard_type: self.shard_type,
+            command: self.command.clone(),
+        }
+    }
 }
 
+#[derive(Clone)]
 pub(crate) enum Commands {
     Put {
         collection: String,
@@ -124,7 +162,7 @@ pub(crate) enum Commands {
 }
 
 fn build_cli() -> Command {
-    global_args(Command::new("mtxdb"))
+    global_args(Command::new("mtxdb").subcommand_precedence_over_arg(true))
         .version(concat!(
             env!("CARGO_PKG_VERSION"),
             " (",
@@ -175,6 +213,8 @@ fn global_args(cmd: Command) -> Command {
             .long("dir")
             .env("MTXDB_DIR")
             .value_name("DIR")
+            .action(ArgAction::Append)
+            .num_args(1..)
             .global(true)
             .help("Database root directory"),
     )
@@ -559,7 +599,10 @@ fn parse_cli() -> Cli {
         std::process::exit(0);
     }
 
-    let dir = matches.get_one::<String>("dir").map(PathBuf::from);
+    let dirs: Vec<PathBuf> = matches
+        .get_many::<String>("dir")
+        .map(|vals| vals.map(PathBuf::from).collect())
+        .unwrap_or_default();
     let shard_type = match matches
         .get_one::<String>("shard_type")
         .map(String::as_str)
@@ -687,7 +730,7 @@ fn parse_cli() -> Cli {
     };
 
     Cli {
-        dir,
+        dirs,
         shard_type,
         command,
     }
@@ -742,5 +785,61 @@ fn main() -> std::process::ExitCode {
             eprintln!("Error: {error:#}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn test_dir_parsing() {
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2"])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2"])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2", "-a"])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+
+        let m = build_cli()
+            .try_get_matches_from([
+                "mtxdb",
+                "scan",
+                "0x0102030405060708090a0b0c0d0e0f10",
+                "-d",
+                "dir1",
+                "dir2",
+            ])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+        assert_eq!(m.subcommand_name(), Some("scan"));
     }
 }
