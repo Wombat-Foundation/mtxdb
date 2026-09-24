@@ -20,7 +20,7 @@ impl Cli {
     /// Return the single selected shard type, or bail if `-t all` was used.
     pub(crate) fn require_shard_type(&self) -> anyhow::Result<ShardType> {
         self.shard_type.context(
-            "this command requires a specific shard type (-t state, -t event-dag, or -t auth-chain)",
+            "this command requires a specific shard type (-t state, -t events, or -t edges)",
         )
     }
 
@@ -240,8 +240,8 @@ fn global_args(cmd: Command) -> Command {
             .long("shard-type")
             .env("MTXDB_SHARD_TYPE")
             .value_name("TYPE")
-            .default_value("event-dag")
-            .value_parser(["state", "event-dag", "auth-chain", "all"])
+            .default_value("events")
+            .value_parser(["state", "events", "event-dag", "edges", "all"])
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on (use 'all' to target every pool)"),
@@ -667,8 +667,8 @@ fn parse_cli() -> Cli {
         .expect("clap supplies the default shard type")
     {
         "state" => Some(ShardType::State),
-        "event-dag" => Some(ShardType::EventDag),
-        "auth-chain" => Some(ShardType::AuthChain),
+        "events" | "event-dag" => Some(ShardType::EventDag),
+        "edges" => Some(ShardType::Edges),
         "all" => None,
         _ => unreachable!("clap validates shard type"),
     };

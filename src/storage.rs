@@ -439,7 +439,7 @@ pub trait StorageEngine: Send + Sync {
     /// engine or block, or deadlock will result.
     ///
     /// # Lifecycle under `put_mutex(collection_id)`:
-    /// 1. Verifies `derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id) == *collection_id`.
+    /// 1. Verifies `metadata.verify_collection_id(collection_id)`.
     /// 2. Verifies `metadata.record_id_rule.policy == FrameIdPolicy::Key`.
     /// 3. Rejects `node_id == &COLLECTION_METADATA_RECORD_ID`.
     /// 4. If collection is unestablished:
@@ -475,8 +475,8 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::AlreadyExists`] if the collection exists with differing metadata,
-    /// [`StorageError::Internal`] on derivation mismatch or reserved node ID inclusion,
+    /// Returns [`StorageError::Collision`] on truncation collision or record collision,
+    /// [`StorageError::Internal`] if existing genesis metadata differs or on derivation mismatch,
     /// and [`StorageError::Io`] on write failures.
     fn create_collection_with_records(
         &self,
@@ -698,6 +698,7 @@ impl StorageEngine for InMemoryStorage {
                 StorageError::Corrupt("malformed collection metadata record".to_owned())
             })?;
             if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
                 return Err(StorageError::Internal(
                     "collection metadata mismatch: existing genesis record differs".to_owned(),
                 ));
@@ -817,6 +818,7 @@ impl StorageEngine for InMemoryStorage {
                 StorageError::Corrupt("malformed collection metadata record".to_owned())
             })?;
             if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
                 return Err(StorageError::Internal(
                     "collection metadata mismatch: existing genesis record differs".to_owned(),
                 ));
@@ -930,7 +932,7 @@ pub(crate) fn assert_collection_len_counts_genesis_and_distinct_ids(store: &dyn 
     };
 
     let metadata = CollectionMetadata {
-        pool_dst: Some(*b"EVNT"),
+        member_namespace: Some(*b"EVNT"),
         collection_canonical_id: b"!room:matrix.org".to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::Pointer {
@@ -943,7 +945,8 @@ pub(crate) fn assert_collection_len_counts_genesis_and_distinct_ids(store: &dyn 
         role: None,
         schema: None,
     };
-    let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+    let collection =
+        derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
     assert_eq!(store.collection_len(&collection).unwrap(), None);
 
     store
@@ -1046,7 +1049,7 @@ mod tests {
 
         let store = InMemoryStorage::new();
         let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -1059,7 +1062,8 @@ mod tests {
             role: None,
             schema: None,
         };
-        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
         assert_eq!(
             store.get_collection_metadata(&collection).unwrap(),
             None,
@@ -1101,7 +1105,7 @@ mod tests {
         };
 
         let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -1114,7 +1118,8 @@ mod tests {
             role: None,
             schema: None,
         };
-        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
 
         // Correct order: metadata first, then records.
         let ordered = InMemoryStorage::new();
@@ -1163,7 +1168,7 @@ mod tests {
         // no-op), so build it directly to keep the guard covered.
         let store = InMemoryStorage::new();
         let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -1176,7 +1181,8 @@ mod tests {
             role: None,
             schema: None,
         };
-        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
         store.collections.write().entry(collection).or_default();
         assert!(store.collection_exists(&collection));
 
@@ -1217,7 +1223,7 @@ mod tests {
 
         let store = Arc::new(InMemoryStorage::new());
         let metadata = Arc::new(CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -1230,7 +1236,8 @@ mod tests {
             role: None,
             schema: None,
         });
-        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -1394,18 +1401,19 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn established_collection_lifecycle_and_validation() {
         use crate::template::{
             derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
-            RecordIdentityRule, POOL_DST_INTERNAL,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
         };
 
         let store = InMemoryStorage::new();
         let canonical_id = b"sys:test-col";
-        let col_id = derive_collection_id(Some(POOL_DST_INTERNAL), canonical_id);
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
 
         let valid_meta = CollectionMetadata {
-            pool_dst: Some(POOL_DST_INTERNAL),
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
             collection_canonical_id: canonical_id.to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Key,
@@ -1514,6 +1522,41 @@ mod tests {
                 &[(node_a, NodeData::new(bytes::Bytes::from_static(b"data")))]
             )
             .is_err());
+
+        // 12. Corrupted stored metadata detection: stored canonical id does not reproduce collection id
+        let meta_colliding = CollectionMetadata {
+            collection_canonical_id: b"sys:other-room".to_vec(),
+            ..valid_meta.clone()
+        };
+        let target_col_id = derive_collection_id(
+            meta_colliding.member_namespace,
+            &meta_colliding.collection_canonical_id,
+        );
+        let sim_store = InMemoryStorage::new();
+        // Existing collection was established with valid_meta (which does not reproduce target_col_id)
+        sim_store
+            .collections
+            .write()
+            .entry(target_col_id)
+            .or_default()
+            .insert(
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(valid_meta.encode().into()),
+            );
+        let err = sim_store
+            .create_or_put_established(&target_col_id, &meta_colliding, &[])
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+
+        // 13. Unknown member namespace rejected on establishment
+        let meta_unknown = CollectionMetadata {
+            member_namespace: Some(*b"EDGE"),
+            ..valid_meta.clone()
+        };
+        let err_unknown = sim_store
+            .create_or_put_established(&target_col_id, &meta_unknown, &[])
+            .unwrap_err();
+        assert!(matches!(err_unknown, StorageError::Internal(_)));
     }
 
     #[test]
@@ -1521,15 +1564,15 @@ mod tests {
     fn create_or_upsert_established_validated_contract() {
         use crate::template::{
             derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
-            RecordIdentityRule, POOL_DST_INTERNAL,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
         };
 
         let store = InMemoryStorage::new();
         let canonical_id = b"sys:validated-upsert";
-        let col_id = derive_collection_id(Some(POOL_DST_INTERNAL), canonical_id);
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
 
         let valid_meta = CollectionMetadata {
-            pool_dst: Some(POOL_DST_INTERNAL),
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
             collection_canonical_id: canonical_id.to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Key,
@@ -1668,6 +1711,36 @@ mod tests {
             store.get(&col_id, &node_id).unwrap().unwrap().bytes,
             b"value_2_updated"[..]
         );
+
+        // 8. Corrupted stored metadata on identity: existing collection metadata does not reproduce collection id
+        let meta_colliding = CollectionMetadata {
+            collection_canonical_id: b"sys:validated-other".to_vec(),
+            ..valid_meta.clone()
+        };
+        let target_col_id = derive_collection_id(
+            meta_colliding.member_namespace,
+            &meta_colliding.collection_canonical_id,
+        );
+        let sim_store = InMemoryStorage::new();
+        sim_store
+            .collections
+            .write()
+            .entry(target_col_id)
+            .or_default()
+            .insert(
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(valid_meta.encode().into()),
+            );
+        let err = sim_store
+            .create_or_upsert_established_validated(
+                &target_col_id,
+                &meta_colliding,
+                &node_id,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
     }
 
     #[test]

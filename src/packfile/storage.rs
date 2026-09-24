@@ -6828,6 +6828,7 @@ impl StorageEngine for PackfileStorage {
                 StorageError::Corrupt("malformed collection metadata record".to_owned())
             })?;
             if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
                 return Err(StorageError::Internal(
                     "collection metadata mismatch: existing genesis record differs".to_owned(),
                 ));
@@ -6963,6 +6964,7 @@ impl StorageEngine for PackfileStorage {
                 StorageError::Corrupt("malformed collection metadata record".to_owned())
             })?;
             if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
                 return Err(StorageError::Internal(
                     "collection metadata mismatch: existing genesis record differs".to_owned(),
                 ));
@@ -14633,7 +14635,7 @@ mod tests {
         let dir = test_dir("ensure_metadata_concurrent");
         let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
         let metadata = Arc::new(CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -14646,7 +14648,8 @@ mod tests {
             role: None,
             schema: None,
         });
-        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
 
         // Release every thread at once so the lookup/append windows overlap.
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -14692,7 +14695,7 @@ mod tests {
         let collection = derive_collection_id(Some(*b"EVNT"), b"!room:matrix.org");
         let candidates: Vec<CollectionMetadata> = (0..8)
             .map(|i| CollectionMetadata {
-                pool_dst: Some(*b"EVNT"),
+                member_namespace: Some(*b"EVNT"),
                 collection_canonical_id: b"!room:matrix.org".to_vec(),
                 record_id_rule: RecordIdentityRule {
                     policy: FrameIdPolicy::Pointer {
@@ -15239,17 +15242,17 @@ mod tests {
     fn packfile_storage_create_or_upsert_established_validated_contract() {
         use crate::template::{
             derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
-            RecordIdentityRule, POOL_DST_INTERNAL,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
         };
 
         let dir = test_dir("create_or_upsert_contract");
         let store = PackfileStorage::open(dir.clone()).unwrap();
 
         let canonical_id = b"sys:packfile-upsert";
-        let col_id = derive_collection_id(Some(POOL_DST_INTERNAL), canonical_id);
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
 
         let valid_meta = CollectionMetadata {
-            pool_dst: Some(POOL_DST_INTERNAL),
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
             collection_canonical_id: canonical_id.to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Key,
@@ -15369,23 +15372,69 @@ mod tests {
             reopened.get(&col_id, &node_id).unwrap().unwrap().bytes,
             b"val2_updated"[..]
         );
+
+        // 7. Corrupted stored metadata detection: stored canonical id does not reproduce collection id
+        let meta_colliding = CollectionMetadata {
+            collection_canonical_id: b"sys:packfile-other".to_vec(),
+            ..valid_meta.clone()
+        };
+        let target_col_id = derive_collection_id(
+            meta_colliding.member_namespace,
+            &meta_colliding.collection_canonical_id,
+        );
+        let sim_dir = test_dir("create_or_upsert_collision");
+        let sim_store = PackfileStorage::open(sim_dir).unwrap();
+        let seed = [(
+            COLLECTION_METADATA_RECORD_ID,
+            NodeData::new(valid_meta.encode().into()),
+        )];
+        sim_store
+            .put_many_internal_locked(&target_col_id, &seed, None)
+            .unwrap();
+
+        let err = sim_store
+            .create_or_upsert_established_validated(
+                &target_col_id,
+                &meta_colliding,
+                &node_id,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+
+        // 8. Unknown member namespace rejected on establishment
+        let meta_unknown = CollectionMetadata {
+            member_namespace: Some(*b"EDGE"),
+            ..valid_meta.clone()
+        };
+        let err_unknown = sim_store
+            .create_or_upsert_established_validated(
+                &target_col_id,
+                &meta_unknown,
+                &node_id,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err_unknown, StorageError::Internal(_)));
     }
 
     #[test]
     fn packfile_storage_create_or_upsert_concurrent_writers() {
         use crate::template::{
             derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
-            RecordIdentityRule, POOL_DST_INTERNAL,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
         };
 
         let dir = test_dir("create_or_upsert_concurrency");
         let store = Arc::new(PackfileStorage::open(dir).unwrap());
 
         let canonical_id = b"sys:concurrent-upsert";
-        let col_id = derive_collection_id(Some(POOL_DST_INTERNAL), canonical_id);
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
 
         let meta = CollectionMetadata {
-            pool_dst: Some(POOL_DST_INTERNAL),
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
             collection_canonical_id: canonical_id.to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Key,

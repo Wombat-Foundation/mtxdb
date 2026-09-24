@@ -170,13 +170,13 @@ pub enum ShardType {
     State,
     /// Event JSON plus collection-DAG-oriented event data.
     EventDag,
-    /// Auth-chain manifests and their closure traversal data.
-    AuthChain,
+    /// Edges pool: houses previous-event edges (`PREV`) and auth-chain edges (`AUTH`).
+    Edges,
 }
 
 impl ShardType {
     /// Every shard type defined by the current database layout.
-    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::AuthChain];
+    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::Edges];
 
     /// Stable on-disk directory name for this pool.
     #[must_use]
@@ -184,20 +184,36 @@ impl ShardType {
         match self {
             Self::State => "state",
             Self::EventDag => "event-dag",
-            Self::AuthChain => "auth-chain",
+            Self::Edges => "edges",
         }
     }
 
-    /// Stable 4-byte namespace discriminator mixed into collection and record
-    /// logical-id derivation. Keeps the same canonical id distinct across pools
-    /// (e.g. `!room` in the `EventDag` pool versus the State pool).
+    /// Stable 4-byte physical pool tag used in physical layout and diagnostic labeling.
+    ///
+    /// # Note
+    /// This is a physical storage pool tag (e.g. `EDGE`), **not** a logical
+    /// member namespace (`PREV` / `AUTH`). Collection derivation MUST use logical
+    /// member namespaces, never this physical pool tag.
     #[must_use]
-    pub const fn pool_dst(self) -> [u8; 4] {
+    pub const fn physical_pool_tag(self) -> [u8; 4] {
         match self {
             Self::State => *b"STAT",
             Self::EventDag => *b"EVNT",
-            Self::AuthChain => *b"AUTH",
+            Self::Edges => *b"EDGE",
         }
+    }
+
+    /// Deprecated compatibility alias for [`Self::physical_pool_tag`].
+    ///
+    /// # Warning
+    /// This returns a physical pool tag, not a member namespace. Do not pass
+    /// this to collection derivation functions.
+    #[deprecated(
+        note = "use physical_pool_tag; ShardType must not be passed to collection derivation"
+    )]
+    #[must_use]
+    pub const fn pool_dst(self) -> [u8; 4] {
+        self.physical_pool_tag()
     }
 }
 
@@ -413,8 +429,8 @@ mod tests {
             root.join("pools/event-dag")
         );
         assert_eq!(
-            layout.pool_dir(ShardType::AuthChain).unwrap(),
-            root.join("pools/auth-chain")
+            layout.pool_dir(ShardType::Edges).unwrap(),
+            root.join("pools/edges")
         );
     }
 

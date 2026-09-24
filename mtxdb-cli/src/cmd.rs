@@ -437,10 +437,12 @@ fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
-/// Pool namespace discriminator for Matrix room collections, mixed into
-/// [`derive_collection_id`]. Matrix room events live in the `EventDag` pool, so
-/// they use that pool's DST.
-const MATRIX_ROOM_POOL_DST: Option<[u8; 4]> = Some(ShardType::EventDag.pool_dst());
+/// Member namespace discriminator for Matrix room collections, mixed into
+/// [`derive_collection_id`]. Matrix room events use the `EVNT` namespace.
+const MATRIX_ROOM_MEMBER_NAMESPACE: Option<[u8; 4]> = Some(mtxdb::MEMBER_NAMESPACE_EVNT);
+#[deprecated(note = "use MATRIX_ROOM_MEMBER_NAMESPACE")]
+#[allow(dead_code)]
+const MATRIX_ROOM_POOL_DST: Option<[u8; 4]> = MATRIX_ROOM_MEMBER_NAMESPACE;
 
 fn blake3_digest(data: &[u8]) -> [u8; 32] {
     mtxdb::content_digest(DigestAlgorithm::Blake3, data)
@@ -456,7 +458,7 @@ fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
 
 /// Derive the BLAKE3 collection ID for a canonical Matrix room ID.
 fn matrix_room_collection_id(room_id: &str) -> [u8; 16] {
-    derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
+    derive_collection_id(MATRIX_ROOM_MEMBER_NAMESPACE, room_id.as_bytes())
 }
 
 /// Resolve a collection selector: a `0x`-prefixed logical ID (the engine's
@@ -800,7 +802,7 @@ fn print_get_header(
     eprintln!("  payload:     {} bytes", data.bytes.len());
     if *node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
         if let Some(meta) = CollectionMetadata::decode(&data.bytes) {
-            let pool = meta.pool_dst.as_ref().map_or_else(
+            let pool = meta.member_namespace.as_ref().map_or_else(
                 || "none".to_owned(),
                 |d| String::from_utf8_lossy(d).into_owned(),
             );
@@ -4364,7 +4366,7 @@ fn collection_metadata_for(
     collection_canonical_id: &str,
 ) -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: template.collection_key.pool_dst,
+        member_namespace: template.collection_key.member_namespace,
         collection_canonical_id: collection_canonical_id.as_bytes().to_vec(),
         record_id_rule: template.record_id_rule.clone(),
         payload: template.payload.clone(),
@@ -4804,7 +4806,7 @@ fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
                 .as_deref()
                 .and_then(MatrixRoomExtension::decode_blob)
                 .is_some();
-            let pool = metadata.pool_dst.map_or_else(
+            let pool = metadata.member_namespace.map_or_else(
                 || "none".to_owned(),
                 |dst| String::from_utf8_lossy(&dst).into_owned(),
             );
@@ -4939,6 +4941,8 @@ impl ScanOptions {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools,
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
 fn cmd_scan_coalesced(
@@ -5062,6 +5066,7 @@ fn cmd_scan_coalesced(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
 fn cmd_scan(
@@ -5091,6 +5096,7 @@ fn cmd_scan(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
 fn cmd_scan_single(
@@ -5172,6 +5178,7 @@ fn cmd_scan_single(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the pack scan helper receives the explicit scan filters and output options"
 )]
 fn scan_pack(
@@ -5275,7 +5282,7 @@ fn scan_pack(
             if let Some(record) = &data {
                 if *node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
                     if let Some(meta) = CollectionMetadata::decode(&record.data) {
-                        let pool = meta.pool_dst.as_ref().map_or_else(
+                        let pool = meta.member_namespace.as_ref().map_or_else(
                             || "none".to_owned(),
                             |d| String::from_utf8_lossy(d).into_owned(),
                         );
@@ -5610,6 +5617,7 @@ enum CollectionScanMode {
 }
 
 impl CollectionScanMode {
+    #[allow(clippy::fn_params_excessive_bools)]
     fn new(verbose: bool, raw: bool, sort: Option<SortColumn>, header: bool, decode: bool) -> Self {
         if raw {
             Self::Raw { verbose }
@@ -5714,7 +5722,7 @@ fn print_collection_record(
         if let Some(record) = &data {
             if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
                 if let Some(meta) = CollectionMetadata::decode(&record.data) {
-                    let pool = meta.pool_dst.as_ref().map_or_else(
+                    let pool = meta.member_namespace.as_ref().map_or_else(
                         || "none".to_owned(),
                         |d| String::from_utf8_lossy(d).into_owned(),
                     );
@@ -5806,7 +5814,6 @@ fn print_scan_payload(data: &[u8], decode: Option<&str>) {
                 }
             }
             "raw" => Some(hex_bytes(data).into_bytes()),
-            "auto" => pretty_print_payload(data),
             _ => pretty_print_payload(data),
         }
     } else {
@@ -5927,7 +5934,7 @@ fn default_matrix_import_template() -> CollectionTemplate {
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: "/room_id".into(),
-            pool_dst: MATRIX_ROOM_POOL_DST,
+            member_namespace: MATRIX_ROOM_MEMBER_NAMESPACE,
             display_id_pointer: "/room_id".into(),
         },
         establishment: Some(EstablishmentRule {
@@ -6072,7 +6079,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     // The collection-id derivation is a fixed, core-owned function of a pool
     // namespace discriminator rather than a template-selected digest algorithm.
     // The Matrix import profile targets the EventDag pool.
-    let pool_dst = MATRIX_ROOM_POOL_DST;
+    let member_namespace = MATRIX_ROOM_MEMBER_NAMESPACE;
     if let Some(policy) = template
         .get("record")
         .and_then(|r| r.get("payload"))
@@ -6114,7 +6121,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: membership_pointer.to_owned(),
-            pool_dst,
+            member_namespace,
             display_id_pointer: display_id_pointer.to_owned(),
         },
         establishment: Some(establishment),
@@ -6243,7 +6250,7 @@ fn template_node_id(
 /// membership value (e.g. a Matrix `room_id`), producing the collection ID.
 fn template_collection_id(template: &CollectionTemplate, membership_value: &str) -> [u8; 16] {
     derive_collection_id(
-        template.collection_key.pool_dst,
+        template.collection_key.member_namespace,
         membership_value.as_bytes(),
     )
 }
@@ -6401,17 +6408,16 @@ fn cmd_import_file(
                 .count() as u64
         };
 
-        // Import auth chain events into the auth-chain shard pool.
+        // Import auth chain events into the edges shard pool.
         if !federation.auth_chain.is_empty() {
-            // Derive the auth-chain pool dir from the event-dag pool dir.
-            // pool_dir is {root}/pools/event-dag; auth-chain is {root}/pools/auth-chain.
-            let auth_chain_dir = dir
+            // Derive the edges pool dir from the event-dag pool dir.
+            // pool_dir is {root}/pools/event-dag; edges is {root}/pools/edges.
+            let edges_dir = dir
                 .parent()
-                .map(|p| p.join("auth-chain"))
-                .context("deriving auth-chain pool path")?;
-            fs::create_dir_all(&auth_chain_dir)?;
-            let auth_store =
-                PackfileStorage::open(auth_chain_dir).context("opening auth-chain store")?;
+                .map(|p| p.join("edges"))
+                .context("deriving edges pool path")?;
+            fs::create_dir_all(&edges_dir)?;
+            let auth_store = PackfileStorage::open(edges_dir).context("opening edges store")?;
             let mut auth_count = 0u64;
             let mut auth_skipped = 0u64;
             // Auth-chain events may span multiple rooms (collections). Group
@@ -6445,7 +6451,7 @@ fn cmd_import_file(
                     continue;
                 };
                 let collection_id =
-                    derive_collection_id(Some(ShardType::AuthChain.pool_dst()), room_id.as_bytes());
+                    derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
                 let event_bytes = ev.encode().into_bytes();
                 by_collection
                     .entry((collection_id, room_id))
@@ -6494,7 +6500,7 @@ fn cmd_import_file(
                 }
                 if !to_write.is_empty() {
                     let auth_metadata = CollectionMetadata {
-                        pool_dst: Some(ShardType::AuthChain.pool_dst()),
+                        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_AUTH),
                         collection_canonical_id: room_id.into_bytes(),
                         record_id_rule: template.record_id_rule.clone(),
                         payload: template.payload.clone(),
@@ -8473,7 +8479,7 @@ mod tests {
         matrix_room_extension_from_store, parse_federation_input, parse_pack_id_selector,
         parse_pack_selectors, pretty_print_payload, resolve_import_collection, run,
         scan_payload_suffix, template_collection_id, template_node_id, verify_auth_chain_edges,
-        CollectionTemplate, MatrixRoomExtension, StateSet, MATRIX_ROOM_POOL_DST,
+        CollectionTemplate, MatrixRoomExtension, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -8876,7 +8882,7 @@ mod tests {
         let canonical_id = b"sys:flat-kv";
         let col_id = derive_collection_id(Some(*b"INTL"), canonical_id);
         let genesis_meta = CollectionMetadata {
-            pool_dst: Some(*b"INTL"),
+            member_namespace: Some(*b"INTL"),
             collection_canonical_id: canonical_id.to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Payload,
@@ -9059,7 +9065,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/room_id".into(),
-                pool_dst: MATRIX_ROOM_POOL_DST,
+                member_namespace: MATRIX_ROOM_MEMBER_NAMESPACE,
                 display_id_pointer: "/room_id".into(),
             },
             establishment: None,
@@ -9309,14 +9315,14 @@ mod tests {
         )
         .unwrap();
 
-        let auth_dir = pool_dir.parent().unwrap().join("auth-chain");
+        let auth_dir = pool_dir.parent().unwrap().join("edges");
         assert_eq!(
             count_pack_records(&auth_dir),
             2,
-            "the auth-chain pool must hold genesis metadata and the one imported auth event, unchanged by the reimport"
+            "the edges pool must hold genesis metadata and the one imported auth event, unchanged by the reimport"
         );
         let auth_store = PackfileStorage::open(auth_dir).unwrap();
-        let auth_col = derive_collection_id(Some(ShardType::AuthChain.pool_dst()), b"!room");
+        let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");
         let meta = auth_store
             .get_collection_metadata(&auth_col)
             .unwrap()
@@ -9371,7 +9377,7 @@ mod tests {
             .unwrap()
             .expect("establishment must write the genesis metadata record");
         assert_eq!(metadata.collection_canonical_id, b"!room");
-        assert_eq!(metadata.pool_dst, MATRIX_ROOM_POOL_DST);
+        assert_eq!(metadata.member_namespace, MATRIX_ROOM_MEMBER_NAMESPACE);
         let blob = metadata.extension.expect("Matrix room extension blob");
 
         // The self-describing blob is readable back through the same path
@@ -10681,11 +10687,11 @@ mod tests {
         let room_id = "!roomid:example.org";
         assert_eq!(
             hex::encode(matrix_room_collection_id(room_id)),
-            "e0828dba265372f79ef010da2c83cd96"
+            "e82141db836a47fedb667d6249aaa94b"
         );
         assert_eq!(
             matrix_room_collection_id(room_id),
-            derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
+            derive_collection_id(MATRIX_ROOM_MEMBER_NAMESPACE, room_id.as_bytes())
         );
     }
 

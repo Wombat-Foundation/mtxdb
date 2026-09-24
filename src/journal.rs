@@ -33,7 +33,7 @@ enum JournalVersion {
     V2,
     /// Shared multi-pool segment. Every mutation frame carries a mandatory pool
     /// tag in the flag byte, so one physical WAL can carry the state,
-    /// event-DAG, and auth-chain pools and recovery can route each frame back
+    /// event-DAG, and edges pools and recovery can route each frame back
     /// to its pool.
     V3PoolTagged,
 }
@@ -374,7 +374,7 @@ impl TxnStage {
         Ok(())
     }
 
-    /// Append staged pool groups in dependency order: auth-chain, event-DAG,
+    /// Append staged pool groups in dependency order: edges, event-DAG,
     /// then state. Does not fsync; the ordinary coalesced sync remains the
     /// durability boundary. Repeated calls are safe, including after a
     /// partial error.
@@ -384,7 +384,7 @@ impl TxnStage {
     /// cannot append the group's complete framing and trailer.
     pub fn publish(
         &self,
-        auth_chain: Option<&JournalCoordinator>,
+        edges: Option<&JournalCoordinator>,
         event_dag: Option<&JournalCoordinator>,
         state: Option<&JournalCoordinator>,
     ) -> io::Result<()> {
@@ -393,14 +393,14 @@ impl TxnStage {
             Self::DISCARDED | Self::PUBLISHED => return Ok(()),
             _ => {}
         }
-        let coordinators = [auth_chain, event_dag, state];
+        let coordinators = [edges, event_dag, state];
         if coordinators.iter().all(Option::is_none) {
             // Journaling is disabled process-wide, so there is no journal to
             // publish into.
             self.state.store(Self::PUBLISHED, Ordering::Release);
             return Ok(());
         }
-        let pools = [ShardType::AuthChain, ShardType::EventDag, ShardType::State];
+        let pools = [ShardType::Edges, ShardType::EventDag, ShardType::State];
         for (ordered_index, pool) in pools.into_iter().enumerate() {
             let index = pool_index(pool);
             if data.appended[index] || data.pools[index].is_empty() {
@@ -422,7 +422,7 @@ const fn pool_index(pool: ShardType) -> usize {
     match pool {
         ShardType::State => 0,
         ShardType::EventDag => 1,
-        ShardType::AuthChain => 2,
+        ShardType::Edges => 2,
     }
 }
 
@@ -435,7 +435,7 @@ pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
     match pool {
         ShardType::State => 1,
         ShardType::EventDag => 2,
-        ShardType::AuthChain => 3,
+        ShardType::Edges => 3,
     }
 }
 
@@ -445,7 +445,7 @@ pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
     match tag {
         1 => Some(ShardType::State),
         2 => Some(ShardType::EventDag),
-        3 => Some(ShardType::AuthChain),
+        3 => Some(ShardType::Edges),
         _ => None,
     }
 }
@@ -2408,7 +2408,7 @@ mod tests {
         let tagged = [
             (Some(ShardType::State), put(1, 1, b"state")),
             (Some(ShardType::EventDag), put(2, 2, b"event")),
-            (Some(ShardType::AuthChain), put(3, 3, b"auth")),
+            (Some(ShardType::Edges), put(3, 3, b"edges")),
         ];
         journal
             .append_group_tagged_with_sequence(&tagged, None)
@@ -2427,7 +2427,7 @@ mod tests {
             vec![
                 Some(ShardType::State),
                 Some(ShardType::EventDag),
-                Some(ShardType::AuthChain),
+                Some(ShardType::Edges),
             ]
         );
 
@@ -2473,7 +2473,7 @@ mod tests {
             0,
             "another pool's group must not advance event-DAG's watermark"
         );
-        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::AuthChain), 0);
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::Edges), 0);
 
         // Group two: event-DAG only. State's watermark must stay put.
         coordinator
@@ -2635,7 +2635,7 @@ mod tests {
             .publish_tagged(ShardType::State, put(1, 1, b"a"), |_| {})
             .unwrap();
         coordinator
-            .publish_tagged(ShardType::AuthChain, put(3, 3, b"c"), |_| {})
+            .publish_tagged(ShardType::Edges, put(3, 3, b"c"), |_| {})
             .unwrap();
         coordinator.sync().unwrap();
 
@@ -2645,10 +2645,7 @@ mod tests {
             .iter()
             .map(|entry| entry.pool)
             .collect();
-        assert_eq!(
-            pools,
-            vec![Some(ShardType::State), Some(ShardType::AuthChain)]
-        );
+        assert_eq!(pools, vec![Some(ShardType::State), Some(ShardType::Edges)]);
         fs::remove_file(path).unwrap();
     }
 

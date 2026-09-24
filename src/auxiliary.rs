@@ -14,7 +14,7 @@
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{
     derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
-    POOL_DST_INTERNAL,
+    MEMBER_NAMESPACE_INTL,
 };
 
 const VALUE_MAGIC: &[u8; 4] = b"AUX1";
@@ -37,7 +37,7 @@ pub fn auxiliary_key_digest(key: &[u8]) -> AuxiliaryKeyDigest {
 /// identities remain the full 32-byte digests stored in each envelope.
 #[must_use]
 pub fn auxiliary_collection_id(name: &str) -> [u8; 16] {
-    derive_collection_id(Some(POOL_DST_INTERNAL), name.as_bytes())
+    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), name.as_bytes())
 }
 
 fn physical_id(digest: &AuxiliaryKeyDigest) -> NodeId {
@@ -74,7 +74,7 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     #[must_use]
     pub fn metadata(&self) -> CollectionMetadata {
         CollectionMetadata {
-            pool_dst: Some(POOL_DST_INTERNAL),
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
             collection_canonical_id: self.name.as_bytes().to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Key,
@@ -189,6 +189,7 @@ fn decode_value(
 mod tests {
     use super::*;
     use crate::storage::InMemoryStorage;
+    use crate::template::MEMBER_NAMESPACE_INTL;
 
     #[test]
     fn named_indexes_share_storage_but_have_distinct_collections() {
@@ -242,7 +243,7 @@ mod tests {
             .unwrap()
             .expect("metadata must be established on put");
         assert_eq!(meta.collection_canonical_id, b"sys:matrix-state-groups");
-        assert_eq!(meta.pool_dst, Some(POOL_DST_INTERNAL));
+        assert_eq!(meta.member_namespace, Some(MEMBER_NAMESPACE_INTL));
         assert_eq!(meta.role.as_deref(), Some("system_auxiliary"));
         assert_eq!(meta.record_id_rule.policy, FrameIdPolicy::Key);
         assert!(meta.verify_collection_id(&index.collection_id()));
