@@ -7,8 +7,13 @@
 //! coordinator, and replays recovered groups. It holds the root lock for its
 //! whole lifetime, so exactly one writer process owns the database.
 //!
-//! Legacy per-pool roots are never opened; [`DatabaseLayout`] fails closed on
-//! them. Callers that need to drive a single pool directly can still use
+//! A legacy per-pool root (one whose `db.meta` predates the WAL-layout field,
+//! or was written as [`WalLayout::PerPool`]) is *not* rejected: it is opened
+//! onto a fresh root-level shared segment, and its old `pools/*/wal.bin`
+//! files are assumed already checkpointed and are ignored. The fresh segment's
+//! LSN space is seeded above every per-pool `journal.lsn` so the legacy
+//! coverage values stay meaningful; see [`shared_wal_seed_lsn`]. Callers that
+//! need to drive a single pool directly can still use
 //! [`crate::journal::SharedWalLock`] with
 //! [`PackfileStorage::enable_shared_journal`](crate::PackfileStorage::enable_shared_journal).
 #![cfg(not(target_arch = "wasm32"))]
@@ -40,27 +45,13 @@ impl SharedDatabase {
     /// root writer lock.
     ///
     /// # Errors
-    /// Returns an error if the root is a legacy per-pool root, the root lock is
-    /// held, the shared segment cannot be opened, or any pool cannot be opened
-    /// or attached.
+    /// Returns an error if the root lock is held, the shared segment cannot be
+    /// opened, or any pool cannot be opened or attached.
     pub fn open(root: PathBuf) -> Result<Self, StorageError> {
         let layout = DatabaseLayout::open(root)?;
         let wal_path = layout.shared_wal_path();
         let lock = SharedWalLock::acquire(layout.root())?;
-        // A root that was driven through per-pool journals carries each pool's
-        // durable coverage as a `journal.lsn` below its pool directory. Start
-        // the fresh shared segment above all of them, so every legacy coverage
-        // value stays meaningful in the one shared LSN space: a restarted
-        // shared writer can never replay past (or reclaim beneath) coverage
-        // that belonged to a different numbering.
-        let seed_lsn = {
-            let mut watermark = 0_u64;
-            for shard in ShardType::ALL {
-                let dir = layout.pool_dir(shard)?;
-                watermark = watermark.max(PackfileStorage::read_journal_lsn(&dir));
-            }
-            watermark.saturating_add(1)
-        };
+        let seed_lsn = shared_wal_seed_lsn(&layout)?;
         let (journal, scan) = Journal::open_shared_seeded(&wal_path, seed_lsn)?;
         let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
 
@@ -101,6 +92,32 @@ impl SharedDatabase {
     pub fn pool(&self, shard: ShardType) -> &Arc<PackfileStorage> {
         &self.pools[shard_index(shard)]
     }
+}
+
+/// The base LSN a fresh shared WAL for `layout` must start above: one past the
+/// highest per-pool `journal.lsn` recorded beside a pool's last checkpoint.
+///
+/// A root driven through per-pool journals stores each pool's durable coverage
+/// in that pool's own (now-retired) LSN space. The shared segment that replaces
+/// them must begin above every one of those watermarks, so each legacy coverage
+/// value stays meaningful in the single shared space: a restarted shared writer
+/// can neither replay past a pool's legacy coverage nor reclaim beneath a fresh
+/// frame that only looks covered because numbering restarted. Returns `1` for a
+/// root with no recorded coverage (a brand-new database).
+///
+/// This is the seed [`Journal::open_shared_seeded`] consumes; a caller that
+/// opens the shared segment itself (the Synapse binding) should use the same
+/// value rather than the default `open_shared` base of `1`.
+///
+/// # Errors
+/// Returns an error if a pool directory cannot be created or read.
+pub fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> Result<u64, StorageError> {
+    let mut watermark = 0_u64;
+    for shard in ShardType::ALL {
+        let dir = layout.pool_dir(shard)?;
+        watermark = watermark.max(PackfileStorage::read_journal_lsn(&dir));
+    }
+    Ok(watermark.saturating_add(1))
 }
 
 /// Index of `shard` in the fixed `[State, EventDag, AuthChain]` pool array.
@@ -240,35 +257,40 @@ mod tests {
 
     #[test]
     fn a_legacy_pool_coverage_seeds_the_shared_wal_above_it() {
-        let root = test_root("legacy_seed");
-        std::fs::create_dir_all(root.join("pools/state")).unwrap();
-        std::fs::write(root.join("db.meta"), {
-            let mut bytes = Vec::from(b"MDBD".as_slice());
-            bytes.push(1);
-            bytes.extend_from_slice(&[0u8; 8]);
-            bytes.extend_from_slice(b"state\nevent-dag\nauth-chain\n");
-            bytes
-        })
-        .unwrap();
-        // A per-pool checkpoint watermark from the legacy layout.
-        std::fs::write(root.join("pools/state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
+        // The layout marker is informational (see `DatabaseLayout::open`): both
+        // a PerPool-marked legacy root and a Shared-marked root whose sidecars
+        // predate the shared segment must seed the fresh WAL above the highest
+        // per-pool watermark, so legacy coverage values stay meaningful in the
+        // one shared LSN space.
+        for (name, layout_code) in [("legacy_seed_perpool", 0u8), ("legacy_seed_shared", 1u8)] {
+            let root = test_root(name);
+            std::fs::create_dir_all(root.join("pools/state")).unwrap();
+            let mut meta = Vec::from(b"MDBD".as_slice());
+            meta.push(1);
+            meta.extend_from_slice(&[0u8; 8]);
+            meta[4 + 1] = layout_code; // reserved[0] is the WAL-layout byte
+            meta.extend_from_slice(b"state\nevent-dag\nauth-chain\n");
+            std::fs::write(root.join("db.meta"), meta).unwrap();
+            // A checkpoint watermark recorded before the shared segment existed.
+            std::fs::write(root.join("pools/state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
 
-        let db = SharedDatabase::open(root.clone()).unwrap();
-        let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
-        assert!(
-            scan.base_lsn > 7,
-            "the fresh shared WAL must start above the legacy per-pool coverage"
-        );
-        db.pool(ShardType::State)
-            .put(&[0x55u8; 16], &node(3), &NodeData::from_slice(b"live"))
-            .unwrap();
-        db.pool(ShardType::State).sync_all().unwrap();
-        assert!(
-            db.coordinator().committed_lsn_for_pool(ShardType::State) > 7,
-            "a new shared frame must be numbered above the legacy watermark"
-        );
-        drop(db);
-        let _ = std::fs::remove_dir_all(&root);
+            let db = SharedDatabase::open(root.clone()).unwrap();
+            let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
+            assert!(
+                scan.base_lsn > 7,
+                "{name}: the fresh shared WAL must start above the recorded coverage"
+            );
+            db.pool(ShardType::State)
+                .put(&[0x55u8; 16], &node(3), &NodeData::from_slice(b"live"))
+                .unwrap();
+            db.pool(ShardType::State).sync_all().unwrap();
+            assert!(
+                db.coordinator().committed_lsn_for_pool(ShardType::State) > 7,
+                "{name}: a new shared frame must be numbered above the watermark"
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
