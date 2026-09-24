@@ -460,6 +460,12 @@ fn fmt_opt(value: Option<u64>) -> String {
     value.map_or_else(|| "n/a".to_owned(), |v| v.to_string())
 }
 
+/// Widest of a header and every cell that will be printed under it, so a
+/// table column can be padded to fit its data instead of a guessed constant.
+fn max_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
+    cells.fold(header.len(), |width, cell| width.max(cell.len()))
+}
+
 /// One timed read, with the store reopened cold for each pass.
 ///
 /// The store must be **dropped** before the cache is dropped and reopened
@@ -728,28 +734,51 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
 
     // ── Report ──
     //
-    // Every column is right-aligned to an explicit width so the header and
-    // the rows line up, including the `{}/{}` "found" column whose width is
-    // chosen to fit the longest `found/total` pair.
-    const POLICY_W: usize = 6;
-    const TARGET_W: usize = 7;
-    const FOUND_W: usize = 17;
-    const ELAPSED_W: usize = 10;
-    const NUM_W: usize = 11;
+    // Column widths are derived from the widest cell actually present, so
+    // the header and every row line up regardless of how long the policy
+    // names, fault counts, or byte totals run on this machine. Fixed widths
+    // would let a longer policy name (`prefetch`) overflow and shift the
+    // whole row.
+    let policy_w = max_width("policy", rows.iter().map(|r| r.policy));
+    let target_w = max_width("target", rows.iter().map(|r| r.target));
+    let found_cells: Vec<String> = rows
+        .iter()
+        .map(|r| format!("{}/{}", r.found, r.total))
+        .collect();
+    let found_w = max_width("found", found_cells.iter().map(String::as_str));
+    let elapsed_cells: Vec<String> = rows.iter().map(|r| format!("{:.2?}", r.elapsed)).collect();
+    let elapsed_w = max_width("elapsed", elapsed_cells.iter().map(String::as_str));
+    // The four right-aligned numeric columns (majflt, disk read, extents,
+    // prefetch) share one width: the widest of their headers and any cell.
+    let mut num_w = "majflt".len().max("disk read".len()).max("extents".len());
+    for r in &rows {
+        for cell in [
+            fmt_opt(r.major_faults),
+            fmt_opt(r.disk_read_bytes),
+            r.extents.to_string(),
+            r.prefetch_bytes.to_string(),
+        ] {
+            num_w = num_w.max(cell.len());
+        }
+        num_w = num_w.max("prefetch".len());
+    }
     println!();
     println!("  [3/3] results");
     println!("═══════════════════════════════════════════════════════════════");
     println!(
-        "  {:<POLICY_W$} {:<TARGET_W$} {:>FOUND_W$} {:>ELAPSED_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$}",
+        "  {:<policy_w$} {:<target_w$} {:>found_w$} {:>elapsed_w$} {:>num_w$} {:>num_w$} {:>num_w$} {:>num_w$}",
         "policy", "target", "found", "elapsed", "majflt", "disk read", "extents", "prefetch"
     );
-    for r in &rows {
+    for (r, (found, elapsed)) in rows
+        .iter()
+        .zip(found_cells.iter().zip(elapsed_cells.iter()))
+    {
         println!(
-            "  {:<POLICY_W$} {:<TARGET_W$} {:>FOUND_W$} {:>ELAPSED_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$}",
+            "  {:<policy_w$} {:<target_w$} {:>found_w$} {:>elapsed_w$} {:>num_w$} {:>num_w$} {:>num_w$} {:>num_w$}",
             r.policy,
             r.target,
-            format!("{}/{}", r.found, r.total),
-            format!("{:.2?}", r.elapsed),
+            found,
+            elapsed,
             fmt_opt(r.major_faults),
             fmt_opt(r.disk_read_bytes),
             r.extents,
