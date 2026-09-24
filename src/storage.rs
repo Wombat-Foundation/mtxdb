@@ -79,7 +79,7 @@ impl DigestAlgorithm {
                 use sha2::Digest as _;
                 DigestHasher::Sha256(sha2::Sha256::new())
             }
-            Self::Blake3 => DigestHasher::Blake3(Box::new(blake3::Hasher::new())),
+            Self::Blake3 => DigestHasher::Blake3(blake3::Hasher::new()),
             Self::Unknown(id) => DigestHasher::Unknown(id),
         }
     }
@@ -101,14 +101,32 @@ impl DigestAlgorithm {
 ///
 /// Obtained from [`DigestAlgorithm::hasher`]; feed input with [`Self::update`]
 /// and finish with [`Self::finalize`].
+///
+/// Intended to be used transiently — created, fed, finalized, and dropped
+/// within one call. It is sized for the largest algorithm's state (BLAKE3,
+/// ~1.9 KiB), so storing many in a `Vec` or a long-lived struct wastes memory;
+/// prefer `DigestAlgorithm::digest` or `content_digest` for one-shot hashing.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the ~1.9 KiB BLAKE3 state is only ever created and consumed \
+              transiently on the stack by `digest`/`derive_collection_id`; \
+              unboxing trades that single stack bump for not heap-allocating \
+              a hasher on every content hash"
+)]
 pub enum DigestHasher {
     /// SHA-256 state.
     Sha256(sha2::Sha256),
     /// BLAKE3 state.
-    Blake3(Box<blake3::Hasher>),
+    Blake3(blake3::Hasher),
     /// An algorithm this build cannot hash; every operation panics.
     Unknown(u8),
 }
+
+const _: () = assert!(
+    std::mem::size_of::<DigestHasher>() <= 2048,
+    "DigestHasher outgrew its documented ~1.9 KiB bound; re-check the \
+     `large_enum_variant` allowance above and the stack cost of transient use"
+);
 
 impl DigestHasher {
     /// Feed `data` into the hash state.
