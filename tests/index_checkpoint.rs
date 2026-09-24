@@ -790,12 +790,12 @@ mod tests {
         );
         assert_eq!(
             store.stats().sidecar_writes,
-            2,
-            "a dirty delta-path sync must write the sidecar exactly once"
+            1,
+            "a dirty delta-path sync must defer the sidecar"
         );
+        assert!(store.is_shard_collections_stale());
 
-        // A structural deletion uses the v3 tombstone append; still one
-        // sidecar write.
+        // A structural deletion uses the v3 tombstone append; still deferred.
         store.delete_collection(&collection_id(2)).unwrap();
         store.sync().unwrap();
         let sync = store
@@ -805,12 +805,13 @@ mod tests {
         assert!(sync.delta_log > std::time::Duration::ZERO);
         assert_eq!(
             store.stats().sidecar_writes,
-            3,
-            "a dirty checkpoint-path sync must write the sidecar exactly once"
+            1,
+            "a dirty tombstone delta-path sync must defer the sidecar"
         );
+        assert!(store.is_shard_collections_stale());
 
-        // The sidecar rides the newest checkpoint fingerprint, so the fast
-        // reopen path still serves it rather than falling back to a rescan.
+        // Dropping the writer flushes the deferred sidecar, repinned to the newest pack
+        // fingerprint so the fast reopen path still serves it rather than falling back.
         drop(store);
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
         let open = reopened

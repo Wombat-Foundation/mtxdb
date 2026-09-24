@@ -1237,9 +1237,18 @@ pub struct PackfileStorage {
     /// cost, while a crash left a stale checkpoint is still always resolved by
     /// the fingerprint → rescan fallback.
     index_checkpoint_dirty: AtomicBool,
-    /// The shard→collection sidecar needs writing even though no index is
-    /// dirty (see `RoomScanOutput::sidecar_missing`).
+    /// The shard→collection sidecar is known missing or invalid and must be
+    /// regenerated even though no index is dirty (see
+    /// `RoomScanOutput::sidecar_missing`). Distinct from
+    /// `shard_collections_stale`: that flag only says ordinary writes have
+    /// advanced the in-memory bookkeeping past the on-disk copy, which is
+    /// deferred to the next persistence anchor.
     shard_collections_dirty: AtomicBool,
+    /// In-memory shard→collection bookkeeping has advanced past the on-disk
+    /// sidecar because a per-event durable barrier deferred the write. The
+    /// sidecar is rebuildable acceleration metadata, so this only schedules a
+    /// flush at the next anchor: a checkpoint rewrite, a repack, or shutdown.
+    shard_collections_stale: AtomicBool,
     /// A missing sidecar was observed, but its physical byte metrics could not
     /// be rebuilt. Keep retrying rather than publishing misleading zeros.
     shard_collections_recovery_failed: AtomicBool,
@@ -2031,6 +2040,7 @@ impl PackfileStorage {
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
             shard_collections_dirty: AtomicBool::new(scan_out.sidecar_missing),
+            shard_collections_stale: AtomicBool::new(false),
             shard_collections_recovery_failed: AtomicBool::new(scan_out.sidecar_recovery_failed),
             shard_collections_failure_logged: AtomicBool::new(false),
             #[cfg(test)]
@@ -3361,7 +3371,15 @@ impl PackfileStorage {
         // durability for the directory entry itself).
         self.sidecar_writes.fetch_add(1, Ordering::Relaxed);
         self.shard_collections_dirty.store(false, Ordering::Relaxed);
+        self.shard_collections_stale.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// True when dirty writes have modified shard→collection bookkeeping but
+    /// persistence of `shard_collections.bin` has been deferred to the next
+    /// anchor (checkpoint rewrite, repack, or clean shutdown).
+    pub fn is_shard_collections_stale(&self) -> bool {
+        self.shard_collections_stale.load(Ordering::Relaxed)
     }
 
     /// Best-effort wrapper around [`Self::persist_shard_collections`] — logs and
@@ -7007,12 +7025,11 @@ impl PackfileStorage {
 
     /// Sync all open shards to disk (full pool, not just dirty).
     ///
-    /// Also persists the shard→collection directory as a side effect — an
-    /// explicit sync is a natural point to flush this observability data too.
-    /// The sidecar is written exactly once, pinned to the same pack
-    /// fingerprint the index checkpoint/delta advance to inside
-    /// `persist_index_checkpoint_or_delta`; see its owner comment for why the
-    /// write lives there rather than here.
+    /// A full checkpoint rewrite also persists the shard→collection directory
+    /// as a side effect — the rewrite is an anchor at which this observability
+    /// sidecar is re-pinned to the same pack fingerprint the checkpoint just
+    /// became. A delta-only barrier defers it; see
+    /// `persist_index_checkpoint_or_delta` for the deferral policy.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure.
@@ -7427,25 +7444,35 @@ impl PackfileStorage {
     /// the log can be continued, otherwise a full checkpoint rewrite — and
     /// record which path ran in `timings`. No-op when nothing is dirty.
     ///
-    /// The shard→collection inspection sidecar is owned here, written exactly
-    /// once per dirty barrier whether the index persisted as a delta append or
-    /// a full rewrite: it must stay gated to the same pack set the checkpoint
-    /// just became, so the next open can rebuild per-shard counts from records
-    /// instead of walking every slot. A clean barrier writes nothing (the
-    /// sidecar can only have gone stale together with the index — the same
-    /// mutations that move a record into a shard also dirty the index). A
-    /// failure here leaves the previous directory stale; the fingerprint gate
-    /// then falls back to the slot walk until the next rewrite.
+    /// The shard→collection inspection sidecar is deferred away from the
+    /// per-event durable barrier: a delta append and a deferred checkpoint
+    /// rewrite only set `shard_collections_stale`, leaving the on-disk copy
+    /// (and its pack fingerprint) behind the live pack set. That is safe
+    /// because the sidecar is rebuildable acceleration metadata — the next open
+    /// fails its fingerprint gate and falls back to the slot walk — so the hot
+    /// barrier never pays its `sync_data` + rename. The sidecar is re-pinned
+    /// only at anchors: a successful full checkpoint rewrite (to the same pack
+    /// fingerprint the checkpoint just became), a repack, or shutdown (`Drop`).
+    /// A known missing/invalid sidecar (`shard_collections_dirty`) is still
+    /// regenerated even on an otherwise clean barrier, because that is a rare
+    /// recovery path rather than a steady-state write.
     fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         let _persist_guard = self.index_persist_lock.lock();
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             // Nothing to checkpoint, but a sidecar lost while the checkpoint
-            // survived still has to be regenerated.
+            // survived still has to be regenerated. A sidecar that is merely
+            // stale from deferred writes is left for the next anchor.
             if self.shard_collections_dirty.load(Ordering::Relaxed) {
+                let sidecar_started = std::time::Instant::now();
                 self.persist_shard_collections_best_effort();
+                timings.sidecar = sidecar_started.elapsed();
             }
             return;
         }
+        // Only a full checkpoint rewrite re-pins the sidecar to the pack
+        // fingerprint the checkpoint just became. Every other dirty path
+        // records staleness instead and writes nothing.
+        let mut sidecar_anchor = false;
         if self.delta_state_needs_full_rewrite() {
             if self.should_defer_checkpoint_rewrite() {
                 // Write-neutral stopgap: the caller already synced the
@@ -7456,12 +7483,14 @@ impl PackfileStorage {
                 // `index_checkpoint_dirty` set so a later barrier past the
                 // budget still rewrites.
                 self.checkpoint_skips.fetch_add(1, Ordering::Relaxed);
+                self.shard_collections_stale.store(true, Ordering::Relaxed);
                 return;
             }
             let checkpoint_started = std::time::Instant::now();
             self.persist_index_checkpoint_best_effort();
             self.note_checkpoint_rewrite();
             timings.checkpoint = checkpoint_started.elapsed();
+            sidecar_anchor = true;
         } else {
             let delta_started = std::time::Instant::now();
             if let Err(error) = self.append_index_delta() {
@@ -7474,13 +7503,24 @@ impl PackfileStorage {
                 self.persist_index_checkpoint_best_effort();
                 self.note_checkpoint_rewrite();
                 timings.checkpoint = checkpoint_started.elapsed();
+                sidecar_anchor = true;
             } else {
                 timings.delta_log = delta_started.elapsed();
+                // A missing/invalid sidecar must still be regenerated, but a
+                // normal delta append defers it: the on-disk copy is merely
+                // stale and the next open rebuilds it from the slot walk.
+                if self.shard_collections_dirty.load(Ordering::Relaxed) {
+                    sidecar_anchor = true;
+                } else {
+                    self.shard_collections_stale.store(true, Ordering::Relaxed);
+                }
             }
         }
-        let sidecar_started = std::time::Instant::now();
-        self.persist_shard_collections_best_effort();
-        timings.sidecar = sidecar_started.elapsed();
+        if sidecar_anchor {
+            let sidecar_started = std::time::Instant::now();
+            self.persist_shard_collections_best_effort();
+            timings.sidecar = sidecar_started.elapsed();
+        }
     }
 
     /// Fingerprint of the current on-disk pack set, computed from each
@@ -7994,6 +8034,22 @@ pub struct RuntimeStats {
     /// real concurrent-writer load: compare this against total sync wall
     /// time (`last_sync_timings`) to judge whether it's worth pursuing.
     pub dirty_lock_wait: std::time::Duration,
+}
+
+/// Flush a dirty/stale shard→collection sidecar on shutdown so a clean exit
+/// leaves the sidecar pinned to the final pack set. Best-effort and gated: a
+/// read-only handle never sets either flag, and any write error is swallowed by
+/// the best-effort wrapper. Dropping without this running remains safe — the
+/// sidecar is rebuildable acceleration metadata — so correctness never depends
+/// on `Drop`.
+impl Drop for PackfileStorage {
+    fn drop(&mut self) {
+        if self.shard_collections_dirty.load(Ordering::Relaxed)
+            || self.shard_collections_stale.load(Ordering::Relaxed)
+        {
+            self.persist_shard_collections_best_effort();
+        }
+    }
 }
 
 impl Default for RuntimeStats {
@@ -13139,7 +13195,10 @@ mod tests {
             .expect("writer must finish once recovery ends");
         writer.join().unwrap();
 
+        // `sync_all` defers the sidecar on a delta-only barrier; flush it
+        // explicitly so this checks the totals rather than the deferral.
         store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
         let expected = crate::packfile::layout::physical_layout(&dir)
             .unwrap()
             .collections[&TEST_COLLECTION]
@@ -13263,7 +13322,10 @@ mod tests {
             let _ = store.persist_shard_collections();
         }
         writer.join().unwrap();
+        // `sync_all` now defers the sidecar on a delta-only barrier, so flush
+        // it explicitly before checking the totals recovery published.
         store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
 
         let expected = crate::packfile::layout::physical_layout(&dir)
             .unwrap()
@@ -13323,6 +13385,222 @@ mod tests {
             "regenerated bytes must equal the physical layout, not zero"
         );
         drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A delta-only sync must not rewrite the sidecar: it records staleness and
+    /// waits for an explicit flush. The first sync (no checkpoint base) is a
+    /// full rewrite, so it is still an anchor.
+    #[test]
+    fn delta_barrier_defers_sidecar_until_an_explicit_flush() {
+        let dir = test_dir("sidecar_deferred_delta_barrier");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        assert_eq!(
+            store.stats().sidecar_writes,
+            1,
+            "the checkpoint anchor writes the sidecar"
+        );
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        let after_checkpoint = fs::read(&sidecar).unwrap();
+
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(1),
+                &NodeData::new(bytes::Bytes::from_static(b"more")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        assert_eq!(
+            store.stats().sidecar_writes,
+            1,
+            "a delta-only barrier must not rewrite the sidecar"
+        );
+        assert!(store.shard_collections_stale.load(Ordering::Relaxed));
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            after_checkpoint,
+            "the on-disk sidecar is left stale, not rewritten"
+        );
+
+        // An explicit flush is the checkpoint/repack/shutdown anchor.
+        store.persist_shard_collections().unwrap();
+        assert_eq!(store.stats().sidecar_writes, 2);
+        assert!(!store.shard_collections_stale.load(Ordering::Relaxed));
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 2)]
+        );
+
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sidecar left stale by a deferred delta barrier must not be trusted: a
+    /// concurrent read-only open falls back to the slot walk. Dropping the
+    /// writer flushes it, so a later open trusts it again.
+    #[test]
+    fn stale_sidecar_forces_slot_scan_and_drop_repins_it() {
+        let dir = test_dir("sidecar_stale_then_drop");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        for i in 0..3u8 {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        store.sync_all().unwrap(); // checkpoint anchor: sidecar written
+
+        for i in 3..6u8 {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        store.sync_all().unwrap(); // delta barrier: sidecar deferred
+
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        assert_eq!(
+            reader.open_timings().unwrap().bookkeeping_source,
+            BookkeepingSource::SlotScan,
+            "a stale sidecar must not be trusted"
+        );
+        assert_eq!(
+            reader
+                .collection_summaries()
+                .into_iter()
+                .find(|(id, _, _, _)| *id == TEST_COLLECTION)
+                .unwrap()
+                .1,
+            6,
+            "the slot walk must still see every live record"
+        );
+        drop(reader);
+
+        // Dropping the writer flushes the deferred sidecar, re-pinned to the
+        // live pack set.
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.open_timings().unwrap().bookkeeping_source,
+            BookkeepingSource::Sidecar,
+            "Drop must have re-pinned the sidecar to the live packs"
+        );
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 6)]
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A torn (partially written) sidecar must be treated as absent: open
+    /// rebuilds from the slot walk, and the next clean barrier regenerates it
+    /// with exact byte totals.
+    #[test]
+    fn torn_sidecar_is_ignored_and_regenerated() {
+        let dir = test_dir("sidecar_torn");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(0),
+                    &NodeData::new(bytes::Bytes::from_static(b"x")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+        }
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        let full = fs::read(&sidecar).unwrap();
+        assert!(full.len() > 20);
+        fs::write(&sidecar, &full[..full.len() / 2]).unwrap();
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.open_timings().unwrap().bookkeeping_source,
+            BookkeepingSource::SlotScan,
+            "a torn sidecar must not be trusted"
+        );
+        // The open observed a missing sidecar, so the clean barrier regenerates
+        // it without needing any write.
+        reopened.sync_all().unwrap();
+        assert!(reopened.stats().sidecar_writes >= 1);
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "regeneration must use exact byte totals, not zeros"
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The rate-limited flush must stay consistent while writers append.
+    #[test]
+    fn maybe_persist_shard_collections_is_consistent_under_concurrent_writes() {
+        let dir = test_dir("sidecar_maybe_persist_concurrent");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        let writer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for i in 0..500u32 {
+                    let mut id = [0u8; 16];
+                    id[..4].copy_from_slice(&i.to_le_bytes());
+                    id[9] = u8::try_from(i & 0xff).unwrap().wrapping_mul(37);
+                    store
+                        .put(
+                            &TEST_COLLECTION,
+                            &id,
+                            &NodeData::new(bytes::Bytes::from(vec![b'x'; 32])),
+                        )
+                        .unwrap();
+                }
+            })
+        };
+        while !writer.is_finished() {
+            store.persist_shard_collections().unwrap();
+        }
+        writer.join().unwrap();
+        store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
+
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "totals flushed under concurrent writes must match the frames on disk"
+        );
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 500)]
+        );
+        drop(store);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -13514,7 +13792,10 @@ mod tests {
         );
 
         store.delete_collection(&TEST_COLLECTION).unwrap();
+        // A delta-only sync defers the sidecar, so flush it to exercise the
+        // persisted directory rather than the deferral.
         store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
 
         let directory = PackfileStorage::collection_directory_from_disk(&dir);
         assert_eq!(
