@@ -625,6 +625,64 @@ impl StorageEngine for InMemoryStorage {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+/// Shared body of the `collection_len_counts_genesis_and_distinct_ids` test
+/// that every backend runs. Both the in-memory and the packfile suite call
+/// this against their own store, so the assertions live in one place instead
+/// of drifting copies.
+pub(crate) fn assert_collection_len_counts_genesis_and_distinct_ids(store: &dyn StorageEngine) {
+    use crate::template::{CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
+
+    let collection = [0x7Bu8; 16];
+    assert_eq!(store.collection_len(&collection).unwrap(), None);
+
+    let metadata = CollectionMetadata {
+        pool_dst: Some(*b"EVNT"),
+        collection_canonical_id: b"!room:matrix.org".to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::Pointer {
+                pointer: "/event_id".into(),
+            },
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    };
+    store
+        .ensure_collection_metadata(&collection, &metadata)
+        .unwrap();
+    assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
+
+    let a = [0xA1u8; 16];
+    let b = [0xB2u8; 16];
+    store
+        .put(
+            &collection,
+            &a,
+            &NodeData::new(bytes::Bytes::from_static(b"one")),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &b,
+            &NodeData::new(bytes::Bytes::from_static(b"two")),
+        )
+        .unwrap();
+    assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+
+    // Overwriting an id does not add a record.
+    store
+        .put(
+            &collection,
+            &a,
+            &NodeData::new(bytes::Bytes::from_static(b"uno")),
+        )
+        .unwrap();
+    assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::error::Error;
@@ -825,58 +883,7 @@ mod tests {
 
     #[test]
     fn collection_len_counts_genesis_and_distinct_ids() {
-        use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
-        };
-
-        let store = InMemoryStorage::new();
-        let collection = [0x7Bu8; 16];
-        assert_eq!(store.collection_len(&collection).unwrap(), None);
-
-        let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
-            collection_canonical_id: b"!room:matrix.org".to_vec(),
-            record_id_rule: RecordIdentityRule {
-                policy: FrameIdPolicy::Pointer {
-                    pointer: "/event_id".into(),
-                },
-                digest_algorithm: DigestAlgorithm::Sha256,
-            },
-            payload: PayloadPolicy::Source,
-            extension: None,
-        };
-        store
-            .ensure_collection_metadata(&collection, &metadata)
-            .unwrap();
-        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
-
-        let a = [0xA1u8; 16];
-        let b = [0xB2u8; 16];
-        store
-            .put(
-                &collection,
-                &a,
-                &NodeData::new(bytes::Bytes::from_static(b"one")),
-            )
-            .unwrap();
-        store
-            .put(
-                &collection,
-                &b,
-                &NodeData::new(bytes::Bytes::from_static(b"two")),
-            )
-            .unwrap();
-        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
-
-        // Overwriting an id does not add a record.
-        store
-            .put(
-                &collection,
-                &a,
-                &NodeData::new(bytes::Bytes::from_static(b"uno")),
-            )
-            .unwrap();
-        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+        assert_collection_len_counts_genesis_and_distinct_ids(&InMemoryStorage::new());
     }
 
     /// An empty batch must be a no-op across every backend: no collection is

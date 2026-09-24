@@ -3509,6 +3509,36 @@ impl PackfileStorage {
         }
     }
 
+    /// Snapshot every collection's live generation for a checkpoint, encoded as
+    /// `(collection_id, generation, room)`. Callers hold all collection put
+    /// mutexes, so the snapshot is a consistent point in the index.
+    fn checkpoint_snapshots(&self) -> Vec<([u8; 16], u64, Arc<RoomGeneration>)> {
+        let tables = self.index_tables.read();
+        tables
+            .collection_order
+            .iter()
+            .filter_map(|collection_id| {
+                tables.collections.get(collection_id).map(|g| {
+                    let generation = arc_swap::ArcSwapAny::load_full(g);
+                    (*collection_id, generation.generation, generation)
+                })
+            })
+            .collect()
+    }
+
+    /// The journal LSN this store's checkpoint covers: its own pool's committed
+    /// watermark on a shared segment (one group can interleave other pools'
+    /// frames), or the global committed LSN for a per-pool segment. `None` when
+    /// no journal is enabled.
+    fn checkpoint_covered_lsn(&self) -> Option<u64> {
+        self.journal().map(|journal| {
+            match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+                Some(pool) => journal.committed_lsn_for_pool(pool),
+                None => journal.committed_lsn(),
+            }
+        })
+    }
+
     /// Persist the full per-collection index state to `index.checkpoint`, so
     /// the next open can load it instead of rescanning every packfile.
     ///
@@ -3633,19 +3663,7 @@ impl PackfileStorage {
             .map(|(slot, shard)| (*slot, shard.pack_id))
             .collect();
 
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
 
         // Rotate the delta epoch while still locked: `old_base_fingerprint`
         // (D0's name, if any) is retired below only after `fingerprint`'s
@@ -3667,10 +3685,7 @@ impl PackfileStorage {
         // pool's own committed watermark instead, so its coverage and the
         // reclaim floor both describe only frames this index holds.
         let journal_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
-        let wal_lsn = self.journal().map(|journal| match journal_pool {
-            Some(pool) => journal.committed_lsn_for_pool(pool),
-            None => journal.committed_lsn(),
-        });
+        let wal_lsn = self.checkpoint_covered_lsn();
         drop(guards);
         // `create_guard` is deliberately NOT dropped here, unlike the
         // per-collection put mutexes above. An existing collection's
@@ -3866,26 +3881,9 @@ impl PackfileStorage {
         let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
-        let covered_lsn = self.journal().map_or(0, |journal| {
-            match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
-                Some(pool) => journal.committed_lsn_for_pool(pool),
-                None => journal.committed_lsn(),
-            }
-        });
+        let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
         drop(guards);
         drop(create_guard);
 
@@ -3939,19 +3937,7 @@ impl PackfileStorage {
         let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
         self.shards.flush_all().unwrap();
         let fingerprint = self.current_pack_fingerprint();
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         (fingerprint, old_base_fingerprint)
     }
@@ -3969,26 +3955,9 @@ impl PackfileStorage {
         let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
-        let covered_lsn = self.journal().map_or(0, |journal| {
-            match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
-                Some(pool) => journal.committed_lsn_for_pool(pool),
-                None => journal.committed_lsn(),
-            }
-        });
+        let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
         drop(guards);
         let pack_table: Vec<(u16, u64)> = self
             .shards
@@ -14458,59 +14427,9 @@ mod tests {
 
     #[test]
     fn collection_len_counts_genesis_and_distinct_ids() {
-        use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
-        };
-
         let dir = test_dir("collection_len");
         let store = PackfileStorage::open(dir.clone()).unwrap();
-        let collection = [0x7Au8; 16];
-        assert_eq!(store.collection_len(&collection).unwrap(), None);
-
-        let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
-            collection_canonical_id: b"!room:matrix.org".to_vec(),
-            record_id_rule: RecordIdentityRule {
-                policy: FrameIdPolicy::Pointer {
-                    pointer: "/event_id".into(),
-                },
-                digest_algorithm: DigestAlgorithm::Sha256,
-            },
-            payload: PayloadPolicy::Source,
-            extension: None,
-        };
-        store
-            .ensure_collection_metadata(&collection, &metadata)
-            .unwrap();
-        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
-
-        let a = [0xA1u8; 16];
-        let b = [0xB2u8; 16];
-        store
-            .put(
-                &collection,
-                &a,
-                &NodeData::new(bytes::Bytes::from_static(b"one")),
-            )
-            .unwrap();
-        store
-            .put(
-                &collection,
-                &b,
-                &NodeData::new(bytes::Bytes::from_static(b"two")),
-            )
-            .unwrap();
-        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
-
-        // Overwriting an id appends a frame but does not add a record.
-        store
-            .put(
-                &collection,
-                &a,
-                &NodeData::new(bytes::Bytes::from_static(b"uno")),
-            )
-            .unwrap();
-        assert_eq!(store.collection_len(&collection).unwrap(), Some(3));
+        crate::storage::assert_collection_len_counts_genesis_and_distinct_ids(&store);
         drop(store);
         fs::remove_dir_all(&dir).ok();
     }
