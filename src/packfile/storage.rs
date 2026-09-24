@@ -822,6 +822,13 @@ pub struct ReadPlanPolicy {
     /// handful of reads gains nothing from a plan, and the grouping/sort is
     /// pure overhead.
     pub min_batch_candidates: usize,
+    /// When set, advise each shard mapping `MADV_RANDOM` before reading, with
+    /// no planning at all. A random-access hint suppresses the kernel's
+    /// sequential readahead, so a scattered `get_many` reads only the pages
+    /// it faults rather than having readahead amplify each one into a large
+    /// block read. This is the low-cost alternative to extent planning on a
+    /// rotational disk: `false` on the presets that plan.
+    pub random_advice: bool,
 }
 
 impl Default for ReadPlanPolicy {
@@ -843,6 +850,21 @@ impl ReadPlanPolicy {
             merge_gap_bytes: 0,
             max_extent_bytes: 0,
             min_batch_candidates: usize::MAX,
+            random_advice: false,
+        }
+    }
+
+    /// No extent planning, but advise each shard `MADV_RANDOM` before reading
+    /// so kernel readahead does not amplify a scattered batch into large
+    /// sequential reads. The cheap baseline to compare a real plan against:
+    /// if this alone captures the win, the planner earns nothing.
+    #[must_use]
+    pub fn random_advice() -> Self {
+        Self {
+            merge_gap_bytes: 0,
+            max_extent_bytes: 0,
+            min_batch_candidates: usize::MAX,
+            random_advice: true,
         }
     }
 
@@ -858,6 +880,7 @@ impl ReadPlanPolicy {
             merge_gap_bytes: 2 * 1024 * 1024,
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 16,
+            random_advice: false,
         }
     }
 
@@ -7119,6 +7142,13 @@ impl StorageEngine for PackfileStorage {
             let policy = self.read_plan_policy();
             let plan_wanted = policy.wants(usize::try_from(candidates_seen).unwrap_or(usize::MAX));
 
+            // Suppress readahead for a scattered batch when asked. This is
+            // independent of extent planning: it reads the same pages either
+            // way, it just stops the kernel from over-reading first.
+            if policy.random_advice && candidates_seen > 0 {
+                Self::advise_random(&pinned);
+            }
+
             // One grouping of candidate offsets per shard feeds both the
             // scatter counters and the merged read plan below.
             let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
@@ -7283,6 +7313,28 @@ impl PackfileStorage {
             }
         }
     }
+
+    /// Advise every pinned shard mapping `MADV_RANDOM` before a scattered
+    /// batch read, so the kernel does not let readahead amplify each fault
+    /// into a large sequential block read. This is the no-plan alternative to
+    /// [`Self::prefetch_extents`]: it does not merge or prefetch anything, it
+    /// only stops readahead from over-reading beyond the pages actually
+    /// touched. A shard whose mapping is absent or whose `madvise` fails is
+    /// simply left alone — the read still works, just with default advice.
+    #[cfg(unix)]
+    fn advise_random(pinned: &HashMap<u16, Arc<Shard>>) {
+        for shard in pinned.values() {
+            if let Ok(guard) = shard.mmap() {
+                if let Some(mapping) = guard.as_ref() {
+                    let _ = mapping.advise(memmap2::Advice::Random);
+                }
+            }
+        }
+    }
+
+    /// Non-Unix builds have no `madvise`; readahead advice is a no-op.
+    #[cfg(not(unix))]
+    fn advise_random(_pinned: &HashMap<u16, Arc<Shard>>) {}
 
     /// `madvise(MADV_WILLNEED)` one extent, returning its byte length on
     /// success and `None` if it could not be advised.
@@ -12052,6 +12104,7 @@ mod tests {
                 merge_gap_bytes: 100_000,
                 max_extent_bytes: 10_000_000,
                 min_batch_candidates: 1,
+                random_advice: false,
             },
         );
         assert_eq!(
@@ -12085,6 +12138,7 @@ mod tests {
                 merge_gap_bytes: 10_000_000,
                 max_extent_bytes: 200_000,
                 min_batch_candidates: 1,
+                random_advice: false,
             },
         );
         assert_eq!(
@@ -12116,6 +12170,7 @@ mod tests {
                 merge_gap_bytes: 100,
                 max_extent_bytes: 8 * 1024 * 1024,
                 min_batch_candidates: 1,
+                random_advice: false,
             },
         );
         let slots: Vec<u16> = extents.iter().map(|extent| extent.slot).collect();
@@ -12128,10 +12183,23 @@ mod tests {
             merge_gap_bytes: 0,
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 16,
+            random_advice: false,
         };
         assert!(!policy.wants(15));
         assert!(policy.wants(16));
         assert!(!ReadPlanPolicy::disabled().wants(1_000_000));
+    }
+
+    #[test]
+    fn test_random_advice_preset_plans_nothing() {
+        // The random-advice preset suppresses readahead but builds no
+        // extents: it must never satisfy `wants`, whatever the batch size.
+        let policy = ReadPlanPolicy::random_advice();
+        assert!(policy.random_advice);
+        assert!(!policy.wants(1_000_000));
+        assert!(!ReadPlanPolicy::disabled().random_advice);
+        assert!(!ReadPlanPolicy::prefetch().random_advice);
+        assert!(ReadPlanPolicy::prefetch().wants(16));
     }
 
     #[test]
@@ -12156,6 +12224,7 @@ mod tests {
             merge_gap_bytes: 1024 * 1024,
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 1,
+            random_advice: false,
         });
 
         let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
