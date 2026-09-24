@@ -407,6 +407,16 @@ pub struct JournalSyncTimings {
     pub journal_waiter: bool,
     /// Whether this request was already covered by another durable request.
     pub journal_coalesced: bool,
+    /// Number of journal sync callers active when this request entered.
+    pub journal_in_flight: u64,
+}
+
+struct SyncInFlightGuard<'a>(&'a AtomicU64);
+
+impl Drop for SyncInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Result of validating a journal file.
@@ -473,6 +483,7 @@ const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
 /// the journal lock.
 pub struct JournalCoordinator {
     journal: Mutex<Journal>,
+    path: PathBuf,
     pending: Mutex<Vec<(u64, Mutation)>>,
     /// Next LSN to assign. Advanced under `pending`, independently of journal
     /// I/O, so a publish never blocks behind a sync's fsync.
@@ -498,6 +509,7 @@ pub struct JournalCoordinator {
     journal_waiters: AtomicU64,
     /// Number of requests covered without appending or fsyncing themselves.
     coalesced_syncs: AtomicU64,
+    sync_in_flight: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -506,8 +518,10 @@ impl JournalCoordinator {
     pub fn new(journal: Journal, scan: &Scan) -> Self {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
         let next_lsn = journal.next_lsn;
+        let path = journal.path.clone();
         Self {
             journal: Mutex::new(journal),
+            path,
             pending: Mutex::new(Vec::new()),
             next_lsn: AtomicU64::new(next_lsn),
             published_lsn: AtomicU64::new(committed_lsn),
@@ -518,6 +532,7 @@ impl JournalCoordinator {
             sync_calls: AtomicU64::new(0),
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
+            sync_in_flight: AtomicU64::new(0),
         }
     }
 
@@ -540,6 +555,12 @@ impl JournalCoordinator {
     #[must_use]
     pub fn committed_lsn(&self) -> u64 {
         self.committed_lsn.load(Ordering::Acquire)
+    }
+
+    /// Path of the journal segment used by this coordinator.
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
     }
 
     /// Highest LSN whose journal group is complete (commit trailer appended),
@@ -626,6 +647,12 @@ impl JournalCoordinator {
     ) -> io::Result<(Option<CommitReceipt>, JournalSyncTimings)> {
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
         let mut timings = JournalSyncTimings::default();
+        let in_flight = self
+            .sync_in_flight
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        timings.journal_in_flight = in_flight;
+        let _in_flight_guard = SyncInFlightGuard(&self.sync_in_flight);
         if target_lsn == 0 {
             timings.journal_coalesced = true;
             self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
@@ -728,12 +755,13 @@ impl JournalCoordinator {
     fn warn_if_slow_fsync(&self, path: &Path, target_lsn: u64, timings: &JournalSyncTimings) {
         if timings.journal_fsync >= SLOW_FSYNC_WARN {
             eprintln!(
-                "mtxdb: slow WAL fsync {}ms (through lsn {target_lsn}, lock wait {}ms, append {}ms, {} records, {} bytes, waiters {}, {})",
+                "mtxdb: slow WAL fsync {}ms (through lsn {target_lsn}, lock wait {}ms, append {}ms, {} records, {} bytes, in-flight {}, waiters {}, {})",
                 timings.journal_fsync.as_millis(),
                 timings.journal_lock_wait.as_millis(),
                 timings.journal_append.as_millis(),
                 timings.journal_records,
                 timings.journal_bytes,
+                timings.journal_in_flight,
                 self.journal_waiters.load(Ordering::Relaxed),
                 path.display(),
             );

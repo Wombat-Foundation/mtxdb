@@ -1667,6 +1667,17 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
         stats.sync_totals.journal_waiters,
         stats.sync_totals.journal_coalesced
     );
+    let journal_groups = stats
+        .sync_totals
+        .journal_sync_calls
+        .saturating_sub(stats.sync_totals.journal_coalesced);
+    println!(
+        "      batching       {} records / {} groups   coalesced {}/{}",
+        stats.sync_totals.journal_records,
+        journal_groups,
+        stats.sync_totals.journal_coalesced,
+        stats.sync_totals.journal_sync_calls
+    );
     println!(
         "      wal            total {}   lock wait {}   pending wait {}   append {}   fsync {}",
         fmt_ms(stats.sync_totals.wal),
@@ -1680,9 +1691,26 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
         fmt_ms(stats.sync_totals.max_journal_lock_wait),
         fmt_ms(stats.sync_totals.max_journal_fsync)
     );
+    println!(
+        "      pending age    total {}   dirty-lock wait {}",
+        fmt_ms(stats.sync_totals.pending_publish_age),
+        fmt_ms(stats.sync_totals.dirty_lock_wait)
+    );
+    println!(
+        "      latency        fsync {:?}   lock-wait {:?}   peak in-flight {}",
+        stats.sync_diagnostics.fsync_latency.buckets,
+        stats.sync_diagnostics.lock_wait_latency.buckets,
+        stats.sync_diagnostics.peak_journal_in_flight
+    );
+    println!(
+        "    publish          {} calls   {}",
+        stats.publish_calls,
+        fmt_ms(stats.publish_time)
+    );
     if let Some(timings) = stats.last_sync_timings {
         println!(
-            "    last journal     wal {}   lock wait {}   pending wait {}   append {}   fsync {}   records {}   bytes {}",
+            "    last journal     {}   wal {}   lock wait {}   pending wait {}   append {}   fsync {}   records {}   bytes {}",
+            if timings.failed { "FAILED" } else { "ok" },
             fmt_ms(timings.wal),
             fmt_ms(timings.journal_lock_wait),
             fmt_ms(timings.journal_pending_wait),
@@ -1690,6 +1718,24 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
             fmt_ms(timings.journal_fsync),
             timings.journal_records,
             fmt_bytes(timings.journal_bytes)
+        );
+    }
+    for (index, sample) in stats.sync_diagnostics.worst_syncs.iter().enumerate() {
+        println!(
+            "    worst[{index:>2}]       {} pid {} total {} wal {} fsync {} lock {} sidecar {} delta {} checkpoint {} in-flight {} records {} bytes {} path {}",
+            if sample.failed { "FAILED" } else { "ok" },
+            sample.process_id,
+            fmt_ms(sample.total),
+            fmt_ms(sample.wal),
+            fmt_ms(sample.journal_fsync),
+            fmt_ms(sample.journal_lock_wait),
+            fmt_ms(sample.sidecar),
+            fmt_ms(sample.delta_log),
+            fmt_ms(sample.checkpoint),
+            sample.journal_in_flight,
+            sample.journal_records,
+            fmt_bytes(sample.journal_bytes),
+            sample.journal_path.as_deref().unwrap_or("-")
         );
     }
     println!(
@@ -1837,6 +1883,10 @@ fn stats_json_object(
         ],
         "  ",
     );
+    let journal_groups = stats
+        .sync_totals
+        .journal_sync_calls
+        .saturating_sub(stats.sync_totals.journal_coalesced);
     let sync_totals = json_object(
         &[
             ("calls", stats.sync_totals.calls.to_string()),
@@ -1879,6 +1929,7 @@ fn stats_json_object(
                 "journal_coalesced",
                 stats.sync_totals.journal_coalesced.to_string(),
             ),
+            ("journal_groups", journal_groups.to_string()),
             (
                 "max_journal_lock_wait_ns",
                 stats
@@ -1891,6 +1942,14 @@ fn stats_json_object(
                 "max_journal_fsync_ns",
                 stats.sync_totals.max_journal_fsync.as_nanos().to_string(),
             ),
+            (
+                "dirty_lock_wait_ns",
+                stats.sync_totals.dirty_lock_wait.as_nanos().to_string(),
+            ),
+            (
+                "pending_publish_age_ns",
+                stats.sync_totals.pending_publish_age.as_nanos().to_string(),
+            ),
         ],
         "  ",
     );
@@ -1900,6 +1959,7 @@ fn stats_json_object(
             json_object(
                 &[
                     ("total_ns", timings.total.as_nanos().to_string()),
+                    ("failed", timings.failed.to_string()),
                     ("wal_ns", timings.wal.as_nanos().to_string()),
                     (
                         "journal_lock_wait_ns",
@@ -1920,12 +1980,99 @@ fn stats_json_object(
                     ("journal_sync_calls", timings.journal_sync_calls.to_string()),
                     ("journal_bytes", timings.journal_bytes.to_string()),
                     ("journal_records", timings.journal_records.to_string()),
+                    ("journal_in_flight", timings.journal_in_flight.to_string()),
                     ("journal_waiters", timings.journal_waiters.to_string()),
                     ("journal_coalesced", timings.journal_coalesced.to_string()),
                 ],
                 "  ",
             )
         },
+    );
+    let histogram_json = |buckets: [u64; 5]| {
+        format!(
+            "[{}, {}, {}, {}, {}]",
+            buckets[0], buckets[1], buckets[2], buckets[3], buckets[4]
+        )
+    };
+    let worst_syncs = format!(
+        "[{}]",
+        stats
+            .sync_diagnostics
+            .worst_syncs
+            .iter()
+            .map(|sample| {
+                json_object(
+                    &[
+                        ("timestamp_ms", sample.timestamp_ms.to_string()),
+                        ("failed", sample.failed.to_string()),
+                        ("process_id", sample.process_id.to_string()),
+                        (
+                            "journal_path",
+                            sample
+                                .journal_path
+                                .as_ref()
+                                .map_or_else(|| "null".to_owned(), |path| json_string(path)),
+                        ),
+                        ("total_ns", sample.total.as_nanos().to_string()),
+                        ("pack_flush_ns", sample.pack_flush.as_nanos().to_string()),
+                        ("pack_fsync_ns", sample.pack_fsync.as_nanos().to_string()),
+                        ("sidecar_ns", sample.sidecar.as_nanos().to_string()),
+                        ("delta_log_ns", sample.delta_log.as_nanos().to_string()),
+                        ("checkpoint_ns", sample.checkpoint.as_nanos().to_string()),
+                        (
+                            "dirty_lock_wait_ns",
+                            sample.dirty_lock_wait.as_nanos().to_string(),
+                        ),
+                        (
+                            "pending_publish_age_ns",
+                            sample.pending_publish_age.as_nanos().to_string(),
+                        ),
+                        ("wal_ns", sample.wal.as_nanos().to_string()),
+                        (
+                            "journal_lock_wait_ns",
+                            sample.journal_lock_wait.as_nanos().to_string(),
+                        ),
+                        (
+                            "journal_pending_wait_ns",
+                            sample.journal_pending_wait.as_nanos().to_string(),
+                        ),
+                        (
+                            "journal_append_ns",
+                            sample.journal_append.as_nanos().to_string(),
+                        ),
+                        (
+                            "journal_fsync_ns",
+                            sample.journal_fsync.as_nanos().to_string(),
+                        ),
+                        ("journal_records", sample.journal_records.to_string()),
+                        ("journal_bytes", sample.journal_bytes.to_string()),
+                        ("journal_in_flight", sample.journal_in_flight.to_string()),
+                        ("journal_waiters", sample.journal_waiters.to_string()),
+                        ("journal_coalesced", sample.journal_coalesced.to_string()),
+                    ],
+                    "    ",
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    let sync_diagnostics = json_object(
+        &[
+            (
+                "fsync_latency_buckets",
+                histogram_json(stats.sync_diagnostics.fsync_latency.buckets),
+            ),
+            (
+                "lock_wait_latency_buckets",
+                histogram_json(stats.sync_diagnostics.lock_wait_latency.buckets),
+            ),
+            (
+                "peak_journal_in_flight",
+                stats.sync_diagnostics.peak_journal_in_flight.to_string(),
+            ),
+            ("worst_syncs", worst_syncs),
+        ],
+        "  ",
     );
 
     let mut shards = String::from("[\n");
@@ -1959,6 +2106,9 @@ fn stats_json_object(
         ("runtime", runtime),
         ("last_sync", last_sync),
         ("sync_totals", sync_totals),
+        ("sync_diagnostics", sync_diagnostics),
+        ("publish_calls", stats.publish_calls.to_string()),
+        ("publish_time_ns", stats.publish_time.as_nanos().to_string()),
         ("shards", shards),
     ];
     json_object(&top, "")

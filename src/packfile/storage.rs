@@ -212,6 +212,8 @@ impl Default for OpenTimings {
 /// separately) and the metadata phases from the sync method itself.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncTimings {
+    /// Whether this barrier returned an error after collecting its partial timings.
+    pub failed: bool,
     /// Writing buffered frames out to the pack files.
     pub pack_flush: std::time::Duration,
     /// fsync'ing the pack files.
@@ -245,6 +247,12 @@ pub struct SyncTimings {
     pub journal_waiters: u64,
     /// Whether this operation was already covered by another sync.
     pub journal_coalesced: u64,
+    /// Number of journal sync callers active when this operation entered.
+    pub journal_in_flight: u64,
+    /// Time spent waiting for the shard pool's dirty-set lock in this barrier.
+    pub dirty_lock_wait: std::time::Duration,
+    /// Age of the oldest unpublished write when this barrier began.
+    pub pending_publish_age: std::time::Duration,
     /// Total wall time of the `sync_all` call.
     pub total: std::time::Duration,
 }
@@ -252,6 +260,7 @@ pub struct SyncTimings {
 impl Default for SyncTimings {
     fn default() -> Self {
         Self {
+            failed: false,
             pack_flush: std::time::Duration::ZERO,
             pack_fsync: std::time::Duration::ZERO,
             sidecar: std::time::Duration::ZERO,
@@ -267,6 +276,9 @@ impl Default for SyncTimings {
             journal_records: 0,
             journal_waiters: 0,
             journal_coalesced: 0,
+            journal_in_flight: 0,
+            dirty_lock_wait: std::time::Duration::ZERO,
+            pending_publish_age: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
         }
     }
@@ -309,6 +321,8 @@ struct SyncTotals {
     journal_coalesced: AtomicU64,
     max_journal_lock_wait_ns: AtomicU64,
     max_journal_fsync_ns: AtomicU64,
+    dirty_lock_wait_ns: AtomicU64,
+    pending_publish_age_ns: AtomicU64,
 }
 
 impl SyncTotals {
@@ -351,6 +365,8 @@ impl SyncTotals {
             u64::try_from(timings.journal_fsync.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        Self::add_duration(&self.dirty_lock_wait_ns, timings.dirty_lock_wait);
+        Self::add_duration(&self.pending_publish_age_ns, timings.pending_publish_age);
     }
 
     fn snapshot(&self) -> SyncTotalsSnapshot {
@@ -376,6 +392,8 @@ impl SyncTotals {
             journal_coalesced: self.journal_coalesced.load(Ordering::Relaxed),
             max_journal_lock_wait: duration(&self.max_journal_lock_wait_ns),
             max_journal_fsync: duration(&self.max_journal_fsync_ns),
+            dirty_lock_wait: duration(&self.dirty_lock_wait_ns),
+            pending_publish_age: duration(&self.pending_publish_age_ns),
         }
     }
 
@@ -400,6 +418,8 @@ impl SyncTotals {
             &self.journal_coalesced,
             &self.max_journal_lock_wait_ns,
             &self.max_journal_fsync_ns,
+            &self.dirty_lock_wait_ns,
+            &self.pending_publish_age_ns,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -449,6 +469,116 @@ pub struct SyncTotalsSnapshot {
     pub max_journal_lock_wait: std::time::Duration,
     /// Largest single journal fsync observed.
     pub max_journal_fsync: std::time::Duration,
+    /// Cumulative dirty-set lock wait attributed to sync barriers.
+    pub dirty_lock_wait: std::time::Duration,
+    /// Cumulative age observed for pending writes at sync entry.
+    pub pending_publish_age: std::time::Duration,
+}
+
+/// Fixed latency buckets used by sync diagnostics: `<1ms`, `<10ms`,
+/// `<100ms`, `<1s`, and `>=1s`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct SyncLatencyHistogram {
+    pub buckets: [u64; 5],
+}
+
+impl SyncLatencyHistogram {
+    fn observe(&mut self, duration: std::time::Duration) {
+        let micros = duration.as_micros();
+        let bucket = if micros < 1_000 {
+            0
+        } else if micros < 10_000 {
+            1
+        } else if micros < 100_000 {
+            2
+        } else if micros < 1_000_000 {
+            3
+        } else {
+            4
+        };
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+    }
+}
+
+/// One of the worst sync operations retained for post-run diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct SyncDiagnosticSample {
+    /// Unix timestamp in milliseconds when the sync completed.
+    pub timestamp_ms: u128,
+    pub process_id: u32,
+    pub journal_path: Option<String>,
+    pub total: std::time::Duration,
+    pub failed: bool,
+    pub pack_flush: std::time::Duration,
+    pub pack_fsync: std::time::Duration,
+    pub sidecar: std::time::Duration,
+    pub delta_log: std::time::Duration,
+    pub checkpoint: std::time::Duration,
+    pub dirty_lock_wait: std::time::Duration,
+    pub pending_publish_age: std::time::Duration,
+    pub wal: std::time::Duration,
+    pub journal_lock_wait: std::time::Duration,
+    pub journal_pending_wait: std::time::Duration,
+    pub journal_append: std::time::Duration,
+    pub journal_fsync: std::time::Duration,
+    pub journal_records: u64,
+    pub journal_bytes: u64,
+    pub journal_in_flight: u64,
+    pub journal_waiters: u64,
+    pub journal_coalesced: u64,
+}
+
+/// Runtime sync diagnostics retained after the operation that produced them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct SyncDiagnosticsSnapshot {
+    pub fsync_latency: SyncLatencyHistogram,
+    pub lock_wait_latency: SyncLatencyHistogram,
+    pub peak_journal_in_flight: u64,
+    pub worst_syncs: Vec<SyncDiagnosticSample>,
+}
+
+#[derive(Default)]
+struct SyncDiagnostics {
+    fsync_latency: SyncLatencyHistogram,
+    lock_wait_latency: SyncLatencyHistogram,
+    peak_journal_in_flight: u64,
+    worst_syncs: Vec<SyncDiagnosticSample>,
+}
+
+impl SyncDiagnostics {
+    const WORST_LIMIT: usize = 16;
+
+    fn record(&mut self, sample: SyncDiagnosticSample) {
+        if sample.journal_path.is_some() {
+            if sample.journal_coalesced == 0 && !sample.journal_fsync.is_zero() {
+                self.fsync_latency.observe(sample.journal_fsync);
+            }
+            if sample.journal_coalesced == 0 {
+                self.lock_wait_latency.observe(sample.journal_lock_wait);
+            }
+            self.peak_journal_in_flight = self.peak_journal_in_flight.max(sample.journal_in_flight);
+        }
+        self.worst_syncs.push(sample);
+        self.worst_syncs
+            .sort_unstable_by_key(|sample| std::cmp::Reverse(sample.total));
+        self.worst_syncs.truncate(Self::WORST_LIMIT);
+    }
+
+    fn snapshot(&self) -> SyncDiagnosticsSnapshot {
+        SyncDiagnosticsSnapshot {
+            fsync_latency: self.fsync_latency,
+            lock_wait_latency: self.lock_wait_latency,
+            peak_journal_in_flight: self.peak_journal_in_flight,
+            worst_syncs: self.worst_syncs.clone(),
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
@@ -901,6 +1031,14 @@ pub struct PackfileStorage {
     /// across a whole run instead of only the most recent barrier (which
     /// `last_sync_timings` alone cannot answer).
     sync_totals: SyncTotals,
+    /// Rolling sync diagnostics retained for post-run inspection. This is
+    /// deliberately bounded and never participates in durability decisions.
+    sync_diagnostics: parking_lot::Mutex<SyncDiagnostics>,
+    /// Number and time spent publishing mutations to the optional journal.
+    publish_calls: AtomicU64,
+    publish_time_ns: AtomicU64,
+    pending_publish_since: parking_lot::Mutex<Option<std::time::Instant>>,
+    publish_generation: AtomicU64,
     /// Minimum wall-clock interval between full checkpoint rewrites needed
     /// because no usable delta base exists or a v3 append failed. Zero disables this half of the
     /// rewrite budget. See [`Self::set_checkpoint_rewrite_budget`].
@@ -1851,6 +1989,11 @@ impl PackfileStorage {
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
+            sync_diagnostics: parking_lot::Mutex::new(SyncDiagnostics::default()),
+            publish_calls: AtomicU64::new(0),
+            publish_time_ns: AtomicU64::new(0),
+            pending_publish_since: parking_lot::Mutex::new(None),
+            publish_generation: AtomicU64::new(0),
             checkpoint_rewrite_min_interval_ns: AtomicU64::new(0),
             checkpoint_rewrite_max_bytes: AtomicU64::new(0),
             last_checkpoint_rewrite_at: parking_lot::Mutex::new(None),
@@ -6766,12 +6909,19 @@ impl StorageEngine for PackfileStorage {
     fn sync(&self) -> Result<(), StorageError> {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
-        self.sync_durability(true, &mut timings)?;
-        self.persist_index_checkpoint_or_delta(&mut timings);
+        let pending_generation = self.mark_sync_pending_age(&mut timings);
+        let result = self
+            .sync_durability(true, &mut timings)
+            .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+        timings.failed = result.is_err();
+        self.finish_sync_pending_age(pending_generation);
         timings.total = started.elapsed();
-        self.count_sync_persistence(&timings);
+        self.record_sync_diagnostics(&timings);
+        if result.is_ok() {
+            self.count_sync_persistence(&timings);
+        }
         *self.last_sync_timings.lock() = Some(timings);
-        Ok(())
+        result
     }
 
     fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -6812,12 +6962,19 @@ impl PackfileStorage {
     pub fn sync_all(&self) -> Result<(), StorageError> {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
-        self.sync_durability(false, &mut timings)?;
-        self.persist_index_checkpoint_or_delta(&mut timings);
+        let pending_generation = self.mark_sync_pending_age(&mut timings);
+        let result = self
+            .sync_durability(false, &mut timings)
+            .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+        timings.failed = result.is_err();
+        self.finish_sync_pending_age(pending_generation);
         timings.total = started.elapsed();
-        self.count_sync_persistence(&timings);
+        self.record_sync_diagnostics(&timings);
+        if result.is_ok() {
+            self.count_sync_persistence(&timings);
+        }
         *self.last_sync_timings.lock() = Some(timings);
-        Ok(())
+        result
     }
 
     /// Rewrite the on-disk index checkpoint now, bypassing the delta-append
@@ -6996,7 +7153,9 @@ impl PackfileStorage {
         &self,
         mutation: impl FnOnce() -> JournalMutation,
     ) -> Result<Option<u64>, StorageError> {
+        let started = std::time::Instant::now();
         let Some(journal) = self.journal() else {
+            self.record_published_mutation(started);
             return Ok(None);
         };
         // Replayed mutations are already durable in the journal; never
@@ -7006,10 +7165,27 @@ impl PackfileStorage {
         }
         // The live index is already updated synchronously on the write path,
         // so the overlay callback has nothing to publish.
-        journal
+        let result = journal
             .publish(mutation(), |_lsn| {})
             .map(Some)
-            .map_err(StorageError::Io)
+            .map_err(StorageError::Io);
+        if result.is_ok() {
+            self.record_published_mutation(started);
+        }
+        result
+    }
+
+    fn record_published_mutation(&self, started: std::time::Instant) {
+        self.publish_calls.fetch_add(1, Ordering::Relaxed);
+        self.publish_time_ns.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let mut pending = self.pending_publish_since.lock();
+        if pending.is_none() {
+            *pending = Some(std::time::Instant::now());
+        }
+        self.publish_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Advance one barrier's durability boundary.
@@ -7025,6 +7201,7 @@ impl PackfileStorage {
         dirty_only: bool,
         timings: &mut SyncTimings,
     ) -> Result<(), StorageError> {
+        let dirty_lock_before = self.shards.dirty_lock_wait();
         if let Some(journal) = self.journal() {
             let flush_started = std::time::Instant::now();
             self.shards.flush_all()?;
@@ -7044,6 +7221,7 @@ impl PackfileStorage {
             timings.journal_records = journal_timings.journal_records;
             timings.journal_waiters = u64::from(journal_timings.journal_waiter);
             timings.journal_coalesced = u64::from(journal_timings.journal_coalesced);
+            timings.journal_in_flight = journal_timings.journal_in_flight;
         } else if dirty_only {
             self.shards.sync_dirty()?;
             if let Some((flush, fsync)) = self.shards.last_sync_split() {
@@ -7057,6 +7235,10 @@ impl PackfileStorage {
                 timings.pack_fsync = fsync;
             }
         }
+        timings.dirty_lock_wait = self
+            .shards
+            .dirty_lock_wait()
+            .saturating_sub(dirty_lock_before);
         Ok(())
     }
 
@@ -7073,6 +7255,53 @@ impl PackfileStorage {
             self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
         } else if !timings.delta_log.is_zero() {
             self.delta_appends.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_sync_diagnostics(&self, timings: &SyncTimings) {
+        let journal_path = self
+            .journal()
+            .map(|journal| journal.path().display().to_string());
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        self.sync_diagnostics.lock().record(SyncDiagnosticSample {
+            timestamp_ms,
+            process_id: std::process::id(),
+            journal_path,
+            total: timings.total,
+            failed: timings.failed,
+            pack_flush: timings.pack_flush,
+            pack_fsync: timings.pack_fsync,
+            sidecar: timings.sidecar,
+            delta_log: timings.delta_log,
+            checkpoint: timings.checkpoint,
+            dirty_lock_wait: timings.dirty_lock_wait,
+            pending_publish_age: timings.pending_publish_age,
+            wal: timings.wal,
+            journal_lock_wait: timings.journal_lock_wait,
+            journal_pending_wait: timings.journal_pending_wait,
+            journal_append: timings.journal_append,
+            journal_fsync: timings.journal_fsync,
+            journal_records: timings.journal_records,
+            journal_bytes: timings.journal_bytes,
+            journal_in_flight: timings.journal_in_flight,
+            journal_waiters: timings.journal_waiters,
+            journal_coalesced: timings.journal_coalesced,
+        });
+    }
+
+    fn mark_sync_pending_age(&self, timings: &mut SyncTimings) -> u64 {
+        let generation = self.publish_generation.load(Ordering::Acquire);
+        if let Some(since) = *self.pending_publish_since.lock() {
+            timings.pending_publish_age = since.elapsed();
+        }
+        generation
+    }
+
+    fn finish_sync_pending_age(&self, generation: u64) {
+        if self.publish_generation.load(Ordering::Acquire) == generation {
+            *self.pending_publish_since.lock() = None;
         }
     }
     /// `put_bytes + put_many_bytes` written since the last full checkpoint
@@ -7434,6 +7663,11 @@ impl PackfileStorage {
             last_open_timings: self.open_timings(),
             last_sync_timings: self.sync_timings(),
             sync_totals: self.sync_totals.snapshot(),
+            sync_diagnostics: self.sync_diagnostics.lock().snapshot(),
+            publish_calls: self.publish_calls.load(Ordering::Relaxed),
+            publish_time: std::time::Duration::from_nanos(
+                self.publish_time_ns.load(Ordering::Relaxed),
+            ),
             repack: self.repack_stats(),
             cache,
             shards: self.shard_stats(),
@@ -7497,6 +7731,7 @@ impl PackfileStorage {
         *self.last_open_timings.lock() = None;
         *self.last_sync_timings.lock() = None;
         self.sync_totals.reset();
+        self.sync_diagnostics.lock().reset();
     }
 
     /// Number of times a specific collection has been repacked. 0 if it has
@@ -7649,6 +7884,13 @@ pub struct RuntimeStats {
     /// `last_sync_timings`, and the only view that can answer a run-wide
     /// scatter-vs-rewrite split (the most-recent breakdown is one barrier).
     pub sync_totals: SyncTotalsSnapshot,
+    /// Bounded worst-operation samples and latency histograms for the current
+    /// process. Unlike cumulative totals, these preserve tail behavior.
+    pub sync_diagnostics: SyncDiagnosticsSnapshot,
+    /// Successful mutation publication calls and their cumulative time.
+    pub publish_calls: u64,
+    /// Cumulative time spent publishing mutations.
+    pub publish_time: std::time::Duration,
     /// Cumulative repack activity (persisted across opens).
     pub repack: RepackStats,
     /// Aggregate decoded-node cache hit/miss across loaded collections.
@@ -7720,6 +7962,9 @@ impl Default for RuntimeStats {
             last_open_timings: None,
             last_sync_timings: None,
             sync_totals: SyncTotalsSnapshot::default(),
+            sync_diagnostics: SyncDiagnosticsSnapshot::default(),
+            publish_calls: 0,
+            publish_time: std::time::Duration::ZERO,
             repack: RepackStats::default(),
             cache: CacheStats::default(),
             shards: Vec::new(),
@@ -10492,6 +10737,28 @@ mod tests {
             timings.journal_lock_wait + timings.journal_append + timings.journal_fsync
                 <= timings.wal,
             "reported journal phases cannot exceed the WAL phase"
+        );
+        let stats = store.stats();
+        assert_eq!(stats.publish_calls, 1);
+        assert_eq!(stats.sync_diagnostics.worst_syncs.len(), 1);
+        assert_eq!(stats.sync_diagnostics.peak_journal_in_flight, 1);
+        assert_eq!(
+            stats
+                .sync_diagnostics
+                .fsync_latency
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            stats
+                .sync_diagnostics
+                .lock_wait_latency
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            1
         );
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
         assert!(store.journal().expect("journal enabled").committed_lsn() >= 1);
