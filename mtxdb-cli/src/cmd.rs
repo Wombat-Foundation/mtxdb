@@ -1625,10 +1625,16 @@ fn cmd_collections(
 /// Print the collections table header row for the given view. Shared by the
 /// coalesced and single-directory report paths so their column layouts cannot
 /// drift apart.
-fn print_collection_table_header(layout: bool, canonical: bool, canonical_width: usize) {
+fn print_collection_table_header(
+    layout: bool,
+    canonical: bool,
+    canonical_width: usize,
+    role_width: usize,
+) {
+    let canonical_field_width = canonical_width.saturating_add(2).saturating_add(role_width);
     if layout {
         if canonical {
-            println!("  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
+            println!("  {:<34}  {:<canonical_field_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
         } else {
             println!(
                 "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
@@ -1637,7 +1643,7 @@ fn print_collection_table_header(layout: bool, canonical: bool, canonical_width:
         }
     } else if canonical {
         println!(
-            "  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
             "collection", "canonical", "nodes", "load", "shards", "index", "disk"
         );
     } else {
@@ -1645,6 +1651,14 @@ fn print_collection_table_header(layout: bool, canonical: bool, canonical_width:
             "  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
             "collection", "nodes", "load", "shards", "index", "disk"
         );
+    }
+}
+
+fn display_collection_role(role: &str) -> &str {
+    match role {
+        // Keep old stores readable after the role was shortened in the store.
+        "event_dag" => "event",
+        role => role,
     }
 }
 
@@ -1672,13 +1686,24 @@ fn canonical_column_width<'a>(displays: impl IntoIterator<Item = &'a String>) ->
         .max("canonical".len())
 }
 
-fn format_canonical_display(display: &str, width: usize) -> String {
+fn canonical_role_width<'a>(displays: impl IntoIterator<Item = &'a String>) -> usize {
+    displays
+        .into_iter()
+        .filter_map(|display| split_canonical_display(display).1)
+        .map(|role| role.len().saturating_add(1))
+        .max()
+        .unwrap_or(0)
+}
+
+fn format_canonical_display(display: &str, width: usize, role_width: usize) -> String {
     let (identity, role) = split_canonical_display(display);
     let mut formatted = format!("{identity:<width$}");
     if let Some(role) = role {
         formatted.push_str("  (");
         formatted.push_str(role);
     }
+    let used_role_width = role.map_or(0, |role| role.len().saturating_add(1));
+    formatted.push_str(&" ".repeat(role_width.saturating_sub(used_role_width)));
     formatted
 }
 
@@ -1772,7 +1797,10 @@ fn cmd_collections_coalesced(
                                             let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
                                             if metadata.verify_collection_id(id) {
                                                 if let Some(role) = &metadata.role {
-                                                    format!("{raw} ({role})")
+                                                    format!(
+                                                        "{raw} ({})",
+                                                        display_collection_role(role)
+                                                    )
                                                 } else {
                                                     raw.into_owned()
                                                 }
@@ -1900,8 +1928,9 @@ fn cmd_collections_coalesced(
 
         let canonical_width =
             canonical_column_width(ordered.iter().filter_map(|c| c.canonical.as_ref()));
+        let role_width = canonical_role_width(ordered.iter().filter_map(|c| c.canonical.as_ref()));
 
-        print_collection_table_header(layout, canonical, canonical_width);
+        print_collection_table_header(layout, canonical, canonical_width, role_width);
 
         let mut total_nodes = 0_usize;
         let mut total_memory = 0_usize;
@@ -1931,7 +1960,8 @@ fn cmd_collections_coalesced(
                     .unwrap_or("[unregistered]")
                     .to_owned()
             };
-            let canonical_display = format_canonical_display(&canonical_id, canonical_width);
+            let canonical_display =
+                format_canonical_display(&canonical_id, canonical_width, role_width);
             let load = fmt_load_percent(item.nodes, item.capacity);
             let shards = if item.shards_count == 1 {
                 String::new()
@@ -2085,8 +2115,8 @@ fn cmd_collections_in_dir(
                                 |metadata| {
                                     let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
                                     if metadata.verify_collection_id(id) {
-                                        if let Some(role) = &metadata.role {
-                                            format!("{raw} ({role})")
+                                            if let Some(role) = &metadata.role {
+                                                format!("{raw} ({})", display_collection_role(role))
                                         } else {
                                             raw.into_owned()
                                         }
@@ -2183,7 +2213,9 @@ fn cmd_collections_in_dir(
         ordering.then_with(|| left.0.cmp(&right.0))
     });
     let canonical_width = canonical_column_width(canonical_ids.values());
-    print_collection_table_header(layout, canonical, canonical_width);
+    let role_width = canonical_role_width(canonical_ids.values());
+    let canonical_field_width = canonical_width.saturating_add(2).saturating_add(role_width);
+    print_collection_table_header(layout, canonical, canonical_width, role_width);
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
@@ -2208,7 +2240,7 @@ fn cmd_collections_in_dir(
         let canonical_id = canonical_ids
             .get(collection_id)
             .map_or("[unregistered]", String::as_str);
-        let canonical_display = format_canonical_display(canonical_id, canonical_width);
+        let canonical_display = format_canonical_display(canonical_id, canonical_width, role_width);
         let load = fmt_load_percent(*nodes, *capacity);
         let shards = collection_shards
             .as_ref()
@@ -2255,7 +2287,7 @@ fn cmd_collections_in_dir(
     println!();
     if layout {
         println!(
-            "  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
             "total",
             "",
             total_nodes,
@@ -2272,7 +2304,7 @@ fn cmd_collections_in_dir(
         );
     } else {
         println!(
-            "  {:<34}  {:<canonical_width$}  {total_nodes:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "  {:<34}  {:<canonical_field_width$}  {total_nodes:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
             "total",
             "",
             "",
@@ -4552,7 +4584,7 @@ fn collection_metadata_for(
         record_id_rule: template.record_id_rule.clone(),
         payload: template.payload.clone(),
         extension: Some(extension.encode_blob()),
-        role: Some("event_dag".to_owned()),
+        role: Some("event".to_owned()),
         schema: Some("matrix.event.v1".to_owned()),
     }
 }
@@ -8931,8 +8963,8 @@ mod tests {
         cmd_import_file, cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
         collection_canonical_id, compile_import_template, compute_state_groups,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
-        default_matrix_import_template, derive_template_key, event_id, event_room_id,
-        event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
+        default_matrix_import_template, derive_template_key, display_collection_role, event_id,
+        event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
         format_canonical_display, format_id, glob_pack_files, import_pdu_events,
         interleaving_worth_noting, listing_shard_types, matrix_batch_has_create,
         matrix_room_collection_id, matrix_room_extension_from_store, parse_federation_input,
@@ -8979,20 +9011,19 @@ mod tests {
 
     #[test]
     fn canonical_collection_display_aligns_roles_and_reserves_total_column() {
-        let short = "!short (event_dag)".to_owned();
-        let long = "!a-much-longer-room-id (event_dag)".to_owned();
-        assert_eq!(
-            split_canonical_display(&short),
-            ("!short", Some("event_dag)"))
-        );
+        let short = "!short (event)".to_owned();
+        let long = "!a-much-longer-room-id (event)".to_owned();
+        assert_eq!(display_collection_role("event_dag"), "event");
+        assert_eq!(display_collection_role("state"), "state");
+        assert_eq!(split_canonical_display(&short), ("!short", Some("event)")));
         assert_eq!(
             canonical_column_width([&short, &long].into_iter()),
             "!a-much-longer-room-id".len()
         );
         assert_eq!(
-            format_canonical_display(&short, "!a-much-longer-room-id".len()),
+            format_canonical_display(&short, "!a-much-longer-room-id".len(), "(event)".len(),),
             format!(
-                "!short{}  (event_dag)",
+                "!short{}  (event)",
                 " ".repeat("!a-much-longer-room-id".len() - "!short".len())
             )
         );
