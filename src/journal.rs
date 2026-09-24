@@ -409,7 +409,7 @@ impl TxnStage {
             let coordinator = coordinators[ordered_index].ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "staged pool has no journal")
             })?;
-            coordinator.append_pending(&data.pools[index])?;
+            coordinator.append_pending_tagged(pool, &data.pools[index])?;
             data.appended[index] = true;
         }
         self.state.store(Self::PUBLISHED, Ordering::Release);
@@ -430,7 +430,7 @@ const fn pool_index(pool: ShardType) -> usize {
 ///
 /// `0` is reserved for "untagged", which only a version-2 segment may contain;
 /// a version-3 frame must carry `1..=3`.
-const fn pool_tag(pool: ShardType) -> u8 {
+pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
     match pool {
         ShardType::State => 1,
         ShardType::EventDag => 2,
@@ -440,7 +440,7 @@ const fn pool_tag(pool: ShardType) -> u8 {
 
 /// Inverse of [`pool_tag`]. `0` (untagged) maps to `None`; any other
 /// out-of-range code is rejected by the frame decoder.
-const fn pool_from_tag(tag: u8) -> Option<ShardType> {
+pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
     match tag {
         1 => Some(ShardType::State),
         2 => Some(ShardType::EventDag),
@@ -610,6 +610,11 @@ pub struct JournalCoordinator {
     /// segment's own counter, so groups across several pool segments share one
     /// global order. See [`Self::with_shared_sequence`].
     sequence: Option<Arc<AtomicU64>>,
+    /// Committed groups recovered when this coordinator's segment was opened.
+    /// Retained so a store attaching to a coordinator it did not construct
+    /// (the shared-WAL path, where one coordinator serves every pool) can seed
+    /// its replay set from the same scan.
+    recovered: Vec<CommittedGroup>,
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
@@ -638,12 +643,21 @@ impl JournalCoordinator {
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             sequence: None,
+            recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
             sync_calls: AtomicU64::new(0),
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
             sync_in_flight: AtomicU64::new(0),
         }
+    }
+
+    /// The committed groups recovered when this coordinator's segment was
+    /// opened, in sequence order. A store attaching to a coordinator it did
+    /// not construct (the shared-WAL path) uses this to seed its replay set.
+    #[must_use]
+    pub fn recovered_groups(&self) -> Vec<CommittedGroup> {
+        self.recovered.clone()
     }
 
     /// Build a coordinator whose groups draw their sequence from a shared,
@@ -982,6 +996,28 @@ impl JournalCoordinator {
     /// poisoned, or the append fails. A partial append poisons the underlying
     /// journal; subsequent publication is rejected until reopen/recovery.
     pub fn append_pending(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
+        self.append_pending_inner(None, mutations)
+    }
+
+    /// Like [`Self::append_pending`], tagging every staged mutation with
+    /// `pool`. Required when the coordinator's segment is pool-tagged; the
+    /// pool-less [`Self::append_pending`] would be rejected there.
+    ///
+    /// # Errors
+    /// Same as [`Self::append_pending`].
+    pub fn append_pending_tagged(
+        &self,
+        pool: ShardType,
+        mutations: &[Mutation],
+    ) -> io::Result<CommitReceipt> {
+        self.append_pending_inner(Some(pool), mutations)
+    }
+
+    fn append_pending_inner(
+        &self,
+        staged_pool: Option<ShardType>,
+        mutations: &[Mutation],
+    ) -> io::Result<CommitReceipt> {
         if mutations.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1017,7 +1053,12 @@ impl JournalCoordinator {
             }
             group_mutations.push((*pool, mutation.clone()));
         }
-        group_mutations.extend(mutations.iter().cloned().map(|mutation| (None, mutation)));
+        group_mutations.extend(
+            mutations
+                .iter()
+                .cloned()
+                .map(|mutation| (staged_pool, mutation)),
+        );
         let expected_first_lsn = journal.next_lsn;
         let expected_count = u64::try_from(group_mutations.len()).unwrap_or(u64::MAX);
         let sequence = self
@@ -2057,6 +2098,35 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Exclusive writer claim on a database root's shared WAL.
+///
+/// One shared segment serves every pool, so a single writer process must own
+/// it. This takes the same crash-safe `{pid, starttime}` lock the per-pool
+/// writer lock uses, at `<db_root>/.mtxdb.wal.lock`, and releases it on drop
+/// (see `ShardPool::acquire_writer_lock` for the staleness contract). The
+/// holder opens the segment with [`Journal::open_shared`], builds one
+/// [`JournalCoordinator`], and attaches each pool with
+/// `PackfileStorage::enable_shared_journal`.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct SharedWalLock {
+    _lock: crate::shard::WriterLock,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SharedWalLock {
+    /// Acquire the root shared-WAL writer lock.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock` if another live writer holds it, or an I/O error
+    /// if the lock file cannot be created.
+    pub fn acquire(db_root: impl AsRef<Path>) -> io::Result<Self> {
+        let path = db_root.as_ref().join(".mtxdb.wal.lock");
+        Ok(Self {
+            _lock: crate::shard::ShardPool::acquire_lock_path(&path)?,
+        })
+    }
 }
 
 #[cfg(test)]

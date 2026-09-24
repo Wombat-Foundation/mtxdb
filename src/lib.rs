@@ -53,6 +53,8 @@ pub use auxiliary::{
 };
 pub use cache::NodeCache;
 pub use index::LossyIndex;
+#[cfg(not(target_arch = "wasm32"))]
+pub use journal::SharedWalLock;
 pub use journal::{TxnStage, TxnStageState};
 pub use layout::{DatabaseLayout, ShardType};
 pub use matrix_policy::{

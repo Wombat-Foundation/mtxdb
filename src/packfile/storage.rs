@@ -13,7 +13,9 @@ use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::{EntryUndo, InsertError, LossyIndex};
-use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
+use crate::journal::{
+    pool_from_tag, pool_tag, Journal, JournalCoordinator, Mutation as JournalMutation,
+};
 use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -1275,6 +1277,11 @@ pub struct PackfileStorage {
     /// per-shard pack fsyncs and the index checkpoint can be deferred without
     /// risking acknowledged data (see [`Self::enable_journal`]).
     journal: parking_lot::Mutex<Option<Arc<JournalCoordinator>>>,
+    /// Pool tag this store publishes under on a shared journal, as a
+    /// [`crate::journal::pool_tag`] code (`0` = untagged/per-pool). Set by
+    /// [`Self::enable_shared_journal`]; read on the publish and replay hot
+    /// paths, so it is a plain atomic rather than behind the journal mutex.
+    journal_pool: std::sync::atomic::AtomicU8,
     /// Committed groups recovered when the journal was opened, retained for
     /// [`Self::replay_journal`] to re-apply after a reopen.
     journal_recovery: parking_lot::Mutex<Vec<crate::journal::CommittedGroup>>,
@@ -2050,6 +2057,7 @@ impl PackfileStorage {
             #[cfg(test)]
             recovery_pause_hook: parking_lot::Mutex::new(None),
             journal: parking_lot::Mutex::new(None),
+            journal_pool: std::sync::atomic::AtomicU8::new(0),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
             #[cfg(feature = "multi-reader")]
@@ -3689,9 +3697,19 @@ impl PackfileStorage {
         // correctness (the checkpoint is already durable).
         if let Some(lsn) = wal_lsn {
             self.write_journal_lsn(lsn)?;
-            if let Some(journal) = self.journal() {
-                if let Err(error) = journal.reclaim_through(lsn) {
-                    eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+            // A per-pool segment holds only this pool's frames, so this
+            // checkpoint covers everything at or below `lsn` and the segment
+            // can drop that prefix. A shared segment also holds other pools'
+            // frames, which this checkpoint does not cover — reclaiming through
+            // `lsn` would delete frames those pools have not materialized.
+            // Cross-pool reclaim needs the minimum durable coverage across all
+            // participating pools (see the shared durability fence design), so
+            // a shared segment is left to grow for now.
+            if self.journal_pool.load(Ordering::Acquire) == 0 {
+                if let Some(journal) = self.journal() {
+                    if let Err(error) = journal.reclaim_through(lsn) {
+                        eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                    }
                 }
             }
         }
@@ -7164,6 +7182,40 @@ impl PackfileStorage {
         Ok(())
     }
 
+    /// Attach this store to a shared, multi-pool journal coordinator.
+    ///
+    /// Every mutation this store publishes is tagged with `pool`, so recovery
+    /// routes it back to this pool. Because all pools share one coordinator
+    /// (and therefore one segment), any one pool's `sync`/`sync_all` fences
+    /// every pool's pending mutations in a single group and a single fsync —
+    /// instead of each pool paying its own WAL fsync.
+    ///
+    /// The coordinator must be built from a pool-tagged segment (see
+    /// [`Journal::open_shared`]) and the caller must hold the root writer lock
+    /// ([`crate::journal::SharedWalLock`]). This is opt-in; a store that never
+    /// calls it keeps the legacy per-pool journal path unchanged.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if a journal is already enabled on this store.
+    pub fn enable_shared_journal(
+        &self,
+        journal: Arc<JournalCoordinator>,
+        pool: crate::layout::ShardType,
+    ) -> Result<(), StorageError> {
+        let mut slot = self.journal.lock();
+        if slot.is_some() {
+            return Err(StorageError::Internal(
+                "a journal is already enabled on this store".into(),
+            ));
+        }
+        self.journal_recovery
+            .lock()
+            .clone_from(&journal.recovered_groups());
+        *slot = Some(journal);
+        self.journal_pool.store(pool_tag(pool), Ordering::Release);
+        Ok(())
+    }
+
     /// Re-apply the recovered journal's post-checkpoint mutations after a
     /// reopen, then dirty the index so the next sync checkpoints them.
     ///
@@ -7187,9 +7239,15 @@ impl PackfileStorage {
         self.replaying.store(true, Ordering::SeqCst);
         let result = (|| -> Result<u64, StorageError> {
             let mut replayed = 0u64;
+            // On a shared journal, replay only this pool's frames; the other
+            // pools' mutations are replayed by their own stores.
+            let pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
             for group in &groups {
                 for entry in &group.entries {
                     if entry.lsn <= covered {
+                        continue;
+                    }
+                    if pool.is_some_and(|pool| entry.pool != Some(pool)) {
                         continue;
                     }
                     match &entry.mutation {
@@ -7244,11 +7302,14 @@ impl PackfileStorage {
             return Ok(None);
         }
         // The live index is already updated synchronously on the write path,
-        // so the overlay callback has nothing to publish.
-        let result = journal
-            .publish(mutation(), |_lsn| {})
-            .map(Some)
-            .map_err(StorageError::Io);
+        // so the overlay callback has nothing to publish. On a shared journal,
+        // tag the frame with this store's pool so recovery can route it.
+        let result = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+            Some(pool) => journal.publish_tagged(pool, mutation(), |_lsn| {}),
+            None => journal.publish(mutation(), |_lsn| {}),
+        }
+        .map(Some)
+        .map_err(StorageError::Io);
         if result.is_ok() {
             self.record_published_mutation(started);
         }
@@ -14513,5 +14574,117 @@ mod tests {
         drop(checkpoint_index);
         drop(reopened);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two stores attached to one shared coordinator: a single pool's sync
+    /// commits both pools' pending mutations in one group, and a later reopen
+    /// replays only each pool's own tagged frames.
+    #[test]
+    fn shared_journal_fences_all_pools_and_routes_replay_by_pool() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_journal_root");
+        let dir_a = test_dir("shared_journal_a");
+        let dir_b = test_dir("shared_journal_b");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+
+        let a = PackfileStorage::open(dir_a.clone()).unwrap();
+        let b = PackfileStorage::open(dir_b.clone()).unwrap();
+        a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        b.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        a.put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::new(bytes::Bytes::from_static(b"state")),
+        )
+        .unwrap();
+        b.put(
+            &OTHER_COLLECTION,
+            &distinct_id(1),
+            &NodeData::new(bytes::Bytes::from_static(b"event")),
+        )
+        .unwrap();
+
+        // One pool's sync fences the other pool's pending mutation too.
+        a.sync_all().unwrap();
+        assert_eq!(
+            coordinator.committed_lsn(),
+            coordinator.published_lsn(),
+            "one barrier must commit every pool's published mutation"
+        );
+        drop(a);
+        drop(b);
+
+        // A fresh session over the shared segment: one group, both pools.
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        assert_eq!(scan.groups.len(), 1, "one fence wrote one group");
+        assert_eq!(
+            scan.groups[0].entries.len(),
+            2,
+            "the single group carries both pools' mutations"
+        );
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+
+        let fresh_a = PackfileStorage::open(test_dir("shared_journal_fresh_a")).unwrap();
+        fresh_a
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .unwrap();
+        assert_eq!(
+            fresh_a.replay_journal().unwrap(),
+            1,
+            "the state store replays only its own pool's frame"
+        );
+        assert!(fresh_a
+            .get(&TEST_COLLECTION, &distinct_id(0))
+            .unwrap()
+            .is_some());
+        assert!(
+            fresh_a
+                .get(&OTHER_COLLECTION, &distinct_id(1))
+                .unwrap()
+                .is_none(),
+            "a pool must not replay another pool's frames"
+        );
+
+        let fresh_b = PackfileStorage::open(test_dir("shared_journal_fresh_b")).unwrap();
+        fresh_b
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::EventDag)
+            .unwrap();
+        assert_eq!(fresh_b.replay_journal().unwrap(), 1);
+        assert!(fresh_b
+            .get(&OTHER_COLLECTION, &distinct_id(1))
+            .unwrap()
+            .is_some());
+        assert!(fresh_b
+            .get(&TEST_COLLECTION, &distinct_id(0))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The root shared-WAL lock is exclusive while held and reacquirable after
+    /// the holder drops it.
+    #[test]
+    fn shared_wal_lock_is_exclusive() {
+        let root = test_dir("shared_wal_lock_exclusive");
+        let first = crate::journal::SharedWalLock::acquire(&root).unwrap();
+        let second = crate::journal::SharedWalLock::acquire(&root);
+        assert!(
+            matches!(second, Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a second writer must be refused while the root lock is held"
+        );
+        drop(first);
+        assert!(
+            crate::journal::SharedWalLock::acquire(&root).is_ok(),
+            "a released root lock must be reacquirable"
+        );
     }
 }

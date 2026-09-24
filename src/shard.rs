@@ -451,7 +451,7 @@ impl Drop for Shard {
 /// `flock` releasing on fd close — a crash instead leaves it for the next
 /// opener's staleness check (`lock_holder_is_dead`) to reclaim.
 #[cfg(not(target_arch = "wasm32"))]
-struct WriterLock {
+pub(crate) struct WriterLock {
     path: PathBuf,
 }
 
@@ -1242,20 +1242,32 @@ impl ShardPool {
     /// `lock_holder_is_dead`) — a bare PID is not enough on its own.
     #[cfg(not(target_arch = "wasm32"))]
     fn acquire_writer_lock(base_dir: &Path) -> io::Result<WriterLock> {
-        let lock_path = base_dir.join(".mtxdb.lock");
-        match Self::try_create_lock_file(&lock_path) {
-            Ok(()) => Ok(WriterLock { path: lock_path }),
+        Self::acquire_lock_path(&base_dir.join(".mtxdb.lock"))
+    }
+
+    /// Acquire the same `{pid, starttime}`-guarded exclusive lock at an
+    /// arbitrary path. Shared by the per-pool writer lock (`.mtxdb.lock`) and
+    /// the database-root shared-WAL lock (`.mtxdb.wal.lock`); see
+    /// `acquire_writer_lock`'s doc for the staleness contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn acquire_lock_path(lock_path: &Path) -> io::Result<WriterLock> {
+        match Self::try_create_lock_file(lock_path) {
+            Ok(()) => Ok(WriterLock {
+                path: lock_path.to_path_buf(),
+            }),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if Self::lock_holder_is_dead(&lock_path) {
-                    let _ = fs::remove_file(&lock_path);
-                    Self::try_create_lock_file(&lock_path)?;
-                    return Ok(WriterLock { path: lock_path });
+                if Self::lock_holder_is_dead(lock_path) {
+                    let _ = fs::remove_file(lock_path);
+                    Self::try_create_lock_file(lock_path)?;
+                    return Ok(WriterLock {
+                        path: lock_path.to_path_buf(),
+                    });
                 }
                 Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
                         "{} is already locked by another writer process",
-                        base_dir.display()
+                        lock_path.display()
                     ),
                 ))
             }
