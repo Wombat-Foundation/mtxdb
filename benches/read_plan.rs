@@ -364,6 +364,28 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Node-cache capacity for the ingest open. Matches the storage default; named
+/// only because the explicit open call must pass it.
+const BENCH_CACHE_CAPACITY: usize = 100_000;
+
+/// Open the store for ingest, honoring `MTXDB_BENCH_COMPRESS=0`.
+///
+/// With compression on (the default) the ingest phase spends most of its CPU
+/// inside zstd even though the bench payload is incompressible, so the write
+/// cost it reports is zstd-on-noise, not the append/index path a real workload
+/// pays. `MTXDB_BENCH_COMPRESS=0` disables per-record compression so ingest
+/// reflects the rest of the write path.
+fn open_for_ingest(dir: std::path::PathBuf) -> PackfileStorage {
+    let compress_off = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0");
+    PackfileStorage::open_with_cache_and_policies(
+        dir,
+        BENCH_CACHE_CAPACITY,
+        !compress_off,
+        mtxdb::packfile::ChecksumPolicy::Full,
+    )
+    .unwrap()
+}
+
 /// The `prefetch` preset, with optional per-field env overrides so a run can
 /// sweep the merge gap without touching code.
 fn prefetch_policy() -> ReadPlanPolicy {
@@ -714,7 +736,7 @@ fn run(
 ) {
     let target_count = target_count.min(records);
     let dir = bench_root();
-    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let store = open_for_ingest(dir.clone());
     // The read-plan counters are only incremented while stats tracking is
     // on; the prefetch itself is not gated on it.
     store.set_stats_enabled(true);
@@ -726,6 +748,14 @@ fn run(
     println!("  records:      {records}");
     println!("  targets/set:  {target_count}");
     println!("  payload:      {payload_len} bytes");
+    println!(
+        "  compression:  {}",
+        if std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0") {
+            "off (MTXDB_BENCH_COMPRESS=0)"
+        } else {
+            "on (default; incompressible payload makes this pure zstd cost)"
+        }
+    );
     println!("  passes:       {passes} (median reported)");
     println!("  scratch dir:  {}", dir.display());
     let fstype = mount_fstype(&dir).unwrap_or_else(|| "unknown".to_owned());
