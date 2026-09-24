@@ -2182,7 +2182,7 @@ impl PackfileStorage {
     }
 
     /// The journal LSN the on-disk checkpoint covers (0 when none is recorded).
-    fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
+    pub(crate) fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
         fs::read(Self::journal_lsn_path(base_dir))
             .ok()
             .and_then(|bytes| bytes.get(..8).map(<[u8; 8]>::try_from))
@@ -3530,12 +3530,19 @@ impl PackfileStorage {
     /// watermark on a shared segment (one group can interleave other pools'
     /// frames), or the global committed LSN for a per-pool segment. `None` when
     /// no journal is enabled.
+    ///
+    /// The value is floored by the durable coverage already recorded beside the
+    /// checkpoint. A pool whose frames have all been reclaimed has no committed
+    /// group left to derive a watermark from, so the fresh coordinator reports
+    /// zero for it; writing that zero would erase the durable coverage and make
+    /// the next replay start from a stale bound. Coverage only ever advances.
     fn checkpoint_covered_lsn(&self) -> Option<u64> {
         self.journal().map(|journal| {
-            match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+            let committed = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
                 Some(pool) => journal.committed_lsn_for_pool(pool),
                 None => journal.committed_lsn(),
-            }
+            };
+            committed.max(Self::read_journal_lsn(&self.base_dir))
         })
     }
 
@@ -7233,6 +7240,13 @@ impl PackfileStorage {
     /// ([`crate::journal::SharedWalLock`]). This is opt-in; a store that never
     /// calls it keeps the legacy per-pool journal path unchanged.
     ///
+    /// The store's existing durable coverage (the `journal.lsn` written beside
+    /// its last checkpoint) is reported to the coordinator on attach. Without
+    /// it, a pool whose frames were reclaimed before a restart has no coverage
+    /// in the freshly recovered segment, and reclaim could advance past frames
+    /// this store has not materialized (or block on a pool that is in fact
+    /// already covered).
+    ///
     /// # Errors
     /// Returns `InvalidInput` if a journal is already enabled on this store.
     pub fn enable_shared_journal(
@@ -7249,8 +7263,9 @@ impl PackfileStorage {
         self.journal_recovery
             .lock()
             .clone_from(&journal.recovered_groups());
-        *slot = Some(journal);
         self.journal_pool.store(pool_tag(pool), Ordering::Release);
+        journal.report_pool_coverage(pool, Self::read_journal_lsn(&self.base_dir));
+        *slot = Some(journal);
         Ok(())
     }
 
@@ -9214,7 +9229,7 @@ mod tests {
 
     #[cfg(feature = "multi-reader")]
     #[test]
-    fn reset_has_coverage_gap_flags_a_header_only_segment() {
+    fn reset_has_coverage_gap_is_a_pure_base_jump() {
         // A fully reclaimed segment carries no groups, only a moved base LSN.
         // Keying the gap check off the first group would miss it entirely.
         let header_only = crate::journal::Scan {
@@ -9224,61 +9239,29 @@ mod tests {
             base_lsn: 3,
         };
         let per_pool = |covered: u64| ReadJournal::empty(std::path::PathBuf::new(), covered, None);
+        let shared = |covered: u64| {
+            ReadJournal::empty(
+                std::path::PathBuf::new(),
+                covered,
+                Some(crate::layout::ShardType::State),
+            )
+        };
+        // The base jumped from covered + 1 = 2 to 3, so the reclaimed prefix may
+        // hold a frame this reader lacks. Both layouts must ask for a reload;
+        // whether the jump is a real gap for this pool is decided after the
+        // reload, not by inspecting the surviving groups. A previous check that
+        // looked for this pool's frames in those groups both missed reclaimed
+        // frames (silent staleness) and rejected valid frames when another pool
+        // opened the gap.
         assert!(per_pool(1).reset_has_coverage_gap(&header_only));
+        assert!(shared(1).reset_has_coverage_gap(&header_only));
+        // covered + 1 reaches the base, so nothing at or below covered moved.
         assert!(!per_pool(2).reset_has_coverage_gap(&header_only));
+        assert!(!shared(2).reset_has_coverage_gap(&header_only));
         assert!(
             !per_pool(0).reset_has_coverage_gap(&crate::journal::Scan::empty()),
             "a missing/short segment reports base 0 and is not a gap"
         );
-        // A shared reader whose own pool has no frames in the segment loses
-        // nothing when the base advanced for another pool's frames.
-        let idle_state = ReadJournal::empty(
-            std::path::PathBuf::new(),
-            0,
-            Some(crate::layout::ShardType::State),
-        );
-        assert!(!idle_state.reset_has_coverage_gap(&header_only));
-    }
-
-    #[cfg(feature = "multi-reader")]
-    #[test]
-    fn reset_has_coverage_gap_is_pool_aware_on_a_shared_segment() {
-        let entry = |pool, lsn| crate::journal::JournalEntry {
-            lsn,
-            offset: 0,
-            frame_len: 0,
-            pool: Some(pool),
-            mutation: crate::journal::Mutation::DeleteCollection {
-                collection_id: [0x11; 16],
-            },
-        };
-        let scan = crate::journal::Scan {
-            groups: vec![crate::journal::CommittedGroup {
-                sequence: 1,
-                first_lsn: 3,
-                last_lsn: 3,
-                entries: vec![entry(crate::layout::ShardType::EventDag, 3)],
-            }],
-            valid_len: 0,
-            truncated_tail: false,
-            base_lsn: 3,
-        };
-        // The base jumped from covered+1 = 2 to 3, filled entirely by another
-        // pool. This pool must not treat that as a lost frame.
-        let state = ReadJournal::empty(
-            std::path::PathBuf::new(),
-            1,
-            Some(crate::layout::ShardType::State),
-        );
-        assert!(!state.reset_has_coverage_gap(&scan));
-        // The pool that actually has frames in the segment is the one that
-        // must reload, because the reclaimed base may have skipped its own.
-        let event = ReadJournal::empty(
-            std::path::PathBuf::new(),
-            1,
-            Some(crate::layout::ShardType::EventDag),
-        );
-        assert!(event.reset_has_coverage_gap(&scan));
     }
 
     #[cfg(feature = "multi-reader")]
@@ -14824,16 +14807,25 @@ mod tests {
             )
             .unwrap();
         state.sync_all().unwrap();
+        // Force a full rewrite so this test exercises reclaim deterministically
+        // (an ordinary sync may append a delta instead).
+        state.force_index_checkpoint().unwrap();
 
-        // The two pools have distinct watermarks, and the shared segment keeps
-        // every group through the lower of them.
+        // The two pools have distinct watermarks. Each pool's group is
+        // reclaimed as soon as that pool has checkpointed it: state's later
+        // group does not wait on event-DAG, whose frames never reached it.
         let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
         let event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
         assert!(state_lsn > event_lsn, "state committed a later group");
         let scan = Journal::scan_read_only(&wal).unwrap();
         assert!(
-            scan.base_lsn <= event_lsn + 1,
-            "reclaim must stop at the lagging pool's watermark"
+            scan.groups.is_empty(),
+            "each pool's own group is reclaimed once that pool covers it"
+        );
+        assert_eq!(
+            scan.base_lsn,
+            state_lsn + 1,
+            "an idle pool must not pin a later group its frames never reached"
         );
 
         drop(state);
@@ -14856,6 +14848,93 @@ mod tests {
         assert_eq!(
             got[1].as_ref().map(|data| data.bytes.as_ref()),
             Some(&b"state-2"[..])
+        );
+    }
+
+    /// A shared reader whose own frame was committed by another pool's sync
+    /// (so its checkpoint has not advanced) must tolerate a base LSN gap opened
+    /// entirely by the other pools and read its own frame, instead of failing
+    /// closed on the reclaim.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn shared_read_committed_accepts_another_pools_reclaimed_prefix() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_gap_root");
+        let dir_state = test_dir("shared_gap_state");
+        let dir_event = test_dir("shared_gap_event");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let state = PackfileStorage::open(dir_state.clone()).unwrap();
+        let event = PackfileStorage::open(dir_event.clone()).unwrap();
+        state
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        event
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        // State checkpoints one frame, then the reader opens bound to it.
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"state-1")),
+            )
+            .unwrap();
+        state.sync_all().unwrap();
+        state.force_index_checkpoint().unwrap();
+        let reader = PackfileStorage::open_read_only(dir_state.clone()).unwrap();
+        reader
+            .enable_read_journal_shared(&wal, ShardType::State)
+            .unwrap();
+
+        // Event-DAG reclaims its own later groups, advancing the segment base
+        // well past the reader's coverage without ever moving state's.
+        for id in 1..4u8 {
+            event
+                .put(
+                    &OTHER_COLLECTION,
+                    &distinct_id(id),
+                    &NodeData::new(bytes::Bytes::from_static(b"event")),
+                )
+                .unwrap();
+            event.sync_all().unwrap();
+            event.force_index_checkpoint().unwrap();
+        }
+
+        // State publishes a second frame; event's sync commits it, but state
+        // never checkpoints, so state's durable coverage stays at the first
+        // frame while the frame now sits above the advanced base.
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(9),
+                &NodeData::new(bytes::Bytes::from_static(b"state-2")),
+            )
+            .unwrap();
+        event.sync_all().unwrap();
+
+        let got = reader
+            .get_read_committed(&TEST_COLLECTION, &[distinct_id(9)])
+            .expect("a base gap made of other pools' frames must not fail closed");
+        assert_eq!(
+            got[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"state-2"[..])
+        );
+        assert_eq!(
+            reader
+                .get_read_committed(&TEST_COLLECTION, &[distinct_id(0)])
+                .unwrap()[0]
+                .as_ref()
+                .map(|data| data.bytes.as_ref()),
+            Some(&b"state-1"[..]),
+            "the reader's own checkpointed frame must remain readable"
         );
     }
 

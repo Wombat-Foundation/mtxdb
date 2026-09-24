@@ -47,7 +47,21 @@ impl SharedDatabase {
         let layout = DatabaseLayout::open(root)?;
         let wal_path = layout.shared_wal_path();
         let lock = SharedWalLock::acquire(layout.root())?;
-        let (journal, scan) = Journal::open_shared(&wal_path)?;
+        // A root that was driven through per-pool journals carries each pool's
+        // durable coverage as a `journal.lsn` below its pool directory. Start
+        // the fresh shared segment above all of them, so every legacy coverage
+        // value stays meaningful in the one shared LSN space: a restarted
+        // shared writer can never replay past (or reclaim beneath) coverage
+        // that belonged to a different numbering.
+        let seed_lsn = {
+            let mut watermark = 0_u64;
+            for shard in ShardType::ALL {
+                let dir = layout.pool_dir(shard)?;
+                watermark = watermark.max(PackfileStorage::read_journal_lsn(&dir));
+            }
+            watermark.saturating_add(1)
+        };
+        let (journal, scan) = Journal::open_shared_seeded(&wal_path, seed_lsn)?;
         let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
 
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
@@ -101,7 +115,9 @@ const fn shard_index(shard: ShardType) -> usize {
 #[cfg(test)]
 mod tests {
     use super::SharedDatabase;
+    use crate::journal::Journal;
     use crate::layout::ShardType;
+    use crate::packfile::storage::PackfileStorage;
     use crate::storage::{NodeData, NodeId, StorageEngine};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -157,6 +173,100 @@ mod tests {
             .unwrap()
             .expect("replayed node must be readable after reopen");
         assert_eq!(got.bytes.as_ref(), b"x");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
+        let root = test_root("coverage_no_regress");
+        let state_collection = [0x33u8; 16];
+        let event_collection = [0x44u8; 16];
+        {
+            let db = SharedDatabase::open(root.clone()).unwrap();
+            db.pool(ShardType::State)
+                .put(
+                    &state_collection,
+                    &node(1),
+                    &NodeData::from_slice(b"state-1"),
+                )
+                .unwrap();
+            db.pool(ShardType::State).sync_all().unwrap();
+            db.pool(ShardType::State).force_index_checkpoint().unwrap();
+            assert!(db.coordinator().committed_lsn_for_pool(ShardType::State) > 0);
+
+            // Event-DAG checkpoints a later group; prefix reclaim drops every
+            // retained group, including state's, leaving state with no frames.
+            db.pool(ShardType::EventDag)
+                .put(
+                    &event_collection,
+                    &node(2),
+                    &NodeData::from_slice(b"event-1"),
+                )
+                .unwrap();
+            db.pool(ShardType::EventDag).sync_all().unwrap();
+            db.pool(ShardType::EventDag)
+                .force_index_checkpoint()
+                .unwrap();
+            assert_eq!(
+                Journal::scan_read_only(root.join("wal.bin"))
+                    .unwrap()
+                    .groups
+                    .len(),
+                0,
+                "every retained group must be reclaimed before the restart"
+            );
+        }
+
+        let before = PackfileStorage::read_journal_lsn(&root.join("pools/state"));
+        assert!(
+            before > 0,
+            "state's durable checkpoint coverage must survive the reclaim"
+        );
+
+        // Reopen: the fresh coordinator has no state frame to derive a
+        // watermark from. A checkpoint must preserve the recorded coverage
+        // rather than erase it, or the next replay would start from zero.
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        db.pool(ShardType::State).force_index_checkpoint().unwrap();
+        assert_eq!(
+            PackfileStorage::read_journal_lsn(&root.join("pools/state")),
+            before,
+            "a checkpoint must never regress its covered LSN to zero"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_legacy_pool_coverage_seeds_the_shared_wal_above_it() {
+        let root = test_root("legacy_seed");
+        std::fs::create_dir_all(root.join("pools/state")).unwrap();
+        std::fs::write(root.join("db.meta"), {
+            let mut bytes = Vec::from(b"MDBD".as_slice());
+            bytes.push(1);
+            bytes.extend_from_slice(&[0u8; 8]);
+            bytes.extend_from_slice(b"state\nevent-dag\nauth-chain\n");
+            bytes
+        })
+        .unwrap();
+        // A per-pool checkpoint watermark from the legacy layout.
+        std::fs::write(root.join("pools/state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
+
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
+        assert!(
+            scan.base_lsn > 7,
+            "the fresh shared WAL must start above the legacy per-pool coverage"
+        );
+        db.pool(ShardType::State)
+            .put(&[0x55u8; 16], &node(3), &NodeData::from_slice(b"live"))
+            .unwrap();
+        db.pool(ShardType::State).sync_all().unwrap();
+        assert!(
+            db.coordinator().committed_lsn_for_pool(ShardType::State) > 7,
+            "a new shared frame must be numbered above the legacy watermark"
+        );
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }

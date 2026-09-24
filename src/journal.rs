@@ -5,7 +5,7 @@
 //! which captures each sync caller's
 //! target LSN and releases it only after a durable group covers that target.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -613,11 +613,9 @@ const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
 /// Cross-pool coverage bookkeeping for reclaiming a shared segment.
 #[derive(Default)]
 struct CoverageState {
-    /// Pools with at least one frame in the segment (recovered at open, or
-    /// published this session). A group may only be reclaimed once all of
-    /// these have reported durable coverage past it.
-    required: HashSet<ShardType>,
-    /// Highest durable checkpoint coverage reported per pool.
+    /// Highest durable checkpoint coverage reported per pool. A group is
+    /// reclaimable only once every pool that contributed a frame to it has
+    /// reported coverage through the group's `last_lsn`.
     covered: HashMap<ShardType, u64>,
 }
 
@@ -690,16 +688,7 @@ impl JournalCoordinator {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
         let next_lsn = journal.next_lsn;
         let path = journal.path.clone();
-        // Every pool with a frame already in the segment is required to report
-        // coverage before any of its frame's group can be reclaimed.
-        let mut coverage = CoverageState::default();
-        for group in &scan.groups {
-            for entry in &group.entries {
-                if let Some(pool) = entry.pool {
-                    coverage.required.insert(pool);
-                }
-            }
-        }
+        let coverage = CoverageState::default();
         // Seed each pool's committed watermark from the recovered groups, so a
         // fresh coordinator over a pre-existing segment reports the same
         // coverage the segment already carries.
@@ -742,11 +731,10 @@ impl JournalCoordinator {
     }
 
     /// Record that `pool`'s durable checkpoint has materialized every frame it
-    /// owns through `lsn`. Coverage only advances, and a pool becomes required
-    /// as soon as it has a frame in the segment (recovered or published).
+    /// owns through `lsn`. Coverage only advances. A pool with no reported
+    /// coverage never blocks a group that does not carry its frames.
     pub fn report_pool_coverage(&self, pool: ShardType, lsn: u64) {
         let mut coverage = self.coverage.lock();
-        coverage.required.insert(pool);
         let entry = coverage.covered.entry(pool).or_insert(0);
         *entry = (*entry).max(lsn);
     }
@@ -781,33 +769,47 @@ impl JournalCoordinator {
         }
     }
 
-    /// Reclaim the shared segment's prefix covered by **every** pool that has
-    /// frames in it, returning the reclaim result or `None` when some required
-    /// pool has not yet reported coverage (so no group may be dropped).
+    /// Reclaim the longest prefix of the shared segment whose every group is
+    /// durably covered by all of that group's own pools, returning the reclaim
+    /// result or `None` when nothing is reclaimable yet.
     ///
-    /// This is the shared-segment counterpart to [`Self::reclaim_through`]: a
-    /// single pool's checkpoint covers only its own frames, so the segment may
-    /// only be truncated up to the minimum durable coverage across all pools.
+    /// A group is reclaimed atomically, so it may only be dropped once every
+    /// pool that contributed a frame to it has reported coverage through the
+    /// group's `last_lsn`. The pools in one group are independent of the pools
+    /// in another, so the reclaimable prefix is **not** a single minimum across
+    /// every pool: an idle pool whose last frame sits in an early group must not
+    /// pin later groups that its frames never reached. Walk the live groups in
+    /// order and stop at the first one any contributing pool has not covered.
     ///
     /// # Errors
-    /// Propagates a segment-rewrite failure from [`Self::reclaim_through`].
+    /// Propagates a scan or segment-rewrite failure from [`Self::reclaim_through`].
     pub fn reclaim_shared(&self) -> io::Result<Option<Reclaim>> {
-        let min = {
+        let scan = Journal::scan_read_only(&self.path)?;
+        let boundary = {
             let coverage = self.coverage.lock();
-            if coverage.required.is_empty() {
-                return Ok(None);
-            }
-            let mut min = u64::MAX;
-            for pool in &coverage.required {
-                match coverage.covered.get(pool) {
-                    Some(&lsn) => min = min.min(lsn),
-                    // A required pool with no coverage at all blocks reclaim.
-                    None => return Ok(None),
+            let mut boundary = None;
+            'groups: for group in &scan.groups {
+                for entry in &group.entries {
+                    match entry.pool {
+                        Some(pool)
+                            if coverage
+                                .covered
+                                .get(&pool)
+                                .is_some_and(|lsn| *lsn >= group.last_lsn) => {}
+                        // Either the contributing pool has not reported coverage
+                        // through this group, or a frame carries no pool tag and
+                        // so cannot be attributed. Stop before dropping it.
+                        _ => break 'groups,
+                    }
                 }
+                boundary = Some(group.last_lsn);
             }
-            min
+            boundary
         };
-        self.reclaim_through(min).map(Some)
+        match boundary {
+            Some(covered_lsn) => self.reclaim_through(covered_lsn).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Build a coordinator whose groups draw their sequence from a shared,
@@ -906,11 +908,6 @@ impl JournalCoordinator {
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
         publish_overlay(lsn);
         pending.push((lsn, pool, mutation));
-        if let Some(pool) = pool {
-            // A newly publishing pool must report coverage before reclaim can
-            // drop its frames.
-            self.coverage.lock().required.insert(pool);
-        }
         self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn.store(lsn, Ordering::Release);
         Ok(lsn)
@@ -1265,18 +1262,6 @@ impl JournalCoordinator {
         self.visible_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
         drop(pending);
-        // A staged transaction group reaches the segment without going through
-        // `publish`, so register its pools here too: otherwise reclaim would
-        // not know it must wait for them and could drop their frames before
-        // they checkpoint.
-        {
-            let mut coverage = self.coverage.lock();
-            for (pool, _) in &group_mutations {
-                if let Some(pool) = pool {
-                    coverage.required.insert(*pool);
-                }
-            }
-        }
         // The group is visible but not yet durable; record its per-pool extents
         // so a later coalesced fsync can promote each pool's watermark.
         let extents = pool_extents(
@@ -1412,7 +1397,7 @@ impl Journal {
     /// data-bearing segment's header is invalid, if any committed group fails
     /// validation, or if the segment exceeds `MAX_SEGMENT_LEN`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
-        Self::open_versioned(path, JournalVersion::per_pool())
+        Self::open_versioned(path, JournalVersion::per_pool(), 1)
     }
 
     /// Open a shared (multi-pool) journal segment, or create one if the file is
@@ -1423,16 +1408,39 @@ impl Journal {
     /// Same as [`Self::open`], plus `InvalidData` if an existing segment is not
     /// the pool-tagged version.
     pub fn open_shared(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
-        Self::open_versioned(path, JournalVersion::shared())
+        Self::open_versioned(path, JournalVersion::shared(), 1)
+    }
+
+    /// Like [`Self::open_shared`], but when the segment is first created its
+    /// LSN space begins at `base_lsn` rather than 1.
+    ///
+    /// A database root that was previously driven through per-pool journals is
+    /// opened onto one fresh shared segment, but its pools carry durable
+    /// coverage (`journal.lsn`) in each per-pool LSN space. Starting the shared
+    /// segment above every one of those watermarks keeps all per-pool coverage
+    /// values meaningful in the new, single shared LSN space: a rebuilt shared
+    /// segment can neither replay past a pool's legacy coverage nor let reclaim
+    /// drop a fresh frame that only looks covered because the numbering
+    /// restarted. An existing segment ignores `base_lsn` and keeps its own.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_shared`].
+    pub fn open_shared_seeded(path: impl AsRef<Path>, base_lsn: u64) -> io::Result<(Self, Scan)> {
+        Self::open_versioned(path, JournalVersion::shared(), base_lsn.max(1))
     }
 
     /// Open a journal whose on-disk version must be `version`, creating it with
-    /// that version when the file is absent or shorter than the header.
+    /// that version and base LSN `base_lsn` when the file is absent or shorter
+    /// than the header.
     ///
     /// # Errors
     /// Same as [`Self::open`], plus `InvalidData` if an existing complete
     /// segment was written by a different version.
-    fn open_versioned(path: impl AsRef<Path>, version: JournalVersion) -> io::Result<(Self, Scan)> {
+    fn open_versioned(
+        path: impl AsRef<Path>,
+        version: JournalVersion,
+        base_lsn: u64,
+    ) -> io::Result<(Self, Scan)> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1453,7 +1461,7 @@ impl Journal {
             // failing open forever on a partial header.
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            write_file_header(&mut file, version, 1, 1)?;
+            write_file_header(&mut file, version, 1, base_lsn)?;
             file.sync_all()?;
             sync_parent_dir(&path)?;
         }
@@ -2524,6 +2532,58 @@ mod tests {
         // Once every pool reports, the prefix can go.
         coordinator.report_pool_coverage(ShardType::EventDag, committed);
         assert!(coordinator.reclaim_shared().unwrap().is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shared_reclaim_does_not_wait_for_an_idle_pool() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_idle_pool_reclaim");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        // State contributes only the first group, then goes idle.
+        coordinator
+            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+            .unwrap();
+        coordinator.sync().unwrap();
+        let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
+
+        // Event-DAG writes several later groups that never carry a state frame.
+        let mut event_lsn = 0;
+        for id in 0..4u8 {
+            coordinator
+                .publish_tagged(ShardType::EventDag, put(2, id, b"event"), |_| {})
+                .unwrap();
+            coordinator.sync().unwrap();
+            event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
+        }
+        assert!(event_lsn > state_lsn);
+
+        // State covers only its own group. Reclaim must advance through that
+        // group and stop at the first uncovered event-DAG group — not refuse to
+        // advance at all because some pool is behind.
+        coordinator.report_pool_coverage(ShardType::State, state_lsn);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 4, "uncovered event groups must survive");
+        assert_eq!(
+            scan.base_lsn,
+            state_lsn + 1,
+            "the covered state group is reclaimed independently"
+        );
+
+        // Once event-DAG covers its frames, the idle state pool must not pin
+        // the later groups its frames never reached.
+        coordinator.report_pool_coverage(ShardType::EventDag, event_lsn);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert!(
+            scan.groups.is_empty(),
+            "an idle pool must not block later groups it never contributed to"
+        );
+        assert_eq!(scan.base_lsn, event_lsn + 1);
         fs::remove_file(path).unwrap();
     }
 

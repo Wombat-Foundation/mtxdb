@@ -119,30 +119,18 @@ impl ReadJournal {
         self.delete_lsn.retain(|_, lsn| *lsn > covered);
     }
 
-    /// Whether a reset segment's base has advanced past the coverage this
-    /// reader's index incorporated, leaving a hole this pool cannot fill.
+    /// Whether the segment's base has advanced past the coverage this reader's
+    /// index incorporated, so the prefix may hold frames this index lacks.
     ///
-    /// A shared segment interleaves every pool's frames, so the raw base LSN
-    /// advancing is not by itself a gap for this pool: reclaim only drops a
-    /// group once every contributing pool has materialized its frames, and a
-    /// pool with no frames of its own in the segment loses nothing when other
-    /// pools' frames are reclaimed. A gap is only real when the segment still
-    /// carries frames tagged for this pool — then the base jump may have
-    /// skipped this pool's frames, so the checkpoint must be reloaded (or, if
-    /// reloading cannot close it, the read fails closed). A per-pool segment
-    /// (`pool` is `None`) has only this store's frames, so any base jump is a
-    /// gap.
+    /// The reclaimed prefix is already gone from disk, so its contents cannot
+    /// be inferred from the surviving groups. A base jump is therefore treated
+    /// as a possible gap unconditionally; whether it is a *real* gap for this
+    /// pool is decided by the caller, which reloads the checkpoint-bound index
+    /// and only accepts the jump once that index is known to be current (see
+    /// [`PackfileStorage::refresh_read_journal`]). A `base_lsn` at or below
+    /// `covered + 1` means nothing at or below `covered` was dropped.
     pub(super) fn reset_has_coverage_gap(&self, scan: &crate::journal::Scan) -> bool {
-        if scan.base_lsn <= self.covered.saturating_add(1) {
-            return false;
-        }
-        match self.pool {
-            None => true,
-            Some(pool) => scan
-                .groups
-                .iter()
-                .any(|group| group.entries.iter().any(|entry| entry.pool == Some(pool))),
-        }
+        scan.base_lsn > self.covered.saturating_add(1)
     }
 
     /// Apply every committed group above `observed_lsn` to the overlay.
@@ -153,10 +141,16 @@ impl ReadJournal {
     /// reclaimed, so the overlay is rebuilt from scratch. Never repairs or
     /// creates the file, matching a read-only worker's constraints.
     ///
+    /// `accept_reclaimed_prefix` is set by the caller once it has reloaded the
+    /// checkpoint-bound index to the writer's latest durable coverage for this
+    /// pool. On a shared segment a base jump beyond that coverage can only be
+    /// other pools' reclaimed frames, which this pool does not need, so the
+    /// jump is accepted instead of forcing another reload.
+    ///
     /// Returns [`ReadRefresh::NeedsReload`] when a reset reveals the writer
     /// reclaimed past this reader's incorporated coverage; the caller must
     /// reload the checkpoint-bound index and rebind `covered` before retrying.
-    fn refresh(&mut self) -> Result<ReadRefresh, StorageError> {
+    fn refresh(&mut self, accept_reclaimed_prefix: bool) -> Result<ReadRefresh, StorageError> {
         // Coverage is fixed to the index this reader loaded. Reading
         // `journal.lsn` fresh would prune entries the reader's stale index has
         // not incorporated yet, dropping records from both sources.
@@ -201,7 +195,10 @@ impl ReadJournal {
             // must be gap-checked too — not only an explicit shrink. Without
             // this, a reload that rebinds `covered` below the segment base
             // would silently serve a hole.
-            if (reset || full_scan) && self.reset_has_coverage_gap(&scan) {
+            if (reset || full_scan)
+                && !accept_reclaimed_prefix
+                && self.reset_has_coverage_gap(&scan)
+            {
                 return Ok(ReadRefresh::NeedsReload);
             }
             for group in &scan.groups {
@@ -351,7 +348,7 @@ impl PackfileStorage {
             let Some(overlay) = guard.as_mut() else {
                 return Ok(guard);
             };
-            if overlay.refresh()? == ReadRefresh::Applied {
+            if overlay.refresh(false)? == ReadRefresh::Applied {
                 return Ok(guard);
             }
             if !self.reload_index_from_checkpoint() {
@@ -366,10 +363,18 @@ impl PackfileStorage {
             }
             overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
             overlay.reset_overlay();
+            // The reload bound this overlay to the newest checkpoint it could
+            // load. On a shared segment a base jump beyond that checkpoint is
+            // made up of other pools' reclaimed frames, which this pool never
+            // needs, so accept it once the loaded checkpoint is at least this
+            // pool's latest durable coverage. A per-pool segment holds only
+            // this store's frames, so it stays fail-closed.
+            let accept_reclaimed_prefix =
+                overlay.pool.is_some() && overlay.covered >= Self::read_journal_lsn(&self.base_dir);
             // Rebuild immediately while still holding the guard: returning the
             // guard only once the overlay is applied keeps another reader from
             // observing the just-cleared state.
-            if overlay.refresh()? == ReadRefresh::Applied {
+            if overlay.refresh(accept_reclaimed_prefix)? == ReadRefresh::Applied {
                 return Ok(guard);
             }
             drop(guard);
