@@ -1652,18 +1652,14 @@ fn print_collection_table_header(layout: bool, canonical: bool, canonical_width:
 /// currently renders roles as `canonical (role)`; keeping the suffix out of the
 /// identity width makes the role column line up across rows.
 fn split_canonical_display(display: &str) -> (&str, Option<&str>) {
-    display
-        .rfind(" (")
-        .filter(|_| display.ends_with(')') || display.ends_with(")*"))
-        .map_or((display, None), |start| {
-            let Some(role_start) = start.checked_add(1) else {
-                return (display, None);
-            };
-            let Some(role) = display.get(role_start..) else {
-                return (display, None);
-            };
-            (&display[..start], Some(role))
-        })
+    let Some((identity, role)) = display.rsplit_once(" (") else {
+        return (display, None);
+    };
+    if role.ends_with(')') || role.ends_with(")*") {
+        (identity, Some(role))
+    } else {
+        (display, None)
+    }
 }
 
 fn canonical_column_width<'a>(displays: impl IntoIterator<Item = &'a String>) -> usize {
@@ -1680,7 +1676,7 @@ fn format_canonical_display(display: &str, width: usize) -> String {
     let (identity, role) = split_canonical_display(display);
     let mut formatted = format!("{identity:<width$}");
     if let Some(role) = role {
-        formatted.push_str("  ");
+        formatted.push_str("  (");
         formatted.push_str(role);
     }
     formatted
@@ -8987,7 +8983,7 @@ mod tests {
         let long = "!a-much-longer-room-id (event_dag)".to_owned();
         assert_eq!(
             split_canonical_display(&short),
-            ("!short", Some("(event_dag)"))
+            ("!short", Some("event_dag)"))
         );
         assert_eq!(
             canonical_column_width([&short, &long].into_iter()),
