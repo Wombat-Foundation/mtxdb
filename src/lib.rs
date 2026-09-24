@@ -66,7 +66,10 @@ pub use matrix_policy::{
     EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
 };
-pub use packfile::{storage::PackfileStorage, FrameMetadata, Record};
+pub use packfile::{
+    storage::{PackfileStorage, ReadPlanPolicy},
+    FrameMetadata, Record,
+};
 pub use shard::ShardPool;
 pub use storage::{
     content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,

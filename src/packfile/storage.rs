@@ -785,6 +785,155 @@ const DELTA_LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// adjacency (that would require a per-candidate frame-length probe).
 const READ_RUN_GAP_BYTES: u64 = 128;
 
+/// Largest on-disk size of a single frame: the 4-byte length prefix, a
+/// [`packfile::MAX_RECORD_LEN`]-bounded body, and the 4-byte CRC. Used as the
+/// per-candidate frame-length estimate when planning merged read extents: it
+/// over-approximates so the plan never advises short of a frame's true end,
+/// and it avoids a per-candidate length-prefix probe (which would fault in the
+/// very cold page the plan exists to prefetch).
+const MAX_FRAME_DISK_LEN: u64 = (packfile::MAX_RECORD_LEN + 8) as u64;
+
+/// Tuning for `get_many`'s merged read plan.
+///
+/// `get_many` probes the lossy index once per requested id, so a large batch
+/// yields many candidate `(shard, offset)` locations scattered across a few
+/// shards. Without a plan each candidate is read independently; on rotational
+/// media the per-candidate seeks dominate. When enabled, candidates on the same
+/// shard whose offsets are within [`Self::merge_gap_bytes`] of each other are
+/// melded into one contiguous extent, and each extent is prefetched with
+/// `madvise(MADV_WILLNEED)` before resolution — the kernel then reads it as one
+/// sequential run while the existing per-candidate decode path still verifies
+/// every requested hash (lossy-index false positives included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPlanPolicy {
+    /// Candidate offsets at most this far apart (start to start, on the same
+    /// shard) are melded into one prefetched extent. On an HDD, reading
+    /// through a gap is cheaper than a seek once the gap is under roughly
+    /// `seek_time * throughput` (~1-2 MB at 10 ms / 100 MB/s), which is the
+    /// same order as the ~500-1000 4 KiB blocks a rotational drive reads in
+    /// one seek. [`ReadPlanPolicy::hdd`] uses 2 MiB; `0` melds only adjacent
+    /// offsets.
+    pub merge_gap_bytes: u64,
+    /// Hard ceiling on one merged extent. Bounds the bytes read through gaps
+    /// and keeps a dense batch from collapsing into a single unbounded
+    /// prefetch. `0` disables prefetching entirely.
+    pub max_extent_bytes: u64,
+    /// Batches with fewer candidate locations than this skip planning: a
+    /// handful of reads gains nothing from a plan, and the grouping/sort is
+    /// pure overhead.
+    pub min_batch_candidates: usize,
+}
+
+impl Default for ReadPlanPolicy {
+    /// Disabled: merged prefetch is opt-in. Its win is rotational-media
+    /// specific, and a `WILLNEED` over a multi-MiB extent reads through gaps
+    /// nobody asked for — on an SSD or a warm cache that is pure page-cache
+    /// pressure. Use [`ReadPlanPolicy::hdd`] (or a tuned policy) for a
+    /// rotational store.
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl ReadPlanPolicy {
+    /// A plan that never prefetches: no extent is ever built.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            merge_gap_bytes: 0,
+            max_extent_bytes: 0,
+            min_batch_candidates: usize::MAX,
+        }
+    }
+
+    /// A **starting point** for rotational (HDD) storage, not a tuned preset:
+    /// meld candidates within 2 MiB — the ~500-1000 4 KiB blocks a drive reads
+    /// in one seek — up to an 8 MiB extent, once a batch has at least 16
+    /// candidate locations. These numbers are reasoned from seek/throughput
+    /// arithmetic but have not been validated against a cold-cache benchmark;
+    /// treat them as a place to start tuning.
+    #[must_use]
+    pub fn hdd() -> Self {
+        Self {
+            merge_gap_bytes: 2 * 1024 * 1024,
+            max_extent_bytes: 8 * 1024 * 1024,
+            min_batch_candidates: 16,
+        }
+    }
+
+    /// Whether a batch with `candidate_count` candidate locations should be
+    /// planned.
+    fn wants(&self, candidate_count: usize) -> bool {
+        self.max_extent_bytes > 0 && candidate_count >= self.min_batch_candidates
+    }
+}
+
+/// One contiguous byte extent on a shard to prefetch as a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadExtent {
+    /// Shard slot the extent lives on.
+    slot: u16,
+    /// Inclusive start offset (a candidate frame's length prefix).
+    start: u64,
+    /// Exclusive end offset.
+    end: u64,
+}
+
+/// Meld a shard's sorted candidate offsets into prefetch extents.
+///
+/// `per_shard` maps each touched shard slot to its candidate offsets, each
+/// vector sorted ascending. A run starts at the first offset and absorbs the
+/// next while the start-to-start distance stays within
+/// [`ReadPlanPolicy::merge_gap_bytes`] and the resulting span stays within
+/// [`ReadPlanPolicy::max_extent_bytes`]. A run's end is its last offset plus
+/// [`MAX_FRAME_DISK_LEN`] (see that constant for why the frame length is
+/// estimated rather than probed).
+fn plan_read_extents(
+    per_shard: &HashMap<u16, Vec<u64>>,
+    policy: ReadPlanPolicy,
+) -> Vec<ReadExtent> {
+    let mut extents = Vec::new();
+    // A single candidate's extent is always `MAX_FRAME_DISK_LEN` long, so a
+    // cap below that would split every candidate onto its own extent. Floor it.
+    let cap = policy.max_extent_bytes.max(MAX_FRAME_DISK_LEN);
+    for (&slot, offsets) in per_shard {
+        let Some(&first) = offsets.first() else {
+            continue;
+        };
+        let mut run_start = first;
+        let mut run_last = first;
+        for &offset in &offsets[1..] {
+            let gap_ok = offset.saturating_sub(run_last) <= policy.merge_gap_bytes;
+            let span_ok = offset
+                .saturating_add(MAX_FRAME_DISK_LEN)
+                .saturating_sub(run_start)
+                <= cap;
+            if gap_ok && span_ok {
+                run_last = offset;
+            } else {
+                extents.push(ReadExtent {
+                    slot,
+                    start: run_start,
+                    end: run_last.saturating_add(MAX_FRAME_DISK_LEN),
+                });
+                run_start = offset;
+                run_last = offset;
+            }
+        }
+        extents.push(ReadExtent {
+            slot,
+            start: run_start,
+            end: run_last.saturating_add(MAX_FRAME_DISK_LEN),
+        });
+    }
+    // `per_shard` is a `HashMap`, so iteration (and therefore extent order)
+    // would otherwise be nondeterministic across runs. Prefetch order does not
+    // affect correctness, but a stable order keeps plans reproducible and
+    // testable.
+    extents.sort_unstable_by_key(|extent| (extent.slot, extent.start));
+    extents
+}
+
 /// Reject a record whose in-shard offset the 32-bit `IndexEntry` field cannot
 /// represent, so the caller surfaces a `StorageError::Corrupt` instead of
 /// silently dropping the record (or panicking in `IndexEntry::new`).
@@ -1051,6 +1200,10 @@ pub struct PackfileStorage {
     /// Per-instance index config: seed from the pool's `pool.meta`, floor
     /// and load factor from defaults (or future tuning).
     index_config: crate::index::IndexConfig,
+    /// Merged-read-plan tuning for `get_many` (see [`ReadPlanPolicy`]).
+    /// Read once per batch; settable at runtime via
+    /// [`Self::set_read_plan_policy`].
+    read_plan: parking_lot::RwLock<ReadPlanPolicy>,
     /// Total number of `repack_collection_reachable` calls across all collections.
     repack_count: AtomicU64,
     /// Total records kept (rewritten into the new generation) across all repacks.
@@ -1191,6 +1344,20 @@ pub struct PackfileStorage {
     /// scatters over, even if it only touches sparse frames). Drives the
     /// scattered-read signal independent of candidate count.
     read_many_span_bytes: AtomicU64,
+    /// Merged read extents prefetched with `madvise(MADV_WILLNEED)` across
+    /// `get_many` batches. This is the physical plan the batch executed, as
+    /// opposed to the [`READ_RUN_GAP_BYTES`] logical shape in
+    /// [`Self::read_many_runs`].
+    read_plan_extents: AtomicU64,
+    /// Bytes covered by prefetched read extents (sum of extent lengths, not
+    /// physical disk bytes — `madvise` is a hint the kernel may partially or
+    /// fully ignore).
+    read_plan_prefetch_bytes: AtomicU64,
+    /// Planned extents that were not prefetched — offset beyond the current
+    /// mapping (typically a buffered-but-unflushed frame), missing mapping, or
+    /// a failed `madvise`. A persistently nonzero value means the plan is
+    /// silently degrading to no prefetch for those extents.
+    read_plan_skipped_extents: AtomicU64,
 
     // Always-on write-path counters (per-record `fetch_add` only on the
     // single-record `put`, whose hot cost is dominated by the write itself).
@@ -2064,6 +2231,7 @@ impl PackfileStorage {
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
             index_config,
+            read_plan: RwLock::new(ReadPlanPolicy::default()),
             repack_count: AtomicU64::new(0),
             repack_kept_total: AtomicU64::new(0),
             repack_dropped_total: AtomicU64::new(0),
@@ -2119,6 +2287,9 @@ impl PackfileStorage {
             candidate_frame_bytes: AtomicU64::new(0),
             read_many_runs: AtomicU64::new(0),
             read_many_span_bytes: AtomicU64::new(0),
+            read_plan_extents: AtomicU64::new(0),
+            read_plan_prefetch_bytes: AtomicU64::new(0),
+            read_plan_skipped_extents: AtomicU64::new(0),
             put_calls: AtomicU64::new(0),
             put_bytes: AtomicU64::new(0),
             put_many_calls: AtomicU64::new(0),
@@ -2918,6 +3089,18 @@ impl PackfileStorage {
     pub fn set_repack_threshold_entries(&self, entries: u64) {
         self.repack_threshold_entries
             .store(entries, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the merged-read-plan policy for `get_many` (see
+    /// [`ReadPlanPolicy`]). Takes effect on the next batch.
+    pub fn set_read_plan_policy(&self, policy: ReadPlanPolicy) {
+        *self.read_plan.write() = policy;
+    }
+
+    /// The current merged-read-plan policy.
+    #[must_use]
+    pub fn read_plan_policy(&self) -> ReadPlanPolicy {
+        *self.read_plan.read()
     }
 
     /// Returns `true` if a collection's index has reached the configured repack
@@ -6933,26 +7116,32 @@ impl StorageEngine for PackfileStorage {
 
             to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
 
-            if track {
-                self.index_candidates
-                    .fetch_add(candidates_seen, Ordering::Relaxed);
-                let touched: HashSet<u16> = to_fetch
-                    .iter()
-                    .flat_map(|(_, candidates)| candidates.iter().map(|(slot, _)| *slot))
-                    .collect();
-                self.get_many_shards_touched
-                    .fetch_add(touched.len() as u64, Ordering::Relaxed);
+            let policy = self.read_plan_policy();
+            let plan_wanted = policy.wants(usize::try_from(candidates_seen).unwrap_or(usize::MAX));
 
-                let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+            // One grouping of candidate offsets per shard feeds both the
+            // scatter counters and the merged read plan below.
+            let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+            if track || plan_wanted {
                 for (_, candidates) in &to_fetch {
                     for (slot, offset) in candidates {
                         per_shard.entry(*slot).or_default().push(*offset);
                     }
                 }
-                let mut runs: u64 = 0;
-                let mut span: u64 = 0;
                 for offsets in per_shard.values_mut() {
                     offsets.sort_unstable();
+                }
+            }
+
+            if track {
+                self.index_candidates
+                    .fetch_add(candidates_seen, Ordering::Relaxed);
+                self.get_many_shards_touched
+                    .fetch_add(per_shard.len() as u64, Ordering::Relaxed);
+
+                let mut runs: u64 = 0;
+                let mut span: u64 = 0;
+                for offsets in per_shard.values() {
                     let first = *offsets.first().expect("offsets non-empty by construction");
                     let last = *offsets.last().expect("offsets non-empty by construction");
                     runs = runs.saturating_add(1);
@@ -6965,6 +7154,14 @@ impl StorageEngine for PackfileStorage {
                 }
                 self.read_many_runs.fetch_add(runs, Ordering::Relaxed);
                 self.read_many_span_bytes.fetch_add(span, Ordering::Relaxed);
+            }
+
+            // Meld nearby candidates into contiguous extents and hint the
+            // kernel to read each as one sequential run, before the
+            // per-candidate decode loop touches them one at a time.
+            if plan_wanted {
+                let extents = plan_read_extents(&per_shard, policy);
+                self.prefetch_extents(&extents, &pinned, track);
             }
 
             for (i, candidates) in &to_fetch {
@@ -7052,6 +7249,81 @@ impl StorageEngine for PackfileStorage {
 }
 
 impl PackfileStorage {
+    /// Hint the kernel to read each planned extent as one sequential run.
+    ///
+    /// Reads go through the shard's mmap, so the physical coalescing is a
+    /// `madvise(MADV_WILLNEED)` over the merged range rather than a `pread`
+    /// into a buffer: the existing zero-copy decode path is unchanged, and the
+    /// kernel is free to queue the readahead asynchronously while resolution
+    /// proceeds. Best-effort: an extent that cannot be advised (missing
+    /// mapping, offset beyond the current mapping, or a failed `madvise`) is
+    /// counted in `read_plan_skipped_extents` rather than silently dropped.
+    #[cfg(unix)]
+    fn prefetch_extents(
+        &self,
+        extents: &[ReadExtent],
+        pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+    ) {
+        for extent in extents {
+            match Self::prefetch_extent(extent, pinned) {
+                Some(len) => {
+                    if track {
+                        self.read_plan_extents.fetch_add(1, Ordering::Relaxed);
+                        self.read_plan_prefetch_bytes
+                            .fetch_add(len, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    if track {
+                        self.read_plan_skipped_extents
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `madvise(MADV_WILLNEED)` one extent, returning its byte length on
+    /// success and `None` if it could not be advised.
+    ///
+    /// `advise_range` requires the offset and length to lie within the mapping;
+    /// clamp rather than error, since a virtual (buffered-but-unflushed) offset
+    /// is legitimately beyond the current mapping and simply cannot be
+    /// prefetched until the shard flushes.
+    #[cfg(unix)]
+    fn prefetch_extent(extent: &ReadExtent, pinned: &HashMap<u16, Arc<Shard>>) -> Option<u64> {
+        let shard = pinned.get(&extent.slot)?;
+        let guard = shard.mmap().ok()?;
+        let mapping = guard.as_ref()?;
+        let start = usize::try_from(extent.start).ok()?;
+        let end = usize::try_from(extent.end)
+            .unwrap_or(usize::MAX)
+            .min(mapping.len());
+        if start >= end {
+            return None;
+        }
+        let len = end.saturating_sub(start);
+        mapping
+            .advise_range(memmap2::Advice::WillNeed, start, len)
+            .ok()?;
+        Some(u64::try_from(len).unwrap_or(u64::MAX))
+    }
+
+    /// Non-Unix builds have no `madvise`; every planned extent is skipped.
+    #[cfg(not(unix))]
+    fn prefetch_extents(
+        &self,
+        extents: &[ReadExtent],
+        _pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+    ) {
+        if track {
+            self.read_plan_skipped_extents
+                .fetch_add(extents.len() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Persist the pre-batch generation after a batch failed after physical
     /// appends. The append-only frames remain as unreachable bytes, but the
     /// checkpoint's matching pack fingerprint makes that exclusion durable
@@ -7857,6 +8129,9 @@ impl PackfileStorage {
             candidate_frame_bytes: self.candidate_frame_bytes.load(Ordering::Relaxed),
             read_many_runs: self.read_many_runs.load(Ordering::Relaxed),
             read_many_span_bytes: self.read_many_span_bytes.load(Ordering::Relaxed),
+            read_plan_extents: self.read_plan_extents.load(Ordering::Relaxed),
+            read_plan_prefetch_bytes: self.read_plan_prefetch_bytes.load(Ordering::Relaxed),
+            read_plan_skipped_extents: self.read_plan_skipped_extents.load(Ordering::Relaxed),
             put_calls: self.put_calls.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             put_many_calls: self.put_many_calls.load(Ordering::Relaxed),
@@ -7943,6 +8218,9 @@ impl PackfileStorage {
             &self.candidate_frame_bytes,
             &self.read_many_runs,
             &self.read_many_span_bytes,
+            &self.read_plan_extents,
+            &self.read_plan_prefetch_bytes,
+            &self.read_plan_skipped_extents,
             &self.put_calls,
             &self.put_bytes,
             &self.put_many_calls,
@@ -8069,6 +8347,16 @@ pub struct RuntimeStats {
     /// `get_many` batch (stats-gated; the logical byte-extent the batch
     /// scatters over, not physical disk bytes read).
     pub read_many_span_bytes: u64,
+    /// Merged read extents prefetched with `madvise(MADV_WILLNEED)` across
+    /// `get_many` batches (the executed physical plan, as opposed to the
+    /// [`Self::read_many_runs`] logical shape).
+    pub read_plan_extents: u64,
+    /// Bytes covered by prefetched read extents (sum of extent lengths; not
+    /// physical disk bytes, since `madvise` is a hint).
+    pub read_plan_prefetch_bytes: u64,
+    /// Planned extents not prefetched (offset beyond the current mapping,
+    /// missing mapping, or a failed `madvise`).
+    pub read_plan_skipped_extents: u64,
     /// Single-record `put` attempts.
     pub put_calls: u64,
     /// Bytes accepted across single-record `put` attempts.
@@ -8203,6 +8491,9 @@ impl Default for RuntimeStats {
             candidate_frame_bytes: 0,
             read_many_runs: 0,
             read_many_span_bytes: 0,
+            read_plan_extents: 0,
+            read_plan_prefetch_bytes: 0,
+            read_plan_skipped_extents: 0,
             put_calls: 0,
             put_bytes: 0,
             put_many_calls: 0,
@@ -11746,6 +12037,153 @@ mod tests {
         assert_eq!(
             single_after.read_many_span_bytes,
             single_before.read_many_span_bytes
+        );
+    }
+
+    #[test]
+    fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
+        let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+
+        // Meld runs across gaps within the threshold, split across larger ones.
+        per_shard.insert(3, vec![0, 50_000, 400_000, 450_000, 10_000_000]);
+        let extents = plan_read_extents(
+            &per_shard,
+            ReadPlanPolicy {
+                merge_gap_bytes: 100_000,
+                max_extent_bytes: 10_000_000,
+                min_batch_candidates: 1,
+            },
+        );
+        assert_eq!(
+            extents,
+            vec![
+                ReadExtent {
+                    slot: 3,
+                    start: 0,
+                    end: 50_000 + MAX_FRAME_DISK_LEN,
+                },
+                ReadExtent {
+                    slot: 3,
+                    start: 400_000,
+                    end: 450_000 + MAX_FRAME_DISK_LEN,
+                },
+                ReadExtent {
+                    slot: 3,
+                    start: 10_000_000,
+                    end: 10_000_000 + MAX_FRAME_DISK_LEN,
+                },
+            ]
+        );
+
+        // A generous gap threshold still splits once the run would exceed the
+        // cap: 0 and 100_000 fit under 200_000, but adding 150_000 would not.
+        per_shard.clear();
+        per_shard.insert(7, vec![0, 100_000, 150_000]);
+        let capped = plan_read_extents(
+            &per_shard,
+            ReadPlanPolicy {
+                merge_gap_bytes: 10_000_000,
+                max_extent_bytes: 200_000,
+                min_batch_candidates: 1,
+            },
+        );
+        assert_eq!(
+            capped,
+            vec![
+                ReadExtent {
+                    slot: 7,
+                    start: 0,
+                    end: 100_000 + MAX_FRAME_DISK_LEN,
+                },
+                ReadExtent {
+                    slot: 7,
+                    start: 150_000,
+                    end: 150_000 + MAX_FRAME_DISK_LEN,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plan_read_extents_orders_by_slot() {
+        let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+        per_shard.insert(9, vec![0, 10]);
+        per_shard.insert(2, vec![0, 10]);
+        per_shard.insert(5, vec![0, 10]);
+        let extents = plan_read_extents(
+            &per_shard,
+            ReadPlanPolicy {
+                merge_gap_bytes: 100,
+                max_extent_bytes: 8 * 1024 * 1024,
+                min_batch_candidates: 1,
+            },
+        );
+        let slots: Vec<u16> = extents.iter().map(|extent| extent.slot).collect();
+        assert_eq!(slots, vec![2, 5, 9]);
+    }
+
+    #[test]
+    fn test_read_plan_policy_wants_gates_on_batch_size_and_cap() {
+        let policy = ReadPlanPolicy {
+            merge_gap_bytes: 0,
+            max_extent_bytes: 8 * 1024 * 1024,
+            min_batch_candidates: 16,
+        };
+        assert!(!policy.wants(15));
+        assert!(policy.wants(16));
+        assert!(!ReadPlanPolicy::disabled().wants(1_000_000));
+    }
+
+    #[test]
+    fn test_get_many_prefetch_plan_counters() {
+        let dir = test_dir("read_plan_counters");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let entries: Vec<_> = (0..8u8)
+            .map(|value| {
+                let mut id = [0u8; 16];
+                id[0] = value;
+                id[9] = value.wrapping_mul(37).wrapping_add(11);
+                (id, NodeData::new(bytes::Bytes::from(vec![value; 16])))
+            })
+            .collect();
+        writer.put_many(&TEST_COLLECTION, &entries).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let reader = PackfileStorage::open_read_only(dir).unwrap();
+        reader.set_stats_enabled(true);
+        reader.set_read_plan_policy(ReadPlanPolicy {
+            merge_gap_bytes: 1024 * 1024,
+            max_extent_bytes: 8 * 1024 * 1024,
+            min_batch_candidates: 1,
+        });
+
+        let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
+        let before = reader.stats();
+        let results = reader.get_many(&TEST_COLLECTION, &ids).unwrap();
+        assert_eq!(
+            results.iter().filter(|value| value.is_some()).count(),
+            entries.len()
+        );
+        let after = reader.stats();
+        assert!(after.read_plan_extents > before.read_plan_extents);
+        assert!(after.read_plan_prefetch_bytes > before.read_plan_prefetch_bytes);
+        // Every candidate is committed to disk, so every planned extent is
+        // prefetchable and none is skipped.
+        assert_eq!(after.read_plan_skipped_extents, 0);
+
+        // A disabled policy prefetches nothing, even for the same batch.
+        reader.set_read_plan_policy(ReadPlanPolicy::disabled());
+        let disabled_before = reader.stats();
+        reader.get_many(&TEST_COLLECTION, &ids).unwrap();
+        let disabled_after = reader.stats();
+        assert_eq!(
+            disabled_after.read_plan_extents,
+            disabled_before.read_plan_extents
+        );
+        assert_eq!(
+            disabled_after.read_plan_prefetch_bytes,
+            disabled_before.read_plan_prefetch_bytes
         );
     }
 
