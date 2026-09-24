@@ -147,9 +147,9 @@ pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 pub enum TxnStageState {
     /// The SQL transaction attempt is active and may add mutations.
     Active,
-    /// Pack/index mutations have been applied and journal publication may be
-    /// retried without applying them again.
-    Applied,
+    /// The published journal group is being materialized into pack/index
+    /// storage. Per-mutation progress makes retries resumable.
+    Materializing,
     /// The journal group is published; pack/index application is still
     /// pending or retrying.
     JournalPublished,
@@ -167,6 +167,8 @@ struct TxnStageData {
     /// Successful pool appends. Retrying a callback after a partial error
     /// resumes at the failed pool instead of duplicating earlier groups.
     appended: [bool; 3],
+    /// Receipt identifying the published journal group owned by this stage.
+    receipt: Option<CommitReceipt>,
 }
 
 /// Transaction-local mutation buffer used by [`crate::database::DatabaseTransaction`].
@@ -196,7 +198,7 @@ impl TxnStage {
     const ACTIVE: u8 = 0;
     const DISCARDED: u8 = 1;
     const PUBLISHED: u8 = 2;
-    const APPLIED: u8 = 3;
+    const MATERIALIZING: u8 = 3;
     const JOURNAL_PUBLISHED: u8 = 4;
 
     /// Create an empty stage for one transaction attempt.
@@ -209,6 +211,7 @@ impl TxnStage {
                 applied: std::array::from_fn(|_| Vec::new()),
                 bytes: 0,
                 appended: [false; 3],
+                receipt: None,
             }),
         }
     }
@@ -219,7 +222,7 @@ impl TxnStage {
         match self.state.load(Ordering::Acquire) {
             Self::DISCARDED => TxnStageState::Discarded,
             Self::PUBLISHED => TxnStageState::Published,
-            Self::APPLIED => TxnStageState::Applied,
+            Self::MATERIALIZING => TxnStageState::Materializing,
             Self::JOURNAL_PUBLISHED => TxnStageState::JournalPublished,
             _ => TxnStageState::Active,
         }
@@ -242,6 +245,11 @@ impl TxnStage {
     /// Snapshot staged mutations for application to storage at commit time.
     pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; 3] {
         self.data.lock().pools.clone()
+    }
+
+    /// Receipt identifying this stage's published journal group.
+    pub(crate) fn published_receipt(&self) -> Option<CommitReceipt> {
+        self.data.lock().receipt
     }
 
     /// Return whether one staged mutation has already been applied to storage.
@@ -268,16 +276,15 @@ impl TxnStage {
         Ok(())
     }
 
-    /// Mark pack/index application complete so journal publication can be
-    /// retried without applying the storage mutations twice.
-    pub(crate) fn mark_applied(&self) -> io::Result<()> {
+    /// Begin pack/index materialization after the journal group is published.
+    pub(crate) fn begin_materialization(&self) -> io::Result<()> {
         let state = self.state.load(Ordering::Acquire);
         match state {
             Self::ACTIVE | Self::JOURNAL_PUBLISHED => {
-                self.state.store(Self::APPLIED, Ordering::Release);
+                self.state.store(Self::MATERIALIZING, Ordering::Release);
                 Ok(())
             }
-            Self::APPLIED | Self::PUBLISHED => Ok(()),
+            Self::MATERIALIZING | Self::PUBLISHED => Ok(()),
             Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
             _ => Err(io::Error::other("invalid transaction stage state")),
         }
@@ -291,7 +298,7 @@ impl TxnStage {
                 self.state.store(Self::JOURNAL_PUBLISHED, Ordering::Release);
                 Ok(())
             }
-            Self::JOURNAL_PUBLISHED | Self::APPLIED | Self::PUBLISHED => Ok(()),
+            Self::JOURNAL_PUBLISHED | Self::MATERIALIZING | Self::PUBLISHED => Ok(()),
             Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
             _ => Err(io::Error::other("invalid transaction stage state")),
         }
@@ -300,7 +307,7 @@ impl TxnStage {
     /// Mark both journal publication and storage application complete.
     pub(crate) fn mark_published(&self) -> io::Result<()> {
         match self.state.load(Ordering::Acquire) {
-            Self::APPLIED | Self::PUBLISHED => {
+            Self::MATERIALIZING | Self::PUBLISHED => {
                 self.state.store(Self::PUBLISHED, Ordering::Release);
                 Ok(())
             }
@@ -472,7 +479,7 @@ impl TxnStage {
     ) -> io::Result<()> {
         let mut data = self.data.lock();
         match self.state.load(Ordering::Acquire) {
-            Self::DISCARDED | Self::JOURNAL_PUBLISHED | Self::APPLIED | Self::PUBLISHED => {
+            Self::DISCARDED | Self::JOURNAL_PUBLISHED | Self::MATERIALIZING | Self::PUBLISHED => {
                 return Ok(())
             }
             _ => {}
@@ -521,8 +528,9 @@ impl TxnStage {
                                 .then_some((*pool, data.pools[index].as_slice()))
                         })
                         .collect::<Vec<_>>();
-                    coordinator.append_pending_tagged_groups(&batches)?;
+                    let receipt = coordinator.append_pending_tagged_groups(&batches)?;
                     data.appended.fill(true);
+                    data.receipt = Some(receipt);
                     self.mark_journal_published()?;
                     return Ok(());
                 }
@@ -545,8 +553,9 @@ impl TxnStage {
             let coordinator = coordinators[ordered_index].ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "staged pool has no journal")
             })?;
-            coordinator.append_pending_tagged(pool, &data.pools[index])?;
+            let receipt = coordinator.append_pending_tagged(pool, &data.pools[index])?;
             data.appended[index] = true;
+            data.receipt = Some(receipt);
         }
         self.mark_journal_published()?;
         Ok(())

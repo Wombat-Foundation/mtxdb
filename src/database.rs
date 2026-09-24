@@ -20,6 +20,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::journal::{
@@ -77,14 +78,29 @@ pub struct SharedDatabase {
     layout: DatabaseLayout,
     coordinator: Arc<JournalCoordinator>,
     pools: [Arc<PackfileStorage>; 3],
+    /// Published transactions whose materialization still needs to be
+    /// completed. The queue owns the transaction stage, so dropping a caller's
+    /// handle cannot orphan the visibility overlay.
+    recovery_queue: parking_lot::Mutex<Vec<RecoveryItem>>,
+    /// Serializes materialization across transaction handles and recovery
+    /// workers. The stage's applied-bit check and mutation application must be
+    /// one critical section.
+    recovery_lifecycle: parking_lot::Mutex<()>,
     /// Held for the lifetime of the handle: one writer per database root.
     _lock: SharedWalLock,
+}
+
+struct RecoveryItem {
+    receipt: CommitReceipt,
+    stage: Arc<TxnStage>,
 }
 
 /// Storage transaction whose mutations remain invisible until commit.
 pub struct DatabaseTransaction<'a> {
     database: &'a SharedDatabase,
-    stage: TxnStage,
+    stage: Arc<TxnStage>,
+    overlay_active: AtomicBool,
+    lifecycle: parking_lot::Mutex<()>,
 }
 
 impl DatabaseTransaction<'_> {
@@ -120,42 +136,76 @@ impl DatabaseTransaction<'_> {
     /// Returns an error if storage application or shared-WAL publication
     /// fails. After storage application succeeds, retrying this method is safe.
     pub fn commit(&self) -> Result<(), StorageError> {
+        let _lifecycle = self.lifecycle.lock();
         if self.stage.state() == TxnStageState::Active {
-            self.database
-                .publish_transaction(&self.stage)
+            self.database.activate_transaction_overlay()?;
+            self.overlay_active.store(true, Ordering::Release);
+            if let Err(error) = self.database.publish_transaction(&self.stage) {
+                self.database.deactivate_transaction_overlay();
+                self.overlay_active.store(false, Ordering::Release);
+                return Err(StorageError::Io(error));
+            }
+        }
+        if matches!(self.stage.state(), TxnStageState::JournalPublished) {
+            self.stage
+                .begin_materialization()
                 .map_err(StorageError::Io)?;
         }
-        if self.stage.state() == TxnStageState::JournalPublished {
-            let batches = self.stage.snapshot_mutations();
-            for pool in ShardType::ALL {
-                for (index, mutation) in batches[shard_index(pool)].iter().enumerate() {
-                    if self.stage.mutation_applied(pool, index) {
-                        continue;
-                    }
-                    self.database
-                        .pool(pool)
-                        .apply_transaction_mutation(mutation)?;
-                    self.stage
-                        .mark_mutation_applied(pool, index)
-                        .map_err(StorageError::Io)?;
-                }
+        if self.stage.state() == TxnStageState::Materializing {
+            self.database
+                .register_recovery_stage(Arc::clone(&self.stage));
+            let _recovery_lifecycle = self.database.recovery_lifecycle.lock();
+            if self.stage.state() != TxnStageState::Materializing {
+                self.overlay_active.store(false, Ordering::Release);
+                return Ok(());
             }
-            self.stage.mark_applied().map_err(StorageError::Io)?;
+            self.database.materialize_transaction(&self.stage)?;
             self.stage.mark_published().map_err(StorageError::Io)?;
+            self.database.finish_recovery_stage(&self.stage);
+            self.overlay_active.store(false, Ordering::Release);
         }
         Ok(())
     }
 
     /// Abort the transaction. Since staged mutations have not touched storage,
     /// abort is O(1) and leaves no revocation records behind.
-    pub fn abort(&self) {
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Internal`] if journal publication or
+    /// materialization has already started. A published transaction cannot be
+    /// rolled back through this API.
+    pub fn abort(&self) -> Result<(), StorageError> {
+        let _lifecycle = self.lifecycle.lock();
+        if self.stage.state() != TxnStageState::Active {
+            return Err(StorageError::Internal(
+                "a published or materializing transaction cannot be aborted".to_owned(),
+            ));
+        }
         self.stage.discard();
+        if self.overlay_active.swap(false, Ordering::AcqRel) {
+            self.database.deactivate_transaction_overlay();
+        }
+        Ok(())
     }
 
     /// Current transaction lifecycle state.
     #[must_use]
     pub fn state(&self) -> TxnStageState {
         self.stage.state()
+    }
+}
+
+impl Drop for DatabaseTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.overlay_active.load(Ordering::Acquire) {
+            return;
+        }
+        if self.stage.state() == TxnStageState::Active {
+            self.database.deactivate_transaction_overlay();
+        }
+        // Published stages are owned by SharedDatabase::recovery_queue. Drop
+        // must not perform I/O, block during unwinding, or release the overlay
+        // before that queue has materialized the stage.
     }
 }
 
@@ -208,6 +258,8 @@ impl SharedDatabase {
             layout,
             coordinator,
             pools,
+            recovery_queue: parking_lot::Mutex::new(Vec::new()),
+            recovery_lifecycle: parking_lot::Mutex::new(()),
             _lock: lock,
         })
     }
@@ -253,8 +305,104 @@ impl SharedDatabase {
     pub fn begin_transaction(&self) -> DatabaseTransaction<'_> {
         DatabaseTransaction {
             database: self,
-            stage: TxnStage::new(),
+            stage: Arc::new(TxnStage::new()),
+            overlay_active: AtomicBool::new(false),
+            lifecycle: parking_lot::Mutex::new(()),
         }
+    }
+
+    fn activate_transaction_overlay(&self) -> Result<(), StorageError> {
+        let wal_path = self.layout.shared_wal_path();
+        let mut activated = 0usize;
+        for pool in ShardType::ALL {
+            if let Err(error) = self
+                .pool(pool)
+                .activate_transaction_overlay(&wal_path, pool)
+            {
+                for previous in ShardType::ALL.into_iter().take(activated) {
+                    self.pool(previous).deactivate_transaction_overlay();
+                }
+                return Err(error);
+            }
+            activated = activated.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn deactivate_transaction_overlay(&self) {
+        for pool in ShardType::ALL {
+            self.pool(pool).deactivate_transaction_overlay();
+        }
+    }
+
+    fn register_recovery_stage(&self, stage: Arc<TxnStage>) {
+        let Some(receipt) = stage.published_receipt() else {
+            return;
+        };
+        let mut queue = self.recovery_queue.lock();
+        if !queue.iter().any(|candidate| {
+            candidate.receipt.first_lsn == receipt.first_lsn
+                && candidate.receipt.last_lsn == receipt.last_lsn
+        }) {
+            queue.push(RecoveryItem { receipt, stage });
+        }
+    }
+
+    fn finish_recovery_stage(&self, stage: &TxnStage) {
+        self.recovery_queue
+            .lock()
+            .retain(|candidate| !std::ptr::eq(candidate.stage.as_ref(), stage));
+        self.deactivate_transaction_overlay();
+    }
+
+    fn materialize_transaction(&self, stage: &TxnStage) -> Result<(), StorageError> {
+        let batches = stage.snapshot_mutations();
+        for pool in ShardType::ALL {
+            for (index, mutation) in batches[shard_index(pool)].iter().enumerate() {
+                if stage.mutation_applied(pool, index) {
+                    continue;
+                }
+                self.pool(pool).apply_transaction_mutation(mutation)?;
+                stage
+                    .mark_mutation_applied(pool, index)
+                    .map_err(StorageError::Io)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize published transactions retained by the database recovery
+    /// queue. This is the explicit recovery/worker boundary; transaction
+    /// destructors never perform storage I/O.
+    ///
+    /// # Errors
+    /// Returns the first materialization error. The corresponding stage stays
+    /// queued and its overlay remains active for a later retry.
+    pub fn recover_pending_transactions(&self) -> Result<(), StorageError> {
+        let _recovery_lifecycle = self.recovery_lifecycle.lock();
+        let stages = self
+            .recovery_queue
+            .lock()
+            .iter()
+            .map(|item| (item.receipt, Arc::clone(&item.stage)))
+            .collect::<Vec<_>>();
+        for (receipt, stage) in stages {
+            debug_assert_eq!(
+                stage.published_receipt(),
+                Some(receipt),
+                "recovery queue receipt must identify its stage"
+            );
+            if stage.state() == TxnStageState::JournalPublished {
+                stage.begin_materialization().map_err(StorageError::Io)?;
+            }
+            if stage.state() != TxnStageState::Materializing {
+                continue;
+            }
+            self.materialize_transaction(&stage)?;
+            stage.mark_published().map_err(StorageError::Io)?;
+            self.finish_recovery_stage(&stage);
+        }
+        Ok(())
     }
 
     /// Publish all legacy pending mutations through the database coordinator.
@@ -326,13 +474,14 @@ const fn shard_index(shard: ShardType) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedDatabase;
+    use super::{shard_index, SharedDatabase};
     use crate::journal::Journal;
     use crate::layout::ShardType;
     use crate::packfile::storage::PackfileStorage;
     use crate::storage::{NodeData, NodeId, StorageEngine};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
 
     fn test_root(name: &str) -> PathBuf {
         let path =
@@ -383,7 +532,8 @@ mod tests {
             .get(&collection, &node_id)
             .unwrap()
             .is_none());
-        transaction.abort();
+        transaction.abort().unwrap();
+        drop(transaction);
         assert!(db
             .pool(ShardType::State)
             .get(&collection, &node_id)
@@ -452,7 +602,305 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(ShardType::EventDag), Some(ShardType::State)]
         );
+        drop(transaction);
         drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retrying_commit_and_recovery_can_run_concurrently() {
+        let root = test_root("transaction_concurrent_recovery");
+        let database = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+        let transaction = Arc::new(database.begin_transaction());
+        let collection = [0x66; 16];
+        let node_id = node(1);
+        transaction
+            .put(
+                ShardType::State,
+                collection,
+                node_id,
+                &NodeData::new(bytes::Bytes::from_static(b"concurrent")),
+            )
+            .unwrap();
+
+        database.activate_transaction_overlay().unwrap();
+        transaction.overlay_active.store(true, Ordering::Release);
+        database.publish_transaction(&transaction.stage).unwrap();
+        transaction.stage.begin_materialization().unwrap();
+        database.register_recovery_stage(Arc::clone(&transaction.stage));
+
+        let recovery_start = Arc::new(Barrier::new(2));
+        let recovery_guard = database.recovery_lifecycle.lock();
+        std::thread::scope(|scope| {
+            let recovery_database = Arc::clone(&database);
+            let recovery_start_thread = Arc::clone(&recovery_start);
+            let recovery = scope.spawn(move || {
+                recovery_start_thread.wait();
+                recovery_database.recover_pending_transactions()
+            });
+
+            recovery_start.wait();
+            let commit_transaction = Arc::clone(&transaction);
+            let commit_started = Arc::new(Barrier::new(2));
+            let commit_started_thread = Arc::clone(&commit_started);
+            let commit = scope.spawn(move || {
+                commit_started_thread.wait();
+                commit_transaction.commit()
+            });
+            commit_started.wait();
+
+            // Both calls have started while the recovery lifecycle is held;
+            // releasing it makes them contend on the same published stage.
+            drop(recovery_guard);
+            recovery.join().unwrap().unwrap();
+            commit.join().unwrap().unwrap();
+        });
+
+        assert_eq!(
+            transaction.state(),
+            crate::journal::TxnStageState::Published
+        );
+        assert!(database
+            .pool(ShardType::State)
+            .get(&collection, &node_id)
+            .unwrap()
+            .is_some());
+        for pool in ShardType::ALL {
+            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
+        }
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn published_transaction_is_visible_before_materialization() {
+        let root = test_root("transaction_overlay");
+        let state_collection = [0x61; 16];
+        let event_collection = [0x62; 16];
+        let state_node = node(1);
+        let event_node = node(2);
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let old_node = node(9);
+        database
+            .pool(ShardType::State)
+            .put(
+                &state_collection,
+                &old_node,
+                &NodeData::new(bytes::Bytes::from_static(b"old")),
+            )
+            .unwrap();
+        database.publish_pending().unwrap();
+        let transaction = database.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                state_collection,
+                state_node,
+                &NodeData::new(bytes::Bytes::from_static(b"state")),
+            )
+            .unwrap();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                event_node,
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+
+        // Keep the database alive separately: the transaction borrows it and
+        // its overlay must remain active while the published group is not yet
+        // materialized into either live index.
+        database.activate_transaction_overlay().unwrap();
+        transaction.overlay_active.store(true, Ordering::Release);
+        database.publish_transaction(&transaction.stage).unwrap();
+
+        assert_eq!(
+            database
+                .pool(ShardType::State)
+                .get(&state_collection, &state_node)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            b"state"
+        );
+        assert_eq!(
+            database
+                .pool(ShardType::State)
+                .get(&state_collection, &old_node)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            b"old",
+            "overlay reads must fall back to pre-existing live records"
+        );
+        assert_eq!(
+            database
+                .pool(ShardType::EventDag)
+                .get(&event_collection, &event_node)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            b"event"
+        );
+
+        assert!(transaction.abort().is_err());
+        transaction.stage.begin_materialization().unwrap();
+        database.register_recovery_stage(Arc::clone(&transaction.stage));
+        drop(transaction);
+        database.recover_pending_transactions().unwrap();
+        for pool in ShardType::ALL {
+            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
+        }
+        drop(database);
+        let reopened = SharedDatabase::open(root.clone()).unwrap();
+        assert!(reopened
+            .pool(ShardType::State)
+            .get(&state_collection, &state_node)
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .pool(ShardType::EventDag)
+            .get(&event_collection, &event_node)
+            .unwrap()
+            .is_some());
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn partial_materialization_retries_through_overlay_and_drains_it() {
+        let root = test_root("transaction_materialization_retry");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let state_collection = [0x71; 16];
+        let event_collection = [0x72; 16];
+        let state_node = node(1);
+        let event_node = node(2);
+        let transaction = database.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                state_collection,
+                state_node,
+                &NodeData::new(bytes::Bytes::from_static(b"state")),
+            )
+            .unwrap();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                event_node,
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+
+        database.activate_transaction_overlay().unwrap();
+        transaction.overlay_active.store(true, Ordering::Release);
+        database.publish_transaction(&transaction.stage).unwrap();
+        transaction.stage.begin_materialization().unwrap();
+        database.register_recovery_stage(Arc::clone(&transaction.stage));
+        let state_mutation =
+            transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
+        database
+            .pool(ShardType::State)
+            .apply_transaction_mutation(&state_mutation)
+            .unwrap();
+        transaction
+            .stage
+            .mark_mutation_applied(ShardType::State, 0)
+            .unwrap();
+        assert_eq!(
+            transaction.state(),
+            crate::journal::TxnStageState::Materializing
+        );
+        assert!(database
+            .pool(ShardType::State)
+            .get(&state_collection, &state_node)
+            .unwrap()
+            .is_some());
+        assert!(database
+            .pool(ShardType::EventDag)
+            .get(&event_collection, &event_node)
+            .unwrap()
+            .is_some());
+
+        transaction.commit().unwrap();
+        assert_eq!(
+            transaction.state(),
+            crate::journal::TxnStageState::Published
+        );
+        for pool in ShardType::ALL {
+            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
+        }
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dropped_partial_transaction_recovers_from_wal_and_drains_overlay() {
+        let root = test_root("transaction_orphan_recovery");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let state_collection = [0x81; 16];
+        let event_collection = [0x82; 16];
+        let state_node = node(1);
+        let event_node = node(2);
+        let transaction = database.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                state_collection,
+                state_node,
+                &NodeData::new(bytes::Bytes::from_static(b"state")),
+            )
+            .unwrap();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                event_node,
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+
+        database.activate_transaction_overlay().unwrap();
+        transaction.overlay_active.store(true, Ordering::Release);
+        database.publish_transaction(&transaction.stage).unwrap();
+        transaction.stage.begin_materialization().unwrap();
+        database.register_recovery_stage(Arc::clone(&transaction.stage));
+        let state_mutation =
+            transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
+        database
+            .pool(ShardType::State)
+            .apply_transaction_mutation(&state_mutation)
+            .unwrap();
+        transaction
+            .stage
+            .mark_mutation_applied(ShardType::State, 0)
+            .unwrap();
+        drop(transaction);
+
+        // Drop only leaves the published stage in the database-owned queue;
+        // the explicit recovery boundary performs the materialization.
+        database.recover_pending_transactions().unwrap();
+        for pool in ShardType::ALL {
+            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
+        }
+        assert!(database
+            .pool(ShardType::State)
+            .get(&state_collection, &state_node)
+            .unwrap()
+            .is_some());
+        assert!(database
+            .pool(ShardType::EventDag)
+            .get(&event_collection, &event_node)
+            .unwrap()
+            .is_some());
+        drop(database);
         let _ = std::fs::remove_dir_all(&root);
     }
 

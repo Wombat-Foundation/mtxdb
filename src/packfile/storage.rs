@@ -26,9 +26,7 @@ use crate::storage::{
 };
 use crate::template::{CollectionMetadata, FrameIdPolicy, COLLECTION_METADATA_RECORD_ID};
 
-#[cfg(feature = "multi-reader")]
 mod read_journal;
-#[cfg(feature = "multi-reader")]
 use read_journal::ReadJournal;
 
 thread_local! {
@@ -94,7 +92,6 @@ enum ReloadMode {
     /// Used only by `reload_index_from_checkpoint`, where the writer is still
     /// appending and its packs have already grown past the checkpoint (a strict
     /// gate would fail the read closed).
-    #[cfg(feature = "multi-reader")]
     JournalBound,
 }
 
@@ -1544,8 +1541,11 @@ pub struct PackfileStorage {
     /// Enabled on a read-only store so a worker can observe committed-but-
     /// unflushed journal groups that the durable fingerprint gate deliberately
     /// hides. See [`Self::enable_read_journal`].
-    #[cfg(feature = "multi-reader")]
     read_journal: parking_lot::Mutex<Option<ReadJournal>>,
+    /// Number of in-process transactions whose published groups are still
+    /// being materialized. While non-zero, ordinary reads consult the journal
+    /// overlay before the live index.
+    transaction_overlay_users: AtomicU64,
     /// Journal LSN covered by the durable index this handle actually loaded.
     ///
     /// Read once at open, when the index is built from the on-disk checkpoint
@@ -2334,8 +2334,8 @@ impl PackfileStorage {
             journal_pool: std::sync::atomic::AtomicU8::new(0),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
-            #[cfg(feature = "multi-reader")]
             read_journal: parking_lot::Mutex::new(None),
+            transaction_overlay_users: AtomicU64::new(0),
             read_covered_lsn,
             read_reloads: AtomicU64::new(0),
             read_reload_failures: AtomicU64::new(0),
@@ -7072,7 +7072,7 @@ impl PackfileStorage {
 
 impl StorageEngine for PackfileStorage {
     fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
-        self.generation(collection_id).is_some()
+        self.try_collection_exists(collection_id).unwrap_or(false)
     }
 
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
@@ -7291,6 +7291,13 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+            return Ok(self
+                .get_read_committed(collection_id, std::slice::from_ref(id))?
+                .into_iter()
+                .next()
+                .flatten());
+        }
         let track = self.stats_enabled.load(Ordering::Relaxed);
         // A concurrent repack can swap the generation and retire the shard ids
         // its index pointed at. Pin the candidate shards and confirm the
@@ -7346,6 +7353,9 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+            return self.get_read_committed(collection_id, ids);
+        }
         let track = self.stats_enabled.load(Ordering::Relaxed);
         // As in `get`: pin the candidate shards and retry if a concurrent
         // repack swapped the generation (and so may have retired them) between
@@ -7533,6 +7543,27 @@ impl StorageEngine for PackfileStorage {
 }
 
 impl PackfileStorage {
+    /// Check collection existence without hiding overlay/read failures.
+    ///
+    /// The trait's historical boolean API is retained for compatibility and
+    /// fails closed on errors. New callers that need to distinguish absence
+    /// from storage failure should use this method.
+    ///
+    /// # Errors
+    /// Returns a storage or journal-overlay error when the authoritative
+    /// read-committed lookup cannot be completed.
+    pub fn try_collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
+        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+            return self
+                .get_read_committed(
+                    collection_id,
+                    std::slice::from_ref(&COLLECTION_METADATA_RECORD_ID),
+                )
+                .map(|values| values.first().is_some_and(Option::is_some));
+        }
+        Ok(self.generation(collection_id).is_some())
+    }
+
     /// Hint the kernel to read each planned extent as one sequential run.
     ///
     /// Reads go through the shard's mmap, so the physical coalescing is a
@@ -7911,6 +7942,54 @@ impl PackfileStorage {
     #[must_use]
     pub fn journal(&self) -> Option<Arc<JournalCoordinator>> {
         self.journal.lock().clone()
+    }
+
+    /// Enable the in-process read overlay for a published transaction that is
+    /// still being materialized. The overlay is shared with the existing
+    /// read-committed implementation, but ordinary reads consult it only
+    /// while at least one transaction is in this state.
+    pub(crate) fn activate_transaction_overlay(
+        &self,
+        wal_path: &Path,
+        pool: crate::layout::ShardType,
+    ) -> Result<(), StorageError> {
+        let previous = self
+            .transaction_overlay_users
+            .fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            if let Err(error) = self.enable_read_journal_shared(wal_path, pool) {
+                self.transaction_overlay_users
+                    .fetch_sub(1, Ordering::AcqRel);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop consulting the in-process transaction overlay after all staged
+    /// mutations have been materialized or the transaction was abandoned
+    /// before journal publication.
+    pub(crate) fn deactivate_transaction_overlay(&self) {
+        // TODO: use `AtomicU64::fetch_update` when the MSRV is raised to 1.95.
+        let mut users = self.transaction_overlay_users.load(Ordering::Acquire);
+        loop {
+            debug_assert!(users != 0, "transaction overlay deactivated too often");
+            let next = users.saturating_sub(1);
+            match self.transaction_overlay_users.compare_exchange_weak(
+                users,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => users = current,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transaction_overlay_user_count(&self) -> u64 {
+        self.transaction_overlay_users.load(Ordering::Acquire)
     }
 
     /// Publish one mutation to the journal, if enabled. Returns the assigned
