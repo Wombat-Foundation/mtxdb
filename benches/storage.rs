@@ -143,9 +143,16 @@ impl DagGenerator {
         // orphan chains are reachable without putting an oversized prev list
         // on the last ordinary event.
         if remaining.is_empty() {
-            debug_assert_eq!(prev_events.len(), total_events);
+            debug_assert_eq!(
+                prev_events.len(),
+                total_events,
+                "no orphans remained, so no synthetic absorb nodes should have been added"
+            );
         } else {
-            debug_assert!(prev_events.len() > total_events);
+            debug_assert!(
+                prev_events.len() > total_events,
+                "orphans remained, so at least one synthetic absorb node must have been added"
+            );
         }
 
         Self {
