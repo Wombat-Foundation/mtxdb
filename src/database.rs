@@ -127,6 +127,7 @@ impl DatabaseTransaction<'_> {
         node_id: [u8; 16],
         data: &crate::storage::NodeData,
     ) -> io::Result<()> {
+        let _lifecycle = self.lifecycle.lock();
         self.stage
             .stage_put(pool, collection_id, node_id, data.bytes.to_vec())
     }
@@ -137,6 +138,7 @@ impl DatabaseTransaction<'_> {
     /// Returns an error if the transaction's staging budget is exhausted or
     /// it has already been committed/aborted.
     pub fn delete_collection(&self, pool: ShardType, collection_id: [u8; 16]) -> io::Result<()> {
+        let _lifecycle = self.lifecycle.lock();
         self.stage.stage_delete_collection(pool, collection_id)
     }
 
@@ -149,6 +151,12 @@ impl DatabaseTransaction<'_> {
     pub fn commit(&self) -> Result<(), StorageError> {
         let _lifecycle = self.lifecycle.lock();
         if self.stage.state() == TxnStageState::Active {
+            if self.stage.is_empty() {
+                self.stage
+                    .mark_empty_published()
+                    .map_err(StorageError::Io)?;
+                return Ok(());
+            }
             let mut overlay = Some(self.database.activate_transaction_overlay()?);
             if let Err(error) = self.database.publish_transaction(&self.stage) {
                 drop(overlay.take());
@@ -167,27 +175,14 @@ impl DatabaseTransaction<'_> {
                     "published transaction has no journal receipt".to_owned(),
                 ));
             };
-            if let Err(error) = self.database.register_new_recovery_stage(
+            // Keep recovery from removing a duplicate queue entry between
+            // registration and transferring ownership of this overlay.
+            let _recovery_lifecycle = self.database.recovery_lifecycle.lock();
+            self.database.register_new_recovery_stage(
                 Arc::clone(&self.stage),
                 receipt,
                 &mut overlay,
-            ) {
-                // A duplicate registration means a recovery worker won the
-                // race and already owns the stage. Otherwise retry with the
-                // receipt read from the published stage; the registration
-                // helper has not consumed the overlay on failure.
-                if self
-                    .database
-                    .ensure_recovery_stage_registered(&self.stage)
-                    .is_err()
-                {
-                    self.database.register_new_recovery_stage(
-                        Arc::clone(&self.stage),
-                        self.stage.published_receipt().ok_or(error)?,
-                        &mut overlay,
-                    )?;
-                }
-            }
+            )?;
         }
         if matches!(self.stage.state(), TxnStageState::JournalPublished) {
             self.stage
@@ -616,6 +611,36 @@ mod tests {
             .unwrap()
             .is_none());
         drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn transaction_rejects_mutations_after_completion() {
+        let root = test_root("transaction_terminal_mutations");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x5A; 16];
+        let node_id = node(1);
+        let data = NodeData::new(bytes::Bytes::from_static(b"late"));
+
+        let published = database.begin_transaction();
+        published.commit().unwrap();
+        assert!(published
+            .put(ShardType::State, collection, node_id, &data)
+            .is_err());
+        assert!(published
+            .delete_collection(ShardType::State, collection)
+            .is_err());
+
+        let discarded = database.begin_transaction();
+        discarded.abort().unwrap();
+        assert!(discarded
+            .put(ShardType::State, collection, node_id, &data)
+            .is_err());
+        assert!(discarded
+            .delete_collection(ShardType::State, collection)
+            .is_err());
+
+        drop(database);
         let _ = std::fs::remove_dir_all(&root);
     }
 

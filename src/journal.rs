@@ -252,6 +252,11 @@ impl TxnStage {
         self.data.lock().receipt
     }
 
+    /// Whether this stage has no mutations to publish or materialize.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data.lock().pools.iter().all(Vec::is_empty)
+    }
+
     /// Return whether one staged mutation has already been applied to storage.
     pub(crate) fn mutation_applied(&self, pool: ShardType, index: usize) -> bool {
         self.data.lock().applied[pool_index(pool)]
@@ -301,6 +306,27 @@ impl TxnStage {
             Self::JOURNAL_PUBLISHED | Self::MATERIALIZING | Self::PUBLISHED => Ok(()),
             Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
             _ => Err(io::Error::other("invalid transaction stage state")),
+        }
+    }
+
+    /// Complete an active no-op transaction without creating a journal group.
+    pub(crate) fn mark_empty_published(&self) -> io::Result<()> {
+        let data = self.data.lock();
+        if data.pools.iter().any(|pool| !pool.is_empty()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot complete a transaction with staged mutations as empty",
+            ));
+        }
+        match self.state.load(Ordering::Acquire) {
+            Self::ACTIVE | Self::PUBLISHED => {
+                self.state.store(Self::PUBLISHED, Ordering::Release);
+                Ok(())
+            }
+            Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
+            _ => Err(io::Error::other(
+                "transaction stage is not empty and active",
+            )),
         }
     }
 
