@@ -1656,7 +1656,13 @@ fn split_canonical_display(display: &str) -> (&str, Option<&str>) {
         .rfind(" (")
         .filter(|_| display.ends_with(')') || display.ends_with(")*"))
         .map_or((display, None), |start| {
-            (&display[..start], Some(&display[start + 1..]))
+            let Some(role_start) = start.checked_add(1) else {
+                return (display, None);
+            };
+            let Some(role) = display.get(role_start..) else {
+                return (display, None);
+            };
+            (&display[..start], Some(role))
         })
 }
 
