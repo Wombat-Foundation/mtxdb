@@ -463,7 +463,7 @@ fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
 /// any command that mutates data.
 fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
     let pool = selected_pool_dir(cli)?;
-    PackfileStorage::open(pool.clone()).with_context(|| {
+    let store = PackfileStorage::open(pool.clone()).with_context(|| {
         let lock_path = pool.join(".mtxdb.lock");
         if lock_path.exists() {
             format!(
@@ -473,13 +473,18 @@ fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
         } else {
             format!("failed to open store for writing at `{}`", pool.display())
         }
-    })
+    })?;
+    store.set_read_plan_policy(cli.read_plan);
+    Ok(store)
 }
 
 /// Open the store read-only — coexists with a live writer process rather
 /// than contending with it. For commands that only ever read collection data.
 fn open_store_read_only(cli: &Cli) -> anyhow::Result<PackfileStorage> {
-    PackfileStorage::open_read_only(selected_pool_dir(cli)?).context("failed to open store")
+    let store =
+        PackfileStorage::open_read_only(selected_pool_dir(cli)?).context("failed to open store")?;
+    store.set_read_plan_policy(cli.read_plan);
+    Ok(store)
 }
 
 /// Resolve the selected independent shard pool below the database root.
@@ -2836,6 +2841,12 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
         fmt_bytes(stats.candidate_frame_bytes)
     );
     println!(
+        "    read plan        {} prefetched extents / {} bytes / {} skipped",
+        stats.read_plan_extents,
+        fmt_bytes(stats.read_plan_prefetch_bytes),
+        stats.read_plan_skipped_extents
+    );
+    println!(
         "    repack           {} reps / {} kept / {} dropped",
         stats.repack.repack_count, stats.repack.kept_total, stats.repack.dropped_total
     );
@@ -2941,6 +2952,15 @@ fn stats_json_object(
             (
                 "read_many_span_bytes",
                 stats.read_many_span_bytes.to_string(),
+            ),
+            ("read_plan_extents", stats.read_plan_extents.to_string()),
+            (
+                "read_plan_prefetch_bytes",
+                stats.read_plan_prefetch_bytes.to_string(),
+            ),
+            (
+                "read_plan_skipped_extents",
+                stats.read_plan_skipped_extents.to_string(),
             ),
             ("repack_count", stats.repack.repack_count.to_string()),
             ("repack_kept_total", stats.repack.kept_total.to_string()),
@@ -6280,8 +6300,8 @@ fn import_pdu_events(
     // One batched index probe for dedup/collision checks, then one `put_many`
     // for only the genuinely-new records — instead of N get+put round trips,
     // one index/pack generation, and a locality-ordered rather than
-    // offset-coalesced set of candidate reads (get_many sorts candidates but
-    // does not merge ranges).
+    // offset-coalesced set of candidate reads (get_many sorts candidates;
+    // merging them into prefetch extents is the opt-in read plan).
     let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
     let existing = store.get_many(&collection_id, &probe_ids)?;
     let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
@@ -8201,6 +8221,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: Some(ShardType::State),
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Sync { all: true },
         };
 
@@ -8228,6 +8249,7 @@ mod tests {
             dirs: Vec::new(),
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -8248,6 +8270,7 @@ mod tests {
             dirs: Vec::new(),
             shard_type: Some(ShardType::State),
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -8268,6 +8291,7 @@ mod tests {
             dirs: Vec::new(),
             shard_type: Some(ShardType::EventDag),
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Collections {
                 all: true,
                 layout: false,
@@ -8291,6 +8315,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -8313,6 +8338,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Shards {
                 all: false,
                 layout: false,
@@ -8336,6 +8362,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: Some(ShardType::State),
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -8358,6 +8385,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Stats { json: false },
         };
         cmd_stats(&cli, false).unwrap();
@@ -8371,6 +8399,7 @@ mod tests {
             dirs: Vec::new(),
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
                 collection: String::new(),
                 stats: false,
@@ -8483,6 +8512,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Get {
                 collection: None,
                 id: node_hex.clone(),
@@ -8514,6 +8544,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
                 collection: col_hex.clone(),
                 stats: false,
@@ -8541,6 +8572,7 @@ mod tests {
             dirs: vec![dir.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Scan {
                 selector: col_hex.clone(),
                 verbose: false,
@@ -10206,6 +10238,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Shards {
                 all: false,
                 layout: false,
@@ -10227,6 +10260,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
             coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Put {
                 collection: "0x0102030405060708090a0b0c0d0e0f10".to_owned(),
                 id: "0x0102030405060708090a0b0c0d0e0f10".to_owned(),
@@ -10270,6 +10304,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
             coalesce: true,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Shards {
                 all: false,
                 layout: false,
@@ -10282,6 +10317,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
             coalesce: true,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -10296,6 +10332,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
             coalesce: true,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Stats { json: true },
         };
         cmd_stats(&cli_stats, true).unwrap();
@@ -10336,6 +10373,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
             coalesce: true,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Get {
                 collection: None,
                 id: hex_id.clone(),
@@ -10390,6 +10428,7 @@ mod tests {
                 dirs: vec![dir.clone()],
                 shard_type: None,
                 coalesce: true,
+                read_plan: mtxdb::ReadPlanPolicy::disabled(),
                 command: cmd,
             };
             assert!(
@@ -10442,6 +10481,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: Some(ShardType::EventDag),
             coalesce: true,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Repack {
                 collection: None,
                 packs: vec![],
@@ -10514,6 +10554,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: Some(ShardType::EventDag),
             coalesce: true,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
                 collection: format_id(&col1),
                 stats: false,
@@ -10525,6 +10566,7 @@ mod tests {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: Some(ShardType::EventDag),
             coalesce: true,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Scan {
                 selector: format_id(&col1),
                 verbose: false,

@@ -6,13 +6,14 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
-use mtxdb::ShardType;
+use mtxdb::{ReadPlanPolicy, ShardType};
 
 #[derive(Clone)]
 pub(crate) struct Cli {
     pub(crate) dirs: Vec<PathBuf>,
     pub(crate) shard_type: Option<ShardType>,
     pub(crate) coalesce: bool,
+    pub(crate) read_plan: ReadPlanPolicy,
     pub(crate) command: Commands,
 }
 
@@ -68,6 +69,7 @@ impl Cli {
             dirs: vec![dir],
             shard_type: self.shard_type,
             coalesce: self.coalesce,
+            read_plan: self.read_plan,
             command: self.command.clone(),
         }
     }
@@ -241,6 +243,15 @@ fn global_args(cmd: Command) -> Command {
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on (use 'all' to target every pool)"),
+    )
+    .arg(
+        Arg::new("read_plan")
+            .long("read-plan")
+            .value_name("MODE")
+            .default_value("off")
+            .value_parser(["off", "hdd"])
+            .global(true)
+            .help("Merged read prefetch for batch reads: 'off' (default) or 'hdd' to meld nearby candidates into sequential extents"),
     )
 }
 
@@ -612,6 +623,18 @@ fn sub_get() -> Command {
         )
 }
 
+/// Map the `--read-plan` CLI mode to a store policy.
+///
+/// `clap`'s value parser restricts the argument to these modes, so the
+/// fallthrough is unreachable in practice.
+fn read_plan_from_mode(mode: &str) -> ReadPlanPolicy {
+    match mode {
+        "off" => ReadPlanPolicy::disabled(),
+        "hdd" => ReadPlanPolicy::hdd(),
+        _ => unreachable!("clap validates read-plan mode"),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive clap-to-command mapping is clearest in one match"
@@ -629,6 +652,12 @@ fn parse_cli() -> Cli {
         .map(|vals| vals.map(PathBuf::from).collect())
         .unwrap_or_default();
     let coalesce = matches.get_flag("coalesce");
+    let read_plan = read_plan_from_mode(
+        matches
+            .get_one::<String>("read_plan")
+            .map(String::as_str)
+            .expect("clap supplies the default read-plan mode"),
+    );
     let shard_type = match matches
         .get_one::<String>("shard_type")
         .map(String::as_str)
@@ -761,6 +790,7 @@ fn parse_cli() -> Cli {
         dirs,
         shard_type,
         coalesce,
+        read_plan,
         command,
     }
 }
@@ -893,5 +923,41 @@ mod parse_tests {
             Some("target")
         );
         assert!(sub.get_flag("yes"));
+    }
+
+    #[test]
+    fn test_read_plan_flag_parsing() {
+        // Default is off.
+        let default = build_cli()
+            .try_get_matches_from(["mtxdb", "shards"])
+            .unwrap();
+        assert_eq!(
+            default.get_one::<String>("read_plan").map(String::as_str),
+            Some("off")
+        );
+
+        // Explicit hdd is accepted (before and after the subcommand).
+        for argv in [
+            ["mtxdb", "--read-plan", "hdd", "shards"],
+            ["mtxdb", "shards", "--read-plan", "hdd"],
+        ] {
+            let m = build_cli().try_get_matches_from(argv).unwrap();
+            assert_eq!(
+                m.get_one::<String>("read_plan").map(String::as_str),
+                Some("hdd")
+            );
+        }
+
+        // An unknown mode is rejected by clap's value parser.
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "--read-plan", "ssd", "shards"])
+            .is_err());
+    }
+
+    #[test]
+    fn test_read_plan_mode_maps_to_policy() {
+        assert_eq!(read_plan_from_mode("off"), ReadPlanPolicy::disabled());
+        assert_eq!(read_plan_from_mode("hdd"), ReadPlanPolicy::hdd());
+        assert_ne!(read_plan_from_mode("hdd"), ReadPlanPolicy::disabled());
     }
 }
