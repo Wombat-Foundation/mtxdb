@@ -264,6 +264,31 @@ enum Eviction {
     Manual,
 }
 
+/// What the eviction step did for one pass, reported verbatim in the
+/// `EVICTED=` field. A single `true`/`false` flattens three distinct states:
+/// a command that ran and succeeded, a human drop we cannot observe, and no
+/// eviction at all. Keeping them separate is what makes `EVICTED=requested`
+/// readable as "we asked, but nothing confirms the pages left."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvictionStatus {
+    /// The eviction command ran and reported success.
+    Ran,
+    /// The operator was prompted to drop by hand; the result is unobservable.
+    Requested,
+    /// No eviction was available (missing tool / would have failed).
+    Unavailable,
+}
+
+impl EvictionStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ran => "true",
+            Self::Requested => "requested",
+            Self::Unavailable => "false",
+        }
+    }
+}
+
 /// Pick the strongest available eviction strategy, in order of reliability.
 fn select_eviction(manual_drop: bool) -> Eviction {
     if manual_drop {
@@ -344,6 +369,41 @@ fn hdd_policy() -> ReadPlanPolicy {
     policy
 }
 
+/// Median of the gaps between consecutive sorted record indices, in bytes.
+///
+/// A target set is only informative about the merge gap if it lands in the
+/// regime the preset was reasoned for: one wanted record every ~0.5-2 MB.
+/// Densities far above that (most records wanted) make both policies read
+/// the whole file; far below, every read is an isolated seek and no melding
+/// can happen. This is the number that says which regime the run hit, from
+/// record indices and the payload stride.
+fn median_target_gap_bytes(sorted_indices: &[usize], stride_bytes: u64) -> u64 {
+    if sorted_indices.len() < 2 {
+        return 0;
+    }
+    let mut gaps: Vec<u64> = sorted_indices
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]) as u64 * stride_bytes)
+        .collect();
+    gaps.sort_unstable();
+    gaps[gaps.len() / 2]
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
 // ── Measurement ─────────────────────────────────────────────────────
 
 struct Row {
@@ -352,7 +412,7 @@ struct Row {
     found: usize,
     total: usize,
     elapsed: Duration,
-    evicted: bool,
+    evicted: EvictionStatus,
     major_faults: Option<u64>,
     minor_faults: Option<u64>,
     disk_read_bytes: Option<u64>,
@@ -401,10 +461,22 @@ fn measure_once(
     // whether an eviction command actually ran and reported success — not
     // whether the pages left, which neither syscall tells us.
     let evicted = match eviction {
-        Eviction::RootDrop => drop_page_caches().is_ok(),
-        Eviction::Vmtouch => evict_dir(dir),
+        Eviction::RootDrop => {
+            if drop_page_caches().is_ok() {
+                EvictionStatus::Ran
+            } else {
+                EvictionStatus::Unavailable
+            }
+        }
+        Eviction::Vmtouch => {
+            if evict_dir(dir) {
+                EvictionStatus::Ran
+            } else {
+                EvictionStatus::Unavailable
+            }
+        }
         // A human ran `drop_caches`; we cannot observe the result.
-        Eviction::Manual => false,
+        Eviction::Manual => EvictionStatus::Requested,
     };
 
     // Step 2: reopen fresh, apply the policy, and time a mmap-backed read.
@@ -538,18 +610,41 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     );
 
     // ── Target sets ──
+    //
+    // Dense: a contiguous prefix, the "read most of the file" case.
+    // Sparse: uniformly sampled across the *whole* dataset (not clustered),
+    // the regime the merge gap is supposed to matter in. Its achieved
+    // density is reported below, because a run that lands nowhere near the
+    // 0.5-2 MB gap regime cannot say anything about the threshold.
     let dense: Vec<NodeId> = (0..target_count).map(node_id).collect();
 
     let mut rng = Rng::new(0xC0FF_EE00_1234_5678);
     let mut seen: HashSet<usize> = HashSet::with_capacity(target_count);
-    let mut random_idx: Vec<usize> = Vec::with_capacity(target_count);
-    while random_idx.len() < target_count {
+    let mut sparse_idx: Vec<usize> = Vec::with_capacity(target_count);
+    while sparse_idx.len() < target_count {
         let candidate = (rng.next_u64() % records as u64) as usize;
         if seen.insert(candidate) {
-            random_idx.push(candidate);
+            sparse_idx.push(candidate);
         }
     }
-    let random: Vec<NodeId> = random_idx.into_iter().map(node_id).collect();
+    let sparse: Vec<NodeId> = sparse_idx.iter().copied().map(node_id).collect();
+
+    // The payload is ~payload_len bytes plus the frame's fixed overhead and
+    // CRC, so record stride is a little larger; using payload_len is close
+    // enough for a regime hint.
+    let mut sparse_sorted = sparse_idx.clone();
+    sparse_sorted.sort_unstable();
+    let stride = payload_len as u64;
+    let median_gap = median_target_gap_bytes(&sparse_sorted, stride);
+    let span_bytes = records as u64 * stride;
+    println!();
+    println!("  target density (sparse):");
+    println!(
+        "        {} targets / {} (~1 per {})",
+        target_count,
+        fmt_bytes(span_bytes),
+        fmt_bytes(median_gap),
+    );
 
     // From here on the measured path needs a store it can close and
     // reopen, so release the ingest writer first.
@@ -557,7 +652,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
 
     // ── Measure ──
     println!();
-    println!("  [2/3] measuring (off vs hdd, dense vs random, {passes} passes, median)…");
+    println!("  [2/3] measuring (off vs hdd, dense vs sparse, {passes} passes, median)…");
     let policy_hdd = hdd_policy();
     println!(
         "        hdd: gap={} B extent={} B min_batch={}",
@@ -567,8 +662,8 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     let combos: [(&'static str, ReadPlanPolicy, &'static str, &Vec<NodeId>); 4] = [
         ("off", ReadPlanPolicy::disabled(), "dense", &dense),
         ("hdd", policy_hdd, "dense", &dense),
-        ("off", ReadPlanPolicy::disabled(), "random", &random),
-        ("hdd", policy_hdd, "random", &random),
+        ("off", ReadPlanPolicy::disabled(), "sparse", &sparse),
+        ("hdd", policy_hdd, "sparse", &sparse),
     ];
 
     let eviction = select_eviction(manual_drop);
@@ -580,20 +675,29 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         .collect();
 
     // ── Report ──
+    //
+    // Every column is right-aligned to an explicit width so the header and
+    // the rows line up, including the `{}/{}` "found" column whose width is
+    // chosen to fit the longest `found/total` pair.
+    const POLICY_W: usize = 6;
+    const TARGET_W: usize = 7;
+    const FOUND_W: usize = 17;
+    const ELAPSED_W: usize = 10;
+    const NUM_W: usize = 11;
     println!();
     println!("  [3/3] results");
     println!("═══════════════════════════════════════════════════════════════");
     println!(
-        "  {:<6} {:<7} {:>9} {:>10} {:>9} {:>11} {:>9} {:>9}",
+        "  {:<POLICY_W$} {:<TARGET_W$} {:>FOUND_W$} {:>ELAPSED_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$}",
         "policy", "target", "found", "elapsed", "majflt", "disk read", "extents", "prefetch"
     );
     for r in &rows {
         println!(
-            "  {:<6} {:<7} {:>9} {:>10.2?} {:>9} {:>11} {:>9} {:>9}",
+            "  {:<POLICY_W$} {:<TARGET_W$} {:>FOUND_W$} {:>ELAPSED_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$} {:>NUM_W$}",
             r.policy,
             r.target,
             format!("{}/{}", r.found, r.total),
-            r.elapsed,
+            format!("{:.2?}", r.elapsed),
             fmt_opt(r.major_faults),
             fmt_opt(r.disk_read_bytes),
             r.extents,
@@ -623,7 +727,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
             r.extents,
             r.prefetch_bytes,
             r.skipped,
-            r.evicted,
+            r.evicted.as_str(),
         );
     }
 
@@ -631,13 +735,25 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     // `read_bytes` (block layer) is the trustworthy signal, not major
     // faults: once a sequential pattern triggers readahead, later pages
     // arrive with no demand fault at all, so `majflt` stays near zero while
-    // real device I/O happens. Require device bytes on every `off` row;
-    // treat a zero `majflt` as a note, not a failure.
+    // real device I/O happens.
+    //
+    // More than a non-zero check is needed. Eviction can under-deliver and
+    // leave part of the read resident, which still moves some bytes but
+    // makes the timing meaningless. Require each `off` row's device bytes to
+    // exceed half of the read's lower bound — one 4 KiB page per target — so
+    // a half-warm run suppresses the ratio too. The true page count is
+    // >= target_count (each wanted record shares or spans a page), so half
+    // of that is a deliberately loose floor that only catches gross
+    // under-delivery.
+    const PAGE_SIZE: u64 = 4096;
     let off_rows: Vec<&Row> = rows.iter().filter(|r| r.policy == "off").collect();
-    let off_cold =
-        !off_rows.is_empty() && off_rows.iter().all(|r| r.disk_read_bytes.unwrap_or(0) > 0);
+    let off_cold = !off_rows.is_empty()
+        && off_rows.iter().all(|r| {
+            let floor = r.total as u64 * PAGE_SIZE / 2;
+            r.disk_read_bytes.unwrap_or(0) >= floor
+        });
     if off_cold {
-        for target in ["dense", "random"] {
+        for target in ["dense", "sparse"] {
             let off = rows
                 .iter()
                 .find(|r| r.policy == "off" && r.target == target);
@@ -657,8 +773,9 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     } else {
         println!();
         println!("  ✗ COLD READ NOT ACHIEVED — ratios suppressed.");
-        println!("    The `off` rows show no device read bytes, so both policies read");
-        println!("    from page cache and any difference is noise.");
+        println!("    An `off` row read less than half of one page per target off the");
+        println!("    device, so at least part of the read was served from cache and");
+        println!("    any difference is noise.");
         println!("    Point MTXDB_BENCH_ROOT at a real (non-tmpfs) disk and run as");
         println!("    root so drop_page_caches() can evict, or use vmtouch with the");
         println!("    store closed (already done here) and no live mappings.");
