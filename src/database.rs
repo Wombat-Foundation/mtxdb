@@ -18,10 +18,11 @@
 //! [`PackfileStorage::enable_shared_journal`](crate::PackfileStorage::enable_shared_journal).
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::journal::{Journal, JournalCoordinator, SharedWalLock};
+use crate::journal::{CommitReceipt, Journal, JournalCoordinator, SharedWalLock, TxnStage};
 use crate::layout::{DatabaseLayout, ShardType};
 use crate::packfile::storage::PackfileStorage;
 use crate::storage::StorageError;
@@ -165,6 +166,36 @@ impl SharedDatabase {
     #[must_use]
     pub fn edges(&self) -> &Arc<PackfileStorage> {
         self.pool(ShardType::Edges)
+    }
+
+    /// Publish all legacy pending mutations through the database coordinator.
+    ///
+    /// A shared database has one coordinator for all pools, so this is one
+    /// cross-pool visibility operation. It does not fsync; call `sync_all` or
+    /// the normal durability path separately.
+    ///
+    /// # Errors
+    /// Returns an error if the journal is poisoned or the pending queue cannot
+    /// be appended as one complete group.
+    pub fn publish_pending(&self) -> io::Result<Option<CommitReceipt>> {
+        self.coordinator.publish_pending()
+    }
+
+    /// Publish one transaction-owned mutation group through the shared WAL.
+    ///
+    /// All mutations staged for the three pools are appended as one tagged
+    /// journal group. A later durability operation may fsync that group, but
+    /// readers see either the complete group or none of it.
+    ///
+    /// # Errors
+    /// Returns an error if staging is inactive, the coordinator is poisoned,
+    /// or the journal group cannot be appended.
+    pub fn publish_transaction(&self, stage: &TxnStage) -> io::Result<()> {
+        stage.publish(
+            Some(&self.coordinator),
+            Some(&self.coordinator),
+            Some(&self.coordinator),
+        )
     }
 }
 

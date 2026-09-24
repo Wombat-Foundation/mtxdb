@@ -401,6 +401,50 @@ impl TxnStage {
             return Ok(());
         }
         let pools = [ShardType::Edges, ShardType::EventDag, ShardType::State];
+
+        // A shared-WAL database gives every pool the same coordinator. Keep
+        // the transaction as one journal group in that case, so readers never
+        // observe only a prefix of a cross-pool commit. Standalone/per-pool
+        // journals cannot provide that boundary and retain the ordered,
+        // retry-safe fallback below.
+        let active_pool_count = pools
+            .iter()
+            .filter(|pool| {
+                let index = pool_index(**pool);
+                !data.appended[index] && !data.pools[index].is_empty()
+            })
+            .count();
+        let active_coordinators = pools
+            .iter()
+            .filter_map(|pool| {
+                let index = pool_index(*pool);
+                (!data.appended[index] && !data.pools[index].is_empty())
+                    .then(|| coordinators[index])
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        if active_coordinators.len() == active_pool_count {
+            if let Some(coordinator) = active_coordinators.first().copied() {
+                if active_coordinators
+                    .iter()
+                    .all(|candidate| std::ptr::eq(*candidate, coordinator))
+                {
+                    let batches = pools
+                        .iter()
+                        .filter_map(|pool| {
+                            let index = pool_index(*pool);
+                            (!data.appended[index] && !data.pools[index].is_empty())
+                                .then_some((*pool, data.pools[index].as_slice()))
+                        })
+                        .collect::<Vec<_>>();
+                    coordinator.append_pending_tagged_groups(&batches)?;
+                    data.appended.fill(true);
+                    self.state.store(Self::PUBLISHED, Ordering::Release);
+                    return Ok(());
+                }
+            }
+        }
+
         for (ordered_index, pool) in pools.into_iter().enumerate() {
             let index = pool_index(pool);
             if data.appended[index] || data.pools[index].is_empty() {
@@ -1201,10 +1245,43 @@ impl JournalCoordinator {
             })
     }
 
+    /// Append pending legacy mutations and several pool-tagged transaction
+    /// batches as one visible journal group.
+    ///
+    /// This is the atomic publication boundary for a transaction that writes
+    /// multiple pools through a shared coordinator. The caller must provide
+    /// each pool at most once; empty batches are ignored.
+    ///
+    /// # Errors
+    /// Returns an error if the journal is poisoned, the pending LSN sequence
+    /// is inconsistent, or the group cannot be appended.
+    pub fn append_pending_tagged_groups(
+        &self,
+        batches: &[(ShardType, &[Mutation])],
+    ) -> io::Result<CommitReceipt> {
+        let staged = batches
+            .iter()
+            .map(|(pool, mutations)| (Some(*pool), *mutations))
+            .collect::<Vec<_>>();
+        self.append_pending_groups(&staged)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot append an empty transaction group",
+            )
+        })
+    }
+
     fn append_pending_inner(
         &self,
         staged_pool: Option<ShardType>,
         mutations: &[Mutation],
+    ) -> io::Result<Option<CommitReceipt>> {
+        self.append_pending_groups(&[(staged_pool, mutations)])
+    }
+
+    fn append_pending_groups(
+        &self,
+        staged: &[(Option<ShardType>, &[Mutation])],
     ) -> io::Result<Option<CommitReceipt>> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
@@ -1223,11 +1300,15 @@ impl JournalCoordinator {
         // drains the queue only while holding the journal lock, so the check
         // cannot race with a drain.
         let mut pending = self.pending.lock();
-        if mutations.is_empty() && pending.is_empty() {
+        if staged.iter().all(|(_, mutations)| mutations.is_empty()) && pending.is_empty() {
             return Ok(None);
         }
+        let staged_len = staged
+            .iter()
+            .map(|(_, mutations)| mutations.len())
+            .sum::<usize>();
         let mut group_mutations: Vec<(Option<ShardType>, Mutation)> =
-            Vec::with_capacity(pending.len().saturating_add(mutations.len()));
+            Vec::with_capacity(pending.len().saturating_add(staged_len));
         for (offset, (lsn, pool, mutation)) in pending.iter().enumerate() {
             let expected = journal
                 .next_lsn
@@ -1241,12 +1322,9 @@ impl JournalCoordinator {
             }
             group_mutations.push((*pool, mutation.clone()));
         }
-        group_mutations.extend(
-            mutations
-                .iter()
-                .cloned()
-                .map(|mutation| (staged_pool, mutation)),
-        );
+        for (pool, mutations) in staged {
+            group_mutations.extend(mutations.iter().cloned().map(|mutation| (*pool, mutation)));
+        }
         let expected_first_lsn = journal.next_lsn;
         let expected_count = u64::try_from(group_mutations.len()).unwrap_or(u64::MAX);
         let sequence = self
@@ -2370,7 +2448,7 @@ impl SharedWalLock {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalCoordinator, Mutation};
+    use super::{Journal, JournalCoordinator, Mutation, TxnStage, TxnStageState};
     use std::fs;
     use std::io::Write as _;
     use std::sync::atomic::AtomicU64;
@@ -2669,6 +2747,51 @@ mod tests {
             .map(|entry| entry.pool)
             .collect();
         assert_eq!(pools, vec![Some(ShardType::State), Some(ShardType::Edges)]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transaction_stage_publishes_all_pools_as_one_shared_group() {
+        use crate::layout::ShardType;
+
+        let path = temp_path("txn_stage_shared_group");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        let stage = TxnStage::new();
+        stage
+            .stage_put(ShardType::State, [1; 16], [1; 16], b"state".to_vec())
+            .unwrap();
+        stage
+            .stage_put(ShardType::EventDag, [2; 16], [2; 16], b"event".to_vec())
+            .unwrap();
+        stage
+            .stage_put(ShardType::Edges, [3; 16], [3; 16], b"edge".to_vec())
+            .unwrap();
+
+        stage
+            .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+            .unwrap();
+        stage
+            .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+            .unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(scan.groups[0].entries.len(), 3);
+        assert_eq!(
+            scan.groups[0]
+                .entries
+                .iter()
+                .map(|entry| entry.pool)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(ShardType::Edges),
+                Some(ShardType::EventDag),
+                Some(ShardType::State)
+            ]
+        );
+        assert_eq!(stage.state(), TxnStageState::Published);
         fs::remove_file(path).unwrap();
     }
 
