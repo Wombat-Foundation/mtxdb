@@ -690,9 +690,22 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     println!("  store size:   {}", fmt_bytes(store_bytes));
 
     // ── Measure ──
+    //
+    // Dense is a small contiguous prefix that always reads nearly the whole
+    // small store and says nothing about the merge threshold. It is on by
+    // default for the ratio comparison; skip it with MTXDB_READ_PLAN_DENSE=0
+    // to halve the measured rows when only the sparse verdict matters.
+    let include_dense = std::env::var("MTXDB_READ_PLAN_DENSE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     println!();
     println!(
-        "  [2/3] measuring (off vs hdd, dense vs sparse, {passes} interleaved passes, median)…"
+        "  [2/3] measuring (off vs hdd, {}, {passes} interleaved passes, median)…",
+        if include_dense {
+            "dense + sparse"
+        } else {
+            "sparse only"
+        }
     );
     let policy_hdd = hdd_policy();
     println!(
@@ -700,12 +713,13 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         policy_hdd.merge_gap_bytes, policy_hdd.max_extent_bytes, policy_hdd.min_batch_candidates
     );
 
-    let combos: [(&'static str, ReadPlanPolicy, &'static str, &Vec<NodeId>); 4] = [
-        ("off", ReadPlanPolicy::disabled(), "dense", &dense),
-        ("hdd", policy_hdd, "dense", &dense),
-        ("off", ReadPlanPolicy::disabled(), "sparse", &sparse),
-        ("hdd", policy_hdd, "sparse", &sparse),
-    ];
+    let mut combos: Vec<(&'static str, ReadPlanPolicy, &'static str, &Vec<NodeId>)> = Vec::new();
+    if include_dense {
+        combos.push(("off", ReadPlanPolicy::disabled(), "dense", &dense));
+        combos.push(("hdd", policy_hdd, "dense", &dense));
+    }
+    combos.push(("off", ReadPlanPolicy::disabled(), "sparse", &sparse));
+    combos.push(("hdd", policy_hdd, "sparse", &sparse));
 
     let eviction = select_eviction(manual_drop);
     let rows: Vec<Row> = measure(&dir, &combos, eviction, passes);
