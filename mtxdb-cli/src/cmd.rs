@@ -3595,7 +3595,137 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
     }
 }
 
+fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    let deep = matches!(cli.command, Commands::Info { stats: true, .. });
+    let target = classify_info_selector(selector)?;
+    let valid_dirs = valid_database_dirs(cli)?;
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+
+    match target {
+        InfoTarget::Collection => {
+            let collection_id = parse_collection_selector(selector)?;
+            let mut matches = Vec::new();
+            for db_dir in &valid_dirs {
+                let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
+                    continue;
+                };
+                for &shard_type in &shard_types {
+                    let Ok(dir) = pool_dir(&layout, shard_type) else {
+                        continue;
+                    };
+                    let has_collection = if let Some(summaries) =
+                        PackfileStorage::collection_summaries_from_disk(&dir)
+                    {
+                        summaries.iter().any(|(id, _, _, _)| id == &collection_id)
+                    } else if let Ok(store) = PackfileStorage::open_read_only(dir.clone()) {
+                        store.collection_index_info(&collection_id).is_some()
+                    } else {
+                        false
+                    };
+                    if has_collection {
+                        matches.push((db_dir.clone(), shard_type, dir));
+                    }
+                }
+            }
+
+            if matches.is_empty() {
+                eprintln!(
+                    "collection {}: not found across {} database(s)",
+                    format_id(&collection_id),
+                    valid_dirs.len()
+                );
+                return Ok(());
+            }
+
+            if matches.len() == 1 {
+                let (db_dir, shard_type, dir) = &matches[0];
+                println!("database: {}", db_dir.display());
+                println!("pool:     {}", shard_type.as_str());
+                inspect_collection_in_dir(dir, &collection_id, deep);
+            } else {
+                for (i, (db_dir, shard_type, dir)) in matches.iter().enumerate() {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!(
+                        "=== Database: {} (pool: {}) ===",
+                        db_dir.display(),
+                        shard_type.as_str()
+                    );
+                    inspect_collection_in_dir(dir, &collection_id, deep);
+                }
+                println!();
+                println!(
+                    "note: collection found in {} of {} database(s)",
+                    matches.len(),
+                    valid_dirs.len()
+                );
+            }
+            Ok(())
+        }
+        InfoTarget::Pack => {
+            let pack_id = parse_pack_id_selector(selector)?;
+            let mut matches = Vec::new();
+            for db_dir in &valid_dirs {
+                let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
+                    continue;
+                };
+                for &shard_type in &shard_types {
+                    let Ok(dir) = pool_dir(&layout, shard_type) else {
+                        continue;
+                    };
+                    let shard_entries: Vec<(u64, u64, u8)> = match glob_pack_files(&dir) {
+                        Ok(files) => {
+                            files.into_iter().filter(|&(id, _, _)| id == pack_id).collect()
+                        }
+                        Err(_) => continue,
+                    };
+                    if !shard_entries.is_empty() {
+                        matches.push((db_dir.clone(), shard_type, dir, shard_entries));
+                    }
+                }
+            }
+
+            if matches.is_empty() {
+                eprintln!(
+                    "pack 0x{pack_id:016x}: not found across {} database(s)",
+                    valid_dirs.len()
+                );
+                return Ok(());
+            }
+
+            for (i, (db_dir, shard_type, dir, shard_entries)) in matches.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                println!(
+                    "=== Database: {} (pool: {}) ===",
+                    db_dir.display(),
+                    shard_type.as_str()
+                );
+                print_pack_info(dir, pack_id, shard_entries, *shard_type);
+            }
+            if matches.len() > 1 {
+                println!();
+                println!(
+                    "note: pack found in {} of {} database(s)",
+                    matches.len(),
+                    valid_dirs.len()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+    if cli.coalesce {
+        return cmd_info_coalesced(cli, selector);
+    }
     run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector))
 }
 
@@ -4627,6 +4757,126 @@ impl ScanOptions {
     clippy::too_many_arguments,
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
+fn cmd_scan_coalesced(
+    cli: &Cli,
+    selector: &str,
+    verbose: bool,
+    limit: i64,
+    id: Option<&str>,
+    collection: Option<&str>,
+    raw: bool,
+    sort: Option<&str>,
+    reverse: bool,
+) -> anyhow::Result<()> {
+    let target = classify_info_selector(selector)?;
+    let valid_dirs = valid_database_dirs(cli)?;
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+
+    let mut matching_dirs = Vec::new();
+    match target {
+        InfoTarget::Collection => {
+            let collection_id = parse_collection_selector(selector)?;
+            for db_dir in &valid_dirs {
+                let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
+                    continue;
+                };
+                let mut found_in_db = false;
+                for &shard_type in &shard_types {
+                    let Ok(dir) = pool_dir(&layout, shard_type) else {
+                        continue;
+                    };
+                    let has = if let Some(summaries) =
+                        PackfileStorage::collection_summaries_from_disk(&dir)
+                    {
+                        summaries.iter().any(|(id, _, _, _)| id == &collection_id)
+                    } else if let Ok(store) = PackfileStorage::open_read_only(dir) {
+                        store.collection_index_info(&collection_id).is_some()
+                    } else {
+                        false
+                    };
+                    if has {
+                        found_in_db = true;
+                        break;
+                    }
+                }
+                if found_in_db {
+                    matching_dirs.push(db_dir.clone());
+                }
+            }
+        }
+        InfoTarget::Pack => {
+            let pack_id = parse_pack_id_selector(selector)?;
+            for db_dir in &valid_dirs {
+                let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
+                    continue;
+                };
+                let mut found_in_db = false;
+                for &shard_type in &shard_types {
+                    let Ok(dir) = pool_dir(&layout, shard_type) else {
+                        continue;
+                    };
+                    if let Ok(files) = glob_pack_files(&dir) {
+                        if files.iter().any(|&(id, _, _)| id == pack_id) {
+                            found_in_db = true;
+                            break;
+                        }
+                    }
+                }
+                if found_in_db {
+                    matching_dirs.push(db_dir.clone());
+                }
+            }
+        }
+    }
+
+    if matching_dirs.is_empty() {
+        bail!(
+            "no matching {} `{selector}` found across {} database(s)",
+            match target {
+                InfoTarget::Collection => "collection",
+                InfoTarget::Pack => "pack",
+            },
+            valid_dirs.len()
+        );
+    }
+
+    if matching_dirs.len() == 1 {
+        let sub_cli = cli.with_dir(matching_dirs[0].clone());
+        println!("database: {}", matching_dirs[0].display());
+        cmd_scan_single(
+            &sub_cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+        )?;
+    } else {
+        for (i, db_dir) in matching_dirs.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            println!("=== Database: {} ===", db_dir.display());
+            let sub_cli = cli.with_dir(db_dir.clone());
+            if let Err(e) = cmd_scan_single(
+                &sub_cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+            ) {
+                eprintln!("error in `{}`: {e:#}", db_dir.display());
+            }
+        }
+        println!();
+        println!(
+            "note: matched in {} of {} database(s)",
+            matching_dirs.len(),
+            valid_dirs.len()
+        );
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "maps 1:1 to CLI args before building ScanOptions"
+)]
 fn cmd_scan(
     cli: &Cli,
     selector: &str,
@@ -4638,6 +4888,11 @@ fn cmd_scan(
     sort: Option<&str>,
     reverse: bool,
 ) -> anyhow::Result<()> {
+    if cli.coalesce {
+        return cmd_scan_coalesced(
+            cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+        );
+    }
     run_multi_dir(cli, |sub_cli| {
         cmd_scan_single(
             sub_cli, selector, verbose, limit, id, collection, raw, sort, reverse,
@@ -10229,5 +10484,95 @@ mod tests {
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();
         std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn coalesced_info_and_scan_filter_to_matching_databases() {
+        let dir1 = unique_temp_dir();
+        let dir2 = unique_temp_dir();
+
+        let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
+        let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
+
+        let col1 = [0x11; 16];
+        let col2 = [0x22; 16];
+        let node1 = [0x33; 16];
+        let node2 = [0x44; 16];
+
+        let s1 =
+            PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        s1.put(
+            &col1,
+            &node1,
+            &NodeData::new(Bytes::from_static(b"{\"content\": \"msg1\"}")),
+        )
+        .unwrap();
+        s1.sync().unwrap();
+
+        let s2 =
+            PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        s2.put(
+            &col2,
+            &node2,
+            &NodeData::new(Bytes::from_static(b"{\"content\": \"msg2\"}")),
+        )
+        .unwrap();
+        s2.sync().unwrap();
+
+        let cli_info = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: true,
+            command: Commands::Info {
+                collection: format_id(&col1),
+                stats: false,
+            },
+        };
+        cmd_info(&cli_info, &format_id(&col1)).unwrap();
+
+        let cli_scan = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: true,
+            command: Commands::Scan {
+                selector: format_id(&col1),
+                verbose: false,
+                limit: 10,
+                id: None,
+                collection: None,
+                raw: false,
+                sort: None,
+                reverse: false,
+            },
+        };
+        cmd_scan(
+            &cli_scan,
+            &format_id(&col1),
+            false,
+            10,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let missing = format_id(&[0x99; 16]);
+        assert!(cmd_scan(
+            &cli_scan,
+            &missing,
+            false,
+            10,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 }
