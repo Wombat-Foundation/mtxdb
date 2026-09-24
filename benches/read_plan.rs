@@ -745,13 +745,20 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     // >= target_count (each wanted record shares or spans a page), so half
     // of that is a deliberately loose floor that only catches gross
     // under-delivery.
+    //
+    // The floor only applies to the sparse set. The dense set is a small
+    // contiguous prefix, so its device bytes are legitimately a tiny
+    // fraction of the file and can sit below the floor even when the read
+    // was fully cold -- checking it would suppress a good run. Dense is
+    // reported for completeness, not used as a gate.
     const PAGE_SIZE: u64 = 4096;
-    let off_rows: Vec<&Row> = rows.iter().filter(|r| r.policy == "off").collect();
-    let off_cold = !off_rows.is_empty()
-        && off_rows.iter().all(|r| {
-            let floor = r.total as u64 * PAGE_SIZE / 2;
-            r.disk_read_bytes.unwrap_or(0) >= floor
-        });
+    let off_sparse = rows
+        .iter()
+        .find(|r| r.policy == "off" && r.target == "sparse");
+    let off_cold = off_sparse.is_some_and(|r| {
+        let floor = r.total as u64 * PAGE_SIZE / 2;
+        r.disk_read_bytes.unwrap_or(0) >= floor
+    });
     if off_cold {
         for target in ["dense", "sparse"] {
             let off = rows
@@ -765,7 +772,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
                 println!("bench: read_plan_ratio TARGET={target} HDD_VS_OFF={speedup:.3}");
             }
         }
-        if off_rows.iter().all(|r| r.major_faults.unwrap_or(0) == 0) {
+        if off_sparse.is_some_and(|r| r.major_faults.unwrap_or(0) == 0) {
             println!();
             println!("  note: major faults are 0 even though device bytes are non-zero —");
             println!("        readahead is serving the pages, which is expected here.");
@@ -773,9 +780,9 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     } else {
         println!();
         println!("  ✗ COLD READ NOT ACHIEVED — ratios suppressed.");
-        println!("    An `off` row read less than half of one page per target off the");
-        println!("    device, so at least part of the read was served from cache and");
-        println!("    any difference is noise.");
+        println!("    The sparse `off` row read less than half of one page per target");
+        println!("    off the device, so at least part of the read was served from");
+        println!("    cache and any difference is noise.");
         println!("    Point MTXDB_BENCH_ROOT at a real (non-tmpfs) disk and run as");
         println!("    root so drop_page_caches() can evict, or use vmtouch with the");
         println!("    store closed (already done here) and no live mappings.");
