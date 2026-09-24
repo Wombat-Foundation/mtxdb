@@ -528,28 +528,39 @@ fn measure_once(
     }
 }
 
-/// The latest of `passes` reads of one `(policy, target)` pair, with the
-/// per-pass elapsed times reduced to a median and the counters taken from
-/// the last pass (they are per-read totals, not accumulated).
-fn measure(
-    dir: &Path,
-    policy_name: &'static str,
-    target_name: &'static str,
-    targets: &[NodeId],
-    policy: ReadPlanPolicy,
-    eviction: Eviction,
-    passes: usize,
-) -> Row {
-    let mut elapsed_samples = Vec::with_capacity(passes);
-    let mut last = None;
-    for _ in 0..passes {
-        let row = measure_once(dir, policy_name, target_name, targets, policy, eviction);
-        elapsed_samples.push(row.elapsed);
-        last = Some(row);
-    }
-    let mut row = last.expect("at least one pass");
+/// Reduce a combo's per-pass rows to one: median elapsed, counters from the
+/// last pass (they are per-read totals, not accumulated).
+fn reduce_passes(mut rows: Vec<Row>) -> Row {
+    let elapsed_samples: Vec<Duration> = rows.iter().map(|r| r.elapsed).collect();
+    let mut row = rows.pop().expect("at least one pass");
     row.elapsed = median_duration(&elapsed_samples);
     row
+}
+
+/// Measure every `(policy, target)` combo, interleaving the passes: one read
+/// of each combo per pass, then the next pass. Running a combo's passes back
+/// to back would let the policy measured first warm the drive's cache and
+/// bias the one measured second; interleaving spreads that across both.
+fn measure(
+    dir: &Path,
+    combos: &[(&'static str, ReadPlanPolicy, &'static str, &Vec<NodeId>)],
+    eviction: Eviction,
+    passes: usize,
+) -> Vec<Row> {
+    let mut samples: Vec<Vec<Row>> = (0..combos.len()).map(|_| Vec::new()).collect();
+    for _ in 0..passes {
+        for (index, (policy_name, policy, target_name, targets)) in combos.iter().enumerate() {
+            samples[index].push(measure_once(
+                dir,
+                policy_name,
+                target_name,
+                targets,
+                *policy,
+                eviction,
+            ));
+        }
+    }
+    samples.into_iter().map(reduce_passes).collect()
 }
 
 // ── Scenario ────────────────────────────────────────────────────────
@@ -652,7 +663,9 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
 
     // ── Measure ──
     println!();
-    println!("  [2/3] measuring (off vs hdd, dense vs sparse, {passes} passes, median)…");
+    println!(
+        "  [2/3] measuring (off vs hdd, dense vs sparse, {passes} interleaved passes, median)…"
+    );
     let policy_hdd = hdd_policy();
     println!(
         "        hdd: gap={} B extent={} B min_batch={}",
@@ -667,12 +680,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     ];
 
     let eviction = select_eviction(manual_drop);
-    let rows: Vec<Row> = combos
-        .into_iter()
-        .map(|(name, policy, target_name, targets)| {
-            measure(&dir, name, target_name, targets, policy, eviction, passes)
-        })
-        .collect();
+    let rows: Vec<Row> = measure(&dir, &combos, eviction, passes);
 
     // ── Report ──
     //
