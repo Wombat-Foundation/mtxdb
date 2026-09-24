@@ -496,30 +496,13 @@ fn policy_elapsed(rows: &[Row]) -> impl Fn(&str, &str) -> Option<f64> + '_ {
     }
 }
 
-/// One timed read, with the store reopened cold for each pass.
-///
-/// The store must be **dropped** before the cache is dropped and reopened
-/// after: while it is alive its shards are mmapped, and both
-/// `drop_caches` and `vmtouch -e` skip pages a live process has mapped, so
-/// an in-place eviction leaves them resident and silently measures a warm
-/// cache. A fresh `open_read_only` also has no in-process node cache, so
-/// every id goes through index lookup and mmap decode.
-fn measure_once(
-    dir: &Path,
-    policy_name: &'static str,
-    target_name: &'static str,
-    targets: &[NodeId],
-    policy: ReadPlanPolicy,
-    eviction: Eviction,
-) -> Row {
-    if eviction == Eviction::Manual {
-        wait_for_manual_drop(&format!("{policy_name} / {target_name}"));
-    }
-
-    // Step 1: evict while nothing has the shards mapped. `EVICTED` records
-    // whether an eviction command actually ran and reported success — not
-    // whether the pages left, which neither syscall tells us.
-    let evicted = match eviction {
+/// Evict the page cache per `eviction`, returning what was done. The store
+/// must already be dropped: while it is alive its shards are mmapped, and
+/// both `drop_caches` and `vmtouch -e` skip pages a live process has mapped,
+/// so an in-place eviction leaves them resident and silently measures a warm
+/// cache.
+fn evict(dir: &Path, eviction: Eviction) -> EvictionStatus {
+    match eviction {
         Eviction::RootDrop => {
             if drop_page_caches().is_ok() {
                 EvictionStatus::Ran
@@ -538,7 +521,26 @@ fn measure_once(
         Eviction::Manual => EvictionStatus::Requested,
         // Nothing was evicted on purpose; the read is warm by design.
         Eviction::Warm => EvictionStatus::Warm,
-    };
+    }
+}
+
+/// One timed read, with the store reopened cold for each pass.
+///
+/// A fresh `open_read_only` also has no in-process node cache, so every id
+/// goes through index lookup and mmap decode.
+fn measure_once(
+    dir: &Path,
+    policy_name: &'static str,
+    target_name: &'static str,
+    targets: &[NodeId],
+    policy: ReadPlanPolicy,
+    eviction: Eviction,
+) -> Row {
+    if eviction == Eviction::Manual {
+        wait_for_manual_drop(&format!("{policy_name} / {target_name}"));
+    }
+
+    let evicted = evict(dir, eviction);
 
     // Step 2: reopen fresh, apply the policy, and time a mmap-backed read.
     let store = PackfileStorage::open_read_only(dir.to_path_buf()).unwrap();
@@ -644,6 +646,35 @@ fn measure(
         }
     }
     samples.into_iter().map(reduce_passes).collect()
+}
+
+/// Time one cold repack (`repack_collection_reachable`) under `policy`.
+///
+/// This is the scan/compaction regression check for readahead suppression:
+/// repack walks and rewrites records through the shard mmap
+/// (`scan_full_adjacency`, `copy_record_to_shard`), the same mapping
+/// `MADV_RANDOM` is set on, so a persistent random hint can slow it. The
+/// store is reopened, evicted, then one repack is timed.
+fn repack_once(
+    dir: &Path,
+    policy_name: &'static str,
+    policy: ReadPlanPolicy,
+    eviction: Eviction,
+) -> (&'static str, Duration) {
+    if eviction == Eviction::Manual {
+        wait_for_manual_drop(&format!("repack / {policy_name}"));
+    }
+    let _ = evict(dir, eviction);
+
+    // Repack rewrites the pack, so it needs a writable open. No stats/cache
+    // policy beyond the read plan is applied.
+    let store = PackfileStorage::open(dir.to_path_buf()).unwrap();
+    store.set_read_plan_policy(policy);
+    let started = Instant::now();
+    store
+        .repack_collection_reachable(&ROOM, |_hash, _data| Vec::new())
+        .unwrap();
+    (policy_name, started.elapsed())
 }
 
 // ── Scenario ────────────────────────────────────────────────────────
@@ -757,6 +788,40 @@ fn run(
     // store and catch full scans / re-reads the byte floor alone cannot.
     let store_bytes = store_size_bytes(&dir);
     println!("  store size:   {}", fmt_bytes(store_bytes));
+
+    // Repack mode is a distinct measurement: the scan/compaction regression
+    // check for readahead suppression, not a point-read sweep.
+    if std::env::var("MTXDB_READ_PLAN_REPACK")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
+        let eviction = select_eviction(manual_drop, warm);
+        println!();
+        println!("  [2/3] repack (scan/compaction) regression check…");
+        let mut medians: Vec<(&'static str, Duration)> = Vec::new();
+        for (name, policy) in [
+            ("plain", ReadPlanPolicy::disabled()),
+            ("random", ReadPlanPolicy::random_advice()),
+        ] {
+            let mut elapsed = Vec::with_capacity(passes);
+            for _ in 0..passes {
+                elapsed.push(repack_once(&dir, name, policy, eviction).1);
+            }
+            let median = median_duration(&elapsed);
+            let min = elapsed.iter().copied().min().unwrap_or(Duration::ZERO);
+            let max = elapsed.iter().copied().max().unwrap_or(Duration::ZERO);
+            println!("        {name:<7} {median:.2?} [{min:.2?}..{max:.2?}]");
+            medians.push((name, median));
+        }
+        if let [(_, plain), (_, random)] = medians.as_slice() {
+            println!(
+                "bench: read_plan_repack REPACK_RANDOM_VS_PLAIN={:.3}",
+                plain.as_secs_f64() / random.as_secs_f64()
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
 
     // ── Measure ──
     //
