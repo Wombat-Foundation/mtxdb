@@ -294,7 +294,7 @@ fn persist_store_meta(base_dir: &Path) {
         return; // never true for a real semver string; just don't write garbage
     };
     let mut buf = Vec::with_capacity(6usize.saturating_add(version.len()));
-    buf.extend_from_slice(b"SMeta");
+    buf.extend_from_slice(b"MTXS");
     buf.push(STORE_META_VERSION);
     buf.push(version_len);
     buf.extend_from_slice(version);
@@ -321,12 +321,12 @@ fn persist_store_meta(base_dir: &Path) {
 #[must_use]
 pub fn store_created_by_version(base_dir: &Path) -> Option<String> {
     let data = fs::read(base_dir.join(STORE_META_FILENAME)).ok()?;
-    if data.len() < 7 || &data[0..5] != b"SMeta" || data[5] != STORE_META_VERSION {
+    if data.len() < 6 || &data[0..4] != b"MTXS" || data[4] != STORE_META_VERSION {
         return None;
     }
-    let version_len = usize::from(data[6]);
-    let version_end = 7usize.checked_add(version_len)?;
-    let version_bytes = data.get(7..version_end)?;
+    let version_len = usize::from(data[5]);
+    let version_end = 6usize.checked_add(version_len)?;
+    let version_bytes = data.get(6..version_end)?;
     String::from_utf8(version_bytes.to_vec()).ok()
 }
 
@@ -1464,8 +1464,8 @@ impl ShardPool {
         bucket_seed: u64,
         sync_dir: bool,
     ) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(22);
-        buf.extend_from_slice(b"PMeta");
+        let mut buf = Vec::with_capacity(21);
+        buf.extend_from_slice(b"MTXP");
         buf.push(POOL_META_VERSION);
         buf.extend_from_slice(&next.to_le_bytes());
         buf.extend_from_slice(&bucket_seed.to_le_bytes());
@@ -1506,32 +1506,32 @@ impl ShardPool {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if data.len() < 22 {
+        if data.len() < 21 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "pool.meta is truncated ({} bytes, expected >= 22)",
+                    "pool.meta is truncated ({} bytes, expected >= 21)",
                     data.len()
                 ),
             ));
         }
-        if &data[0..5] != b"PMeta" {
+        if &data[0..4] != b"MTXP" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pool.meta has invalid magic",
             ));
         }
-        if data[5] != POOL_META_VERSION {
+        if data[4] != POOL_META_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
                     "pool.meta has unsupported version {} (expected {})",
-                    data[5], POOL_META_VERSION
+                    data[4], POOL_META_VERSION
                 ),
             ));
         }
-        let next_pack_id = u64::from_le_bytes(data[6..14].try_into().unwrap());
-        let bucket_seed = u64::from_le_bytes(data[14..22].try_into().unwrap());
+        let next_pack_id = u64::from_le_bytes(data[5..13].try_into().unwrap());
+        let bucket_seed = u64::from_le_bytes(data[13..21].try_into().unwrap());
         Ok(Some(PoolMeta {
             next_pack_id,
             bucket_seed,
@@ -3952,7 +3952,7 @@ mod tests {
             // Place fake orphaned .tmp files
             fs::write(
                 dir.join("pool.meta.tmp.1234"),
-                b"PMeta\x01\x01\x00\x00\x00\x00\x00\x00\x00",
+                b"MTXP\x01\x01\x00\x00\x00\x00\x00\x00\x00",
             )
             .unwrap();
             fs::write(dir.join("pack_0000000000000000.tmp.1234.0"), b"PACK\x02...").unwrap();

@@ -74,9 +74,16 @@ pub use shard::ShardPool;
 pub use storage::{
     content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,
 };
+#[allow(deprecated)]
 pub use template::{
-    derive_collection_id, frame_digest, record_logical_id, CollectionKeyRule, CollectionMetadata,
-    CollectionTemplate, EstablishmentRule, FrameIdInput, FrameIdPolicy, PayloadPolicy,
-    RecordIdentityRule, COLLECTION_METADATA_RECORD_ID, COLLECTION_TEMPLATE_FORMAT_V1,
-    POOL_DST_INTERNAL,
+    derive_collection_id, derive_group_full_id, derive_group_member_collection_id,
+    derive_group_member_full_id, derive_member_collection_id_from_group,
+    derive_member_full_id_from_group, frame_digest, namespace_bias, record_logical_id,
+    try_derive_collection_full_id, try_derive_collection_id, wrapping_add_le, CollectionKeyRule,
+    CollectionMetadata, CollectionTemplate, EstablishmentRule, FrameIdInput, FrameIdPolicy,
+    PayloadPolicy, RecordIdentityRule, COLLECTION_METADATA_RECORD_ID,
+    COLLECTION_TEMPLATE_FORMAT_V1, MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT,
+    MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT, NAMESPACE_BIAS_AUTH,
+    NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT,
+    POOL_DST_AUTH, POOL_DST_EVNT, POOL_DST_INTERNAL, POOL_DST_PREV, POOL_DST_STAT,
 };

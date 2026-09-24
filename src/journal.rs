@@ -384,7 +384,7 @@ impl TxnStage {
     /// cannot append the group's complete framing and trailer.
     pub fn publish(
         &self,
-        auth_chain: Option<&JournalCoordinator>,
+        edges: Option<&JournalCoordinator>,
         event_dag: Option<&JournalCoordinator>,
         state: Option<&JournalCoordinator>,
     ) -> io::Result<()> {
@@ -393,7 +393,7 @@ impl TxnStage {
             Self::DISCARDED | Self::PUBLISHED => return Ok(()),
             _ => {}
         }
-        let coordinators = [auth_chain, event_dag, state];
+        let coordinators = [edges, event_dag, state];
         if coordinators.iter().all(Option::is_none) {
             // Journaling is disabled process-wide, so there is no journal to
             // publish into.
@@ -2408,7 +2408,7 @@ mod tests {
         let tagged = [
             (Some(ShardType::State), put(1, 1, b"state")),
             (Some(ShardType::EventDag), put(2, 2, b"event")),
-            (Some(ShardType::Edges), put(3, 3, b"auth")),
+            (Some(ShardType::Edges), put(3, 3, b"edges")),
         ];
         journal
             .append_group_tagged_with_sequence(&tagged, None)

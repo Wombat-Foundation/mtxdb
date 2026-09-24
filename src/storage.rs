@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
+use crate::template::{CollectionMetadata, FrameIdPolicy, COLLECTION_METADATA_RECORD_ID};
 
 /// A 128-bit lookup identity for a record within a collection.
 ///
@@ -368,17 +369,131 @@ pub trait StorageEngine: Send + Sync {
     /// Returns [`StorageError::Io`] on I/O failure.
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError>;
 
+    /// Atomically establish a collection or append to it if already established.
+    ///
+    /// Under the collection's put-mutex:
+    /// - Validates common batch inputs:
+    ///   - Rejects [`COLLECTION_METADATA_RECORD_ID`] in `records`.
+    ///   - Rejects intra-batch duplicate node IDs in `records`.
+    ///   - Rejects metadata whose canonical ID is empty.
+    ///   - Validates that `metadata.verify_collection_id(collection_id)` is `true`.
+    /// - If the collection does not yet exist:
+    ///   - Prepends the genesis metadata record ([`COLLECTION_METADATA_RECORD_ID`])
+    ///     with encoded `metadata`.
+    ///   - Appends `records` in a single atomic batch.
+    /// - If the collection already exists:
+    ///   - Verifies that stored genesis metadata matches `metadata` (`found == *metadata`).
+    ///     Fails closed with [`StorageError::Internal`] if metadata conflicts.
+    ///   - Enforces idempotency and collision semantics on `records`:
+    ///     - Same node ID + same payload => idempotent success (skipped).
+    ///     - Same node ID + different payload => [`StorageError::Collision`] collision failure.
+    ///   - Appends any new records in `records`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Internal`] if inputs are invalid or if metadata
+    /// fails verification.
+    /// Returns [`StorageError::Collision`] if a record payload collision occurs.
+    /// Returns [`StorageError::Corrupt`] if existing stored metadata cannot be decoded.
+    /// Returns [`StorageError::Io`] on I/O failure.
+    fn create_or_put_established(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError>;
+
+    /// Append records to an already-established collection.
+    ///
+    /// Locks the collection under its put-mutex, verifies that the collection
+    /// exists and has an established genesis metadata record whose derivation reproduces
+    /// `collection_id`, and appends the records.
+    ///
+    /// If an input record is already present:
+    /// - If existing payload matches, it is treated as an idempotent retry.
+    /// - If existing payload differs, a [`StorageError::Collision`] collision error is returned.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if the collection does not exist or has no metadata record.
+    /// Returns [`StorageError::Internal`] if `records` contains [`COLLECTION_METADATA_RECORD_ID`]
+    /// or duplicate keys within the batch.
+    /// Returns [`StorageError::Collision`] if a record payload collision occurs.
+    /// Returns [`StorageError::Corrupt`] if stored genesis metadata is corrupted or fails derivation.
+    /// Returns [`StorageError::Io`] on I/O failure.
+    fn put_many_established(
+        &self,
+        collection_id: &[u8; 16],
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError>;
+
+    /// Establish a collection (if absent) or upsert a record (if present),
+    /// running a validation closure against any existing record under the engine's
+    /// per-collection lock before mutating.
+    ///
+    /// # Policy
+    /// This method requires `metadata.record_id_rule.policy == FrameIdPolicy::Key`.
+    /// Immutable content-addressed collections must use [`Self::create_or_put_established`].
+    ///
+    /// # Safety and Re-entrancy
+    /// The `validate` callback runs synchronously while holding the internal
+    /// collection mutex. It is inspection-only and **must not** call back into the
+    /// engine or block, or deadlock will result.
+    ///
+    /// # Lifecycle under `put_mutex(collection_id)`:
+    /// 1. Verifies `metadata.verify_collection_id(collection_id)`.
+    /// 2. Verifies `metadata.record_id_rule.policy == FrameIdPolicy::Key`.
+    /// 3. Rejects `node_id == &COLLECTION_METADATA_RECORD_ID`.
+    /// 4. If collection is unestablished:
+    ///    - Inspects `existing` (which is `None`).
+    ///    - Invokes `validate(None)`.
+    ///    - If validation fails, aborts immediately; the collection remains absent.
+    ///    - Atomically writes genesis metadata and the record in a single journal group.
+    /// 5. If collection is established:
+    ///    - Verifies `metadata` matches stored genesis record.
+    ///    - Fetches `existing` record under `node_id`.
+    ///    - Invokes `validate(existing.as_ref())`.
+    ///    - If validation fails, aborts with error; no changes are made.
+    ///    - Idempotency check: if `existing.bytes == data.bytes`, returns `Ok(())` without appending a frame.
+    ///    - Otherwise, atomically appends the replacement record and updates the index.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Internal`] on derivation mismatch, non-Key policy,
+    /// or reserved node ID inclusion.
+    /// Returns [`StorageError::Collision`] if validation or key identity detects a collision.
+    /// Returns [`StorageError::Corrupt`] if existing metadata or framing is corrupt.
+    /// Returns [`StorageError::Io`] on write failure.
+    fn create_or_upsert_established_validated(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        node_id: &NodeId,
+        data: &NodeData,
+        validate: &mut dyn FnMut(Option<&NodeData>) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError>;
+
+    /// Convenience alias for [`Self::create_or_put_established`] to establish a collection
+    /// with an initial batch of application records (or empty).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Collision`] on truncation collision or record collision,
+    /// [`StorageError::Internal`] if existing genesis metadata differs or on derivation mismatch,
+    /// and [`StorageError::Io`] on write failures.
+    fn create_collection_with_records(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        initial_records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        self.create_or_put_established(collection_id, metadata, initial_records)
+    }
+
     /// Write a collection's genesis metadata record if it has none, or verify
     /// that an existing record matches `metadata`. Idempotent: a caller may
     /// invoke it before every batch.
     ///
     /// The record is stored as an ordinary frame under the reserved
     /// [`COLLECTION_METADATA_RECORD_ID`] key, so it rides the same append,
-    /// checkpoint, and crash-recovery paths as application records. Callers
-    /// must invoke it before the collection's first application record, so the
-    /// genesis frame precedes (and is durable with or before) any application
-    /// record. The engine enforces this: writing genesis metadata for a
-    /// collection that already holds records is rejected.
+    /// checkpoint, and crash-recovery paths as application records.
     ///
     /// # Errors
     /// Returns [`StorageError::Io`] on I/O failure, [`StorageError::Corrupt`]
@@ -390,27 +505,7 @@ pub trait StorageEngine: Send + Sync {
         collection_id: &[u8; 16],
         metadata: &CollectionMetadata,
     ) -> Result<(), StorageError> {
-        if let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
-            let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
-                StorageError::Corrupt("malformed collection metadata record".to_owned())
-            })?;
-            if found != *metadata {
-                return Err(StorageError::Internal(
-                    "collection metadata mismatch: existing genesis record differs".to_owned(),
-                ));
-            }
-            return Ok(());
-        }
-        if self.collection_exists(collection_id) {
-            return Err(StorageError::Internal(
-                "genesis metadata must be written before the collection's first record".to_owned(),
-            ));
-        }
-        self.put(
-            collection_id,
-            &COLLECTION_METADATA_RECORD_ID,
-            &NodeData::new(metadata.encode().into()),
-        )
+        self.create_or_put_established(collection_id, metadata, &[])
     }
 
     /// Fetch and decode a collection's genesis metadata record, if present.
@@ -446,6 +541,8 @@ pub enum StorageError {
     Corrupt(String),
     /// An internal invariant was violated.
     Internal(String),
+    /// A record collision occurred: an existing record conflicts with the requested key or content identity.
+    Collision(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -456,6 +553,7 @@ impl std::fmt::Display for StorageError {
             Self::VerificationFailed(id) => write!(f, "verification failed for node {id:?}"),
             Self::Corrupt(msg) => write!(f, "corrupt data: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
+            Self::Collision(msg) => write!(f, "record collision: {msg}"),
         }
     }
 }
@@ -489,12 +587,50 @@ impl From<StorageError> for std::io::Error {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, message)
             }
             StorageError::Internal(message) => std::io::Error::other(message),
+            StorageError::Collision(message) => {
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, message)
+            }
         }
     }
 }
 
 /// In-memory storage engine for tests.
 ///
+pub(crate) fn hex16(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+pub(crate) fn validate_established_batch_inputs(
+    records: &[(NodeId, NodeData)],
+) -> Result<(), StorageError> {
+    if records.len() > 1 {
+        let mut seen = HashSet::with_capacity(records.len());
+        for (id, _) in records {
+            if *id == COLLECTION_METADATA_RECORD_ID {
+                return Err(StorageError::Internal(
+                    "cannot write reserved metadata record id as application record".to_owned(),
+                ));
+            }
+            if !seen.insert(*id) {
+                return Err(StorageError::Internal(
+                    "duplicate node ID within batch".to_owned(),
+                ));
+            }
+        }
+    } else if let Some((id, _)) = records.first() {
+        if *id == COLLECTION_METADATA_RECORD_ID {
+            return Err(StorageError::Internal(
+                "cannot write reserved metadata record id as application record".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Partitions nodes by collection. Each collection's nodes are tracked in a
 /// per-collection `HashMap`, enabling correct `delete_collection` behavior.
 pub struct InMemoryStorage {
@@ -537,11 +673,24 @@ impl StorageEngine for InMemoryStorage {
             .map(std::collections::HashMap::len))
     }
 
-    fn ensure_collection_metadata(
+    fn create_or_put_established(
         &self,
         collection_id: &[u8; 16],
         metadata: &CollectionMetadata,
+        records: &[(NodeId, NodeData)],
     ) -> Result<(), StorageError> {
+        validate_established_batch_inputs(records)?;
+        if !metadata.verify_collection_id(collection_id) {
+            return Err(StorageError::Internal(
+                "collection metadata does not reproduce collection id".to_owned(),
+            ));
+        }
+        if metadata.collection_canonical_id.is_empty() {
+            return Err(StorageError::Internal(
+                "collection metadata has empty canonical id".to_owned(),
+            ));
+        }
+
         let mut collections = self.collections.write();
         let collection = collections.entry(*collection_id).or_default();
         if let Some(existing) = collection.get(&COLLECTION_METADATA_RECORD_ID) {
@@ -549,22 +698,170 @@ impl StorageEngine for InMemoryStorage {
                 StorageError::Corrupt("malformed collection metadata record".to_owned())
             })?;
             if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
                 return Err(StorageError::Internal(
                     "collection metadata mismatch: existing genesis record differs".to_owned(),
                 ));
             }
+            for (id, data) in records {
+                if let Some(existing_rec) = collection.get(id) {
+                    if existing_rec.bytes != data.bytes {
+                        return Err(StorageError::Collision(format!(
+                            "record collision on node {}",
+                            hex16(id)
+                        )));
+                    }
+                } else {
+                    collection.insert(*id, data.clone());
+                }
+            }
+        } else {
+            if !collection.is_empty() {
+                return Err(StorageError::Internal(
+                    "genesis metadata must be written before the collection's first record"
+                        .to_owned(),
+                ));
+            }
+            collection.insert(
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(metadata.encode().into()),
+            );
+            for (id, data) in records {
+                collection.insert(*id, data.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn put_many_established(
+        &self,
+        collection_id: &[u8; 16],
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        validate_established_batch_inputs(records)?;
+        if records.is_empty() {
             return Ok(());
         }
-        if !collection.is_empty() {
-            return Err(StorageError::Internal(
-                "genesis metadata must be written before the collection's first record".to_owned(),
+        let mut collections = self.collections.write();
+        let collection = collections
+            .get_mut(collection_id)
+            .ok_or(StorageError::NotFound(*collection_id))?;
+        let existing = collection
+            .get(&COLLECTION_METADATA_RECORD_ID)
+            .ok_or(StorageError::NotFound(*collection_id))?;
+        let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+            StorageError::Corrupt("malformed collection metadata record".to_owned())
+        })?;
+        if !found.verify_collection_id(collection_id) {
+            return Err(StorageError::Corrupt(
+                "stored collection metadata does not reproduce collection id".to_owned(),
             ));
         }
-        collection.insert(
-            COLLECTION_METADATA_RECORD_ID,
-            NodeData::new(metadata.encode().into()),
-        );
+
+        for (id, data) in records {
+            if let Some(existing_rec) = collection.get(id) {
+                if existing_rec.bytes != data.bytes {
+                    return Err(StorageError::Collision(format!(
+                        "record collision on node {}",
+                        hex16(id)
+                    )));
+                }
+            } else {
+                collection.insert(*id, data.clone());
+            }
+        }
         Ok(())
+    }
+
+    fn create_or_upsert_established_validated(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        node_id: &NodeId,
+        data: &NodeData,
+        validate: &mut dyn FnMut(Option<&NodeData>) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        if node_id == &COLLECTION_METADATA_RECORD_ID {
+            return Err(StorageError::Internal(
+                "cannot write application record to reserved collection metadata node id"
+                    .to_owned(),
+            ));
+        }
+        if !metadata.verify_collection_id(collection_id) {
+            return Err(StorageError::Internal(
+                "collection metadata does not reproduce collection id".to_owned(),
+            ));
+        }
+        if metadata.collection_canonical_id.is_empty() {
+            return Err(StorageError::Internal(
+                "collection metadata has empty canonical id".to_owned(),
+            ));
+        }
+        if metadata.record_id_rule.policy != FrameIdPolicy::Key {
+            return Err(StorageError::Internal(
+                "create_or_upsert_established_validated requires FrameIdPolicy::Key".to_owned(),
+            ));
+        }
+
+        let mut collections = self.collections.write();
+        let exists = collections
+            .get(collection_id)
+            .and_then(|c| c.get(&COLLECTION_METADATA_RECORD_ID))
+            .is_some();
+
+        if exists {
+            let collection = collections.get_mut(collection_id).expect("checked above");
+            let existing_meta_rec = collection
+                .get(&COLLECTION_METADATA_RECORD_ID)
+                .expect("checked above");
+            let found = CollectionMetadata::decode(&existing_meta_rec.bytes).ok_or_else(|| {
+                StorageError::Corrupt("malformed collection metadata record".to_owned())
+            })?;
+            if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
+                return Err(StorageError::Internal(
+                    "collection metadata mismatch: existing genesis record differs".to_owned(),
+                ));
+            }
+
+            let existing = collection.get(node_id);
+            validate(existing)?;
+
+            if let Some(existing) = existing {
+                if existing.bytes == data.bytes {
+                    return Ok(());
+                }
+            }
+            collection.insert(*node_id, data.clone());
+        } else {
+            if let Some(c) = collections.get(collection_id) {
+                if !c.is_empty() {
+                    return Err(StorageError::Internal(
+                        "genesis metadata must be written before the collection's first record"
+                            .to_owned(),
+                    ));
+                }
+            }
+
+            validate(None)?;
+
+            let collection = collections.entry(*collection_id).or_default();
+            collection.insert(
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(metadata.encode().into()),
+            );
+            collection.insert(*node_id, data.clone());
+        }
+
+        Ok(())
+    }
+
+    fn ensure_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+    ) -> Result<(), StorageError> {
+        self.create_or_put_established(collection_id, metadata, &[])
     }
 
     fn get_many(
@@ -630,13 +927,12 @@ impl StorageEngine for InMemoryStorage {
 /// this against their own store, so the assertions live in one place instead
 /// of drifting copies.
 pub(crate) fn assert_collection_len_counts_genesis_and_distinct_ids(store: &dyn StorageEngine) {
-    use crate::template::{CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
-
-    let collection = [0x7Bu8; 16];
-    assert_eq!(store.collection_len(&collection).unwrap(), None);
+    use crate::template::{
+        derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+    };
 
     let metadata = CollectionMetadata {
-        pool_dst: Some(*b"EVNT"),
+        member_namespace: Some(*b"EVNT"),
         collection_canonical_id: b"!room:matrix.org".to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::Pointer {
@@ -646,7 +942,13 @@ pub(crate) fn assert_collection_len_counts_genesis_and_distinct_ids(store: &dyn 
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: None,
+        schema: None,
     };
+    let collection =
+        derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
+    assert_eq!(store.collection_len(&collection).unwrap(), None);
+
     store
         .ensure_collection_metadata(&collection, &metadata)
         .unwrap();
@@ -741,19 +1043,13 @@ mod tests {
     #[test]
     fn collection_metadata_roundtrips_and_verifies() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
 
         let store = InMemoryStorage::new();
-        let collection = [0x5Au8; 16];
-        assert_eq!(
-            store.get_collection_metadata(&collection).unwrap(),
-            None,
-            "a fresh collection has no genesis metadata"
-        );
-
         let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -763,7 +1059,17 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
+            role: None,
+            schema: None,
         };
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            None,
+            "a fresh collection has no genesis metadata"
+        );
+
         store
             .ensure_collection_metadata(&collection, &metadata)
             .unwrap();
@@ -794,11 +1100,12 @@ mod tests {
     #[test]
     fn genesis_metadata_must_precede_the_first_record() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
 
         let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -808,11 +1115,14 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         };
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
 
         // Correct order: metadata first, then records.
         let ordered = InMemoryStorage::new();
-        let collection = [0x6Bu8; 16];
         ordered
             .ensure_collection_metadata(&collection, &metadata)
             .unwrap();
@@ -848,7 +1158,8 @@ mod tests {
     #[test]
     fn empty_collection_entry_does_not_block_genesis_metadata() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
 
         // An empty collection entry holds no record, so it must not be mistaken
@@ -856,12 +1167,8 @@ mod tests {
         // `put_many` no longer creates such an entry (an empty batch is a
         // no-op), so build it directly to keep the guard covered.
         let store = InMemoryStorage::new();
-        let collection = [0x7Cu8; 16];
-        store.collections.write().entry(collection).or_default();
-        assert!(store.collection_exists(&collection));
-
         let metadata = CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -871,7 +1178,14 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         };
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
+        store.collections.write().entry(collection).or_default();
+        assert!(store.collection_exists(&collection));
+
         store
             .ensure_collection_metadata(&collection, &metadata)
             .unwrap();
@@ -902,14 +1216,14 @@ mod tests {
     #[test]
     fn ensure_collection_metadata_is_atomic_under_concurrency() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
         use std::sync::Arc;
 
         let store = Arc::new(InMemoryStorage::new());
-        let collection = [0x7Du8; 16];
         let metadata = Arc::new(CollectionMetadata {
-            pool_dst: Some(*b"EVNT"),
+            member_namespace: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Pointer {
@@ -919,7 +1233,11 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         });
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -1013,6 +1331,10 @@ mod tests {
             StorageError::Internal("oops".into()).to_string(),
             "internal error: oops"
         );
+        assert_eq!(
+            StorageError::Collision("conflict".into()).to_string(),
+            "record collision: conflict"
+        );
     }
 
     #[test]
@@ -1021,6 +1343,8 @@ mod tests {
         assert!(StorageError::Io(io).source().is_some());
         assert!(StorageError::NotFound([0; 16]).source().is_none());
         assert!(StorageError::Corrupt(String::new()).source().is_none());
+        assert!(StorageError::Internal(String::new()).source().is_none());
+        assert!(StorageError::Collision(String::new()).source().is_none());
     }
 
     #[test]
@@ -1048,6 +1372,9 @@ mod tests {
 
         let internal: std::io::Error = StorageError::Internal("mbz".into()).into();
         assert_eq!(internal.kind(), std::io::ErrorKind::Other);
+
+        let collision: std::io::Error = StorageError::Collision("dup".into()).into();
+        assert_eq!(collision.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
@@ -1071,5 +1398,357 @@ mod tests {
         store.delete_collection(&TEST_COLLECTION).unwrap();
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_none());
         store.sync().unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn established_collection_lifecycle_and_validation() {
+        use crate::template::{
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
+        };
+
+        let store = InMemoryStorage::new();
+        let canonical_id = b"sys:test-col";
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
+
+        let valid_meta = CollectionMetadata {
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
+            collection_canonical_id: canonical_id.to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_auxiliary".to_owned()),
+            schema: None,
+        };
+
+        // 1. Rejects metadata if it does not reproduce collection id
+        let wrong_col_id = [0x99; 16];
+        assert!(store
+            .create_or_put_established(&wrong_col_id, &valid_meta, &[])
+            .is_err());
+
+        // 2. Rejects metadata if canonical id is empty
+        let empty_canonical_meta = CollectionMetadata {
+            collection_canonical_id: Vec::new(),
+            ..valid_meta.clone()
+        };
+        assert!(store
+            .create_or_put_established(&col_id, &empty_canonical_meta, &[])
+            .is_err());
+
+        // 3. Rejects application records containing COLLECTION_METADATA_RECORD_ID
+        let bad_rec = (
+            COLLECTION_METADATA_RECORD_ID,
+            NodeData::new(bytes::Bytes::from_static(b"bad")),
+        );
+        assert!(store
+            .create_or_put_established(&col_id, &valid_meta, &[bad_rec])
+            .is_err());
+
+        // 4. Rejects duplicate node IDs within a single batch
+        let node_a = [0x01; 16];
+        let dup_rec1 = (node_a, NodeData::new(bytes::Bytes::from_static(b"data1")));
+        let dup_rec2 = (node_a, NodeData::new(bytes::Bytes::from_static(b"data2")));
+        assert!(store
+            .create_or_put_established(&col_id, &valid_meta, &[dup_rec1.clone(), dup_rec2])
+            .is_err());
+
+        // 5. Successful atomic establishment with records
+        let node_b = [0x02; 16];
+        let rec_b = (node_b, NodeData::new(bytes::Bytes::from_static(b"datab")));
+        store
+            .create_or_put_established(&col_id, &valid_meta, &[dup_rec1.clone(), rec_b.clone()])
+            .unwrap();
+
+        // Stored metadata matches
+        let stored_meta = store.get_collection_metadata(&col_id).unwrap().unwrap();
+        assert_eq!(stored_meta, valid_meta);
+        assert_eq!(
+            store.get(&col_id, &node_a).unwrap().unwrap().bytes,
+            b"data1"[..]
+        );
+        assert_eq!(
+            store.get(&col_id, &node_b).unwrap().unwrap().bytes,
+            b"datab"[..]
+        );
+
+        // 6. Conflicting metadata on existing collection fails closed
+        let conflicting_meta = CollectionMetadata {
+            role: Some("other_role".to_owned()),
+            ..valid_meta.clone()
+        };
+        assert!(store
+            .create_or_put_established(&col_id, &conflicting_meta, &[])
+            .is_err());
+
+        // 7. Idempotent success on matching record
+        store
+            .create_or_put_established(&col_id, &valid_meta, &[dup_rec1])
+            .unwrap();
+
+        // 8. Collision error on different payload for existing key
+        let collision_rec = (
+            node_a,
+            NodeData::new(bytes::Bytes::from_static(b"collision")),
+        );
+        let err = store
+            .create_or_put_established(&col_id, &valid_meta, std::slice::from_ref(&collision_rec))
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Collision(_)));
+
+        // 9. put_many_established on existing collection
+        let node_c = [0x03; 16];
+        let rec_c = (node_c, NodeData::new(bytes::Bytes::from_static(b"datac")));
+        store.put_many_established(&col_id, &[rec_c]).unwrap();
+        assert_eq!(
+            store.get(&col_id, &node_c).unwrap().unwrap().bytes,
+            b"datac"[..]
+        );
+
+        // 10. put_many_established fails on payload collision
+        let err = store
+            .put_many_established(&col_id, &[collision_rec])
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Collision(_)));
+
+        // 11. put_many_established fails on non-existent collection
+        assert!(store
+            .put_many_established(
+                &[0xee; 16],
+                &[(node_a, NodeData::new(bytes::Bytes::from_static(b"data")))]
+            )
+            .is_err());
+
+        // 12. Corrupted stored metadata detection: stored canonical id does not reproduce collection id
+        let meta_colliding = CollectionMetadata {
+            collection_canonical_id: b"sys:other-room".to_vec(),
+            ..valid_meta.clone()
+        };
+        let target_col_id = derive_collection_id(
+            meta_colliding.member_namespace,
+            &meta_colliding.collection_canonical_id,
+        );
+        let sim_store = InMemoryStorage::new();
+        // Existing collection was established with valid_meta (which does not reproduce target_col_id)
+        sim_store
+            .collections
+            .write()
+            .entry(target_col_id)
+            .or_default()
+            .insert(
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(valid_meta.encode().into()),
+            );
+        let err = sim_store
+            .create_or_put_established(&target_col_id, &meta_colliding, &[])
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+
+        // 13. Unknown member namespace rejected on establishment
+        let meta_unknown = CollectionMetadata {
+            member_namespace: Some(*b"EDGE"),
+            ..valid_meta.clone()
+        };
+        let err_unknown = sim_store
+            .create_or_put_established(&target_col_id, &meta_unknown, &[])
+            .unwrap_err();
+        assert!(matches!(err_unknown, StorageError::Internal(_)));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_or_upsert_established_validated_contract() {
+        use crate::template::{
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
+        };
+
+        let store = InMemoryStorage::new();
+        let canonical_id = b"sys:validated-upsert";
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
+
+        let valid_meta = CollectionMetadata {
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
+            collection_canonical_id: canonical_id.to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_auxiliary".to_owned()),
+            schema: None,
+        };
+
+        let node_id = [0x11; 16];
+        let data1 = NodeData::new(bytes::Bytes::from_static(b"value_1"));
+
+        // 1. Rejects policy != Key
+        let mut non_key_meta = valid_meta.clone();
+        non_key_meta.record_id_rule.policy = FrameIdPolicy::Pointer {
+            pointer: "/event_id".into(),
+        };
+        let err = store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &non_key_meta,
+                &node_id,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+
+        // 2. Rejects reserved node ID
+        let err = store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &COLLECTION_METADATA_RECORD_ID,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+
+        // 3. Validation failure on absent collection leaves collection absent!
+        let err = store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data1,
+                &mut |existing| {
+                    assert!(existing.is_none());
+                    Err(StorageError::Internal("aborted by validator".into()))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+        assert_eq!(store.get_collection_metadata(&col_id).unwrap(), None);
+        assert!(store.get(&col_id, &node_id).unwrap().is_none());
+        assert!(!store.collection_exists(&col_id));
+
+        // 4. First successful write establishes collection and writes record atomically
+        store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data1,
+                &mut |existing| {
+                    assert!(existing.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_collection_metadata(&col_id).unwrap().unwrap(),
+            valid_meta
+        );
+        assert_eq!(
+            store.get(&col_id, &node_id).unwrap().unwrap().bytes,
+            b"value_1"[..]
+        );
+
+        // 5. Idempotent retry: same key + same payload -> Ok(())
+        let mut callback_ran = false;
+        store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data1,
+                &mut |existing| {
+                    callback_ran = true;
+                    assert_eq!(existing.unwrap().bytes, b"value_1"[..]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(callback_ran);
+
+        // 6. Same key replacement succeeds and updates value
+        let data2 = NodeData::new(bytes::Bytes::from_static(b"value_2_updated"));
+        store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data2,
+                &mut |existing| {
+                    assert_eq!(existing.unwrap().bytes, b"value_1"[..]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.get(&col_id, &node_id).unwrap().unwrap().bytes,
+            b"value_2_updated"[..]
+        );
+
+        // 7. Validation failure on existing record aborts without updating
+        let data3 = NodeData::new(bytes::Bytes::from_static(b"value_3_collision"));
+        let err = store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data3,
+                &mut |existing| {
+                    assert_eq!(existing.unwrap().bytes, b"value_2_updated"[..]);
+                    Err(StorageError::Collision("key digest mismatch".into()))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Collision(_)));
+        // Value remains uncorrupted:
+        assert_eq!(
+            store.get(&col_id, &node_id).unwrap().unwrap().bytes,
+            b"value_2_updated"[..]
+        );
+
+        // 8. Corrupted stored metadata on identity: existing collection metadata does not reproduce collection id
+        let meta_colliding = CollectionMetadata {
+            collection_canonical_id: b"sys:validated-other".to_vec(),
+            ..valid_meta.clone()
+        };
+        let target_col_id = derive_collection_id(
+            meta_colliding.member_namespace,
+            &meta_colliding.collection_canonical_id,
+        );
+        let sim_store = InMemoryStorage::new();
+        sim_store
+            .collections
+            .write()
+            .entry(target_col_id)
+            .or_default()
+            .insert(
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(valid_meta.encode().into()),
+            );
+        let err = sim_store
+            .create_or_upsert_established_validated(
+                &target_col_id,
+                &meta_colliding,
+                &node_id,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+    }
+
+    #[test]
+    fn storage_engine_trait_object_safety() {
+        let store = InMemoryStorage::new();
+        let trait_ref: &dyn StorageEngine = &store;
+        let arc_trait: Arc<dyn StorageEngine> = Arc::new(InMemoryStorage::new());
+        assert!(!trait_ref.collection_exists(&[0u8; 16]));
+        assert!(!arc_trait.collection_exists(&[0u8; 16]));
     }
 }

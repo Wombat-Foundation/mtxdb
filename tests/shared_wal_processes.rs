@@ -1,7 +1,3 @@
-#![cfg(feature = "multi-reader")]
-// Integration tests are test code by construction; this file has no non-test
-// items to wrap in a `#[cfg(test)]` module.
-#![allow(clippy::tests_outside_test_module)]
 //! Two real OS processes, one shared WAL.
 //!
 //! The parent test is the writer: it opens a [`SharedDatabase`] (which holds
@@ -13,6 +9,11 @@
 //! This is the cross-process half of the shared durability fence: the reader
 //! takes no writer lock, never touches the writer's handle, and must observe
 //! a committed record the writer produced in another process.
+
+#![cfg(feature = "multi-reader")]
+// Integration tests are test code by construction; this file has no non-test
+// items to wrap in a `#[cfg(test)]` module.
+#![allow(clippy::tests_outside_test_module)]
 
 use std::path::PathBuf;
 

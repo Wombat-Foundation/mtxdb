@@ -92,6 +92,24 @@ impl SharedDatabase {
     pub fn pool(&self, shard: ShardType) -> &Arc<PackfileStorage> {
         &self.pools[shard_index(shard)]
     }
+
+    /// The State store (`ShardType::State`).
+    #[must_use]
+    pub fn state(&self) -> &Arc<PackfileStorage> {
+        self.pool(ShardType::State)
+    }
+
+    /// The Event DAG store (`ShardType::EventDag`).
+    #[must_use]
+    pub fn event_dag(&self) -> &Arc<PackfileStorage> {
+        self.pool(ShardType::EventDag)
+    }
+
+    /// The Edges store (`ShardType::Edges`), hosting PREV and AUTH edge collections.
+    #[must_use]
+    pub fn edges(&self) -> &Arc<PackfileStorage> {
+        self.pool(ShardType::Edges)
+    }
 }
 
 /// The base LSN a fresh shared WAL for `layout` must start above: one past the
@@ -266,11 +284,11 @@ mod tests {
         for (name, layout_code) in [("legacy_seed_perpool", 0u8), ("legacy_seed_shared", 1u8)] {
             let root = test_root(name);
             std::fs::create_dir_all(root.join("pools/state")).unwrap();
-            let mut meta = Vec::from(b"MDBD".as_slice());
+            let mut meta = Vec::from(b"MTXD".as_slice());
             meta.push(1);
             meta.extend_from_slice(&[0u8; 8]);
             meta[4 + 1] = layout_code; // reserved[0] is the WAL-layout byte
-            meta.extend_from_slice(b"state\nevent-dag\nedges\n");
+            meta.extend_from_slice(b"state\nevent\nedges\n");
             std::fs::write(root.join("db.meta"), meta).unwrap();
             // A checkpoint watermark recorded before the shared segment existed.
             std::fs::write(root.join("pools/state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
@@ -317,10 +335,10 @@ mod tests {
             root.join("db.meta"),
             // `WalLayout::PerPool` marker: reserved WAL-layout byte 0.
             {
-                let mut bytes = Vec::from(b"MDBD".as_slice());
+                let mut bytes = Vec::from(b"MTXD".as_slice());
                 bytes.push(1);
                 bytes.extend_from_slice(&[0u8; 8]);
-                bytes.extend_from_slice(b"state\nevent-dag\nedges\n");
+                bytes.extend_from_slice(b"state\nevent\nedges\n");
                 bytes
             },
         )

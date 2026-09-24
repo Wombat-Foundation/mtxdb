@@ -224,7 +224,17 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             id,
             raw,
             verbose,
-        } => cmd_get(cli, collection.as_deref(), id, *raw, *verbose),
+            header,
+            decode,
+        } => cmd_get(
+            cli,
+            collection.as_deref(),
+            id,
+            *raw,
+            *verbose,
+            *header,
+            decode.as_deref(),
+        ),
         Commands::Collections {
             all,
             layout,
@@ -234,10 +244,15 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
-        Commands::Info { collection, .. } => cmd_info(cli, collection),
+        Commands::Info { collection, stats } => match collection {
+            Some(collection) => cmd_info(cli, collection),
+            None => cmd_info_default(cli, *stats),
+        },
         Commands::Scan {
             selector,
             verbose,
+            header,
+            decode,
             limit,
             id,
             collection,
@@ -248,6 +263,8 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cli,
             selector,
             *verbose,
+            *header,
+            decode.as_deref(),
             *limit,
             id.as_deref(),
             collection.as_deref(),
@@ -424,10 +441,12 @@ fn parse_get_id(id: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
-/// Pool namespace discriminator for Matrix room collections, mixed into
-/// [`derive_collection_id`]. Matrix room events live in the `EventDag` pool, so
-/// they use that pool's DST.
-const MATRIX_ROOM_POOL_DST: Option<[u8; 4]> = Some(ShardType::EventDag.pool_dst());
+/// Member namespace discriminator for Matrix room collections, mixed into
+/// [`derive_collection_id`]. Matrix room events use the `EVNT` namespace.
+const MATRIX_ROOM_MEMBER_NAMESPACE: Option<[u8; 4]> = Some(mtxdb::MEMBER_NAMESPACE_EVNT);
+#[deprecated(note = "use MATRIX_ROOM_MEMBER_NAMESPACE")]
+#[allow(dead_code)]
+const MATRIX_ROOM_POOL_DST: Option<[u8; 4]> = MATRIX_ROOM_MEMBER_NAMESPACE;
 
 fn blake3_digest(data: &[u8]) -> [u8; 32] {
     mtxdb::content_digest(DigestAlgorithm::Blake3, data)
@@ -443,7 +462,7 @@ fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
 
 /// Derive the BLAKE3 collection ID for a canonical Matrix room ID.
 fn matrix_room_collection_id(room_id: &str) -> [u8; 16] {
-    derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
+    derive_collection_id(MATRIX_ROOM_MEMBER_NAMESPACE, room_id.as_bytes())
 }
 
 /// Resolve a collection selector: a `0x`-prefixed logical ID (the engine's
@@ -640,7 +659,7 @@ fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
 
 /// A collection ID not found under `cli.shard_type` is often just in one of
 /// the *other* independent shard-type pools (`-t`/`--shard-type` defaults
-/// to `event-dag`, so a `state`-only collection ID "not found" there is the
+/// to `event`, so a `state`-only collection ID "not found" there is the
 /// single most common `scan`/`info` support question). Cheaply checks each
 /// other pool's persisted sidecar (no full-scan fallback, no index rebuild)
 /// and, if any has it, returns a one-line hint naming them; `String::new()`
@@ -731,9 +750,39 @@ fn cmd_put(cli: &Cli, collection: &str, id: &str, data: &str) -> anyhow::Result<
     Ok(())
 }
 
-fn emit_get_data(data: &NodeData, raw: bool) -> anyhow::Result<()> {
-    let emitted = if raw {
+fn emit_get_data(data: &NodeData, raw: bool, decode: Option<&str>) -> anyhow::Result<()> {
+    let emitted = if raw || decode == Some("raw") {
         data.bytes.to_vec()
+    } else if let Some(mode) = decode {
+        match mode {
+            "json" => pretty_json_stream(&data.bytes)
+                .ok_or_else(|| anyhow::anyhow!("payload is not valid JSON"))?,
+            "hamt" => decode_hamt_root(&data.bytes)
+                .or_else(|| decode_hamt_node(&data.bytes))
+                .ok_or_else(|| anyhow::anyhow!("payload is not a valid HAMT root or node"))?,
+            "state" => {
+                if data.bytes.len() == 8 {
+                    let state_group = u64::from_be_bytes(data.bytes.as_ref().try_into().unwrap());
+                    format!("PTR: 0x{state_group:016x}\n").into_bytes()
+                } else if let Some(hamt) =
+                    decode_hamt_root(&data.bytes).or_else(|| decode_hamt_node(&data.bytes))
+                {
+                    hamt
+                } else {
+                    bail!("payload is not a state group pointer or HAMT node");
+                }
+            }
+            "auto" => {
+                if let Some(rendered) = pretty_print_payload(&data.bytes) {
+                    rendered
+                } else {
+                    hex_bytes(&data.bytes).into_bytes()
+                }
+            }
+            other => {
+                bail!("unsupported decode format `{other}`; choose json, hamt, state, raw, or auto")
+            }
+        }
     } else if let Some(rendered) = pretty_print_payload(&data.bytes) {
         rendered
     } else {
@@ -742,10 +791,74 @@ fn emit_get_data(data: &NodeData, raw: bool) -> anyhow::Result<()> {
     io::stdout().write_all(&emitted)?;
     // Raw output stays byte-exact. All textual output is
     // newline-terminated, including encoded binary fallbacks.
-    if !raw && !emitted.ends_with(b"\n") {
+    if !raw && decode != Some("raw") && !emitted.ends_with(b"\n") {
         io::stdout().write_all(b"\n")?;
     }
     Ok(())
+}
+
+fn print_get_header(
+    node_id: &[u8; 16],
+    collection_id: &[u8; 16],
+    shard_type: ShardType,
+    data: &NodeData,
+    store: Option<&PackfileStorage>,
+) {
+    eprintln!("header:");
+    eprintln!("  collection:  {}", format_id(collection_id));
+    eprintln!("  node:        {}", format_id(node_id));
+    eprintln!("  pool:        {}", shard_type.as_str());
+    eprintln!("  payload:     {} bytes", data.bytes.len());
+    if *node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+        if let Some(meta) = CollectionMetadata::decode(&data.bytes) {
+            let pool = meta.member_namespace.as_ref().map_or_else(
+                || "none".to_owned(),
+                |d| String::from_utf8_lossy(d).into_owned(),
+            );
+            let role = meta.role.as_ref().map_or_else(
+                || "unspecified".to_owned(),
+                std::string::ToString::to_string,
+            );
+            let schema = meta.schema.as_deref().unwrap_or("none");
+            let verified = meta.verify_collection_id(collection_id);
+            let verify_str = if verified {
+                "valid"
+            } else {
+                "MISMATCH / CORRUPT"
+            };
+            eprintln!("  genesis metadata:");
+            eprintln!("    pool:      {pool}");
+            eprintln!("    role:      {role}");
+            eprintln!("    schema:    {schema}");
+            eprintln!(
+                "    canonical: {}",
+                String::from_utf8_lossy(&meta.collection_canonical_id)
+            );
+            eprintln!("    identity:  {verify_str}");
+        }
+    } else if let Some(store) = store {
+        if let Ok(Some(meta)) = store.get_collection_metadata(collection_id) {
+            let role = meta.role.as_ref().map_or_else(
+                || "unspecified".to_owned(),
+                std::string::ToString::to_string,
+            );
+            let schema = meta.schema.as_deref().unwrap_or("none");
+            let verified = meta.verify_collection_id(collection_id);
+            let verify_str = if verified {
+                "valid"
+            } else {
+                "MISMATCH / CORRUPT"
+            };
+            eprintln!("  collection metadata:");
+            eprintln!("    role:      {role}");
+            eprintln!("    schema:    {schema}");
+            eprintln!(
+                "    canonical: {}",
+                String::from_utf8_lossy(&meta.collection_canonical_id)
+            );
+            eprintln!("    identity:  {verify_str}");
+        }
+    }
 }
 
 fn print_get_verbose(
@@ -836,12 +949,15 @@ fn extract_origin_server_ts(bytes: &[u8]) -> Option<u64> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_get_single(
     cli: &Cli,
     collection: Option<&str>,
     id: &str,
     raw: bool,
     verbose: bool,
+    header: bool,
+    decode: Option<&str>,
 ) -> anyhow::Result<()> {
     let node_id = parse_get_id(id)?;
     if cli.shard_type.is_none() {
@@ -859,10 +975,16 @@ fn cmd_get_single(
         match matches.as_slice() {
             [] => bail!("not found"),
             [(shard_type, collection_id, data)] => {
+                if header {
+                    let store = pool_dir(&db_layout, *shard_type)
+                        .ok()
+                        .and_then(|dir| PackfileStorage::open_read_only(dir).ok());
+                    print_get_header(&node_id, collection_id, *shard_type, data, store.as_ref());
+                }
                 if verbose {
                     print_get_verbose(id, &node_id, *shard_type, collection_id, data);
                 }
-                emit_get_data(data, raw)
+                emit_get_data(data, raw, decode)
             }
             _ => {
                 let locations = matches
@@ -887,10 +1009,19 @@ fn cmd_get_single(
         match matches.as_slice() {
             [] => bail!("not found{}", other_shard_type_node_hint(cli, &node_id)),
             [(collection_id, data)] => {
+                if header {
+                    print_get_header(
+                        &node_id,
+                        collection_id,
+                        cli.require_shard_type()?,
+                        data,
+                        Some(&store),
+                    );
+                }
                 if verbose {
                     print_get_verbose(id, &node_id, cli.require_shard_type()?, collection_id, data);
                 }
-                emit_get_data(data, raw)
+                emit_get_data(data, raw, decode)
             }
             _ => bail!(
                 "node ID {id} is present in multiple collections ({}); specify --collection",
@@ -904,12 +1035,15 @@ fn cmd_get_single(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_get_coalesced(
     cli: &Cli,
     collection: Option<&str>,
     id: &str,
     raw: bool,
     verbose: bool,
+    header: bool,
+    decode: Option<&str>,
 ) -> anyhow::Result<()> {
     struct Candidate {
         db_dir: PathBuf,
@@ -996,6 +1130,20 @@ fn cmd_get_coalesced(
         selected
     };
 
+    if header {
+        let store = DatabaseLayout::open_read_only(winner.db_dir.clone())
+            .ok()
+            .and_then(|layout| pool_dir(&layout, winner.shard_type).ok())
+            .and_then(|dir| PackfileStorage::open_read_only(dir).ok());
+        print_get_header(
+            &node_id,
+            &winner.collection_id,
+            winner.shard_type,
+            &winner.data,
+            store.as_ref(),
+        );
+    }
+
     if verbose {
         print_get_verbose(
             id,
@@ -1008,26 +1156,29 @@ fn cmd_get_coalesced(
         eprintln!("  candidates: {} database match(es)", candidates.len());
     }
 
-    emit_get_data(&winner.data, raw)
+    emit_get_data(&winner.data, raw, decode)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_get(
     cli: &Cli,
     collection: Option<&str>,
     id: &str,
     raw: bool,
     verbose: bool,
+    header: bool,
+    decode: Option<&str>,
 ) -> anyhow::Result<()> {
     let dirs = cli.dirs_or_default();
     if dirs.len() > 1 {
         if cli.coalesce {
-            return cmd_get_coalesced(cli, collection, id, raw, verbose);
+            return cmd_get_coalesced(cli, collection, id, raw, verbose, header, decode);
         }
         return run_multi_dir(cli, |sub_cli| {
-            cmd_get_single(sub_cli, collection, id, raw, verbose)
+            cmd_get_single(sub_cli, collection, id, raw, verbose, header, decode)
         });
     }
-    cmd_get_single(cli, collection, id, raw, verbose)
+    cmd_get_single(cli, collection, id, raw, verbose, header, decode)
 }
 
 /// Render arbitrary payload bytes safely for terminal output. Raw bytes stay
@@ -1434,7 +1585,7 @@ fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Resolve the pool set for commands that can list every independent pool.
-/// An explicit `--all` must override the CLI's default `event-dag` selection;
+/// An explicit `--all` must override the CLI's default `event` selection;
 /// otherwise `collections --all`/`shards --all` silently list only one pool.
 fn listing_shard_types(cli: &Cli, all: bool) -> Vec<ShardType> {
     if all {
@@ -1574,32 +1725,40 @@ fn cmd_collections_coalesced(
             } else {
                 None
             };
-            let canonical_map: HashMap<[u8; 16], String> =
-                if canonical {
-                    PackfileStorage::open_read_only(pool_dir.clone())
+            let canonical_map: HashMap<[u8; 16], String> = if canonical {
+                PackfileStorage::open_read_only(pool_dir.clone())
                         .ok()
                         .map(|store| {
                             summaries
                                 .iter()
-                                .filter_map(|(id, _, _, _)| {
-                                    store.get_collection_metadata(id).ok().flatten().map(
+                                .map(|(id, _, _, _)| {
+                                    let display = store.get_collection_metadata(id).ok().flatten().map_or_else(
+                                        || "[unregistered]".to_owned(),
                                         |metadata| {
-                                            (
-                                                *id,
-                                                String::from_utf8_lossy(
-                                                    &metadata.collection_canonical_id,
-                                                )
-                                                .into_owned(),
-                                            )
+                                            let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
+                                            if metadata.verify_collection_id(id) {
+                                                if let Some(role) = &metadata.role {
+                                                    format!("{raw} ({role})")
+                                                } else {
+                                                    raw.into_owned()
+                                                }
+                                            } else {
+                                                eprintln!(
+                                                    "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
+                                                    format_id(id)
+                                                );
+                                                format!("[mismatch: {raw}]")
+                                            }
                                         },
-                                    )
+                                    );
+                                    (*id, display)
                                 })
                                 .collect()
                         })
                         .unwrap_or_default()
-                } else {
-                    HashMap::new()
-                };
+            } else {
+                HashMap::new()
+            };
 
             for (col_id, nodes, memory, capacity) in summaries {
                 let disk = physical
@@ -1645,7 +1804,12 @@ fn cmd_collections_coalesced(
                 entry.avoidable = entry.avoidable.saturating_add(avoidable);
                 if let Some(c) = canonical_map.get(&col_id) {
                     if let Some(existing) = &entry.canonical {
-                        if existing != c {
+                        if existing == "[unregistered]" && c != "[unregistered]" {
+                            entry.canonical = Some(c.clone());
+                        } else if existing != "[unregistered]"
+                            && c != "[unregistered]"
+                            && existing != c
+                        {
                             entry.canonical_conflict = true;
                             eprintln!(
                                 "warning: conflicting canonical IDs for collection {}: `{existing}` vs `{c}`",
@@ -1706,6 +1870,7 @@ fn cmd_collections_coalesced(
             .map(String::len)
             .max()
             .unwrap_or(0)
+            .max("[unregistered]".len())
             .max("canonical".len());
 
         print_collection_table_header(layout, canonical, canonical_width);
@@ -1731,9 +1896,12 @@ fn cmd_collections_coalesced(
         for item in ordered.into_iter().take(max_rows) {
             let hex = format_id(&item.id);
             let canonical_id = if item.canonical_conflict {
-                format!("{}*", item.canonical.as_deref().unwrap_or("-"))
+                format!("{}*", item.canonical.as_deref().unwrap_or("[unregistered]"))
             } else {
-                item.canonical.as_deref().unwrap_or("-").to_owned()
+                item.canonical
+                    .as_deref()
+                    .unwrap_or("[unregistered]")
+                    .to_owned()
             };
             let load = fmt_load_percent(item.nodes, item.capacity);
             let shards = if item.shards_count == 1 {
@@ -1874,18 +2042,31 @@ fn cmd_collections_in_dir(
             .map(|store| {
                 collections
                     .iter()
-                    .filter_map(|(id, _, _, _)| {
-                        store
+                    .map(|(id, _, _, _)| {
+                        let display = store
                             .get_collection_metadata(id)
                             .ok()
                             .flatten()
-                            .map(|metadata| {
-                                (
-                                    *id,
-                                    String::from_utf8_lossy(&metadata.collection_canonical_id)
-                                        .into_owned(),
-                                )
-                            })
+                            .map_or_else(
+                                || "[unregistered]".to_owned(),
+                                |metadata| {
+                                    let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
+                                    if metadata.verify_collection_id(id) {
+                                        if let Some(role) = &metadata.role {
+                                            format!("{raw} ({role})")
+                                        } else {
+                                            raw.into_owned()
+                                        }
+                                    } else {
+                                        eprintln!(
+                                            "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
+                                            format_id(id)
+                                        );
+                                        format!("[mismatch: {raw}]")
+                                    }
+                                },
+                            );
+                        (*id, display)
                     })
                     .collect()
             })
@@ -1973,6 +2154,7 @@ fn cmd_collections_in_dir(
         .map(String::len)
         .max()
         .unwrap_or(0)
+        .max("[unregistered]".len())
         .max("canonical".len());
     print_collection_table_header(layout, canonical, canonical_width);
     let mut total_nodes = 0_usize;
@@ -1996,7 +2178,9 @@ fn cmd_collections_in_dir(
     };
     for (_, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
         let hex = format_id(collection_id);
-        let canonical_id = canonical_ids.get(collection_id).map_or("-", String::as_str);
+        let canonical_id = canonical_ids
+            .get(collection_id)
+            .map_or("[unregistered]", String::as_str);
         let load = fmt_load_percent(*nodes, *capacity);
         let shards = collection_shards
             .as_ref()
@@ -2119,7 +2303,7 @@ const SECTION_RULE: &str =
 
 /// Prints one `--all` section's fenced header: a rule, an uppercased
 /// `-- NAME --` banner (hyphens in the pool's directory name become spaces,
-/// e.g. `event-dag` -> `EVENT DAG`), another rule, then a blank line.
+/// e.g. `event` -> `EVENT`), another rule, then a blank line.
 fn print_section_header(shard_type: ShardType) {
     let banner = shard_type.as_str().replace('-', " ").to_uppercase();
     println!("{SECTION_RULE}");
@@ -2440,7 +2624,7 @@ fn cmd_shards_coalesced(
 
 fn cmd_shards_single(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
     // See the matching comment in `cmd_collections`: `-t all` must behave
-    // like `--all`, not list only the default event-dag pool.
+    // like `--all`, not list only the default event pool.
     if all || cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let types = listing_shard_types(cli, all);
@@ -3733,6 +3917,126 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Show the small, human-facing database and pool metadata summary used when
+/// `info` has no selector. This deliberately reads headers and sidecar sizes
+/// without opening a writer or scanning pack payloads.
+fn cmd_info_default(cli: &Cli, stats: bool) -> anyhow::Result<()> {
+    if cli.coalesce {
+        let valid_dirs = valid_database_dirs(cli)?;
+        if valid_dirs.len() > 1 {
+            for (index, dir) in valid_dirs.iter().enumerate() {
+                if index != 0 {
+                    println!();
+                    println!();
+                }
+                println!("=== Database: {} ===", dir.display());
+                cmd_info_default(&cli.with_dir(dir.clone()), stats)?;
+            }
+            return Ok(());
+        }
+    }
+    run_multi_dir(cli, |sub_cli| cmd_info_default_single(sub_cli, stats))
+}
+
+fn metadata_file_summary(path: &Path) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return "missing".to_owned();
+    };
+    let magic = bytes.get(..4).map_or_else(
+        || "<short>".to_owned(),
+        |raw| String::from_utf8_lossy(raw).into_owned(),
+    );
+    let version = bytes
+        .get(4)
+        .map_or_else(|| "?".to_owned(), std::string::ToString::to_string);
+    format!(
+        "valid-looking magic={magic:?} version={version} ({} bytes)",
+        bytes.len()
+    )
+}
+
+fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let root = cli.single_dir();
+    let db_meta = root.join(mtxdb::layout::DB_META_FILENAME);
+    let wal = match layout.wal_layout() {
+        mtxdb::layout::WalLayout::Shared => "shared",
+        mtxdb::layout::WalLayout::PerPool => "per-pool",
+    };
+
+    println!("database: {}", root.display());
+    println!("  db.meta:      {}", metadata_file_summary(&db_meta));
+    println!("  wal layout:   {wal}");
+    println!();
+
+    for (index, shard_type) in cli.shard_types().enumerate() {
+        if index != 0 {
+            println!();
+        }
+        let dir = pool_dir(&layout, shard_type)?;
+        let packs = glob_pack_files(&dir)?;
+        let pack_bytes = packs.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
+        let collection_count =
+            PackfileStorage::collection_summaries_from_disk(&dir).map(|summaries| summaries.len());
+        let checkpoint = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
+        let delta = dir.join(mtxdb::index::delta::INDEX_DELTA_FILE);
+
+        println!("pool: {} ({})", shard_type.as_str(), dir.display());
+        println!(
+            "  pool.meta:    {}",
+            metadata_file_summary(&dir.join("pool.meta"))
+        );
+        println!(
+            "  store.meta:   {}",
+            metadata_file_summary(&dir.join("store.meta"))
+        );
+        println!(
+            "  packs:        {} ({})",
+            packs.len(),
+            fmt_bytes(pack_bytes)
+        );
+        println!(
+            "  collections:  {}",
+            collection_count.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+        );
+        println!(
+            "  index:        checkpoint={} delta={}",
+            if checkpoint.is_file() {
+                fmt_bytes(fs::metadata(&checkpoint)?.len())
+            } else {
+                "missing".to_owned()
+            },
+            if delta.is_file() {
+                fmt_bytes(fs::metadata(&delta)?.len())
+            } else {
+                "missing".to_owned()
+            }
+        );
+        println!(
+            "  shard sidecars: stats={} collections={}",
+            if dir.join("shard_stats.bin").is_file() {
+                "present"
+            } else {
+                "missing"
+            },
+            if dir.join("shard_collections.bin").is_file() {
+                "present"
+            } else {
+                "missing"
+            }
+        );
+
+        if stats {
+            let (runtime, summaries) = read_stats_for_dir(&dir)?;
+            println!("  stats:        {} pack summaries", summaries.len());
+            if let Some(timing) = runtime.last_open_timings {
+                println!("  open path:    {}", open_path_label(timing.path));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     if cli.coalesce {
         return cmd_info_coalesced(cli, selector);
@@ -4213,11 +4517,13 @@ fn collection_metadata_for(
     collection_canonical_id: &str,
 ) -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: template.collection_key.pool_dst,
+        member_namespace: template.collection_key.member_namespace,
         collection_canonical_id: collection_canonical_id.as_bytes().to_vec(),
         record_id_rule: template.record_id_rule.clone(),
         payload: template.payload.clone(),
         extension: Some(extension.encode_blob()),
+        role: Some("event_dag".to_owned()),
+        schema: Some("matrix.event.v1".to_owned()),
     }
 }
 
@@ -4694,12 +5000,23 @@ fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
                 .as_deref()
                 .and_then(MatrixRoomExtension::decode_blob)
                 .is_some();
-            let pool = metadata.pool_dst.map_or_else(
+            let pool = metadata.member_namespace.map_or_else(
                 || "none".to_owned(),
                 |dst| String::from_utf8_lossy(&dst).into_owned(),
             );
+            let role_str = metadata.role.as_ref().map_or_else(
+                || "unspecified".to_owned(),
+                std::string::ToString::to_string,
+            );
+            let schema_str = metadata.schema.as_deref().unwrap_or("none");
+            let verified = metadata.verify_collection_id(collection_id);
+            let verify_str = if verified {
+                "valid"
+            } else {
+                "MISMATCH / CORRUPT"
+            };
             println!(
-                "  {:<12} pool {pool}; canonical id {}",
+                "  {:<12} pool {pool}; role {role_str}; schema {schema_str}; canonical id {} (verification: {verify_str})",
                 "identity:",
                 String::from_utf8_lossy(&metadata.collection_canonical_id)
             );
@@ -4781,6 +5098,8 @@ fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
 )]
 struct ScanOptions {
     verbose: bool,
+    header: bool,
+    decode: Option<String>,
     limit: i64,
     node_id: Option<[u8; 16]>,
     raw: bool,
@@ -4816,12 +5135,16 @@ impl ScanOptions {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools,
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
 fn cmd_scan_coalesced(
     cli: &Cli,
     selector: &str,
     verbose: bool,
+    header: bool,
+    decode: Option<&str>,
     limit: i64,
     id: Option<&str>,
     collection: Option<&str>,
@@ -4909,7 +5232,7 @@ fn cmd_scan_coalesced(
         let sub_cli = cli.with_dir(matching_dirs[0].clone());
         println!("database: {}", matching_dirs[0].display());
         cmd_scan_single(
-            &sub_cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+            &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
         )?;
     } else {
         for (i, db_dir) in matching_dirs.iter().enumerate() {
@@ -4919,7 +5242,8 @@ fn cmd_scan_coalesced(
             println!("=== Database: {} ===", db_dir.display());
             let sub_cli = cli.with_dir(db_dir.clone());
             if let Err(e) = cmd_scan_single(
-                &sub_cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+                &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort,
+                reverse,
             ) {
                 eprintln!("error in `{}`: {e:#}", db_dir.display());
             }
@@ -4936,12 +5260,15 @@ fn cmd_scan_coalesced(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
 fn cmd_scan(
     cli: &Cli,
     selector: &str,
     verbose: bool,
+    header: bool,
+    decode: Option<&str>,
     limit: i64,
     id: Option<&str>,
     collection: Option<&str>,
@@ -4951,24 +5278,27 @@ fn cmd_scan(
 ) -> anyhow::Result<()> {
     if cli.coalesce {
         return cmd_scan_coalesced(
-            cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+            cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
         );
     }
     run_multi_dir(cli, |sub_cli| {
         cmd_scan_single(
-            sub_cli, selector, verbose, limit, id, collection, raw, sort, reverse,
+            sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
         )
     })
 }
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
     reason = "maps 1:1 to CLI args before building ScanOptions"
 )]
 fn cmd_scan_single(
     cli: &Cli,
     selector: &str,
     verbose: bool,
+    header: bool,
+    decode: Option<&str>,
     limit: i64,
     id: Option<&str>,
     collection: Option<&str>,
@@ -4977,13 +5307,15 @@ fn cmd_scan_single(
     reverse: bool,
 ) -> anyhow::Result<()> {
     let sort_column = sort.map(SortColumn::from_str).transpose()?;
-    if sort_column == Some(SortColumn::Payload) && (!verbose || raw) {
-        bail!("scan sorting requires --verbose and cannot be combined with --raw");
+    if sort_column == Some(SortColumn::Payload) && (!verbose && decode.is_none() || raw) {
+        bail!("scan sorting requires --verbose or --decode and cannot be combined with --raw");
     }
     let node_id = id.map(parse_node_id).transpose()?;
     let collection_filter = collection.map(parse_collection_selector).transpose()?;
     let opts = ScanOptions {
         verbose,
+        header,
+        decode: decode.map(str::to_owned),
         limit,
         node_id,
         raw,
@@ -5040,6 +5372,7 @@ fn cmd_scan_single(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the pack scan helper receives the explicit scan filters and output options"
 )]
 fn scan_pack(
@@ -5055,7 +5388,7 @@ fn scan_pack(
     let mut records = Vec::new();
     let mut matched_records = 0usize;
     let mut truncated = false;
-    let verify_payload = opts.verbose || opts.raw;
+    let verify_payload = opts.verbose || opts.header || opts.decode.is_some() || opts.raw;
     for record in mtxdb::packfile::scan_packfile_iter(path, verify_payload)? {
         let (record_collection, record_id, offset) = record?;
         // TODO: tied to MSRV 1.81.0 — replace with .is_none_or() once the
@@ -5128,8 +5461,8 @@ fn scan_pack(
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = format_id(collection_id);
         let id_hex = format_id(node_id);
-        let data = opts
-            .verbose
+        let need_record = opts.verbose || opts.header || opts.decode.is_some();
+        let data = need_record
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
             .transpose()?;
         let payload = data
@@ -5139,10 +5472,62 @@ fn scan_pack(
             "{}",
             scan_table_row(&collection_hex, &id_hex, *offset, payload.as_deref())
         );
-        if let Some(data) =
-            data.filter(|data| scan_payload_suffix(&data.data, shard_type).is_none())
-        {
-            print_scan_payload(&data.data);
+        if opts.header {
+            if let Some(record) = &data {
+                if *node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+                    if let Some(meta) = CollectionMetadata::decode(&record.data) {
+                        let pool = meta.member_namespace.as_ref().map_or_else(
+                            || "none".to_owned(),
+                            |d| String::from_utf8_lossy(d).into_owned(),
+                        );
+                        let role = meta.role.as_ref().map_or_else(
+                            || "unspecified".to_owned(),
+                            std::string::ToString::to_string,
+                        );
+                        let schema = meta.schema.as_deref().unwrap_or("none");
+                        let verified = meta.verify_collection_id(collection_id);
+                        let verify_str = if verified {
+                            "valid"
+                        } else {
+                            "MISMATCH / CORRUPT"
+                        };
+                        println!(
+                            "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
+                            String::from_utf8_lossy(&meta.collection_canonical_id)
+                        );
+                    } else {
+                        println!("    [header] genesis metadata (corrupt TLV block)");
+                    }
+                } else if let Some(meta) = &record.metadata {
+                    let mut details = Vec::new();
+                    if let Some(logical_id) = &meta.logical_id {
+                        details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
+                    }
+                    if let Some(content_digest) = &meta.content_digest {
+                        details.push(format!("digest: 0x{}", hex::encode(content_digest)));
+                    }
+                    if let Some(role) = &meta.role {
+                        details.push(format!("role: {}", String::from_utf8_lossy(role)));
+                    }
+                    if details.is_empty() {
+                        println!(
+                            "    [header] frame metadata block present (no recognized fields)"
+                        );
+                    } else {
+                        println!("    [header] frame metadata: {}", details.join(", "));
+                    }
+                } else {
+                    println!("    [header] standard frame (no metadata block)");
+                }
+            }
+        }
+        let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
+        if should_decode {
+            if let Some(data) =
+                data.filter(|data| scan_payload_suffix(&data.data, shard_type).is_none())
+            {
+                print_scan_payload(&data.data, opts.decode.as_deref());
+            }
         }
     }
     if truncated {
@@ -5219,7 +5604,13 @@ fn cmd_scan_collection_in_pool(
     let mut context = CollectionScanContext {
         collection_id,
         node_id: opts.node_id,
-        mode: CollectionScanMode::new(opts.verbose, opts.raw, opts.sort),
+        mode: CollectionScanMode::new(
+            opts.verbose,
+            opts.raw,
+            opts.sort,
+            opts.header,
+            opts.decode.is_some(),
+        ),
         max_rows,
         frames: 0,
         raw_matches: Vec::new(),
@@ -5229,6 +5620,8 @@ fn cmd_scan_collection_in_pool(
         reverse: opts.reverse,
         show_section_header,
         needs_section_spacing,
+        header: opts.header,
+        decode: opts.decode.clone(),
     };
     for (_, shard) in shards {
         if let Some(collection_packs) = &collection_packs {
@@ -5406,6 +5799,8 @@ struct CollectionScanContext {
     reverse: bool,
     show_section_header: bool,
     needs_section_spacing: bool,
+    header: bool,
+    decode: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -5416,10 +5811,11 @@ enum CollectionScanMode {
 }
 
 impl CollectionScanMode {
-    fn new(verbose: bool, raw: bool, sort: Option<SortColumn>) -> Self {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn new(verbose: bool, raw: bool, sort: Option<SortColumn>, header: bool, decode: bool) -> Self {
         if raw {
             Self::Raw { verbose }
-        } else if verbose {
+        } else if verbose || header || decode {
             Self::Verbose { sort }
         } else {
             Self::Plain
@@ -5500,9 +5896,8 @@ fn print_collection_record(
         print_scan_table_header("PACK", scan_payload_label(context.shard_type));
         context.header_printed = true;
     }
-    let data = context
-        .mode
-        .verbose()
+    let need_record = context.mode.verbose() || context.header || context.decode.is_some();
+    let data = need_record
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
     let payload = data.as_ref().map(|data| {
@@ -5521,11 +5916,60 @@ fn print_collection_record(
             payload.as_deref(),
         )
     );
-    if let Some(data) = data.filter(|data| {
-        record_id != mtxdb::COLLECTION_METADATA_RECORD_ID
-            && scan_payload_suffix(&data.data, context.shard_type).is_none()
-    }) {
-        print_scan_payload(&data.data);
+    if context.header {
+        if let Some(record) = &data {
+            if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+                if let Some(meta) = CollectionMetadata::decode(&record.data) {
+                    let pool = meta.member_namespace.as_ref().map_or_else(
+                        || "none".to_owned(),
+                        |d| String::from_utf8_lossy(d).into_owned(),
+                    );
+                    let role = meta.role.as_ref().map_or_else(
+                        || "unspecified".to_owned(),
+                        std::string::ToString::to_string,
+                    );
+                    let schema = meta.schema.as_deref().unwrap_or("none");
+                    let verified = meta.verify_collection_id(&context.collection_id);
+                    let verify_str = if verified {
+                        "valid"
+                    } else {
+                        "MISMATCH / CORRUPT"
+                    };
+                    println!(
+                        "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
+                        String::from_utf8_lossy(&meta.collection_canonical_id)
+                    );
+                } else {
+                    println!("    [header] genesis metadata (corrupt TLV block)");
+                }
+            } else if let Some(meta) = &record.metadata {
+                let mut details = Vec::new();
+                if let Some(logical_id) = &meta.logical_id {
+                    details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
+                }
+                if let Some(content_digest) = &meta.content_digest {
+                    details.push(format!("digest: 0x{}", hex::encode(content_digest)));
+                }
+                if let Some(role) = &meta.role {
+                    details.push(format!("role: {}", String::from_utf8_lossy(role)));
+                }
+                if details.is_empty() {
+                    println!("    [header] frame metadata block present (no recognized fields)");
+                } else {
+                    println!("    [header] frame metadata: {}", details.join(", "));
+                }
+            } else {
+                println!("    [header] standard frame (no metadata block)");
+            }
+        }
+    }
+    let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
+    if should_decode {
+        if let Some(data) =
+            data.filter(|data| scan_payload_suffix(&data.data, context.shard_type).is_none())
+        {
+            print_scan_payload(&data.data, context.decode.as_deref());
+        }
     }
     Ok(())
 }
@@ -5554,10 +5998,31 @@ fn eprint_scan_limit_note(total: usize, limit: usize) {
 
 /// Print a readable payload for `scan --verbose` without ever treating an
 /// arbitrary binary record as terminal text.
-fn print_scan_payload(data: &[u8]) {
-    let pretty = pretty_print_payload(data).expect("undecodable payloads use an inline suffix");
-    for line in String::from_utf8_lossy(&pretty).lines() {
-        println!("    {line}");
+fn print_scan_payload(data: &[u8], decode: Option<&str>) {
+    let rendered = if let Some(mode) = decode {
+        match mode {
+            "json" => pretty_json_stream(data),
+            "hamt" => decode_hamt_root(data).or_else(|| decode_hamt_node(data)),
+            "state" => {
+                if data.len() == 8 {
+                    let state_group = u64::from_be_bytes(data.try_into().unwrap());
+                    Some(format!("PTR: 0x{state_group:016x}\n").into_bytes())
+                } else {
+                    decode_hamt_root(data).or_else(|| decode_hamt_node(data))
+                }
+            }
+            "raw" => Some(hex_bytes(data).into_bytes()),
+            _ => pretty_print_payload(data),
+        }
+    } else {
+        pretty_print_payload(data)
+    };
+    if let Some(pretty) = rendered {
+        for line in String::from_utf8_lossy(&pretty).lines() {
+            println!("    {line}");
+        }
+    } else {
+        println!("    {}", hex_bytes(data));
     }
 }
 
@@ -5669,7 +6134,7 @@ fn default_matrix_import_template() -> CollectionTemplate {
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: "/room_id".into(),
-            pool_dst: MATRIX_ROOM_POOL_DST,
+            member_namespace: MATRIX_ROOM_MEMBER_NAMESPACE,
             display_id_pointer: "/room_id".into(),
         },
         establishment: Some(EstablishmentRule {
@@ -5814,7 +6279,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     // The collection-id derivation is a fixed, core-owned function of a pool
     // namespace discriminator rather than a template-selected digest algorithm.
     // The Matrix import profile targets the EventDag pool.
-    let pool_dst = MATRIX_ROOM_POOL_DST;
+    let member_namespace = MATRIX_ROOM_MEMBER_NAMESPACE;
     if let Some(policy) = template
         .get("record")
         .and_then(|r| r.get("payload"))
@@ -5856,7 +6321,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
         payload: PayloadPolicy::Source,
         collection_key: CollectionKeyRule {
             pointer: membership_pointer.to_owned(),
-            pool_dst,
+            member_namespace,
             display_id_pointer: display_id_pointer.to_owned(),
         },
         establishment: Some(establishment),
@@ -5985,7 +6450,7 @@ fn template_node_id(
 /// membership value (e.g. a Matrix `room_id`), producing the collection ID.
 fn template_collection_id(template: &CollectionTemplate, membership_value: &str) -> [u8; 16] {
     derive_collection_id(
-        template.collection_key.pool_dst,
+        template.collection_key.member_namespace,
         membership_value.as_bytes(),
     )
 }
@@ -6145,15 +6610,14 @@ fn cmd_import_file(
 
         // Import auth chain events into the edges shard pool.
         if !federation.auth_chain.is_empty() {
-            // Derive the edges pool dir from the event-dag pool dir.
-            // pool_dir is {root}/pools/event-dag; edges is {root}/pools/edges.
-            let auth_chain_dir = dir
+            // Derive the edges pool dir from the event pool dir.
+            // pool_dir is {root}/pools/event; edges is {root}/pools/edges.
+            let edges_dir = dir
                 .parent()
                 .map(|p| p.join("edges"))
                 .context("deriving edges pool path")?;
-            fs::create_dir_all(&auth_chain_dir)?;
-            let auth_store =
-                PackfileStorage::open(auth_chain_dir).context("opening edges store")?;
+            fs::create_dir_all(&edges_dir)?;
+            let auth_store = PackfileStorage::open(edges_dir).context("opening edges store")?;
             // This open bypasses `open_store`, so carry the caller's
             // `--read-plan` choice over from the event store instead of
             // silently running the default.
@@ -6165,7 +6629,8 @@ fn cmd_import_file(
             // only the missing records via `put_many` — one read plan and one
             // index/pack generation per collection instead of N individual
             // `put` round trips.
-            let mut by_collection: HashMap<[u8; 16], Vec<ImportBatchEntry>> = HashMap::new();
+            let mut by_collection: HashMap<([u8; 16], String), Vec<ImportBatchEntry>> =
+                HashMap::new();
             for ev in &federation.auth_chain {
                 let Some(incoming_event_id) = event_id(ev) else {
                     auth_skipped = auth_skipped.saturating_add(1);
@@ -6175,17 +6640,33 @@ fn cmd_import_file(
                     auth_skipped = auth_skipped.saturating_add(1);
                     continue;
                 };
-                let collection_id = event_room_id(ev).map_or([0u8; 16], |room_id| {
-                    template_collection_id(template, room_id)
-                });
+                let room_id_str = event_room_id(ev)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        if matrix_create_event_id(ev).is_some() {
+                            establishment_identity(ev)
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| detected_collection.clone());
+                let Some(room_id) = room_id_str else {
+                    auth_skipped = auth_skipped.saturating_add(1);
+                    continue;
+                };
+                let collection_id =
+                    derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
                 let event_bytes = ev.encode().into_bytes();
-                by_collection.entry(collection_id).or_default().push((
-                    id_bytes,
-                    incoming_event_id.to_owned(),
-                    NodeData::new(bytes::Bytes::from(event_bytes)),
-                ));
+                by_collection
+                    .entry((collection_id, room_id))
+                    .or_default()
+                    .push((
+                        id_bytes,
+                        incoming_event_id.to_owned(),
+                        NodeData::new(bytes::Bytes::from(event_bytes)),
+                    ));
             }
-            for (collection_id, entries) in by_collection {
+            for ((collection_id, room_id), entries) in by_collection {
                 // Same dedup rule as the PDU path: the 128-bit node ID is a
                 // truncated hash, so two distinct event IDs mapping to one key
                 // is a collision to reject, not collapse; a repeat with the
@@ -6222,7 +6703,20 @@ fn cmd_import_file(
                     }
                 }
                 if !to_write.is_empty() {
-                    auth_store.put_many(&collection_id, &to_write)?;
+                    let auth_metadata = CollectionMetadata {
+                        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_AUTH),
+                        collection_canonical_id: room_id.into_bytes(),
+                        record_id_rule: template.record_id_rule.clone(),
+                        payload: template.payload.clone(),
+                        extension: None,
+                        role: Some("auth_chain".to_owned()),
+                        schema: Some("matrix.event.v1".to_owned()),
+                    };
+                    auth_store.create_or_put_established(
+                        &collection_id,
+                        &auth_metadata,
+                        &to_write,
+                    )?;
                     // Deliberate semantic change from the pre-batching loop,
                     // which counted every accepted input event including ones
                     // already on disk: `auth_count` now reports only genuinely
@@ -6387,10 +6881,9 @@ fn import_pdu_events(
         established_collections.insert(collection_id);
         let extension = MatrixRoomExtension::from_events(events);
         let metadata = collection_metadata_for(template, &extension, &resolved.canonical_id);
-        store.ensure_collection_metadata(&collection_id, &metadata)?;
-    }
-
-    if !to_write.is_empty() {
+        store.create_or_put_established(&collection_id, &metadata, &to_write)?;
+        event_count = event_count.saturating_add(to_write.len() as u64);
+    } else if !to_write.is_empty() {
         if let Some(order) = topological_event_order(events) {
             let mut order_by_node = HashMap::with_capacity(order.len());
             for event in events {
@@ -6441,7 +6934,7 @@ fn import_pdu_events(
     };
     if !state_groups.is_empty() {
         use mtxdb::auxiliary::AuxiliaryIndex;
-        let aux = AuxiliaryIndex::open(state_store, "matrix-state-groups");
+        let aux = AuxiliaryIndex::open(state_store, "sys:matrix-state-groups");
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
             .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
@@ -8414,13 +8907,15 @@ mod tests {
         matrix_room_extension_from_store, parse_federation_input, parse_pack_id_selector,
         parse_pack_selectors, pretty_print_payload, resolve_import_collection, run,
         scan_payload_suffix, template_collection_id, template_node_id, verify_auth_chain_edges,
-        CollectionTemplate, MatrixRoomExtension, StateSet, MATRIX_ROOM_POOL_DST,
+        CollectionTemplate, MatrixRoomExtension, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
     use mtxdb::packfile::storage::PackfileStorage;
     use mtxdb::storage::{NodeData, StorageEngine};
-    use mtxdb::template::{CollectionKeyRule, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
+    use mtxdb::template::{
+        CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+    };
     use mtxdb::{
         content_digest, derive_collection_id, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion,
         ShardType,
@@ -8687,7 +9182,7 @@ mod tests {
             coalesce: false,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
-                collection: String::new(),
+                collection: Some(String::new()),
                 stats: false,
             },
         };
@@ -8804,11 +9299,125 @@ mod tests {
                 id: node_hex.clone(),
                 raw: false,
                 verbose: false,
+                header: false,
+                decode: None,
             },
         };
 
-        cmd_get(&cli, None, &node_hex, false, false).unwrap();
-        cmd_get(&cli, Some(&col_hex), &node_hex, true, false).unwrap();
+        cmd_get(&cli, None, &node_hex, false, false, false, None).unwrap();
+        cmd_get(&cli, Some(&col_hex), &node_hex, true, false, false, None).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn get_and_scan_with_header_and_decode() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+        let store = PackfileStorage::open(state_dir).unwrap();
+
+        let canonical_id = b"sys:flat-kv";
+        let col_id = derive_collection_id(Some(*b"INTL"), canonical_id);
+        let genesis_meta = CollectionMetadata {
+            member_namespace: Some(*b"INTL"),
+            collection_canonical_id: canonical_id.to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Payload,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_kv".to_owned()),
+            schema: None,
+        };
+
+        store
+            .ensure_collection_metadata(&col_id, &genesis_meta)
+            .unwrap();
+
+        let node_id = [0x42; 16];
+        let data = NodeData::new(Bytes::from_static(b"{\"hello\":\"world\"}\n"));
+        store.put(&col_id, &node_id, &data).unwrap();
+        store.sync().unwrap();
+
+        let col_hex = format_id(&col_id);
+        let genesis_hex = format_id(&mtxdb::COLLECTION_METADATA_RECORD_ID);
+        let node_hex = format_id(&node_id);
+
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: None,
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Get {
+                collection: Some(col_hex.clone()),
+                id: node_hex.clone(),
+                raw: false,
+                verbose: false,
+                header: true,
+                decode: Some("json".to_owned()),
+            },
+        };
+
+        // Test get on data node with header and json decode
+        cmd_get(
+            &cli,
+            Some(&col_hex),
+            &node_hex,
+            false,
+            false,
+            true,
+            Some("json"),
+        )
+        .unwrap();
+
+        // Test get on data node with raw decode
+        cmd_get(
+            &cli,
+            Some(&col_hex),
+            &node_hex,
+            false,
+            false,
+            false,
+            Some("raw"),
+        )
+        .unwrap();
+
+        // Test get on genesis node with header
+        cmd_get(&cli, Some(&col_hex), &genesis_hex, false, false, true, None).unwrap();
+
+        // Test scan on collection with header and decode
+        cmd_scan(
+            &cli,
+            &col_hex,
+            false,
+            true,
+            Some("json"),
+            -1,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Test scan on collection with raw decode
+        cmd_scan(
+            &cli,
+            &col_hex,
+            false,
+            false,
+            Some("raw"),
+            -1,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -8832,7 +9441,7 @@ mod tests {
             coalesce: false,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
-                collection: col_hex.clone(),
+                collection: Some(col_hex.clone()),
                 stats: false,
             },
         };
@@ -8862,6 +9471,8 @@ mod tests {
             command: Commands::Scan {
                 selector: col_hex.clone(),
                 verbose: false,
+                header: false,
+                decode: None,
                 limit: -1,
                 id: None,
                 collection: None,
@@ -8871,7 +9482,10 @@ mod tests {
             },
         };
 
-        cmd_scan(&cli, &col_hex, false, -1, None, None, false, None, false).unwrap();
+        cmd_scan(
+            &cli, &col_hex, false, false, None, -1, None, None, false, None, false,
+        )
+        .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -8892,7 +9506,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             collection_key: CollectionKeyRule {
                 pointer: "/room_id".into(),
-                pool_dst: MATRIX_ROOM_POOL_DST,
+                member_namespace: MATRIX_ROOM_MEMBER_NAMESPACE,
                 display_id_pointer: "/room_id".into(),
             },
             establishment: None,
@@ -9097,7 +9711,7 @@ mod tests {
     #[test]
     fn auth_chain_reimport_writes_nothing_new() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let input = root.join("export.json");
@@ -9145,15 +9759,24 @@ mod tests {
         let auth_dir = pool_dir.parent().unwrap().join("edges");
         assert_eq!(
             count_pack_records(&auth_dir),
-            1,
-            "the edges pool must hold exactly the one imported auth event, unchanged by the reimport"
+            2,
+            "the edges pool must hold genesis metadata and the one imported auth event, unchanged by the reimport"
         );
+        let auth_store = PackfileStorage::open(auth_dir).unwrap();
+        let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");
+        let meta = auth_store
+            .get_collection_metadata(&auth_col)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.role.as_deref(), Some("auth_chain"));
+        assert_eq!(meta.collection_canonical_id, b"!room");
+        assert!(meta.verify_collection_id(&auth_col));
     }
 
     #[test]
     fn import_establishment_persists_the_matrix_extension() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let input = root.join("export.json");
@@ -9195,7 +9818,7 @@ mod tests {
             .unwrap()
             .expect("establishment must write the genesis metadata record");
         assert_eq!(metadata.collection_canonical_id, b"!room");
-        assert_eq!(metadata.pool_dst, MATRIX_ROOM_POOL_DST);
+        assert_eq!(metadata.member_namespace, MATRIX_ROOM_MEMBER_NAMESPACE);
         let blob = metadata.extension.expect("Matrix room extension blob");
 
         // The self-describing blob is readable back through the same path
@@ -9516,7 +10139,7 @@ mod tests {
     #[test]
     fn import_v12_followup_batch_lands_in_the_create_collection() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let template = default_matrix_import_template();
@@ -9600,7 +10223,7 @@ mod tests {
     #[test]
     fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event-dag");
+        let pool_dir = root.join("pools").join("event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let template = default_matrix_import_template();
@@ -10506,11 +11129,11 @@ mod tests {
         let room_id = "!roomid:example.org";
         assert_eq!(
             hex::encode(matrix_room_collection_id(room_id)),
-            "e0828dba265372f79ef010da2c83cd96"
+            "e82141db836a47fedb667d6249aaa94b"
         );
         assert_eq!(
             matrix_room_collection_id(room_id),
-            derive_collection_id(MATRIX_ROOM_POOL_DST, room_id.as_bytes())
+            derive_collection_id(MATRIX_ROOM_MEMBER_NAMESPACE, room_id.as_bytes())
         );
     }
 
@@ -10666,11 +11289,13 @@ mod tests {
                 id: hex_id.clone(),
                 raw: true,
                 verbose: true,
+                header: false,
+                decode: None,
             },
         };
 
         // Coalesced get should succeed and pick the newer candidate
-        cmd_get(&cli, None, &hex_id, true, true).unwrap();
+        cmd_get(&cli, None, &hex_id, true, true, false, None).unwrap();
 
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();
@@ -10843,7 +11468,7 @@ mod tests {
             coalesce: true,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
-                collection: format_id(&col1),
+                collection: Some(format_id(&col1)),
                 stats: false,
             },
         };
@@ -10857,6 +11482,8 @@ mod tests {
             command: Commands::Scan {
                 selector: format_id(&col1),
                 verbose: false,
+                header: false,
+                decode: None,
                 limit: 10,
                 id: None,
                 collection: None,
@@ -10869,6 +11496,8 @@ mod tests {
             &cli_scan,
             &format_id(&col1),
             false,
+            false,
+            None,
             10,
             None,
             None,
@@ -10879,7 +11508,10 @@ mod tests {
         .unwrap();
 
         let missing = format_id(&[0x99; 16]);
-        assert!(cmd_scan(&cli_scan, &missing, false, 10, None, None, false, None, false,).is_err());
+        assert!(cmd_scan(
+            &cli_scan, &missing, false, false, None, 10, None, None, false, None, false
+        )
+        .is_err());
 
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();

@@ -22,10 +22,10 @@ use std::path::{Path, PathBuf};
 /// points validate this root and open their selected named pool through this
 /// type; [`PackfileStorage`](crate::PackfileStorage) remains available as a
 /// lower-level single-pool API.
-const DB_META_MAGIC: &[u8; 4] = b"MDBD";
+const DB_META_MAGIC: &[u8; 4] = b"MTXD";
 const DB_META_VERSION: u8 = 1;
 const DB_META_RESERVED_LEN: usize = 8;
-const DB_META_POOL_LIST: &[u8] = b"state\nevent-dag\nedges\n";
+const DB_META_POOL_LIST: &[u8] = b"state\nevent\nedges\n";
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
@@ -170,7 +170,7 @@ pub enum ShardType {
     State,
     /// Event JSON plus collection-DAG-oriented event data.
     EventDag,
-    /// Auth-chain manifests and their closure traversal data.
+    /// Edges pool: houses previous-event edges (`PREV`) and auth-chain edges (`AUTH`).
     Edges,
 }
 
@@ -183,21 +183,37 @@ impl ShardType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::State => "state",
-            Self::EventDag => "event-dag",
+            Self::EventDag => "event",
             Self::Edges => "edges",
         }
     }
 
-    /// Stable 4-byte namespace discriminator mixed into collection and record
-    /// logical-id derivation. Keeps the same canonical id distinct across pools
-    /// (e.g. `!room` in the `EventDag` pool versus the State pool).
+    /// Stable 4-byte physical pool tag used in physical layout and diagnostic labeling.
+    ///
+    /// # Note
+    /// This is a physical storage pool tag (e.g. `EDGE`), **not** a logical
+    /// member namespace (`PREV` / `AUTH`). Collection derivation MUST use logical
+    /// member namespaces, never this physical pool tag.
     #[must_use]
-    pub const fn pool_dst(self) -> [u8; 4] {
+    pub const fn physical_pool_tag(self) -> [u8; 4] {
         match self {
             Self::State => *b"STAT",
             Self::EventDag => *b"EVNT",
-            Self::Edges => *b"AUTH",
+            Self::Edges => *b"EDGE",
         }
+    }
+
+    /// Deprecated compatibility alias for [`Self::physical_pool_tag`].
+    ///
+    /// # Warning
+    /// This returns a physical pool tag, not a member namespace. Do not pass
+    /// this to collection derivation functions.
+    #[deprecated(
+        note = "use physical_pool_tag; ShardType must not be passed to collection derivation"
+    )]
+    #[must_use]
+    pub const fn pool_dst(self) -> [u8; 4] {
+        self.physical_pool_tag()
     }
 }
 
@@ -410,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             layout.pool_dir(ShardType::EventDag).unwrap(),
-            root.join("pools/event-dag")
+            root.join("pools/event")
         );
         assert_eq!(
             layout.pool_dir(ShardType::Edges).unwrap(),
@@ -452,7 +468,7 @@ mod tests {
     fn rejects_a_truncated_descriptor() {
         let root = test_dir("truncated_descriptor");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(DB_META_FILENAME), b"MDBD").unwrap();
+        fs::write(root.join(DB_META_FILENAME), b"MTXD").unwrap();
         let err = DatabaseLayout::open(root).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
