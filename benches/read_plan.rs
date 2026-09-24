@@ -404,6 +404,29 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
+/// Total size in bytes of every regular file under `dir`, recursively. Used
+/// to express a read's device bytes as a fraction of the store, so a full
+/// scan is visible as ~1.0 rather than having to be inferred.
+fn store_size_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            total += store_size_bytes(&entry.path());
+        } else if kind.is_file() {
+            if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 // ── Measurement ─────────────────────────────────────────────────────
 
 struct Row {
@@ -661,6 +684,11 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     // reopen, so release the ingest writer first.
     drop(store);
 
+    // Actual on-disk store size, to express a read as a fraction of the
+    // store and catch full scans / re-reads the byte floor alone cannot.
+    let store_bytes = store_size_bytes(&dir);
+    println!("  store size:   {}", fmt_bytes(store_bytes));
+
     // ── Measure ──
     println!();
     println!(
@@ -745,29 +773,49 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     // arrive with no demand fault at all, so `majflt` stays near zero while
     // real device I/O happens.
     //
-    // More than a non-zero check is needed. Eviction can under-deliver and
-    // leave part of the read resident, which still moves some bytes but
-    // makes the timing meaningless. Require each `off` row's device bytes to
-    // exceed half of the read's lower bound — one 4 KiB page per target — so
-    // a half-warm run suppresses the ratio too. The true page count is
-    // >= target_count (each wanted record shares or spans a page), so half
-    // of that is a deliberately loose floor that only catches gross
-    // under-delivery.
-    //
-    // The floor only applies to the sparse set. The dense set is a small
+    // The gate is the sparse `off` row only. The dense set is a small
     // contiguous prefix, so its device bytes are legitimately a tiny
-    // fraction of the file and can sit below the floor even when the read
-    // was fully cold -- checking it would suppress a good run. Dense is
-    // reported for completeness, not used as a gate.
+    // fraction of the store and can sit below the floor even on a fully cold
+    // read -- checking it would suppress a good run. Dense is reported for
+    // completeness, not used as a gate.
+    //
+    // Two checks, because the byte floor alone is not enough:
+    //   * too few bytes -> eviction under-delivered and part of the read was
+    //     served from cache, so the timing is meaningless. Require at least
+    //     half of one 4 KiB page per target (a deliberately loose lower
+    //     bound on the true page count).
+    //   * too many bytes -> the read moved far more than the whole store,
+    //     which is re-reads/scan amplification, not a clean cold read. Warn
+    //     rather than pass silently.
+    // The bytes-vs-store fraction is printed either way; it is the number
+    // that shows at a glance whether a run was a full scan.
     const PAGE_SIZE: u64 = 4096;
     let off_sparse = rows
         .iter()
         .find(|r| r.policy == "off" && r.target == "sparse");
-    let off_cold = off_sparse.is_some_and(|r| {
-        let floor = r.total as u64 * PAGE_SIZE / 2;
-        r.disk_read_bytes.unwrap_or(0) >= floor
-    });
+    let off_bytes = off_sparse.and_then(|r| r.disk_read_bytes).unwrap_or(0);
+    let floor = off_sparse.map_or(0, |r| r.total as u64 * PAGE_SIZE / 2);
+    let fraction = if store_bytes == 0 {
+        None
+    } else {
+        Some(off_bytes as f64 / store_bytes as f64)
+    };
+    let off_cold = off_sparse.is_some() && off_bytes >= floor;
     if off_cold {
+        if let Some(fraction) = fraction {
+            println!();
+            println!(
+                "  sparse `off` read {} off the device = {fraction:.2}× the {} store",
+                fmt_bytes(off_bytes),
+                fmt_bytes(store_bytes),
+            );
+        }
+        if store_bytes > 0 && off_bytes > store_bytes.saturating_mul(2) {
+            println!();
+            println!("  ⚠ sparse `off` read more than twice the store — likely re-reads or");
+            println!("    scan amplification rather than a clean single scan; treat the");
+            println!("    ratio with caution.");
+        }
         for target in ["dense", "sparse"] {
             let off = rows
                 .iter()
