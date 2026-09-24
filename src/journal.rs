@@ -1296,7 +1296,7 @@ impl Journal {
     }
 
     /// Open a shared (multi-pool) journal segment, or create one if the file is
-    /// absent. The segment is created as [`JournalVersion::V3PoolTagged`], so
+    /// absent. The segment is created as `JournalVersion::V3PoolTagged`, so
     /// every mutation frame appended through it must carry a pool tag.
     ///
     /// # Errors

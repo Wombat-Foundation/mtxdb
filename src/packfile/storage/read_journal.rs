@@ -388,7 +388,7 @@ impl PackfileStorage {
     /// `path` is a writer's journal segment. The overlay is built with
     /// [`Journal::scan_read_only`], which never creates, repairs, or locks the
     /// segment, so this is safe from a read-only worker process. The durable
-    /// read API ([`StorageEngine::get_many`], [`Self::get_many_with_refresh`])
+    /// read API ([`crate::storage::StorageEngine::get_many`], [`Self::get_many_with_refresh`])
     /// is unchanged and continues to hide unflushed writes; only
     /// [`Self::get_read_committed`] consults the overlay.
     ///
