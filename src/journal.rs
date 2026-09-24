@@ -2194,30 +2194,19 @@ impl SharedWalLock {
     /// if the lock file cannot be created.
     pub fn acquire(db_root: impl AsRef<Path>) -> io::Result<Self> {
         let db_root = db_root.as_ref();
-        // Fail closed on the layout: never let a caller point a shared WAL at a
-        // root that still declares three per-pool segments (or is not an mtxdb
-        // database root at all).
-        match crate::layout::read_wal_layout(db_root)? {
-            Some(crate::layout::WalLayout::Shared) => {}
-            Some(crate::layout::WalLayout::PerPool) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{} uses the legacy per-pool WAL layout; migrate it before opening a shared WAL",
-                        db_root.display()
-                    ),
-                ));
-            }
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{} is not an mtxdb database root (missing {}); initialize it first",
-                        db_root.display(),
-                        crate::layout::DB_META_FILENAME
-                    ),
-                ));
-            }
+        // Require a database root. A root that predates the shared layout
+        // (marker `PerPool`) is accepted: it is driven through a fresh
+        // root-level shared segment like any other, and its old per-pool WALs
+        // are ignored.
+        if crate::layout::read_wal_layout(db_root)?.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is not an mtxdb database root (missing {}); initialize it first",
+                    db_root.display(),
+                    crate::layout::DB_META_FILENAME
+                ),
+            ));
         }
         let path = db_root.join(".mtxdb.wal.lock");
         Ok(Self {

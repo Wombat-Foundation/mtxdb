@@ -129,6 +129,40 @@ pub fn read_wal_layout(root: &Path) -> io::Result<Option<WalLayout>> {
     Ok(Some(db_meta_wal_layout(&contents)))
 }
 
+/// Nearest enclosing database root for `dir`, if any.
+///
+/// Walks `dir` and its ancestors looking for a `db.meta` descriptor. This is
+/// how a store opened on `root/pools/<pool>` discovers that it lives inside a
+/// shared-WAL root (see the legacy-journal gate in
+/// [`PackfileStorage::enable_journal`](crate::PackfileStorage::enable_journal)).
+///
+/// # Errors
+/// Returns `InvalidData` if a descriptor is found but unrecognized, so a
+/// caller can never mistake a corrupt root for a standalone store.
+pub fn enclosing_root(dir: &Path) -> io::Result<Option<(PathBuf, WalLayout)>> {
+    for ancestor in dir.ancestors() {
+        let meta_path = ancestor.join(DB_META_FILENAME);
+        if !meta_path.is_file() {
+            continue;
+        }
+        let contents = fs::read(&meta_path)?;
+        if !validate_db_meta(&contents) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unrecognized mtxdb database descriptor: {}",
+                    meta_path.display()
+                ),
+            ));
+        }
+        return Ok(Some((
+            ancestor.to_path_buf(),
+            db_meta_wal_layout(&contents),
+        )));
+    }
+    Ok(None)
+}
+
 /// A named independent packfile pool in an mtxdb database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShardType {
@@ -206,9 +240,10 @@ impl DatabaseLayout {
             }
             db_meta_wal_layout(&contents)
         } else {
-            // A newly initialized database-format root uses one shared WAL.
-            // Roots written before this field existed decode as PerPool and
-            // are never silently reinterpreted.
+            // A newly initialized database-format root always uses one shared
+            // WAL. A root written before this field existed decodes as
+            // PerPool; it is opened (see `shared_wal_path`) with a fresh
+            // root-level shared WAL, and its old per-pool WALs are ignored.
             Self::write_descriptor(&meta_path, WalLayout::Shared)?;
             WalLayout::Shared
         };
@@ -283,31 +318,29 @@ impl DatabaseLayout {
         Ok(Self { root, wal_layout })
     }
 
+    /// The database root this layout was opened from.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// WAL layout this root declares.
     #[must_use]
     pub fn wal_layout(&self) -> WalLayout {
         self.wal_layout
     }
 
-    /// Path of the root-level shared WAL, or an error when this root uses the
-    /// legacy per-pool layout.
+    /// Path of the root-level shared WAL, `<root>/wal.bin`.
     ///
-    /// # Errors
-    /// Returns `InvalidData` for a per-pool root, so a caller can never point
-    /// the shared-WAL path at a store that still expects three per-pool
-    /// segments.
-    pub fn shared_wal_path(&self) -> io::Result<PathBuf> {
-        if self.wal_layout != WalLayout::Shared {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "database root {} uses the legacy per-pool WAL layout; \\
-                     migrate it before using a shared WAL",
-                    self.root.display()
-                ),
-            ));
-        }
-        Ok(self.root.join("wal.bin"))
+    /// This is a database-wide constant: every root, old or new, is driven
+    /// through one root-level segment. [`WalLayout`] is retained only to
+    /// *document* a root written before the shared layout existed; it does not
+    /// change this path. A legacy per-pool root is opened with a fresh shared
+    /// segment and its `pools/*/wal.bin` files are ignored (assumed already
+    /// checkpointed into their packs).
+    #[must_use]
+    pub fn shared_wal_path(&self) -> PathBuf {
+        self.root.join("wal.bin")
     }
 
     fn reject_legacy_flat_store(root: &Path) -> io::Result<()> {
@@ -486,14 +519,14 @@ mod tests {
         let layout = DatabaseLayout::open(root.clone()).unwrap();
         assert_eq!(layout.wal_layout(), super::WalLayout::Shared);
         assert_eq!(
-            layout.shared_wal_path().unwrap(),
+            layout.shared_wal_path(),
             root.join("wal.bin"),
             "a shared root's WAL lives at the root"
         );
     }
 
     #[test]
-    fn a_legacy_descriptor_stays_per_pool_and_refuses_the_shared_wal() {
+    fn a_legacy_per_pool_root_opens_onto_a_fresh_shared_wal() {
         let root = test_dir("legacy_per_pool_layout");
         fs::create_dir_all(&root).unwrap();
         // A root written before the WAL-layout field existed: reserved byte 0.
@@ -502,14 +535,31 @@ mod tests {
             super::db_meta_bytes(super::WalLayout::PerPool),
         )
         .unwrap();
+
+        // The marker is retained (it documents the old root) but never blocks
+        // opening: the root is driven through `<root>/wal.bin` like any other,
+        // and its old per-pool WALs are ignored.
         let layout = DatabaseLayout::open(root.clone()).unwrap();
         assert_eq!(layout.wal_layout(), super::WalLayout::PerPool);
-        let err = layout.shared_wal_path().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("legacy per-pool"));
+        assert_eq!(layout.shared_wal_path(), root.join("wal.bin"));
 
-        let read_only = DatabaseLayout::open_read_only(root).unwrap();
+        let read_only = DatabaseLayout::open_read_only(root.clone()).unwrap();
         assert_eq!(read_only.wal_layout(), super::WalLayout::PerPool);
+        assert_eq!(read_only.shared_wal_path(), root.join("wal.bin"));
+    }
+
+    #[test]
+    fn enclosing_root_finds_a_shared_root_from_a_pool_directory() {
+        let root = test_dir("enclosing_root");
+        let layout = DatabaseLayout::open(root.clone()).unwrap();
+        let pool = layout.pool_dir(ShardType::State).unwrap();
+        let (found, wal_layout) = super::enclosing_root(&pool).unwrap().unwrap();
+        assert_eq!(found, root);
+        assert_eq!(wal_layout, super::WalLayout::Shared);
+
+        let standalone = test_dir("enclosing_root_none");
+        fs::create_dir_all(&standalone).unwrap();
+        assert!(super::enclosing_root(&standalone).unwrap().is_none());
     }
 
     #[test]

@@ -193,6 +193,15 @@ impl NodeData {
             children: Vec::new(),
         }
     }
+
+    /// Wrap a byte slice as node data, copying it.
+    ///
+    /// Convenience for callers (including integration tests and language
+    /// bindings) that have a `&[u8]` rather than a `bytes::Bytes`.
+    #[must_use]
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self::new(bytes::Bytes::copy_from_slice(bytes))
+    }
 }
 
 /// A reference to a node that may be resident in cache or need disk fetch.
