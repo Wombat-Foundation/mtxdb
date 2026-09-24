@@ -462,7 +462,18 @@ fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
 /// (e.g. a live embedder) already holds the writer lock — required for
 /// any command that mutates data.
 fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
-    PackfileStorage::open(selected_pool_dir(cli)?).context("failed to open store")
+    let pool = selected_pool_dir(cli)?;
+    PackfileStorage::open(pool.clone()).with_context(|| {
+        let lock_path = pool.join(".mtxdb.lock");
+        if lock_path.exists() {
+            format!(
+                "failed to open store for writing at `{}`: a lock file exists and could not be replaced (check directory and lock file permissions, e.g. `sudo chown -R $USER <DIR>`)",
+                pool.display()
+            )
+        } else {
+            format!("failed to open store for writing at `{}`", pool.display())
+        }
+    })
 }
 
 /// Open the store read-only — coexists with a live writer process rather
@@ -7811,7 +7822,17 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
                 eprintln!("{}: skipped (no packfiles)", shard_type.as_str());
                 continue;
             }
-            let store = PackfileStorage::open(dir.clone()).context("failed to open store")?;
+            let store = PackfileStorage::open(dir.clone()).with_context(|| {
+                let lock_path = dir.join(".mtxdb.lock");
+                if lock_path.exists() {
+                    format!(
+                        "failed to open store for writing at `{}`: a lock file exists and could not be replaced (check directory and lock file permissions, e.g. `sudo chown -R $USER <DIR>`)",
+                        dir.display()
+                    )
+                } else {
+                    format!("failed to open store for writing at `{}`", dir.display())
+                }
+            })?;
             store.sync()?;
             eprintln!(
                 "{}: synced: persisted shard IO stats and shard\u{2192}collection directory",
