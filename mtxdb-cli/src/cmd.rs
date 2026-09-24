@@ -3595,6 +3595,7 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let deep = matches!(cli.command, Commands::Info { stats: true, .. });
     let target = classify_info_selector(selector)?;

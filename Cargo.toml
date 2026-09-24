@@ -98,6 +98,9 @@ parking_lot = "0.12"
 sha2 = "0.10"
 zstd = { version = "0.13", default-features = false, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs2 = "0.4"
+
 # Native builds link the system libzstd via pkg-config (already installed
 # at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
 # `zstd`/`zstd-safe` don't forward a "pkg-config" feature of their own, so

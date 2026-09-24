@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use fs2::FileExt as _;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Seek, Write};
@@ -445,21 +447,12 @@ impl Drop for Shard {
     }
 }
 
-/// Holds the writer's exclusive claim on a `base_dir` (see
-/// `ShardPool::acquire_writer_lock`). Removing the marker file on drop is
-/// what makes a clean shutdown release the lock instantly, same as real
-/// `flock` releasing on fd close — a crash instead leaves it for the next
-/// opener's staleness check (`lock_holder_is_dead`) to reclaim.
+/// Holds the writer's exclusive claim on a pool or database-root lock path.
+/// On Unix, the open file descriptor owns a kernel advisory lock for this
+/// value's lifetime. The marker contents are diagnostic only.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct WriterLock {
-    path: PathBuf,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for WriterLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    _file: File,
 }
 
 /// Pool of global shard files shared across all collections.
@@ -1251,28 +1244,32 @@ impl ShardPool {
     /// `acquire_writer_lock`'s doc for the staleness contract.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn acquire_lock_path(lock_path: &Path) -> io::Result<WriterLock> {
-        match Self::try_create_lock_file(lock_path) {
-            Ok(()) => Ok(WriterLock {
-                path: lock_path.to_path_buf(),
-            }),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if Self::lock_holder_is_dead(lock_path) {
-                    let _ = fs::remove_file(lock_path);
-                    Self::try_create_lock_file(lock_path)?;
-                    return Ok(WriterLock {
-                        path: lock_path.to_path_buf(),
-                    });
-                }
-                Err(io::Error::new(
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
-                        "{} is already locked by another writer process",
+                        "{} is already locked by another writer",
                         lock_path.display()
                     ),
-                ))
+                )
+            } else {
+                error
             }
-            Err(e) => Err(e),
-        }
+        })?;
+
+        file.set_len(0)?;
+        file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+        file.sync_all()?;
+
+        Ok(WriterLock { _file: file })
     }
 
     /// Atomically create the lock file and write our `{pid, starttime}`
@@ -1283,22 +1280,6 @@ impl ShardPool {
     /// alive") on a torn write from a crash mid-write — there's no
     /// correctness reason to pay an fsync on every lock acquisition to
     /// protect against that.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn try_create_lock_file(lock_path: &Path) -> io::Result<()> {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)?;
-        let pid = std::process::id();
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(start_time) = Self::proc_start_time("self") {
-                return write!(file, "{pid} {start_time}");
-            }
-        }
-        write!(file, "{pid}")
-    }
-
     /// Reads field 22 (`starttime`, clock ticks since boot) out of
     /// `/proc/<pid_or_self>/stat`. Parses from the *last* `)` rather than
     /// splitting on whitespace from the start: the second field (`comm`,
@@ -1307,7 +1288,7 @@ impl ShardPool {
     /// classic `/proc/stat` parsing bug. Field 22 is the 20th
     /// whitespace-separated token after that closing paren (field 3 is the
     /// first token after it).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     fn proc_start_time(pid_or_self: &str) -> Option<u64> {
         let contents = fs::read_to_string(format!("/proc/{pid_or_self}/stat")).ok()?;
         let after_comm = contents.rsplit_once(')')?.1;
@@ -1344,7 +1325,7 @@ impl ShardPool {
     /// an older binary (bare PID, no starttime) has nothing to compare
     /// against and fails closed exactly as before, same as any other
     /// unparsable content.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     fn lock_holder_is_dead(lock_path: &Path) -> bool {
         #[cfg(target_os = "linux")]
         {
