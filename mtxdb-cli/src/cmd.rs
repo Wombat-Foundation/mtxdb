@@ -4370,7 +4370,7 @@ fn collection_metadata_for(
         payload: template.payload.clone(),
         extension: Some(extension.encode_blob()),
         role: Some("event_dag".to_owned()),
-        schema: Some("matrix-event".to_owned()),
+        schema: Some("matrix.event.v1".to_owned()),
     }
 }
 
@@ -6500,7 +6500,7 @@ fn cmd_import_file(
                         payload: template.payload.clone(),
                         extension: None,
                         role: Some("auth_chain".to_owned()),
-                        schema: Some("matrix-event".to_owned()),
+                        schema: Some("matrix.event.v1".to_owned()),
                     };
                     auth_store.create_or_put_established(
                         &collection_id,
@@ -6673,7 +6673,7 @@ fn import_pdu_events(
         store.create_or_put_established(&collection_id, &metadata, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     } else if !to_write.is_empty() {
-        store.put_many_established(&collection_id, &to_write)?;
+        store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
 

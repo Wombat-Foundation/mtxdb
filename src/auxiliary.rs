@@ -122,15 +122,16 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
         decode_value(&digest, &data.bytes).map(Some)
     }
 
-    /// Insert a value by its logical key.
+    /// Insert or update a value by its logical key.
     ///
     /// Atomically establishes the collection metadata on the first write
-    /// and appends the key-value envelope. Retains idempotency (same key and value succeeds)
-    /// and rejects collisions (same key with different value or physical ID conflict).
+    /// and appends the key-value envelope. Retains idempotency (same key and value succeeds),
+    /// permits same-key replacement with updated values, and rejects truncated-ID collisions
+    /// (distinct key with the same 16-byte physical node ID) with [`StorageError::Collision`].
     ///
     /// # Errors
-    /// Returns [`StorageError::Internal`] or [`StorageError::Corrupt`] if a collision occurs,
-    /// or propagates backend error.
+    /// Returns [`StorageError::Collision`] on physical ID key collisions,
+    /// [`StorageError::Corrupt`] on corrupted existing records, or propagates backend error.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let digest = auxiliary_key_digest(key);
@@ -141,10 +142,21 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
         encoded.extend_from_slice(value);
         let data = NodeData::new(bytes::Bytes::from(encoded));
 
-        self.engine.create_or_put_established(
+        let mut validate = |existing: Option<&NodeData>| -> Result<(), StorageError> {
+            if let Some(existing) = existing {
+                if !existing.bytes.is_empty() {
+                    decode_value(&digest, &existing.bytes)?;
+                }
+            }
+            Ok(())
+        };
+
+        self.engine.create_or_upsert_established_validated(
             &self.collection_id,
             &self.metadata(),
-            &[(node_id, data)],
+            &node_id,
+            &data,
+            &mut validate,
         )
     }
 }
@@ -166,7 +178,7 @@ fn decode_value(
         ));
     }
     if encoded[digest_start..value_start] != expected_digest[..] {
-        return Err(StorageError::Corrupt(
+        return Err(StorageError::Collision(
             "auxiliary-index key digest collision".to_owned(),
         ));
     }
@@ -237,8 +249,62 @@ mod tests {
 
         // Idempotent retry succeeds
         index.put(b"event_1", b"state_group_1").unwrap();
+        assert_eq!(
+            index.get(b"event_1").unwrap(),
+            Some(b"state_group_1".to_vec())
+        );
 
-        // Value collision returns error
-        assert!(index.put(b"event_1", b"different_group").is_err());
+        // Same-key replacement succeeds and updates value
+        index.put(b"event_1", b"different_group").unwrap();
+        assert_eq!(
+            index.get(b"event_1").unwrap(),
+            Some(b"different_group".to_vec())
+        );
+    }
+
+    #[test]
+    fn auxiliary_index_rejects_truncated_id_collision_without_corrupting() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "sys:test-collisions");
+        index.put(b"key_1", b"val_1").unwrap();
+        assert_eq!(index.get(b"key_1").unwrap(), Some(b"val_1".to_vec()));
+
+        let digest1 = auxiliary_key_digest(b"key_1");
+        let node_id1 = physical_id(&digest1);
+
+        // Fabricate a colliding key that has a different full digest but targets the same node_id
+        let mut colliding_digest = digest1;
+        colliding_digest[31] ^= 0xFF; // Different 32-byte digest, same first 16 bytes!
+        assert_eq!(&colliding_digest[..16], &node_id1[..]);
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(VALUE_MAGIC);
+        encoded.extend_from_slice(&colliding_digest);
+        encoded.extend_from_slice(b"colliding_val");
+        let colliding_data = NodeData::new(bytes::Bytes::from(encoded));
+
+        let mut validate = |existing: Option<&NodeData>| -> Result<(), StorageError> {
+            if let Some(existing) = existing {
+                if !existing.bytes.is_empty() {
+                    decode_value(&colliding_digest, &existing.bytes)?;
+                }
+            }
+            Ok(())
+        };
+
+        let err = engine
+            .create_or_upsert_established_validated(
+                &index.collection_id(),
+                &index.metadata(),
+                &node_id1,
+                &colliding_data,
+                &mut validate,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, StorageError::Collision(_)));
+
+        // Original key remains intact and uncorrupted:
+        assert_eq!(index.get(b"key_1").unwrap(), Some(b"val_1".to_vec()));
     }
 }

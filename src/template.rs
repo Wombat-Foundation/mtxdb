@@ -118,6 +118,24 @@ pub fn record_logical_id(digest: &Digest32) -> NodeId {
 /// Pool namespace discriminator for core-internal collections (auxiliary
 /// indexes) that are not owned by one of the protocol pools.
 pub const POOL_DST_INTERNAL: [u8; 4] = *b"INTL";
+/// Member namespace discriminator for event DAG JSON collections in the `EventDag` pool.
+pub const POOL_DST_EVNT: [u8; 4] = *b"EVNT";
+/// Member namespace discriminator for previous-event edge collections in the Edges pool.
+pub const POOL_DST_PREV: [u8; 4] = *b"PREV";
+/// Member namespace discriminator for auth-chain edge collections in the Edges pool.
+pub const POOL_DST_AUTH: [u8; 4] = *b"AUTH";
+/// Member namespace discriminator for state collections in the State pool.
+pub const POOL_DST_STAT: [u8; 4] = *b"STAT";
+
+/// Deterministic derivation of member collection ID for a given canonical group identity
+/// and 4-byte member namespace.
+#[must_use]
+pub fn derive_group_member_collection_id(
+    namespace: [u8; 4],
+    group_canonical_id: &[u8],
+) -> [u8; 16] {
+    derive_collection_id(Some(namespace), group_canonical_id)
+}
 
 /// Derive a collection's 128-bit **logical** id from its pool namespace
 /// discriminator and **canonical** id (the caller-defined external key, e.g.
@@ -497,10 +515,10 @@ impl CollectionMetadata {
                 META_TAG_PAYLOAD => meta.payload = decode_payload(value)?,
                 META_TAG_EXTENSION => meta.extension = Some(value.to_vec()),
                 META_TAG_ROLE => {
-                    meta.role = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+                    meta.role = Some(std::str::from_utf8(value).ok()?.to_owned());
                 }
                 META_TAG_SCHEMA => {
-                    meta.schema = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+                    meta.schema = Some(std::str::from_utf8(value).ok()?.to_owned());
                 }
                 _ => {}
             }
@@ -744,7 +762,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
             role: Some("event_dag".to_owned()),
-            schema: Some("matrix-event".to_owned()),
+            schema: Some("matrix.event.v1".to_owned()),
         };
         assert_eq!(CollectionMetadata::decode(&meta.encode()).unwrap(), meta);
         let id = derive_collection_id(meta.pool_dst, &meta.collection_canonical_id);
@@ -772,7 +790,7 @@ mod tests {
             payload: PayloadPolicy::Source,
             extension: Some(b"ext".to_vec()),
             role: Some("event_dag".to_owned()),
-            schema: Some("matrix-event".to_owned()),
+            schema: Some("matrix.event.v1".to_owned()),
         }
     }
 
@@ -874,5 +892,41 @@ mod tests {
             decode_payload(&[0x01]).unwrap(),
             PayloadPolicy::Projection { include: vec![] }
         );
+    }
+
+    #[test]
+    fn collection_metadata_decode_rejects_invalid_utf8_role_or_schema() {
+        let meta = CollectionMetadata {
+            pool_dst: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:example.com".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("valid_role".to_owned()),
+            schema: Some("valid.schema.v1".to_owned()),
+        };
+        let encoded = meta.encode();
+        assert!(CollectionMetadata::decode(&encoded).is_some());
+
+        // Corrupt role TLV (tag 0x06) with invalid UTF-8:
+        let mut corrupted_role = Vec::new();
+        push_tlv(&mut corrupted_role, 0x01, b"EVNT");
+        push_tlv(&mut corrupted_role, 0x02, b"!room:example.com");
+        push_tlv(&mut corrupted_role, 0x03, &[0x06, 0x01]); // Key policy, Blake3
+        push_tlv(&mut corrupted_role, 0x04, &[0x00]); // Payload source
+        push_tlv(&mut corrupted_role, 0x06, &[0xFF, 0xFE, 0xFD]); // Invalid UTF-8 role
+        assert!(CollectionMetadata::decode(&corrupted_role).is_none());
+
+        // Corrupt schema TLV (tag 0x07) with invalid UTF-8:
+        let mut corrupted_schema = Vec::new();
+        push_tlv(&mut corrupted_schema, 0x01, b"EVNT");
+        push_tlv(&mut corrupted_schema, 0x02, b"!room:example.com");
+        push_tlv(&mut corrupted_schema, 0x03, &[0x06, 0x01]);
+        push_tlv(&mut corrupted_schema, 0x04, &[0x00]);
+        push_tlv(&mut corrupted_schema, 0x07, &[0xFF, 0xFE, 0xFD]); // Invalid UTF-8 schema
+        assert!(CollectionMetadata::decode(&corrupted_schema).is_none());
     }
 }
