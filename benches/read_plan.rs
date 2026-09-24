@@ -5,15 +5,15 @@
 //!
 //! - **dense**: a contiguous run of insertion order, so the target frames
 //!   are physically adjacent;
-//! - **random**: uniformly drawn insertion order, so the target frames are
+//! - **sparse**: uniformly drawn insertion order, so the target frames are
 //!   physically dispersed across the collection.
 //!
 //! Each target set is read twice — once with `ReadPlanPolicy::disabled()`
-//! (`off`) and once with a merged plan (`hdd`) — evicting the page cache
-//! before every read. The point is to see whether melding nearby candidates
-//! into sequential `madvise(MADV_WILLNEED)` extents cuts cold-read time,
-//! disk bytes, or major faults, and to show the planned-extent counters
-//! actually firing.
+//! (`plain`) and once with a merged plan (`prefetch`) — evicting the page
+//! cache before every read. The point is to see whether melding nearby
+//! candidates into sequential `madvise(MADV_WILLNEED)` extents cuts
+//! cold-read time, disk bytes, or major faults, and to show the
+//! planned-extent counters actually firing.
 //!
 //! Run with `cargo bench --manifest-path benches/Cargo.toml --bench read_plan`.
 //!
@@ -33,7 +33,7 @@
 //! - `MTXDB_READ_PLAN_RECORDS` (default 200000)
 //! - `MTXDB_READ_PLAN_TARGETS` (default 100000)
 //! - `MTXDB_READ_PLAN_PAYLOAD` (default 1024)
-//! - `MTXDB_READ_PLAN_GAP` / `_EXTENT` / `_MIN` override the `hdd` preset.
+//! - `MTXDB_READ_PLAN_GAP` / `_EXTENT` / `_MIN` override the `prefetch` preset.
 //! - `MTXDB_BENCH_ROOT` redirects scratch data off tmpfs (see `bench_root`).
 #![allow(
     clippy::arithmetic_side_effects,
@@ -347,10 +347,10 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// The `hdd` preset, with optional per-field env overrides so a run can
+/// The `prefetch` preset, with optional per-field env overrides so a run can
 /// sweep the merge gap without touching code.
-fn hdd_policy() -> ReadPlanPolicy {
-    let mut policy = ReadPlanPolicy::hdd();
+fn prefetch_policy() -> ReadPlanPolicy {
+    let mut policy = ReadPlanPolicy::prefetch();
     if let Ok(v) = std::env::var("MTXDB_READ_PLAN_GAP") {
         if let Ok(n) = v.parse() {
             policy.merge_gap_bytes = n;
@@ -700,26 +700,28 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         .unwrap_or(true);
     println!();
     println!(
-        "  [2/3] measuring (off vs hdd, {}, {passes} interleaved passes, median)…",
+        "  [2/3] measuring (plain vs prefetch, {}, {passes} interleaved passes, median)…",
         if include_dense {
             "dense + sparse"
         } else {
             "sparse only"
         }
     );
-    let policy_hdd = hdd_policy();
+    let policy_prefetch = prefetch_policy();
     println!(
-        "        hdd: gap={} B extent={} B min_batch={}",
-        policy_hdd.merge_gap_bytes, policy_hdd.max_extent_bytes, policy_hdd.min_batch_candidates
+        "        prefetch: gap={} B extent={} B min_batch={}",
+        policy_prefetch.merge_gap_bytes,
+        policy_prefetch.max_extent_bytes,
+        policy_prefetch.min_batch_candidates
     );
 
     let mut combos: Vec<(&'static str, ReadPlanPolicy, &'static str, &Vec<NodeId>)> = Vec::new();
     if include_dense {
-        combos.push(("off", ReadPlanPolicy::disabled(), "dense", &dense));
-        combos.push(("hdd", policy_hdd, "dense", &dense));
+        combos.push(("plain", ReadPlanPolicy::disabled(), "dense", &dense));
+        combos.push(("prefetch", policy_prefetch, "dense", &dense));
     }
-    combos.push(("off", ReadPlanPolicy::disabled(), "sparse", &sparse));
-    combos.push(("hdd", policy_hdd, "sparse", &sparse));
+    combos.push(("plain", ReadPlanPolicy::disabled(), "sparse", &sparse));
+    combos.push(("prefetch", policy_prefetch, "sparse", &sparse));
 
     let eviction = select_eviction(manual_drop);
     let rows: Vec<Row> = measure(&dir, &combos, eviction, passes);
@@ -804,45 +806,45 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     // The bytes-vs-store fraction is printed either way; it is the number
     // that shows at a glance whether a run was a full scan.
     const PAGE_SIZE: u64 = 4096;
-    let off_sparse = rows
+    let plain_sparse = rows
         .iter()
-        .find(|r| r.policy == "off" && r.target == "sparse");
-    let off_bytes = off_sparse.and_then(|r| r.disk_read_bytes).unwrap_or(0);
-    let floor = off_sparse.map_or(0, |r| r.total as u64 * PAGE_SIZE / 2);
+        .find(|r| r.policy == "plain" && r.target == "sparse");
+    let plain_bytes = plain_sparse.and_then(|r| r.disk_read_bytes).unwrap_or(0);
+    let floor = plain_sparse.map_or(0, |r| r.total as u64 * PAGE_SIZE / 2);
     let fraction = if store_bytes == 0 {
         None
     } else {
-        Some(off_bytes as f64 / store_bytes as f64)
+        Some(plain_bytes as f64 / store_bytes as f64)
     };
-    let off_cold = off_sparse.is_some() && off_bytes >= floor;
-    if off_cold {
+    let plain_cold = plain_sparse.is_some() && plain_bytes >= floor;
+    if plain_cold {
         if let Some(fraction) = fraction {
             println!();
             println!(
-                "  sparse `off` read {} off the device = {fraction:.2}× the {} store",
-                fmt_bytes(off_bytes),
+                "  sparse `plain` read {} off the device = {fraction:.2}× the {} store",
+                fmt_bytes(plain_bytes),
                 fmt_bytes(store_bytes),
             );
         }
-        if store_bytes > 0 && off_bytes > store_bytes.saturating_mul(2) {
+        if store_bytes > 0 && plain_bytes > store_bytes.saturating_mul(2) {
             println!();
-            println!("  ⚠ sparse `off` read more than twice the store — likely re-reads or");
+            println!("  ⚠ sparse `plain` read more than twice the store — likely re-reads or");
             println!("    scan amplification rather than a clean single scan; treat the");
             println!("    ratio with caution.");
         }
         for target in ["dense", "sparse"] {
-            let off = rows
+            let plain = rows
                 .iter()
-                .find(|r| r.policy == "off" && r.target == target);
-            let hdd = rows
+                .find(|r| r.policy == "plain" && r.target == target);
+            let prefetch = rows
                 .iter()
-                .find(|r| r.policy == "hdd" && r.target == target);
-            if let (Some(off), Some(hdd)) = (off, hdd) {
-                let speedup = off.elapsed.as_secs_f64() / hdd.elapsed.as_secs_f64();
-                println!("bench: read_plan_ratio TARGET={target} HDD_VS_OFF={speedup:.3}");
+                .find(|r| r.policy == "prefetch" && r.target == target);
+            if let (Some(plain), Some(prefetch)) = (plain, prefetch) {
+                let speedup = plain.elapsed.as_secs_f64() / prefetch.elapsed.as_secs_f64();
+                println!("bench: read_plan_ratio TARGET={target} PREFETCH_VS_PLAIN={speedup:.3}");
             }
         }
-        if off_sparse.is_some_and(|r| r.major_faults.unwrap_or(0) == 0) {
+        if plain_sparse.is_some_and(|r| r.major_faults.unwrap_or(0) == 0) {
             println!();
             println!("  note: major faults are 0 even though device bytes are non-zero —");
             println!("        readahead is serving the pages, which is expected here.");
@@ -850,7 +852,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     } else {
         println!();
         println!("  ✗ COLD READ NOT ACHIEVED — ratios suppressed.");
-        println!("    The sparse `off` row read less than half of one page per target");
+        println!("    The sparse `plain` row read less than half of one page per target");
         println!("    off the device, so at least part of the read was served from");
         println!("    cache and any difference is noise.");
         println!("    Point MTXDB_BENCH_ROOT at a real (non-tmpfs) disk and run as");

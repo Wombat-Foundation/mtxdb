@@ -811,8 +811,8 @@ pub struct ReadPlanPolicy {
     /// through a gap is cheaper than a seek once the gap is under roughly
     /// `seek_time * throughput` (~1-2 MB at 10 ms / 100 MB/s), which is the
     /// same order as the ~500-1000 4 KiB blocks a rotational drive reads in
-    /// one seek. [`ReadPlanPolicy::hdd`] uses 2 MiB; `0` melds only adjacent
-    /// offsets.
+    /// one seek. [`ReadPlanPolicy::prefetch`] uses 2 MiB; `0` melds only
+    /// adjacent offsets.
     pub merge_gap_bytes: u64,
     /// Hard ceiling on one merged extent. Bounds the bytes read through gaps
     /// and keeps a dense batch from collapsing into a single unbounded
@@ -828,7 +828,7 @@ impl Default for ReadPlanPolicy {
     /// Disabled: merged prefetch is opt-in. Its win is rotational-media
     /// specific, and a `WILLNEED` over a multi-MiB extent reads through gaps
     /// nobody asked for — on an SSD or a warm cache that is pure page-cache
-    /// pressure. Use [`ReadPlanPolicy::hdd`] (or a tuned policy) for a
+    /// pressure. Use [`ReadPlanPolicy::prefetch`] (or a tuned policy) for a
     /// rotational store.
     fn default() -> Self {
         Self::disabled()
@@ -853,7 +853,7 @@ impl ReadPlanPolicy {
     /// arithmetic but have not been validated against a cold-cache benchmark;
     /// treat them as a place to start tuning.
     #[must_use]
-    pub fn hdd() -> Self {
+    pub fn prefetch() -> Self {
         Self {
             merge_gap_bytes: 2 * 1024 * 1024,
             max_extent_bytes: 8 * 1024 * 1024,

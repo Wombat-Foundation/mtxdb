@@ -248,10 +248,10 @@ fn global_args(cmd: Command) -> Command {
         Arg::new("read_plan")
             .long("read-plan")
             .value_name("MODE")
-            .default_value("off")
-            .value_parser(["off", "hdd"])
+            .default_value("plain")
+            .value_parser(["plain", "prefetch"])
             .global(true)
-            .help("Merged read prefetch for batch reads: 'off' (default) or 'hdd' to meld nearby candidates into sequential extents"),
+            .help("Merged read prefetch for batch reads: 'plain' (default, independent reads) or 'prefetch' to meld nearby candidates into sequential extents"),
     )
 }
 
@@ -629,8 +629,8 @@ fn sub_get() -> Command {
 /// fallthrough is unreachable in practice.
 fn read_plan_from_mode(mode: &str) -> ReadPlanPolicy {
     match mode {
-        "off" => ReadPlanPolicy::disabled(),
-        "hdd" => ReadPlanPolicy::hdd(),
+        "plain" => ReadPlanPolicy::disabled(),
+        "prefetch" => ReadPlanPolicy::prefetch(),
         _ => unreachable!("clap validates read-plan mode"),
     }
 }
@@ -927,24 +927,24 @@ mod parse_tests {
 
     #[test]
     fn test_read_plan_flag_parsing() {
-        // Default is off.
+        // Default is plain.
         let default = build_cli()
             .try_get_matches_from(["mtxdb", "shards"])
             .unwrap();
         assert_eq!(
             default.get_one::<String>("read_plan").map(String::as_str),
-            Some("off")
+            Some("plain")
         );
 
-        // Explicit hdd is accepted (before and after the subcommand).
+        // Explicit prefetch is accepted (before and after the subcommand).
         for argv in [
-            ["mtxdb", "--read-plan", "hdd", "shards"],
-            ["mtxdb", "shards", "--read-plan", "hdd"],
+            ["mtxdb", "--read-plan", "prefetch", "shards"],
+            ["mtxdb", "shards", "--read-plan", "prefetch"],
         ] {
             let m = build_cli().try_get_matches_from(argv).unwrap();
             assert_eq!(
                 m.get_one::<String>("read_plan").map(String::as_str),
-                Some("hdd")
+                Some("prefetch")
             );
         }
 
@@ -956,8 +956,8 @@ mod parse_tests {
 
     #[test]
     fn test_read_plan_mode_maps_to_policy() {
-        assert_eq!(read_plan_from_mode("off"), ReadPlanPolicy::disabled());
-        assert_eq!(read_plan_from_mode("hdd"), ReadPlanPolicy::hdd());
-        assert_ne!(read_plan_from_mode("hdd"), ReadPlanPolicy::disabled());
+        assert_eq!(read_plan_from_mode("plain"), ReadPlanPolicy::disabled());
+        assert_eq!(read_plan_from_mode("prefetch"), ReadPlanPolicy::prefetch());
+        assert_ne!(read_plan_from_mode("prefetch"), ReadPlanPolicy::disabled());
     }
 }
