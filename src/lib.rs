@@ -21,7 +21,7 @@ pub mod csr;
 /// In-memory dependency DAG used to track unresolved node references.
 pub mod dag;
 /// Root-level handle that opens every pool behind one shared WAL fence.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "multi-reader")]
 pub mod database;
 /// Frontier tracking for nodes awaiting their dependencies before being writable.
 pub mod frontier;
@@ -55,14 +55,15 @@ pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
 };
 pub use cache::NodeCache;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "multi-reader")]
 pub use database::{DatabaseTransaction, PoolPolicies, PoolPolicy, SharedDatabase};
 pub use index::LossyIndex;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "multi-reader")]
 pub use journal::SharedWalLock;
+#[cfg(feature = "multi-reader")]
 pub use journal::{TxnStage, TxnStageState};
 pub use layout::{enclosing_root, read_wal_layout, DatabaseLayout, ShardType, WalLayout};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "multi-reader")]
 pub use matrix_policy::matrix_pool_policies;
 pub use matrix_policy::{
     EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,

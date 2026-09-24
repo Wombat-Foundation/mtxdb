@@ -143,6 +143,7 @@ pub enum Mutation {
 pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 
 /// Lifecycle of a transaction's staged journal mutations.
+#[cfg(feature = "multi-reader")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnStageState {
     /// The SQL transaction attempt is active and may add mutations.
@@ -160,6 +161,7 @@ pub enum TxnStageState {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "multi-reader")]
 struct TxnStageData {
     pools: [Vec<Mutation>; 3],
     applied: [Vec<bool>; 3],
@@ -171,7 +173,8 @@ struct TxnStageData {
     receipt: Option<CommitReceipt>,
 }
 
-/// Transaction-local mutation buffer used by [`crate::database::DatabaseTransaction`].
+/// Transaction-local mutation buffer used by
+/// [`crate::database::DatabaseTransaction`].
 ///
 /// Journal entries for a SQL transaction are buffered here and published from
 /// its post-commit callback. Call [`Self::discard`] from the transaction's
@@ -183,17 +186,20 @@ struct TxnStageData {
 /// [`Self::discard`] drops only buffered mutations. The database transaction
 /// applies them to packs and indexes only after its caller declares commit,
 /// then publishes the resulting shared-WAL group.
+#[cfg(feature = "multi-reader")]
 pub struct TxnStage {
     state: std::sync::atomic::AtomicU8,
     data: Mutex<TxnStageData>,
 }
 
+#[cfg(feature = "multi-reader")]
 impl Default for TxnStage {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "multi-reader")]
 impl TxnStage {
     const ACTIVE: u8 = 0;
     const DISCARDED: u8 = 1;
@@ -243,21 +249,25 @@ impl TxnStage {
     }
 
     /// Snapshot staged mutations for application to storage at commit time.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; 3] {
         self.data.lock().pools.clone()
     }
 
     /// Receipt identifying this stage's published journal group.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn published_receipt(&self) -> Option<CommitReceipt> {
         self.data.lock().receipt
     }
 
     /// Whether this stage has no mutations to publish or materialize.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn is_empty(&self) -> bool {
         self.data.lock().pools.iter().all(Vec::is_empty)
     }
 
     /// Return whether one staged mutation has already been applied to storage.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn mutation_applied(&self, pool: ShardType, index: usize) -> bool {
         self.data.lock().applied[pool_index(pool)]
             .get(index)
@@ -267,6 +277,7 @@ impl TxnStage {
 
     /// Record successful application of one staged mutation. This makes a
     /// retry after a later mutation fails resume at the failed mutation.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn mark_mutation_applied(&self, pool: ShardType, index: usize) -> io::Result<()> {
         let mut data = self.data.lock();
         let applied = data.applied[pool_index(pool)]
@@ -282,6 +293,7 @@ impl TxnStage {
     }
 
     /// Begin pack/index materialization after the journal group is published.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn begin_materialization(&self) -> io::Result<()> {
         let state = self.state.load(Ordering::Acquire);
         match state {
@@ -310,6 +322,7 @@ impl TxnStage {
     }
 
     /// Complete an active no-op transaction without creating a journal group.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn mark_empty_published(&self) -> io::Result<()> {
         let data = self.data.lock();
         if data.pools.iter().any(|pool| !pool.is_empty()) {
@@ -331,6 +344,7 @@ impl TxnStage {
     }
 
     /// Mark both journal publication and storage application complete.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn mark_published(&self) -> io::Result<()> {
         match self.state.load(Ordering::Acquire) {
             Self::MATERIALIZING | Self::PUBLISHED => {
@@ -592,6 +606,7 @@ impl TxnStage {
     }
 }
 
+#[cfg(feature = "multi-reader")]
 const fn pool_index(pool: ShardType) -> usize {
     match pool {
         ShardType::State => 0,
@@ -1670,6 +1685,7 @@ impl Journal {
     ///
     /// # Errors
     /// Same as [`Self::open_shared`].
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn open_shared_with_base(
         path: impl AsRef<Path>,
         base_lsn: u64,
@@ -2556,12 +2572,10 @@ fn invalid_data(message: &'static str) -> io::Error {
 /// holder opens the segment with [`Journal::open_shared`], builds one
 /// [`JournalCoordinator`], and attaches each pool with
 /// `PackfileStorage::enable_shared_journal`.
-#[cfg(not(target_arch = "wasm32"))]
 pub struct SharedWalLock {
     _lock: crate::shard::WriterLock,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl SharedWalLock {
     /// Acquire the root shared-WAL writer lock.
     ///
@@ -2593,7 +2607,9 @@ impl SharedWalLock {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalCoordinator, Mutation, TxnStage, TxnStageState};
+    use super::{Journal, JournalCoordinator, Mutation};
+    #[cfg(feature = "multi-reader")]
+    use super::{TxnStage, TxnStageState};
     use std::fs;
     use std::io::Write as _;
     use std::sync::atomic::AtomicU64;
@@ -2896,6 +2912,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn transaction_stage_publishes_all_pools_as_one_shared_group() {
         use crate::layout::ShardType;
 
@@ -2941,6 +2958,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn transaction_stage_rejects_legacy_pending_mutations() {
         use crate::layout::ShardType;
 

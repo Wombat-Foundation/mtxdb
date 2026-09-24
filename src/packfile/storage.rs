@@ -8012,6 +8012,7 @@ impl PackfileStorage {
     /// still being materialized. The overlay is shared with the existing
     /// read-committed implementation, but ordinary reads consult it only
     /// while at least one transaction is in this state.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn activate_transaction_overlay(
         &self,
         wal_path: &Path,
@@ -8033,6 +8034,7 @@ impl PackfileStorage {
     /// Stop consulting the in-process transaction overlay after all staged
     /// mutations have been materialized or the transaction was abandoned
     /// before journal publication.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn deactivate_transaction_overlay(&self) {
         let mut users = self.transaction_overlay_users.load(Ordering::Acquire);
         loop {
@@ -8091,6 +8093,7 @@ impl PackfileStorage {
     /// Apply a mutation staged by a database transaction without publishing
     /// it to the legacy per-write journal queue. The transaction coordinator
     /// publishes the complete batch after every pool has applied successfully.
+    #[cfg(feature = "multi-reader")]
     pub(crate) fn apply_transaction_mutation(
         &self,
         mutation: &JournalMutation,

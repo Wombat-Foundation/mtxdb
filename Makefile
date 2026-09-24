@@ -113,7 +113,6 @@ build: ##H Build all
 	$(CARGO) build --release --timings
 	$(CARGO) build --release --timings --manifest-path mtxdb-cli/Cargo.toml
 	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
-	RUSTFLAGS= $(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
 
 
 MTXDB_INSTALL_PROFILE ?= release
@@ -128,7 +127,6 @@ clean: ##H Clean build artifacts
 	$(CARGO) clean
 	cd mtxdb-cli && $(CARGO) clean
 	cd mtxdb-ffi && $(CARGO) clean
-	cd mtxdb-wasm && $(CARGO) clean
 	cd benches && $(CARGO) clean
 	rm -rf .mypy_cache/ .ruff_cache/ __pycache__/
 	rm -rf .coverage/ lcov.info
@@ -138,7 +136,8 @@ clean: ##H Clean build artifacts
 # Execute command for reach submodule
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-PROJECT_CRATES ?= mtxdb-cli/ mtxdb-ffi/ mtxdb-wasm/ benches/
+PROJECT_CRATES ?= mtxdb-cli/ mtxdb-ffi/
+# PROJECT_CRATES ?= mtxdb-cli/ mtxdb-ffi/ benches/
 
 .PHONY: sub
 sub:	##H Run a command for each crate (set c)

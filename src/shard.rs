@@ -1,4 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
 use fs2::FileExt as _;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -483,7 +482,6 @@ impl Drop for Shard {
 /// Holds the writer's exclusive claim on a pool or database-root lock path.
 /// On Unix, the open file descriptor owns a kernel advisory lock for this
 /// value's lifetime. The marker contents are diagnostic only.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct WriterLock {
     _file: File,
 }
@@ -614,8 +612,6 @@ pub struct ShardPool {
     /// its lifetime matters — so `#[allow(dead_code)]` here is correct,
     /// not a lint dodge: the field genuinely has no read access by
     /// design, the same way a `MutexGuard` binding is never "used" either.
-    /// `None` on wasm32, where there's no cross-process model to guard.
-    #[cfg(not(target_arch = "wasm32"))]
     #[allow(dead_code)]
     writer_lock: Option<WriterLock>,
 }
@@ -1069,7 +1065,7 @@ impl ShardPool {
         checksum_policy: packfile::ChecksumPolicy,
         stats_persisted_at: Option<u64>,
         mut timings: ShardOpenTimings,
-        #[cfg(not(target_arch = "wasm32"))] writer_lock: Option<WriterLock>,
+        writer_lock: Option<WriterLock>,
     ) -> Self {
         let metadata_subphases_sum = timings
             .pool_meta_restore
@@ -1110,7 +1106,6 @@ impl ShardPool {
             compress,
             checksum_policy,
             append_policy: AppendPolicy::Eager,
-            #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         }
     }
@@ -1135,16 +1130,11 @@ impl ShardPool {
             ));
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
         let writer_lock_started = Instant::now();
-        #[cfg(not(target_arch = "wasm32"))]
         let writer_lock = writable
             .then(|| Self::acquire_writer_lock(&base_dir))
             .transpose()?;
-        #[cfg(not(target_arch = "wasm32"))]
         let writer_lock_time = writer_lock_started.elapsed();
-        #[cfg(target_arch = "wasm32")]
-        let writer_lock_time = Duration::ZERO;
 
         let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
         let mut next_slot: u16 = 0;
@@ -1236,7 +1226,6 @@ impl ShardPool {
                 total,
                 ..Default::default()
             },
-            #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         ))
     }
@@ -1272,7 +1261,6 @@ impl ShardPool {
     /// removed and retried once rather than wrongly blocking forever. The
     /// starttime is what makes this safe across PID reuse (see
     /// `lock_holder_is_dead`) — a bare PID is not enough on its own.
-    #[cfg(not(target_arch = "wasm32"))]
     fn acquire_writer_lock(base_dir: &Path) -> io::Result<WriterLock> {
         Self::acquire_lock_path(&base_dir.join(".mtxdb.lock"))
     }
@@ -1281,7 +1269,6 @@ impl ShardPool {
     /// arbitrary path. Shared by the per-pool writer lock (`.mtxdb.lock`) and
     /// the database-root shared-WAL lock (`.mtxdb.wal.lock`); see
     /// `acquire_writer_lock`'s doc for the staleness contract.
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn acquire_lock_path(lock_path: &Path) -> io::Result<WriterLock> {
         let mut file = File::options()
             .read(true)
@@ -1364,7 +1351,7 @@ impl ShardPool {
     /// an older binary (bare PID, no starttime) has nothing to compare
     /// against and fails closed exactly as before, same as any other
     /// unparsable content.
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(test)]
     fn lock_holder_is_dead(lock_path: &Path) -> bool {
         #[cfg(target_os = "linux")]
         {
