@@ -532,11 +532,19 @@ pub struct SyncDiagnosticSample {
 
 /// Runtime sync diagnostics retained after the operation that produced them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub struct SyncDiagnosticsSnapshot {
+    /// Counts journal fsync observations by latency bucket for this snapshot.
     pub fsync_latency: SyncLatencyHistogram,
+    /// Counts journal lock-wait observations by latency bucket for this
+    /// snapshot.
     pub lock_wait_latency: SyncLatencyHistogram,
+    /// Maximum journal in-flight count observed during this snapshot.
+    /// Unlike the lifetime maxima in [`SyncTotalsSnapshot`], this value is
+    /// cleared by [`PackfileStorage::take_sync_diagnostics`].
     pub peak_journal_in_flight: u64,
+    /// The up-to-16 slowest sync samples observed during this snapshot,
+    /// ordered from slowest to fastest. This is interval-scoped and bounded,
+    /// not a lifetime history.
     pub worst_syncs: Vec<SyncDiagnosticSample>,
 }
 
