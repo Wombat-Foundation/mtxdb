@@ -804,6 +804,27 @@ const MAX_FRAME_DISK_LEN: u64 = (packfile::MAX_RECORD_LEN + 8) as u64;
 /// `madvise(MADV_WILLNEED)` before resolution — the kernel then reads it as one
 /// sequential run while the existing per-candidate decode path still verifies
 /// every requested hash (lossy-index false positives included).
+///
+/// # Measured behaviour (cold-cache, 1M records × 1 KiB, careful HDD vs SSD)
+///
+/// This plan is **rotational-media (HDD) only** and must not be enabled by
+/// default anywhere:
+///
+/// - **Wins on HDD** when target spacing is roughly 700 KiB or more: 1.9-3×
+///   faster than the `MADV_RANDOM` baseline, and 2.6-5× faster than
+///   independent reads. The win comes from prefetching target neighborhoods,
+///   not from reading through gaps — any gap from 0 to ~256 KiB performed about
+///   equally.
+/// - **Neutral on HDD** by ~174 KiB spacing (all policies ~1.0×): the batch is
+///   dense enough that independent reads already touch most pages.
+/// - **Loses on SSD** (0.6-0.85× vs `MADV_RANDOM`): there is no seek to avoid,
+///   so reading through gaps is pure waste, and the plan reads far more bytes
+///   than the readahead-suppressing alternative.
+///
+/// [`Self::random_advice`] — suppressing kernel readahead with `MADV_RANDOM`
+/// and no planning at all — is the portable win: 4.5-6.5× on SSD, 1.4-3.4× on
+/// sparse HDD, and neutral on dense HDD. Prefer it unless the workload is a
+/// sparse batch on rotational media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadPlanPolicy {
     /// Candidate offsets at most this far apart (start to start, on the same
@@ -826,17 +847,22 @@ pub struct ReadPlanPolicy {
     /// no planning at all. A random-access hint suppresses the kernel's
     /// sequential readahead, so a scattered `get_many` reads only the pages
     /// it faults rather than having readahead amplify each one into a large
-    /// block read. This is the low-cost alternative to extent planning on a
-    /// rotational disk: `false` on the presets that plan.
+    /// block read.
+    ///
+    /// This is the **portable** win and the one to reach for first: measured
+    /// at 4.5-6.5× faster than independent reads on SSD, 1.4-3.4× on sparse
+    /// HDD, and neutral on dense HDD, with no device-specific tuning. Extent
+    /// planning ([`Self::prefetch`]) only beats it on sparse rotational media.
+    /// `false` on the presets that plan.
     pub random_advice: bool,
 }
 
 impl Default for ReadPlanPolicy {
-    /// Disabled: merged prefetch is opt-in. Its win is rotational-media
-    /// specific, and a `WILLNEED` over a multi-MiB extent reads through gaps
-    /// nobody asked for — on an SSD or a warm cache that is pure page-cache
-    /// pressure. Use [`ReadPlanPolicy::prefetch`] (or a tuned policy) for a
-    /// rotational store.
+    /// Disabled: the defaults change no behaviour, so nothing regresses on
+    /// existing callers. The portable improvement is
+    /// [`ReadPlanPolicy::random_advice`] (readahead suppression); extent
+    /// planning ([`ReadPlanPolicy::prefetch`]) is rotational-media only. A
+    /// store that wants either opts in explicitly.
     fn default() -> Self {
         Self::disabled()
     }

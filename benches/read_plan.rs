@@ -8,12 +8,19 @@
 //! - **sparse**: uniformly drawn insertion order, so the target frames are
 //!   physically dispersed across the collection.
 //!
-//! Each target set is read twice — once with `ReadPlanPolicy::disabled()`
-//! (`plain`) and once with a merged plan (`prefetch`) — evicting the page
-//! cache before every read. The point is to see whether melding nearby
-//! candidates into sequential `madvise(MADV_WILLNEED)` extents cuts
-//! cold-read time, disk bytes, or major faults, and to show the
-//! planned-extent counters actually firing.
+//! Each target set is read three ways, evicting the page cache before every
+//! read:
+//!
+//! - `plain`: `ReadPlanPolicy::disabled()` — independent reads;
+//! - `random`: `MADV_RANDOM` on the mapping, no planning — a readahead
+//!   suppression control;
+//! - `prefetch`: merged extents + `madvise(MADV_WILLNEED)`.
+//!
+//! The point is to see whether melding nearby candidates into sequential
+//! extents cuts cold-read time, disk bytes, or major faults; whether the
+//! gain is really just readahead suppression (compare against `random`); and
+//! to show the planned-extent counters actually firing. The verdict is
+//! device-dependent — run it on both an HDD and an SSD.
 //!
 //! Run with `cargo bench --manifest-path benches/Cargo.toml --bench read_plan`.
 //!
