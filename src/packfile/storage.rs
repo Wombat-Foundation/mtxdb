@@ -3661,7 +3661,16 @@ impl PackfileStorage {
         // that LSN (the journal scan only knows the committed prefix). The
         // committed LSN is conservative -- the fsynced packs above may cover
         // more -- and replaying that suffix again is idempotent.
-        let wal_lsn = self.journal().map(|journal| journal.committed_lsn());
+        //
+        // On a shared segment the global committed LSN can include other pools'
+        // frames, which this checkpoint does not materialize. Record this
+        // pool's own committed watermark instead, so its coverage and the
+        // reclaim floor both describe only frames this index holds.
+        let journal_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
+        let wal_lsn = self.journal().map(|journal| match journal_pool {
+            Some(pool) => journal.committed_lsn_for_pool(pool),
+            None => journal.committed_lsn(),
+        });
         drop(guards);
         // `create_guard` is deliberately NOT dropped here, unlike the
         // per-collection put mutexes above. An existing collection's
@@ -3719,7 +3728,7 @@ impl PackfileStorage {
         if let Some(lsn) = wal_lsn {
             self.write_journal_lsn(lsn)?;
             if let Some(journal) = self.journal() {
-                match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+                match journal_pool {
                     // A per-pool segment holds only this pool's frames, so this
                     // checkpoint covers everything at or below `lsn` and the
                     // segment can drop that prefix.
@@ -3871,7 +3880,12 @@ impl PackfileStorage {
                 .collect()
         };
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
-        let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
+        let covered_lsn = self.journal().map_or(0, |journal| {
+            match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+                Some(pool) => journal.committed_lsn_for_pool(pool),
+                None => journal.committed_lsn(),
+            }
+        });
         drop(guards);
         drop(create_guard);
 
@@ -3969,7 +3983,12 @@ impl PackfileStorage {
                 .collect()
         };
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
-        let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
+        let covered_lsn = self.journal().map_or(0, |journal| {
+            match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+                Some(pool) => journal.committed_lsn_for_pool(pool),
+                None => journal.committed_lsn(),
+            }
+        });
         drop(guards);
         let pack_table: Vec<(u16, u64)> = self
             .shards
@@ -9235,12 +9254,62 @@ mod tests {
             truncated_tail: false,
             base_lsn: 3,
         };
-        assert!(ReadJournal::reset_has_coverage_gap(&header_only, 1));
-        assert!(!ReadJournal::reset_has_coverage_gap(&header_only, 2));
+        let per_pool = |covered: u64| ReadJournal::empty(std::path::PathBuf::new(), covered, None);
+        assert!(per_pool(1).reset_has_coverage_gap(&header_only));
+        assert!(!per_pool(2).reset_has_coverage_gap(&header_only));
         assert!(
-            !ReadJournal::reset_has_coverage_gap(&crate::journal::Scan::empty(), 0),
+            !per_pool(0).reset_has_coverage_gap(&crate::journal::Scan::empty()),
             "a missing/short segment reports base 0 and is not a gap"
         );
+        // A shared reader whose own pool has no frames in the segment loses
+        // nothing when the base advanced for another pool's frames.
+        let idle_state = ReadJournal::empty(
+            std::path::PathBuf::new(),
+            0,
+            Some(crate::layout::ShardType::State),
+        );
+        assert!(!idle_state.reset_has_coverage_gap(&header_only));
+    }
+
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn reset_has_coverage_gap_is_pool_aware_on_a_shared_segment() {
+        let entry = |pool, lsn| crate::journal::JournalEntry {
+            lsn,
+            offset: 0,
+            frame_len: 0,
+            pool: Some(pool),
+            mutation: crate::journal::Mutation::DeleteCollection {
+                collection_id: [0x11; 16],
+            },
+        };
+        let scan = crate::journal::Scan {
+            groups: vec![crate::journal::CommittedGroup {
+                sequence: 1,
+                first_lsn: 3,
+                last_lsn: 3,
+                entries: vec![entry(crate::layout::ShardType::EventDag, 3)],
+            }],
+            valid_len: 0,
+            truncated_tail: false,
+            base_lsn: 3,
+        };
+        // The base jumped from covered+1 = 2 to 3, filled entirely by another
+        // pool. This pool must not treat that as a lost frame.
+        let state = ReadJournal::empty(
+            std::path::PathBuf::new(),
+            1,
+            Some(crate::layout::ShardType::State),
+        );
+        assert!(!state.reset_has_coverage_gap(&scan));
+        // The pool that actually has frames in the segment is the one that
+        // must reload, because the reclaimed base may have skipped its own.
+        let event = ReadJournal::empty(
+            std::path::PathBuf::new(),
+            1,
+            Some(crate::layout::ShardType::EventDag),
+        );
+        assert!(event.reset_has_coverage_gap(&scan));
     }
 
     #[cfg(feature = "multi-reader")]
@@ -14779,6 +14848,95 @@ mod tests {
         assert!(
             scan.base_lsn > 1,
             "the segment base advanced past the reclaimed group"
+        );
+    }
+
+    /// End-to-end: three interleaved pool groups, independent per-pool
+    /// checkpoints, shared reclaim, then a read-only reopen. The state reader's
+    /// index boundary is state's own watermark, so a base advanced by the
+    /// event-DAG pool must not be mistaken for a lost state frame.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn shared_interleaved_checkpoints_reclaim_then_read_only_reopen() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_e2e_root");
+        let dir_state = test_dir("shared_e2e_state");
+        let dir_event = test_dir("shared_e2e_event");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+
+        let state = PackfileStorage::open(dir_state.clone()).unwrap();
+        let event = PackfileStorage::open(dir_event.clone()).unwrap();
+        state
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        event
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        // Interleaved commits: each sync checkpoints only its own pool.
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"state-1")),
+            )
+            .unwrap();
+        state.sync_all().unwrap();
+        event
+            .put(
+                &OTHER_COLLECTION,
+                &distinct_id(1),
+                &NodeData::new(bytes::Bytes::from_static(b"event-1")),
+            )
+            .unwrap();
+        event.sync_all().unwrap();
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(2),
+                &NodeData::new(bytes::Bytes::from_static(b"state-2")),
+            )
+            .unwrap();
+        state.sync_all().unwrap();
+
+        // The two pools have distinct watermarks, and the shared segment keeps
+        // every group through the lower of them.
+        let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
+        let event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
+        assert!(state_lsn > event_lsn, "state committed a later group");
+        let scan = Journal::scan_read_only(&wal).unwrap();
+        assert!(
+            scan.base_lsn <= event_lsn + 1,
+            "reclaim must stop at the lagging pool's watermark"
+        );
+
+        drop(state);
+        drop(event);
+
+        // Read-only reopen of the state pool: its checkpoint covered exactly
+        // its own watermark, so the reclaimed prefix is not a coverage gap and
+        // the durable records remain readable.
+        let reader = PackfileStorage::open_read_only(dir_state.clone()).unwrap();
+        reader
+            .enable_read_journal_shared(&wal, ShardType::State)
+            .unwrap();
+        let got = reader
+            .get_read_committed(&TEST_COLLECTION, &[distinct_id(0), distinct_id(2)])
+            .unwrap();
+        assert_eq!(
+            got[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"state-1"[..])
+        );
+        assert_eq!(
+            got[1].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"state-2"[..])
         );
     }
 

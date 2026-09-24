@@ -119,18 +119,30 @@ impl ReadJournal {
         self.delete_lsn.retain(|_, lsn| *lsn > covered);
     }
 
-    /// Whether a reset (reclaimed/rotated) segment now begins past the
-    /// coverage this reader's durable index incorporated.
+    /// Whether a reset segment's base has advanced past the coverage this
+    /// reader's index incorporated, leaving a hole this pool cannot fill.
     ///
-    /// After a reset the overlay is rebuilt from the segment alone. If the
-    /// segment's base LSN is past `covered + 1`, the writer reclaimed groups
-    /// this reader's index never absorbed: those records are in neither the
-    /// overlay nor the index. This uses the header base LSN, not the first
-    /// group, so a fully reclaimed (header-only) segment — where the segment
-    /// has no groups at all — is still detected. A missing/short segment
-    /// reports base 0 and is not a gap.
-    pub(super) fn reset_has_coverage_gap(scan: &crate::journal::Scan, covered: u64) -> bool {
-        scan.base_lsn > covered.saturating_add(1)
+    /// A shared segment interleaves every pool's frames, so the raw base LSN
+    /// advancing is not by itself a gap for this pool: reclaim only drops a
+    /// group once every contributing pool has materialized its frames, and a
+    /// pool with no frames of its own in the segment loses nothing when other
+    /// pools' frames are reclaimed. A gap is only real when the segment still
+    /// carries frames tagged for this pool — then the base jump may have
+    /// skipped this pool's frames, so the checkpoint must be reloaded (or, if
+    /// reloading cannot close it, the read fails closed). A per-pool segment
+    /// (`pool` is `None`) has only this store's frames, so any base jump is a
+    /// gap.
+    pub(super) fn reset_has_coverage_gap(&self, scan: &crate::journal::Scan) -> bool {
+        if scan.base_lsn <= self.covered.saturating_add(1) {
+            return false;
+        }
+        match self.pool {
+            None => true,
+            Some(pool) => scan
+                .groups
+                .iter()
+                .any(|group| group.entries.iter().any(|entry| entry.pool == Some(pool))),
+        }
     }
 
     /// Apply every committed group above `observed_lsn` to the overlay.
@@ -189,7 +201,7 @@ impl ReadJournal {
             // must be gap-checked too — not only an explicit shrink. Without
             // this, a reload that rebinds `covered` below the segment base
             // would silently serve a hole.
-            if (reset || full_scan) && Self::reset_has_coverage_gap(&scan, covered) {
+            if (reset || full_scan) && self.reset_has_coverage_gap(&scan) {
                 return Ok(ReadRefresh::NeedsReload);
             }
             for group in &scan.groups {

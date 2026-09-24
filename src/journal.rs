@@ -450,6 +450,31 @@ pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
     }
 }
 
+/// One appended group's `last_lsn` and the distinct pools it carried, each
+/// mapped to that same `last_lsn`. See [`JournalCoordinator::pending_promotions`].
+type PendingPromotion = (u64, Vec<(ShardType, u64)>);
+
+/// Distinct pools carried by one committed group, each mapped to the group's
+/// `last_lsn`. A group is reclaimed atomically, so a pool's watermark must be
+/// the whole group's end, not the LSN of its own frame within it: the group may
+/// only be dropped once every pool in it has reported coverage through
+/// `last_lsn`.
+fn pool_extents(
+    last_lsn: u64,
+    pools: impl Iterator<Item = Option<ShardType>>,
+) -> Vec<(ShardType, u64)> {
+    let mut extents: Vec<(ShardType, u64)> = Vec::new();
+    for pool in pools {
+        let Some(pool) = pool else {
+            continue;
+        };
+        if !extents.iter().any(|(existing, _)| *existing == pool) {
+            extents.push((pool, last_lsn));
+        }
+    }
+    extents
+}
+
 /// One decoded mutation frame, with the byte range it occupied in the segment
 /// so a reader can re-read and re-validate the frame it has already trusted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -626,6 +651,21 @@ pub struct JournalCoordinator {
     /// the point every pool present in it has materialized. See
     /// [`Self::report_pool_coverage`] and [`Self::reclaim_shared`].
     coverage: Mutex<CoverageState>,
+    /// Highest committed group `last_lsn` that carried a frame for each pool.
+    ///
+    /// A pool's checkpoint may only record this, never the global
+    /// [`Self::committed_lsn`]: one shared group can interleave several pools'
+    /// frames, so the global value can include LSNs whose frames this pool's
+    /// index has not materialized. Recording the global value would both claim
+    /// coverage the checkpoint lacks and let reclaim drop another pool's
+    /// uncovered frames. See [`Self::committed_lsn_for_pool`].
+    pool_committed: Mutex<HashMap<ShardType, u64>>,
+    /// Appended-but-not-yet-committed groups, with the highest LSN each carried
+    /// per pool. Appending a transaction group makes it visible before it is
+    /// fsynced; when a later durable commit passes it,
+    /// [`Self::promote_pool_committed`] drains the entry so every pool's
+    /// watermark still advances from a coalesced fsync.
+    pending_promotions: Mutex<Vec<PendingPromotion>>,
     /// Committed groups recovered when this coordinator's segment was opened.
     /// Retained so a store attaching to a coordinator it did not construct
     /// (the shared-WAL path, where one coordinator serves every pool) can seed
@@ -660,6 +700,18 @@ impl JournalCoordinator {
                 }
             }
         }
+        // Seed each pool's committed watermark from the recovered groups, so a
+        // fresh coordinator over a pre-existing segment reports the same
+        // coverage the segment already carries.
+        let mut pool_committed: HashMap<ShardType, u64> = HashMap::new();
+        for group in &scan.groups {
+            for entry in &group.entries {
+                if let Some(pool) = entry.pool {
+                    let watermark = pool_committed.entry(pool).or_insert(0);
+                    *watermark = (*watermark).max(group.last_lsn);
+                }
+            }
+        }
         Self {
             journal: Mutex::new(journal),
             path,
@@ -670,6 +722,8 @@ impl JournalCoordinator {
             committed_lsn: AtomicU64::new(committed_lsn),
             sequence: None,
             coverage: Mutex::new(coverage),
+            pool_committed: Mutex::new(pool_committed),
+            pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
             sync_calls: AtomicU64::new(0),
@@ -695,6 +749,36 @@ impl JournalCoordinator {
         coverage.required.insert(pool);
         let entry = coverage.covered.entry(pool).or_insert(0);
         *entry = (*entry).max(lsn);
+    }
+
+    /// Highest committed group `last_lsn` that carried at least one frame for
+    /// `pool`, or 0 when no committed group has yet.
+    ///
+    /// A pool checkpoint must record this, not [`Self::committed_lsn`]. One
+    /// shared group can interleave several pools' frames, so the global
+    /// committed LSN can run ahead of what this pool's index has materialized;
+    /// recording it would claim coverage the checkpoint does not have and let
+    /// reclaim drop another pool's uncovered frames.
+    #[must_use]
+    pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
+        self.pool_committed.lock().get(&pool).copied().unwrap_or(0)
+    }
+
+    /// Advance per-pool committed watermarks for every appended group whose
+    /// `last_lsn` is at or below `through_lsn`.
+    fn promote_pool_committed(&self, through_lsn: u64) {
+        let mut promotions = self.pending_promotions.lock();
+        let mut watermarks = self.pool_committed.lock();
+        let (ready, pending): (Vec<PendingPromotion>, Vec<PendingPromotion>) = promotions
+            .drain(..)
+            .partition(|(last_lsn, _)| *last_lsn <= through_lsn);
+        *promotions = pending;
+        for (_, extents) in ready {
+            for (pool, lsn) in extents {
+                let entry = watermarks.entry(pool).or_insert(0);
+                *entry = (*entry).max(lsn);
+            }
+        }
     }
 
     /// Reclaim the shared segment's prefix covered by **every** pool that has
@@ -924,6 +1008,7 @@ impl JournalCoordinator {
             timings.journal_fsync = fsync_started.elapsed();
             self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, &timings);
             self.committed_lsn.store(target_lsn, Ordering::Release);
+            self.promote_pool_committed(target_lsn);
             return Ok((None, timings));
         }
         let batch = {
@@ -1041,6 +1126,18 @@ impl JournalCoordinator {
         )
         .unwrap_or(batch.len())
         .min(batch.len());
+        // Advance each pool's committed watermark over the durable prefix, and
+        // promote any earlier transaction group this fsync also made durable.
+        let extents = pool_extents(
+            receipt.last_lsn,
+            batch[..committed_count].iter().map(|(_, pool, _)| *pool),
+        );
+        if !extents.is_empty() {
+            self.pending_promotions
+                .lock()
+                .push((receipt.last_lsn, extents));
+        }
+        self.promote_pool_committed(receipt.last_lsn);
         if committed_count < batch.len() {
             let mut pending = self.pending.lock();
             pending.splice(0..0, batch.into_iter().skip(committed_count));
@@ -1168,6 +1265,29 @@ impl JournalCoordinator {
         self.visible_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
         drop(pending);
+        // A staged transaction group reaches the segment without going through
+        // `publish`, so register its pools here too: otherwise reclaim would
+        // not know it must wait for them and could drop their frames before
+        // they checkpoint.
+        {
+            let mut coverage = self.coverage.lock();
+            for (pool, _) in &group_mutations {
+                if let Some(pool) = pool {
+                    coverage.required.insert(*pool);
+                }
+            }
+        }
+        // The group is visible but not yet durable; record its per-pool extents
+        // so a later coalesced fsync can promote each pool's watermark.
+        let extents = pool_extents(
+            receipt.last_lsn,
+            group_mutations.iter().map(|(pool, _)| *pool),
+        );
+        if !extents.is_empty() {
+            self.pending_promotions
+                .lock()
+                .push((receipt.last_lsn, extents));
+        }
         Ok(receipt)
     }
 
@@ -2316,6 +2436,94 @@ mod tests {
             journal.append_group(&[put(1, 1, b"x")]).is_err(),
             "a pool-tagged segment must reject an untagged frame"
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shared_committed_watermark_is_per_pool() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_pool_watermark");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        // Group one: state only. Only state's watermark may advance past zero.
+        coordinator
+            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+            .unwrap();
+        coordinator.sync().unwrap();
+        let state_only = coordinator.committed_lsn();
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::State),
+            state_only,
+            "the state frame's group advances state's watermark"
+        );
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::EventDag),
+            0,
+            "another pool's group must not advance event-DAG's watermark"
+        );
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::AuthChain), 0);
+
+        // Group two: event-DAG only. State's watermark must stay put.
+        coordinator
+            .publish_tagged(ShardType::EventDag, put(2, 2, b"event"), |_| {})
+            .unwrap();
+        coordinator.sync().unwrap();
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::State),
+            state_only
+        );
+        assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > state_only);
+
+        // A group carrying both pools advances both to the group's own end.
+        coordinator
+            .publish_tagged(ShardType::State, put(3, 3, b"s2"), |_| {})
+            .unwrap();
+        coordinator
+            .publish_tagged(ShardType::EventDag, put(4, 4, b"e2"), |_| {})
+            .unwrap();
+        coordinator.sync().unwrap();
+        let shared = coordinator.committed_lsn();
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), shared);
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::EventDag),
+            shared
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shared_reclaim_waits_for_a_staged_pools_frame() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_staged_required");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        // A transaction stages an event-DAG frame without going through
+        // `publish`; it must still block reclaim until event-DAG checkpoints.
+        coordinator
+            .append_pending_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+            .unwrap();
+        coordinator
+            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+            .unwrap();
+        coordinator.sync().unwrap();
+        let committed = coordinator.committed_lsn();
+        assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > 0);
+
+        // State checkpoints, event-DAG does not: the staged frame's group must
+        // survive, because event-DAG has no durable coverage for it yet.
+        coordinator.report_pool_coverage(ShardType::State, committed);
+        assert!(
+            coordinator.reclaim_shared().unwrap().is_none(),
+            "a staged pool without coverage must block reclaim"
+        );
+
+        // Once every pool reports, the prefix can go.
+        coordinator.report_pool_coverage(ShardType::EventDag, committed);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
         fs::remove_file(path).unwrap();
     }
 
