@@ -807,12 +807,12 @@ const MAX_FRAME_DISK_LEN: u64 = (packfile::MAX_RECORD_LEN + 8) as u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadPlanPolicy {
     /// Candidate offsets at most this far apart (start to start, on the same
-    /// shard) are melded into one prefetched extent. On an HDD, reading
-    /// through a gap is cheaper than a seek once the gap is under roughly
-    /// `seek_time * throughput` (~1-2 MB at 10 ms / 100 MB/s), which is the
-    /// same order as the ~500-1000 4 KiB blocks a rotational drive reads in
-    /// one seek. [`ReadPlanPolicy::prefetch`] uses 2 MiB; `0` melds only
-    /// adjacent offsets.
+    /// shard) are melded into one prefetched extent. Reading through a gap can
+    /// be cheaper than a seek, but a gap far larger than the target spacing
+    /// makes the plan read through most of the file for no benefit — measured
+    /// on a cold-cache HDD, every gap from 0 to ~256 KiB performed about
+    /// equally, and a 2 MiB gap over-merged. [`ReadPlanPolicy::prefetch`] uses
+    /// 64 KiB; `0` melds only adjacent offsets.
     pub merge_gap_bytes: u64,
     /// Hard ceiling on one merged extent. Bounds the bytes read through gaps
     /// and keeps a dense batch from collapsing into a single unbounded
@@ -868,16 +868,17 @@ impl ReadPlanPolicy {
         }
     }
 
-    /// A **starting point** for rotational (HDD) storage, not a tuned preset:
-    /// meld candidates within 2 MiB — the ~500-1000 4 KiB blocks a drive reads
-    /// in one seek — up to an 8 MiB extent, once a batch has at least 16
-    /// candidate locations. These numbers are reasoned from seek/throughput
-    /// arithmetic but have not been validated against a cold-cache benchmark;
-    /// treat them as a place to start tuning.
+    /// A starting point for rotational (HDD) storage: meld candidates within
+    /// 64 KiB, up to an 8 MiB extent, once a batch has at least 16 candidate
+    /// locations. On a cold-cache HDD benchmark, any gap from 0 up to ~256 KiB
+    /// performed about equally well, while the earlier 2 MiB guess over-merged
+    /// and read through far more of the file than it saved in seeks. See the
+    /// type docs for the measured HDD-only results and why readahead
+    /// suppression ([`Self::random_advice`]) is the more portable win.
     #[must_use]
     pub fn prefetch() -> Self {
         Self {
-            merge_gap_bytes: 2 * 1024 * 1024,
+            merge_gap_bytes: 64 * 1024,
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 16,
             random_advice: false,
