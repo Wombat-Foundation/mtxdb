@@ -508,6 +508,7 @@ impl SyncLatencyHistogram {
 
 /// One of the worst sync operations retained for post-run diagnosis.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SyncDiagnosticSample {
     /// Unix timestamp in milliseconds when the sync completed.
     pub timestamp_ms: u128,
@@ -557,6 +558,7 @@ pub struct SyncDiagnosticSample {
 
 /// Runtime sync diagnostics retained after the operation that produced them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SyncDiagnosticsSnapshot {
     /// Non-cumulative [`SyncLatencyHistogram`] of journal fsync latencies
     /// observed during the interval ending at the take. See
@@ -7732,10 +7734,13 @@ impl PackfileStorage {
     /// diagnostics for the next observation interval.
     ///
     /// Unlike [`Self::reset_stats`], this leaves all runtime counters and
-    /// cumulative sync totals untouched. The returned histograms, peak, and
-    /// worst-operation samples therefore describe the interval ending at this
-    /// call; syncs racing with the call are recorded in either the returned
-    /// snapshot or the next interval, never partially in both.
+    /// cumulative sync totals untouched. The returned histograms, peak
+    /// in-flight count, interval maxima (`max_journal_lock_wait` and
+    /// `max_journal_fsync`), and worst-operation samples therefore describe
+    /// the interval ending at this call; the interval maxima reset to zero
+    /// alongside the histograms. Syncs racing with the call are recorded in
+    /// either the returned snapshot or the next interval, never partially in
+    /// both.
     #[must_use]
     pub fn take_sync_diagnostics(&self) -> SyncDiagnosticsSnapshot {
         let mut diagnostics = self.sync_diagnostics.lock();
