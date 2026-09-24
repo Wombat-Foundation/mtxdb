@@ -1636,6 +1636,27 @@ impl PackfileStorage {
         Ok(store)
     }
 
+    /// Open a read-only worker on one pool of a **shared** WAL.
+    ///
+    /// Identical to [`Self::open_read_committed`] except the overlay applies
+    /// only frames tagged with `pool`, so a worker reading the state pool does
+    /// not observe event-DAG or auth-chain mutations that share the same
+    /// segment. `wal_path` is the database root's shared `wal.bin`, not a
+    /// per-pool segment.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_read_committed`].
+    #[cfg(feature = "multi-reader")]
+    pub fn open_read_committed_shared(
+        base_dir: PathBuf,
+        wal_path: impl AsRef<Path>,
+        pool: crate::layout::ShardType,
+    ) -> Result<Self, StorageError> {
+        let store = Self::open_read_only(base_dir)?;
+        store.enable_read_journal_shared(wal_path, pool)?;
+        Ok(store)
+    }
+
     /// Open a packfile storage with a custom per-collection cache capacity.
     ///
     /// # Errors
@@ -3697,18 +3718,25 @@ impl PackfileStorage {
         // correctness (the checkpoint is already durable).
         if let Some(lsn) = wal_lsn {
             self.write_journal_lsn(lsn)?;
-            // A per-pool segment holds only this pool's frames, so this
-            // checkpoint covers everything at or below `lsn` and the segment
-            // can drop that prefix. A shared segment also holds other pools'
-            // frames, which this checkpoint does not cover — reclaiming through
-            // `lsn` would delete frames those pools have not materialized.
-            // Cross-pool reclaim needs the minimum durable coverage across all
-            // participating pools (see the shared durability fence design), so
-            // a shared segment is left to grow for now.
-            if self.journal_pool.load(Ordering::Acquire) == 0 {
-                if let Some(journal) = self.journal() {
-                    if let Err(error) = journal.reclaim_through(lsn) {
-                        eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+            if let Some(journal) = self.journal() {
+                match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+                    // A per-pool segment holds only this pool's frames, so this
+                    // checkpoint covers everything at or below `lsn` and the
+                    // segment can drop that prefix.
+                    None => {
+                        if let Err(error) = journal.reclaim_through(lsn) {
+                            eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                        }
+                    }
+                    // A shared segment also holds other pools' frames. Record
+                    // this pool's coverage and reclaim only up to the minimum
+                    // across every pool that has frames in the segment, so no
+                    // pool's frames are dropped before they are materialized.
+                    Some(pool) => {
+                        journal.report_pool_coverage(pool, lsn);
+                        if let Err(error) = journal.reclaim_shared() {
+                            eprintln!("warning: shared journal reclaim failed: {error}");
+                        }
                     }
                 }
             }
@@ -14670,11 +14698,160 @@ mod tests {
             .is_none());
     }
 
+    /// A shared segment may only be reclaimed up to the minimum durable
+    /// coverage across every pool that has frames in it.
+    #[test]
+    fn shared_reclaim_waits_for_every_pool_then_truncates() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_reclaim_root");
+        let dir_a = test_dir("shared_reclaim_a");
+        let dir_b = test_dir("shared_reclaim_b");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+
+        let a = PackfileStorage::open(dir_a.clone()).unwrap();
+        let b = PackfileStorage::open(dir_b.clone()).unwrap();
+        a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        b.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        a.put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::new(bytes::Bytes::from_static(b"a")),
+        )
+        .unwrap();
+        b.put(
+            &OTHER_COLLECTION,
+            &distinct_id(1),
+            &NodeData::new(bytes::Bytes::from_static(b"b")),
+        )
+        .unwrap();
+
+        // Only A checkpoints; B still has an un-covered frame in the segment,
+        // so the shared prefix must not be reclaimed yet.
+        a.sync_all().unwrap();
+        assert_eq!(
+            Journal::scan_read_only(&wal).unwrap().groups.len(),
+            1,
+            "shared reclaim must wait for every pool's coverage"
+        );
+
+        // B checkpoints too; now the covered prefix can be dropped.
+        b.sync_all().unwrap();
+        let scan = Journal::scan_read_only(&wal).unwrap();
+        assert_eq!(scan.groups.len(), 0, "every pool covered: prefix reclaimed");
+        assert!(
+            scan.base_lsn > 1,
+            "the segment base advanced past the reclaimed group"
+        );
+    }
+
+    /// A read-only worker on a shared WAL must observe only its own pool's
+    /// tagged frames, not the other pools' interleaved in the same segment.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn shared_read_committed_filters_by_pool() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_read_committed_root");
+        let wal = root.join("wal.bin");
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        coordinator
+            .publish_tagged(
+                ShardType::State,
+                JournalMutation::Put {
+                    collection_id: TEST_COLLECTION,
+                    node_id: distinct_id(0),
+                    payload: b"state".to_vec(),
+                },
+                |_| {},
+            )
+            .unwrap();
+        coordinator
+            .publish_tagged(
+                ShardType::EventDag,
+                JournalMutation::Put {
+                    collection_id: OTHER_COLLECTION,
+                    node_id: distinct_id(1),
+                    payload: b"event".to_vec(),
+                },
+                |_| {},
+            )
+            .unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        // A read-only open needs at least one shard, so seed each reader's own
+        // pool directory with a durable record in an unrelated collection.
+        let seed_dir = |name: &str| {
+            let dir = test_dir(name);
+            {
+                let seed = PackfileStorage::open(dir.clone()).unwrap();
+                seed.put(
+                    &[0x77; 16],
+                    &distinct_id(9),
+                    &NodeData::new(bytes::Bytes::from_static(b"seed")),
+                )
+                .unwrap();
+                seed.sync_all().unwrap();
+            }
+            dir
+        };
+
+        let state_reader = PackfileStorage::open_read_committed_shared(
+            seed_dir("shared_read_committed_state"),
+            &wal,
+            ShardType::State,
+        )
+        .unwrap();
+        assert!(
+            state_reader
+                .get_read_committed(&TEST_COLLECTION, &[distinct_id(0)])
+                .unwrap()[0]
+                .is_some(),
+            "the state worker must see its own pool's frame"
+        );
+        assert!(
+            state_reader
+                .get_read_committed(&OTHER_COLLECTION, &[distinct_id(1)])
+                .unwrap()[0]
+                .is_none(),
+            "the state worker must not see the event-DAG pool's frame"
+        );
+
+        let event_reader = PackfileStorage::open_read_committed_shared(
+            seed_dir("shared_read_committed_event"),
+            &wal,
+            ShardType::EventDag,
+        )
+        .unwrap();
+        assert!(event_reader
+            .get_read_committed(&OTHER_COLLECTION, &[distinct_id(1)])
+            .unwrap()[0]
+            .is_some());
+        assert!(event_reader
+            .get_read_committed(&TEST_COLLECTION, &[distinct_id(0)])
+            .unwrap()[0]
+            .is_none());
+    }
+
     /// The root shared-WAL lock is exclusive while held and reacquirable after
     /// the holder drops it.
     #[test]
     fn shared_wal_lock_is_exclusive() {
         let root = test_dir("shared_wal_lock_exclusive");
+        // A shared-WAL lock is gated on a shared-layout database descriptor.
+        let _layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
         let first = crate::journal::SharedWalLock::acquire(&root).unwrap();
         let second = crate::journal::SharedWalLock::acquire(&root);
         assert!(

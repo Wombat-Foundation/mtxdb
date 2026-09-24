@@ -26,25 +26,68 @@ const DB_META_MAGIC: &[u8; 4] = b"MDBD";
 const DB_META_VERSION: u8 = 1;
 const DB_META_RESERVED_LEN: usize = 8;
 const DB_META_POOL_LIST: &[u8] = b"state\nevent-dag\nauth-chain\n";
-const DB_META_FILENAME: &str = "db.meta";
+/// File name of the database-root descriptor.
+pub const DB_META_FILENAME: &str = "db.meta";
 
 /// `magic + version` header length shared by the writer and the validator.
 const DB_META_HEADER_LEN: usize = 4 + 1 + DB_META_RESERVED_LEN;
+/// Offset of the first reserved byte, repurposed as the WAL layout code.
+const DB_META_WAL_LAYOUT_OFFSET: usize = 4 + 1;
 
-/// Build the on-disk descriptor bytes for a fresh database root.
-fn db_meta_bytes() -> Vec<u8> {
+/// Which durability-journal layout a database root uses.
+///
+/// Recorded in `db.meta`'s reserved bytes (zero in roots written before this
+/// field existed, i.e. [`WalLayout::PerPool`]). It exists so a store can never
+/// be silently reinterpreted under the wrong layout: opening a shared root as
+/// per-pool, or a per-pool root as shared, fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalLayout {
+    /// One `wal.bin` per pool directory (the original layout).
+    PerPool,
+    /// One shared `wal.bin` at the database root, carrying pool-tagged frames
+    /// for every pool (the default for newly initialized roots).
+    Shared,
+}
+
+impl WalLayout {
+    const fn code(self) -> u8 {
+        match self {
+            Self::PerPool => 0,
+            Self::Shared => 1,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::PerPool),
+            1 => Some(Self::Shared),
+            _ => None,
+        }
+    }
+}
+
+/// Build the on-disk descriptor bytes for a database root.
+fn db_meta_bytes(wal_layout: WalLayout) -> Vec<u8> {
     let mut buf = Vec::with_capacity(DB_META_HEADER_LEN.saturating_add(DB_META_POOL_LIST.len()));
     buf.extend_from_slice(DB_META_MAGIC);
     buf.push(DB_META_VERSION);
     buf.extend_from_slice(&[0u8; DB_META_RESERVED_LEN]);
+    buf[DB_META_WAL_LAYOUT_OFFSET] = wal_layout.code();
     buf.extend_from_slice(DB_META_POOL_LIST);
     buf
 }
 
+/// Parse the WAL layout byte from a descriptor that has already passed
+/// [`validate_db_meta`]. An absent/zero byte (a root written before the field
+/// existed) is the legacy [`WalLayout::PerPool`].
+fn db_meta_wal_layout(contents: &[u8]) -> WalLayout {
+    WalLayout::from_code(contents[DB_META_WAL_LAYOUT_OFFSET]).unwrap_or(WalLayout::PerPool)
+}
+
 /// Validate a descriptor read from disk: correct magic, a version this
-/// build understands, and the expected pool list. The reserved bytes are
-/// not validated — a future version may give them meaning, but this build
-/// only ever writes them zero-filled.
+/// build understands, the expected pool list, and a WAL-layout byte this
+/// build understands. An unknown layout byte fails closed rather than being
+/// guessed at.
 fn validate_db_meta(contents: &[u8]) -> bool {
     if contents.len() < DB_META_HEADER_LEN {
         return false;
@@ -55,11 +98,39 @@ fn validate_db_meta(contents: &[u8]) -> bool {
     if contents[4] != DB_META_VERSION {
         return false;
     }
+    if WalLayout::from_code(contents[DB_META_WAL_LAYOUT_OFFSET]).is_none() {
+        return false;
+    }
     contents[DB_META_HEADER_LEN..] == *DB_META_POOL_LIST
 }
 
+/// Read the WAL layout a database root declares, or `None` when the root has
+/// no `db.meta`.
+///
+/// # Errors
+/// Returns `InvalidData` if a descriptor exists but is unrecognized, so a
+/// caller can never fall back to a guessed layout.
+pub fn read_wal_layout(root: &Path) -> io::Result<Option<WalLayout>> {
+    let meta_path = root.join(DB_META_FILENAME);
+    let contents = match fs::read(&meta_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !validate_db_meta(&contents) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unrecognized mtxdb database descriptor: {}",
+                meta_path.display()
+            ),
+        ));
+    }
+    Ok(Some(db_meta_wal_layout(&contents)))
+}
+
 /// A named independent packfile pool in an mtxdb database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShardType {
     /// HAMT nodes, roots, and state-group sidecars.
     State,
@@ -100,6 +171,8 @@ impl ShardType {
 #[derive(Debug, Clone)]
 pub struct DatabaseLayout {
     root: PathBuf,
+    /// WAL layout declared by `db.meta`. Fixed when the root is opened.
+    wal_layout: WalLayout,
 }
 
 impl DatabaseLayout {
@@ -120,7 +193,7 @@ impl DatabaseLayout {
         // data was silently dropped into the wrong location.
         Self::reject_legacy_flat_store(&root)?;
         let meta_path = root.join(DB_META_FILENAME);
-        if meta_path.exists() {
+        let wal_layout = if meta_path.exists() {
             let contents = fs::read(&meta_path)?;
             if !validate_db_meta(&contents) {
                 return Err(io::Error::new(
@@ -131,13 +204,18 @@ impl DatabaseLayout {
                     ),
                 ));
             }
+            db_meta_wal_layout(&contents)
         } else {
-            Self::write_descriptor(&meta_path)?;
-        }
+            // A newly initialized database-format root uses one shared WAL.
+            // Roots written before this field existed decode as PerPool and
+            // are never silently reinterpreted.
+            Self::write_descriptor(&meta_path, WalLayout::Shared)?;
+            WalLayout::Shared
+        };
         for shard_type in ShardType::ALL {
             fs::create_dir_all(root.join("pools").join(shard_type.as_str()))?;
         }
-        Ok(Self { root })
+        Ok(Self { root, wal_layout })
     }
 
     /// Return a named pool's directory, creating its parent directory.
@@ -201,7 +279,35 @@ impl DatabaseLayout {
             ));
         }
         Self::reject_legacy_flat_store(&root)?;
-        Ok(Self { root })
+        let wal_layout = db_meta_wal_layout(&contents);
+        Ok(Self { root, wal_layout })
+    }
+
+    /// WAL layout this root declares.
+    #[must_use]
+    pub fn wal_layout(&self) -> WalLayout {
+        self.wal_layout
+    }
+
+    /// Path of the root-level shared WAL, or an error when this root uses the
+    /// legacy per-pool layout.
+    ///
+    /// # Errors
+    /// Returns `InvalidData` for a per-pool root, so a caller can never point
+    /// the shared-WAL path at a store that still expects three per-pool
+    /// segments.
+    pub fn shared_wal_path(&self) -> io::Result<PathBuf> {
+        if self.wal_layout != WalLayout::Shared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "database root {} uses the legacy per-pool WAL layout; \\
+                     migrate it before using a shared WAL",
+                    self.root.display()
+                ),
+            ));
+        }
+        Ok(self.root.join("wal.bin"))
     }
 
     fn reject_legacy_flat_store(root: &Path) -> io::Result<()> {
@@ -224,10 +330,10 @@ impl DatabaseLayout {
         Ok(())
     }
 
-    fn write_descriptor(path: &Path) -> io::Result<()> {
+    fn write_descriptor(path: &Path, wal_layout: WalLayout) -> io::Result<()> {
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
-                file.write_all(&db_meta_bytes())?;
+                file.write_all(&db_meta_bytes(wal_layout))?;
                 file.sync_all()
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -301,7 +407,7 @@ mod tests {
     fn rejects_a_descriptor_with_an_unknown_version() {
         let root = test_dir("bad_version");
         fs::create_dir_all(&root).unwrap();
-        let mut bytes = super::db_meta_bytes();
+        let mut bytes = super::db_meta_bytes(super::WalLayout::Shared);
         bytes[4] = super::DB_META_VERSION.wrapping_add(1);
         fs::write(root.join(DB_META_FILENAME), &bytes).unwrap();
         let err = DatabaseLayout::open(root).unwrap_err();
@@ -354,7 +460,11 @@ mod tests {
     fn read_only_open_rejects_a_legacy_flat_store() {
         let root = test_dir("read_only_legacy");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(DB_META_FILENAME), super::db_meta_bytes()).unwrap();
+        fs::write(
+            root.join(DB_META_FILENAME),
+            super::db_meta_bytes(super::WalLayout::PerPool),
+        )
+        .unwrap();
         fs::write(root.join("shard_0000_0000000000000000.pack"), b"legacy").unwrap();
         let err = DatabaseLayout::open_read_only(root).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -368,5 +478,49 @@ mod tests {
         // propagate as `Err`, never panic or abort.
         fs::create_dir_all(root.join(DB_META_FILENAME)).unwrap();
         assert!(DatabaseLayout::open_read_only(root).is_err());
+    }
+
+    #[test]
+    fn a_new_root_declares_the_shared_wal_layout() {
+        let root = test_dir("shared_wal_default");
+        let layout = DatabaseLayout::open(root.clone()).unwrap();
+        assert_eq!(layout.wal_layout(), super::WalLayout::Shared);
+        assert_eq!(
+            layout.shared_wal_path().unwrap(),
+            root.join("wal.bin"),
+            "a shared root's WAL lives at the root"
+        );
+    }
+
+    #[test]
+    fn a_legacy_descriptor_stays_per_pool_and_refuses_the_shared_wal() {
+        let root = test_dir("legacy_per_pool_layout");
+        fs::create_dir_all(&root).unwrap();
+        // A root written before the WAL-layout field existed: reserved byte 0.
+        fs::write(
+            root.join(DB_META_FILENAME),
+            super::db_meta_bytes(super::WalLayout::PerPool),
+        )
+        .unwrap();
+        let layout = DatabaseLayout::open(root.clone()).unwrap();
+        assert_eq!(layout.wal_layout(), super::WalLayout::PerPool);
+        let err = layout.shared_wal_path().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("legacy per-pool"));
+
+        let read_only = DatabaseLayout::open_read_only(root).unwrap();
+        assert_eq!(read_only.wal_layout(), super::WalLayout::PerPool);
+    }
+
+    #[test]
+    fn an_unknown_wal_layout_byte_fails_closed() {
+        let root = test_dir("unknown_wal_layout");
+        fs::create_dir_all(&root).unwrap();
+        let mut bytes = super::db_meta_bytes(super::WalLayout::Shared);
+        bytes[super::DB_META_WAL_LAYOUT_OFFSET] = 0x7f;
+        fs::write(root.join(DB_META_FILENAME), &bytes).unwrap();
+        let err = DatabaseLayout::open(root).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unrecognized"));
     }
 }

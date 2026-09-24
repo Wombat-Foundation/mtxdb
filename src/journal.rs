@@ -5,6 +5,7 @@
 //! which captures each sync caller's
 //! target LSN and releases it only after a durable group covers that target.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -584,6 +585,17 @@ pub struct Journal {
 /// An fsync at least this slow is reported on stderr when it happens.
 const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Cross-pool coverage bookkeeping for reclaiming a shared segment.
+#[derive(Default)]
+struct CoverageState {
+    /// Pools with at least one frame in the segment (recovered at open, or
+    /// published this session). A group may only be reclaimed once all of
+    /// these have reported durable coverage past it.
+    required: HashSet<ShardType>,
+    /// Highest durable checkpoint coverage reported per pool.
+    covered: HashMap<ShardType, u64>,
+}
+
 /// Serializes mutation publication and durable commits for one journal.
 ///
 /// Mutations are assigned LSNs under a short queue lock. A sync caller captures
@@ -610,6 +622,10 @@ pub struct JournalCoordinator {
     /// segment's own counter, so groups across several pool segments share one
     /// global order. See [`Self::with_shared_sequence`].
     sequence: Option<Arc<AtomicU64>>,
+    /// Per-pool durable coverage, used to reclaim a shared segment only up to
+    /// the point every pool present in it has materialized. See
+    /// [`Self::report_pool_coverage`] and [`Self::reclaim_shared`].
+    coverage: Mutex<CoverageState>,
     /// Committed groups recovered when this coordinator's segment was opened.
     /// Retained so a store attaching to a coordinator it did not construct
     /// (the shared-WAL path, where one coordinator serves every pool) can seed
@@ -634,6 +650,16 @@ impl JournalCoordinator {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
         let next_lsn = journal.next_lsn;
         let path = journal.path.clone();
+        // Every pool with a frame already in the segment is required to report
+        // coverage before any of its frame's group can be reclaimed.
+        let mut coverage = CoverageState::default();
+        for group in &scan.groups {
+            for entry in &group.entries {
+                if let Some(pool) = entry.pool {
+                    coverage.required.insert(pool);
+                }
+            }
+        }
         Self {
             journal: Mutex::new(journal),
             path,
@@ -643,6 +669,7 @@ impl JournalCoordinator {
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             sequence: None,
+            coverage: Mutex::new(coverage),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
             sync_calls: AtomicU64::new(0),
@@ -658,6 +685,45 @@ impl JournalCoordinator {
     #[must_use]
     pub fn recovered_groups(&self) -> Vec<CommittedGroup> {
         self.recovered.clone()
+    }
+
+    /// Record that `pool`'s durable checkpoint has materialized every frame it
+    /// owns through `lsn`. Coverage only advances, and a pool becomes required
+    /// as soon as it has a frame in the segment (recovered or published).
+    pub fn report_pool_coverage(&self, pool: ShardType, lsn: u64) {
+        let mut coverage = self.coverage.lock();
+        coverage.required.insert(pool);
+        let entry = coverage.covered.entry(pool).or_insert(0);
+        *entry = (*entry).max(lsn);
+    }
+
+    /// Reclaim the shared segment's prefix covered by **every** pool that has
+    /// frames in it, returning the reclaim result or `None` when some required
+    /// pool has not yet reported coverage (so no group may be dropped).
+    ///
+    /// This is the shared-segment counterpart to [`Self::reclaim_through`]: a
+    /// single pool's checkpoint covers only its own frames, so the segment may
+    /// only be truncated up to the minimum durable coverage across all pools.
+    ///
+    /// # Errors
+    /// Propagates a segment-rewrite failure from [`Self::reclaim_through`].
+    pub fn reclaim_shared(&self) -> io::Result<Option<Reclaim>> {
+        let min = {
+            let coverage = self.coverage.lock();
+            if coverage.required.is_empty() {
+                return Ok(None);
+            }
+            let mut min = u64::MAX;
+            for pool in &coverage.required {
+                match coverage.covered.get(pool) {
+                    Some(&lsn) => min = min.min(lsn),
+                    // A required pool with no coverage at all blocks reclaim.
+                    None => return Ok(None),
+                }
+            }
+            min
+        };
+        self.reclaim_through(min).map(Some)
     }
 
     /// Build a coordinator whose groups draw their sequence from a shared,
@@ -756,6 +822,11 @@ impl JournalCoordinator {
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
         publish_overlay(lsn);
         pending.push((lsn, pool, mutation));
+        if let Some(pool) = pool {
+            // A newly publishing pool must report coverage before reclaim can
+            // drop its frames.
+            self.coverage.lock().required.insert(pool);
+        }
         self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn.store(lsn, Ordering::Release);
         Ok(lsn)
@@ -2122,7 +2193,33 @@ impl SharedWalLock {
     /// Returns `WouldBlock` if another live writer holds it, or an I/O error
     /// if the lock file cannot be created.
     pub fn acquire(db_root: impl AsRef<Path>) -> io::Result<Self> {
-        let path = db_root.as_ref().join(".mtxdb.wal.lock");
+        let db_root = db_root.as_ref();
+        // Fail closed on the layout: never let a caller point a shared WAL at a
+        // root that still declares three per-pool segments (or is not an mtxdb
+        // database root at all).
+        match crate::layout::read_wal_layout(db_root)? {
+            Some(crate::layout::WalLayout::Shared) => {}
+            Some(crate::layout::WalLayout::PerPool) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} uses the legacy per-pool WAL layout; migrate it before opening a shared WAL",
+                        db_root.display()
+                    ),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} is not an mtxdb database root (missing {}); initialize it first",
+                        db_root.display(),
+                        crate::layout::DB_META_FILENAME
+                    ),
+                ));
+            }
+        }
+        let path = db_root.join(".mtxdb.wal.lock");
         Ok(Self {
             _lock: crate::shard::ShardPool::acquire_lock_path(&path)?,
         })

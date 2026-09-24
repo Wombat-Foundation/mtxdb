@@ -39,6 +39,10 @@ enum ReadRefresh {
 /// `observed_lsn` have a complete commit trailer, so they are committed even
 /// though the writer may not have fsynced or advanced the durable index yet.
 pub(super) struct ReadJournal {
+    /// Pool whose tagged frames this overlay applies, or `None` for a per-pool
+    /// (untagged, version-2) segment. A shared segment interleaves all pools'
+    /// frames, so a pool's reader must apply only frames tagged for it.
+    pool: Option<crate::layout::ShardType>,
     /// Segment file scanned for committed groups.
     path: PathBuf,
     /// The journal LSN covered by the durable index this reader actually
@@ -69,8 +73,13 @@ pub(super) struct ReadJournal {
 }
 
 impl ReadJournal {
-    pub(super) fn empty(path: PathBuf, covered: u64) -> Self {
+    pub(super) fn empty(
+        path: PathBuf,
+        covered: u64,
+        pool: Option<crate::layout::ShardType>,
+    ) -> Self {
         Self {
+            pool,
             path,
             covered,
             observed_len: 0,
@@ -186,6 +195,12 @@ impl ReadJournal {
             for group in &scan.groups {
                 for entry in &group.entries {
                     if entry.lsn <= self.observed_lsn || entry.lsn <= covered {
+                        continue;
+                    }
+                    // A shared segment interleaves all pools' frames; apply
+                    // only this pool's. `None` pool is a per-pool segment,
+                    // whose frames are all this store's.
+                    if self.pool.is_some_and(|pool| entry.pool != Some(pool)) {
                         continue;
                     }
                     match &entry.mutation {
@@ -385,11 +400,38 @@ impl PackfileStorage {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), StorageError> {
+        self.enable_read_journal_inner(path, None)
+    }
+
+    /// Like [`Self::enable_read_journal`], but for a shared, pool-tagged
+    /// segment: the overlay applies only frames tagged with `pool`, so a
+    /// worker reading one pool of a shared WAL does not observe the other
+    /// pools' mutations.
+    ///
+    /// # Errors
+    /// Same as [`Self::enable_read_journal`].
+    pub fn enable_read_journal_shared(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        pool: crate::layout::ShardType,
+    ) -> Result<(), StorageError> {
+        self.enable_read_journal_inner(path, Some(pool))
+    }
+
+    fn enable_read_journal_inner(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        pool: Option<crate::layout::ShardType>,
+    ) -> Result<(), StorageError> {
         // Bind the overlay to the coverage of the index this handle loaded, not
         // whatever `journal.lsn` says now: a concurrent checkpoint may already
         // have advanced past this handle's in-memory index.
         let covered = self.read_covered_lsn.load(Ordering::Acquire);
-        *self.read_journal.lock() = Some(ReadJournal::empty(path.as_ref().to_path_buf(), covered));
+        *self.read_journal.lock() = Some(ReadJournal::empty(
+            path.as_ref().to_path_buf(),
+            covered,
+            pool,
+        ));
         if let Err(error) = self.refresh_read_journal() {
             *self.read_journal.lock() = None;
             return Err(error);

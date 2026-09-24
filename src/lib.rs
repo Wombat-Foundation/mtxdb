@@ -56,7 +56,7 @@ pub use index::LossyIndex;
 #[cfg(not(target_arch = "wasm32"))]
 pub use journal::SharedWalLock;
 pub use journal::{TxnStage, TxnStageState};
-pub use layout::{DatabaseLayout, ShardType};
+pub use layout::{read_wal_layout, DatabaseLayout, ShardType, WalLayout};
 pub use matrix_policy::{
     EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
