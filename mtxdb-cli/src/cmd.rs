@@ -6552,6 +6552,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: Some(ShardType::State),
+            coalesce: false,
             command: Commands::Sync { all: true },
         };
 
@@ -6578,6 +6579,7 @@ mod tests {
         let cli = Cli {
             dirs: Vec::new(),
             shard_type: None,
+            coalesce: false,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -6597,6 +6599,7 @@ mod tests {
         let cli = Cli {
             dirs: Vec::new(),
             shard_type: Some(ShardType::State),
+            coalesce: false,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -6616,6 +6619,7 @@ mod tests {
         let cli = Cli {
             dirs: Vec::new(),
             shard_type: Some(ShardType::EventDag),
+            coalesce: false,
             command: Commands::Collections {
                 all: true,
                 layout: false,
@@ -6638,6 +6642,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -6659,6 +6664,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Shards {
                 all: false,
                 layout: false,
@@ -6681,6 +6687,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: Some(ShardType::State),
+            coalesce: false,
             command: Commands::Collections {
                 all: false,
                 layout: false,
@@ -6702,6 +6709,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Stats { json: false },
         };
         cmd_stats(&cli, false).unwrap();
@@ -6714,6 +6722,7 @@ mod tests {
         let cli = Cli {
             dirs: Vec::new(),
             shard_type: None,
+            coalesce: false,
             command: Commands::Info {
                 collection: String::new(),
                 stats: false,
@@ -6825,6 +6834,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Get {
                 collection: None,
                 id: node_hex.clone(),
@@ -6855,6 +6865,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Info {
                 collection: col_hex.clone(),
                 stats: false,
@@ -6881,6 +6892,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Scan {
                 selector: col_hex.clone(),
                 verbose: false,
@@ -8545,6 +8557,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Shards {
                 all: false,
                 layout: false,
@@ -8565,6 +8578,7 @@ mod tests {
         let cli = Cli {
             dirs: vec![dir1.clone(), dir2.clone()],
             shard_type: None,
+            coalesce: false,
             command: Commands::Put {
                 collection: "0x0102030405060708090a0b0c0d0e0f10".to_owned(),
                 id: "0x0102030405060708090a0b0c0d0e0f10".to_owned(),

@@ -12,6 +12,7 @@ use mtxdb::ShardType;
 pub(crate) struct Cli {
     pub(crate) dirs: Vec<PathBuf>,
     pub(crate) shard_type: Option<ShardType>,
+    pub(crate) coalesce: bool,
     pub(crate) command: Commands,
 }
 
@@ -66,6 +67,7 @@ impl Cli {
         Self {
             dirs: vec![dir],
             shard_type: self.shard_type,
+            coalesce: self.coalesce,
             command: self.command.clone(),
         }
     }
@@ -216,7 +218,15 @@ fn global_args(cmd: Command) -> Command {
             .action(ArgAction::Append)
             .num_args(1..)
             .global(true)
-            .help("Database root directory"),
+            .help("Database root directory (or multiple directories)"),
+    )
+    .arg(
+        Arg::new("coalesce")
+            .short('c')
+            .long("coalesce")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Aggregate and coalesce views across multiple database roots"),
     )
     .arg(
         Arg::new("shard_type")
@@ -603,6 +613,7 @@ fn parse_cli() -> Cli {
         .get_many::<String>("dir")
         .map(|vals| vals.map(PathBuf::from).collect())
         .unwrap_or_default();
+    let coalesce = matches.get_flag("coalesce");
     let shard_type = match matches
         .get_one::<String>("shard_type")
         .map(String::as_str)
@@ -732,6 +743,7 @@ fn parse_cli() -> Cli {
     Cli {
         dirs,
         shard_type,
+        coalesce,
         command,
     }
 }
@@ -841,5 +853,15 @@ mod parse_tests {
             .collect();
         assert_eq!(dirs, vec!["dir1", "dir2"]);
         assert_eq!(m.subcommand_name(), Some("scan"));
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2", "-c"])
+            .unwrap();
+        assert!(m.get_flag("coalesce"));
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "--coalesce", "shards", "-d", "dir1", "dir2"])
+            .unwrap();
+        assert!(m.get_flag("coalesce"));
     }
 }
