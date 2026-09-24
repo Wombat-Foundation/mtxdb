@@ -2731,6 +2731,58 @@ mod tests {
     }
 
     #[test]
+    fn publish_pending_flushes_tagged_queue_without_staging_or_fsync() {
+        use crate::layout::ShardType;
+        let path = temp_path("publish_pending_tagged");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        coordinator
+            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+            .unwrap();
+        coordinator
+            .publish_tagged(ShardType::EventDag, put(2, 2, b"event"), |_| {})
+            .unwrap();
+        let receipt = coordinator
+            .publish_pending()
+            .unwrap()
+            .expect("queued mutations must produce a group");
+        assert_eq!((receipt.first_lsn, receipt.last_lsn), (1, 2));
+        // Complete and visible to a read-only overlay, but not yet durable.
+        assert_eq!(coordinator.visible_lsn(), 2);
+        assert_eq!(coordinator.committed_lsn(), 0);
+        // The queue is drained: a second flush has nothing to append.
+        assert!(coordinator.publish_pending().unwrap().is_none());
+
+        // A later sync makes the whole group durable and promotes each pool.
+        coordinator.sync_through(2).unwrap();
+        assert_eq!(coordinator.committed_lsn(), 2);
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 2);
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::EventDag), 2);
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn empty_pending_flush_is_none_but_staged_append_still_rejects() {
+        use crate::layout::ShardType;
+        let path = temp_path("publish_pending_empty");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        assert!(coordinator.publish_pending().unwrap().is_none());
+        let error = coordinator.append_pending(&[]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let error = coordinator
+            .append_pending_tagged(ShardType::State, &[])
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn committed_groups_round_trip_with_contiguous_lsns() {
         let path = temp_path("round_trip");
         let _ = fs::remove_file(&path);
