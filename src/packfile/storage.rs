@@ -477,9 +477,14 @@ pub struct SyncTotalsSnapshot {
 
 /// Fixed latency buckets used by sync diagnostics: `<1ms`, `<10ms`,
 /// `<100ms`, `<1s`, and `>=1s`.
+///
+/// Buckets are **non-cumulative**: `buckets[i]` counts only the observations
+/// that fell inside bucket `i`'s own range, so the total observation count is
+/// the sum of all five entries, not the last one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub struct SyncLatencyHistogram {
+    /// Per-bucket observation counts, indexed to match the ranges above
+    /// (`buckets[0]` = `<1ms` … `buckets[4]` = `>=1s`). Non-cumulative.
     pub buckets: [u64; 5],
 }
 
@@ -503,45 +508,76 @@ impl SyncLatencyHistogram {
 
 /// One of the worst sync operations retained for post-run diagnosis.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub struct SyncDiagnosticSample {
     /// Unix timestamp in milliseconds when the sync completed.
     pub timestamp_ms: u128,
+    /// OS process ID that performed or coordinated the sync.
     pub process_id: u32,
+    /// Path to the active journal segment file, if journal-backed.
     pub journal_path: Option<String>,
+    /// Total duration of the sync operation.
     pub total: std::time::Duration,
+    /// Whether the sync operation encountered an error or failed.
     pub failed: bool,
+    /// Duration spent writing buffered packfile frames to disk.
     pub pack_flush: std::time::Duration,
+    /// Duration spent issuing fsync on dirty packfiles.
     pub pack_fsync: std::time::Duration,
+    /// Duration spent syncing collection sidecar state.
     pub sidecar: std::time::Duration,
+    /// Duration spent appending to or flushing the index delta log.
     pub delta_log: std::time::Duration,
+    /// Duration spent writing an index checkpoint.
     pub checkpoint: std::time::Duration,
+    /// Duration spent waiting for the pool-wide dirty shard set lock.
     pub dirty_lock_wait: std::time::Duration,
+    /// Age of the oldest pending uncommitted frame included in this sync.
     pub pending_publish_age: std::time::Duration,
+    /// Duration spent on WAL sync (if WAL is enabled).
     pub wal: std::time::Duration,
+    /// Duration spent waiting to acquire the journal lock.
     pub journal_lock_wait: std::time::Duration,
+    /// Duration spent waiting for pending journal batches.
     pub journal_pending_wait: std::time::Duration,
+    /// Duration spent appending journal records to the file.
     pub journal_append: std::time::Duration,
+    /// Duration spent issuing fsync on the journal file.
     pub journal_fsync: std::time::Duration,
+    /// Number of journal records committed by this sync barrier.
     pub journal_records: u64,
+    /// Total byte length of journal records committed by this sync barrier.
     pub journal_bytes: u64,
+    /// Number of concurrent journal transactions in flight at sync time.
     pub journal_in_flight: u64,
+    /// Number of concurrent callers waiting on this journal sync barrier.
     pub journal_waiters: u64,
+    /// Number of sync callers whose sync was coalesced into this single physical fsync.
     pub journal_coalesced: u64,
 }
 
 /// Runtime sync diagnostics retained after the operation that produced them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncDiagnosticsSnapshot {
-    /// Counts journal fsync observations by latency bucket for this snapshot.
+    /// Non-cumulative [`SyncLatencyHistogram`] of journal fsync latencies
+    /// observed during the interval ending at the take. See
+    /// [`SyncLatencyHistogram::buckets`] for bucket membership.
     pub fsync_latency: SyncLatencyHistogram,
-    /// Counts journal lock-wait observations by latency bucket for this
-    /// snapshot.
+    /// Non-cumulative [`SyncLatencyHistogram`] of journal lock-wait latencies
+    /// observed during the interval ending at the take. See
+    /// [`SyncLatencyHistogram::buckets`] for bucket membership.
     pub lock_wait_latency: SyncLatencyHistogram,
     /// Maximum journal in-flight count observed during this snapshot.
     /// Unlike the lifetime maxima in [`SyncTotalsSnapshot`], this value is
     /// cleared by [`PackfileStorage::take_sync_diagnostics`].
     pub peak_journal_in_flight: u64,
+    /// Maximum journal lock wait observed during this snapshot.
+    /// Unlike the lifetime maxima in [`SyncTotalsSnapshot`], this value is
+    /// cleared by [`PackfileStorage::take_sync_diagnostics`].
+    pub max_journal_lock_wait: std::time::Duration,
+    /// Maximum journal fsync duration observed during this snapshot.
+    /// Unlike the lifetime maxima in [`SyncTotalsSnapshot`], this value is
+    /// cleared by [`PackfileStorage::take_sync_diagnostics`].
+    pub max_journal_fsync: std::time::Duration,
     /// The up-to-16 slowest sync samples observed during this snapshot,
     /// ordered from slowest to fastest. This is interval-scoped and bounded,
     /// not a lifetime history.
@@ -553,6 +589,8 @@ struct SyncDiagnostics {
     fsync_latency: SyncLatencyHistogram,
     lock_wait_latency: SyncLatencyHistogram,
     peak_journal_in_flight: u64,
+    max_journal_lock_wait: std::time::Duration,
+    max_journal_fsync: std::time::Duration,
     worst_syncs: Vec<SyncDiagnosticSample>,
 }
 
@@ -568,6 +606,8 @@ impl SyncDiagnostics {
                 self.lock_wait_latency.observe(sample.journal_lock_wait);
             }
             self.peak_journal_in_flight = self.peak_journal_in_flight.max(sample.journal_in_flight);
+            self.max_journal_lock_wait = self.max_journal_lock_wait.max(sample.journal_lock_wait);
+            self.max_journal_fsync = self.max_journal_fsync.max(sample.journal_fsync);
         }
         self.worst_syncs.push(sample);
         self.worst_syncs
@@ -580,6 +620,8 @@ impl SyncDiagnostics {
             fsync_latency: self.fsync_latency,
             lock_wait_latency: self.lock_wait_latency,
             peak_journal_in_flight: self.peak_journal_in_flight,
+            max_journal_lock_wait: self.max_journal_lock_wait,
+            max_journal_fsync: self.max_journal_fsync,
             worst_syncs: self.worst_syncs.clone(),
         }
     }
@@ -10786,6 +10828,8 @@ mod tests {
         );
         let interval = store.take_sync_diagnostics();
         assert_eq!(interval.peak_journal_in_flight, 1);
+        assert!(interval.max_journal_fsync > Duration::ZERO);
+        assert_eq!(interval.max_journal_lock_wait, timings.journal_lock_wait);
         assert_eq!(interval.worst_syncs.len(), 1);
         assert_eq!(
             interval.fsync_latency.buckets.iter().sum::<u64>(),
