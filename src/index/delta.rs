@@ -1106,6 +1106,17 @@ pub enum DeltaReplayError {
         /// The frame's target bucket.
         bucket: u32,
     },
+    /// A frame's packed entry named a slot at or above
+    /// [`crate::shard::MAX_SHARDS`], which no live shard can occupy. A
+    /// legitimate writer never produces one (`IndexEntry::new` rejects it), so
+    /// this can only be log corruption or a structurally invalid frame.
+    /// Accepting it would install an entry the shard scan cannot resolve.
+    SlotOutOfRange {
+        /// The frame's target bucket.
+        bucket: u32,
+        /// The decoded slot, at or above `MAX_SHARDS`.
+        slot: u16,
+    },
 }
 
 impl std::fmt::Display for DeltaReplayError {
@@ -1122,6 +1133,13 @@ impl std::fmt::Display for DeltaReplayError {
                 write!(
                     f,
                     "delta frame at bucket {bucket} carries the empty-slot sentinel"
+                )
+            }
+            Self::SlotOutOfRange { bucket, slot } => {
+                write!(
+                    f,
+                    "delta frame at bucket {bucket} names shard slot {slot}, \
+                     which is not below MAX_SHARDS"
                 )
             }
         }

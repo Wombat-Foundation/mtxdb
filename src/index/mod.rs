@@ -620,6 +620,20 @@ impl LossyIndex {
                     bucket: frame.bucket,
                 });
             }
+            // The packed entry's slot field must name a live shard. A writer
+            // only ever encodes a slot from its own `ShardPool` (bounded by
+            // `MAX_SHARDS`; see `IndexEntry::new`), so a value at or above the
+            // cap can only be log corruption or a structurally invalid frame.
+            // Accepting it would install an entry no shard scan can resolve —
+            // `referenced_slot_ids` and friends skip `id >= MAX_SHARDS` — so
+            // the record would silently vanish from recovery.
+            let decoded = IndexEntry(frame.slot);
+            if usize::from(decoded.slot()) >= crate::shard::MAX_SHARDS {
+                return Err(DeltaReplayError::SlotOutOfRange {
+                    bucket: frame.bucket,
+                    slot: decoded.slot(),
+                });
+            }
         }
         for frame in frames {
             let bucket = frame.bucket as usize;
@@ -1672,6 +1686,37 @@ mod tests {
         // The index must be left untouched: an owned clone is made before
         // replay, so this checks the caller's rescan fallback has a live
         // checkpoint copy to fall back to, not a partially-erased one.
+        assert_eq!(checkpoint.len(), occupied_before);
+        assert_eq!(checkpoint.lookup(&hash), Some((0, 100)));
+    }
+
+    #[test]
+    fn replay_rejects_a_frame_naming_a_slot_above_max_shards() {
+        let mut hash = [0u8; 16];
+        hash[15] = 1;
+
+        let checkpoint_source = LossyIndex::new(16);
+        let (bucket, _slot) = checkpoint_source.insert_tracked(&hash, 0, 100).unwrap();
+        let checkpoint = LossyIndex::deserialize(&checkpoint_source.serialize()).unwrap();
+        let occupied_before = checkpoint.len();
+
+        // A frame whose packed entry decodes to a slot at MAX_SHARDS names no
+        // live shard; a writer can never emit one (`IndexEntry::new` rejects
+        // it), so replay must reject the whole log instead of installing an
+        // entry no shard scan can resolve.
+        let out_of_range = u16::try_from(crate::shard::MAX_SHARDS).unwrap();
+        let bad_entry = IndexEntry::new(0, 0, 0).0 | (u64::from(out_of_range) << 32);
+        let err = checkpoint
+            .replay_frames(&[DeltaFrame {
+                collection_id: [0; 16],
+                bucket,
+                generation: 0,
+                slot: bad_entry,
+            }])
+            .unwrap_err();
+        assert!(
+            matches!(err, DeltaReplayError::SlotOutOfRange { bucket: b, slot } if b == bucket && slot == out_of_range)
+        );
         assert_eq!(checkpoint.len(), occupied_before);
         assert_eq!(checkpoint.lookup(&hash), Some((0, 100)));
     }
