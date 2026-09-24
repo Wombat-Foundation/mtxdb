@@ -14,9 +14,9 @@ use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::{EntryUndo, InsertError, LossyIndex};
-use crate::journal::{
-    pool_from_tag, pool_tag, Journal, JournalCoordinator, Mutation as JournalMutation,
-};
+#[cfg(feature = "multi-reader")]
+use crate::journal::pool_tag;
+use crate::journal::{pool_from_tag, Journal, JournalCoordinator, Mutation as JournalMutation};
 use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -3818,10 +3818,13 @@ impl PackfileStorage {
     /// the next replay start from a stale bound. Coverage only ever advances.
     fn checkpoint_covered_lsn(&self) -> Option<u64> {
         self.journal().map(|journal| {
+            #[cfg(feature = "multi-reader")]
             let committed = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
                 Some(pool) => journal.committed_lsn_for_pool(pool),
                 None => journal.committed_lsn(),
             };
+            #[cfg(not(feature = "multi-reader"))]
+            let committed = journal.committed_lsn();
             committed.max(Self::read_journal_lsn(&self.base_dir))
         })
     }
@@ -4043,12 +4046,15 @@ impl PackfileStorage {
                     // this pool's coverage and reclaim only up to the minimum
                     // across every pool that has frames in the segment, so no
                     // pool's frames are dropped before they are materialized.
+                    #[cfg(feature = "multi-reader")]
                     Some(pool) => {
                         journal.report_pool_coverage(pool, lsn);
                         if let Err(error) = journal.reclaim_shared() {
                             eprintln!("warning: shared journal reclaim failed: {error}");
                         }
                     }
+                    #[cfg(not(feature = "multi-reader"))]
+                    Some(_) => unreachable!("shared journal state requires multi-reader"),
                 }
             }
         }
@@ -7886,6 +7892,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Same as [`Self::enable_journal`].
+    #[cfg(feature = "multi-reader")]
     pub fn enable_journal_with_sequence(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -7922,6 +7929,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `InvalidInput` if a journal is already enabled on this store.
+    #[cfg(feature = "multi-reader")]
     pub fn enable_shared_journal(
         &self,
         journal: Arc<JournalCoordinator>,
@@ -8078,12 +8086,18 @@ impl PackfileStorage {
         // The live index is already updated synchronously on the write path,
         // so the overlay callback has nothing to publish. On a shared journal,
         // tag the frame with this store's pool so recovery can route it.
+        #[cfg(feature = "multi-reader")]
         let result = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
             Some(pool) => journal.publish_tagged(pool, mutation(), |_lsn| {}),
             None => journal.publish(mutation(), |_lsn| {}),
         }
         .map(Some)
         .map_err(StorageError::Io);
+        #[cfg(not(feature = "multi-reader"))]
+        let result = journal
+            .publish(mutation(), |_lsn| {})
+            .map(Some)
+            .map_err(StorageError::Io);
         if result.is_ok() {
             self.record_published_mutation(started);
         }
@@ -15547,6 +15561,7 @@ mod tests {
     /// commits both pools' pending mutations in one group, and a later reopen
     /// replays only each pool's own tagged frames.
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_journal_fences_all_pools_and_routes_replay_by_pool() {
         use crate::journal::{Journal, JournalCoordinator};
         use crate::layout::ShardType;
@@ -15640,6 +15655,7 @@ mod tests {
     /// A shared segment may only be reclaimed up to the minimum durable
     /// coverage across every pool that has frames in it.
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_reclaim_waits_for_every_pool_then_truncates() {
         use crate::journal::{Journal, JournalCoordinator};
         use crate::layout::ShardType;
@@ -15697,8 +15713,8 @@ mod tests {
     /// checkpoints, shared reclaim, then a read-only reopen. The state reader's
     /// index boundary is state's own watermark, so a base advanced by the
     /// event-DAG pool must not be mistaken for a lost state frame.
-    #[cfg(feature = "multi-reader")]
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_interleaved_checkpoints_reclaim_then_read_only_reopen() {
         use crate::journal::{Journal, JournalCoordinator};
         use crate::layout::ShardType;
@@ -15795,8 +15811,8 @@ mod tests {
     /// (so its checkpoint has not advanced) must tolerate a base LSN gap opened
     /// entirely by the other pools and read its own frame, instead of failing
     /// closed on the reclaim.
-    #[cfg(feature = "multi-reader")]
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_read_committed_accepts_another_pools_reclaimed_prefix() {
         use crate::journal::{Journal, JournalCoordinator};
         use crate::layout::ShardType;
@@ -15880,8 +15896,8 @@ mod tests {
 
     /// A read-only worker on a shared WAL must observe only its own pool's
     /// tagged frames, not the other pools' interleaved in the same segment.
-    #[cfg(feature = "multi-reader")]
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_read_committed_filters_by_pool() {
         use crate::journal::{Journal, JournalCoordinator};
         use crate::layout::ShardType;
@@ -15972,6 +15988,7 @@ mod tests {
     /// The root shared-WAL lock is exclusive while held and reacquirable after
     /// the holder drops it.
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_wal_lock_is_exclusive() {
         let root = test_dir("shared_wal_lock_exclusive");
         // A shared-WAL lock is gated on a shared-layout database descriptor.

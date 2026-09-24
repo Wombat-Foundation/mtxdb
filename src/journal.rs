@@ -45,6 +45,7 @@ impl JournalVersion {
     }
 
     /// Version a freshly created shared (multi-pool) segment uses.
+    #[cfg(feature = "multi-reader")]
     const fn shared() -> Self {
         Self::V3PoolTagged
     }
@@ -800,6 +801,7 @@ pub struct Journal {
 const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Cross-pool coverage bookkeeping for reclaiming a shared segment.
+#[cfg(feature = "multi-reader")]
 #[derive(Default)]
 struct CoverageState {
     /// Highest durable checkpoint coverage reported per pool. A group is
@@ -839,6 +841,7 @@ pub struct JournalCoordinator {
     /// Per-pool durable coverage, used to reclaim a shared segment only up to
     /// the point every pool present in it has materialized. See
     /// [`Self::report_pool_coverage`] and [`Self::reclaim_shared`].
+    #[cfg(feature = "multi-reader")]
     coverage: Mutex<CoverageState>,
     /// Highest committed group `last_lsn` that carried a frame for each pool.
     ///
@@ -879,6 +882,7 @@ impl JournalCoordinator {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
         let next_lsn = journal.next_lsn;
         let path = journal.path.clone();
+        #[cfg(feature = "multi-reader")]
         let coverage = CoverageState::default();
         // Seed each pool's committed watermark from the recovered groups, so a
         // fresh coordinator over a pre-existing segment reports the same
@@ -902,6 +906,7 @@ impl JournalCoordinator {
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             sequence: None,
+            #[cfg(feature = "multi-reader")]
             coverage: Mutex::new(coverage),
             pool_committed: Mutex::new(pool_committed),
             pending_promotions: Mutex::new(Vec::new()),
@@ -925,6 +930,7 @@ impl JournalCoordinator {
     /// Record that `pool`'s durable checkpoint has materialized every frame it
     /// owns through `lsn`. Coverage only advances. A pool with no reported
     /// coverage never blocks a group that does not carry its frames.
+    #[cfg(feature = "multi-reader")]
     pub fn report_pool_coverage(&self, pool: ShardType, lsn: u64) {
         let mut coverage = self.coverage.lock();
         let entry = coverage.covered.entry(pool).or_insert(0);
@@ -940,6 +946,7 @@ impl JournalCoordinator {
     /// recording it would claim coverage the checkpoint does not have and let
     /// reclaim drop another pool's uncovered frames.
     #[must_use]
+    #[cfg(feature = "multi-reader")]
     pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
         self.pool_committed.lock().get(&pool).copied().unwrap_or(0)
     }
@@ -975,6 +982,7 @@ impl JournalCoordinator {
     ///
     /// # Errors
     /// Propagates a scan or segment-rewrite failure from [`Self::reclaim_through`].
+    #[cfg(feature = "multi-reader")]
     pub fn reclaim_shared(&self) -> io::Result<Option<Reclaim>> {
         let scan = Journal::scan_read_only(&self.path)?;
         let boundary = {
@@ -1013,6 +1021,7 @@ impl JournalCoordinator {
     /// in a single segment's group sequence are then expected; recovery
     /// permits them.
     #[must_use]
+    #[cfg(feature = "multi-reader")]
     pub fn with_shared_sequence(journal: Journal, scan: &Scan, sequence: Arc<AtomicU64>) -> Self {
         let mut coordinator = Self::new(journal, scan);
         coordinator.sequence = Some(sequence);
@@ -1073,6 +1082,7 @@ impl JournalCoordinator {
     ///
     /// # Errors
     /// Same as [`Self::publish`].
+    #[cfg(feature = "multi-reader")]
     pub fn publish_tagged(
         &self,
         pool: ShardType,
@@ -1278,7 +1288,7 @@ impl JournalCoordinator {
             .as_ref()
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
         let append_started = std::time::Instant::now();
-        let receipt = match journal.append_group_tagged_with_sequence(&mutations, sequence) {
+        let receipt = match journal.append_group_for_current_mode(&mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -1380,6 +1390,7 @@ impl JournalCoordinator {
     ///
     /// # Errors
     /// Same as [`Self::append_pending`].
+    #[cfg(feature = "multi-reader")]
     pub fn append_pending_tagged(
         &self,
         pool: ShardType,
@@ -1404,6 +1415,7 @@ impl JournalCoordinator {
     /// # Errors
     /// Returns an error if the journal is poisoned, the pending LSN sequence
     /// is inconsistent, or the group cannot be appended.
+    #[cfg(feature = "multi-reader")]
     pub fn append_pending_tagged_groups(
         &self,
         batches: &[(ShardType, &[Mutation])],
@@ -1429,6 +1441,34 @@ impl JournalCoordinator {
                 "cannot append an empty transaction group",
             )
         })
+    }
+
+    fn collect_group_mutations(
+        pending: &[(u64, Option<ShardType>, Mutation)],
+        next_lsn: u64,
+        staged: &[(Option<ShardType>, &[Mutation])],
+    ) -> io::Result<Vec<(Option<ShardType>, Mutation)>> {
+        let staged_len = staged
+            .iter()
+            .map(|(_, mutations)| mutations.len())
+            .sum::<usize>();
+        let mut group_mutations = Vec::with_capacity(pending.len().saturating_add(staged_len));
+        for (offset, (lsn, pool, mutation)) in pending.iter().enumerate() {
+            let expected = next_lsn
+                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
+                .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
+            if *lsn != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy journal queue is not contiguous with the journal tail",
+                ));
+            }
+            group_mutations.push((*pool, mutation.clone()));
+        }
+        for (pool, mutations) in staged {
+            group_mutations.extend(mutations.iter().cloned().map(|mutation| (*pool, mutation)));
+        }
+        Ok(group_mutations)
     }
 
     fn append_pending_inner(
@@ -1463,35 +1503,14 @@ impl JournalCoordinator {
         if staged.iter().all(|(_, mutations)| mutations.is_empty()) && pending.is_empty() {
             return Ok(None);
         }
-        let staged_len = staged
-            .iter()
-            .map(|(_, mutations)| mutations.len())
-            .sum::<usize>();
-        let mut group_mutations: Vec<(Option<ShardType>, Mutation)> =
-            Vec::with_capacity(pending.len().saturating_add(staged_len));
-        for (offset, (lsn, pool, mutation)) in pending.iter().enumerate() {
-            let expected = journal
-                .next_lsn
-                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
-                .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-            if *lsn != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "legacy journal queue is not contiguous with the journal tail",
-                ));
-            }
-            group_mutations.push((*pool, mutation.clone()));
-        }
-        for (pool, mutations) in staged {
-            group_mutations.extend(mutations.iter().cloned().map(|mutation| (*pool, mutation)));
-        }
+        let group_mutations = Self::collect_group_mutations(&pending, journal.next_lsn, staged)?;
         let expected_first_lsn = journal.next_lsn;
         let expected_count = u64::try_from(group_mutations.len()).unwrap_or(u64::MAX);
         let sequence = self
             .sequence
             .as_ref()
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
-        let receipt = match journal.append_group_tagged_with_sequence(&group_mutations, sequence) {
+        let receipt = match journal.append_group_for_current_mode(&group_mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -1668,6 +1687,7 @@ impl Journal {
     /// # Errors
     /// Same as [`Self::open`], plus `InvalidData` if an existing segment is not
     /// the pool-tagged version.
+    #[cfg(feature = "multi-reader")]
     pub fn open_shared(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
         Self::open_versioned(path, JournalVersion::shared(), 1)
     }
@@ -1794,7 +1814,8 @@ impl Journal {
     /// # Errors
     /// Same as [`Self::append_group`], plus `InvalidInput` if `sequence` is
     /// behind this segment's next sequence, or if this is a pool-tagged segment
-    /// (which requires [`Self::append_group_tagged_with_sequence`]).
+    /// (which requires the multi-reader-only
+    /// `append_group_tagged_with_sequence` method).
     pub fn append_group_with_sequence(
         &mut self,
         mutations: &[Mutation],
@@ -1813,12 +1834,33 @@ impl Journal {
     /// # Errors
     /// Same as [`Self::append_group_with_sequence`], plus `InvalidInput` if
     /// this segment is not pool-tagged.
+    #[cfg(feature = "multi-reader")]
     pub fn append_group_tagged_with_sequence(
         &mut self,
         mutations: &[(Option<ShardType>, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
         self.append_group_inner(mutations, sequence)
+    }
+
+    fn append_group_for_current_mode(
+        &mut self,
+        mutations: &[(Option<ShardType>, Mutation)],
+        sequence: Option<u64>,
+    ) -> io::Result<CommitReceipt> {
+        #[cfg(feature = "multi-reader")]
+        {
+            self.append_group_tagged_with_sequence(mutations, sequence)
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        {
+            let untagged = mutations
+                .iter()
+                .cloned()
+                .map(|(_, mutation)| mutation)
+                .collect::<Vec<_>>();
+            self.append_group_with_sequence(&untagged, sequence)
+        }
     }
 
     /// Shared implementation for a group of mutations, each paired with its
@@ -1975,7 +2017,7 @@ impl Journal {
     ///
     /// Callers sharing one cross-pool sequence allocator initialize it above
     /// the maximum of these across segments. See
-    /// [`JournalCoordinator::with_shared_sequence`].
+    /// `JournalCoordinator::with_shared_sequence`.
     #[must_use]
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
@@ -2572,10 +2614,12 @@ fn invalid_data(message: &'static str) -> io::Error {
 /// holder opens the segment with [`Journal::open_shared`], builds one
 /// [`JournalCoordinator`], and attaches each pool with
 /// `PackfileStorage::enable_shared_journal`.
+#[cfg(feature = "multi-reader")]
 pub struct SharedWalLock {
     _lock: crate::shard::WriterLock,
 }
 
+#[cfg(feature = "multi-reader")]
 impl SharedWalLock {
     /// Acquire the root shared-WAL writer lock.
     ///
@@ -2612,7 +2656,9 @@ mod tests {
     use super::{TxnStage, TxnStageState};
     use std::fs;
     use std::io::Write as _;
+    #[cfg(feature = "multi-reader")]
     use std::sync::atomic::AtomicU64;
+    #[cfg(feature = "multi-reader")]
     use std::sync::Arc;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
@@ -2660,6 +2706,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_segment_round_trips_pool_tags() {
         use crate::layout::ShardType;
         let path = temp_path("shared_pool_tags");
@@ -2700,6 +2747,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_segment_rejects_untagged_frames() {
         let path = temp_path("shared_untagged");
         let _ = fs::remove_file(&path);
@@ -2712,6 +2760,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_committed_watermark_is_per_pool() {
         use crate::layout::ShardType;
         let path = temp_path("shared_pool_watermark");
@@ -2766,6 +2815,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_reclaim_waits_for_a_staged_pools_frame() {
         use crate::layout::ShardType;
         let path = temp_path("shared_staged_required");
@@ -2800,6 +2850,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_reclaim_does_not_wait_for_an_idle_pool() {
         use crate::layout::ShardType;
         let path = temp_path("shared_idle_pool_reclaim");
@@ -2852,6 +2903,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn per_pool_segment_rejects_tagged_frames() {
         use crate::layout::ShardType;
         let path = temp_path("perpool_tagged");
@@ -2868,6 +2920,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn open_mode_must_match_segment_version() {
         let path = temp_path("version_mismatch");
         let _ = fs::remove_file(&path);
@@ -2887,6 +2940,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn coordinator_publishes_tagged_frames() {
         use crate::layout::ShardType;
         let path = temp_path("coordinator_tagged");
@@ -3064,6 +3118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn publish_pending_flushes_tagged_queue_without_staging_or_fsync() {
         use crate::layout::ShardType;
         let path = temp_path("publish_pending_tagged");
@@ -3099,7 +3154,6 @@ mod tests {
 
     #[test]
     fn empty_pending_flush_is_none_but_staged_append_still_rejects() {
-        use crate::layout::ShardType;
         let path = temp_path("publish_pending_empty");
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open(&path).unwrap();
@@ -3108,10 +3162,14 @@ mod tests {
         assert!(coordinator.publish_pending().unwrap().is_none());
         let error = coordinator.append_pending(&[]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        let error = coordinator
-            .append_pending_tagged(ShardType::State, &[])
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        #[cfg(feature = "multi-reader")]
+        {
+            use crate::layout::ShardType;
+            let error = coordinator
+                .append_pending_tagged(ShardType::State, &[])
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
         fs::remove_file(path).unwrap();
     }
 
@@ -3567,6 +3625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_sequence_orders_groups_across_segments_and_allows_gaps() {
         let dir = temp_path("shared_sequence");
         let _ = fs::remove_dir_all(&dir);
