@@ -384,6 +384,29 @@ pub struct CommitReceipt {
     pub first_lsn: u64,
     /// Last mutation LSN in the group.
     pub last_lsn: u64,
+    /// Bytes appended for this complete group, including header and trailer.
+    pub bytes_written: u64,
+}
+
+/// Breakdown and counters for one journal durability request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JournalSyncTimings {
+    /// Time spent waiting for the single-writer journal mutex.
+    pub journal_lock_wait: std::time::Duration,
+    /// Time spent waiting for the pending-mutation queue mutex.
+    pub journal_pending_wait: std::time::Duration,
+    /// Time spent appending and encoding the group, excluding fsync.
+    pub journal_append: std::time::Duration,
+    /// Time spent making the journal file durable.
+    pub journal_fsync: std::time::Duration,
+    /// Number of mutations included in a newly appended group.
+    pub journal_records: u64,
+    /// Bytes included in a newly appended group, including framing.
+    pub journal_bytes: u64,
+    /// Whether this request had to wait for the journal mutex.
+    pub journal_waiter: bool,
+    /// Whether this request was already covered by another durable request.
+    pub journal_coalesced: bool,
 }
 
 /// Result of validating a journal file.
@@ -438,6 +461,9 @@ pub struct Journal {
     poisoned: bool,
 }
 
+/// An fsync at least this slow is reported on stderr when it happens.
+const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Serializes mutation publication and durable commits for one journal.
 ///
 /// Mutations are assigned LSNs under a short queue lock. A sync caller captures
@@ -466,6 +492,12 @@ pub struct JournalCoordinator {
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
+    /// Number of sync requests entering the coordinator.
+    sync_calls: AtomicU64,
+    /// Number of sync requests that found the journal mutex occupied.
+    journal_waiters: AtomicU64,
+    /// Number of requests covered without appending or fsyncing themselves.
+    coalesced_syncs: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -483,6 +515,9 @@ impl JournalCoordinator {
             committed_lsn: AtomicU64::new(committed_lsn),
             sequence: None,
             poisoned: AtomicBool::new(false),
+            sync_calls: AtomicU64::new(0),
+            journal_waiters: AtomicU64::new(0),
+            coalesced_syncs: AtomicU64::new(0),
         }
     }
 
@@ -576,8 +611,25 @@ impl JournalCoordinator {
     /// Returns an error if the target was never published, the journal is
     /// poisoned, or writing/syncing the covering group fails.
     pub fn sync_through(&self, target_lsn: u64) -> io::Result<Option<CommitReceipt>> {
+        self.sync_through_timed(target_lsn)
+            .map(|(receipt, _)| receipt)
+    }
+
+    /// Durably commit pending mutations and report where the time went.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the target is invalid, the journal is poisoned,
+    /// or appending/fsyncing the group fails.
+    pub fn sync_through_timed(
+        &self,
+        target_lsn: u64,
+    ) -> io::Result<(Option<CommitReceipt>, JournalSyncTimings)> {
+        self.sync_calls.fetch_add(1, Ordering::Relaxed);
+        let mut timings = JournalSyncTimings::default();
         if target_lsn == 0 {
-            return Ok(None);
+            timings.journal_coalesced = true;
+            self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
+            return Ok((None, timings));
         }
         if target_lsn > self.published_lsn.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -586,7 +638,9 @@ impl JournalCoordinator {
             ));
         }
         if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-            return Ok(None);
+            timings.journal_coalesced = true;
+            self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
+            return Ok((None, timings));
         }
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
@@ -594,27 +648,42 @@ impl JournalCoordinator {
             ));
         }
 
-        let mut journal = self.journal.lock();
+        let lock_started = std::time::Instant::now();
+        let mut journal = if let Some(guard) = self.journal.try_lock() {
+            guard
+        } else {
+            timings.journal_waiter = true;
+            self.journal_waiters.fetch_add(1, Ordering::Relaxed);
+            self.journal.lock()
+        };
+        timings.journal_lock_wait = lock_started.elapsed();
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed commit",
             ));
         }
         if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-            return Ok(None);
+            timings.journal_coalesced = true;
+            self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
+            return Ok((None, timings));
         }
         // Transaction-staged groups are already complete in the segment, so
         // the coalesced sync only needs to make their bytes durable.
         if target_lsn <= self.visible_lsn.load(Ordering::Acquire) {
+            let fsync_started = std::time::Instant::now();
             if let Err(error) = journal.make_durable() {
                 self.poisoned.store(true, Ordering::Release);
                 return Err(error);
             }
+            timings.journal_fsync = fsync_started.elapsed();
+            self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, &timings);
             self.committed_lsn.store(target_lsn, Ordering::Release);
-            return Ok(None);
+            return Ok((None, timings));
         }
         let batch = {
+            let pending_started = std::time::Instant::now();
             let mut pending = self.pending.lock();
+            timings.journal_pending_wait = pending_started.elapsed();
             let covered_count = pending
                 .iter()
                 .take_while(|(lsn, _)| *lsn <= target_lsn)
@@ -624,7 +693,9 @@ impl JournalCoordinator {
                 // after our first check but before we acquired the journal
                 // lock. In that case its durable group covers this caller.
                 if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-                    return Ok(None);
+                    timings.journal_coalesced = true;
+                    self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
+                    return Ok((None, timings));
                 }
                 return Err(io::Error::other(
                     "published sync target has no pending journal mutations",
@@ -643,7 +714,30 @@ impl JournalCoordinator {
             }
             pending.drain(..covered_count).collect::<Vec<_>>()
         };
-        self.append_and_sync_batch(&mut journal, batch, target_lsn)
+        let record_count = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        let result = self.append_and_sync_batch(&mut journal, batch, target_lsn, &mut timings);
+        timings.journal_records = record_count;
+        if let Ok(Some(receipt)) = &result {
+            timings.journal_bytes = receipt.bytes_written;
+        }
+        result.map(|receipt| (receipt, timings))
+    }
+
+    /// Report an fsync slower than [`SLOW_FSYNC_WARN`] as it happens, with the
+    /// lock wait and waiter count needed to tell contention from disk latency.
+    fn warn_if_slow_fsync(&self, path: &Path, target_lsn: u64, timings: &JournalSyncTimings) {
+        if timings.journal_fsync >= SLOW_FSYNC_WARN {
+            eprintln!(
+                "mtxdb: slow WAL fsync {}ms (through lsn {target_lsn}, lock wait {}ms, append {}ms, {} records, {} bytes, waiters {}, {})",
+                timings.journal_fsync.as_millis(),
+                timings.journal_lock_wait.as_millis(),
+                timings.journal_append.as_millis(),
+                timings.journal_records,
+                timings.journal_bytes,
+                self.journal_waiters.load(Ordering::Relaxed),
+                path.display(),
+            );
+        }
     }
 
     fn append_and_sync_batch(
@@ -651,12 +745,14 @@ impl JournalCoordinator {
         journal: &mut Journal,
         batch: Vec<(u64, Mutation)>,
         target_lsn: u64,
+        timings: &mut JournalSyncTimings,
     ) -> io::Result<Option<CommitReceipt>> {
         let mutations: Vec<Mutation> = batch.iter().map(|(_, mutation)| mutation.clone()).collect();
         let sequence = self
             .sequence
             .as_ref()
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
+        let append_started = std::time::Instant::now();
         let receipt = match journal.append_group_with_sequence(&mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -669,16 +765,20 @@ impl JournalCoordinator {
                 return Err(error);
             }
         };
+        timings.journal_append = append_started.elapsed();
         // The group is complete and readable by a read-only overlay, but not
         // yet durable. Publish the visibility boundary before the fsync so
         // workers can observe it. A crash before `make_durable` may lose it,
         // which is safe: an unfsynced group is never acknowledged.
         self.visible_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
+        let fsync_started = std::time::Instant::now();
         if let Err(error) = journal.make_durable() {
             self.poisoned.store(true, Ordering::Release);
             return Err(error);
         }
+        timings.journal_fsync = fsync_started.elapsed();
+        self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, timings);
         // The group is durable, so record its extent before checking the
         // receipt. This prevents a retry from re-appending committed entries.
         self.committed_lsn
@@ -1098,6 +1198,7 @@ impl Journal {
             sequence,
             first_lsn,
             last_lsn,
+            bytes_written: group_size,
         })
     }
 

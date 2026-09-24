@@ -1660,6 +1660,39 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
         fmt_ms(stats.dirty_lock_wait)
     );
     println!(
+        "    journal          {} calls / {} records / {}   waiters {}   coalesced {}",
+        stats.sync_totals.journal_sync_calls,
+        stats.sync_totals.journal_records,
+        fmt_bytes(stats.sync_totals.journal_bytes),
+        stats.sync_totals.journal_waiters,
+        stats.sync_totals.journal_coalesced
+    );
+    println!(
+        "      wal            total {}   lock wait {}   pending wait {}   append {}   fsync {}",
+        fmt_ms(stats.sync_totals.wal),
+        fmt_ms(stats.sync_totals.journal_lock_wait),
+        fmt_ms(stats.sync_totals.journal_pending_wait),
+        fmt_ms(stats.sync_totals.journal_append),
+        fmt_ms(stats.sync_totals.journal_fsync)
+    );
+    println!(
+        "      wal max        lock wait {}   fsync {}",
+        fmt_ms(stats.sync_totals.max_journal_lock_wait),
+        fmt_ms(stats.sync_totals.max_journal_fsync)
+    );
+    if let Some(timings) = stats.last_sync_timings {
+        println!(
+            "    last journal     wal {}   lock wait {}   pending wait {}   append {}   fsync {}   records {}   bytes {}",
+            fmt_ms(timings.wal),
+            fmt_ms(timings.journal_lock_wait),
+            fmt_ms(timings.journal_pending_wait),
+            fmt_ms(timings.journal_append),
+            fmt_ms(timings.journal_fsync),
+            timings.journal_records,
+            fmt_bytes(timings.journal_bytes)
+        );
+    }
+    println!(
         "    get (read ctrs)  {} calls / {} misses   get_many {} batches / {} records / {} misses",
         stats.get_calls,
         stats.get_misses,
@@ -1804,6 +1837,96 @@ fn stats_json_object(
         ],
         "  ",
     );
+    let sync_totals = json_object(
+        &[
+            ("calls", stats.sync_totals.calls.to_string()),
+            ("total_ns", stats.sync_totals.total.as_nanos().to_string()),
+            ("wal_ns", stats.sync_totals.wal.as_nanos().to_string()),
+            (
+                "journal_lock_wait_ns",
+                stats.sync_totals.journal_lock_wait.as_nanos().to_string(),
+            ),
+            (
+                "journal_pending_wait_ns",
+                stats
+                    .sync_totals
+                    .journal_pending_wait
+                    .as_nanos()
+                    .to_string(),
+            ),
+            (
+                "journal_append_ns",
+                stats.sync_totals.journal_append.as_nanos().to_string(),
+            ),
+            (
+                "journal_fsync_ns",
+                stats.sync_totals.journal_fsync.as_nanos().to_string(),
+            ),
+            (
+                "journal_sync_calls",
+                stats.sync_totals.journal_sync_calls.to_string(),
+            ),
+            ("journal_bytes", stats.sync_totals.journal_bytes.to_string()),
+            (
+                "journal_records",
+                stats.sync_totals.journal_records.to_string(),
+            ),
+            (
+                "journal_waiters",
+                stats.sync_totals.journal_waiters.to_string(),
+            ),
+            (
+                "journal_coalesced",
+                stats.sync_totals.journal_coalesced.to_string(),
+            ),
+            (
+                "max_journal_lock_wait_ns",
+                stats
+                    .sync_totals
+                    .max_journal_lock_wait
+                    .as_nanos()
+                    .to_string(),
+            ),
+            (
+                "max_journal_fsync_ns",
+                stats.sync_totals.max_journal_fsync.as_nanos().to_string(),
+            ),
+        ],
+        "  ",
+    );
+    let last_sync = stats.last_sync_timings.map_or_else(
+        || "null".to_owned(),
+        |timings| {
+            json_object(
+                &[
+                    ("total_ns", timings.total.as_nanos().to_string()),
+                    ("wal_ns", timings.wal.as_nanos().to_string()),
+                    (
+                        "journal_lock_wait_ns",
+                        timings.journal_lock_wait.as_nanos().to_string(),
+                    ),
+                    (
+                        "journal_pending_wait_ns",
+                        timings.journal_pending_wait.as_nanos().to_string(),
+                    ),
+                    (
+                        "journal_append_ns",
+                        timings.journal_append.as_nanos().to_string(),
+                    ),
+                    (
+                        "journal_fsync_ns",
+                        timings.journal_fsync.as_nanos().to_string(),
+                    ),
+                    ("journal_sync_calls", timings.journal_sync_calls.to_string()),
+                    ("journal_bytes", timings.journal_bytes.to_string()),
+                    ("journal_records", timings.journal_records.to_string()),
+                    ("journal_waiters", timings.journal_waiters.to_string()),
+                    ("journal_coalesced", timings.journal_coalesced.to_string()),
+                ],
+                "  ",
+            )
+        },
+    );
 
     let mut shards = String::from("[\n");
     for (index, summary) in summaries.iter().enumerate() {
@@ -1834,6 +1957,8 @@ fn stats_json_object(
         ("index_bytes", stats.index_bytes.to_string()),
         ("open_timings_ms", open_timings),
         ("runtime", runtime),
+        ("last_sync", last_sync),
+        ("sync_totals", sync_totals),
         ("shards", shards),
     ];
     json_object(&top, "")

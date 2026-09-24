@@ -227,6 +227,24 @@ pub struct SyncTimings {
     /// Committing the pending write-ahead journal group (one sequential
     /// fsync). Zero when no journal is configured.
     pub wal: std::time::Duration,
+    /// Time spent waiting for the journal's single-writer mutex.
+    pub journal_lock_wait: std::time::Duration,
+    /// Time spent waiting for the pending-mutation queue mutex.
+    pub journal_pending_wait: std::time::Duration,
+    /// Time spent encoding and appending the journal group, excluding fsync.
+    pub journal_append: std::time::Duration,
+    /// Time spent making the journal file durable.
+    pub journal_fsync: std::time::Duration,
+    /// Number of journal sync calls represented by this operation.
+    pub journal_sync_calls: u64,
+    /// Bytes appended to the journal by this operation, including framing.
+    pub journal_bytes: u64,
+    /// Records appended to the journal by this operation.
+    pub journal_records: u64,
+    /// Whether this operation waited for the journal mutex.
+    pub journal_waiters: u64,
+    /// Whether this operation was already covered by another sync.
+    pub journal_coalesced: u64,
     /// Total wall time of the `sync_all` call.
     pub total: std::time::Duration,
 }
@@ -240,6 +258,15 @@ impl Default for SyncTimings {
             delta_log: std::time::Duration::ZERO,
             checkpoint: std::time::Duration::ZERO,
             wal: std::time::Duration::ZERO,
+            journal_lock_wait: std::time::Duration::ZERO,
+            journal_pending_wait: std::time::Duration::ZERO,
+            journal_append: std::time::Duration::ZERO,
+            journal_fsync: std::time::Duration::ZERO,
+            journal_sync_calls: 0,
+            journal_bytes: 0,
+            journal_records: 0,
+            journal_waiters: 0,
+            journal_coalesced: 0,
             total: std::time::Duration::ZERO,
         }
     }
@@ -271,6 +298,17 @@ struct SyncTotals {
     checkpoint_ns: AtomicU64,
     /// Sum of [`SyncTimings::wal`].
     wal_ns: AtomicU64,
+    journal_lock_wait_ns: AtomicU64,
+    journal_pending_wait_ns: AtomicU64,
+    journal_append_ns: AtomicU64,
+    journal_fsync_ns: AtomicU64,
+    journal_sync_calls: AtomicU64,
+    journal_bytes: AtomicU64,
+    journal_records: AtomicU64,
+    journal_waiters: AtomicU64,
+    journal_coalesced: AtomicU64,
+    max_journal_lock_wait_ns: AtomicU64,
+    max_journal_fsync_ns: AtomicU64,
 }
 
 impl SyncTotals {
@@ -291,6 +329,28 @@ impl SyncTotals {
         Self::add_duration(&self.delta_log_ns, timings.delta_log);
         Self::add_duration(&self.checkpoint_ns, timings.checkpoint);
         Self::add_duration(&self.wal_ns, timings.wal);
+        Self::add_duration(&self.journal_lock_wait_ns, timings.journal_lock_wait);
+        Self::add_duration(&self.journal_pending_wait_ns, timings.journal_pending_wait);
+        Self::add_duration(&self.journal_append_ns, timings.journal_append);
+        Self::add_duration(&self.journal_fsync_ns, timings.journal_fsync);
+        self.journal_sync_calls
+            .fetch_add(timings.journal_sync_calls, Ordering::Relaxed);
+        self.journal_bytes
+            .fetch_add(timings.journal_bytes, Ordering::Relaxed);
+        self.journal_records
+            .fetch_add(timings.journal_records, Ordering::Relaxed);
+        self.journal_waiters
+            .fetch_add(timings.journal_waiters, Ordering::Relaxed);
+        self.journal_coalesced
+            .fetch_add(timings.journal_coalesced, Ordering::Relaxed);
+        self.max_journal_lock_wait_ns.fetch_max(
+            u64::try_from(timings.journal_lock_wait.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.max_journal_fsync_ns.fetch_max(
+            u64::try_from(timings.journal_fsync.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     fn snapshot(&self) -> SyncTotalsSnapshot {
@@ -305,6 +365,17 @@ impl SyncTotals {
             delta_log: duration(&self.delta_log_ns),
             checkpoint: duration(&self.checkpoint_ns),
             wal: duration(&self.wal_ns),
+            journal_lock_wait: duration(&self.journal_lock_wait_ns),
+            journal_pending_wait: duration(&self.journal_pending_wait_ns),
+            journal_append: duration(&self.journal_append_ns),
+            journal_fsync: duration(&self.journal_fsync_ns),
+            journal_sync_calls: self.journal_sync_calls.load(Ordering::Relaxed),
+            journal_bytes: self.journal_bytes.load(Ordering::Relaxed),
+            journal_records: self.journal_records.load(Ordering::Relaxed),
+            journal_waiters: self.journal_waiters.load(Ordering::Relaxed),
+            journal_coalesced: self.journal_coalesced.load(Ordering::Relaxed),
+            max_journal_lock_wait: duration(&self.max_journal_lock_wait_ns),
+            max_journal_fsync: duration(&self.max_journal_fsync_ns),
         }
     }
 
@@ -318,6 +389,17 @@ impl SyncTotals {
             &self.delta_log_ns,
             &self.checkpoint_ns,
             &self.wal_ns,
+            &self.journal_lock_wait_ns,
+            &self.journal_pending_wait_ns,
+            &self.journal_append_ns,
+            &self.journal_fsync_ns,
+            &self.journal_sync_calls,
+            &self.journal_bytes,
+            &self.journal_records,
+            &self.journal_waiters,
+            &self.journal_coalesced,
+            &self.max_journal_lock_wait_ns,
+            &self.max_journal_fsync_ns,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -345,6 +427,28 @@ pub struct SyncTotalsSnapshot {
     pub checkpoint: std::time::Duration,
     /// Cumulative [`SyncTimings::wal`].
     pub wal: std::time::Duration,
+    /// Cumulative time waiting for the journal mutex.
+    pub journal_lock_wait: std::time::Duration,
+    /// Cumulative time waiting for the pending-mutation queue mutex.
+    pub journal_pending_wait: std::time::Duration,
+    /// Cumulative journal append/encoding time, excluding fsync.
+    pub journal_append: std::time::Duration,
+    /// Cumulative journal fsync time.
+    pub journal_fsync: std::time::Duration,
+    /// Number of journal sync calls.
+    pub journal_sync_calls: u64,
+    /// Cumulative journal bytes appended, including framing.
+    pub journal_bytes: u64,
+    /// Cumulative journal records appended.
+    pub journal_records: u64,
+    /// Number of journal sync calls that waited for the journal mutex.
+    pub journal_waiters: u64,
+    /// Number of journal sync calls covered by another sync.
+    pub journal_coalesced: u64,
+    /// Largest single journal mutex wait observed.
+    pub max_journal_lock_wait: std::time::Duration,
+    /// Largest single journal fsync observed.
+    pub max_journal_fsync: std::time::Duration,
 }
 
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
@@ -6927,8 +7031,19 @@ impl PackfileStorage {
             timings.pack_flush = flush_started.elapsed();
             let target = journal.capture_sync_target();
             let wal_started = std::time::Instant::now();
-            journal.sync_through(target).map_err(StorageError::Io)?;
+            let (_, journal_timings) = journal
+                .sync_through_timed(target)
+                .map_err(StorageError::Io)?;
             timings.wal = wal_started.elapsed();
+            timings.journal_lock_wait = journal_timings.journal_lock_wait;
+            timings.journal_pending_wait = journal_timings.journal_pending_wait;
+            timings.journal_append = journal_timings.journal_append;
+            timings.journal_fsync = journal_timings.journal_fsync;
+            timings.journal_sync_calls = 1;
+            timings.journal_bytes = journal_timings.journal_bytes;
+            timings.journal_records = journal_timings.journal_records;
+            timings.journal_waiters = u64::from(journal_timings.journal_waiter);
+            timings.journal_coalesced = u64::from(journal_timings.journal_coalesced);
         } else if dirty_only {
             self.shards.sync_dirty()?;
             if let Some((flush, fsync)) = self.shards.last_sync_split() {
@@ -10368,6 +10483,15 @@ mod tests {
             timings.pack_fsync,
             Duration::ZERO,
             "the barrier path must not fsync pack shards with a WAL"
+        );
+        assert_eq!(timings.journal_sync_calls, 1);
+        assert!(timings.journal_records >= 1);
+        assert!(timings.journal_bytes > 0);
+        assert!(timings.journal_fsync > Duration::ZERO);
+        assert!(
+            timings.journal_lock_wait + timings.journal_append + timings.journal_fsync
+                <= timings.wal,
+            "reported journal phases cannot exceed the WAL phase"
         );
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
         assert!(store.journal().expect("journal enabled").committed_lsn() >= 1);
