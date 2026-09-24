@@ -3180,6 +3180,18 @@ impl PackfileStorage {
         *self.read_plan.read()
     }
 
+    /// Whether this storage attempts zstd compression on written records.
+    #[must_use]
+    pub fn is_compression_enabled(&self) -> bool {
+        self.shards.is_compression_enabled()
+    }
+
+    /// The checksum policy configured for this storage.
+    #[must_use]
+    pub fn checksum_policy(&self) -> packfile::ChecksumPolicy {
+        self.shards.checksum_policy()
+    }
+
     /// Returns `true` if a collection's index has reached the configured repack
     /// threshold.
     ///

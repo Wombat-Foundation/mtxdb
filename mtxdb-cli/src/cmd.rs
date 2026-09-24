@@ -1634,22 +1634,22 @@ fn print_collection_table_header(
     let canonical_field_width = canonical_width.saturating_add(2).saturating_add(role_width);
     if layout {
         if canonical {
-            println!("  {:<34}  {:<canonical_field_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
+            println!("  {:<34}  {:<canonical_field_width$}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "idx load", "packs", "disk", "runs", "largest", "avoidable");
         } else {
             println!(
-                "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-                "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
+                "  {:<34}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                "collection", "nodes", "idx load", "packs", "disk", "runs", "largest", "avoidable"
             );
         }
     } else if canonical {
         println!(
-            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-            "collection", "canonical", "nodes", "load", "shards", "index", "disk"
+            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
+            "collection", "canonical", "nodes", "idx load", "shards", "index", "disk"
         );
     } else {
         println!(
-            "  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-            "collection", "nodes", "load", "shards", "index", "disk"
+            "  {:<34}  {:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
+            "collection", "nodes", "idx load", "shards", "index", "disk"
         );
     }
 }
@@ -1901,6 +1901,7 @@ fn cmd_collections_coalesced(
                     | "nodes"
                     | "shards"
                     | "index"
+                    | "idx-load"
                     | "load"
                     | "disk"
                     | "packs"
@@ -1916,7 +1917,7 @@ fn cmd_collections_coalesced(
                 "nodes" => right.nodes.cmp(&left.nodes),
                 "shards" | "packs" => right.shards_count.cmp(&left.shards_count),
                 "index" => right.memory.cmp(&left.memory),
-                "load" => load_factor_percent(right.nodes, right.capacity)
+                "idx-load" | "load" => load_factor_percent(right.nodes, right.capacity)
                     .total_cmp(&load_factor_percent(left.nodes, left.capacity)),
                 "disk" => right.disk_bytes.cmp(&left.disk_bytes),
                 "avoidable" => right.avoidable.cmp(&left.avoidable),
@@ -1977,12 +1978,12 @@ fn cmd_collections_coalesced(
                 };
                 if canonical {
                     println!(
-                        "  {hex:<34}  {canonical_display}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                        "  {hex:<34}  {canonical_display}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
                         item.nodes, load, item.shards_count, disk_display, item.runs, fmt_bytes(item.largest_segment), avoidable_str
                     );
                 } else {
                     println!(
-                        "  {hex:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                        "  {hex:<34}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
                         item.nodes,
                         load,
                         item.shards_count,
@@ -1994,7 +1995,7 @@ fn cmd_collections_coalesced(
                 }
             } else if canonical {
                 println!(
-                    "  {hex:<34}  {canonical_display}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+                    "  {hex:<34}  {canonical_display}  {:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
                     item.nodes,
                     load,
                     shards,
@@ -2003,7 +2004,7 @@ fn cmd_collections_coalesced(
                 );
             } else {
                 println!(
-                    "  {hex:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+                    "  {hex:<34}  {:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
                     item.nodes,
                     load,
                     shards,
@@ -2175,6 +2176,7 @@ fn cmd_collections_in_dir(
                 | "nodes"
                 | "shards"
                 | "index"
+                | "idx-load"
                 | "load"
                 | "disk"
                 | "packs"
@@ -2199,7 +2201,7 @@ fn cmd_collections_in_dir(
                 .map_or(0, |s| s.pack_bytes.len())
                 .cmp(&left_layout.map_or(0, |s| s.pack_bytes.len())),
             "index" => right.2.cmp(&left.2),
-            "load" => load_factor_percent(right.1, right.3)
+            "idx-load" | "load" => load_factor_percent(right.1, right.3)
                 .total_cmp(&load_factor_percent(left.1, left.3)),
             "disk" => right_layout
                 .map_or(0, |s| s.disk_bytes)
@@ -2270,15 +2272,15 @@ fn cmd_collections_in_dir(
             let largest = stats.map_or(0, |s| s.largest_segment_bytes);
             let avoidable = avoidable_spread_bytes(stats);
             if canonical {
-                println!("  {hex:<34}  {canonical_display}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}", disk_display, fmt_bytes(largest), fmt_bytes(avoidable));
+                println!("  {hex:<34}  {canonical_display}  {nodes:>7}  {load:>8}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}", disk_display, fmt_bytes(largest), fmt_bytes(avoidable));
             } else {
-                println!("  {hex:<34}  {nodes:>7}  {load:>6}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}", disk_display, fmt_bytes(largest), fmt_bytes(avoidable));
+                println!("  {hex:<34}  {nodes:>7}  {load:>8}  {packs:>6}  {:>13}  {runs:>5}  {:>10}  {:>13}", disk_display, fmt_bytes(largest), fmt_bytes(avoidable));
             }
         } else if canonical {
-            println!("  {hex:<34}  {canonical_display}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}", fmt_index_kilobytes(*memory), disk_display);
+            println!("  {hex:<34}  {canonical_display}  {nodes:>7}  {load:>8}  {shards:>6}  {:>12}  {:>13}", fmt_index_kilobytes(*memory), disk_display);
         } else {
             println!(
-                "  {hex}  {nodes:>7}  {load:>6}  {shards:>6}  {:>12}  {:>13}",
+                "  {hex}  {nodes:>7}  {load:>8}  {shards:>6}  {:>12}  {:>13}",
                 fmt_index_kilobytes(*memory),
                 disk_display
             );
@@ -2287,7 +2289,7 @@ fn cmd_collections_in_dir(
     println!();
     if layout {
         println!(
-            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
             "total",
             "",
             total_nodes,
@@ -2304,7 +2306,7 @@ fn cmd_collections_in_dir(
         );
     } else {
         println!(
-            "  {:<34}  {:<canonical_field_width$}  {total_nodes:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "  {:<34}  {:<canonical_field_width$}  {total_nodes:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
             "total",
             "",
             "",
@@ -11389,6 +11391,21 @@ mod tests {
             },
         };
         cmd_collections(&cli_cols, false, false, false, Some("nodes"), 10).unwrap();
+        cmd_collections(&cli_cols, false, false, false, Some("idx-load"), 10).unwrap();
+        cmd_collections(&cli_cols, false, false, false, Some("load"), 10).unwrap();
+
+        let mut cli_cols_coalesce = cli_cols.clone();
+        cli_cols_coalesce.coalesce = true;
+        cmd_collections(
+            &cli_cols_coalesce,
+            false,
+            false,
+            false,
+            Some("idx-load"),
+            10,
+        )
+        .unwrap();
+        cmd_collections(&cli_cols_coalesce, false, false, false, Some("load"), 10).unwrap();
 
         let cli_stats = Cli {
             dirs: vec![dir1.clone(), dir2.clone()],

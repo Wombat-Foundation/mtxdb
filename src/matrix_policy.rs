@@ -319,9 +319,42 @@ pub struct RoomMetadata {
     pub additional_creators: Vec<String>,
 }
 
+/// Matrix storage profile defaults for a shared-WAL database.
+///
+/// Under the Matrix storage model:
+/// - `State`: HAMT nodes, roots, and state-group sidecars are dense hashes that
+///   do not benefit from zstd; compression is disabled to save CPU cycles on write and replay.
+/// - `EventDag`: Event JSON benefits significantly from zstd; compression is enabled.
+/// - `Edges`: Edge records retain standard defaults.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
+    crate::database::PoolPolicies {
+        state: crate::database::PoolPolicy {
+            compress: false,
+            checksum_policy: crate::packfile::ChecksumPolicy::Full,
+        },
+        event_dag: crate::database::PoolPolicy::default(),
+        edges: crate::database::PoolPolicy::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn matrix_pool_policies_skips_state_compression() {
+        let policies = matrix_pool_policies();
+        assert!(!policies.state.compress);
+        assert!(policies.event_dag.compress);
+        assert!(policies.edges.compress);
+        assert_eq!(
+            policies.state.checksum_policy,
+            crate::packfile::ChecksumPolicy::Full
+        );
+    }
 
     #[test]
     fn v1_v2_v3_identity_boundaries_are_explicit() {

@@ -26,6 +26,47 @@ use crate::layout::{DatabaseLayout, ShardType};
 use crate::packfile::storage::PackfileStorage;
 use crate::storage::StorageError;
 
+/// Write and verification policy for a single storage pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolPolicy {
+    /// Whether new records written through this pool attempt zstd compression.
+    pub compress: bool,
+    /// How much CRC32 checksum verification this pool applies.
+    pub checksum_policy: crate::packfile::ChecksumPolicy,
+}
+
+impl Default for PoolPolicy {
+    fn default() -> Self {
+        Self {
+            compress: true,
+            checksum_policy: crate::packfile::ChecksumPolicy::Full,
+        }
+    }
+}
+
+/// Policies for every named pool in a shared-WAL database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PoolPolicies {
+    /// Policy for the state pool (`ShardType::State`).
+    pub state: PoolPolicy,
+    /// Policy for the event DAG pool (`ShardType::EventDag`).
+    pub event_dag: PoolPolicy,
+    /// Policy for the edges pool (`ShardType::Edges`).
+    pub edges: PoolPolicy,
+}
+
+impl PoolPolicies {
+    /// Return the policy associated with `shard`.
+    #[must_use]
+    pub fn for_shard(&self, shard: ShardType) -> &PoolPolicy {
+        match shard {
+            ShardType::State => &self.state,
+            ShardType::EventDag => &self.event_dag,
+            ShardType::Edges => &self.edges,
+        }
+    }
+}
+
 /// A database root open for writing through one shared durability fence.
 ///
 /// Dropping it releases the root writer lock and the pools it opened.
@@ -38,7 +79,7 @@ pub struct SharedDatabase {
 }
 
 impl SharedDatabase {
-    /// Open `root` for writing through one shared WAL.
+    /// Open `root` for writing through one shared WAL using default pool policies.
     ///
     /// The root is initialized with the shared layout if it does not yet
     /// exist. This blocks with `WouldBlock` if another live process holds the
@@ -48,6 +89,19 @@ impl SharedDatabase {
     /// Returns an error if the root lock is held, the shared segment cannot be
     /// opened, or any pool cannot be opened or attached.
     pub fn open(root: PathBuf) -> Result<Self, StorageError> {
+        Self::open_with_policies(root, PoolPolicies::default())
+    }
+
+    /// Open `root` for writing through one shared WAL with explicit per-pool policies.
+    ///
+    /// The root is initialized with the shared layout if it does not yet
+    /// exist. This blocks with `WouldBlock` if another live process holds the
+    /// root writer lock.
+    ///
+    /// # Errors
+    /// Returns an error if the root lock is held, the shared segment cannot be
+    /// opened, or any pool cannot be opened or attached.
+    pub fn open_with_policies(root: PathBuf, policies: PoolPolicies) -> Result<Self, StorageError> {
         let layout = DatabaseLayout::open(root)?;
         let wal_path = layout.shared_wal_path();
         let lock = SharedWalLock::acquire(layout.root())?;
@@ -58,7 +112,9 @@ impl SharedDatabase {
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
         for shard in ShardType::ALL {
             let dir = layout.pool_dir(shard)?;
-            let store = PackfileStorage::open(dir)?;
+            let policy = policies.for_shard(shard);
+            let store =
+                PackfileStorage::open_with_policies(dir, policy.compress, policy.checksum_policy)?;
             store.enable_shared_journal(Arc::clone(&coordinator), shard)?;
             store.replay_journal()?;
             pools.push(Arc::new(store));
@@ -376,6 +432,43 @@ mod tests {
         assert!(
             err.to_string().contains("inside database root"),
             "unexpected error: {err}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_uses_default_pool_policies_enabling_compression() {
+        let root = test_root("default_policies");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        for shard in ShardType::ALL {
+            assert!(
+                db.pool(shard).is_compression_enabled(),
+                "default policy must enable compression for {shard:?}"
+            );
+            assert_eq!(
+                db.pool(shard).checksum_policy(),
+                crate::packfile::ChecksumPolicy::Full
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_with_policies_applies_per_pool_settings() {
+        let root = test_root("explicit_policies");
+        let mut policies = super::PoolPolicies::default();
+        policies.state.compress = false;
+        policies.edges.checksum_policy = crate::packfile::ChecksumPolicy::WriteOnly;
+
+        let db = SharedDatabase::open_with_policies(root.clone(), policies).unwrap();
+        assert!(!db.state().is_compression_enabled());
+        assert!(db.event_dag().is_compression_enabled());
+        assert!(db.edges().is_compression_enabled());
+        assert_eq!(
+            db.edges().checksum_policy(),
+            crate::packfile::ChecksumPolicy::WriteOnly
         );
         drop(db);
         let _ = std::fs::remove_dir_all(&root);

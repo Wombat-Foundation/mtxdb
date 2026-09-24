@@ -56,12 +56,14 @@ pub use auxiliary::{
 };
 pub use cache::NodeCache;
 #[cfg(not(target_arch = "wasm32"))]
-pub use database::SharedDatabase;
+pub use database::{PoolPolicies, PoolPolicy, SharedDatabase};
 pub use index::LossyIndex;
 #[cfg(not(target_arch = "wasm32"))]
 pub use journal::SharedWalLock;
 pub use journal::{TxnStage, TxnStageState};
 pub use layout::{enclosing_root, read_wal_layout, DatabaseLayout, ShardType, WalLayout};
+#[cfg(not(target_arch = "wasm32"))]
+pub use matrix_policy::matrix_pool_policies;
 pub use matrix_policy::{
     EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,

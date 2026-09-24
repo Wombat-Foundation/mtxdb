@@ -304,7 +304,7 @@ fn sub_collections() -> Command {
                 .help("Show each collection's canonical ID"),
         )
         .arg(limit_arg())
-        .arg(sort_arg("collection, nodes, load, shards, index, disk, packs, avoidable, segments, fragmentation"))
+        .arg(sort_arg("collection, nodes, idx-load (alias: load), shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
 
 fn layout_arg() -> Arg {

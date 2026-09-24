@@ -1253,6 +1253,12 @@ impl ShardPool {
         self.bucket_seed
     }
 
+    /// Whether this pool attempts zstd compression on written records.
+    #[must_use]
+    pub fn is_compression_enabled(&self) -> bool {
+        self.compress
+    }
+
     /// Claim the writer lock on `base_dir`: atomically create a
     /// `.mtxdb.lock` marker file, which fails with `AlreadyExists` if
     /// another writer already holds it. Pure `std::fs` — no OS-level
