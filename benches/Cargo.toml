@@ -89,6 +89,12 @@ name = "scan"
 path = "scan.rs"
 harness = false
 
+# Cold-cache off-vs-hdd comparison for get_many's merged read plan.
+[[bench]]
+name = "read_plan"
+path = "read_plan.rs"
+harness = false
+
 [[bench]]
 name = "compare_external"
 path = "compare_external.rs"
