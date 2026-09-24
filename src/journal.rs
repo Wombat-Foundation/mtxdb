@@ -162,6 +162,7 @@ pub enum TxnStageState {
 #[derive(Debug)]
 struct TxnStageData {
     pools: [Vec<Mutation>; 3],
+    applied: [Vec<bool>; 3],
     bytes: usize,
     /// Successful pool appends. Retrying a callback after a partial error
     /// resumes at the failed pool instead of duplicating earlier groups.
@@ -205,6 +206,7 @@ impl TxnStage {
             state: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
             data: Mutex::new(TxnStageData {
                 pools: std::array::from_fn(|_| Vec::new()),
+                applied: std::array::from_fn(|_| Vec::new()),
                 bytes: 0,
                 appended: [false; 3],
             }),
@@ -231,6 +233,7 @@ impl TxnStage {
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) == Self::ACTIVE {
             data.pools.iter_mut().for_each(Vec::clear);
+            data.applied.iter_mut().for_each(Vec::clear);
             data.bytes = 0;
             self.state.store(Self::DISCARDED, Ordering::Release);
         }
@@ -239,6 +242,30 @@ impl TxnStage {
     /// Snapshot staged mutations for application to storage at commit time.
     pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; 3] {
         self.data.lock().pools.clone()
+    }
+
+    /// Return whether one staged mutation has already been applied to storage.
+    pub(crate) fn mutation_applied(&self, pool: ShardType, index: usize) -> bool {
+        self.data.lock().applied[pool_index(pool)]
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Record successful application of one staged mutation. This makes a
+    /// retry after a later mutation fails resume at the failed mutation.
+    pub(crate) fn mark_mutation_applied(&self, pool: ShardType, index: usize) -> io::Result<()> {
+        let mut data = self.data.lock();
+        let applied = data.applied[pool_index(pool)]
+            .get_mut(index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "staged mutation index out of bounds",
+                )
+            })?;
+        *applied = true;
+        Ok(())
     }
 
     /// Mark pack/index application complete so journal publication can be
@@ -341,6 +368,7 @@ impl TxnStage {
             node_id,
             payload,
         });
+        data.applied[pool_index(pool)].push(false);
         data.bytes = total;
         Ok(())
     }
@@ -389,6 +417,7 @@ impl TxnStage {
             node_id: *node_id,
             payload: payload.clone(),
         }));
+        data.applied[pool_index(pool)].extend(vec![false; entries.len()]);
         data.bytes = total;
         Ok(())
     }
@@ -422,6 +451,7 @@ impl TxnStage {
             ));
         }
         data.pools[pool_index(pool)].push(Mutation::DeleteCollection { collection_id });
+        data.applied[pool_index(pool)].push(false);
         data.bytes = total;
         Ok(())
     }
@@ -497,6 +527,13 @@ impl TxnStage {
                     return Ok(());
                 }
             }
+        }
+
+        if active_pool_count > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cross-pool transactions require one shared journal coordinator",
+            ));
         }
 
         for (ordered_index, pool) in pools.into_iter().enumerate() {
@@ -1318,9 +1355,16 @@ impl JournalCoordinator {
         batches: &[(ShardType, &[Mutation])],
     ) -> io::Result<CommitReceipt> {
         let _publication = self.publication.lock();
-        // Flush unrelated legacy writes as a separate group first. They must
-        // not become part of this transaction's commit boundary.
-        self.append_pending_groups(&[])?;
+        // Never flush unrelated legacy writes here. They may belong to a
+        // different SQL transaction and must not become visible merely because
+        // this transaction committed. The caller must publish the legacy queue
+        // through its own lifecycle before retrying this transaction.
+        if !self.pending.lock().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "legacy journal mutations are pending; publish them before the staged transaction",
+            ));
+        }
         let staged = batches
             .iter()
             .map(|(pool, mutations)| (Some(*pool), *mutations))
@@ -2858,7 +2902,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_stage_does_not_absorb_legacy_pending_mutations() {
+    fn transaction_stage_rejects_legacy_pending_mutations() {
         use crate::layout::ShardType;
 
         let path = temp_path("txn_stage_legacy_boundary");
@@ -2878,6 +2922,19 @@ mod tests {
                 b"transaction".to_vec(),
             )
             .unwrap();
+        assert_eq!(
+            stage
+                .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            Journal::scan_read_only(&path).unwrap().groups.len(),
+            0,
+            "the staged publication must not flush legacy mutations"
+        );
+        coordinator.publish_pending().unwrap();
         stage
             .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
             .unwrap();

@@ -128,10 +128,16 @@ impl DatabaseTransaction<'_> {
         if self.stage.state() == TxnStageState::JournalPublished {
             let batches = self.stage.snapshot_mutations();
             for pool in ShardType::ALL {
-                for mutation in &batches[shard_index(pool)] {
+                for (index, mutation) in batches[shard_index(pool)].iter().enumerate() {
+                    if self.stage.mutation_applied(pool, index) {
+                        continue;
+                    }
                     self.database
                         .pool(pool)
                         .apply_transaction_mutation(mutation)?;
+                    self.stage
+                        .mark_mutation_applied(pool, index)
+                        .map_err(StorageError::Io)?;
                 }
             }
             self.stage.mark_applied().map_err(StorageError::Io)?;
@@ -430,6 +436,21 @@ mod tests {
         assert_eq!(
             transaction.state(),
             crate::journal::TxnStageState::Published
+        );
+        let scan = crate::journal::Journal::scan_read_only(root.join("wal.bin")).unwrap();
+        assert_eq!(
+            scan.groups.len(),
+            1,
+            "one transaction must emit one journal group"
+        );
+        assert_eq!(scan.groups[0].entries.len(), 2);
+        assert_eq!(
+            scan.groups[0]
+                .entries
+                .iter()
+                .map(|entry| entry.pool)
+                .collect::<Vec<_>>(),
+            vec![Some(ShardType::EventDag), Some(ShardType::State)]
         );
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
