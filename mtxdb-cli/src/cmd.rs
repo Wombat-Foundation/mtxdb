@@ -177,10 +177,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             id,
             raw,
             verbose,
-        } => {
-            cli.require_single_dir("get")?;
-            cmd_get(cli, collection.as_deref(), id, *raw, *verbose)
-        }
+        } => cmd_get(cli, collection.as_deref(), id, *raw, *verbose),
         Commands::Collections {
             all,
             layout,
@@ -430,6 +427,60 @@ fn open_layout(cli: &Cli) -> anyhow::Result<DatabaseLayout> {
             root.display()
         )
     })
+}
+
+/// Collect all valid database directories among the CLI's targeted paths,
+/// skipping non-directories and directories lacking `db.meta` with warnings.
+pub(crate) fn valid_database_dirs(cli: &Cli) -> anyhow::Result<Vec<PathBuf>> {
+    let dirs = cli.dirs_or_default();
+    let mut valid = Vec::new();
+    for dir in &dirs {
+        if !dir.is_dir() {
+            eprintln!("skipping `{}`: not a directory", dir.display());
+            continue;
+        }
+        if !dir.join("db.meta").is_file() {
+            eprintln!(
+                "skipping `{}`: no db.meta found (not an mtxdb database)",
+                dir.display()
+            );
+            continue;
+        }
+        valid.push(dir.clone());
+    }
+    if valid.is_empty() {
+        bail!(
+            "none of the {} specified targets are mtxdb databases",
+            dirs.len()
+        );
+    }
+    Ok(valid)
+}
+
+fn database_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn database_labels(paths: &[PathBuf]) -> HashMap<PathBuf, String> {
+    let mut map = HashMap::new();
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for path in paths {
+        let name = database_label(path);
+        let count = name_counts.entry(name).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    for path in paths {
+        let name = database_label(path);
+        if name_counts.get(&name).copied().unwrap_or(0) > 1 {
+            map.insert(path.clone(), path.display().to_string());
+        } else {
+            map.insert(path.clone(), name);
+        }
+    }
+    map
 }
 
 /// Run a command over all targeted database roots.
@@ -682,7 +733,25 @@ fn get_matches_in_store(
     }
 }
 
-fn cmd_get(
+fn extract_origin_server_ts(bytes: &[u8]) -> Option<u64> {
+    let mut copy = bytes.to_vec();
+    let event = simd_json::to_owned_value(&mut copy).ok()?;
+    if let OwnedValue::Object(fields) = &event {
+        fields
+            .get("origin_server_ts")
+            .and_then(OwnedValue::as_u64)
+            .or_else(|| {
+                fields
+                    .get("origin_server_ts")
+                    .and_then(OwnedValue::as_i64)
+                    .and_then(|ts| u64::try_from(ts).ok())
+            })
+    } else {
+        None
+    }
+}
+
+fn cmd_get_single(
     cli: &Cli,
     collection: Option<&str>,
     id: &str,
@@ -748,6 +817,129 @@ fn cmd_get(
             ),
         }
     }
+}
+
+fn cmd_get_coalesced(
+    cli: &Cli,
+    collection: Option<&str>,
+    id: &str,
+    raw: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    struct Candidate {
+        db_dir: PathBuf,
+        shard_type: ShardType,
+        collection_id: [u8; 16],
+        data: NodeData,
+        origin_server_ts: Option<u64>,
+    }
+
+    let valid_dirs = valid_database_dirs(cli)?;
+    let node_id = parse_get_id(id)?;
+
+    let mut candidates = Vec::new();
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+
+    for db_dir in &valid_dirs {
+        let Ok(layout) = DatabaseLayout::open(db_dir.clone()) else {
+            continue;
+        };
+        for &shard_type in &shard_types {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            let Ok(store) = PackfileStorage::open_read_only(dir) else {
+                continue;
+            };
+            for (col_id, data) in get_matches_in_store(&store, collection, &node_id)? {
+                let origin_server_ts = extract_origin_server_ts(&data.bytes);
+                candidates.push(Candidate {
+                    db_dir: db_dir.clone(),
+                    shard_type,
+                    collection_id: col_id,
+                    data,
+                    origin_server_ts,
+                });
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        bail!("not found in any of the {} databases", valid_dirs.len());
+    }
+
+    let first_payload = &candidates[0].data.bytes;
+    let all_identical = candidates.iter().all(|c| c.data.bytes == *first_payload);
+
+    let winner = if all_identical {
+        &candidates[0]
+    } else {
+        let mut sorted_candidates: Vec<&Candidate> = candidates.iter().collect();
+        sorted_candidates.sort_by(|a, b| {
+            b.origin_server_ts
+                .cmp(&a.origin_server_ts)
+                .then_with(|| a.db_dir.to_string_lossy().cmp(&b.db_dir.to_string_lossy()))
+        });
+
+        let selected = sorted_candidates[0];
+        let distinct_payloads = {
+            let mut set = HashSet::new();
+            for c in &candidates {
+                set.insert(&c.data.bytes);
+            }
+            set.len()
+        };
+
+        let ts_msg = match selected.origin_server_ts {
+            Some(ts) => format!("origin_server_ts: {ts}"),
+            None => "lexicographical tie-break".to_owned(),
+        };
+
+        eprintln!(
+            "warning: conflicting records found for ID {id} ({distinct_payloads} distinct payloads across {} databases); selecting newest ({ts_msg}) from `{}`",
+            candidates.len(),
+            selected.db_dir.display()
+        );
+
+        selected
+    };
+
+    if verbose {
+        print_get_verbose(
+            id,
+            &node_id,
+            winner.shard_type,
+            &winner.collection_id,
+            &winner.data,
+        );
+        eprintln!("  database:   {}", winner.db_dir.display());
+        eprintln!("  candidates: {} database match(es)", candidates.len());
+    }
+
+    emit_get_data(&winner.data, raw)
+}
+
+fn cmd_get(
+    cli: &Cli,
+    collection: Option<&str>,
+    id: &str,
+    raw: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let dirs = cli.dirs_or_default();
+    if dirs.len() > 1 {
+        if cli.coalesce {
+            return cmd_get_coalesced(cli, collection, id, raw, verbose);
+        }
+        return run_multi_dir(cli, |sub_cli| {
+            cmd_get_single(sub_cli, collection, id, raw, verbose)
+        });
+    }
+    cmd_get_single(cli, collection, id, raw, verbose)
 }
 
 /// Render arbitrary payload bytes safely for terminal output. Raw bytes stay
@@ -1172,9 +1364,325 @@ fn cmd_collections(
     sort: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<()> {
+    if cli.coalesce {
+        let valid_dirs = valid_database_dirs(cli)?;
+        if valid_dirs.len() > 1 {
+            return cmd_collections_coalesced(
+                cli,
+                &valid_dirs,
+                all,
+                layout,
+                canonical,
+                sort,
+                limit,
+            );
+        }
+    }
     run_multi_dir(cli, |sub_cli| {
         cmd_collections_single(sub_cli, all, layout, canonical, sort, limit)
     })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "coalesced table construction and formatting is kept together"
+)]
+fn cmd_collections_coalesced(
+    cli: &Cli,
+    valid_dirs: &[PathBuf],
+    all: bool,
+    layout: bool,
+    canonical: bool,
+    sort: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<()> {
+    struct CoalescedCol {
+        id: [u8; 16],
+        canonical: Option<String>,
+        nodes: usize,
+        memory: usize,
+        capacity: u32,
+        disk_bytes: u64,
+        shards_count: usize,
+        runs: u64,
+        largest_segment: u64,
+        avoidable: u64,
+    }
+
+    let types = listing_shard_types(cli, all);
+    let physical_needed = layout
+        || sort.is_some_and(|column| {
+            matches!(
+                column,
+                "disk" | "packs" | "avoidable" | "segments" | "fragmentation"
+            )
+        });
+
+    for (type_index, shard_type) in types.into_iter().enumerate() {
+        if type_index != 0 {
+            println!();
+            println!();
+        }
+        print_section_header(shard_type);
+
+        let mut map: HashMap<[u8; 16], CoalescedCol> = HashMap::new();
+        let mut total_dbs_with_collections = HashSet::new();
+
+        for db_dir in valid_dirs {
+            let Ok(layout_db) = DatabaseLayout::open(db_dir.clone()) else {
+                continue;
+            };
+            let Ok(pool_dir) = pool_dir(&layout_db, shard_type) else {
+                continue;
+            };
+            if glob_pack_files(&pool_dir).map_or(true, |p| p.is_empty()) {
+                continue;
+            }
+            let summaries = match PackfileStorage::collection_summaries_from_disk(&pool_dir) {
+                Some(s) => s,
+                None => {
+                    if let Ok(store) = PackfileStorage::open_read_only(pool_dir.clone()) {
+                        store.collection_summaries()
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+            if summaries.is_empty() {
+                continue;
+            }
+            total_dbs_with_collections.insert(db_dir.clone());
+            let collection_shards = PackfileStorage::collection_shards_from_disk(&pool_dir);
+            let sidecar_disk = PackfileStorage::collection_disk_bytes_from_disk(&pool_dir);
+            let physical = if physical_needed {
+                physical_layout(&pool_dir).ok()
+            } else {
+                None
+            };
+            let canonical_map: HashMap<[u8; 16], String> =
+                if canonical {
+                    PackfileStorage::open_read_only(pool_dir.clone())
+                        .ok()
+                        .map(|store| {
+                            summaries
+                                .iter()
+                                .filter_map(|(id, _, _, _)| {
+                                    store.get_collection_metadata(id).ok().flatten().map(
+                                        |metadata| {
+                                            (
+                                                *id,
+                                                String::from_utf8_lossy(
+                                                    &metadata.collection_canonical_id,
+                                                )
+                                                .into_owned(),
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    HashMap::new()
+                };
+
+            for (col_id, nodes, memory, capacity) in summaries {
+                let disk = physical
+                    .as_ref()
+                    .and_then(|p| p.collections.get(&col_id))
+                    .map(|s| s.disk_bytes)
+                    .or_else(|| {
+                        sidecar_disk
+                            .as_ref()
+                            .and_then(|sd| sd.get(&col_id).copied())
+                    })
+                    .unwrap_or(0);
+                let shards_in_this_db = collection_shards
+                    .as_ref()
+                    .and_then(|cs| cs.get(&col_id))
+                    .map_or(1, Vec::len);
+                let stats = physical.as_ref().and_then(|p| p.collections.get(&col_id));
+                let runs = stats.map_or(0, |s| s.segments);
+                let largest = stats.map_or(0, |s| s.largest_segment_bytes);
+                let avoidable = avoidable_spread_bytes(stats);
+
+                let entry = map.entry(col_id).or_insert_with(|| CoalescedCol {
+                    id: col_id,
+                    canonical: None,
+                    nodes: 0,
+                    memory: 0,
+                    capacity: 0,
+                    disk_bytes: 0,
+                    shards_count: 0,
+                    runs: 0,
+                    largest_segment: 0,
+                    avoidable: 0,
+                });
+
+                entry.nodes = entry.nodes.saturating_add(nodes);
+                entry.memory = entry.memory.saturating_add(memory);
+                entry.capacity = entry.capacity.saturating_add(capacity);
+                entry.disk_bytes = entry.disk_bytes.saturating_add(disk);
+                entry.shards_count = entry.shards_count.saturating_add(shards_in_this_db);
+                entry.runs = entry.runs.saturating_add(runs);
+                entry.largest_segment = entry.largest_segment.max(largest);
+                entry.avoidable = entry.avoidable.saturating_add(avoidable);
+                if entry.canonical.is_none() {
+                    if let Some(c) = canonical_map.get(&col_id) {
+                        entry.canonical = Some(c.clone());
+                    }
+                }
+            }
+        }
+
+        if map.is_empty() {
+            println!(
+                "no collections found across {} database(s)",
+                valid_dirs.len()
+            );
+            continue;
+        }
+
+        let mut ordered: Vec<CoalescedCol> = map.into_values().collect();
+        if let Some(column) = sort {
+            if !matches!(
+                column,
+                "collection"
+                    | "nodes"
+                    | "shards"
+                    | "index"
+                    | "load"
+                    | "disk"
+                    | "packs"
+                    | "avoidable"
+                    | "segments"
+                    | "fragmentation"
+            ) {
+                bail!("unknown collections sort column `{column}`");
+            }
+        }
+        ordered.sort_by(|left, right| {
+            let ordering = match sort.unwrap_or("") {
+                "nodes" => right.nodes.cmp(&left.nodes),
+                "shards" | "packs" => right.shards_count.cmp(&left.shards_count),
+                "index" => right.memory.cmp(&left.memory),
+                "load" => load_factor_percent(right.nodes, right.capacity)
+                    .total_cmp(&load_factor_percent(left.nodes, left.capacity)),
+                "disk" => right.disk_bytes.cmp(&left.disk_bytes),
+                "avoidable" => right.avoidable.cmp(&left.avoidable),
+                "segments" | "fragmentation" => right.runs.cmp(&left.runs),
+                _ => left.id.cmp(&right.id),
+            };
+            ordering.then_with(|| left.id.cmp(&right.id))
+        });
+
+        let canonical_width = ordered
+            .iter()
+            .filter_map(|c| c.canonical.as_ref())
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .max("canonical".len());
+
+        if layout {
+            if canonical {
+                println!("  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
+            } else {
+                println!(
+                    "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                    "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
+                );
+            }
+        } else if canonical {
+            println!(
+                "  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+                "collection", "canonical", "nodes", "load", "shards", "index", "disk"
+            );
+        } else {
+            println!(
+                "  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+                "collection", "nodes", "load", "shards", "index", "disk"
+            );
+        }
+
+        let mut total_nodes = 0_usize;
+        let mut total_memory = 0_usize;
+        let mut total_disk_bytes = 0_u64;
+        let total_rows = ordered.len();
+        for item in &ordered {
+            total_nodes = total_nodes.saturating_add(item.nodes);
+            total_memory = total_memory.saturating_add(item.memory);
+            total_disk_bytes = total_disk_bytes.saturating_add(item.disk_bytes);
+        }
+
+        let max_rows = if limit <= 0 {
+            usize::MAX
+        } else {
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        };
+
+        for item in ordered.into_iter().take(max_rows) {
+            let hex = format_id(&item.id);
+            let canonical_id = item.canonical.as_deref().unwrap_or("-");
+            let load = fmt_load_percent(item.nodes, item.capacity);
+            let shards = if item.shards_count == 1 {
+                String::new()
+            } else {
+                item.shards_count.to_string()
+            };
+            let disk_display = fmt_disk_megabytes(item.disk_bytes);
+            if layout {
+                let avoidable_str = if item.avoidable > 0 {
+                    fmt_disk_megabytes(item.avoidable)
+                } else {
+                    "-".to_owned()
+                };
+                if canonical {
+                    println!(
+                        "  {hex:<34}  {canonical_id:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                        item.nodes, load, item.shards_count, disk_display, item.runs, fmt_bytes(item.largest_segment), avoidable_str
+                    );
+                } else {
+                    println!(
+                        "  {hex:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                        item.nodes,
+                        load,
+                        item.shards_count,
+                        disk_display,
+                        item.runs,
+                        fmt_bytes(item.largest_segment),
+                        avoidable_str
+                    );
+                }
+            } else if canonical {
+                println!(
+                    "  {hex:<34}  {canonical_id:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+                    item.nodes, load, shards, fmt_megabytes(item.memory), disk_display
+                );
+            } else {
+                println!(
+                    "  {hex:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+                    item.nodes,
+                    load,
+                    shards,
+                    fmt_megabytes(item.memory),
+                    disk_display
+                );
+            }
+        }
+        println!();
+        println!(
+            "total: {total_nodes} nodes across {total_rows} collections, {} index memory, {}",
+            fmt_megabytes(total_memory),
+            fmt_disk_megabytes(total_disk_bytes)
+        );
+        println!(
+            "{total_rows} collection(s) across {} database(s), {} on disk",
+            total_dbs_with_collections.len(),
+            fmt_disk_megabytes(total_disk_bytes)
+        );
+    }
+    Ok(())
 }
 
 fn cmd_collections_single(
@@ -1584,7 +2092,248 @@ fn print_pack_physical_layout(
 }
 
 fn cmd_shards(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
+    if cli.coalesce {
+        let valid_dirs = valid_database_dirs(cli)?;
+        if valid_dirs.len() > 1 {
+            return cmd_shards_coalesced(cli, &valid_dirs, all, layout, sort);
+        }
+    }
     run_multi_dir(cli, |sub_cli| cmd_shards_single(sub_cli, all, layout, sort))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "coalesced shard table construction and formatting is kept together"
+)]
+fn cmd_shards_coalesced(
+    cli: &Cli,
+    valid_dirs: &[PathBuf],
+    all: bool,
+    layout: bool,
+    sort: Option<&str>,
+) -> anyhow::Result<()> {
+    struct ShardRow {
+        db_label: String,
+        pack_id: u64,
+        file_bytes: u64,
+        version: u8,
+        is_active: bool,
+        nodes: Option<u64>,
+        collections: Option<u64>,
+        index_bytes: Option<usize>,
+        syncs: u64,
+        segments: u64,
+        interleaving: u64,
+    }
+
+    let types = listing_shard_types(cli, all);
+    let labels = database_labels(valid_dirs);
+    let needs_layout = layout || matches!(sort, Some("segments" | "interleaving"));
+
+    for (type_index, shard_type) in types.into_iter().enumerate() {
+        if type_index != 0 {
+            println!();
+            println!();
+        }
+        print_section_header(shard_type);
+
+        let mut rows = Vec::new();
+        let mut unique_collections = HashSet::new();
+        let mut total_bytes: u64 = 0;
+        let mut total_syncs: u64 = 0;
+        let mut total_nodes: u64 = 0;
+        let mut has_nodes = false;
+        let mut total_index_bytes: usize = 0;
+        let mut dbs_with_packs = HashSet::new();
+
+        for db_dir in valid_dirs {
+            let Ok(layout_db) = DatabaseLayout::open(db_dir.clone()) else {
+                continue;
+            };
+            let Ok(pool_dir) = pool_dir(&layout_db, shard_type) else {
+                continue;
+            };
+            let Ok(mut shard_entries) = glob_pack_files(&pool_dir) else {
+                continue;
+            };
+            if shard_entries.is_empty() {
+                continue;
+            }
+            shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
+            let active_pack_id = shard_entries.iter().map(|(id, _, _)| *id).max();
+            let (stats_map, _) = decode_stats_snapshot(&pool_dir);
+            let node_counts = PackfileStorage::shard_node_counts_from_disk(&pool_dir);
+            let collection_counts = PackfileStorage::shard_collection_counts_from_disk(&pool_dir);
+            let physical = if needs_layout {
+                physical_layout(&pool_dir).ok()
+            } else {
+                None
+            };
+            let (pool_total_index, index_by_shard) = index_requirements_from_disk(&pool_dir)
+                .map_or((0, None), |(total, by_shard)| (total, Some(by_shard)));
+            total_index_bytes = total_index_bytes.saturating_add(pool_total_index);
+
+            for (col_id, _) in PackfileStorage::collection_directory_from_disk(&pool_dir) {
+                unique_collections.insert(col_id);
+            }
+
+            dbs_with_packs.insert(db_dir.clone());
+            let db_label = labels
+                .get(db_dir)
+                .cloned()
+                .unwrap_or_else(|| db_dir.display().to_string());
+
+            for &(pack_id, file_bytes, version) in &shard_entries {
+                let (_, _, sc) = stats_map.get(&pack_id).copied().unwrap_or_default();
+                let nodes = node_counts.as_ref().and_then(|c| c.get(&pack_id)).copied();
+                if let Some(n) = nodes {
+                    total_nodes = total_nodes.saturating_add(n);
+                    has_nodes = true;
+                }
+                let collections = collection_counts
+                    .as_ref()
+                    .and_then(|c| c.get(&pack_id))
+                    .copied();
+                let index_bytes = index_by_shard
+                    .as_ref()
+                    .and_then(|r| r.get(&pack_id))
+                    .copied();
+                let segments = physical
+                    .as_ref()
+                    .and_then(|p| p.packs.get(&pack_id))
+                    .map_or(0, |s| s.segments);
+                let interleaving = physical
+                    .as_ref()
+                    .and_then(|p| p.packs.get(&pack_id))
+                    .map_or(0, |s| s.segments.saturating_sub(s.collections.len() as u64));
+
+                total_bytes = total_bytes.saturating_add(file_bytes);
+                total_syncs = total_syncs.saturating_add(sc);
+
+                rows.push(ShardRow {
+                    db_label: db_label.clone(),
+                    pack_id,
+                    file_bytes,
+                    version,
+                    is_active: active_pack_id == Some(pack_id),
+                    nodes,
+                    collections,
+                    index_bytes,
+                    syncs: sc,
+                    segments,
+                    interleaving,
+                });
+            }
+        }
+
+        if rows.is_empty() {
+            println!(
+                "no shards found across {} database(s) (stores are empty)",
+                valid_dirs.len()
+            );
+            continue;
+        }
+
+        if let Some(column) = sort {
+            if !matches!(
+                column,
+                "database"
+                    | "pack"
+                    | "bytes"
+                    | "nodes"
+                    | "collections"
+                    | "syncs"
+                    | "segments"
+                    | "interleaving"
+            ) {
+                bail!("unknown shards sort column `{column}`");
+            }
+            rows.sort_by(|left, right| {
+                let ordering = match column {
+                    "database" => left.db_label.cmp(&right.db_label),
+                    "pack" => left.pack_id.cmp(&right.pack_id),
+                    "bytes" => right.file_bytes.cmp(&left.file_bytes),
+                    "nodes" => right.nodes.unwrap_or(0).cmp(&left.nodes.unwrap_or(0)),
+                    "collections" => right
+                        .collections
+                        .unwrap_or(0)
+                        .cmp(&left.collections.unwrap_or(0)),
+                    "syncs" => right.syncs.cmp(&left.syncs),
+                    "segments" => right.segments.cmp(&left.segments),
+                    "interleaving" => right.interleaving.cmp(&left.interleaving),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                ordering
+                    .then_with(|| left.db_label.cmp(&right.db_label))
+                    .then_with(|| left.pack_id.cmp(&right.pack_id))
+            });
+        } else {
+            rows.sort_by(|left, right| {
+                left.db_label
+                    .cmp(&right.db_label)
+                    .then_with(|| left.pack_id.cmp(&right.pack_id))
+            });
+        }
+
+        let db_width = rows
+            .iter()
+            .map(|r| r.db_label.len())
+            .max()
+            .unwrap_or(8)
+            .max(8);
+
+        println!(
+            "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "database", "pack id", "ver", "bytes", "nodes", "collections", "index", "syncs",
+        );
+        for row in &rows {
+            let nodes_str = row.nodes.map_or_else(|| "?".to_owned(), |n| n.to_string());
+            let cols_str = row
+                .collections
+                .map_or_else(|| "?".to_owned(), |c| c.to_string());
+            let index_str = row
+                .index_bytes
+                .map_or_else(|| "?".to_owned(), fmt_megabytes);
+            println!(
+                "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+                row.db_label,
+                format!(
+                    "0x{:016x}{}",
+                    row.pack_id,
+                    if row.is_active { "*" } else { " " }
+                ),
+                row.version,
+                fmt_bytes(row.file_bytes),
+                nodes_str,
+                cols_str,
+                index_str,
+                row.syncs,
+            );
+        }
+        println!();
+        println!(
+            "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "total",
+            "",
+            "",
+            fmt_bytes(total_bytes),
+            if has_nodes {
+                total_nodes.to_string()
+            } else {
+                "?".to_owned()
+            },
+            unique_collections.len().to_string(),
+            fmt_megabytes(total_index_bytes),
+            total_syncs,
+        );
+        println!("* active pack in database");
+        println!(
+            "{} pack(s) across {} database(s)",
+            rows.len(),
+            dbs_with_packs.len()
+        );
+    }
+    Ok(())
 }
 
 fn cmd_shards_single(cli: &Cli, all: bool, layout: bool, sort: Option<&str>) -> anyhow::Result<()> {
@@ -1640,7 +2389,140 @@ fn cmd_stats_in_dir(dir: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    if cli.coalesce {
+        let valid_dirs = valid_database_dirs(cli)?;
+        if valid_dirs.len() > 1 {
+            return cmd_stats_coalesced(cli, &valid_dirs, json);
+        }
+    }
     run_multi_dir(cli, |sub_cli| cmd_stats_single(sub_cli, json))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "coalesced stats generation keeps table and json output together"
+)]
+fn cmd_stats_coalesced(cli: &Cli, valid_dirs: &[PathBuf], json: bool) -> anyhow::Result<()> {
+    struct CoalescedStats {
+        shard_type: ShardType,
+        dbs_count: usize,
+        unique_collections: usize,
+        total_index_bytes: usize,
+        total_packs: usize,
+        total_disk_bytes: u64,
+        total_syncs: u64,
+        total_writes: u64,
+        total_bytes_written: u64,
+    }
+
+    let types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+
+    let mut all_stats = Vec::new();
+
+    for shard_type in types {
+        let mut dbs_with_data = 0_usize;
+        let mut collections_set = HashSet::new();
+        let mut total_index_bytes = 0_usize;
+        let mut total_packs = 0_usize;
+        let mut total_disk_bytes = 0_u64;
+        let mut total_syncs = 0_u64;
+        let mut total_writes = 0_u64;
+        let mut total_bytes_written = 0_u64;
+
+        for db_dir in valid_dirs {
+            let Ok(layout) = DatabaseLayout::open(db_dir.clone()) else {
+                continue;
+            };
+            let Ok(pool_dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            let Ok(packs) = glob_pack_files(&pool_dir) else {
+                continue;
+            };
+            if packs.is_empty() {
+                continue;
+            }
+            dbs_with_data = dbs_with_data.saturating_add(1);
+            total_packs = total_packs.saturating_add(packs.len());
+            for (_, bytes, _) in &packs {
+                total_disk_bytes = total_disk_bytes.saturating_add(*bytes);
+            }
+            let (stats_map, _) = decode_stats_snapshot(&pool_dir);
+            for (wc, bw, sc) in stats_map.values() {
+                total_writes = total_writes.saturating_add(*wc);
+                total_bytes_written = total_bytes_written.saturating_add(*bw);
+                total_syncs = total_syncs.saturating_add(*sc);
+            }
+            for (col_id, _) in PackfileStorage::collection_directory_from_disk(&pool_dir) {
+                collections_set.insert(col_id);
+            }
+            if let Some((idx_total, _)) = index_requirements_from_disk(&pool_dir) {
+                total_index_bytes = total_index_bytes.saturating_add(idx_total);
+            }
+        }
+
+        all_stats.push(CoalescedStats {
+            shard_type,
+            dbs_count: dbs_with_data,
+            unique_collections: collections_set.len(),
+            total_index_bytes,
+            total_packs,
+            total_disk_bytes,
+            total_syncs,
+            total_writes,
+            total_bytes_written,
+        });
+    }
+
+    if json {
+        let mut fields = Vec::new();
+        for s in &all_stats {
+            let sub_fields = vec![
+                ("databases", s.dbs_count.to_string()),
+                ("collections", s.unique_collections.to_string()),
+                ("index_bytes", s.total_index_bytes.to_string()),
+                ("packs", s.total_packs.to_string()),
+                ("disk_bytes", s.total_disk_bytes.to_string()),
+                ("sync_count", s.total_syncs.to_string()),
+                ("write_count", s.total_writes.to_string()),
+                ("bytes_written", s.total_bytes_written.to_string()),
+            ];
+            fields.push((s.shard_type.as_str(), json_object(&sub_fields, "  ")));
+        }
+        println!("{}", json_object(&fields, ""));
+    } else {
+        for (index, s) in all_stats.iter().enumerate() {
+            if index != 0 {
+                println!();
+                println!();
+            }
+            print_section_header(s.shard_type);
+            println!("mtxdb stats: coalesced across {} database(s)", s.dbs_count);
+            println!(
+                "  collections        {} (unique)   index bytes {}",
+                s.unique_collections,
+                fmt_bytes(u64::try_from(s.total_index_bytes).unwrap_or(u64::MAX))
+            );
+            println!(
+                "  packs              {}            disk bytes  {}",
+                s.total_packs,
+                fmt_bytes(s.total_disk_bytes)
+            );
+            println!("  persisted (shard_stats.bin)");
+            println!(
+                "    writes           {} calls      {}",
+                s.total_writes,
+                fmt_bytes(s.total_bytes_written)
+            );
+            println!("    syncs            {}", s.total_syncs);
+        }
+    }
+    Ok(())
 }
 
 fn cmd_stats_single(cli: &Cli, json: bool) -> anyhow::Result<()> {
@@ -8592,5 +9474,114 @@ mod tests {
                 .contains("accepts only a single --dir target"),
             "{err}"
         );
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn coalesced_shards_and_collections_and_stats() {
+        let dir1 = unique_temp_dir();
+        let dir2 = unique_temp_dir();
+        let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
+        let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
+
+        let s1 =
+            PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        let col = [0x11; 16];
+        let n1 = [0x22; 16];
+        let d1 = NodeData::new(Bytes::from_static(b"payload 1"));
+        s1.put(&col, &n1, &d1).unwrap();
+        s1.sync().unwrap();
+
+        let s2 =
+            PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        let n2 = [0x33; 16];
+        let d2 = NodeData::new(Bytes::from_static(b"payload 2"));
+        s2.put(&col, &n2, &d2).unwrap();
+        s2.sync().unwrap();
+
+        let cli_shards = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: None,
+            coalesce: true,
+            command: Commands::Shards {
+                all: false,
+                layout: false,
+                sort: Some("bytes".to_owned()),
+            },
+        };
+        cmd_shards(&cli_shards, false, false, Some("bytes")).unwrap();
+
+        let cli_cols = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: None,
+            coalesce: true,
+            command: Commands::Collections {
+                all: false,
+                layout: false,
+                canonical: false,
+                sort: Some("nodes".to_owned()),
+                limit: 10,
+            },
+        };
+        cmd_collections(&cli_cols, false, false, false, Some("nodes"), 10).unwrap();
+
+        let cli_stats = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: None,
+            coalesce: true,
+            command: Commands::Stats { json: true },
+        };
+        cmd_stats(&cli_stats, true).unwrap();
+        cmd_stats(&cli_stats, false).unwrap();
+
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn coalesced_get_resolves_conflict_by_origin_server_ts() {
+        let dir1 = unique_temp_dir();
+        let dir2 = unique_temp_dir();
+        let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
+        let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
+
+        let col = [0xAA; 16];
+        let node = [0xBB; 16];
+        let hex_id = format_id(&node);
+
+        // dir1 has older ts
+        let s1 =
+            PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        let old_json = br#"{"origin_server_ts": 1000, "body": "old"}"#;
+        s1.put(&col, &node, &NodeData::new(Bytes::from_static(old_json)))
+            .unwrap();
+        s1.sync().unwrap();
+
+        // dir2 has newer ts
+        let s2 =
+            PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        let new_json = br#"{"origin_server_ts": 2000, "body": "new"}"#;
+        s2.put(&col, &node, &NodeData::new(Bytes::from_static(new_json)))
+            .unwrap();
+        s2.sync().unwrap();
+
+        let cli = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: None,
+            coalesce: true,
+            command: Commands::Get {
+                collection: None,
+                id: hex_id.clone(),
+                raw: true,
+                verbose: true,
+            },
+        };
+
+        // Coalesced get should succeed and pick the newer candidate
+        cmd_get(&cli, None, &hex_id, true, true).unwrap();
+
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 }
