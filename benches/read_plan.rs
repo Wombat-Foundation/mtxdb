@@ -174,8 +174,9 @@ impl Snapshot {
 // ── Cache eviction / scratch root ───────────────────────────────────
 
 /// Best-effort page-cache eviction via `vmtouch -e`. Only drops *clean*
-/// pages, so callers must have synced first (the bench does). No root
-/// needed; returns `false` if vmtouch is missing or fails.
+/// pages of the named files, and only while no process has them mapped —
+/// callers must have dropped the store first. No root needed; returns
+/// `false` if vmtouch is missing or fails.
 fn evict_dir(dir: &Path) -> bool {
     std::process::Command::new("vmtouch")
         .arg("-e")
@@ -193,6 +194,97 @@ fn vmtouch_on_path() -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
+}
+
+/// Filesystem type of the mount holding `path`, from `/proc/mounts` (the
+/// longest mount point that prefixes `path`). `None` if `/proc/mounts`
+/// is unreadable or no entry matches (non-Linux).
+fn mount_fstype(path: &Path) -> Option<String> {
+    let canonical = path.canonicalize().ok()?;
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        // Fields are space-separated; the mount point (field 2) escapes
+        // spaces as `\040`, which canonical paths won't contain here.
+        let mut fields = line.split(' ');
+        let _dev = fields.next()?;
+        let mount_point = fields.next()?;
+        let fstype = fields.next()?;
+        let mount_path = Path::new(mount_point);
+        if canonical.starts_with(mount_path) {
+            let depth = mount_path.components().count();
+            let deeper_or_equal = best.as_ref().map_or(true, |(d, _)| depth >= *d);
+            if deeper_or_equal {
+                best = Some((depth, fstype.to_owned()));
+            }
+        }
+    }
+    best.map(|(_, fstype)| fstype)
+}
+
+/// True when `path` lives on an in-memory filesystem (`tmpfs`, `ramfs`,
+/// `devtmpfs`), where "cold reads" are a contradiction: the data never
+/// leaves RAM and neither `drop_caches` nor `vmtouch` can evict it.
+fn is_ram_backed(path: &Path) -> bool {
+    matches!(
+        mount_fstype(path).as_deref(),
+        Some("tmpfs" | "ramfs" | "devtmpfs")
+    )
+}
+
+/// Run the root page-cache drop directly, rather than asking the operator
+/// to paste it. Returns `Ok(())` only if the write succeeded (i.e. the
+/// bench is running as root); a permission error comes back as `Err` so the
+/// caller can tell "ran and failed" from "not attempted".
+fn drop_page_caches() -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open("/proc/sys/vm/drop_caches")?;
+    file.write_all(b"3")?;
+    file.flush()
+}
+
+/// Whether this process can drop the page cache itself (i.e. is root and
+/// `/proc/sys/vm/drop_caches` is writable).
+fn root_drop_available() -> bool {
+    fs::OpenOptions::new()
+        .write(true)
+        .open("/proc/sys/vm/drop_caches")
+        .is_ok()
+}
+
+/// How each pass evicts the page cache before its read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eviction {
+    /// `drop_page_caches()` in-process (bench is root).
+    RootDrop,
+    /// `vmtouch -e <dir>`; only clean, unmapped pages.
+    Vmtouch,
+    /// Pause and let the operator run `drop_caches` by hand.
+    Manual,
+}
+
+/// Pick the strongest available eviction strategy, in order of reliability.
+fn select_eviction(manual_drop: bool) -> Eviction {
+    if manual_drop {
+        Eviction::Manual
+    } else if root_drop_available() {
+        Eviction::RootDrop
+    } else {
+        Eviction::Vmtouch
+    }
+}
+
+/// Wait for the operator to press Enter, after printing the exact command
+/// so it can be pasted verbatim.
+fn wait_for_manual_drop(label: &str) {
+    println!();
+    println!("  ▶ drop the page cache now, then press Enter to run `{label}`:");
+    println!("      sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'");
+    print!("  waiting… ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
 }
 
 /// PID-suffixed scratch root, so overlapping bench runs don't clobber each
@@ -270,40 +362,55 @@ struct Row {
     skipped: u64,
 }
 
+/// Median of a set of samples, rounded down. Empty input yields
+/// `Duration::ZERO`; callers only reach here with a non-empty pass count.
+fn median_duration(samples: &[Duration]) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
 fn fmt_opt(value: Option<u64>) -> String {
     value.map_or_else(|| "n/a".to_owned(), |v| v.to_string())
 }
 
-/// Wait for the operator to drop the page cache, when manual mode is on.
-/// Prints the exact command so it can be pasted verbatim.
-fn wait_for_manual_drop(label: &str) {
-    println!();
-    println!("  ▶ drop the page cache now, then press Enter to run `{label}`:");
-    println!("      sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'");
-    print!("  waiting… ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).ok();
-}
-
-fn measure(
-    store: &PackfileStorage,
+/// One timed read, with the store reopened cold for each pass.
+///
+/// The store must be **dropped** before the cache is dropped and reopened
+/// after: while it is alive its shards are mmapped, and both
+/// `drop_caches` and `vmtouch -e` skip pages a live process has mapped, so
+/// an in-place eviction leaves them resident and silently measures a warm
+/// cache. A fresh `open_read_only` also has no in-process node cache, so
+/// every id goes through index lookup and mmap decode.
+fn measure_once(
     dir: &Path,
     policy_name: &'static str,
     target_name: &'static str,
     targets: &[NodeId],
     policy: ReadPlanPolicy,
-    manual_drop: bool,
+    eviction: Eviction,
 ) -> Row {
-    if manual_drop {
+    if eviction == Eviction::Manual {
         wait_for_manual_drop(&format!("{policy_name} / {target_name}"));
     }
 
+    // Step 1: evict while nothing has the shards mapped. `EVICTED` records
+    // whether an eviction command actually ran and reported success — not
+    // whether the pages left, which neither syscall tells us.
+    let evicted = match eviction {
+        Eviction::RootDrop => drop_page_caches().is_ok(),
+        Eviction::Vmtouch => evict_dir(dir),
+        // A human ran `drop_caches`; we cannot observe the result.
+        Eviction::Manual => false,
+    };
+
+    // Step 2: reopen fresh, apply the policy, and time a mmap-backed read.
+    let store = PackfileStorage::open_read_only(dir.to_path_buf()).unwrap();
+    store.set_stats_enabled(true);
     store.set_read_plan_policy(policy);
-    // Force decode from mmap, not the in-process node cache, so both
-    // policies hit the same path.
-    store.collection_cache(&ROOM).clear();
-    let evicted = if manual_drop { true } else { evict_dir(dir) };
 
     let stats_before = store.stats();
     let io_before = Snapshot::capture();
@@ -349,9 +456,33 @@ fn measure(
     }
 }
 
+/// The latest of `passes` reads of one `(policy, target)` pair, with the
+/// per-pass elapsed times reduced to a median and the counters taken from
+/// the last pass (they are per-read totals, not accumulated).
+fn measure(
+    dir: &Path,
+    policy_name: &'static str,
+    target_name: &'static str,
+    targets: &[NodeId],
+    policy: ReadPlanPolicy,
+    eviction: Eviction,
+    passes: usize,
+) -> Row {
+    let mut elapsed_samples = Vec::with_capacity(passes);
+    let mut last = None;
+    for _ in 0..passes {
+        let row = measure_once(dir, policy_name, target_name, targets, policy, eviction);
+        elapsed_samples.push(row.elapsed);
+        last = Some(row);
+    }
+    let mut row = last.expect("at least one pass");
+    row.elapsed = median_duration(&elapsed_samples);
+    row
+}
+
 // ── Scenario ────────────────────────────────────────────────────────
 
-fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: bool) {
+fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: bool, passes: usize) {
     let target_count = target_count.min(records);
     let dir = bench_root();
     let store = PackfileStorage::open(dir.clone()).unwrap();
@@ -366,13 +497,18 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     println!("  records:      {records}");
     println!("  targets/set:  {target_count}");
     println!("  payload:      {payload_len} bytes");
+    println!("  passes:       {passes} (median reported)");
     println!("  scratch dir:  {}", dir.display());
+    let fstype = mount_fstype(&dir).unwrap_or_else(|| "unknown".to_owned());
+    println!("  filesystem:   {fstype}");
     if manual_drop {
         println!("  cache:        MANUAL drop between every read");
+    } else if root_drop_available() {
+        println!("  cache:        in-process drop_page_caches() between reads");
     } else if vmtouch_on_path() {
-        println!("  cache:        vmtouch -e between reads (clean pages only)");
+        println!("  cache:        vmtouch -e between reads (store closed first)");
     } else {
-        println!("  cache:        WARM — vmtouch not found; numbers are not cold");
+        println!("  cache:        WARM — no eviction available; numbers are not cold");
     }
 
     // ── Ingest ──
@@ -415,9 +551,13 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     }
     let random: Vec<NodeId> = random_idx.into_iter().map(node_id).collect();
 
+    // From here on the measured path needs a store it can close and
+    // reopen, so release the ingest writer first.
+    drop(store);
+
     // ── Measure ──
     println!();
-    println!("  [2/3] measuring (off vs hdd, dense vs random)…");
+    println!("  [2/3] measuring (off vs hdd, dense vs random, {passes} passes, median)…");
     let policy_hdd = hdd_policy();
     println!(
         "        hdd: gap={} B extent={} B min_batch={}",
@@ -431,18 +571,11 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         ("hdd", policy_hdd, "random", &random),
     ];
 
+    let eviction = select_eviction(manual_drop);
     let rows: Vec<Row> = combos
         .into_iter()
         .map(|(name, policy, target_name, targets)| {
-            measure(
-                &store,
-                &dir,
-                name,
-                target_name,
-                targets,
-                policy,
-                manual_drop,
-            )
+            measure(&dir, name, target_name, targets, policy, eviction, passes)
         })
         .collect();
 
@@ -472,8 +605,8 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     for r in &rows {
         println!(
             "bench: read_plan POLICY={} TARGET={} FOUND={}/{} RECORDS={} TARGETS={} \
-             PAYLOAD={} ELAPSED_US={:.1} MAJFLT={} MINFLT={} SYSCALLS={} DISK_READ_BYTES={} \
-             EXTENTS={} PREFETCH_BYTES={} SKIPPED={} EVICTED={}",
+             PAYLOAD={} PASSES={} ELAPSED_US={:.1} MAJFLT={} MINFLT={} SYSCALLS={} \
+             DISK_READ_BYTES={} EXTENTS={} PREFETCH_BYTES={} SKIPPED={} EVICTED={}",
             r.policy,
             r.target,
             r.found,
@@ -481,6 +614,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
             records,
             target_count,
             payload_len,
+            passes,
             r.elapsed.as_secs_f64() * 1e6,
             fmt_opt(r.major_faults),
             fmt_opt(r.minor_faults),
@@ -493,38 +627,43 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         );
     }
 
-    if let Some(off) = rows
-        .iter()
-        .find(|r| r.policy == "off" && r.target == "dense")
-    {
-        if let Some(hdd) = rows
-            .iter()
-            .find(|r| r.policy == "hdd" && r.target == "dense")
-        {
-            let speedup = off.elapsed.as_secs_f64() / hdd.elapsed.as_secs_f64();
-            println!("bench: read_plan_ratio TARGET=dense HDD_VS_OFF={speedup:.3}");
+    // A ratio is only evidence if the baseline read actually left RAM.
+    // `read_bytes` (block layer) is the trustworthy signal, not major
+    // faults: once a sequential pattern triggers readahead, later pages
+    // arrive with no demand fault at all, so `majflt` stays near zero while
+    // real device I/O happens. Require device bytes on every `off` row;
+    // treat a zero `majflt` as a note, not a failure.
+    let off_rows: Vec<&Row> = rows.iter().filter(|r| r.policy == "off").collect();
+    let off_cold =
+        !off_rows.is_empty() && off_rows.iter().all(|r| r.disk_read_bytes.unwrap_or(0) > 0);
+    if off_cold {
+        for target in ["dense", "random"] {
+            let off = rows
+                .iter()
+                .find(|r| r.policy == "off" && r.target == target);
+            let hdd = rows
+                .iter()
+                .find(|r| r.policy == "hdd" && r.target == target);
+            if let (Some(off), Some(hdd)) = (off, hdd) {
+                let speedup = off.elapsed.as_secs_f64() / hdd.elapsed.as_secs_f64();
+                println!("bench: read_plan_ratio TARGET={target} HDD_VS_OFF={speedup:.3}");
+            }
         }
-    }
-    if let Some(off) = rows
-        .iter()
-        .find(|r| r.policy == "off" && r.target == "random")
-    {
-        if let Some(hdd) = rows
-            .iter()
-            .find(|r| r.policy == "hdd" && r.target == "random")
-        {
-            let speedup = off.elapsed.as_secs_f64() / hdd.elapsed.as_secs_f64();
-            println!("bench: read_plan_ratio TARGET=random HDD_VS_OFF={speedup:.3}");
+        if off_rows.iter().all(|r| r.major_faults.unwrap_or(0) == 0) {
+            println!();
+            println!("  note: major faults are 0 even though device bytes are non-zero —");
+            println!("        readahead is serving the pages, which is expected here.");
         }
-    }
-
-    if rows.iter().any(|r| !r.evicted) && !manual_drop {
+    } else {
         println!();
-        println!("  NOTE: some reads ran against a warm cache. For cold numbers,");
-        println!("        install vmtouch or rerun with MTXDB_READ_PLAN_MANUAL_DROP=1.");
+        println!("  ✗ COLD READ NOT ACHIEVED — ratios suppressed.");
+        println!("    The `off` rows show no device read bytes, so both policies read");
+        println!("    from page cache and any difference is noise.");
+        println!("    Point MTXDB_BENCH_ROOT at a real (non-tmpfs) disk and run as");
+        println!("    root so drop_page_caches() can evict, or use vmtouch with the");
+        println!("    store closed (already done here) and no live mappings.");
     }
 
-    drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -532,13 +671,33 @@ fn main() {
     let records = env_usize("MTXDB_READ_PLAN_RECORDS", 200_000);
     let target_count = env_usize("MTXDB_READ_PLAN_TARGETS", 100_000);
     let payload_len = env_usize("MTXDB_READ_PLAN_PAYLOAD", 1024);
+    let passes = env_usize("MTXDB_READ_PLAN_PASSES", 3).max(1);
     let manual_drop = std::env::var_os("MTXDB_READ_PLAN_MANUAL_DROP").is_some();
 
-    if !manual_drop && !vmtouch_on_path() {
-        eprintln!("⚠ WARNING: `vmtouch` not found on PATH — reads will be WARM.");
-        eprintln!("  For a cold cache, rerun with MTXDB_READ_PLAN_MANUAL_DROP=1");
-        eprintln!("  and drop the page cache between reads.");
+    // Refuse a RAM-backed scratch dir: on tmpfs the data never leaves RAM,
+    // and neither drop_caches nor vmtouch can evict it — every number would
+    // be warm no matter how the rest is wired.
+    let root = bench_root();
+    if is_ram_backed(&root) {
+        eprintln!("✗ REFUSING TO RUN: scratch dir is on an in-memory filesystem.");
+        eprintln!("    dir:   {}", root.display());
+        eprintln!(
+            "    fstype: {}",
+            mount_fstype(&root).unwrap_or_else(|| "unknown".to_owned())
+        );
+        eprintln!("  A cold read is impossible there. Point MTXDB_BENCH_ROOT at a");
+        eprintln!("  real disk, e.g.:");
+        eprintln!("    MTXDB_BENCH_ROOT=/run/media/shane/shane4tb-ent/bench-scratch \\");
+        eprintln!("      cargo bench --bench read_plan");
+        let _ = fs::remove_dir_all(&root);
+        std::process::exit(1);
     }
 
-    run(records, target_count, payload_len, manual_drop);
+    if !manual_drop && !root_drop_available() && !vmtouch_on_path() {
+        eprintln!("⚠ WARNING: no eviction available — reads will be WARM.");
+        eprintln!("  Run as root (for drop_page_caches), install vmtouch, or set");
+        eprintln!("  MTXDB_READ_PLAN_MANUAL_DROP=1.");
+    }
+
+    run(records, target_count, payload_len, manual_drop, passes);
 }
