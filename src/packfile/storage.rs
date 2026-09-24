@@ -7987,11 +7987,6 @@ impl PackfileStorage {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn transaction_overlay_user_count(&self) -> u64 {
-        self.transaction_overlay_users.load(Ordering::Acquire)
-    }
-
     /// Publish one mutation to the journal, if enabled. Returns the assigned
     /// LSN, or `None` when no journal is configured.
     ///

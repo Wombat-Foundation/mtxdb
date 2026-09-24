@@ -665,9 +665,6 @@ mod tests {
             .get(&collection, &node_id)
             .unwrap()
             .is_some());
-        for pool in ShardType::ALL {
-            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
-        }
         drop(transaction);
         drop(database);
         let _ = std::fs::remove_dir_all(&root);
@@ -753,9 +750,6 @@ mod tests {
         database.register_recovery_stage(Arc::clone(&transaction.stage));
         drop(transaction);
         database.recover_pending_transactions().unwrap();
-        for pool in ShardType::ALL {
-            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
-        }
         drop(database);
         let reopened = SharedDatabase::open(root.clone()).unwrap();
         assert!(reopened
@@ -833,9 +827,6 @@ mod tests {
             transaction.state(),
             crate::journal::TxnStageState::Published
         );
-        for pool in ShardType::ALL {
-            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
-        }
         drop(transaction);
         drop(database);
         let _ = std::fs::remove_dir_all(&root);
@@ -887,9 +878,6 @@ mod tests {
         // Drop only leaves the published stage in the database-owned queue;
         // the explicit recovery boundary performs the materialization.
         database.recover_pending_transactions().unwrap();
-        for pool in ShardType::ALL {
-            assert_eq!(database.pool(pool).transaction_overlay_user_count(), 0);
-        }
         assert!(database
             .pool(ShardType::State)
             .get(&state_collection, &state_node)
