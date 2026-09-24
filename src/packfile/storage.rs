@@ -429,7 +429,12 @@ impl SyncTotals {
 /// Plain, copyable lifetime totals of per-phase sync wall time — the cumulative
 /// counterpart to [`SyncTimings`]. `calls` counts every sync that accumulated,
 /// so phase averages are `phase / calls` and shares are `phase / total`.
+///
+/// Marked `#[non_exhaustive]` so new cumulative phases can be added without
+/// breaking downstream source builds. Read fields by name; construct test
+/// fixtures with [`SyncTotalsSnapshot::default`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SyncTotalsSnapshot {
     /// Number of syncs folded into these totals.
     pub calls: u64,
