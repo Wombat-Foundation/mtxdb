@@ -854,6 +854,22 @@ pub struct ReadPlanPolicy {
     /// HDD, and neutral on dense HDD, with no device-specific tuning. Extent
     /// planning ([`Self::prefetch`]) only beats it on sparse rotational media.
     /// `false` on the presets that plan.
+    ///
+    /// # Warm and untested cases
+    ///
+    /// A warm-cache run showed no regression from suppression (random vs
+    /// independent reads was 0.94-1.20× at 1-5 ms, i.e. within the spread), so
+    /// the cold win does not reverse when data is resident. But only sparse
+    /// *point* reads were tested: no dense case, and — critically — **no
+    /// sequential scan or compaction**. Those walk the pack in order, and
+    /// suppression there would remove the readahead that makes them fast.
+    ///
+    /// `MADV_RANDOM` is persistent mapping state, so this setting affects
+    /// *every* later read on the same mapping, not just the `get_many` that
+    /// set it; nothing here resets it. Do not enable it on a store that also
+    /// does concurrent scans or compaction until that path is measured (or the
+    /// advice is made path-local). Measurements are from one rotational HDD and
+    /// one cheap SATA SSD; `NVMe` and other drives are untested.
     pub random_advice: bool,
 }
 
