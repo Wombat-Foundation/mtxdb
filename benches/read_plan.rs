@@ -269,6 +269,10 @@ enum Eviction {
     Vmtouch,
     /// Pause and let the operator run `drop_caches` by hand.
     Manual,
+    /// Do not evict: measure a warm cache. This is the regression check for a
+    /// policy that suppresses readahead (`MADV_RANDOM`) — it may hurt when the
+    /// data is already resident, which a cold run cannot show.
+    Warm,
 }
 
 /// What the eviction step did for one pass, reported verbatim in the
@@ -284,6 +288,8 @@ enum EvictionStatus {
     Requested,
     /// No eviction was available (missing tool / would have failed).
     Unavailable,
+    /// Eviction was deliberately skipped (warm-cache run).
+    Warm,
 }
 
 impl EvictionStatus {
@@ -292,13 +298,17 @@ impl EvictionStatus {
             Self::Ran => "true",
             Self::Requested => "requested",
             Self::Unavailable => "false",
+            Self::Warm => "warm",
         }
     }
 }
 
 /// Pick the strongest available eviction strategy, in order of reliability.
-fn select_eviction(manual_drop: bool) -> Eviction {
-    if manual_drop {
+/// `warm` wins when set: the run wants a resident cache, not a cold one.
+fn select_eviction(manual_drop: bool, warm: bool) -> Eviction {
+    if warm {
+        Eviction::Warm
+    } else if manual_drop {
         Eviction::Manual
     } else if root_drop_available() {
         Eviction::RootDrop
@@ -477,6 +487,15 @@ fn max_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
     cells.fold(header.len(), |width, cell| width.max(cell.len()))
 }
 
+/// Look up one row's median elapsed, by policy and target set, as seconds.
+fn policy_elapsed(rows: &[Row]) -> impl Fn(&str, &str) -> Option<f64> + '_ {
+    move |policy, target| {
+        rows.iter()
+            .find(|r| r.policy == policy && r.target == target)
+            .map(|r| r.elapsed.as_secs_f64())
+    }
+}
+
 /// One timed read, with the store reopened cold for each pass.
 ///
 /// The store must be **dropped** before the cache is dropped and reopened
@@ -517,6 +536,8 @@ fn measure_once(
         }
         // A human ran `drop_caches`; we cannot observe the result.
         Eviction::Manual => EvictionStatus::Requested,
+        // Nothing was evicted on purpose; the read is warm by design.
+        Eviction::Warm => EvictionStatus::Warm,
     };
 
     // Step 2: reopen fresh, apply the policy, and time a mmap-backed read.
@@ -627,7 +648,14 @@ fn measure(
 
 // ── Scenario ────────────────────────────────────────────────────────
 
-fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: bool, passes: usize) {
+fn run(
+    records: usize,
+    target_count: usize,
+    payload_len: usize,
+    manual_drop: bool,
+    warm: bool,
+    passes: usize,
+) {
     let target_count = target_count.min(records);
     let dir = bench_root();
     let store = PackfileStorage::open(dir.clone()).unwrap();
@@ -646,7 +674,9 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     println!("  scratch dir:  {}", dir.display());
     let fstype = mount_fstype(&dir).unwrap_or_else(|| "unknown".to_owned());
     println!("  filesystem:   {fstype}");
-    if manual_drop {
+    if warm {
+        println!("  cache:        WARM by request — no eviction; cold guard/ratios suppressed");
+    } else if manual_drop {
         println!("  cache:        MANUAL drop between every read");
     } else if root_drop_available() {
         println!("  cache:        in-process drop_page_caches() between reads");
@@ -768,7 +798,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     combos.push(("random", policy_random, "sparse", &sparse));
     combos.push(("prefetch", policy_prefetch, "sparse", &sparse));
 
-    let eviction = select_eviction(manual_drop);
+    let eviction = select_eviction(manual_drop, warm);
     let rows: Vec<Row> = measure(&dir, &combos, eviction, passes);
 
     // ── Report ──
@@ -899,7 +929,31 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         Some(plain_bytes as f64 / store_bytes as f64)
     };
     let plain_cold = plain_sparse.is_some() && plain_bytes >= floor;
-    if plain_cold {
+    if warm {
+        // Warm run: the cold guard does not apply (a resident read moves
+        // ~nothing off the device and would trip it). This is the regression
+        // check for a readahead-suppressing policy — do `random`/`prefetch`
+        // stay at least as fast as `plain` when the pages are already in
+        // cache? Print the ratios unconditionally; there is no cold claim to
+        // gate on.
+        let elapsed = policy_elapsed(&rows);
+        for target in ["dense", "sparse"] {
+            if let (Some(plain), Some(random), Some(prefetch)) = (
+                elapsed("plain", target),
+                elapsed("random", target),
+                elapsed("prefetch", target),
+            ) {
+                println!();
+                println!(
+                    "bench: read_plan_warm_ratio TARGET={target} RANDOM_VS_PLAIN={:.3} \
+                     PREFETCH_VS_PLAIN={:.3} PREFETCH_VS_RANDOM={:.3}",
+                    plain / random,
+                    plain / prefetch,
+                    random / prefetch,
+                );
+            }
+        }
+    } else if plain_cold {
         if let Some(fraction) = fraction {
             println!();
             println!(
@@ -914,11 +968,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
             println!("    scan amplification rather than a clean single scan; treat the");
             println!("    ratio with caution.");
         }
-        let elapsed = |policy: &str, target: &str| {
-            rows.iter()
-                .find(|r| r.policy == policy && r.target == target)
-                .map(|r| r.elapsed.as_secs_f64())
-        };
+        let elapsed = policy_elapsed(&rows);
         for target in ["dense", "sparse"] {
             if let (Some(plain), Some(random), Some(prefetch)) = (
                 elapsed("plain", target),
@@ -962,6 +1012,9 @@ fn main() {
     let payload_len = env_usize("MTXDB_READ_PLAN_PAYLOAD", 1024);
     let passes = env_usize("MTXDB_READ_PLAN_PASSES", 3).max(1);
     let manual_drop = std::env::var_os("MTXDB_READ_PLAN_MANUAL_DROP").is_some();
+    let warm = std::env::var("MTXDB_READ_PLAN_WARM")
+        .map(|v| v != "0")
+        .unwrap_or(false);
 
     // Refuse a RAM-backed scratch dir: on tmpfs the data never leaves RAM,
     // and neither drop_caches nor vmtouch can evict it — every number would
@@ -982,11 +1035,18 @@ fn main() {
         std::process::exit(1);
     }
 
-    if !manual_drop && !root_drop_available() && !vmtouch_on_path() {
+    if !warm && !manual_drop && !root_drop_available() && !vmtouch_on_path() {
         eprintln!("⚠ WARNING: no eviction available — reads will be WARM.");
         eprintln!("  Run as root (for drop_page_caches), install vmtouch, or set");
         eprintln!("  MTXDB_READ_PLAN_MANUAL_DROP=1.");
     }
 
-    run(records, target_count, payload_len, manual_drop, passes);
+    run(
+        records,
+        target_count,
+        payload_len,
+        manual_drop,
+        warm,
+        passes,
+    );
 }
