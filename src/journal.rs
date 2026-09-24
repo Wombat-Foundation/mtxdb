@@ -1161,7 +1161,24 @@ impl JournalCoordinator {
     /// poisoned, or the append fails. A partial append poisons the underlying
     /// journal; subsequent publication is rejected until reopen/recovery.
     pub fn append_pending(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.append_pending_inner(None, mutations)
+        self.append_pending_inner(None, mutations)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot append an empty transaction group",
+            )
+        })
+    }
+
+    /// Append queued legacy mutations as a complete, read-committed group
+    /// without adding staged mutations or fsyncing. A later `sync_through`
+    /// makes the group durable. Returns `Ok(None)` if nothing is queued.
+    ///
+    /// # Errors
+    /// Returns an error if queued LSNs are inconsistent, the journal is
+    /// poisoned, or the append fails. A partial append poisons the underlying
+    /// journal; subsequent publication is rejected until reopen/recovery.
+    pub fn publish_pending(&self) -> io::Result<Option<CommitReceipt>> {
+        self.append_pending_inner(None, &[])
     }
 
     /// Like [`Self::append_pending`], tagging every staged mutation with
@@ -1175,20 +1192,20 @@ impl JournalCoordinator {
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.append_pending_inner(Some(pool), mutations)
+        self.append_pending_inner(Some(pool), mutations)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot append an empty transaction group",
+                )
+            })
     }
 
     fn append_pending_inner(
         &self,
         staged_pool: Option<ShardType>,
         mutations: &[Mutation],
-    ) -> io::Result<CommitReceipt> {
-        if mutations.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot append an empty transaction group",
-            ));
-        }
+    ) -> io::Result<Option<CommitReceipt>> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -1202,7 +1219,13 @@ impl JournalCoordinator {
         }
         // Hold the queue lock through the append so a concurrent legacy
         // publisher cannot assign an LSN between the queued and staged parts.
+        // Emptiness is decided under this lock too: a concurrent `sync_through`
+        // drains the queue only while holding the journal lock, so the check
+        // cannot race with a drain.
         let mut pending = self.pending.lock();
+        if mutations.is_empty() && pending.is_empty() {
+            return Ok(None);
+        }
         let mut group_mutations: Vec<(Option<ShardType>, Mutation)> =
             Vec::with_capacity(pending.len().saturating_add(mutations.len()));
         for (offset, (lsn, pool, mutation)) in pending.iter().enumerate() {
@@ -1273,7 +1296,7 @@ impl JournalCoordinator {
                 .lock()
                 .push((receipt.last_lsn, extents));
         }
-        Ok(receipt)
+        Ok(Some(receipt))
     }
 
     /// Capture the current boundary and wait for a durable group covering it.
