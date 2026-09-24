@@ -74,7 +74,12 @@ fn mix(x: u64) -> u64 {
 /// Layout: `[16-bit tag | 16-bit slot | 32-bit offset]` packed into a `u64`.
 ///
 /// - **tag** (high 16 bits): truncated fingerprint for fast rejection.
-/// - **`slot`** (next 16 bits): which shard file this record lives in.
+/// - **`slot`** (next 16 bits): which shard file this record lives in. The
+///   field is a full 16 bits, but live shard IDs only ever reach
+///   `crate::shard::MAX_SHARDS` (4096), so the top 4 bits of this field are
+///   reserved — `IndexEntry::new` rejects a slot that is not a valid live ID.
+///   They are *not* reclaimed as extra offset bits: `slot()` still decodes
+///   all 16, and widening the offset would change the on-disk encoding.
 /// - **offset** (low 32 bits): byte offset within the shard, stored as
 ///   `offset + 1` so that the all-zeros encoding is reserved as the empty
 ///   sentinel. Actual offset 0 is stored as 1, and `offset()` subtracts 1
@@ -105,10 +110,16 @@ impl IndexEntry {
     /// stored as 1 in the entry.
     ///
     /// # Panics
-    /// Panics if `tag` exceeds 16 bits or `offset` exceeds [`Self::MAX_OFFSET`].
+    /// Panics if `tag` exceeds 16 bits, `slot` is not a valid live shard ID
+    /// (`>= crate::shard::MAX_SHARDS`), or `offset` exceeds
+    /// [`Self::MAX_OFFSET`].
     #[must_use]
     pub fn new(tag: u32, slot: u16, offset: u64) -> Self {
         assert!(tag <= 0xFFFF, "tag must fit in 16 bits");
+        assert!(
+            usize::from(slot) < crate::shard::MAX_SHARDS,
+            "slot {slot} is not a valid live shard ID (must be < MAX_SHARDS)"
+        );
         assert!(
             offset <= Self::MAX_OFFSET,
             "offset must fit in 32 bits minus 1 (reserved for empty sentinel)"
@@ -1324,6 +1335,20 @@ mod tests {
         assert_eq!(entry.slot(), 42);
         assert_eq!(entry.offset(), 0x0FFF_FFF0);
         assert!(!entry.is_empty());
+    }
+
+    #[test]
+    fn new_accepts_the_highest_live_slot_and_rejects_the_next() {
+        let max_live = u16::try_from(crate::shard::MAX_SHARDS - 1).unwrap();
+        let entry = IndexEntry::new(0, max_live, 0);
+        assert_eq!(entry.slot(), max_live);
+
+        let out_of_range = u16::try_from(crate::shard::MAX_SHARDS).unwrap();
+        let result = std::panic::catch_unwind(|| IndexEntry::new(0, out_of_range, 0));
+        assert!(
+            result.is_err(),
+            "a slot at MAX_SHARDS is not a live shard and must be rejected"
+        );
     }
 
     #[test]
