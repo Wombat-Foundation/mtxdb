@@ -5555,11 +5555,13 @@ fn cmd_import(
     let separate_state_store = if state_dir == pool_dir {
         None
     } else {
-        Some(
-            PackfileStorage::open(state_dir)
+        Some({
+            let state_store = PackfileStorage::open(state_dir)
                 .context("failed to open the state pool")?
-                .with_append_policy(mtxdb::shard::AppendPolicy::buffered()),
-        )
+                .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
+            state_store.set_read_plan_policy(cli.read_plan);
+            state_store
+        })
     };
     let state_store = separate_state_store.as_ref().unwrap_or(&store);
     let mut failures = 0_usize;
@@ -6096,6 +6098,10 @@ fn cmd_import_file(
             fs::create_dir_all(&auth_chain_dir)?;
             let auth_store =
                 PackfileStorage::open(auth_chain_dir).context("opening auth-chain store")?;
+            // This open bypasses `open_store`, so carry the caller's
+            // `--read-plan` choice over from the event store instead of
+            // silently running the default.
+            auth_store.set_read_plan_policy(store.read_plan_policy());
             let mut auth_count = 0u64;
             let mut auth_skipped = 0u64;
             // Auth-chain events may span multiple rooms (collections). Group
