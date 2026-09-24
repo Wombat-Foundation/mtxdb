@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
@@ -29,6 +30,13 @@ use crate::template::{CollectionMetadata, FrameIdPolicy, COLLECTION_METADATA_REC
 mod read_journal;
 #[cfg(feature = "multi-reader")]
 use read_journal::ReadJournal;
+
+thread_local! {
+    /// Suppresses journal publication while a committed transaction applies
+    /// its already-staged mutations to the live pack/index state. The outer
+    /// transaction publishes the complete batch exactly once afterward.
+    static JOURNAL_SUPPRESSED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Callback that rewrites a node's child references given resolved child data,
 /// used to inline already-cached children in place of lazy hash pointers.
@@ -7915,6 +7923,9 @@ impl PackfileStorage {
         mutation: impl FnOnce() -> JournalMutation,
     ) -> Result<Option<u64>, StorageError> {
         let started = std::time::Instant::now();
+        if JOURNAL_SUPPRESSED.with(Cell::get) {
+            return Ok(None);
+        }
         let Some(journal) = self.journal() else {
             self.record_published_mutation(started);
             return Ok(None);
@@ -7937,6 +7948,34 @@ impl PackfileStorage {
             self.record_published_mutation(started);
         }
         result
+    }
+
+    /// Apply a mutation staged by a database transaction without publishing
+    /// it to the legacy per-write journal queue. The transaction coordinator
+    /// publishes the complete batch after every pool has applied successfully.
+    pub(crate) fn apply_transaction_mutation(
+        &self,
+        mutation: &JournalMutation,
+    ) -> Result<(), StorageError> {
+        JOURNAL_SUPPRESSED.with(|suppressed| {
+            let previous = suppressed.replace(true);
+            let result = match mutation {
+                JournalMutation::Put {
+                    collection_id,
+                    node_id,
+                    payload,
+                } => self.put(
+                    collection_id,
+                    node_id,
+                    &NodeData::new(bytes::Bytes::from(payload.clone())),
+                ),
+                JournalMutation::DeleteCollection { collection_id } => {
+                    self.delete_collection(collection_id)
+                }
+            };
+            suppressed.set(previous);
+            result
+        })
     }
 
     fn record_published_mutation(&self, started: std::time::Instant) {

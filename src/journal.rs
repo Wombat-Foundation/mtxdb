@@ -147,6 +147,12 @@ pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 pub enum TxnStageState {
     /// The SQL transaction attempt is active and may add mutations.
     Active,
+    /// Pack/index mutations have been applied and journal publication may be
+    /// retried without applying them again.
+    Applied,
+    /// The journal group is published; pack/index application is still
+    /// pending or retrying.
+    JournalPublished,
     /// The SQL attempt failed; retained callbacks must not publish its data.
     Discarded,
     /// Every per-pool group was appended successfully.
@@ -162,21 +168,18 @@ struct TxnStageData {
     appended: [bool; 3],
 }
 
-/// Transaction-local **journal** publication buffer -- not a storage
-/// transaction.
+/// Transaction-local mutation buffer used by [`crate::database::DatabaseTransaction`].
 ///
 /// Journal entries for a SQL transaction are buffered here and published from
 /// its post-commit callback. Call [`Self::discard`] from the transaction's
 /// error callback; that is required because Synapse retains after-callbacks
 /// across retry attempts.
 ///
-/// # Not a rollback
+/// # Storage boundary
 ///
-/// [`Self::discard`] drops only the buffered journal mutations. It does not
-/// touch packs or the live index, because this buffer never writes them; the
-/// deferred-publication redesign (prepare/commit) will route the pack/index
-/// mutation through this buffer's commit path. Until that lands, no
-/// production caller stages through here.
+/// [`Self::discard`] drops only buffered mutations. The database transaction
+/// applies them to packs and indexes only after its caller declares commit,
+/// then publishes the resulting shared-WAL group.
 pub struct TxnStage {
     state: std::sync::atomic::AtomicU8,
     data: Mutex<TxnStageData>,
@@ -192,6 +195,8 @@ impl TxnStage {
     const ACTIVE: u8 = 0;
     const DISCARDED: u8 = 1;
     const PUBLISHED: u8 = 2;
+    const APPLIED: u8 = 3;
+    const JOURNAL_PUBLISHED: u8 = 4;
 
     /// Create an empty stage for one transaction attempt.
     #[must_use]
@@ -212,6 +217,8 @@ impl TxnStage {
         match self.state.load(Ordering::Acquire) {
             Self::DISCARDED => TxnStageState::Discarded,
             Self::PUBLISHED => TxnStageState::Published,
+            Self::APPLIED => TxnStageState::Applied,
+            Self::JOURNAL_PUBLISHED => TxnStageState::JournalPublished,
             _ => TxnStageState::Active,
         }
     }
@@ -226,6 +233,51 @@ impl TxnStage {
             data.pools.iter_mut().for_each(Vec::clear);
             data.bytes = 0;
             self.state.store(Self::DISCARDED, Ordering::Release);
+        }
+    }
+
+    /// Snapshot staged mutations for application to storage at commit time.
+    pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; 3] {
+        self.data.lock().pools.clone()
+    }
+
+    /// Mark pack/index application complete so journal publication can be
+    /// retried without applying the storage mutations twice.
+    pub(crate) fn mark_applied(&self) -> io::Result<()> {
+        let state = self.state.load(Ordering::Acquire);
+        match state {
+            Self::ACTIVE | Self::JOURNAL_PUBLISHED => {
+                self.state.store(Self::APPLIED, Ordering::Release);
+                Ok(())
+            }
+            Self::APPLIED | Self::PUBLISHED => Ok(()),
+            Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
+            _ => Err(io::Error::other("invalid transaction stage state")),
+        }
+    }
+
+    /// Mark the journal group published while storage application remains
+    /// retryable.
+    pub(crate) fn mark_journal_published(&self) -> io::Result<()> {
+        match self.state.load(Ordering::Acquire) {
+            Self::ACTIVE => {
+                self.state.store(Self::JOURNAL_PUBLISHED, Ordering::Release);
+                Ok(())
+            }
+            Self::JOURNAL_PUBLISHED | Self::APPLIED | Self::PUBLISHED => Ok(()),
+            Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
+            _ => Err(io::Error::other("invalid transaction stage state")),
+        }
+    }
+
+    /// Mark both journal publication and storage application complete.
+    pub(crate) fn mark_published(&self) -> io::Result<()> {
+        match self.state.load(Ordering::Acquire) {
+            Self::APPLIED | Self::PUBLISHED => {
+                self.state.store(Self::PUBLISHED, Ordering::Release);
+                Ok(())
+            }
+            _ => Err(io::Error::other("transaction storage has not been applied")),
         }
     }
 
@@ -390,7 +442,9 @@ impl TxnStage {
     ) -> io::Result<()> {
         let mut data = self.data.lock();
         match self.state.load(Ordering::Acquire) {
-            Self::DISCARDED | Self::PUBLISHED => return Ok(()),
+            Self::DISCARDED | Self::JOURNAL_PUBLISHED | Self::APPLIED | Self::PUBLISHED => {
+                return Ok(())
+            }
             _ => {}
         }
         let coordinators = [edges, event_dag, state];
@@ -439,7 +493,7 @@ impl TxnStage {
                         .collect::<Vec<_>>();
                     coordinator.append_pending_tagged_groups(&batches)?;
                     data.appended.fill(true);
-                    self.state.store(Self::PUBLISHED, Ordering::Release);
+                    self.mark_journal_published()?;
                     return Ok(());
                 }
             }
@@ -457,7 +511,7 @@ impl TxnStage {
             coordinator.append_pending_tagged(pool, &data.pools[index])?;
             data.appended[index] = true;
         }
-        self.state.store(Self::PUBLISHED, Ordering::Release);
+        self.mark_journal_published()?;
         Ok(())
     }
 }
@@ -673,6 +727,8 @@ struct CoverageState {
 pub struct JournalCoordinator {
     journal: Mutex<Journal>,
     path: PathBuf,
+    /// Serializes legacy queue publication with transaction-group publication.
+    publication: Mutex<()>,
     pending: Mutex<Vec<(u64, Option<ShardType>, Mutation)>>,
     /// Next LSN to assign. Advanced under `pending`, independently of journal
     /// I/O, so a publish never blocks behind a sync's fsync.
@@ -748,6 +804,7 @@ impl JournalCoordinator {
         Self {
             journal: Mutex::new(journal),
             path,
+            publication: Mutex::new(()),
             pending: Mutex::new(Vec::new()),
             next_lsn: AtomicU64::new(next_lsn),
             published_lsn: AtomicU64::new(committed_lsn),
@@ -940,6 +997,7 @@ impl JournalCoordinator {
         mutation: Mutation,
         publish_overlay: impl FnOnce(u64),
     ) -> io::Result<u64> {
+        let _publication = self.publication.lock();
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed commit",
@@ -1259,6 +1317,10 @@ impl JournalCoordinator {
         &self,
         batches: &[(ShardType, &[Mutation])],
     ) -> io::Result<CommitReceipt> {
+        let _publication = self.publication.lock();
+        // Flush unrelated legacy writes as a separate group first. They must
+        // not become part of this transaction's commit boundary.
+        self.append_pending_groups(&[])?;
         let staged = batches
             .iter()
             .map(|(pool, mutations)| (Some(*pool), *mutations))
@@ -2791,7 +2853,41 @@ mod tests {
                 Some(ShardType::State)
             ]
         );
-        assert_eq!(stage.state(), TxnStageState::Published);
+        assert_eq!(stage.state(), TxnStageState::JournalPublished);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transaction_stage_does_not_absorb_legacy_pending_mutations() {
+        use crate::layout::ShardType;
+
+        let path = temp_path("txn_stage_legacy_boundary");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        coordinator
+            .publish_tagged(ShardType::State, put(9, 9, b"legacy"), |_| {})
+            .unwrap();
+
+        let stage = TxnStage::new();
+        stage
+            .stage_put(
+                ShardType::EventDag,
+                [2; 16],
+                [2; 16],
+                b"transaction".to_vec(),
+            )
+            .unwrap();
+        stage
+            .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+            .unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 2);
+        assert_eq!(scan.groups[0].entries.len(), 1);
+        assert_eq!(scan.groups[1].entries.len(), 1);
+        assert_eq!(scan.groups[0].entries[0].pool, Some(ShardType::State));
+        assert_eq!(scan.groups[1].entries[0].pool, Some(ShardType::EventDag));
         fs::remove_file(path).unwrap();
     }
 

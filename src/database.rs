@@ -22,7 +22,9 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::journal::{CommitReceipt, Journal, JournalCoordinator, SharedWalLock, TxnStage};
+use crate::journal::{
+    CommitReceipt, Journal, JournalCoordinator, SharedWalLock, TxnStage, TxnStageState,
+};
 use crate::layout::{DatabaseLayout, ShardType};
 use crate::packfile::storage::PackfileStorage;
 use crate::storage::StorageError;
@@ -77,6 +79,78 @@ pub struct SharedDatabase {
     pools: [Arc<PackfileStorage>; 3],
     /// Held for the lifetime of the handle: one writer per database root.
     _lock: SharedWalLock,
+}
+
+/// Storage transaction whose mutations remain invisible until commit.
+pub struct DatabaseTransaction<'a> {
+    database: &'a SharedDatabase,
+    stage: TxnStage,
+}
+
+impl DatabaseTransaction<'_> {
+    /// Stage a record for `pool` without changing its live pack or index.
+    ///
+    /// # Errors
+    /// Returns an error if the transaction's bounded staging budget is
+    /// exhausted or it has already been committed/aborted.
+    pub fn put(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+        data: &crate::storage::NodeData,
+    ) -> io::Result<()> {
+        self.stage
+            .stage_put(pool, collection_id, node_id, data.bytes.to_vec())
+    }
+
+    /// Stage removal of a collection.
+    ///
+    /// # Errors
+    /// Returns an error if the transaction's staging budget is exhausted or
+    /// it has already been committed/aborted.
+    pub fn delete_collection(&self, pool: ShardType, collection_id: [u8; 16]) -> io::Result<()> {
+        self.stage.stage_delete_collection(pool, collection_id)
+    }
+
+    /// Commit the staged mutations. Pack/index application is performed once;
+    /// journal publication can be retried if the post-commit callback fails.
+    ///
+    /// # Errors
+    /// Returns an error if storage application or shared-WAL publication
+    /// fails. After storage application succeeds, retrying this method is safe.
+    pub fn commit(&self) -> Result<(), StorageError> {
+        if self.stage.state() == TxnStageState::Active {
+            self.database
+                .publish_transaction(&self.stage)
+                .map_err(StorageError::Io)?;
+        }
+        if self.stage.state() == TxnStageState::JournalPublished {
+            let batches = self.stage.snapshot_mutations();
+            for pool in ShardType::ALL {
+                for mutation in &batches[shard_index(pool)] {
+                    self.database
+                        .pool(pool)
+                        .apply_transaction_mutation(mutation)?;
+                }
+            }
+            self.stage.mark_applied().map_err(StorageError::Io)?;
+            self.stage.mark_published().map_err(StorageError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Abort the transaction. Since staged mutations have not touched storage,
+    /// abort is O(1) and leaves no revocation records behind.
+    pub fn abort(&self) {
+        self.stage.discard();
+    }
+
+    /// Current transaction lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> TxnStageState {
+        self.stage.state()
+    }
 }
 
 impl SharedDatabase {
@@ -166,6 +240,15 @@ impl SharedDatabase {
     #[must_use]
     pub fn edges(&self) -> &Arc<PackfileStorage> {
         self.pool(ShardType::Edges)
+    }
+
+    /// Begin a storage transaction whose writes are invisible until commit.
+    #[must_use]
+    pub fn begin_transaction(&self) -> DatabaseTransaction<'_> {
+        DatabaseTransaction {
+            database: self,
+            stage: TxnStage::new(),
+        }
     }
 
     /// Publish all legacy pending mutations through the database coordinator.
@@ -270,6 +353,84 @@ mod tests {
             );
         }
         assert_eq!(db.layout().wal_layout(), crate::layout::WalLayout::Shared);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn transaction_abort_keeps_staged_mutations_invisible() {
+        let root = test_root("transaction_abort");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x51; 16];
+        let node_id = node(1);
+        let transaction = db.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                collection,
+                node_id,
+                &NodeData::new(bytes::Bytes::from_static(b"not committed")),
+            )
+            .unwrap();
+        assert!(db
+            .pool(ShardType::State)
+            .get(&collection, &node_id)
+            .unwrap()
+            .is_none());
+        transaction.abort();
+        assert!(db
+            .pool(ShardType::State)
+            .get(&collection, &node_id)
+            .unwrap()
+            .is_none());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn transaction_commit_applies_and_publishes_once() {
+        let root = test_root("transaction_commit");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let state_collection = [0x61; 16];
+        let event_collection = [0x62; 16];
+        let transaction = db.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                state_collection,
+                node(1),
+                &NodeData::new(bytes::Bytes::from_static(b"state")),
+            )
+            .unwrap();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                node(2),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        assert!(db
+            .pool(ShardType::State)
+            .get(&state_collection, &node(1))
+            .unwrap()
+            .is_none());
+        transaction.commit().unwrap();
+        transaction.commit().unwrap();
+        assert!(db
+            .pool(ShardType::State)
+            .get(&state_collection, &node(1))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .pool(ShardType::EventDag)
+            .get(&event_collection, &node(2))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            transaction.state(),
+            crate::journal::TxnStageState::Published
+        );
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }

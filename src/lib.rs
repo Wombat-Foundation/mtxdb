@@ -56,7 +56,7 @@ pub use auxiliary::{
 };
 pub use cache::NodeCache;
 #[cfg(not(target_arch = "wasm32"))]
-pub use database::{PoolPolicies, PoolPolicy, SharedDatabase};
+pub use database::{DatabaseTransaction, PoolPolicies, PoolPolicy, SharedDatabase};
 pub use index::LossyIndex;
 #[cfg(not(target_arch = "wasm32"))]
 pub use journal::SharedWalLock;
