@@ -860,16 +860,26 @@ pub struct ReadPlanPolicy {
     /// A warm-cache run showed no regression from suppression (random vs
     /// independent reads was 0.94-1.20× at 1-5 ms, i.e. within the spread), so
     /// the cold win does not reverse when data is resident. But only sparse
-    /// *point* reads were tested: no dense case, and — critically — **no
-    /// sequential scan or compaction**. Those walk the pack in order, and
-    /// suppression there would remove the readahead that makes them fast.
+    /// *point* reads were tested: no warm dense case.
     ///
-    /// `MADV_RANDOM` is persistent mapping state, so this setting affects
-    /// *every* later read on the same mapping, not just the `get_many` that
-    /// set it; nothing here resets it. Do not enable it on a store that also
-    /// does concurrent scans or compaction until that path is measured (or the
-    /// advice is made path-local). Measurements are from one rotational HDD and
-    /// one cheap SATA SSD; `NVMe` and other drives are untested.
+    /// # Persistent advice, and why this is not a default
+    ///
+    /// `madvise` is persistent mapping state, and repack/compaction read
+    /// records through the *same* shard mmap this sets (`scan_full_adjacency`,
+    /// `copy_record_to_shard`), so suppression can leak into them; nothing here
+    /// resets it. A repack benchmark (fresh store per pass, 5 passes, 1M
+    /// records) measured **no regression** — `REPACK_RANDOM_VS_PLAIN` = 0.998
+    /// with fully overlapping ranges — but that store had **no edges**, so the
+    /// mmap adjacency walk barely ran and the result mostly reflects
+    /// `scan_packfile`, which uses its own file handle and is unaffected. The
+    /// mmap walk path is therefore still unmeasured, and this null does not
+    /// clear suppression for the default.
+    ///
+    /// Keep this opt-in. Making it safe by default needs the advice scoped to
+    /// the point-read path — a separate mapping/fd for `get_many`, or an
+    /// explicit concurrency-safe reset (`MADV_NORMAL`/`SEQUENTIAL`) before
+    /// scan/compaction reads. Measurements are from one rotational HDD and one
+    /// cheap SATA SSD; `NVMe` and other drives are untested.
     pub random_advice: bool,
 }
 
