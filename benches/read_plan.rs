@@ -434,7 +434,11 @@ struct Row {
     target: &'static str,
     found: usize,
     total: usize,
+    /// Median elapsed across passes, and the min/max beside it so a single
+    /// outlier pass is visible rather than hidden inside the median.
     elapsed: Duration,
+    elapsed_min: Duration,
+    elapsed_max: Duration,
     evicted: EvictionStatus,
     major_faults: Option<u64>,
     minor_faults: Option<u64>,
@@ -532,6 +536,8 @@ fn measure_once(
         found,
         total: targets.len(),
         elapsed,
+        elapsed_min: elapsed,
+        elapsed_max: elapsed,
         evicted,
         major_faults: io_before
             .zip(io_after)
@@ -557,28 +563,48 @@ fn measure_once(
     }
 }
 
-/// Reduce a combo's per-pass rows to one: median elapsed, counters from the
-/// last pass (they are per-read totals, not accumulated).
+/// Reduce a combo's per-pass rows to one: median elapsed (with min/max kept
+/// beside it), counters from the last pass (they are per-read totals, not
+/// accumulated).
 fn reduce_passes(mut rows: Vec<Row>) -> Row {
     let elapsed_samples: Vec<Duration> = rows.iter().map(|r| r.elapsed).collect();
     let mut row = rows.pop().expect("at least one pass");
     row.elapsed = median_duration(&elapsed_samples);
+    row.elapsed_min = elapsed_samples
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(Duration::ZERO);
+    row.elapsed_max = elapsed_samples
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(Duration::ZERO);
     row
 }
 
 /// Measure every `(policy, target)` combo, interleaving the passes: one read
 /// of each combo per pass, then the next pass. Running a combo's passes back
 /// to back would let the policy measured first warm the drive's cache and
-/// bias the one measured second; interleaving spreads that across both.
+/// bias the one measured second. Interleaving spreads that across passes,
+/// and reversing the combo order on odd passes removes the remaining
+/// within-pass ordering bias (whoever reads second otherwise always sees a
+/// drive that just finished the first policy's read).
 fn measure(
     dir: &Path,
     combos: &[(&'static str, ReadPlanPolicy, &'static str, &Vec<NodeId>)],
     eviction: Eviction,
     passes: usize,
 ) -> Vec<Row> {
-    let mut samples: Vec<Vec<Row>> = (0..combos.len()).map(|_| Vec::new()).collect();
-    for _ in 0..passes {
-        for (index, (policy_name, policy, target_name, targets)) in combos.iter().enumerate() {
+    let count = combos.len();
+    let mut samples: Vec<Vec<Row>> = (0..count).map(|_| Vec::new()).collect();
+    for pass in 0..passes {
+        // Even passes read combos in order, odd passes in reverse, so no
+        // policy always reads second.
+        let forward = pass % 2 == 0;
+        for step in 0..count {
+            let index = if forward { step } else { count - 1 - step };
+            let (policy_name, policy, target_name, targets) = &combos[index];
             samples[index].push(measure_once(
                 dir,
                 policy_name,
@@ -706,7 +732,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         .unwrap_or(true);
     println!();
     println!(
-        "  [2/3] measuring (plain vs prefetch, {}, {passes} interleaved passes, median)…",
+        "  [2/3] measuring (plain vs random vs prefetch, {}, {passes} interleaved passes, median)…",
         if include_dense {
             "dense + sparse"
         } else {
@@ -721,12 +747,18 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         policy_prefetch.min_batch_candidates
     );
 
+    // `random` is the control between plain and prefetch: it disables kernel
+    // readahead (MADV_RANDOM) but does no planning. If it captures most of
+    // prefetch's gain, the planner adds little beyond suppressing readahead.
+    let policy_random = ReadPlanPolicy::random_advice();
     let mut combos: Vec<(&'static str, ReadPlanPolicy, &'static str, &Vec<NodeId>)> = Vec::new();
     if include_dense {
         combos.push(("plain", ReadPlanPolicy::disabled(), "dense", &dense));
+        combos.push(("random", policy_random, "dense", &dense));
         combos.push(("prefetch", policy_prefetch, "dense", &dense));
     }
     combos.push(("plain", ReadPlanPolicy::disabled(), "sparse", &sparse));
+    combos.push(("random", policy_random, "sparse", &sparse));
     combos.push(("prefetch", policy_prefetch, "sparse", &sparse));
 
     let eviction = select_eviction(manual_drop);
@@ -746,8 +778,21 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
         .map(|r| format!("{}/{}", r.found, r.total))
         .collect();
     let found_w = max_width("found", found_cells.iter().map(String::as_str));
-    let elapsed_cells: Vec<String> = rows.iter().map(|r| format!("{:.2?}", r.elapsed)).collect();
-    let elapsed_w = max_width("elapsed", elapsed_cells.iter().map(String::as_str));
+    // Elapsed shows the median with the pass spread beside it
+    // (`median [min..max]`), so an outlier pass is not hidden by the median.
+    let elapsed_cells: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{:.2?} [{:.2?}..{:.2?}]",
+                r.elapsed, r.elapsed_min, r.elapsed_max
+            )
+        })
+        .collect();
+    let elapsed_w = max_width(
+        "elapsed [min..max]",
+        elapsed_cells.iter().map(String::as_str),
+    );
     // The four right-aligned numeric columns (majflt, disk read, extents,
     // prefetch) share one width: the widest of their headers and any cell.
     let mut num_w = "majflt".len().max("disk read".len()).max("extents".len());
@@ -767,7 +812,8 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     println!("═══════════════════════════════════════════════════════════════");
     println!(
         "  {:<policy_w$} {:<target_w$} {:>found_w$} {:>elapsed_w$} {:>num_w$} {:>num_w$} {:>num_w$} {:>num_w$}",
-        "policy", "target", "found", "elapsed", "majflt", "disk read", "extents", "prefetch"
+        "policy", "target", "found", "elapsed [min..max]", "majflt", "disk read", "extents",
+        "prefetch"
     );
     for (r, (found, elapsed)) in rows
         .iter()
@@ -818,7 +864,7 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
     // arrive with no demand fault at all, so `majflt` stays near zero while
     // real device I/O happens.
     //
-    // The gate is the sparse `off` row only. The dense set is a small
+    // The gate is the sparse `plain` row only. The dense set is a small
     // contiguous prefix, so its device bytes are legitimately a tiny
     // fraction of the store and can sit below the floor even on a fully cold
     // read -- checking it would suppress a good run. Dense is reported for
@@ -861,16 +907,27 @@ fn run(records: usize, target_count: usize, payload_len: usize, manual_drop: boo
             println!("    scan amplification rather than a clean single scan; treat the");
             println!("    ratio with caution.");
         }
+        let elapsed = |policy: &str, target: &str| {
+            rows.iter()
+                .find(|r| r.policy == policy && r.target == target)
+                .map(|r| r.elapsed.as_secs_f64())
+        };
         for target in ["dense", "sparse"] {
-            let plain = rows
-                .iter()
-                .find(|r| r.policy == "plain" && r.target == target);
-            let prefetch = rows
-                .iter()
-                .find(|r| r.policy == "prefetch" && r.target == target);
-            if let (Some(plain), Some(prefetch)) = (plain, prefetch) {
-                let speedup = plain.elapsed.as_secs_f64() / prefetch.elapsed.as_secs_f64();
-                println!("bench: read_plan_ratio TARGET={target} PREFETCH_VS_PLAIN={speedup:.3}");
+            if let (Some(plain), Some(random), Some(prefetch)) = (
+                elapsed("plain", target),
+                elapsed("random", target),
+                elapsed("prefetch", target),
+            ) {
+                // PREFETCH_VS_PLAIN is the headline; the other two isolate
+                // how much comes from merely suppressing readahead (random)
+                // versus planning extents (prefetch over random).
+                println!(
+                    "bench: read_plan_ratio TARGET={target} PREFETCH_VS_PLAIN={:.3} \
+                     RANDOM_VS_PLAIN={:.3} PREFETCH_VS_RANDOM={:.3}",
+                    plain / prefetch,
+                    plain / random,
+                    random / prefetch,
+                );
             }
         }
         if plain_sparse.is_some_and(|r| r.major_faults.unwrap_or(0) == 0) {
