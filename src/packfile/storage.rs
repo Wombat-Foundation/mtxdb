@@ -7678,6 +7678,22 @@ impl PackfileStorage {
         }
     }
 
+    /// Atomically take the current sync diagnostics and reset only those
+    /// diagnostics for the next observation interval.
+    ///
+    /// Unlike [`Self::reset_stats`], this leaves all runtime counters and
+    /// cumulative sync totals untouched. The returned histograms, peak, and
+    /// worst-operation samples therefore describe the interval ending at this
+    /// call; syncs racing with the call are recorded in either the returned
+    /// snapshot or the next interval, never partially in both.
+    #[must_use]
+    pub fn take_sync_diagnostics(&self) -> SyncDiagnosticsSnapshot {
+        let mut diagnostics = self.sync_diagnostics.lock();
+        let snapshot = diagnostics.snapshot();
+        diagnostics.reset();
+        snapshot
+    }
+
     /// Zero every runtime counter except `open_count` (counts stores
     /// assembled, not work) and the persisted pool stats — `shards`,
     /// `cache`, `repack`, `index_bytes`, and the collection count reflect
@@ -10759,6 +10775,24 @@ mod tests {
                 .iter()
                 .sum::<u64>(),
             1
+        );
+        let interval = store.take_sync_diagnostics();
+        assert_eq!(interval.peak_journal_in_flight, 1);
+        assert_eq!(interval.worst_syncs.len(), 1);
+        assert_eq!(
+            interval.fsync_latency.buckets.iter().sum::<u64>(),
+            1,
+            "taking diagnostics must return the completed interval"
+        );
+        assert_eq!(
+            store.take_sync_diagnostics(),
+            SyncDiagnosticsSnapshot::default(),
+            "taking diagnostics must reset only the diagnostics interval"
+        );
+        assert_eq!(
+            store.stats().sync_totals.calls,
+            1,
+            "taking diagnostics must preserve cumulative sync totals"
         );
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
         assert!(store.journal().expect("journal enabled").committed_lsn() >= 1);
