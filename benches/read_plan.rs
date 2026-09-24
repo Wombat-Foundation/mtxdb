@@ -377,13 +377,21 @@ const BENCH_CACHE_CAPACITY: usize = 100_000;
 /// reflects the rest of the write path.
 fn open_for_ingest(dir: std::path::PathBuf) -> PackfileStorage {
     let compress_off = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() == Ok("0");
-    PackfileStorage::open_with_cache_and_policies(
+    let store = PackfileStorage::open_with_cache_and_policies(
         dir,
         BENCH_CACHE_CAPACITY,
         !compress_off,
         mtxdb::packfile::ChecksumPolicy::Full,
     )
-    .unwrap()
+    .unwrap();
+    // `MTXDB_READ_PLAN_APPEND=buffered` batches a shard's frames into one
+    // positioned write per ~1 MiB instead of one `pwrite` per record (the
+    // `eager` default). The ingest phase ends in `sync_all`, so the
+    // crash-loss window the policy trades away is not exercised here.
+    match std::env::var("MTXDB_READ_PLAN_APPEND").as_deref() {
+        Ok("buffered") => store.with_append_policy(mtxdb::shard::AppendPolicy::buffered()),
+        _ => store,
+    }
 }
 
 /// The `prefetch` preset, with optional per-field env overrides so a run can
@@ -756,6 +764,13 @@ fn run(
             "on (default; incompressible payload makes this pure zstd cost)"
         }
     );
+    println!(
+        "  append:       {}",
+        match std::env::var("MTXDB_READ_PLAN_APPEND").as_deref() {
+            Ok("buffered") => "buffered (one pwrite per ~1 MiB)",
+            _ => "eager (one pwrite per record)",
+        }
+    );
     println!("  passes:       {passes} (median reported)");
     println!("  scratch dir:  {}", dir.display());
     let fstype = mount_fstype(&dir).unwrap_or_else(|| "unknown".to_owned());
@@ -797,6 +812,18 @@ fn run(
         "        {records} records in {:.2?}",
         ingest_start.elapsed()
     );
+
+    // Ingest-only stop: the A/B for `MTXDB_READ_PLAN_APPEND` times just the
+    // append path, so skip the (slow, unrelated) read-plan sweep. Wchan
+    // sampling around the whole process then attributes only the ingest.
+    if std::env::var("MTXDB_READ_PLAN_INGEST_ONLY")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
 
     // ── Target sets ──
     //
