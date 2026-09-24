@@ -14,6 +14,20 @@ use parking_lot::{Mutex, RwLock};
 use crate::packfile::{self, Record};
 
 /// Maximum number of shards in the pool.
+///
+/// This is a runtime policy cap, not a format limit: the shard slot is a
+/// `u16` that can represent 65,536 values, and nothing about the on-disk
+/// encoding forbids more than this count. The cap deliberately bounds one
+/// process's live shard objects — their pack-file descriptors, their
+/// (lazily created) mappings, and their buffered append memory — under a
+/// no-eviction lifecycle: once live, a shard is retired only when a repack
+/// reclaims it, never by closing and reopening its file.
+///
+/// It is also not a complete resource limit on its own. A process's usable
+/// shard count is bounded by its file-descriptor and VMA budgets, which are
+/// separate and often tighter (see [`ShardPool`]); a single
+/// `MAX_SHARDS`-sized pool can still reach `EMFILE` or exhaust
+/// `vm.max_map_count` first.
 pub const MAX_SHARDS: usize = 4096;
 
 /// Maximum number of shards as `u16`. Primary constant for shard IDs
@@ -444,9 +458,30 @@ impl Drop for WriterLock {
 
 /// Pool of global shard files shared across all collections.
 ///
-/// Only `MAX_SHARDS` files are open at any time, capping file descriptor
-/// usage regardless of collection count. The active write shard rotates when it
-/// exceeds `MAX_SHARD_BYTES`.
+/// At most `MAX_SHARDS` shard files are live at any time, which bounds the
+/// pool's own resource use regardless of collection count. That bound is a
+/// policy cap over live shard *objects*, not a promise about how many the
+/// process can actually hold; the real ceilings are the surrounding system
+/// budgets:
+///
+/// - File descriptors are per-process (`RLIMIT_NOFILE`): each live shard
+///   holds a persistent file descriptor, plus transient ones during rotation
+///   or recovery, so a process reaches `EMFILE` once
+///   `(limit - baseline - headroom) / fds_per_live_shard` shards are live.
+///   Under multiple readers on one host these descriptors also aggregate
+///   against the system-wide `fs.file-max` pool (`ENFILE`).
+/// - Mappings consume virtual address space and VMAs against the *per-process*
+///   `vm.max_map_count`. A mapping is created lazily, and because mappings are
+///   reference-counted a remap can leave more than one live while previously
+///   returned ranges still reference an older mapping — so an active shard
+///   accounts for one or more VMAs, not exactly one. VMA counts do not
+///   aggregate across processes.
+///
+/// Neither budget is fixed here: `fds_per_live_shard` and the per-shard VMA
+/// count both vary with workload and implementation, so the formulas stay
+/// symbolic rather than being reduced to constants.
+///
+/// The active write shard rotates when it exceeds `MAX_SHARD_BYTES`.
 pub struct ShardPool {
     /// Fixed-size array of shard slots. `None` means unused.
     shards: RwLock<Vec<Option<Arc<Shard>>>>,
