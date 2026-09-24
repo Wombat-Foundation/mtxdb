@@ -1465,6 +1465,32 @@ fn cmd_collections(
     })
 }
 
+/// Print the collections table header row for the given view. Shared by the
+/// coalesced and single-directory report paths so their column layouts cannot
+/// drift apart.
+fn print_collection_table_header(layout: bool, canonical: bool, canonical_width: usize) {
+    if layout {
+        if canonical {
+            println!("  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
+        } else {
+            println!(
+                "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
+            );
+        }
+    } else if canonical {
+        println!(
+            "  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "collection", "canonical", "nodes", "load", "shards", "index", "disk"
+        );
+    } else {
+        println!(
+            "  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
+            "collection", "nodes", "load", "shards", "index", "disk"
+        );
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "coalesced table construction and formatting is kept together"
@@ -1676,26 +1702,7 @@ fn cmd_collections_coalesced(
             .unwrap_or(0)
             .max("canonical".len());
 
-        if layout {
-            if canonical {
-                println!("  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
-            } else {
-                println!(
-                    "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-                    "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
-                );
-            }
-        } else if canonical {
-            println!(
-                "  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-                "collection", "canonical", "nodes", "load", "shards", "index", "disk"
-            );
-        } else {
-            println!(
-                "  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-                "collection", "nodes", "load", "shards", "index", "disk"
-            );
-        }
+        print_collection_table_header(layout, canonical, canonical_width);
 
         let mut total_nodes = 0_usize;
         let mut total_memory = 0_usize;
@@ -1961,26 +1968,7 @@ fn cmd_collections_in_dir(
         .max()
         .unwrap_or(0)
         .max("canonical".len());
-    if layout {
-        if canonical {
-            println!("  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}", "collection", "canonical", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable");
-        } else {
-            println!(
-                "  {:<34}  {:>7}  {:>6}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-                "collection", "nodes", "load", "packs", "disk", "runs", "largest", "avoidable"
-            );
-        }
-    } else if canonical {
-        println!(
-            "  {:<34}  {:<canonical_width$}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-            "collection", "canonical", "nodes", "load", "shards", "index", "disk"
-        );
-    } else {
-        println!(
-            "  {:<34}  {:>7}  {:>6}  {:>6}  {:>12}  {:>13}",
-            "collection", "nodes", "load", "shards", "index", "disk"
-        );
-    }
+    print_collection_table_header(layout, canonical, canonical_width);
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
