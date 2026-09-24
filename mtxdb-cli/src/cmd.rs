@@ -190,6 +190,9 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             | Commands::Collections { .. }
             | Commands::Stats { .. }
             | Commands::Get { .. }
+            | Commands::Sync { .. }
+            | Commands::Scan { .. }
+            | Commands::Info { .. }
             | Commands::Repack { out: Some(_), .. } => {}
             Commands::Repack { out: None, .. } => {
                 bail!("--coalesce is not supported for in-place repack; coalescing repack requires --out <DIR>");
@@ -10087,21 +10090,6 @@ mod tests {
         let _ = DatabaseLayout::open(dir.clone()).unwrap();
 
         let unsupported = vec![
-            Commands::Info {
-                collection: "0x00000000000000000000000000000000".to_owned(),
-                stats: false,
-            },
-            Commands::Scan {
-                selector: "0x00000000000000000000000000000000".to_owned(),
-                verbose: false,
-                limit: 10,
-                id: None,
-                collection: None,
-                raw: false,
-                sort: None,
-                reverse: false,
-            },
-            Commands::Sync { all: true },
             Commands::Put {
                 collection: "0x00000000000000000000000000000000".to_owned(),
                 id: "$event:example.org".to_owned(),
