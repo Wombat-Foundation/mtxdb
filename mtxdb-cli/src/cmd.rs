@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -10,7 +11,7 @@ use anyhow::{anyhow, bail, Context};
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
-use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
     derive_collection_id, frame_digest, record_logical_id, CollectionKeyRule, CollectionMetadata,
     CollectionTemplate, DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput,
@@ -4106,6 +4107,7 @@ struct MatrixRoomExtension {
     create_event_id: Option<String>,
     room_version: Option<String>,
     creator: Option<String>,
+    creation_ts: Option<i64>,
 }
 
 const MATRIX_ROOM_EXT: &str = "matrix.room";
@@ -4128,6 +4130,8 @@ impl MatrixRoomExtension {
                     extension.room_version =
                         nested_event_string_field(event, "content", "room_version")
                             .map(str::to_owned);
+                    extension.creation_ts =
+                        event.get("origin_server_ts").and_then(OwnedValue::as_i64);
                 }
             }
             if extension.room_id.is_some() && extension.create_event_id.is_some() {
@@ -4161,6 +4165,9 @@ impl MatrixRoomExtension {
                 ));
             }
         }
+        if let Some(timestamp) = self.creation_ts {
+            fields.push(format!("\"creation_ts\":{timestamp}"));
+        }
         format!("{{{}}}", fields.join(",")).into_bytes()
     }
 
@@ -4175,6 +4182,7 @@ impl MatrixRoomExtension {
             create_event_id: event_string_field(&value, "create_event_id").map(str::to_owned),
             room_version: event_string_field(&value, "room_version").map(str::to_owned),
             creator: event_string_field(&value, "creator").map(str::to_owned),
+            creation_ts: value.get("creation_ts").and_then(OwnedValue::as_i64),
         })
     }
 }
@@ -4227,6 +4235,9 @@ fn print_matrix_room_extension(extension: &MatrixRoomExtension) {
     }
     if let Some(room_version) = &extension.room_version {
         let _ = write!(create, "; room version {room_version}");
+    }
+    if let Some(timestamp) = extension.creation_ts {
+        let _ = write!(create, "; {}", format_matrix_timestamp(timestamp));
     }
     println!("  {:<12} {create}", "create:");
 }
@@ -4450,6 +4461,46 @@ fn format_utc_ms(ms: i64) -> String {
         minutes_of_day / 60,
         minutes_of_day % 60
     )
+}
+
+/// Format a Matrix creation timestamp as the compact human-facing UTC form
+/// used by room summaries, e.g. `5:30 PM 30 Sep 2109`.
+fn format_matrix_timestamp(ms: i64) -> String {
+    let formatted = format_utc_ms(ms);
+    let Some((date, time)) = formatted.split_once(' ') else {
+        return formatted;
+    };
+    let mut date_parts = date.split('-');
+    let (Some(year), Some(month), Some(day)) =
+        (date_parts.next(), date_parts.next(), date_parts.next())
+    else {
+        return formatted;
+    };
+    let mut time_parts = time.split(':');
+    let (Some(hour), Some(minute)) = (time_parts.next(), time_parts.next()) else {
+        return formatted;
+    };
+    let Ok(hour24) = hour.parse::<u32>() else {
+        return formatted;
+    };
+    let hour12 = match hour24 % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    let meridiem = if hour24 < 12 { "AM" } else { "PM" };
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Ok(month_number) = month.parse::<usize>() else {
+        return formatted;
+    };
+    let Some(month_name) = month_number
+        .checked_sub(1)
+        .and_then(|index| months.get(index))
+    else {
+        return formatted;
+    };
+    format!("{hour12}:{minute} {meridiem} {day} {month_name} {year}")
 }
 
 fn top_counts(counts: &HashMap<String, usize>, limit: usize) -> String {
@@ -5454,9 +5505,13 @@ fn print_collection_record(
         .verbose()
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
-    let payload = data
-        .as_ref()
-        .map(|data| scan_payload_cell(&data.data, context.shard_type));
+    let payload = data.as_ref().map(|data| {
+        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+            "collection metadata".to_owned()
+        } else {
+            scan_payload_cell(&data.data, context.shard_type)
+        }
+    });
     println!(
         "{}",
         scan_table_row(
@@ -5466,9 +5521,10 @@ fn print_collection_record(
             payload.as_deref(),
         )
     );
-    if let Some(data) =
-        data.filter(|data| scan_payload_suffix(&data.data, context.shard_type).is_none())
-    {
+    if let Some(data) = data.filter(|data| {
+        record_id != mtxdb::COLLECTION_METADATA_RECORD_ID
+            && scan_payload_suffix(&data.data, context.shard_type).is_none()
+    }) {
         print_scan_payload(&data.data);
     }
     Ok(())
@@ -6087,17 +6143,17 @@ fn cmd_import_file(
                 .count() as u64
         };
 
-        // Import auth chain events into the auth-chain shard pool.
+        // Import auth chain events into the edges shard pool.
         if !federation.auth_chain.is_empty() {
-            // Derive the auth-chain pool dir from the event-dag pool dir.
-            // pool_dir is {root}/pools/event-dag; auth-chain is {root}/pools/auth-chain.
+            // Derive the edges pool dir from the event-dag pool dir.
+            // pool_dir is {root}/pools/event-dag; edges is {root}/pools/edges.
             let auth_chain_dir = dir
                 .parent()
-                .map(|p| p.join("auth-chain"))
-                .context("deriving auth-chain pool path")?;
+                .map(|p| p.join("edges"))
+                .context("deriving edges pool path")?;
             fs::create_dir_all(&auth_chain_dir)?;
             let auth_store =
-                PackfileStorage::open(auth_chain_dir).context("opening auth-chain store")?;
+                PackfileStorage::open(auth_chain_dir).context("opening edges store")?;
             // This open bypasses `open_store`, so carry the caller's
             // `--read-plan` choice over from the event store instead of
             // silently running the default.
@@ -6170,18 +6226,19 @@ fn cmd_import_file(
                     // Deliberate semantic change from the pre-batching loop,
                     // which counted every accepted input event including ones
                     // already on disk: `auth_count` now reports only genuinely
-                    // newly-written auth-chain events, so "imported N" means
+                    // newly-written edges events, so "imported N" means
                     // records actually appended, and a reimport reports 0.
                     auth_count = auth_count.saturating_add(to_write.len() as u64);
                 }
             }
+            persist_matrix_edges(&auth_store, template, &federation.auth_chain)?;
             auth_store.sync_all()?;
             eprintln!(
-                "imported {auth_count} auth-chain events ({} dangling references)",
+                "imported {auth_count} edges events ({} dangling references)",
                 dangling.len()
             );
             if auth_skipped > 0 {
-                eprintln!("skipped {auth_skipped} auth-chain events (missing event_id)");
+                eprintln!("skipped {auth_skipped} edges events (missing event_id)");
             }
         }
 
@@ -6229,7 +6286,7 @@ fn reject_cross_record_collision(
 fn import_pdu_events(
     store: &PackfileStorage,
     state_store: &PackfileStorage,
-    _dir: &Path,
+    dir: &Path,
     path: &Path,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
@@ -6334,45 +6391,81 @@ fn import_pdu_events(
     }
 
     if !to_write.is_empty() {
+        if let Some(order) = topological_event_order(events) {
+            let mut order_by_node = HashMap::with_capacity(order.len());
+            for event in events {
+                if let (Some(event_id), Some(node_id)) =
+                    (event_id(event), template_node_id(template, event)?)
+                {
+                    if let Some(position) = order.get(event_id) {
+                        order_by_node.insert(node_id, *position);
+                    }
+                }
+            }
+            to_write.sort_by_key(|(node_id, _)| {
+                order_by_node.get(node_id).copied().unwrap_or(usize::MAX)
+            });
+        }
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
-    // Compute state groups from the event DAG and persist the mappings.
-    let state_groups = match compute_state_groups(events, auth_chain) {
-        Ok(groups) => groups,
-        Err(cycle_events) => {
-            eprintln!(
-                "warning: skipping state-group computation: DAG has missing parents or cycles involving {} event(s)",
-                cycle_events.len()
-            );
-            HashMap::new()
+    let edge_dir = dir
+        .parent()
+        .map(|parent| parent.join("edges"))
+        .context("deriving edges pool path")?;
+    fs::create_dir_all(&edge_dir)?;
+    let edge_store = PackfileStorage::open(edge_dir)
+        .context("opening edges store")?
+        .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
+    persist_matrix_edges(&edge_store, template, events)?;
+    edge_store.sync_all()?;
+
+    // A replayed batch cannot add any new state-group information. In
+    // particular, federation exports often replay a large auth chain around
+    // a handful of new PDUs; rebuilding that entire DAG for a zero-write
+    // batch only repeats work already done by the successful import.
+    let state_groups = if event_count == 0 {
+        HashMap::new()
+    } else {
+        match compute_state_groups(events, auth_chain) {
+            Ok(groups) => groups,
+            Err(cycle_events) => {
+                eprintln!(
+                    "warning: skipping state-group computation: DAG has missing parents or cycles involving {} event(s)",
+                    cycle_events.len()
+                );
+                HashMap::new()
+            }
         }
     };
     if !state_groups.is_empty() {
         use mtxdb::auxiliary::AuxiliaryIndex;
         let aux = AuxiliaryIndex::open(state_store, "matrix-state-groups");
-        let mut state_count = 0u64;
-        for (event_id, state_group_id) in &state_groups {
-            // Key: event_id, Value: state_group_id (base64url).
-            if let Err(error) = aux.put(event_id.as_bytes(), state_group_id.as_bytes()) {
-                eprintln!("warning: unable to persist state group for {event_id}: {error}");
-            } else {
-                state_count = state_count.saturating_add(1);
+        let entries: Vec<(&[u8], &[u8])> = state_groups
+            .iter()
+            .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
+            .collect();
+        let state_count = match aux.put_many(&entries) {
+            Ok(count) => count as u64,
+            Err(error) => {
+                eprintln!("warning: unable to persist state groups: {error}");
+                0
             }
-        }
+        };
         if state_count > 0 {
-            eprintln!("computed {state_count} state groups for collection {collection_hex}");
+            eprintln!("  state groups: {state_count}");
         }
     }
 
     if let Some(room_id) = detected_collection {
-        eprintln!("imported {event_count} events to collection {collection_hex} (room {room_id})");
+        eprintln!("{room_id} ({collection_hex})");
     } else {
-        eprintln!("imported {event_count} events to collection {collection_hex}");
+        eprintln!("collection {collection_hex}");
     }
+    eprintln!("  imported: {event_count} events");
     if skipped > 0 {
-        eprintln!("skipped {skipped} events (missing event_id)");
+        eprintln!("  skipped: {skipped} events (missing event_id)");
     }
     if already_present > 0 {
         let suffix = if already_present > already_present_ids.len() as u64 {
@@ -6381,7 +6474,7 @@ fn import_pdu_events(
             ""
         };
         eprintln!(
-            "{already_present} events already present [{}{suffix}]",
+            "  already present: {already_present} [{}{suffix}]",
             already_present_ids.join(", "),
         );
     }
@@ -6810,22 +6903,30 @@ fn topo_sort_dag(
     }
 
     // Seed the queue with nodes that have zero in-degree.
-    let mut queue: Vec<usize> = Vec::new();
+    let mut queue: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
     for (idx, &deg) in in_degree.iter().enumerate() {
         if deg == 0 {
-            queue.push(idx);
+            let event_id = reverse_map
+                .get(&frontier.nodes[idx].short_id)
+                .cloned()
+                .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id));
+            queue.push(Reverse((event_id, idx)));
         }
     }
 
     let mut sorted = Vec::with_capacity(n);
-    while let Some(idx) = queue.pop() {
+    while let Some(Reverse((_, idx))) = queue.pop() {
         sorted.push(idx);
         for &child in &children[idx] {
             in_degree[child] = in_degree[child]
                 .checked_sub(1)
                 .expect("DAG in-degree underflow");
             if in_degree[child] == 0 {
-                queue.push(child);
+                let event_id = reverse_map
+                    .get(&frontier.nodes[child].short_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[child].short_id));
+                queue.push(Reverse((event_id, child)));
             }
         }
     }
@@ -6847,6 +6948,23 @@ fn topo_sort_dag(
         problematic.sort();
         Err(problematic)
     }
+}
+
+fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usize>> {
+    let (frontier, _id_map, reverse_map) = build_event_dag(events);
+    let sorted = topo_sort_dag(&frontier, &reverse_map).ok()?;
+    Some(
+        sorted
+            .into_iter()
+            .enumerate()
+            .filter_map(|(order, index)| {
+                reverse_map
+                    .get(&frontier.nodes[index].short_id)
+                    .cloned()
+                    .map(|event_id| (event_id, order))
+            })
+            .collect(),
+    )
 }
 
 /// Compute state groups for a set of events by walking the event DAG in
@@ -6886,6 +7004,10 @@ fn compute_state_groups_in_view(
         combined = events.iter().chain(auth_chain.iter()).cloned().collect();
         &combined
     };
+    let missing_parents = missing_prev_event_ids(all_owned);
+    if !missing_parents.is_empty() {
+        return Err(missing_parents);
+    }
     let (frontier, id_map, reverse_map) = build_event_dag(all_owned);
     if frontier.is_empty() {
         return Ok(HashMap::new());
@@ -6990,6 +7112,38 @@ fn compute_state_groups_in_view(
     }
 
     Ok(result)
+}
+
+/// Return the events whose `prev_events` reference a parent absent from this
+/// import batch. The DAG builder represents these as disk-resident edges and
+/// the topological sort will eventually reject the whole batch; checking here
+/// avoids building and sorting a large doomed frontier first.
+fn missing_prev_event_ids(events: &[OwnedValue]) -> Vec<String> {
+    let known: HashSet<&str> = events.iter().filter_map(event_id).collect();
+    let mut missing = Vec::new();
+    for event in events {
+        let Some(event_id) = event_id(event) else {
+            continue;
+        };
+        let OwnedValue::Object(fields) = event else {
+            continue;
+        };
+        let Some(OwnedValue::Array(prev_events)) = fields.get("prev_events") else {
+            continue;
+        };
+        if prev_events.iter().any(|reference| {
+            let parent = match reference {
+                OwnedValue::String(id) => Some(id.as_str()),
+                OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                _ => None,
+            };
+            parent.is_some_and(|parent| !known.contains(parent))
+        }) {
+            missing.push(event_id.to_owned());
+        }
+    }
+    missing.sort();
+    missing
 }
 
 /// A state set with its state-group digest computed once, so events that share
@@ -8035,6 +8189,132 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
     edges
 }
 
+const EDGE_MAGIC: &[u8] = b"EDG1";
+const EDGE_ID_PREFIX: &[u8] = b"mtxdb-edge\0";
+const EDGE_FIELD_COUNT: usize = 3;
+const EDGE_SEPARATOR_COUNT: usize = 2;
+
+/// Persist the relationships carried by Matrix events in the general edges
+/// pool. Event records remain lossless in the event-dag pool; these compact
+/// records make common graph traversals possible without reparsing every
+/// event payload.
+fn persist_matrix_edges(
+    store: &PackfileStorage,
+    template: &CollectionTemplate,
+    events: &[OwnedValue],
+) -> anyhow::Result<()> {
+    let mut by_collection: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+    for event in events {
+        let Some(source) = event_id(event) else {
+            continue;
+        };
+        let Some(room_id) = event_room_id(event) else {
+            continue;
+        };
+        let collection_id = template_collection_id(template, room_id);
+        for (target, kind) in matrix_relationships(event) {
+            let identity_capacity = source
+                .len()
+                .checked_add(target.len())
+                .and_then(|length| length.checked_add(kind.len()))
+                .and_then(|length| {
+                    length
+                        .checked_add(EDGE_ID_PREFIX.len())
+                        .and_then(|length| length.checked_add(EDGE_SEPARATOR_COUNT))
+                })
+                .context("edge identity length overflow")?;
+            let mut identity = Vec::with_capacity(identity_capacity);
+            identity.extend_from_slice(EDGE_ID_PREFIX);
+            identity.extend_from_slice(source.as_bytes());
+            identity.push(0);
+            identity.extend_from_slice(kind.as_bytes());
+            identity.push(0);
+            identity.extend_from_slice(target.as_bytes());
+            let digest = blake3_digest(&identity);
+            let id: NodeId = digest[..16].try_into().expect("BLAKE3 digest is 32 bytes");
+            let data = encode_matrix_edge(source, &target, &kind)?;
+            by_collection
+                .entry(collection_id)
+                .or_default()
+                .push((id, NodeData::new(bytes::Bytes::from(data))));
+        }
+    }
+
+    for (collection_id, entries) in by_collection {
+        let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
+        let existing = store.get_many(&collection_id, &ids)?;
+        let to_write: Vec<(NodeId, NodeData)> = entries
+            .into_iter()
+            .zip(existing)
+            .filter_map(|(entry, old)| old.is_none().then_some(entry))
+            .collect();
+        if !to_write.is_empty() {
+            store.put_many(&collection_id, &to_write)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_matrix_edge(source: &str, target: &str, kind: &str) -> anyhow::Result<Vec<u8>> {
+    let capacity = EDGE_MAGIC
+        .len()
+        .checked_add(source.len())
+        .and_then(|length| length.checked_add(target.len()))
+        .and_then(|length| length.checked_add(kind.len()))
+        .and_then(|length| {
+            EDGE_FIELD_COUNT
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|fields_size| length.checked_add(fields_size))
+        })
+        .context("edge payload length overflow")?;
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(EDGE_MAGIC);
+    for value in [source, target, kind] {
+        let length = u32::try_from(value.len()).context("edge field is too large")?;
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    Ok(out)
+}
+
+fn matrix_relationships(event: &OwnedValue) -> Vec<(String, String)> {
+    let mut relationships = Vec::new();
+    let OwnedValue::Object(fields) = event else {
+        return relationships;
+    };
+    for (field, kind) in [("prev_events", "prev"), ("auth_events", "auth")] {
+        if let Some(OwnedValue::Array(values)) = fields.get(field) {
+            for value in values.iter() {
+                let target = match value {
+                    OwnedValue::String(id) => Some(id.as_str()),
+                    OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    relationships.push((target.to_owned(), kind.to_owned()));
+                }
+            }
+        }
+    }
+    let Some(OwnedValue::Object(content)) = fields.get("content") else {
+        return relationships;
+    };
+    let Some(OwnedValue::Object(relates_to)) = content.get("m.relates_to") else {
+        return relationships;
+    };
+    if let (Some(OwnedValue::String(rel_type)), Some(OwnedValue::String(target))) =
+        (relates_to.get("rel_type"), relates_to.get("event_id"))
+    {
+        relationships.push((target.to_owned(), format!("relates_to:{rel_type}")));
+    }
+    if let Some(OwnedValue::Object(reply)) = relates_to.get("m.in_reply_to") {
+        if let Some(OwnedValue::String(target)) = reply.get("event_id") {
+            relationships.push((target.to_owned(), "relates_to:m.in_reply_to".to_owned()));
+        }
+    }
+    relationships
+}
+
 fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
     let mut collection_ids: Vec<[u8; 16]> = collections
         .iter()
@@ -8668,12 +8948,12 @@ mod tests {
         .unwrap();
         let stats = store.stats();
         assert_eq!(
-            stats.put_many_calls, 1,
-            "a same-event repeat must collapse into one batched write"
+            stats.put_many_calls, 2,
+            "the event batch and the state-group batch must each use one write"
         );
         assert_eq!(
-            stats.put_many_records, 1,
-            "the repeated event_id must not be written twice"
+            stats.put_many_records, 2,
+            "the repeated event_id must not be written twice, and its state mapping is one record"
         );
         let node_id = template_node_id(&template, &events[0]).unwrap().unwrap();
         assert!(
@@ -8862,11 +9142,11 @@ mod tests {
         )
         .unwrap();
 
-        let auth_dir = pool_dir.parent().unwrap().join("auth-chain");
+        let auth_dir = pool_dir.parent().unwrap().join("edges");
         assert_eq!(
             count_pack_records(&auth_dir),
             1,
-            "the auth-chain pool must hold exactly the one imported auth event, unchanged by the reimport"
+            "the edges pool must hold exactly the one imported auth event, unchanged by the reimport"
         );
     }
 
@@ -9000,6 +9280,7 @@ mod tests {
             create_event_id: Some("$create".into()),
             room_version: Some("10".into()),
             creator: Some("@alice:example.org".into()),
+            creation_ts: None,
         };
         let blob = extension.encode_blob();
         assert_eq!(MatrixRoomExtension::decode_blob(&blob), Some(extension));

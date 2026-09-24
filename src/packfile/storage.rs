@@ -1883,7 +1883,7 @@ impl PackfileStorage {
     ///
     /// Identical to [`Self::open_read_committed`] except the overlay applies
     /// only frames tagged with `pool`, so a worker reading the state pool does
-    /// not observe event-DAG or auth-chain mutations that share the same
+    /// not observe event-DAG or edges mutations that share the same
     /// segment. `wal_path` is the database root's shared `wal.bin`, not a
     /// per-pool segment.
     ///
@@ -6260,7 +6260,7 @@ impl PackfileStorage {
 
     /// Fetches the ancestors of `frontier`, walking `extract_edges`
     /// backward and stopping expansion at (and excluding) anything in
-    /// `stop_at` — a bounded ancestor walk, e.g. for auth-chain or
+    /// `stop_at` — a bounded ancestor walk, e.g. for edges or
     /// prev-event traversal from a caller-supplied frontier back to
     /// caller-supplied already-known boundary nodes.
     ///

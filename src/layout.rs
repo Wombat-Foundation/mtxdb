@@ -3,7 +3,7 @@
 //! A [`crate::packfile::storage::PackfileStorage`] owns exactly one pool;
 //! it must be opened on one of this module's pool directories, never on the
 //! database root. Keeping that boundary explicit gives state, event-DAG, and
-//! auth-chain data independent shard, GC, durability, and writer-lock
+//! edges data independent shard, GC, durability, and writer-lock
 //! lifecycles.
 
 use std::fs::{self, OpenOptions};
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 const DB_META_MAGIC: &[u8; 4] = b"MDBD";
 const DB_META_VERSION: u8 = 1;
 const DB_META_RESERVED_LEN: usize = 8;
-const DB_META_POOL_LIST: &[u8] = b"state\nevent-dag\nauth-chain\n";
+const DB_META_POOL_LIST: &[u8] = b"state\nevent-dag\nedges\n";
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
@@ -171,12 +171,12 @@ pub enum ShardType {
     /// Event JSON plus collection-DAG-oriented event data.
     EventDag,
     /// Auth-chain manifests and their closure traversal data.
-    AuthChain,
+    Edges,
 }
 
 impl ShardType {
     /// Every shard type defined by the current database layout.
-    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::AuthChain];
+    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::Edges];
 
     /// Stable on-disk directory name for this pool.
     #[must_use]
@@ -184,7 +184,7 @@ impl ShardType {
         match self {
             Self::State => "state",
             Self::EventDag => "event-dag",
-            Self::AuthChain => "auth-chain",
+            Self::Edges => "edges",
         }
     }
 
@@ -196,7 +196,7 @@ impl ShardType {
         match self {
             Self::State => *b"STAT",
             Self::EventDag => *b"EVNT",
-            Self::AuthChain => *b"AUTH",
+            Self::Edges => *b"AUTH",
         }
     }
 }
@@ -413,8 +413,8 @@ mod tests {
             root.join("pools/event-dag")
         );
         assert_eq!(
-            layout.pool_dir(ShardType::AuthChain).unwrap(),
-            root.join("pools/auth-chain")
+            layout.pool_dir(ShardType::Edges).unwrap(),
+            root.join("pools/edges")
         );
     }
 

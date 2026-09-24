@@ -121,12 +121,12 @@ pub(crate) fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> Result<u64, Storag
     Ok(watermark.saturating_add(1))
 }
 
-/// Index of `shard` in the fixed `[State, EventDag, AuthChain]` pool array.
+/// Index of `shard` in the fixed `[State, EventDag, Edges]` pool array.
 const fn shard_index(shard: ShardType) -> usize {
     match shard {
         ShardType::State => 0,
         ShardType::EventDag => 1,
-        ShardType::AuthChain => 2,
+        ShardType::Edges => 2,
     }
 }
 
@@ -270,7 +270,7 @@ mod tests {
             meta.push(1);
             meta.extend_from_slice(&[0u8; 8]);
             meta[4 + 1] = layout_code; // reserved[0] is the WAL-layout byte
-            meta.extend_from_slice(b"state\nevent-dag\nauth-chain\n");
+            meta.extend_from_slice(b"state\nevent-dag\nedges\n");
             std::fs::write(root.join("db.meta"), meta).unwrap();
             // A checkpoint watermark recorded before the shared segment existed.
             std::fs::write(root.join("pools/state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
@@ -320,7 +320,7 @@ mod tests {
                 let mut bytes = Vec::from(b"MDBD".as_slice());
                 bytes.push(1);
                 bytes.extend_from_slice(&[0u8; 8]);
-                bytes.extend_from_slice(b"state\nevent-dag\nauth-chain\n");
+                bytes.extend_from_slice(b"state\nevent-dag\nedges\n");
                 bytes
             },
         )

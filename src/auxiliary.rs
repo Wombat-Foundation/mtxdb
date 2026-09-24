@@ -11,6 +11,8 @@
 //! required. Reverting these derivations to SHA-256 would be a regression, not
 //! a compatibility fix.
 
+use std::collections::HashMap;
+
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{derive_collection_id, POOL_DST_INTERNAL};
 
@@ -103,7 +105,12 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
                 decode_value(&digest, &existing.bytes)?;
             }
         }
-        let mut encoded = Vec::with_capacity(VALUE_MAGIC.len() + DIGEST_LEN + value.len());
+        let capacity = VALUE_MAGIC
+            .len()
+            .checked_add(DIGEST_LEN)
+            .and_then(|length| length.checked_add(value.len()))
+            .ok_or_else(|| StorageError::Corrupt("auxiliary value length overflow".to_owned()))?;
+        let mut encoded = Vec::with_capacity(capacity);
         encoded.extend_from_slice(VALUE_MAGIC);
         encoded.extend_from_slice(&digest);
         encoded.extend_from_slice(value);
@@ -112,6 +119,66 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             &node_id,
             &NodeData::new(bytes::Bytes::from(encoded)),
         )
+    }
+
+    /// Insert or replace several values with one read and one write batch.
+    ///
+    /// Existing records are still checked for full-digest collisions, but
+    /// callers avoid one storage round trip per auxiliary entry.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] for malformed existing envelopes or
+    /// digest collisions, and propagates storage errors.
+    pub fn put_many(&self, entries: &[(&[u8], &[u8])]) -> Result<usize, StorageError> {
+        let mut physical: Vec<(NodeId, NodeData)> = Vec::with_capacity(entries.len());
+        let mut seen: HashMap<NodeId, AuxiliaryKeyDigest> = HashMap::with_capacity(entries.len());
+        for (key, value) in entries {
+            let digest = auxiliary_key_digest(key);
+            let node_id = physical_id(&digest);
+            if let Some(previous) = seen.insert(node_id, digest) {
+                if previous != digest {
+                    return Err(StorageError::Corrupt(
+                        "auxiliary-index key digest collision".to_owned(),
+                    ));
+                }
+            }
+            let capacity = VALUE_MAGIC
+                .len()
+                .checked_add(DIGEST_LEN)
+                .and_then(|length| length.checked_add(value.len()))
+                .ok_or_else(|| {
+                    StorageError::Corrupt("auxiliary value length overflow".to_owned())
+                })?;
+            let mut encoded = Vec::with_capacity(capacity);
+            encoded.extend_from_slice(VALUE_MAGIC);
+            encoded.extend_from_slice(&digest);
+            encoded.extend_from_slice(value);
+            physical.push((node_id, NodeData::new(bytes::Bytes::from(encoded))));
+        }
+
+        let ids: Vec<NodeId> = physical.iter().map(|(id, _)| *id).collect();
+        let existing = self.engine.get_many(&self.collection_id, &ids)?;
+        for ((_, data), existing) in physical.iter().zip(existing) {
+            if let Some(existing) = existing {
+                // The full digest is retained in the envelope. Validate it
+                // before allowing the batch to replace the record.
+                let digest_start = VALUE_MAGIC.len();
+                let digest_end = digest_start.checked_add(DIGEST_LEN).ok_or_else(|| {
+                    StorageError::Corrupt("auxiliary digest length overflow".to_owned())
+                })?;
+                let digest: AuxiliaryKeyDigest = data
+                    .bytes
+                    .get(digest_start..digest_end)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        StorageError::Corrupt(
+                            "new auxiliary value has an incomplete digest envelope".to_owned(),
+                        )
+                    })?;
+                decode_value(&digest, &existing.bytes)?;
+            }
+        }
+        self.engine.put_many(&self.collection_id, &physical)
     }
 }
 
