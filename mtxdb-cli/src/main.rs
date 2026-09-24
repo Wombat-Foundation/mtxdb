@@ -129,6 +129,8 @@ pub(crate) enum Commands {
         all: bool,
         root: Vec<String>,
         topo: bool,
+        out: Option<PathBuf>,
+        yes: bool,
     },
     Delete {
         collections: Vec<String>,
@@ -226,7 +228,7 @@ fn global_args(cmd: Command) -> Command {
             .long("coalesce")
             .action(ArgAction::SetTrue)
             .global(true)
-            .help("Aggregate and coalesce views across multiple database roots"),
+            .help("Aggregate supported read-only reports across multiple database roots (shards, collections, stats, get) or coalescing repack (--out)"),
     )
     .arg(
         Arg::new("shard_type")
@@ -533,6 +535,19 @@ fn sub_repack() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Repack in topological order (requires edge-capable data format)"),
         )
+        .arg(
+            Arg::new("out")
+                .long("out")
+                .value_name("DIR")
+                .help("Destination directory for coalescing repack into a new canonical database"),
+        )
+        .arg(
+            Arg::new("yes")
+                .short('y')
+                .long("yes")
+                .action(ArgAction::SetTrue)
+                .help("Skip interactive confirmation"),
+        )
 }
 
 fn sub_delete() -> Command {
@@ -703,6 +718,8 @@ fn parse_cli() -> Cli {
                 .cloned()
                 .collect(),
             topo: m.get_flag("topo"),
+            out: m.get_one::<String>("out").map(PathBuf::from),
+            yes: m.get_flag("yes"),
         },
         Some(("delete", m)) => Commands::Delete {
             collections: m
@@ -863,5 +880,18 @@ mod parse_tests {
             .try_get_matches_from(["mtxdb", "--coalesce", "shards", "-d", "dir1", "dir2"])
             .unwrap();
         assert!(m.get_flag("coalesce"));
+
+        let m = build_cli()
+            .try_get_matches_from([
+                "mtxdb", "repack", "-d", "dir1", "dir2", "-c", "--out", "target", "-y",
+            ])
+            .unwrap();
+        assert!(m.get_flag("coalesce"));
+        let sub = m.subcommand_matches("repack").unwrap();
+        assert_eq!(
+            sub.get_one::<String>("out").map(String::as_str),
+            Some("target")
+        );
+        assert!(sub.get_flag("yes"));
     }
 }

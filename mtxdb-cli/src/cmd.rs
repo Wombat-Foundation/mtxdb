@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -162,7 +162,50 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
     Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
+fn command_name(cmd: &Commands) -> &'static str {
+    match cmd {
+        Commands::Init => "init",
+        Commands::Put { .. } => "put",
+        Commands::Get { .. } => "get",
+        Commands::Scan { .. } => "scan",
+        Commands::Delete { .. } => "delete",
+        Commands::Shards { .. } => "shards",
+        Commands::Collections { .. } => "collections",
+        Commands::Info { .. } => "info",
+        Commands::Sync { .. } => "sync",
+        Commands::Stats { .. } => "stats",
+        Commands::Import { .. } => "import",
+        Commands::Export { .. } => "export",
+        Commands::Repack { .. } => "repack",
+        Commands::Completions { .. } => "completions",
+        _ => "internal",
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
+    if cli.coalesce {
+        match &cli.command {
+            Commands::Shards { .. }
+            | Commands::Collections { .. }
+            | Commands::Stats { .. }
+            | Commands::Get { .. }
+            | Commands::Repack { out: Some(_), .. } => {}
+            Commands::Repack { out: None, .. } => {
+                bail!("--coalesce is not supported for in-place repack; coalescing repack requires --out <DIR>");
+            }
+            _ => {
+                let name = command_name(&cli.command);
+                bail!("--coalesce is not supported by `mtxdb {name}`");
+            }
+        }
+        if cli.dirs_or_default().len() == 1
+            && !matches!(&cli.command, Commands::Repack { out: Some(_), .. })
+        {
+            eprintln!("warning: --coalesce has no effect with only one database directory");
+        }
+    }
+
     match &cli.command {
         Commands::Put {
             collection,
@@ -226,9 +269,24 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             all,
             root,
             topo,
+            out,
+            yes,
         } => {
-            cli.require_single_dir("repack")?;
-            cmd_repack(cli, collection.as_deref(), packs, *all, root, *topo)
+            if let Some(out_dir) = out {
+                cmd_repack_coalesced(
+                    cli,
+                    out_dir,
+                    collection.as_deref(),
+                    packs,
+                    *all,
+                    root,
+                    *topo,
+                    *yes,
+                )
+            } else {
+                cli.require_single_dir("repack")?;
+                cmd_repack(cli, collection.as_deref(), packs, *all, root, *topo, *yes)
+            }
         }
         Commands::Delete { collections, yes } => {
             cli.require_single_dir("delete")?;
@@ -430,7 +488,7 @@ fn open_layout(cli: &Cli) -> anyhow::Result<DatabaseLayout> {
 }
 
 /// Collect all valid database directories among the CLI's targeted paths,
-/// skipping non-directories and directories lacking `db.meta` with warnings.
+/// skipping non-directories and invalid databases with warnings.
 pub(crate) fn valid_database_dirs(cli: &Cli) -> anyhow::Result<Vec<PathBuf>> {
     let dirs = cli.dirs_or_default();
     let mut valid = Vec::new();
@@ -439,14 +497,15 @@ pub(crate) fn valid_database_dirs(cli: &Cli) -> anyhow::Result<Vec<PathBuf>> {
             eprintln!("skipping `{}`: not a directory", dir.display());
             continue;
         }
-        if !dir.join("db.meta").is_file() {
-            eprintln!(
-                "skipping `{}`: no db.meta found (not an mtxdb database)",
-                dir.display()
-            );
-            continue;
+        match DatabaseLayout::open_read_only(dir.clone()) {
+            Ok(_) => valid.push(dir.clone()),
+            Err(e) => {
+                eprintln!(
+                    "skipping `{}`: not a valid mtxdb database ({e})",
+                    dir.display()
+                );
+            }
         }
-        valid.push(dir.clone());
     }
     if valid.is_empty() {
         bail!(
@@ -504,12 +563,15 @@ where
             eprintln!("skipping `{}`: not a directory", dir.display());
             continue;
         }
-        if !dir.join("db.meta").is_file() {
-            eprintln!(
-                "skipping `{}`: no db.meta found (not an mtxdb database)",
-                dir.display()
-            );
-            continue;
+        match DatabaseLayout::open_read_only(dir.clone()) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "skipping `{}`: not a valid mtxdb database ({e})",
+                    dir.display()
+                );
+                continue;
+            }
         }
 
         if executed > 0 {
@@ -534,6 +596,9 @@ where
     }
     if failed == executed {
         bail!("all {executed} database targets failed");
+    }
+    if failed > 0 {
+        eprintln!("warning: {failed} of {executed} database targets failed");
     }
     Ok(())
 }
@@ -845,7 +910,7 @@ fn cmd_get_coalesced(
     };
 
     for db_dir in &valid_dirs {
-        let Ok(layout) = DatabaseLayout::open(db_dir.clone()) else {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
             continue;
         };
         for &shard_type in &shard_types {
@@ -882,7 +947,10 @@ fn cmd_get_coalesced(
         sorted_candidates.sort_by(|a, b| {
             b.origin_server_ts
                 .cmp(&a.origin_server_ts)
+                .then_with(|| a.shard_type.as_str().cmp(b.shard_type.as_str()))
+                .then_with(|| a.collection_id.cmp(&b.collection_id))
                 .then_with(|| a.db_dir.to_string_lossy().cmp(&b.db_dir.to_string_lossy()))
+                .then_with(|| a.data.bytes.cmp(&b.data.bytes))
         });
 
         let selected = sorted_candidates[0];
@@ -894,13 +962,13 @@ fn cmd_get_coalesced(
             set.len()
         };
 
-        let ts_msg = match selected.origin_server_ts {
-            Some(ts) => format!("origin_server_ts: {ts}"),
-            None => "lexicographical tie-break".to_owned(),
+        let strategy_msg = match selected.origin_server_ts {
+            Some(ts) => format!("newest by origin_server_ts: {ts}"),
+            None => "deterministic lexical fallback".to_owned(),
         };
 
         eprintln!(
-            "warning: conflicting records found for ID {id} ({distinct_payloads} distinct payloads across {} databases); selecting newest ({ts_msg}) from `{}`",
+            "warning: conflicting records found for ID {id} ({distinct_payloads} distinct payloads across {} databases); selecting {strategy_msg} from `{}`",
             candidates.len(),
             selected.db_dir.display()
         );
@@ -1399,6 +1467,7 @@ fn cmd_collections_coalesced(
     struct CoalescedCol {
         id: [u8; 16],
         canonical: Option<String>,
+        canonical_conflict: bool,
         nodes: usize,
         memory: usize,
         capacity: u32,
@@ -1429,7 +1498,7 @@ fn cmd_collections_coalesced(
         let mut total_dbs_with_collections = HashSet::new();
 
         for db_dir in valid_dirs {
-            let Ok(layout_db) = DatabaseLayout::open(db_dir.clone()) else {
+            let Ok(layout_db) = DatabaseLayout::open_read_only(db_dir.clone()) else {
                 continue;
             };
             let Ok(pool_dir) = pool_dir(&layout_db, shard_type) else {
@@ -1509,6 +1578,7 @@ fn cmd_collections_coalesced(
                 let entry = map.entry(col_id).or_insert_with(|| CoalescedCol {
                     id: col_id,
                     canonical: None,
+                    canonical_conflict: false,
                     nodes: 0,
                     memory: 0,
                     capacity: 0,
@@ -1527,8 +1597,16 @@ fn cmd_collections_coalesced(
                 entry.runs = entry.runs.saturating_add(runs);
                 entry.largest_segment = entry.largest_segment.max(largest);
                 entry.avoidable = entry.avoidable.saturating_add(avoidable);
-                if entry.canonical.is_none() {
-                    if let Some(c) = canonical_map.get(&col_id) {
+                if let Some(c) = canonical_map.get(&col_id) {
+                    if let Some(existing) = &entry.canonical {
+                        if existing != c {
+                            entry.canonical_conflict = true;
+                            eprintln!(
+                                "warning: conflicting canonical IDs for collection {}: `{existing}` vs `{c}`",
+                                format_id(&col_id)
+                            );
+                        }
+                    } else {
                         entry.canonical = Some(c.clone());
                     }
                 }
@@ -1621,9 +1699,15 @@ fn cmd_collections_coalesced(
             usize::try_from(limit).unwrap_or(usize::MAX)
         };
 
+        let has_canonical_conflict = ordered.iter().any(|c| c.canonical_conflict);
+
         for item in ordered.into_iter().take(max_rows) {
             let hex = format_id(&item.id);
-            let canonical_id = item.canonical.as_deref().unwrap_or("-");
+            let canonical_id = if item.canonical_conflict {
+                format!("{}*", item.canonical.as_deref().unwrap_or("-"))
+            } else {
+                item.canonical.as_deref().unwrap_or("-").to_owned()
+            };
             let load = fmt_load_percent(item.nodes, item.capacity);
             let shards = if item.shards_count == 1 {
                 String::new()
@@ -1680,6 +1764,13 @@ fn cmd_collections_coalesced(
             "{total_rows} collection(s) across {} database(s), {} on disk",
             total_dbs_with_collections.len(),
             fmt_disk_megabytes(total_disk_bytes)
+        );
+        if has_canonical_conflict {
+            println!("* conflicting canonical collection IDs detected across databases");
+        }
+        println!(
+            "note: collection IDs deduplicated across {} database(s), node counts and metrics summed",
+            total_dbs_with_collections.len()
         );
     }
     Ok(())
@@ -2147,7 +2238,7 @@ fn cmd_shards_coalesced(
         let mut dbs_with_packs = HashSet::new();
 
         for db_dir in valid_dirs {
-            let Ok(layout_db) = DatabaseLayout::open(db_dir.clone()) else {
+            let Ok(layout_db) = DatabaseLayout::open_read_only(db_dir.clone()) else {
                 continue;
             };
             let Ok(pool_dir) = pool_dir(&layout_db, shard_type) else {
@@ -2332,6 +2423,9 @@ fn cmd_shards_coalesced(
             rows.len(),
             dbs_with_packs.len()
         );
+        println!(
+            "note: unique collections deduplicated, pack/index/node counts summed across databases"
+        );
     }
     Ok(())
 }
@@ -2435,7 +2529,7 @@ fn cmd_stats_coalesced(cli: &Cli, valid_dirs: &[PathBuf], json: bool) -> anyhow:
         let mut total_bytes_written = 0_u64;
 
         for db_dir in valid_dirs {
-            let Ok(layout) = DatabaseLayout::open(db_dir.clone()) else {
+            let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
                 continue;
             };
             let Ok(pool_dir) = pool_dir(&layout, shard_type) else {
@@ -2520,6 +2614,7 @@ fn cmd_stats_coalesced(cli: &Cli, valid_dirs: &[PathBuf], json: bool) -> anyhow:
                 fmt_bytes(s.total_bytes_written)
             );
             println!("    syncs            {}", s.total_syncs);
+            println!("  (note: collection IDs deduplicated, pack/index/disk metrics summed across databases)");
         }
     }
     Ok(())
@@ -6833,6 +6928,405 @@ fn nested_event_string_field<'a>(
     }
 }
 
+struct CoalescedSourceDb {
+    path: PathBuf,
+    store: PackfileStorage,
+    pool_dir: PathBuf,
+}
+
+const COALESCE_REPACK_CHUNK_SIZE: usize = 1000;
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "orchestrates discovery, candidate scanning, conflict resolution, DAG ordering, and canonical pack generation"
+)]
+fn cmd_repack_coalesced(
+    cli: &Cli,
+    out_dir: &Path,
+    collection: Option<&str>,
+    packs: &[String],
+    all: bool,
+    roots: &[String],
+    topo: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    if cli.dirs.len() > 1 && !cli.coalesce {
+        bail!("repacking across multiple database roots requires --coalesce (-c)");
+    }
+    if !packs.is_empty() {
+        bail!("--pack is not supported with coalescing repack; use --all or --collection <collection>");
+    }
+    if collection.is_none() && !all {
+        bail!("coalescing repack requires --all or --collection <collection>");
+    }
+    if !roots.is_empty() {
+        if collection.is_none() {
+            bail!("--root requires --collection — live roots are per-collection, not meaningful for --all");
+        }
+        if !topo {
+            bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+        }
+    }
+    if topo {
+        println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
+    } else {
+        println!("warning: --topo without --root means no GC; all records preserved");
+    }
+
+    let valid_dirs = valid_database_dirs(cli)?;
+    for dir in &valid_dirs {
+        if let (Ok(can_in), Ok(can_out)) = (dir.canonicalize(), out_dir.canonicalize()) {
+            if can_in == can_out {
+                bail!(
+                    "output directory `{}` cannot be one of the source databases",
+                    out_dir.display()
+                );
+            }
+        }
+    }
+    if out_dir.exists() {
+        if !out_dir.is_dir() {
+            bail!("output path `{}` is not a directory", out_dir.display());
+        }
+        let mut entries = fs::read_dir(out_dir)
+            .with_context(|| format!("failed to read output directory `{}`", out_dir.display()))?;
+        if entries.next().is_some() {
+            bail!(
+                "output directory `{}` already exists and is not empty",
+                out_dir.display()
+            );
+        }
+    }
+
+    let shard_type = cli.require_shard_type()?;
+    let mut sources = Vec::new();
+    for db_dir in &valid_dirs {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
+            continue;
+        };
+        let Ok(pool_dir) = layout.pool_dir_read_only(shard_type) else {
+            continue;
+        };
+        if glob_pack_files(&pool_dir).map_or(true, |p| p.is_empty()) {
+            continue;
+        }
+        let store = PackfileStorage::open_read_only(pool_dir.clone())?;
+        sources.push(CoalescedSourceDb {
+            path: db_dir.clone(),
+            store,
+            pool_dir,
+        });
+    }
+    if sources.is_empty() {
+        bail!(
+            "no source databases contain active data for {} pool",
+            shard_type.as_str()
+        );
+    }
+
+    let target_collections: HashSet<[u8; 16]> = if let Some(col_str) = collection {
+        let cid = parse_collection_id(col_str)?;
+        let mut set = HashSet::new();
+        set.insert(cid);
+        set
+    } else {
+        let mut set = HashSet::new();
+        for src in &sources {
+            for cid in src.store.collection_ids() {
+                set.insert(cid);
+            }
+        }
+        set
+    };
+
+    let mut candidates_by_col: HashMap<
+        [u8; 16],
+        BTreeMap<mtxdb::NodeId, Vec<(PathBuf, NodeData)>>,
+    > = HashMap::new();
+
+    for src in &sources {
+        let mut pack_paths = Vec::new();
+        if let Ok(entries) = fs::read_dir(&src.pool_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "pack") {
+                    pack_paths.push(p);
+                }
+            }
+        }
+        pack_paths.sort();
+
+        let mut seen_in_src: HashMap<[u8; 16], HashSet<mtxdb::NodeId>> = HashMap::new();
+        for pack_path in &pack_paths {
+            let entries = match mtxdb::packfile::scan_packfile(pack_path) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to scan packfile `{}`: {err}",
+                        pack_path.display()
+                    );
+                    continue;
+                }
+            };
+            for (col_id, node_id, _offset) in entries {
+                if target_collections.contains(&col_id) {
+                    seen_in_src.entry(col_id).or_default().insert(node_id);
+                }
+            }
+        }
+
+        for &col_id in &target_collections {
+            if src.store.collection_index_info(&col_id).is_some() {
+                seen_in_src
+                    .entry(col_id)
+                    .or_default()
+                    .insert(mtxdb::COLLECTION_METADATA_RECORD_ID);
+            }
+        }
+
+        for (col_id, node_ids) in seen_in_src {
+            let col_map = candidates_by_col.entry(col_id).or_default();
+            for node_id in node_ids {
+                match src.store.get(&col_id, &node_id) {
+                    Ok(Some(data)) => {
+                        col_map
+                            .entry(node_id)
+                            .or_default()
+                            .push((src.path.clone(), data));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed to get node {} in collection {} from `{}`: {err}",
+                            hex::encode(node_id),
+                            format_id(&col_id),
+                            src.path.display(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut total_collections = 0usize;
+    let mut total_nodes = 0usize;
+    for nodes in candidates_by_col.values() {
+        if !nodes.is_empty() {
+            total_collections = total_collections.saturating_add(1);
+            total_nodes = total_nodes.saturating_add(nodes.len());
+        }
+    }
+    if total_collections == 0 {
+        println!("no collections found to repack");
+        return Ok(());
+    }
+    println!(
+        "coalescing repack preflight: {} collection{}, {} unique nodes across {} database{} -> {}",
+        total_collections,
+        if total_collections == 1 { "" } else { "s" },
+        total_nodes,
+        sources.len(),
+        if sources.len() == 1 { "" } else { "s" },
+        out_dir.display(),
+    );
+    if !yes && !confirm("Proceed with coalescing repack?")? {
+        println!("aborted");
+        return Ok(());
+    }
+
+    let target_layout = DatabaseLayout::open(out_dir.to_path_buf())?;
+    let target_pool_dir = target_layout.pool_dir(shard_type)?;
+    let target_store = PackfileStorage::open(target_pool_dir)?;
+
+    let mut sorted_collection_ids: Vec<[u8; 16]> = candidates_by_col.keys().copied().collect();
+    sorted_collection_ids.sort_unstable();
+
+    let mut written_collections = 0usize;
+    let mut written_nodes = 0usize;
+
+    for collection_id in sorted_collection_ids {
+        let nodes_map = candidates_by_col.remove(&collection_id).unwrap_or_default();
+        if nodes_map.is_empty() {
+            continue;
+        }
+
+        let mut resolved_nodes: HashMap<mtxdb::NodeId, NodeData> =
+            HashMap::with_capacity(nodes_map.len());
+        for (node_id, mut candidates) in nodes_map {
+            if candidates.is_empty() {
+                continue;
+            }
+            let data = if candidates.len() == 1 {
+                candidates.remove(0).1
+            } else {
+                let first_bytes = candidates[0].1.bytes.clone();
+                if candidates.iter().all(|(_, d)| d.bytes == first_bytes) {
+                    candidates.remove(0).1
+                } else {
+                    let mut ranked: Vec<(PathBuf, NodeData, Option<u64>)> = candidates
+                        .into_iter()
+                        .map(|(db, d)| {
+                            let ts = extract_origin_server_ts(&d.bytes);
+                            (db, d, ts)
+                        })
+                        .collect();
+                    ranked.sort_by(|a, b| {
+                        b.2.cmp(&a.2)
+                            .then_with(|| a.0.to_string_lossy().cmp(&b.0.to_string_lossy()))
+                    });
+                    let distinct_payloads = {
+                        let mut set = HashSet::new();
+                        for (_, d, _) in &ranked {
+                            set.insert(&d.bytes);
+                        }
+                        set.len()
+                    };
+                    let winner = ranked.remove(0);
+                    let ts_msg = match winner.2 {
+                        Some(ts) => format!("origin_server_ts: {ts}"),
+                        None => "lexicographical tie-break".to_owned(),
+                    };
+                    eprintln!(
+                        "warning: conflicting records found for collection {} node {} ({} distinct payloads); selecting newest ({ts_msg}) from `{}`",
+                        format_id(&collection_id),
+                        hex::encode(node_id),
+                        distinct_payloads,
+                        winner.0.display()
+                    );
+                    winner.1
+                }
+            };
+            resolved_nodes.insert(node_id, data);
+        }
+
+        if !roots.is_empty() {
+            let mut root_ids = Vec::new();
+            for r in roots {
+                root_ids.push(matrix_event_node_id(r)?);
+            }
+            let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
+            for (node_id, data) in &resolved_nodes {
+                let edges = extract_matrix_edges(node_id, &data.bytes);
+                adjacency.insert(*node_id, edges);
+            }
+            let mut visited = HashSet::new();
+            let mut queue = VecDeque::new();
+            for rid in &root_ids {
+                if resolved_nodes.contains_key(rid) && visited.insert(*rid) {
+                    queue.push_back(*rid);
+                }
+            }
+            while let Some(curr) = queue.pop_front() {
+                if let Some(edges) = adjacency.get(&curr) {
+                    for edge in edges {
+                        if resolved_nodes.contains_key(edge) && visited.insert(*edge) {
+                            queue.push_back(*edge);
+                        }
+                    }
+                }
+            }
+            resolved_nodes.retain(|k, _| visited.contains(k));
+        }
+
+        let ordered_hashes: Vec<[u8; 16]> = if topo {
+            let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
+            for (node_id, data) in &resolved_nodes {
+                let edges = extract_matrix_edges(node_id, &data.bytes);
+                adjacency.insert(*node_id, edges);
+            }
+            let mut live_hashes: Vec<[u8; 16]> = resolved_nodes.keys().copied().collect();
+            live_hashes.sort_unstable();
+            let csr = mtxdb::csr::Csr::build_from_edges(&live_hashes, &adjacency);
+            let topo_order = csr.topo_order();
+            if topo_order.len() == live_hashes.len() {
+                topo_order
+                    .into_iter()
+                    .map(|idx| *csr.hash_of(idx).expect("valid local id"))
+                    .collect()
+            } else {
+                eprintln!(
+                    "warning: cyclic graph detected in collection {}; falling back to chronological order",
+                    format_id(&collection_id)
+                );
+                let mut sorted = live_hashes;
+                sorted.sort_by(|a, b| {
+                    let ts_a = resolved_nodes
+                        .get(a)
+                        .and_then(|d| extract_origin_server_ts(&d.bytes));
+                    let ts_b = resolved_nodes
+                        .get(b)
+                        .and_then(|d| extract_origin_server_ts(&d.bytes));
+                    ts_a.cmp(&ts_b).then_with(|| a.cmp(b))
+                });
+                sorted
+            }
+        } else {
+            let mut sorted: Vec<[u8; 16]> = resolved_nodes.keys().copied().collect();
+            sorted.sort_by(|a, b| {
+                let ts_a = resolved_nodes
+                    .get(a)
+                    .and_then(|d| extract_origin_server_ts(&d.bytes));
+                let ts_b = resolved_nodes
+                    .get(b)
+                    .and_then(|d| extract_origin_server_ts(&d.bytes));
+                ts_a.cmp(&ts_b).then_with(|| a.cmp(b))
+            });
+            sorted
+        };
+
+        let mut entries: Vec<(mtxdb::NodeId, NodeData)> = Vec::with_capacity(ordered_hashes.len());
+        for hash in ordered_hashes {
+            if let Some(data) = resolved_nodes.remove(&hash) {
+                entries.push((hash, data));
+            }
+        }
+
+        let meta_pos = entries
+            .iter()
+            .position(|(id, _)| *id == mtxdb::COLLECTION_METADATA_RECORD_ID);
+        if let Some(pos) = meta_pos {
+            if pos != 0 {
+                let meta_entry = entries.remove(pos);
+                entries.insert(0, meta_entry);
+            }
+        }
+
+        let node_count = entries.len();
+        for chunk in entries.chunks(COALESCE_REPACK_CHUNK_SIZE) {
+            target_store.put_many(&collection_id, chunk)?;
+        }
+
+        if !roots.is_empty() {
+            let mut root_ids = Vec::new();
+            for r in roots {
+                root_ids.push(matrix_event_node_id(r)?);
+            }
+            target_store.set_live_roots(&collection_id, root_ids);
+        }
+
+        written_collections = written_collections.saturating_add(1);
+        written_nodes = written_nodes.saturating_add(node_count);
+    }
+
+    target_store.persist_shard_collections()?;
+    target_store.sync()?;
+    drop(target_store);
+
+    println!(
+        "coalescing repack complete: {} collection{}, {} nodes written to {}",
+        written_collections,
+        if written_collections == 1 { "" } else { "s" },
+        written_nodes,
+        out_dir.display()
+    );
+    println!("post-repack shard state:");
+    let target_cli = cli.with_dir(out_dir.to_path_buf());
+    cmd_shards_single(&target_cli, false, false, None)?;
+    Ok(())
+}
+
 fn cmd_repack(
     cli: &Cli,
     collection: Option<&str>,
@@ -6840,6 +7334,7 @@ fn cmd_repack(
     all: bool,
     roots: &[String],
     topo: bool,
+    yes: bool,
 ) -> anyhow::Result<()> {
     let target = match (collection, packs.is_empty(), all) {
         (Some(collection), true, false) => {
@@ -6876,7 +7371,7 @@ fn cmd_repack(
     } else {
         println!("warning: --topo without --root means no GC; all records preserved");
     }
-    cmd_repack_target(cli, &target, topo, roots)
+    cmd_repack_target(cli, &target, topo, roots, yes)
 }
 
 /// Compacts every pack transitively touched by collections referencing a
@@ -7165,12 +7660,13 @@ fn cmd_repack_target(
     target: &RepackTarget,
     topo: bool,
     roots: &[String],
+    yes: bool,
 ) -> anyhow::Result<()> {
     let Some(preview) = repack_preview(cli, target, topo, roots)? else {
         return Ok(());
     };
 
-    if !confirm("Apply this repack?")? {
+    if !yes && !confirm("Apply this repack?")? {
         println!("aborted");
         return Ok(());
     }
@@ -7333,16 +7829,16 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
 mod tests {
     use super::{
         blake3_digest, build_event_dag, cmd_collections, cmd_get, cmd_import_file, cmd_info,
-        cmd_scan, cmd_shards, cmd_stats, cmd_sync, collection_canonical_id,
+        cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync, collection_canonical_id,
         compile_import_template, compute_state_groups, decode_event_json_record, decode_hamt_node,
         decode_hamt_root, default_matrix_import_template, derive_template_key, event_id,
         event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
         format_id, glob_pack_files, import_pdu_events, interleaving_worth_noting,
         listing_shard_types, matrix_batch_has_create, matrix_room_collection_id,
         matrix_room_extension_from_store, parse_federation_input, parse_pack_id_selector,
-        parse_pack_selectors, pretty_print_payload, resolve_import_collection, scan_payload_suffix,
-        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        MatrixRoomExtension, StateSet, MATRIX_ROOM_POOL_DST,
+        parse_pack_selectors, pretty_print_payload, resolve_import_collection, run,
+        scan_payload_suffix, template_collection_id, template_node_id, verify_auth_chain_edges,
+        CollectionTemplate, MatrixRoomExtension, StateSet, MATRIX_ROOM_POOL_DST,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -9583,5 +10079,146 @@ mod tests {
 
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn coalesce_safeguards_reject_unsupported_commands() {
+        let dir = unique_temp_dir();
+        let _ = DatabaseLayout::open(dir.clone()).unwrap();
+
+        let unsupported = vec![
+            Commands::Info {
+                collection: "0x00000000000000000000000000000000".to_owned(),
+                stats: false,
+            },
+            Commands::Scan {
+                selector: "0x00000000000000000000000000000000".to_owned(),
+                verbose: false,
+                limit: 10,
+                id: None,
+                collection: None,
+                raw: false,
+                sort: None,
+                reverse: false,
+            },
+            Commands::Sync { all: true },
+            Commands::Put {
+                collection: "0x00000000000000000000000000000000".to_owned(),
+                id: "$event:example.org".to_owned(),
+                data: "{}".to_owned(),
+            },
+            Commands::Delete {
+                collections: vec!["0x00000000000000000000000000000000".to_owned()],
+                yes: true,
+            },
+            Commands::Import {
+                paths: vec![],
+                collection: None,
+                template: None,
+            },
+            Commands::Export {
+                collection: "0x00000000000000000000000000000000".to_owned(),
+            },
+            Commands::Repack {
+                collection: None,
+                packs: vec![],
+                all: true,
+                root: vec![],
+                topo: false,
+                out: None,
+                yes: true,
+            },
+        ];
+
+        for cmd in unsupported {
+            let cli = Cli {
+                dirs: vec![dir.clone()],
+                shard_type: None,
+                coalesce: true,
+                command: cmd,
+            };
+            assert!(
+                run(&cli).is_err(),
+                "command should have been rejected with --coalesce"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn coalesced_repack_materializes_canonical_database() {
+        let dir1 = unique_temp_dir();
+        let dir2 = unique_temp_dir();
+        let out_dir = unique_temp_dir();
+
+        let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
+        let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
+
+        let col = [0x11; 16];
+        let node1 = [0x22; 16];
+        let node2 = [0x33; 16];
+
+        let s1 =
+            PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        s1.put(
+            &col,
+            &node1,
+            &NodeData::new(Bytes::from_static(
+                br#"{"origin_server_ts": 100, "content": "msg1"}"#,
+            )),
+        )
+        .unwrap();
+        s1.sync().unwrap();
+
+        let s2 =
+            PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        s2.put(
+            &col,
+            &node2,
+            &NodeData::new(Bytes::from_static(
+                br#"{"origin_server_ts": 200, "content": "msg2"}"#,
+            )),
+        )
+        .unwrap();
+        s2.sync().unwrap();
+
+        let cli = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: true,
+            command: Commands::Repack {
+                collection: None,
+                packs: vec![],
+                all: true,
+                root: vec![],
+                topo: false,
+                out: Some(out_dir.clone()),
+                yes: true,
+            },
+        };
+
+        // Run coalescing repack
+        cmd_repack_coalesced(&cli, &out_dir, None, &[], true, &[], false, true).unwrap();
+
+        // Target directory must be a valid canonical database
+        let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
+        let out_pool = out_layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+        let out_store = PackfileStorage::open_read_only(out_pool).unwrap();
+
+        // Both nodes must be present in the newly materialized database
+        let r1 = out_store.get(&col, &node1).unwrap();
+        assert!(r1.is_some());
+        let r2 = out_store.get(&col, &node2).unwrap();
+        assert!(r2.is_some());
+
+        // Target store must have exactly 1 pack (linearized canonical pack 0)
+        let summaries = out_store.shard_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].pack_id, 0);
+
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 }
