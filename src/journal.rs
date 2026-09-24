@@ -18,16 +18,97 @@ use crate::layout::ShardType;
 use crc32fast::Hasher;
 
 const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
-/// Bumped to 2 when the header gained the base sequence/LSN a rotated segment
-/// needs to keep numbering global across a rewrite.
-const FILE_VERSION: u32 = 2;
-// magic(8) + version(4) + base_sequence(8) + base_lsn(8) + header CRC(4).
-const FILE_HEADER_LEN: usize = 32;
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
-const GROUP_HEADER_LEN: usize = 48;
 const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
-const GROUP_TRAILER_LEN: usize = 16;
-const FRAME_FIXED_LEN: usize = 48;
+
+/// On-disk journal format version. The single place that decides frame
+/// dialect: callers match on this rather than comparing raw version numbers,
+/// so a future bump only has to add a variant here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalVersion {
+    /// Per-pool segment. Mutation frames are untagged and the flag byte must be
+    /// zero. Bumped to 2 when the header gained the base sequence/LSN a rotated
+    /// segment needs to keep numbering global across a rewrite.
+    V2,
+    /// Shared multi-pool segment. Every mutation frame carries a mandatory pool
+    /// tag in the flag byte, so one physical WAL can carry the state,
+    /// event-DAG, and auth-chain pools and recovery can route each frame back
+    /// to its pool.
+    V3PoolTagged,
+}
+
+impl JournalVersion {
+    /// Version a freshly created per-pool segment uses.
+    const fn per_pool() -> Self {
+        Self::V2
+    }
+
+    /// Version a freshly created shared (multi-pool) segment uses.
+    const fn shared() -> Self {
+        Self::V3PoolTagged
+    }
+
+    const fn as_u32(self) -> u32 {
+        match self {
+            Self::V2 => 2,
+            Self::V3PoolTagged => 3,
+        }
+    }
+
+    fn from_u32(value: u32) -> io::Result<Self> {
+        match value {
+            2 => Ok(Self::V2),
+            3 => Ok(Self::V3PoolTagged),
+            _ => Err(invalid_data("unsupported journal version")),
+        }
+    }
+
+    /// Whether every mutation frame in this segment must carry a pool tag.
+    const fn is_pool_tagged(self) -> bool {
+        matches!(self, Self::V3PoolTagged)
+    }
+}
+
+// File header field byte ranges. `FILE_HEADER_LEN` is the sum of the fields.
+const FH_MAGIC: std::ops::Range<usize> = 0..8;
+const FH_VERSION: std::ops::Range<usize> = 8..12;
+const FH_BASE_SEQUENCE: std::ops::Range<usize> = 12..20;
+const FH_BASE_LSN: std::ops::Range<usize> = 20..28;
+const FH_CRC: std::ops::Range<usize> = 28..32;
+/// Header bytes covered by the trailing CRC (everything before it).
+const FH_CRC_COVERED: std::ops::Range<usize> = 0..FH_CRC.start;
+const FILE_HEADER_LEN: usize = FH_CRC.end;
+
+// Group header field byte ranges (`GROUP_HEADER_LEN` is the sum of the fields).
+const GH_MAGIC: std::ops::Range<usize> = 0..4;
+const GH_HEADER_LEN: std::ops::Range<usize> = 4..8;
+const GH_SEQUENCE: std::ops::Range<usize> = 8..16;
+const GH_FIRST_LSN: std::ops::Range<usize> = 16..24;
+const GH_LAST_LSN: std::ops::Range<usize> = 24..32;
+const GH_PAYLOAD_LEN: std::ops::Range<usize> = 32..40;
+const GH_RECORD_COUNT: std::ops::Range<usize> = 40..44;
+const GH_CRC: std::ops::Range<usize> = 44..48;
+/// Group-header bytes covered by `GH_CRC` (everything before it).
+const GH_CRC_COVERED: std::ops::Range<usize> = 0..GH_CRC.start;
+const GROUP_HEADER_LEN: usize = GH_CRC.end;
+
+// Group commit-trailer field byte ranges.
+const GT_MAGIC: std::ops::Range<usize> = 0..4;
+const GT_SEQUENCE: std::ops::Range<usize> = 4..12;
+const GT_CRC: std::ops::Range<usize> = 12..16;
+const GROUP_TRAILER_LEN: usize = GT_CRC.end;
+
+// Mutation frame field byte ranges. A frame is `FRAME_FIXED_LEN` fixed bytes,
+// then the payload, then `FRAME_TRAILER_LEN` CRC bytes.
+const MF_KIND: std::ops::Range<usize> = 0..1;
+/// Pool tag (version 3) or reserved zero (version 2).
+const MF_POOL: std::ops::Range<usize> = 1..2;
+const MF_FLAGS: std::ops::Range<usize> = 2..4;
+const MF_LSN: std::ops::Range<usize> = 4..12;
+const MF_COLLECTION: std::ops::Range<usize> = 12..28;
+const MF_NODE: std::ops::Range<usize> = 28..44;
+const MF_PAYLOAD_LEN: std::ops::Range<usize> = 44..48;
+const FRAME_FIXED_LEN: usize = MF_PAYLOAD_LEN.end;
 const FRAME_TRAILER_LEN: usize = 4;
 /// Smallest possible encoded mutation frame: fixed fields plus its CRC.
 const MIN_FRAME_LEN: usize = FRAME_FIXED_LEN + FRAME_TRAILER_LEN;
@@ -344,6 +425,30 @@ const fn pool_index(pool: ShardType) -> usize {
     }
 }
 
+/// Wire code for a pool tag in a pool-tagged (`FILE_VERSION_POOL_TAGGED`)
+/// mutation frame's previously reserved flag byte.
+///
+/// `0` is reserved for "untagged", which only a version-2 segment may contain;
+/// a version-3 frame must carry `1..=3`.
+const fn pool_tag(pool: ShardType) -> u8 {
+    match pool {
+        ShardType::State => 1,
+        ShardType::EventDag => 2,
+        ShardType::AuthChain => 3,
+    }
+}
+
+/// Inverse of [`pool_tag`]. `0` (untagged) maps to `None`; any other
+/// out-of-range code is rejected by the frame decoder.
+const fn pool_from_tag(tag: u8) -> Option<ShardType> {
+    match tag {
+        1 => Some(ShardType::State),
+        2 => Some(ShardType::EventDag),
+        3 => Some(ShardType::AuthChain),
+        _ => None,
+    }
+}
+
 /// One decoded mutation frame, with the byte range it occupied in the segment
 /// so a reader can re-read and re-validate the frame it has already trusted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -354,6 +459,9 @@ pub struct JournalEntry {
     pub offset: u64,
     /// Encoded frame length in bytes (fixed fields + payload + CRC).
     pub frame_len: u64,
+    /// Pool the frame belongs to. `None` for a version-2 (per-pool) segment;
+    /// `Some` for every frame of a pool-tagged version-3 segment.
+    pub pool: Option<ShardType>,
     /// Decoded mutation.
     pub mutation: Mutation,
 }
@@ -466,6 +574,8 @@ pub struct Reclaim {
 pub struct Journal {
     path: PathBuf,
     file: File,
+    /// On-disk format version of this segment.
+    version: JournalVersion,
     next_sequence: u64,
     next_lsn: u64,
     poisoned: bool,
@@ -484,7 +594,7 @@ const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
 pub struct JournalCoordinator {
     journal: Mutex<Journal>,
     path: PathBuf,
-    pending: Mutex<Vec<(u64, Mutation)>>,
+    pending: Mutex<Vec<(u64, Option<ShardType>, Mutation)>>,
     /// Next LSN to assign. Advanced under `pending`, independently of journal
     /// I/O, so a publish never blocks behind a sync's fsync.
     next_lsn: AtomicU64,
@@ -596,6 +706,30 @@ impl JournalCoordinator {
         mutation: Mutation,
         publish_overlay: impl FnOnce(u64),
     ) -> io::Result<u64> {
+        self.publish_inner(None, mutation, publish_overlay)
+    }
+
+    /// Like [`Self::publish`], but records the frame's pool tag for a shared
+    /// pool-tagged segment. The tag is encoded into the frame and used by
+    /// recovery to route the mutation back to its pool.
+    ///
+    /// # Errors
+    /// Same as [`Self::publish`].
+    pub fn publish_tagged(
+        &self,
+        pool: ShardType,
+        mutation: Mutation,
+        publish_overlay: impl FnOnce(u64),
+    ) -> io::Result<u64> {
+        self.publish_inner(Some(pool), mutation, publish_overlay)
+    }
+
+    fn publish_inner(
+        &self,
+        pool: Option<ShardType>,
+        mutation: Mutation,
+        publish_overlay: impl FnOnce(u64),
+    ) -> io::Result<u64> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed commit",
@@ -607,7 +741,7 @@ impl JournalCoordinator {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
         publish_overlay(lsn);
-        pending.push((lsn, mutation));
+        pending.push((lsn, pool, mutation));
         self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn.store(lsn, Ordering::Release);
         Ok(lsn)
@@ -713,7 +847,7 @@ impl JournalCoordinator {
             timings.journal_pending_wait = pending_started.elapsed();
             let covered_count = pending
                 .iter()
-                .take_while(|(lsn, _)| *lsn <= target_lsn)
+                .take_while(|(lsn, _, _)| *lsn <= target_lsn)
                 .count();
             if covered_count == 0 {
                 // Another sync may have committed and drained this target
@@ -732,7 +866,7 @@ impl JournalCoordinator {
             let last_lsn = covered_count
                 .checked_sub(1)
                 .and_then(|last_index| pending.get(last_index))
-                .map(|(lsn, _)| *lsn)
+                .map(|(lsn, _, _)| *lsn)
                 .ok_or_else(|| io::Error::other("pending journal batch is incomplete"))?;
             if first_lsn != journal.next_lsn || last_lsn != target_lsn {
                 return Err(io::Error::other(
@@ -771,17 +905,20 @@ impl JournalCoordinator {
     fn append_and_sync_batch(
         &self,
         journal: &mut Journal,
-        batch: Vec<(u64, Mutation)>,
+        batch: Vec<(u64, Option<ShardType>, Mutation)>,
         target_lsn: u64,
         timings: &mut JournalSyncTimings,
     ) -> io::Result<Option<CommitReceipt>> {
-        let mutations: Vec<Mutation> = batch.iter().map(|(_, mutation)| mutation.clone()).collect();
+        let mutations: Vec<(Option<ShardType>, Mutation)> = batch
+            .iter()
+            .map(|(_, pool, mutation)| (*pool, mutation.clone()))
+            .collect();
         let sequence = self
             .sequence
             .as_ref()
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
         let append_started = std::time::Instant::now();
-        let receipt = match journal.append_group_with_sequence(&mutations, sequence) {
+        let receipt = match journal.append_group_tagged_with_sequence(&mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -865,8 +1002,9 @@ impl JournalCoordinator {
         // Hold the queue lock through the append so a concurrent legacy
         // publisher cannot assign an LSN between the queued and staged parts.
         let mut pending = self.pending.lock();
-        let mut group_mutations = Vec::with_capacity(pending.len().saturating_add(mutations.len()));
-        for (offset, (lsn, mutation)) in pending.iter().enumerate() {
+        let mut group_mutations: Vec<(Option<ShardType>, Mutation)> =
+            Vec::with_capacity(pending.len().saturating_add(mutations.len()));
+        for (offset, (lsn, pool, mutation)) in pending.iter().enumerate() {
             let expected = journal
                 .next_lsn
                 .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
@@ -877,16 +1015,16 @@ impl JournalCoordinator {
                     "legacy journal queue is not contiguous with the journal tail",
                 ));
             }
-            group_mutations.push(mutation.clone());
+            group_mutations.push((*pool, mutation.clone()));
         }
-        group_mutations.extend_from_slice(mutations);
+        group_mutations.extend(mutations.iter().cloned().map(|mutation| (None, mutation)));
         let expected_first_lsn = journal.next_lsn;
         let expected_count = u64::try_from(group_mutations.len()).unwrap_or(u64::MAX);
         let sequence = self
             .sequence
             .as_ref()
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
-        let receipt = match journal.append_group_with_sequence(&group_mutations, sequence) {
+        let receipt = match journal.append_group_tagged_with_sequence(&group_mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -978,8 +1116,8 @@ impl Journal {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SEGMENT_LEN {
             return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
         }
-        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
-        scan_bytes(&bytes, base_sequence, base_lsn)
+        let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        scan_bytes(&bytes, base_sequence, base_lsn, version)
     }
 
     /// Scan only the committed groups appended at or after `start`, a group
@@ -1014,7 +1152,7 @@ impl Journal {
         file.seek(SeekFrom::Start(0))?;
         let mut header = vec![0; FILE_HEADER_LEN];
         file.read_exact(&mut header)?;
-        let (_, base_lsn) = validate_file_header(&header)?;
+        let (version, _, base_lsn) = validate_file_header(&header)?;
         if start >= len {
             return Ok(Scan {
                 groups: Vec::new(),
@@ -1026,7 +1164,7 @@ impl Journal {
         file.seek(SeekFrom::Start(start))?;
         let mut tail = Vec::new();
         file.read_to_end(&mut tail)?;
-        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn)
+        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, version)
     }
 
     /// Open a journal and recover its committed groups.
@@ -1042,6 +1180,27 @@ impl Journal {
     /// data-bearing segment's header is invalid, if any committed group fails
     /// validation, or if the segment exceeds `MAX_SEGMENT_LEN`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
+        Self::open_versioned(path, JournalVersion::per_pool())
+    }
+
+    /// Open a shared (multi-pool) journal segment, or create one if the file is
+    /// absent. The segment is created as [`JournalVersion::V3PoolTagged`], so
+    /// every mutation frame appended through it must carry a pool tag.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`], plus `InvalidData` if an existing segment is not
+    /// the pool-tagged version.
+    pub fn open_shared(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
+        Self::open_versioned(path, JournalVersion::shared())
+    }
+
+    /// Open a journal whose on-disk version must be `version`, creating it with
+    /// that version when the file is absent or shorter than the header.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`], plus `InvalidData` if an existing complete
+    /// segment was written by a different version.
+    fn open_versioned(path: impl AsRef<Path>, version: JournalVersion) -> io::Result<(Self, Scan)> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1062,17 +1221,22 @@ impl Journal {
             // failing open forever on a partial header.
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            write_file_header(&mut file, 1, 1)?;
+            write_file_header(&mut file, version, 1, 1)?;
             file.sync_all()?;
             sync_parent_dir(&path)?;
         }
 
         let bytes = fs::read(&path)?;
-        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        let (found_version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        if found_version != version {
+            return Err(invalid_data(
+                "journal segment version does not match open mode",
+            ));
+        }
         if bytes.len() as u64 > MAX_SEGMENT_LEN {
             return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
         }
-        let scan = scan_bytes(&bytes, base_sequence, base_lsn)?;
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn, version)?;
         if scan.truncated_tail {
             file.set_len(scan.valid_len)?;
         }
@@ -1090,6 +1254,7 @@ impl Journal {
             Self {
                 path,
                 file,
+                version,
                 next_sequence,
                 next_lsn,
                 poisoned: false,
@@ -1124,10 +1289,40 @@ impl Journal {
     ///
     /// # Errors
     /// Same as [`Self::append_group`], plus `InvalidInput` if `sequence` is
-    /// behind this segment's next sequence.
+    /// behind this segment's next sequence, or if this is a pool-tagged segment
+    /// (which requires [`Self::append_group_tagged_with_sequence`]).
     pub fn append_group_with_sequence(
         &mut self,
         mutations: &[Mutation],
+        sequence: Option<u64>,
+    ) -> io::Result<CommitReceipt> {
+        let untagged = mutations
+            .iter()
+            .cloned()
+            .map(|mutation| (None, mutation))
+            .collect::<Vec<_>>();
+        self.append_group_inner(&untagged, sequence)
+    }
+
+    /// Append a pool-tagged group to a shared, pool-tagged segment.
+    ///
+    /// # Errors
+    /// Same as [`Self::append_group_with_sequence`], plus `InvalidInput` if
+    /// this segment is not pool-tagged.
+    pub fn append_group_tagged_with_sequence(
+        &mut self,
+        mutations: &[(Option<ShardType>, Mutation)],
+        sequence: Option<u64>,
+    ) -> io::Result<CommitReceipt> {
+        self.append_group_inner(mutations, sequence)
+    }
+
+    /// Shared implementation for a group of mutations, each paired with its
+    /// optional pool tag. The tag must match the segment's dialect (see
+    /// [`JournalVersion::is_pool_tagged`]).
+    fn append_group_inner(
+        &mut self,
+        mutations: &[(Option<ShardType>, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
         if self.poisoned {
@@ -1158,13 +1353,13 @@ impl Journal {
         }
 
         let mut payload = Vec::new();
-        for (index, mutation) in mutations.iter().enumerate() {
+        for (index, (pool, mutation)) in mutations.iter().enumerate() {
             let lsn = first_lsn
                 .checked_add(u64::try_from(index).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "mutation index exceeds u64")
                 })?)
                 .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-            encode_mutation(lsn, mutation, &mut payload)?;
+            encode_mutation(lsn, *pool, self.version, mutation, &mut payload)?;
             if u64::try_from(payload.len()).unwrap_or(u64::MAX) > MAX_GROUP_LEN {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1312,8 +1507,8 @@ impl Journal {
             ));
         }
         let bytes = fs::read(&self.path)?;
-        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
-        let scan = scan_bytes(&bytes, base_sequence, base_lsn)?;
+        let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn, version)?;
         let retained = scan
             .groups
             .iter()
@@ -1331,9 +1526,9 @@ impl Journal {
             .map_or((self.next_sequence, self.next_lsn), |group| {
                 (group.sequence, group.first_lsn)
             });
-        let mut rebuilt = file_header_bytes(new_base_sequence, new_base_lsn);
+        let mut rebuilt = file_header_bytes(self.version, new_base_sequence, new_base_lsn);
         for group in &retained {
-            encode_group(group, &mut rebuilt)?;
+            encode_group(group, self.version, &mut rebuilt)?;
         }
 
         let temp_path = self.path.with_extension("rotate");
@@ -1380,43 +1575,49 @@ impl Journal {
     }
 }
 
-fn file_header_bytes(base_sequence: u64, base_lsn: u64) -> Vec<u8> {
-    let mut header = Vec::with_capacity(FILE_HEADER_LEN);
-    header.extend_from_slice(FILE_MAGIC);
-    header.extend_from_slice(&FILE_VERSION.to_le_bytes());
-    header.extend_from_slice(&base_sequence.to_le_bytes());
-    header.extend_from_slice(&base_lsn.to_le_bytes());
+fn file_header_bytes(version: JournalVersion, base_sequence: u64, base_lsn: u64) -> Vec<u8> {
+    let mut header = vec![0_u8; FILE_HEADER_LEN];
+    header[FH_MAGIC].copy_from_slice(FILE_MAGIC);
+    header[FH_VERSION].copy_from_slice(&version.as_u32().to_le_bytes());
+    header[FH_BASE_SEQUENCE].copy_from_slice(&base_sequence.to_le_bytes());
+    header[FH_BASE_LSN].copy_from_slice(&base_lsn.to_le_bytes());
     let mut crc = Hasher::new();
-    crc.update(&header);
-    header.extend_from_slice(&crc.finalize().to_le_bytes());
+    crc.update(&header[FH_CRC_COVERED]);
+    header[FH_CRC].copy_from_slice(&crc.finalize().to_le_bytes());
     header
 }
 
-fn write_file_header(file: &mut File, base_sequence: u64, base_lsn: u64) -> io::Result<()> {
-    file.write_all(&file_header_bytes(base_sequence, base_lsn))
+fn write_file_header(
+    file: &mut File,
+    version: JournalVersion,
+    base_sequence: u64,
+    base_lsn: u64,
+) -> io::Result<()> {
+    file.write_all(&file_header_bytes(version, base_sequence, base_lsn))
 }
 
 /// Validate the file header, returning the base `(sequence, lsn)` this segment
 /// starts numbering at. A rotated segment records the first surviving group's
 /// numbers here so scanning never has to assume the sequence begins at 1.
-fn validate_file_header(bytes: &[u8]) -> io::Result<(u64, u64)> {
+fn validate_file_header(bytes: &[u8]) -> io::Result<(JournalVersion, u64, u64)> {
     let Some(header) = bytes.get(..FILE_HEADER_LEN) else {
         return Err(invalid_data("truncated journal file header"));
     };
-    if &header[..8] != FILE_MAGIC {
+    if &header[FH_MAGIC] != FILE_MAGIC {
         return Err(invalid_data("invalid journal magic"));
     }
-    if u32::from_le_bytes(header[8..12].try_into().expect("fixed slice")) != FILE_VERSION {
-        return Err(invalid_data("unsupported journal version"));
-    }
+    let version = JournalVersion::from_u32(u32::from_le_bytes(
+        header[FH_VERSION].try_into().expect("fixed slice"),
+    ))?;
     let mut crc = Hasher::new();
-    crc.update(&header[..28]);
-    if u32::from_le_bytes(header[28..32].try_into().expect("fixed slice")) != crc.finalize() {
+    crc.update(&header[FH_CRC_COVERED]);
+    if u32::from_le_bytes(header[FH_CRC].try_into().expect("fixed slice")) != crc.finalize() {
         return Err(invalid_data("journal header checksum mismatch"));
     }
     Ok((
-        u64::from_le_bytes(header[12..20].try_into().expect("fixed slice")),
-        u64::from_le_bytes(header[20..28].try_into().expect("fixed slice")),
+        version,
+        u64::from_le_bytes(header[FH_BASE_SEQUENCE].try_into().expect("fixed slice")),
+        u64::from_le_bytes(header[FH_BASE_LSN].try_into().expect("fixed slice")),
     ))
 }
 
@@ -1429,33 +1630,43 @@ fn encode_group_header(
 ) -> [u8; GROUP_HEADER_LEN] {
     let mut header = [0_u8; GROUP_HEADER_LEN];
     let header_len = u32::try_from(GROUP_HEADER_LEN).expect("GROUP_HEADER_LEN must fit in a u32");
-    header[..4].copy_from_slice(GROUP_MAGIC);
-    header[4..8].copy_from_slice(&header_len.to_le_bytes());
-    header[8..16].copy_from_slice(&sequence.to_le_bytes());
-    header[16..24].copy_from_slice(&first_lsn.to_le_bytes());
-    header[24..32].copy_from_slice(&last_lsn.to_le_bytes());
-    header[32..40].copy_from_slice(&payload_len.to_le_bytes());
-    header[40..44].copy_from_slice(&record_count.to_le_bytes());
+    header[GH_MAGIC].copy_from_slice(GROUP_MAGIC);
+    header[GH_HEADER_LEN].copy_from_slice(&header_len.to_le_bytes());
+    header[GH_SEQUENCE].copy_from_slice(&sequence.to_le_bytes());
+    header[GH_FIRST_LSN].copy_from_slice(&first_lsn.to_le_bytes());
+    header[GH_LAST_LSN].copy_from_slice(&last_lsn.to_le_bytes());
+    header[GH_PAYLOAD_LEN].copy_from_slice(&payload_len.to_le_bytes());
+    header[GH_RECORD_COUNT].copy_from_slice(&record_count.to_le_bytes());
     let mut crc = Hasher::new();
-    crc.update(&header[..44]);
-    header[44..48].copy_from_slice(&crc.finalize().to_le_bytes());
+    crc.update(&header[GH_CRC_COVERED]);
+    header[GH_CRC].copy_from_slice(&crc.finalize().to_le_bytes());
     header
 }
 
 fn encode_group_trailer(sequence: u64, group_crc: u32) -> [u8; GROUP_TRAILER_LEN] {
     let mut trailer = [0_u8; GROUP_TRAILER_LEN];
-    trailer[..4].copy_from_slice(GROUP_COMMIT_MAGIC);
-    trailer[4..12].copy_from_slice(&sequence.to_le_bytes());
-    trailer[12..16].copy_from_slice(&group_crc.to_le_bytes());
+    trailer[GT_MAGIC].copy_from_slice(GROUP_COMMIT_MAGIC);
+    trailer[GT_SEQUENCE].copy_from_slice(&sequence.to_le_bytes());
+    trailer[GT_CRC].copy_from_slice(&group_crc.to_le_bytes());
     trailer
 }
 
 /// Re-encode a committed group with its original sequence and LSNs, for a
 /// segment rewrite. Mirrors exactly the framing `commit_group` writes.
-fn encode_group(group: &CommittedGroup, into: &mut Vec<u8>) -> io::Result<()> {
+fn encode_group(
+    group: &CommittedGroup,
+    version: JournalVersion,
+    into: &mut Vec<u8>,
+) -> io::Result<()> {
     let mut payload = Vec::new();
     for entry in &group.entries {
-        encode_mutation(entry.lsn, &entry.mutation, &mut payload)?;
+        encode_mutation(
+            entry.lsn,
+            entry.pool,
+            version,
+            &entry.mutation,
+            &mut payload,
+        )?;
     }
     let record_count = u32::try_from(group.entries.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many journal mutations"))?;
@@ -1478,36 +1689,67 @@ fn encode_group(group: &CommittedGroup, into: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-fn encode_mutation(lsn: u64, mutation: &Mutation, into: &mut Vec<u8>) -> io::Result<()> {
+fn encode_mutation(
+    lsn: u64,
+    pool: Option<ShardType>,
+    version: JournalVersion,
+    mutation: &Mutation,
+    into: &mut Vec<u8>,
+) -> io::Result<()> {
+    // The flag byte is the pool tag in a v3 segment and must be zero in a v2
+    // segment; enforce the pairing rather than silently writing an ambiguous
+    // frame.
+    let pool_byte = match (version.is_pool_tagged(), pool) {
+        (true, Some(pool)) => pool_tag(pool),
+        (true, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a pool-tagged journal frame requires a pool tag",
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a per-pool journal frame must not carry a pool tag",
+            ))
+        }
+        (false, None) => 0,
+    };
+
     let start = into.len();
-    match mutation {
-        Mutation::Put {
-            collection_id,
-            node_id,
-            payload,
-        } => {
-            into.push(1);
-            into.push(0);
-            into.extend_from_slice(&0_u16.to_le_bytes());
-            into.extend_from_slice(&lsn.to_le_bytes());
-            into.extend_from_slice(collection_id);
-            into.extend_from_slice(node_id);
-            let payload_len = u32::try_from(payload.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
-            })?;
-            into.extend_from_slice(&payload_len.to_le_bytes());
-            into.extend_from_slice(payload);
+    // Zeroed fixed area; `MF_FLAGS` and the DeleteCollection-only fields stay
+    // zero by construction. Index the fixed area by its named field ranges so
+    // no raw offset arithmetic is needed.
+    into.resize(start.saturating_add(FRAME_FIXED_LEN), 0);
+    let payload = {
+        let frame = &mut into[start..];
+        frame[MF_KIND].copy_from_slice(&match mutation {
+            Mutation::Put { .. } => [1],
+            Mutation::DeleteCollection { .. } => [2],
+        });
+        frame[MF_POOL].copy_from_slice(&[pool_byte]);
+        frame[MF_LSN].copy_from_slice(&lsn.to_le_bytes());
+        match mutation {
+            Mutation::Put {
+                collection_id,
+                node_id,
+                payload,
+            } => {
+                frame[MF_COLLECTION].copy_from_slice(collection_id);
+                frame[MF_NODE].copy_from_slice(node_id);
+                let payload_len = u32::try_from(payload.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
+                })?;
+                frame[MF_PAYLOAD_LEN].copy_from_slice(&payload_len.to_le_bytes());
+                payload.as_slice()
+            }
+            Mutation::DeleteCollection { collection_id } => {
+                frame[MF_COLLECTION].copy_from_slice(collection_id);
+                &[]
+            }
         }
-        Mutation::DeleteCollection { collection_id } => {
-            into.push(2);
-            into.push(0);
-            into.extend_from_slice(&0_u16.to_le_bytes());
-            into.extend_from_slice(&lsn.to_le_bytes());
-            into.extend_from_slice(collection_id);
-            into.extend_from_slice(&[0_u8; 16]);
-            into.extend_from_slice(&0_u32.to_le_bytes());
-        }
-    }
+    };
+    into.extend_from_slice(payload);
     let mut crc = Hasher::new();
     crc.update(&into[start..]);
     into.extend_from_slice(&crc.finalize().to_le_bytes());
@@ -1581,7 +1823,12 @@ fn verify_group_payload<'a>(
     Ok(payload)
 }
 
-fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Scan> {
+fn scan_bytes(
+    bytes: &[u8],
+    base_sequence: u64,
+    base_lsn: u64,
+    version: JournalVersion,
+) -> io::Result<Scan> {
     if bytes.len() < FILE_HEADER_LEN {
         return Err(invalid_data("truncated journal file header"));
     }
@@ -1591,6 +1838,7 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
         base_sequence,
         base_lsn,
         base_lsn,
+        version,
     )
 }
 
@@ -1607,6 +1855,7 @@ fn scan_groups_from(
     mut expected_sequence: u64,
     mut expected_lsn: u64,
     segment_base_lsn: u64,
+    version: JournalVersion,
 ) -> io::Result<Scan> {
     let mut cursor = 0usize;
     let mut valid_len = base_offset;
@@ -1654,8 +1903,13 @@ fn scan_groups_from(
             .saturating_add(u64::try_from(payload_index).unwrap_or(u64::MAX))
             .try_into()
             .unwrap_or(usize::MAX);
-        let entries =
-            decode_mutations(payload, group.first_lsn, group.record_count, payload_offset)?;
+        let entries = decode_mutations(
+            payload,
+            group.first_lsn,
+            group.record_count,
+            payload_offset,
+            version,
+        )?;
         groups.push(CommittedGroup {
             sequence: group.sequence,
             first_lsn: group.first_lsn,
@@ -1687,6 +1941,7 @@ fn decode_mutations(
     first_lsn: u64,
     record_count: u32,
     payload_offset: usize,
+    version: JournalVersion,
 ) -> io::Result<Vec<JournalEntry>> {
     let mut cursor = 0_usize;
     let mut entries = Vec::with_capacity(usize::try_from(record_count).unwrap_or(0));
@@ -1701,22 +1956,33 @@ fn decode_mutations(
         let frame = payload
             .get(cursor..fixed_end)
             .ok_or_else(|| invalid_data("truncated journal mutation frame"))?;
-        let kind = frame[0];
-        let flags = frame[1];
-        if flags != 0 || frame[2..4] != [0, 0] {
+        let kind = frame[MF_KIND.start];
+        let tag = frame[MF_POOL.start];
+        if frame[MF_FLAGS] != [0, 0] {
             return Err(invalid_data("unsupported journal mutation flags"));
         }
-        let lsn = u64::from_le_bytes(frame[4..12].try_into().expect("fixed slice"));
+        let pool = if version.is_pool_tagged() {
+            if !matches!(tag, 1..=3) {
+                return Err(invalid_data("pool-tagged frame has no valid pool tag"));
+            }
+            pool_from_tag(tag)
+        } else {
+            if tag != 0 {
+                return Err(invalid_data("untagged frame has a nonzero flag byte"));
+            }
+            None
+        };
+        let lsn = u64::from_le_bytes(frame[MF_LSN].try_into().expect("fixed slice"));
         let expected = first_lsn
             .checked_add(u64::from(index))
             .ok_or_else(|| invalid_data("journal mutation LSN overflow"))?;
         if lsn != expected {
             return Err(invalid_data("journal mutation LSN out of order"));
         }
-        let collection_id: [u8; 16] = frame[12..28].try_into().expect("fixed slice");
-        let node_id: [u8; 16] = frame[28..44].try_into().expect("fixed slice");
+        let collection_id: [u8; 16] = frame[MF_COLLECTION].try_into().expect("fixed slice");
+        let node_id: [u8; 16] = frame[MF_NODE].try_into().expect("fixed slice");
         let payload_len = usize::try_from(u32::from_le_bytes(
-            frame[44..48].try_into().expect("fixed slice"),
+            frame[MF_PAYLOAD_LEN].try_into().expect("fixed slice"),
         ))
         .map_err(|_| invalid_data("journal mutation payload length exceeds address space"))?;
         let frame_end = fixed_end
@@ -1755,6 +2021,7 @@ fn decode_mutations(
             lsn,
             offset: u64::try_from(payload_offset.saturating_add(start)).unwrap_or(u64::MAX),
             frame_len: u64::try_from(crc_end.saturating_sub(start)).unwrap_or(u64::MAX),
+            pool,
             mutation,
         });
         cursor = crc_end;
@@ -1842,6 +2109,121 @@ mod tests {
             node_id: [node; 16],
             payload: payload.to_vec(),
         }
+    }
+
+    #[test]
+    fn shared_segment_round_trips_pool_tags() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_pool_tags");
+        let _ = fs::remove_file(&path);
+
+        let (mut journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups.len(), 0);
+        let tagged = [
+            (Some(ShardType::State), put(1, 1, b"state")),
+            (Some(ShardType::EventDag), put(2, 2, b"event")),
+            (Some(ShardType::AuthChain), put(3, 3, b"auth")),
+        ];
+        journal
+            .append_group_tagged_with_sequence(&tagged, None)
+            .unwrap();
+        journal.make_durable().unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        let pools: Vec<_> = scan.groups[0]
+            .entries
+            .iter()
+            .map(|entry| entry.pool)
+            .collect();
+        assert_eq!(
+            pools,
+            vec![
+                Some(ShardType::State),
+                Some(ShardType::EventDag),
+                Some(ShardType::AuthChain),
+            ]
+        );
+
+        // Recovery must preserve the tags so each frame can be routed.
+        let (_journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups[0].entries[1].pool, Some(ShardType::EventDag));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shared_segment_rejects_untagged_frames() {
+        let path = temp_path("shared_untagged");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open_shared(&path).unwrap();
+        assert!(
+            journal.append_group(&[put(1, 1, b"x")]).is_err(),
+            "a pool-tagged segment must reject an untagged frame"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn per_pool_segment_rejects_tagged_frames() {
+        use crate::layout::ShardType;
+        let path = temp_path("perpool_tagged");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        let tagged = [(Some(ShardType::State), put(1, 1, b"x"))];
+        assert!(
+            journal
+                .append_group_tagged_with_sequence(&tagged, None)
+                .is_err(),
+            "a per-pool segment must reject a tagged frame"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_mode_must_match_segment_version() {
+        let path = temp_path("version_mismatch");
+        let _ = fs::remove_file(&path);
+        Journal::open(&path).unwrap();
+        assert!(
+            Journal::open_shared(&path).is_err(),
+            "a per-pool segment must not open as shared"
+        );
+        fs::remove_file(&path).unwrap();
+
+        Journal::open_shared(&path).unwrap();
+        assert!(
+            Journal::open(&path).is_err(),
+            "a shared segment must not open as per-pool"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn coordinator_publishes_tagged_frames() {
+        use crate::layout::ShardType;
+        let path = temp_path("coordinator_tagged");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        coordinator
+            .publish_tagged(ShardType::State, put(1, 1, b"a"), |_| {})
+            .unwrap();
+        coordinator
+            .publish_tagged(ShardType::AuthChain, put(3, 3, b"c"), |_| {})
+            .unwrap();
+        coordinator.sync().unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        let pools: Vec<_> = scan.groups[0]
+            .entries
+            .iter()
+            .map(|entry| entry.pool)
+            .collect();
+        assert_eq!(
+            pools,
+            vec![Some(ShardType::State), Some(ShardType::AuthChain)]
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
