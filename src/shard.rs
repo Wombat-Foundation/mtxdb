@@ -15,6 +15,39 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::packfile::{self, Record};
 
+// Linux `sync_file_range(2)`, declared directly rather than adding a `libc`
+// dependency for a single probe call.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i32;
+}
+
+/// Probe: start writeback for a just-flushed range before the next flush, to
+/// test whether keeping the dirty frontier ahead of the writer shrinks the
+/// `folio_wait_bit` stall. Enabled by `MTXDB_SYNC_FILE_RANGE=1`. A pure hint:
+/// failure is ignored, since the bytes are already in the page cache.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn kick_writeback(file: &File, offset: u64, len: u64) {
+    use std::os::unix::io::AsRawFd;
+    const SYNC_FILE_RANGE_WRITE: u32 = 2;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("MTXDB_SYNC_FILE_RANGE").is_ok_and(|v| v != "0")) {
+        return;
+    }
+    // SAFETY: `file` holds a valid fd for the duration of the call, and the
+    // syscall only advances writeback for the given range — it cannot affect
+    // correctness.
+    let _ = unsafe {
+        sync_file_range(
+            file.as_raw_fd(),
+            i64::try_from(offset).unwrap_or(i64::MAX),
+            i64::try_from(len).unwrap_or(i64::MAX),
+            SYNC_FILE_RANGE_WRITE,
+        )
+    };
+}
+
 /// Maximum number of shards in the pool.
 ///
 /// This is a runtime policy cap, not a format limit: the shard slot is a
@@ -2029,6 +2062,8 @@ impl ShardPool {
                 file.seek(io::SeekFrom::Start(committed))?;
                 file.write_all(&pending_guard)?;
             }
+            #[cfg(target_os = "linux")]
+            kick_writeback(&file, committed, pending_guard.len() as u64);
             let new_len = pending_guard.len() as u64;
             let file_len = committed.checked_add(new_len).ok_or_else(|| {
                 io::Error::new(
