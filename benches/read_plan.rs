@@ -653,28 +653,53 @@ fn measure(
 /// This is the scan/compaction regression check for readahead suppression:
 /// repack walks and rewrites records through the shard mmap
 /// (`scan_full_adjacency`, `copy_record_to_shard`), the same mapping
-/// `MADV_RANDOM` is set on, so a persistent random hint can slow it. The
-/// store is reopened, evicted, then one repack is timed.
+/// `MADV_RANDOM` is set on, so a persistent random hint can slow it.
+///
+/// Repack **mutates** the store (it rewrites the collection's pack and
+/// advances the incremental scan cursor), so every pass must start from an
+/// identical, freshly-ingested copy: `pristine` is copied into `work`, and
+/// that copy is evicted, opened, and repacked once. Without this, pass 2
+/// would measure a smaller, already-repacked layout and the incremental fast
+/// path.
 fn repack_once(
-    dir: &Path,
+    pristine: &Path,
+    work: &Path,
     policy_name: &'static str,
     policy: ReadPlanPolicy,
     eviction: Eviction,
-) -> (&'static str, Duration) {
+) -> Duration {
     if eviction == Eviction::Manual {
         wait_for_manual_drop(&format!("repack / {policy_name}"));
     }
-    let _ = evict(dir, eviction);
 
-    // Repack rewrites the pack, so it needs a writable open. No stats/cache
-    // policy beyond the read plan is applied.
-    let store = PackfileStorage::open(dir.to_path_buf()).unwrap();
+    // Reset the working copy to the pristine post-ingest store.
+    let _ = fs::remove_dir_all(work);
+    copy_dir(pristine, work).expect("copy pristine store for repack pass");
+    let _ = evict(work, eviction);
+
+    let store = PackfileStorage::open(work.to_path_buf()).unwrap();
     store.set_read_plan_policy(policy);
     let started = Instant::now();
     store
         .repack_collection_reachable(&ROOM, |_hash, _data| Vec::new())
         .unwrap();
-    (policy_name, started.elapsed())
+    started.elapsed()
+}
+
+/// Recursively copy `src` to `dst` (files and subdirectories). Small helper
+/// so a repack pass can restart from an identical store snapshot.
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 // ── Scenario ────────────────────────────────────────────────────────
@@ -798,28 +823,48 @@ fn run(
         let eviction = select_eviction(manual_drop, warm);
         println!();
         println!("  [2/3] repack (scan/compaction) regression check…");
-        let mut medians: Vec<(&'static str, Duration)> = Vec::new();
-        for (name, policy) in [
+        // Snapshot the freshly-ingested store so every repack pass starts
+        // identical (repack mutates the layout).
+        let pristine = dir.with_extension("pristine");
+        let work = dir.with_extension("work");
+        let _ = fs::remove_dir_all(&pristine);
+        copy_dir(&dir, &pristine).expect("snapshot pristine store");
+        let policies: [(&'static str, ReadPlanPolicy); 2] = [
             ("plain", ReadPlanPolicy::disabled()),
             ("random", ReadPlanPolicy::random_advice()),
-        ] {
-            let mut elapsed = Vec::with_capacity(passes);
-            for _ in 0..passes {
-                elapsed.push(repack_once(&dir, name, policy, eviction).1);
+        ];
+        let mut samples: Vec<Vec<Duration>> = (0..policies.len()).map(|_| Vec::new()).collect();
+        for pass in 0..passes {
+            // Alternate order across passes so neither policy always follows
+            // the other.
+            let forward = pass % 2 == 0;
+            for step in 0..policies.len() {
+                let index = if forward {
+                    step
+                } else {
+                    policies.len() - 1 - step
+                };
+                let (name, policy) = policies[index];
+                samples[index].push(repack_once(&pristine, &work, name, policy, eviction));
             }
-            let median = median_duration(&elapsed);
+        }
+        let mut medians: Vec<Duration> = Vec::new();
+        for ((name, _), elapsed) in policies.iter().zip(samples.iter()) {
+            let median = median_duration(elapsed);
             let min = elapsed.iter().copied().min().unwrap_or(Duration::ZERO);
             let max = elapsed.iter().copied().max().unwrap_or(Duration::ZERO);
             println!("        {name:<7} {median:.2?} [{min:.2?}..{max:.2?}]");
-            medians.push((name, median));
+            medians.push(median);
         }
-        if let [(_, plain), (_, random)] = medians.as_slice() {
+        if let [plain, random] = medians.as_slice() {
             println!(
                 "bench: read_plan_repack REPACK_RANDOM_VS_PLAIN={:.3}",
                 plain.as_secs_f64() / random.as_secs_f64()
             );
         }
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&pristine);
+        let _ = fs::remove_dir_all(&work);
         return;
     }
 
