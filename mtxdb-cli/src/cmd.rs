@@ -3679,9 +3679,10 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
                         continue;
                     };
                     let shard_entries: Vec<(u64, u64, u8)> = match glob_pack_files(&dir) {
-                        Ok(files) => {
-                            files.into_iter().filter(|&(id, _, _)| id == pack_id).collect()
-                        }
+                        Ok(files) => files
+                            .into_iter()
+                            .filter(|&(id, _, _)| id == pack_id)
+                            .collect(),
                         Err(_) => continue,
                     };
                     if !shard_entries.is_empty() {
@@ -5121,7 +5122,8 @@ fn scan_table_row(location: &str, id: &str, offset: u64, payload: Option<&str>) 
 /// The PAYLOAD cell for one row: a decodable payload prints below the row
 /// instead (its formatted form spans lines), so the cell just says so.
 fn scan_payload_cell(data: &[u8], shard_type: ShardType) -> String {
-    scan_payload_suffix(data, shard_type).unwrap_or_else(|| "(decoded below)".to_owned())
+    scan_payload_suffix(data, shard_type)
+        .unwrap_or_else(|| format!("{} bytes (decoded below)", data.len()))
 }
 
 /// Print every physical frame for a collection across all packs. This is a
@@ -10559,18 +10561,7 @@ mod tests {
         .unwrap();
 
         let missing = format_id(&[0x99; 16]);
-        assert!(cmd_scan(
-            &cli_scan,
-            &missing,
-            false,
-            10,
-            None,
-            None,
-            false,
-            None,
-            false,
-        )
-        .is_err());
+        assert!(cmd_scan(&cli_scan, &missing, false, 10, None, None, false, None, false,).is_err());
 
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();
