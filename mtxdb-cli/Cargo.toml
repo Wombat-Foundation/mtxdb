@@ -31,10 +31,8 @@ clap = { version = "=4.6.6", default-features = false, features = ["std", "env",
 clap_complete = { version = "=4.6.9", optional = true }
 hex = "0.4"
 mtxdb = { path = ".." }
-simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
-
-[dev-dependencies]
 rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
+simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
 [lints]
 workspace = true

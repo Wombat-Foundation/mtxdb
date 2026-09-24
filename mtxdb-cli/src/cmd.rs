@@ -6830,6 +6830,44 @@ fn reject_cross_record_collision(
     Ok(())
 }
 
+/// Apply rezzy's room-versioned Matrix redaction before persisting an event.
+/// The importer still keeps the original value in memory for collection and
+/// DAG/state analysis; only the stored payload is redacted.
+fn redacted_event_bytes(event: &OwnedValue, room_version: &str) -> anyhow::Result<bytes::Bytes> {
+    let source = event.encode();
+    let value = rezzy::JsonValue::parse(&source)
+        .map_err(|error| anyhow::anyhow!("invalid event JSON for redaction: {error:?}"))?;
+    let redacted = rezzy::redact_json(&value, room_version);
+    let encoded = rezzy::json::write_string_value(&redacted)
+        .map_err(|error| anyhow::anyhow!("failed to encode redacted event: {error:?}"))?;
+    Ok(bytes::Bytes::from(encoded.into_bytes()))
+}
+
+fn import_room_version(
+    store: &PackfileStorage,
+    collection_id: &[u8; 16],
+    events: &[OwnedValue],
+) -> anyhow::Result<String> {
+    if let Some(version) = events
+        .iter()
+        .find_map(|event| nested_event_string_field(event, "content", "room_version"))
+    {
+        return Ok(version.to_owned());
+    }
+    let version = store
+        .get_collection_metadata(collection_id)
+        .ok()
+        .flatten()
+        .and_then(|metadata| MatrixRoomExtension::decode_blob(metadata.extension.as_deref()?))
+        .and_then(|extension| extension.room_version);
+    version.with_context(|| {
+        format!(
+            "cannot redact imported events for collection {}: room version is unavailable",
+            format_id(collection_id)
+        )
+    })
+}
+
 /// Import PDU events through the normal event-DAG path.
 #[allow(
     clippy::too_many_arguments,
@@ -6867,6 +6905,7 @@ fn import_pdu_events(
         established_collections,
     )?;
     let collection_id = resolved.collection_id;
+    let room_version = import_room_version(store, &collection_id, events)?;
 
     let collection_hex = format_id(&collection_id);
 
@@ -6906,11 +6945,11 @@ fn import_pdu_events(
                 continue;
             }
             seen_ids.insert(id_bytes, incoming_event_id.to_owned());
-            let event_bytes = ev.encode().into_bytes();
+            let event_bytes = redacted_event_bytes(ev, &room_version)?;
             first.push((
                 id_bytes,
                 incoming_event_id.to_owned(),
-                NodeData::new(bytes::Bytes::from(event_bytes)),
+                NodeData::new(event_bytes),
             ));
         }
         first
@@ -8968,7 +9007,7 @@ mod tests {
         format_canonical_display, format_id, glob_pack_files, import_pdu_events,
         interleaving_worth_noting, listing_shard_types, matrix_batch_has_create,
         matrix_room_collection_id, matrix_room_extension_from_store, parse_federation_input,
-        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload, redacted_event_bytes,
         resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
         template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
         MatrixRoomExtension, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
@@ -8984,7 +9023,7 @@ mod tests {
         content_digest, derive_collection_id, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion,
         ShardType,
     };
-    use simd_json::prelude::Writable;
+    use simd_json::prelude::{ValueObjectAccess, Writable};
     use simd_json::OwnedValue;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -9618,8 +9657,37 @@ mod tests {
 
     fn import_event(event_id_: &str, sender: &str, room: &str) -> OwnedValue {
         owned_value(&format!(
-            r#"{{"event_id":"{event_id_}","sender":"{sender}","room_id":"{room}","type":"m.room.message","content":{{}}}}"#
+            r#"{{"event_id":"{event_id_}","sender":"{sender}","room_id":"{room}","type":"m.room.message","content":{{"room_version":"11"}}}}"#
         ))
+    }
+
+    #[test]
+    fn imported_event_payload_uses_rezzy_redaction() {
+        let event = owned_value(
+            r#"{
+                "event_id":"$event",
+                "room_id":"!room",
+                "sender":"@alice",
+                "type":"m.room.message",
+                "content":{"body":"hello","msgtype":"m.text"},
+                "unsigned":{"age_ts":4},
+                "__pdu_count":123,
+                "__soft_failed":false
+            }"#,
+        );
+        let bytes = redacted_event_bytes(&event, "11").unwrap();
+        let mut json = bytes.to_vec();
+        let redacted = simd_json::to_owned_value(&mut json).unwrap();
+        assert!(redacted.get("unsigned").is_none());
+        assert!(redacted.get("__pdu_count").is_none());
+        assert!(redacted.get("__soft_failed").is_none());
+        assert_eq!(
+            redacted.get("content").and_then(|content| match content {
+                OwnedValue::Object(fields) => Some(fields.is_empty()),
+                _ => None,
+            }),
+            Some(true)
+        );
     }
 
     #[test]
