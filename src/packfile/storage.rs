@@ -7071,14 +7071,12 @@ impl PackfileStorage {
 }
 
 impl StorageEngine for PackfileStorage {
-    fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
-        self.try_collection_exists(collection_id).unwrap_or(false)
+    fn collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
+        self.try_collection_exists(collection_id)
     }
 
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
-        Ok(self
-            .generation(collection_id)
-            .map(|generation| generation.index.len()))
+        self.try_collection_len(collection_id)
     }
 
     fn create_or_put_established(
@@ -7543,6 +7541,15 @@ impl StorageEngine for PackfileStorage {
 }
 
 impl PackfileStorage {
+    /// Check collection existence using the historical boolean API.
+    ///
+    /// Call [`Self::try_collection_exists`] when storage errors must be
+    /// distinguished from a missing collection.
+    #[must_use]
+    pub fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
+        self.try_collection_exists(collection_id).unwrap_or(false)
+    }
+
     /// Check collection existence without hiding overlay/read failures.
     ///
     /// The trait's historical boolean API is retained for compatibility and
@@ -7562,6 +7569,63 @@ impl PackfileStorage {
                 .map(|values| values.first().is_some_and(Option::is_some));
         }
         Ok(self.generation(collection_id).is_some())
+    }
+
+    /// Return collection length at read-committed visibility.
+    ///
+    /// Overlay puts replace durable values with the same node ID and add to
+    /// the durable count only for new IDs. A committed collection delete
+    /// hides the durable generation until replacement puts are applied.
+    ///
+    /// # Errors
+    /// Returns a storage or journal-overlay error when the authoritative
+    /// read-committed view cannot be refreshed.
+    pub fn try_collection_len(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<Option<usize>, StorageError> {
+        if self.transaction_overlay_users.load(Ordering::Acquire) == 0 {
+            return Ok(self
+                .generation(collection_id)
+                .map(|generation| generation.index.len()));
+        }
+
+        let overlay_guard = self.refresh_read_journal()?;
+        let Some(overlay) = overlay_guard.as_ref() else {
+            return Ok(self
+                .generation(collection_id)
+                .map(|generation| generation.index.len()));
+        };
+        let puts = overlay.puts.get(collection_id);
+        let deleted = overlay.delete_lsn.contains_key(collection_id);
+        let generation = self.generation(collection_id);
+        let durable_len = generation
+            .as_ref()
+            .map_or(0, |generation| generation.index.len());
+
+        if deleted {
+            return Ok(puts
+                .filter(|puts| !puts.is_empty())
+                .map(std::collections::HashMap::len));
+        }
+
+        let Some(puts) = puts else {
+            return Ok(generation.map(|_| durable_len));
+        };
+        let additions = puts
+            .keys()
+            .filter(|node_id| {
+                generation.as_ref().map_or(true, |generation| {
+                    generation.index.lookup_all(node_id).next().is_none()
+                })
+            })
+            .count();
+        let length = durable_len.saturating_add(additions);
+        Ok(if generation.is_some() || !puts.is_empty() {
+            Some(length)
+        } else {
+            None
+        })
     }
 
     /// Hint the kernel to read each planned extent as one sequential run.
@@ -7970,11 +8034,11 @@ impl PackfileStorage {
     /// mutations have been materialized or the transaction was abandoned
     /// before journal publication.
     pub(crate) fn deactivate_transaction_overlay(&self) {
-        // TODO: use `AtomicU64::fetch_update` when the MSRV is raised to 1.95.
         let mut users = self.transaction_overlay_users.load(Ordering::Acquire);
         loop {
-            debug_assert!(users != 0, "transaction overlay deactivated too often");
-            let next = users.saturating_sub(1);
+            let next = users
+                .checked_sub(1)
+                .expect("transaction overlay deactivated too often");
             match self.transaction_overlay_users.compare_exchange_weak(
                 users,
                 next,

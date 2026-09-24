@@ -326,7 +326,7 @@ impl PackfileStorage {
     /// On success the held overlay guard is returned so the caller can read the
     /// applied overlay without releasing and reacquiring the mutex, which could
     /// otherwise expose an empty or partially rebuilt overlay to another reader.
-    fn refresh_read_journal(
+    pub(super) fn refresh_read_journal(
         &self,
     ) -> Result<parking_lot::MutexGuard<'_, Option<ReadJournal>>, StorageError> {
         const RELOAD_ATTEMPTS: usize = 8;

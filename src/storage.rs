@@ -344,13 +344,16 @@ pub trait StorageEngine: Send + Sync {
     /// Whether `collection_id` currently holds any record (including the
     /// genesis metadata record).
     ///
-    /// Defaults to `false`; engines that can answer cheaply override it. Used
+    /// Defaults to `Ok(false)`; engines that can answer cheaply override it. Used
     /// by [`Self::ensure_collection_metadata`] to enforce that a protocol
     /// collection's genesis metadata precedes its first application record.
     /// Auxiliary/internal collections that carry no metadata are unaffected,
     /// because they never call `ensure_collection_metadata`.
-    fn collection_exists(&self, _collection_id: &[u8; 16]) -> bool {
-        false
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] on storage or journal-overlay failure.
+    fn collection_exists(&self, _collection_id: &[u8; 16]) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     /// Number of records currently indexed for `collection_id`, or `None` if
@@ -661,8 +664,8 @@ impl StorageEngine for InMemoryStorage {
             .and_then(|r| r.get(id).cloned()))
     }
 
-    fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
-        self.collections.read().contains_key(collection_id)
+    fn collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
+        Ok(self.collections.read().contains_key(collection_id))
     }
 
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
@@ -1184,7 +1187,7 @@ mod tests {
         let collection =
             derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
         store.collections.write().entry(collection).or_default();
-        assert!(store.collection_exists(&collection));
+        assert!(store.collection_exists(&collection).unwrap());
 
         store
             .ensure_collection_metadata(&collection, &metadata)
@@ -1209,7 +1212,7 @@ mod tests {
         let store = InMemoryStorage::new();
         let collection = [0x7Du8; 16];
         assert_eq!(store.put_many(&collection, &[]).unwrap(), 0);
-        assert!(!store.collection_exists(&collection));
+        assert!(!store.collection_exists(&collection).unwrap());
         assert_eq!(store.collection_len(&collection).unwrap(), None);
     }
 
@@ -1631,7 +1634,7 @@ mod tests {
         assert!(matches!(err, StorageError::Internal(_)));
         assert_eq!(store.get_collection_metadata(&col_id).unwrap(), None);
         assert!(store.get(&col_id, &node_id).unwrap().is_none());
-        assert!(!store.collection_exists(&col_id));
+        assert!(!store.collection_exists(&col_id).unwrap());
 
         // 4. First successful write establishes collection and writes record atomically
         store
@@ -1748,7 +1751,7 @@ mod tests {
         let store = InMemoryStorage::new();
         let trait_ref: &dyn StorageEngine = &store;
         let arc_trait: Arc<dyn StorageEngine> = Arc::new(InMemoryStorage::new());
-        assert!(!trait_ref.collection_exists(&[0u8; 16]));
-        assert!(!arc_trait.collection_exists(&[0u8; 16]));
+        assert!(!trait_ref.collection_exists(&[0u8; 16]).unwrap());
+        assert!(!arc_trait.collection_exists(&[0u8; 16]).unwrap());
     }
 }

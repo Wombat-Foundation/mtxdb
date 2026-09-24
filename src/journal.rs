@@ -505,6 +505,10 @@ impl TxnStage {
                 !data.appended[index] && !data.pools[index].is_empty()
             })
             .count();
+        if active_pool_count == 0 {
+            self.state.store(Self::PUBLISHED, Ordering::Release);
+            return Ok(());
+        }
         let active_coordinators = pools
             .iter()
             .filter_map(|pool| {
