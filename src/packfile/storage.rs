@@ -1244,10 +1244,14 @@ pub struct PackfileStorage {
     /// advanced the in-memory bookkeeping past the on-disk copy, which is
     /// deferred to the next persistence anchor.
     shard_collections_dirty: AtomicBool,
-    /// In-memory shard→collection bookkeeping has advanced past the on-disk
-    /// sidecar because a per-event durable barrier deferred the write. The
-    /// sidecar is rebuildable acceleration metadata, so this only schedules a
-    /// flush at the next anchor: a checkpoint rewrite, a repack, or shutdown.
+    /// A completed sync barrier advanced the in-memory shard→collection
+    /// bookkeeping past the on-disk sidecar by deferring its write. Set only on
+    /// the delta-append and budget-deferred-checkpoint paths, never by the raw
+    /// mutation helpers: bookkeeping changed by a write that was never synced
+    /// already invalidates the checkpoint fast path, so the next open
+    /// full-scans and has no use for a sidecar. The sidecar is rebuildable
+    /// acceleration metadata, so this only schedules a flush at the next
+    /// anchor: a checkpoint rewrite, a repack, or shutdown.
     shard_collections_stale: AtomicBool,
     /// A missing sidecar was observed, but its physical byte metrics could not
     /// be rebuilt. Keep retrying rather than publishing misleading zeros.
@@ -3375,9 +3379,11 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// True when dirty writes have modified shard→collection bookkeeping but
-    /// persistence of `shard_collections.bin` has been deferred to the next
-    /// anchor (checkpoint rewrite, repack, or clean shutdown).
+    /// True when a completed sync barrier deferred the `shard_collections.bin`
+    /// write to the next anchor (checkpoint rewrite, repack, or clean
+    /// shutdown). Writes that have not been synced are not reported here: they
+    /// invalidate the checkpoint fast path, so the next open full-scans and
+    /// never consults the sidecar.
     pub fn is_shard_collections_stale(&self) -> bool {
         self.shard_collections_stale.load(Ordering::Relaxed)
     }
@@ -8037,11 +8043,21 @@ pub struct RuntimeStats {
 }
 
 /// Flush a dirty/stale shard→collection sidecar on shutdown so a clean exit
-/// leaves the sidecar pinned to the final pack set. Best-effort and gated: a
-/// read-only handle never sets either flag, and any write error is swallowed by
-/// the best-effort wrapper. Dropping without this running remains safe — the
-/// sidecar is rebuildable acceleration metadata — so correctness never depends
-/// on `Drop`.
+/// leaves the sidecar pinned to the last *durable* pack set.
+///
+/// This covers state that a completed `sync`/`sync_all` left deferred (a delta
+/// append or a budget-deferred checkpoint rewrite set `shard_collections_stale`)
+/// plus a sidecar lost at open (`shard_collections_dirty`). It deliberately
+/// does **not** flush bookkeeping changed by writes that were never synced:
+/// such a write grows a pack past the last checkpoint, so the next open cannot
+/// take the checkpoint fast path at all and full-scans instead — it never
+/// consults the sidecar. Writing one there would be unownable I/O, so the
+/// narrower contract is the correct one.
+///
+/// Best-effort and gated: a read-only handle never sets either flag, and any
+/// write error is swallowed by the best-effort wrapper. Even skipping the flush
+/// entirely is safe — the sidecar is rebuildable acceleration metadata — so
+/// correctness never depends on `Drop`.
 impl Drop for PackfileStorage {
     fn drop(&mut self) {
         if self.shard_collections_dirty.load(Ordering::Relaxed)
@@ -13601,6 +13617,55 @@ mod tests {
             vec![(TEST_COLLECTION, 500)]
         );
         drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A write that is never synced is deliberately not flushed at shutdown:
+    /// it already advances a pack past the checkpoint, so the next open cannot
+    /// take the checkpoint fast path and never consults the sidecar. Correctness
+    /// must hold anyway, because the full rescan rebuilds everything.
+    #[test]
+    fn unsynced_write_then_drop_reopens_by_full_scan_with_correct_data() {
+        let dir = test_dir("sidecar_unsynced_drop");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(0),
+                    &NodeData::new(bytes::Bytes::from_static(b"synced")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+            // A later write with no sync must not mark the sidecar stale, and
+            // `Drop` must not need to flush it.
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(1),
+                    &NodeData::new(bytes::Bytes::from_static(b"unsynced")),
+                )
+                .unwrap();
+            assert!(!store.is_shard_collections_stale());
+        }
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.open_timings().unwrap().path,
+            OpenPath::FullScan,
+            "an unsynced write invalidates the checkpoint fast path"
+        );
+        assert_eq!(
+            reopened
+                .collection_summaries()
+                .into_iter()
+                .find(|(id, _, _, _)| *id == TEST_COLLECTION)
+                .unwrap()
+                .1,
+            2,
+            "the full rescan must still recover every record"
+        );
+        drop(reopened);
         fs::remove_dir_all(&dir).ok();
     }
 
