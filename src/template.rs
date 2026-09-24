@@ -59,6 +59,9 @@ pub enum FrameIdPolicy {
     /// The full logical identity is supplied by the caller and only
     /// cross-checked, never derived.
     ExternalCanonicalIdToCrosscheck,
+    /// The record ID is a caller-supplied key digest (e.g. BLAKE3(key)[..16]).
+    /// Validation and mapping to the underlying key are owned by the application layer.
+    Key,
 }
 
 /// The byte sources a [`FrameIdPolicy`] may draw from.
@@ -77,7 +80,8 @@ pub struct FrameIdInput<'a> {
 ///
 /// Returns `None` when the policy's input is unavailable — a missing pointer or
 /// canonical form, or no descriptor — or when the identity is
-/// [`FrameIdPolicy::ExternalCanonicalIdToCrosscheck`] and must be supplied by the caller instead.
+/// [`FrameIdPolicy::ExternalCanonicalIdToCrosscheck`] or [`FrameIdPolicy::Key`]
+/// and must be supplied by the caller instead.
 #[must_use]
 pub fn frame_digest(
     policy: &FrameIdPolicy,
@@ -89,7 +93,7 @@ pub fn frame_digest(
         FrameIdPolicy::HeaderDescriptor { .. } => Cow::Borrowed(input.descriptor),
         FrameIdPolicy::Pointer { pointer } => Cow::Owned((input.resolve)(pointer)?),
         FrameIdPolicy::Canonical { .. } => Cow::Borrowed(input.canonical?),
-        FrameIdPolicy::ExternalCanonicalIdToCrosscheck => return None,
+        FrameIdPolicy::ExternalCanonicalIdToCrosscheck | FrameIdPolicy::Key => return None,
     };
     Some(algorithm.digest(&bytes))
 }
@@ -184,6 +188,10 @@ pub struct CollectionMetadata {
     /// configuration (room version, creator) from the header without seeking
     /// to and parsing the establishment record.
     pub extension: Option<Vec<u8>>,
+    /// Logical role of this collection (e.g. "`event_dag`", "`state_hamt`", "`system_auxiliary`").
+    pub role: Option<String>,
+    /// Optional wire schema / format version string (e.g. "matrix.event.v1").
+    pub schema: Option<String>,
 }
 
 /// `CollectionMetadata` TLV tags.
@@ -192,6 +200,8 @@ const META_TAG_COLLECTION_CANONICAL_ID: u8 = 0x02;
 const META_TAG_RECORD_ID_RULE: u8 = 0x03;
 const META_TAG_PAYLOAD: u8 = 0x04;
 const META_TAG_EXTENSION: u8 = 0x05;
+const META_TAG_ROLE: u8 = 0x06;
+const META_TAG_SCHEMA: u8 = 0x07;
 
 /// `RecordIdentityRule` nested tags.
 const IDENTITY_TAG_DIGEST_ALGORITHM: u8 = 0x01;
@@ -203,6 +213,7 @@ const POLICY_TAG_PAYLOAD: u8 = 0x02;
 const POLICY_TAG_HEADER_DESCRIPTOR: u8 = 0x03;
 const POLICY_TAG_CANONICAL: u8 = 0x04;
 const POLICY_TAG_EXTERNAL: u8 = 0x05;
+const POLICY_TAG_KEY: u8 = 0x06;
 
 /// [`FrameIdPolicy::Canonical`] nested tags.
 const CANONICAL_TAG_INCLUDE: u8 = 0x01;
@@ -306,6 +317,9 @@ fn encode_frame_id_policy(policy: &FrameIdPolicy) -> Vec<u8> {
         FrameIdPolicy::ExternalCanonicalIdToCrosscheck => {
             push_tlv(&mut out, POLICY_TAG_EXTERNAL, &[]);
         }
+        FrameIdPolicy::Key => {
+            push_tlv(&mut out, POLICY_TAG_KEY, &[]);
+        }
     }
     out
 }
@@ -346,6 +360,7 @@ fn decode_frame_id_policy(bytes: &[u8]) -> Option<FrameIdPolicy> {
             }
         }
         POLICY_TAG_EXTERNAL => FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+        POLICY_TAG_KEY => FrameIdPolicy::Key,
         _ => return None,
     })
 }
@@ -411,6 +426,13 @@ fn decode_payload(bytes: &[u8]) -> Option<PayloadPolicy> {
 }
 
 impl CollectionMetadata {
+    /// Verify whether this metadata's canonical ID and pool DST reproduce the
+    /// given collection ID under the canonical derivation contract.
+    #[must_use]
+    pub fn verify_collection_id(&self, collection_id: &[u8; 16]) -> bool {
+        derive_collection_id(self.pool_dst, &self.collection_canonical_id) == *collection_id
+    }
+
     /// Encode this record as a TLV block.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -432,6 +454,12 @@ impl CollectionMetadata {
         if let Some(extension) = &self.extension {
             push_tlv(&mut out, META_TAG_EXTENSION, extension);
         }
+        if let Some(role) = &self.role {
+            push_tlv(&mut out, META_TAG_ROLE, role.as_bytes());
+        }
+        if let Some(schema) = &self.schema {
+            push_tlv(&mut out, META_TAG_SCHEMA, schema.as_bytes());
+        }
         out
     }
 
@@ -449,6 +477,8 @@ impl CollectionMetadata {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         };
         let mut has_canonical_id = false;
         let mut has_record_id_rule = false;
@@ -466,6 +496,12 @@ impl CollectionMetadata {
                 }
                 META_TAG_PAYLOAD => meta.payload = decode_payload(value)?,
                 META_TAG_EXTENSION => meta.extension = Some(value.to_vec()),
+                META_TAG_ROLE => {
+                    meta.role = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+                }
+                META_TAG_SCHEMA => {
+                    meta.schema = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+                }
                 _ => {}
             }
         }
@@ -707,8 +743,20 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
+            role: Some("event_dag".to_owned()),
+            schema: Some("matrix-event".to_owned()),
         };
         assert_eq!(CollectionMetadata::decode(&meta.encode()).unwrap(), meta);
+        let id = derive_collection_id(meta.pool_dst, &meta.collection_canonical_id);
+        assert!(meta.verify_collection_id(&id));
+        assert!(!meta.verify_collection_id(&[0u8; 16]));
+    }
+
+    #[test]
+    fn frame_id_policy_key_round_trips() {
+        let policy = FrameIdPolicy::Key;
+        let encoded = encode_frame_id_policy(&policy);
+        assert_eq!(decode_frame_id_policy(&encoded).unwrap(), policy);
     }
 
     fn sample_metadata() -> CollectionMetadata {
@@ -723,6 +771,8 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: Some(b"ext".to_vec()),
+            role: Some("event_dag".to_owned()),
+            schema: Some("matrix-event".to_owned()),
         }
     }
 

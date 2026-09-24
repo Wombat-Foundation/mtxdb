@@ -20,7 +20,8 @@ use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
 use crate::storage::{
-    Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef, StorageEngine, StorageError,
+    hex16, validate_established_batch_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
+    StorageEngine, StorageError,
 };
 use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
@@ -6655,6 +6656,17 @@ impl PackfileStorage {
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+        self.put_many_internal_locked(collection_id, entries, metadatas)
+    }
+
+    fn put_many_internal_locked(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
+    ) -> Result<usize, StorageError> {
         if let Some(metadatas) = metadatas {
             debug_assert_eq!(
                 metadatas.len(),
@@ -6665,8 +6677,6 @@ impl PackfileStorage {
         if !self.validate_put_many_inputs(collection_id, entries)? {
             return Ok(0);
         }
-        let collection_arc = self.put_mutex(collection_id);
-        let collection_guard = collection_arc.lock();
 
         // Same comment as in `put`: a brand-new collection must be excluded
         // from a concurrent checkpoint's fingerprint→snapshot window.
@@ -6699,7 +6709,6 @@ impl PackfileStorage {
                     }
                 }
                 drop(create_guard);
-                drop(collection_guard);
                 return Err(self.persist_failed_batch_boundary($error));
             }};
         }
@@ -6791,21 +6800,27 @@ impl StorageEngine for PackfileStorage {
             .map(|generation| generation.index.len()))
     }
 
-    fn ensure_collection_metadata(
+    fn create_or_put_established(
         &self,
         collection_id: &[u8; 16],
         metadata: &CollectionMetadata,
+        records: &[(NodeId, NodeData)],
     ) -> Result<(), StorageError> {
-        // Hold the collection's put mutex across the metadata lookup, the
-        // collection-existence check, and the append. Otherwise two concurrent
-        // writers can both observe an absent genesis record and append
-        // conflicting metadata, or a put can land between the existence check
-        // and the append and make the genesis record non-first. The mutex is
-        // per-instance, so this serializes threads within one process; a second
-        // writer process cannot open the store at all (the shard pool holds an
-        // exclusive `.mtxdb.lock`), so there is no cross-process race to close.
+        validate_established_batch_inputs(records)?;
+        if !metadata.verify_collection_id(collection_id) {
+            return Err(StorageError::Internal(
+                "collection metadata does not reproduce collection id".to_owned(),
+            ));
+        }
+        if metadata.collection_canonical_id.is_empty() {
+            return Err(StorageError::Internal(
+                "collection metadata has empty canonical id".to_owned(),
+            ));
+        }
+
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
+
         if let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
             let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
                 StorageError::Corrupt("malformed collection metadata record".to_owned())
@@ -6815,19 +6830,90 @@ impl StorageEngine for PackfileStorage {
                     "collection metadata mismatch: existing genesis record differs".to_owned(),
                 ));
             }
+            let mut to_append = Vec::with_capacity(records.len());
+            for (id, data) in records {
+                if let Some(existing_rec) = self.get(collection_id, id)? {
+                    if existing_rec.bytes != data.bytes {
+                        return Err(StorageError::Internal(format!(
+                            "record collision on node {}",
+                            hex16(id)
+                        )));
+                    }
+                } else {
+                    to_append.push((*id, data.clone()));
+                }
+            }
+            if !to_append.is_empty() {
+                self.put_many_internal_locked(collection_id, &to_append, None)?;
+            }
+        } else {
+            if self.collection_exists(collection_id) {
+                return Err(StorageError::Internal(
+                    "genesis metadata must be written before the collection's first record"
+                        .to_owned(),
+                ));
+            }
+            let mut batch = Vec::with_capacity(1 + records.len());
+            batch.push((
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(metadata.encode().into()),
+            ));
+            batch.extend_from_slice(records);
+            self.put_many_internal_locked(collection_id, &batch, None)?;
+        }
+        Ok(())
+    }
+
+    fn put_many_established(
+        &self,
+        collection_id: &[u8; 16],
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        validate_established_batch_inputs(records)?;
+        if records.is_empty() {
             return Ok(());
         }
-        if self.collection_exists(collection_id) {
-            return Err(StorageError::Internal(
-                "genesis metadata must be written before the collection's first record".to_owned(),
+
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+
+        let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? else {
+            return Err(StorageError::NotFound(*collection_id));
+        };
+        let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+            StorageError::Corrupt("malformed collection metadata record".to_owned())
+        })?;
+        if !found.verify_collection_id(collection_id) {
+            return Err(StorageError::Corrupt(
+                "stored collection metadata does not reproduce collection id".to_owned(),
             ));
         }
-        self.put_internal_locked(
-            collection_id,
-            &COLLECTION_METADATA_RECORD_ID,
-            &NodeData::new(metadata.encode().into()),
-            None,
-        )
+
+        let mut to_append = Vec::with_capacity(records.len());
+        for (id, data) in records {
+            if let Some(existing_rec) = self.get(collection_id, id)? {
+                if existing_rec.bytes != data.bytes {
+                    return Err(StorageError::Internal(format!(
+                        "record collision on node {}",
+                        hex16(id)
+                    )));
+                }
+            } else {
+                to_append.push((*id, data.clone()));
+            }
+        }
+        if !to_append.is_empty() {
+            self.put_many_internal_locked(collection_id, &to_append, None)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+    ) -> Result<(), StorageError> {
+        self.create_or_put_established(collection_id, metadata, &[])
     }
 
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
@@ -14447,12 +14533,12 @@ mod tests {
     #[test]
     fn ensure_collection_metadata_is_atomic_under_concurrency() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
 
         let dir = test_dir("ensure_metadata_concurrent");
         let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
-        let collection = [0x7Eu8; 16];
         let metadata = Arc::new(CollectionMetadata {
             pool_dst: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
@@ -14464,7 +14550,10 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         });
+        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
 
         // Release every thread at once so the lookup/append windows overlap.
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -14501,16 +14590,17 @@ mod tests {
     #[test]
     fn ensure_collection_metadata_conflicting_writers_have_one_winner() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
 
         let dir = test_dir("ensure_metadata_conflict");
         let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
-        let collection = [0x7Fu8; 16];
+        let collection = derive_collection_id(Some(*b"EVNT"), b"!room:matrix.org");
         let candidates: Vec<CollectionMetadata> = (0..8)
             .map(|i| CollectionMetadata {
                 pool_dst: Some(*b"EVNT"),
-                collection_canonical_id: format!("!room{i}:matrix.org").into_bytes(),
+                collection_canonical_id: b"!room:matrix.org".to_vec(),
                 record_id_rule: RecordIdentityRule {
                     policy: FrameIdPolicy::Pointer {
                         pointer: "/event_id".into(),
@@ -14519,6 +14609,8 @@ mod tests {
                 },
                 payload: PayloadPolicy::Source,
                 extension: None,
+                role: Some(format!("role_{i}")),
+                schema: None,
             })
             .collect();
 

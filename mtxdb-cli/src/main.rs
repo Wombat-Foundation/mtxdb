@@ -85,6 +85,8 @@ pub(crate) enum Commands {
         id: String,
         raw: bool,
         verbose: bool,
+        header: bool,
+        decode: Option<String>,
     },
     Collections {
         all: bool,
@@ -108,6 +110,8 @@ pub(crate) enum Commands {
     Scan {
         selector: String,
         verbose: bool,
+        header: bool,
+        decode: Option<String>,
         limit: i64,
         id: Option<String>,
         collection: Option<String>,
@@ -404,7 +408,21 @@ fn sub_scan() -> Command {
                 .short('v')
                 .long("verbose")
                 .action(ArgAction::SetTrue)
-                .help("Print each frame's JSON payload when available"),
+                .help("Print each frame's payload when available"),
+        )
+        .arg(
+            Arg::new("header")
+                .long("header")
+                .action(ArgAction::SetTrue)
+                .help("Print frame header details (offsets, sizes, flags, and metadata TLVs)"),
+        )
+        .arg(
+            Arg::new("decode")
+                .long("decode")
+                .value_name("FORMAT")
+                .num_args(0..=1)
+                .default_missing_value("auto")
+                .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
         )
         .arg(
             Arg::new("id")
@@ -610,6 +628,20 @@ fn sub_get() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print record and Matrix event metadata to stderr"),
         )
+        .arg(
+            Arg::new("header")
+                .long("header")
+                .action(ArgAction::SetTrue)
+                .help("Print frame header and collection metadata details to stderr"),
+        )
+        .arg(
+            Arg::new("decode")
+                .long("decode")
+                .value_name("FORMAT")
+                .num_args(0..=1)
+                .default_missing_value("auto")
+                .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
+        )
 }
 
 #[allow(
@@ -656,6 +688,8 @@ fn parse_cli() -> Cli {
                 .clone(),
             raw: m.get_flag("raw"),
             verbose: m.get_flag("verbose"),
+            header: m.get_flag("header"),
+            decode: m.get_one::<String>("decode").cloned(),
         },
         Some(("collections", m)) => Commands::Collections {
             all: m.get_flag("all"),
@@ -681,6 +715,8 @@ fn parse_cli() -> Cli {
         Some(("scan", m)) => Commands::Scan {
             selector: m.get_one::<String>("selector").unwrap().clone(),
             verbose: m.get_flag("verbose"),
+            header: m.get_flag("header"),
+            decode: m.get_one::<String>("decode").cloned(),
             id: m.get_one::<String>("id").cloned(),
             collection: m.get_one::<String>("collection").cloned(),
             raw: m.get_flag("raw"),

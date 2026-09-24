@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -368,17 +369,78 @@ pub trait StorageEngine: Send + Sync {
     /// Returns [`StorageError::Io`] on I/O failure.
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError>;
 
+    /// Atomically establish a collection or append to it if already established.
+    ///
+    /// Under the collection's put-mutex:
+    /// - Validates common batch inputs:
+    ///   - Rejects [`COLLECTION_METADATA_RECORD_ID`] in `records`.
+    ///   - Rejects intra-batch duplicate node IDs in `records`.
+    ///   - Rejects metadata whose canonical ID is empty.
+    ///   - Validates that `metadata.verify_collection_id(collection_id)` is `true`.
+    /// - If the collection does not yet exist:
+    ///   - Prepends the genesis metadata record ([`COLLECTION_METADATA_RECORD_ID`])
+    ///     with encoded `metadata`.
+    ///   - Appends `records` in a single atomic batch.
+    /// - If the collection already exists:
+    ///   - Verifies that stored genesis metadata matches `metadata` (`found == *metadata`).
+    ///     Fails closed with [`StorageError::Internal`] if metadata conflicts.
+    ///   - Enforces idempotency and collision semantics on `records`:
+    ///     - Same node ID + same payload => idempotent success (skipped).
+    ///     - Same node ID + different payload => [`StorageError::Internal`] collision failure.
+    ///   - Appends any new records in `records`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Internal`] if inputs are invalid, if metadata
+    /// fails verification, or if a record collision occurs.
+    /// Returns [`StorageError::Corrupt`] if existing stored metadata cannot be decoded.
+    /// Returns [`StorageError::Io`] on I/O failure.
+    fn create_or_put_established(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError>;
+
+    /// Append records to an already-established collection.
+    ///
+    /// Locks the collection under its put-mutex, verifies that the collection
+    /// exists and has an established genesis metadata record whose derivation reproduces
+    /// `collection_id`, and appends the records.
+    ///
+    /// If an input record is already present:
+    /// - If existing payload matches, it is treated as an idempotent retry.
+    /// - If existing payload differs, a [`StorageError::Internal`] collision error is returned.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if the collection does not exist or has no metadata record.
+    /// Returns [`StorageError::Internal`] if `records` contains [`COLLECTION_METADATA_RECORD_ID`],
+    /// duplicate keys within the batch, or a record payload collision with existing data.
+    /// Returns [`StorageError::Corrupt`] if stored genesis metadata is corrupted or fails derivation.
+    /// Returns [`StorageError::Io`] on I/O failure.
+    fn put_many_established(
+        &self,
+        collection_id: &[u8; 16],
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError>;
+
+    /// Convenience alias for [`Self::create_or_put_established`] to establish a collection
+    /// with an initial batch of application records (or empty).
+    fn create_collection_with_records(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        initial_records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        self.create_or_put_established(collection_id, metadata, initial_records)
+    }
+
     /// Write a collection's genesis metadata record if it has none, or verify
     /// that an existing record matches `metadata`. Idempotent: a caller may
     /// invoke it before every batch.
     ///
     /// The record is stored as an ordinary frame under the reserved
     /// [`COLLECTION_METADATA_RECORD_ID`] key, so it rides the same append,
-    /// checkpoint, and crash-recovery paths as application records. Callers
-    /// must invoke it before the collection's first application record, so the
-    /// genesis frame precedes (and is durable with or before) any application
-    /// record. The engine enforces this: writing genesis metadata for a
-    /// collection that already holds records is rejected.
+    /// checkpoint, and crash-recovery paths as application records.
     ///
     /// # Errors
     /// Returns [`StorageError::Io`] on I/O failure, [`StorageError::Corrupt`]
@@ -390,27 +452,7 @@ pub trait StorageEngine: Send + Sync {
         collection_id: &[u8; 16],
         metadata: &CollectionMetadata,
     ) -> Result<(), StorageError> {
-        if let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
-            let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
-                StorageError::Corrupt("malformed collection metadata record".to_owned())
-            })?;
-            if found != *metadata {
-                return Err(StorageError::Internal(
-                    "collection metadata mismatch: existing genesis record differs".to_owned(),
-                ));
-            }
-            return Ok(());
-        }
-        if self.collection_exists(collection_id) {
-            return Err(StorageError::Internal(
-                "genesis metadata must be written before the collection's first record".to_owned(),
-            ));
-        }
-        self.put(
-            collection_id,
-            &COLLECTION_METADATA_RECORD_ID,
-            &NodeData::new(metadata.encode().into()),
-        )
+        self.create_or_put_established(collection_id, metadata, &[])
     }
 
     /// Fetch and decode a collection's genesis metadata record, if present.
@@ -495,6 +537,41 @@ impl From<StorageError> for std::io::Error {
 
 /// In-memory storage engine for tests.
 ///
+pub(crate) fn hex16(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+pub(crate) fn validate_established_batch_inputs(
+    records: &[(NodeId, NodeData)],
+) -> Result<(), StorageError> {
+    if records.len() > 1 {
+        let mut seen = HashSet::with_capacity(records.len());
+        for (id, _) in records {
+            if *id == COLLECTION_METADATA_RECORD_ID {
+                return Err(StorageError::Internal(
+                    "cannot write reserved metadata record id as application record".to_owned(),
+                ));
+            }
+            if !seen.insert(*id) {
+                return Err(StorageError::Internal(
+                    "duplicate node ID within batch".to_owned(),
+                ));
+            }
+        }
+    } else if let Some((id, _)) = records.first() {
+        if *id == COLLECTION_METADATA_RECORD_ID {
+            return Err(StorageError::Internal(
+                "cannot write reserved metadata record id as application record".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Partitions nodes by collection. Each collection's nodes are tracked in a
 /// per-collection `HashMap`, enabling correct `delete_collection` behavior.
 pub struct InMemoryStorage {
@@ -537,11 +614,24 @@ impl StorageEngine for InMemoryStorage {
             .map(std::collections::HashMap::len))
     }
 
-    fn ensure_collection_metadata(
+    fn create_or_put_established(
         &self,
         collection_id: &[u8; 16],
         metadata: &CollectionMetadata,
+        records: &[(NodeId, NodeData)],
     ) -> Result<(), StorageError> {
+        validate_established_batch_inputs(records)?;
+        if !metadata.verify_collection_id(collection_id) {
+            return Err(StorageError::Internal(
+                "collection metadata does not reproduce collection id".to_owned(),
+            ));
+        }
+        if metadata.collection_canonical_id.is_empty() {
+            return Err(StorageError::Internal(
+                "collection metadata has empty canonical id".to_owned(),
+            ));
+        }
+
         let mut collections = self.collections.write();
         let collection = collections.entry(*collection_id).or_default();
         if let Some(existing) = collection.get(&COLLECTION_METADATA_RECORD_ID) {
@@ -553,18 +643,82 @@ impl StorageEngine for InMemoryStorage {
                     "collection metadata mismatch: existing genesis record differs".to_owned(),
                 ));
             }
+            for (id, data) in records {
+                if let Some(existing_rec) = collection.get(id) {
+                    if existing_rec.bytes != data.bytes {
+                        return Err(StorageError::Internal(format!(
+                            "record collision on node {}",
+                            hex16(id)
+                        )));
+                    }
+                } else {
+                    collection.insert(*id, data.clone());
+                }
+            }
+        } else {
+            if !collection.is_empty() {
+                return Err(StorageError::Internal(
+                    "genesis metadata must be written before the collection's first record"
+                        .to_owned(),
+                ));
+            }
+            collection.insert(
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(metadata.encode().into()),
+            );
+            for (id, data) in records {
+                collection.insert(*id, data.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn put_many_established(
+        &self,
+        collection_id: &[u8; 16],
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        validate_established_batch_inputs(records)?;
+        if records.is_empty() {
             return Ok(());
         }
-        if !collection.is_empty() {
-            return Err(StorageError::Internal(
-                "genesis metadata must be written before the collection's first record".to_owned(),
+        let mut collections = self.collections.write();
+        let collection = collections
+            .get_mut(collection_id)
+            .ok_or(StorageError::NotFound(*collection_id))?;
+        let existing = collection
+            .get(&COLLECTION_METADATA_RECORD_ID)
+            .ok_or(StorageError::NotFound(*collection_id))?;
+        let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+            StorageError::Corrupt("malformed collection metadata record".to_owned())
+        })?;
+        if !found.verify_collection_id(collection_id) {
+            return Err(StorageError::Corrupt(
+                "stored collection metadata does not reproduce collection id".to_owned(),
             ));
         }
-        collection.insert(
-            COLLECTION_METADATA_RECORD_ID,
-            NodeData::new(metadata.encode().into()),
-        );
+
+        for (id, data) in records {
+            if let Some(existing_rec) = collection.get(id) {
+                if existing_rec.bytes != data.bytes {
+                    return Err(StorageError::Internal(format!(
+                        "record collision on node {}",
+                        hex16(id)
+                    )));
+                }
+            } else {
+                collection.insert(*id, data.clone());
+            }
+        }
         Ok(())
+    }
+
+    fn ensure_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+    ) -> Result<(), StorageError> {
+        self.create_or_put_established(collection_id, metadata, &[])
     }
 
     fn get_many(
@@ -630,10 +784,9 @@ impl StorageEngine for InMemoryStorage {
 /// this against their own store, so the assertions live in one place instead
 /// of drifting copies.
 pub(crate) fn assert_collection_len_counts_genesis_and_distinct_ids(store: &dyn StorageEngine) {
-    use crate::template::{CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule};
-
-    let collection = [0x7Bu8; 16];
-    assert_eq!(store.collection_len(&collection).unwrap(), None);
+    use crate::template::{
+        derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+    };
 
     let metadata = CollectionMetadata {
         pool_dst: Some(*b"EVNT"),
@@ -646,7 +799,12 @@ pub(crate) fn assert_collection_len_counts_genesis_and_distinct_ids(store: &dyn 
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: None,
+        schema: None,
     };
+    let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+    assert_eq!(store.collection_len(&collection).unwrap(), None);
+
     store
         .ensure_collection_metadata(&collection, &metadata)
         .unwrap();
@@ -741,17 +899,11 @@ mod tests {
     #[test]
     fn collection_metadata_roundtrips_and_verifies() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
 
         let store = InMemoryStorage::new();
-        let collection = [0x5Au8; 16];
-        assert_eq!(
-            store.get_collection_metadata(&collection).unwrap(),
-            None,
-            "a fresh collection has no genesis metadata"
-        );
-
         let metadata = CollectionMetadata {
             pool_dst: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
@@ -763,7 +915,16 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: Some(br#"{"ext":"matrix.room","fmt":1,"room_version":"10"}"#.to_vec()),
+            role: None,
+            schema: None,
         };
+        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            None,
+            "a fresh collection has no genesis metadata"
+        );
+
         store
             .ensure_collection_metadata(&collection, &metadata)
             .unwrap();
@@ -808,6 +969,8 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         };
 
         // Correct order: metadata first, then records.
@@ -871,6 +1034,8 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         };
         store
             .ensure_collection_metadata(&collection, &metadata)
@@ -902,12 +1067,12 @@ mod tests {
     #[test]
     fn ensure_collection_metadata_is_atomic_under_concurrency() {
         use crate::template::{
-            CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
         };
         use std::sync::Arc;
 
         let store = Arc::new(InMemoryStorage::new());
-        let collection = [0x7Du8; 16];
         let metadata = Arc::new(CollectionMetadata {
             pool_dst: Some(*b"EVNT"),
             collection_canonical_id: b"!room:matrix.org".to_vec(),
@@ -919,7 +1084,10 @@ mod tests {
             },
             payload: PayloadPolicy::Source,
             extension: None,
+            role: None,
+            schema: None,
         });
+        let collection = derive_collection_id(metadata.pool_dst, &metadata.collection_canonical_id);
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -1071,5 +1239,126 @@ mod tests {
         store.delete_collection(&TEST_COLLECTION).unwrap();
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_none());
         store.sync().unwrap();
+    }
+
+    #[test]
+    fn established_collection_lifecycle_and_validation() {
+        use crate::template::{
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule, POOL_DST_INTERNAL,
+        };
+
+        let store = InMemoryStorage::new();
+        let canonical_id = b"sys:test-col";
+        let col_id = derive_collection_id(Some(POOL_DST_INTERNAL), canonical_id);
+
+        let valid_meta = CollectionMetadata {
+            pool_dst: Some(POOL_DST_INTERNAL),
+            collection_canonical_id: canonical_id.to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_auxiliary".to_owned()),
+            schema: None,
+        };
+
+        // 1. Rejects metadata if it does not reproduce collection id
+        let wrong_col_id = [0x99; 16];
+        assert!(store
+            .create_or_put_established(&wrong_col_id, &valid_meta, &[])
+            .is_err());
+
+        // 2. Rejects metadata if canonical id is empty
+        let empty_canonical_meta = CollectionMetadata {
+            collection_canonical_id: Vec::new(),
+            ..valid_meta.clone()
+        };
+        assert!(store
+            .create_or_put_established(&col_id, &empty_canonical_meta, &[])
+            .is_err());
+
+        // 3. Rejects application records containing COLLECTION_METADATA_RECORD_ID
+        let bad_rec = (
+            COLLECTION_METADATA_RECORD_ID,
+            NodeData::new(bytes::Bytes::from_static(b"bad")),
+        );
+        assert!(store
+            .create_or_put_established(&col_id, &valid_meta, &[bad_rec])
+            .is_err());
+
+        // 4. Rejects duplicate node IDs within a single batch
+        let node_a = [0x01; 16];
+        let dup_rec1 = (node_a, NodeData::new(bytes::Bytes::from_static(b"data1")));
+        let dup_rec2 = (node_a, NodeData::new(bytes::Bytes::from_static(b"data2")));
+        assert!(store
+            .create_or_put_established(&col_id, &valid_meta, &[dup_rec1.clone(), dup_rec2])
+            .is_err());
+
+        // 5. Successful atomic establishment with records
+        let node_b = [0x02; 16];
+        let rec_b = (node_b, NodeData::new(bytes::Bytes::from_static(b"datab")));
+        store
+            .create_or_put_established(&col_id, &valid_meta, &[dup_rec1.clone(), rec_b.clone()])
+            .unwrap();
+
+        // Stored metadata matches
+        let stored_meta = store.get_collection_metadata(&col_id).unwrap().unwrap();
+        assert_eq!(stored_meta, valid_meta);
+        assert_eq!(
+            store.get(&col_id, &node_a).unwrap().unwrap().bytes,
+            b"data1"[..]
+        );
+        assert_eq!(
+            store.get(&col_id, &node_b).unwrap().unwrap().bytes,
+            b"datab"[..]
+        );
+
+        // 6. Conflicting metadata on existing collection fails closed
+        let conflicting_meta = CollectionMetadata {
+            role: Some("other_role".to_owned()),
+            ..valid_meta.clone()
+        };
+        assert!(store
+            .create_or_put_established(&col_id, &conflicting_meta, &[])
+            .is_err());
+
+        // 7. Idempotent success on matching record
+        store
+            .create_or_put_established(&col_id, &valid_meta, &[dup_rec1])
+            .unwrap();
+
+        // 8. Collision error on different payload for existing key
+        let collision_rec = (
+            node_a,
+            NodeData::new(bytes::Bytes::from_static(b"collision")),
+        );
+        assert!(store
+            .create_or_put_established(&col_id, &valid_meta, &[collision_rec.clone()])
+            .is_err());
+
+        // 9. put_many_established on existing collection
+        let node_c = [0x03; 16];
+        let rec_c = (node_c, NodeData::new(bytes::Bytes::from_static(b"datac")));
+        store.put_many_established(&col_id, &[rec_c]).unwrap();
+        assert_eq!(
+            store.get(&col_id, &node_c).unwrap().unwrap().bytes,
+            b"datac"[..]
+        );
+
+        // 10. put_many_established fails on payload collision
+        assert!(store
+            .put_many_established(&col_id, &[collision_rec])
+            .is_err());
+
+        // 11. put_many_established fails on non-existent collection
+        assert!(store
+            .put_many_established(
+                &[0xee; 16],
+                &[(node_a, NodeData::new(bytes::Bytes::from_static(b"data")))]
+            )
+            .is_err());
     }
 }

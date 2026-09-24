@@ -12,7 +12,10 @@
 //! a compatibility fix.
 
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
-use crate::template::{derive_collection_id, POOL_DST_INTERNAL};
+use crate::template::{
+    derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+    POOL_DST_INTERNAL,
+};
 
 const VALUE_MAGIC: &[u8; 4] = b"AUX1";
 const DIGEST_LEN: usize = 32;
@@ -46,6 +49,7 @@ fn physical_id(digest: &AuxiliaryKeyDigest) -> NodeId {
 /// A named logical auxiliary index backed by an existing storage engine.
 pub struct AuxiliaryIndex<'a, S: StorageEngine + ?Sized> {
     engine: &'a S,
+    name: String,
     collection_id: [u8; 16],
 }
 
@@ -55,8 +59,41 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     pub fn open(engine: &'a S, name: &str) -> Self {
         Self {
             engine,
+            name: name.to_owned(),
             collection_id: auxiliary_collection_id(name),
         }
+    }
+
+    /// Return this index's canonical name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return this index's collection metadata.
+    #[must_use]
+    pub fn metadata(&self) -> CollectionMetadata {
+        CollectionMetadata {
+            pool_dst: Some(POOL_DST_INTERNAL),
+            collection_canonical_id: self.name.as_bytes().to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_auxiliary".to_owned()),
+            schema: None,
+        }
+    }
+
+    /// Ensure that collection metadata is established for this auxiliary index.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Internal`] if existing metadata conflicts, or propagates backend error.
+    pub fn ensure_metadata(&self) -> Result<(), StorageError> {
+        self.engine
+            .create_or_put_established(&self.collection_id, &self.metadata(), &[])
     }
 
     /// Return this index's compatibility collection ID.
@@ -85,32 +122,29 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
         decode_value(&digest, &data.bytes).map(Some)
     }
 
-    /// Insert or replace a value by its logical key.
+    /// Insert a value by its logical key.
     ///
-    /// A collision in the current 16-byte physical compatibility ID is
-    /// rejected instead of silently overwriting the existing key. Full
-    /// 32-byte identity is retained in the versioned value envelope.
+    /// Atomically establishes the collection metadata on the first write
+    /// and appends the key-value envelope. Retains idempotency (same key and value succeeds)
+    /// and rejects collisions (same key with different value or physical ID conflict).
     ///
     /// # Errors
-    /// Returns [`StorageError::Corrupt`] if the physical compatibility ID is
-    /// occupied by another key, or propagates a backend error.
+    /// Returns [`StorageError::Internal`] or [`StorageError::Corrupt`] if a collision occurs,
+    /// or propagates backend error.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let digest = auxiliary_key_digest(key);
         let node_id = physical_id(&digest);
-        if let Some(existing) = self.engine.get(&self.collection_id, &node_id)? {
-            if !existing.bytes.is_empty() {
-                decode_value(&digest, &existing.bytes)?;
-            }
-        }
         let mut encoded = Vec::with_capacity(VALUE_MAGIC.len() + DIGEST_LEN + value.len());
         encoded.extend_from_slice(VALUE_MAGIC);
         encoded.extend_from_slice(&digest);
         encoded.extend_from_slice(value);
-        self.engine.put(
+        let data = NodeData::new(bytes::Bytes::from(encoded));
+
+        self.engine.create_or_put_established(
             &self.collection_id,
-            &node_id,
-            &NodeData::new(bytes::Bytes::from(encoded)),
+            &self.metadata(),
+            &[(node_id, data)],
         )
     }
 }
@@ -184,5 +218,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index.get(b"key").unwrap(), Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn auxiliary_index_establishes_metadata_on_put() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "sys:matrix-state-groups");
+        index.put(b"event_1", b"state_group_1").unwrap();
+        let meta = engine
+            .get_collection_metadata(&index.collection_id())
+            .unwrap()
+            .expect("metadata must be established on put");
+        assert_eq!(meta.collection_canonical_id, b"sys:matrix-state-groups");
+        assert_eq!(meta.pool_dst, Some(POOL_DST_INTERNAL));
+        assert_eq!(meta.role.as_deref(), Some("system_auxiliary"));
+        assert_eq!(meta.record_id_rule.policy, FrameIdPolicy::Key);
+        assert!(meta.verify_collection_id(&index.collection_id()));
+
+        // Idempotent retry succeeds
+        index.put(b"event_1", b"state_group_1").unwrap();
+
+        // Value collision returns error
+        assert!(index.put(b"event_1", b"different_group").is_err());
     }
 }
