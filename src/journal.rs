@@ -989,6 +989,12 @@ pub struct JournalCoordinator {
     /// Guards [`Self::durable_cv`]. The condvar carries no state of its own;
     /// waiters re-check [`Self::committed_lsn`] and the committer's presence
     /// after every wake, so this only provides the required mutex pairing.
+    ///
+    /// Lock order: `journal` may be held while acquiring `durable_lock` (the
+    /// commit path wakes waiters after recording the commit). The reverse is
+    /// forbidden: never acquire `journal` while holding `durable_lock`. Both
+    /// the committer loop and `wait_durable` drop the guard before entering
+    /// journal I/O.
     durable_lock: Mutex<()>,
     /// Signals `wait_durable` callers and the background committer when the
     /// durable boundary may have advanced or the committer has stopped.
@@ -1004,9 +1010,15 @@ pub struct JournalCoordinator {
     /// Published-but-uncommitted count at which `publish` wakes the committer
     /// for an early flush. Zero when no committer is running (no wakeups).
     committer_wake_threshold: AtomicU64,
-    /// Set by the publish that crossed the threshold; cleared by the next
-    /// flush so a burst yields one wake, not one per event.
-    threshold_notified: AtomicBool,
+    /// Monotonic commit generation, bumped whenever `committed_lsn` advances
+    /// (background, explicit, or fallback commit). A new epoch re-arms the
+    /// threshold wake without any explicit clear step.
+    commit_epoch: AtomicU64,
+    /// Commit epoch of the last threshold-crossing wake. Publishers wake only
+    /// when it differs from the current [`Self::commit_epoch`], so a burst
+    /// yields one wake. Initialised to `u64::MAX`, so it never matches epoch 0
+    /// and the first crossing always wakes.
+    threshold_notified_epoch: AtomicU64,
     /// Number of background group commits that appended and fsynced a group.
     background_commits: AtomicU64,
     /// Number of background commit attempts already covered by a concurrent
@@ -1061,7 +1073,8 @@ impl JournalCoordinator {
             background: Mutex::new(BackgroundState::Stopped),
             background_failure: Mutex::new(None),
             committer_wake_threshold: AtomicU64::new(0),
-            threshold_notified: AtomicBool::new(false),
+            commit_epoch: AtomicU64::new(0),
+            threshold_notified_epoch: AtomicU64::new(u64::MAX),
             background_commits: AtomicU64::new(0),
             background_coalesced: AtomicU64::new(0),
         }
@@ -1097,6 +1110,17 @@ impl JournalCoordinator {
     #[cfg(feature = "multi-reader")]
     pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
         self.pool_committed.lock().get(&pool).copied().unwrap_or(0)
+    }
+
+    /// Record a durable commit and advance the generation that re-arms the
+    /// background committer's threshold wake. Centralised so every commit path
+    /// — background, explicit `sync_through`, and fallback — re-arms alike.
+    fn note_commit(&self, through_lsn: u64) {
+        let previous = self.committed_lsn.fetch_max(through_lsn, Ordering::AcqRel);
+        if through_lsn > previous {
+            self.commit_epoch.fetch_add(1, Ordering::AcqRel);
+            self.wake_committer_if_backlogged();
+        }
     }
 
     /// Advance per-pool committed watermarks for every appended group whose
@@ -1261,16 +1285,17 @@ impl JournalCoordinator {
         pending.push((lsn, pool, mutation));
         self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn.store(lsn, Ordering::Release);
-        // Wake the committer only when a burst reaches its early-flush bound;
-        // `publish` is the hot path, so ordinary publishes must not pay a
-        // futex wake. `committer_wake_threshold` is zero when no committer is
+        // Wake the committer only when a burst is at or above its early-flush
+        // bound; `publish` is the hot path, so ordinary publishes must not pay
+        // a futex wake. `committer_wake_threshold` is zero when no committer is
         // running.
         let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
-        // Only the publish that crosses the bound wakes; the flag stays set
-        // (suppressing further wakes in the burst) until the next flush.
-        let wake = threshold > 0
-            && self.pending_count() >= threshold
-            && !self.threshold_notified.swap(true, Ordering::AcqRel);
+        // Only the first publish at or above the bound wakes in a given epoch,
+        // by claiming the current commit epoch. Any commit (background or explicit) advances
+        // the epoch and thereby re-arms the next crossing, so nothing needs an
+        // explicit clear.
+        let wake =
+            threshold > 0 && self.pending_count() >= threshold && self.claim_threshold_wake();
         // Drop the pending-queue lock before taking `durable_lock`, keeping a
         // single lock order (pending -> . . . is never followed by
         // durable_lock) and off the publish path otherwise.
@@ -1372,7 +1397,7 @@ impl JournalCoordinator {
             }
             timings.journal_fsync = fsync_started.elapsed();
             self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, &timings);
-            self.committed_lsn.store(target_lsn, Ordering::Release);
+            self.note_commit(target_lsn);
             self.promote_pool_committed(target_lsn);
             return Ok((None, timings));
         }
@@ -1481,8 +1506,7 @@ impl JournalCoordinator {
         self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, timings);
         // The group is durable, so record its extent before checking the
         // receipt. This prevents a retry from re-appending committed entries.
-        self.committed_lsn
-            .store(receipt.last_lsn, Ordering::Release);
+        self.note_commit(receipt.last_lsn);
         let committed_count = usize::try_from(
             receipt
                 .last_lsn
@@ -1796,6 +1820,54 @@ impl JournalCoordinator {
         self.durable_cv.notify_all();
     }
 
+    /// Claim the wake for the current commit epoch.
+    ///
+    /// Returns `true` only for the publish that wakes the committer for this
+    /// epoch, so a burst costs one wake. The claim is retried because a commit
+    /// can advance the epoch between the load and the CAS; re-reading the epoch
+    /// after a successful claim ensures that newer commit also gets a wake
+    /// instead of being suppressed by a claim that was valid a moment earlier.
+    fn claim_threshold_wake(&self) -> bool {
+        self.claim_threshold_wake_with(|| {})
+    }
+
+    /// [`Self::claim_threshold_wake`] with a hook run between a successful claim
+    /// and the epoch recheck, so tests can force a commit into that window.
+    fn claim_threshold_wake_with(&self, mut between_claim_and_recheck: impl FnMut()) -> bool {
+        loop {
+            let notified = self.threshold_notified_epoch.load(Ordering::Acquire);
+            let epoch = self.commit_epoch.load(Ordering::Acquire);
+            if notified == epoch {
+                return false;
+            }
+            if self
+                .threshold_notified_epoch
+                .compare_exchange(notified, epoch, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                between_claim_and_recheck();
+                if self.commit_epoch.load(Ordering::Acquire) == epoch {
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Wake the committer and durability waiters when a durable commit left the
+    /// pending queue at or above the early-flush bound.
+    ///
+    /// Publishers that arrived during an fsync read the pre-commit epoch and
+    /// suppressed their wake, so nothing would re-arm the parked committer
+    /// until the next publish or timer tick. This closes that window from the
+    /// commit side, after the epoch has advanced. It is a no-op when no
+    /// committer is running (`committer_wake_threshold` is zero).
+    fn wake_committer_if_backlogged(&self) {
+        let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
+        if threshold > 0 && self.pending_count() >= threshold {
+            self.wake_durable_waiters();
+        }
+    }
+
     /// Block until the group covering `token` is durable.
     ///
     /// With a background committer running this waits for it to flush; the
@@ -1818,12 +1890,6 @@ impl JournalCoordinator {
             if target <= self.committed_lsn.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            if target > self.published_lsn.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "sync target has not been published",
-                ));
-            }
             // Recheck every predicate under `durable_lock`, the same lock the
             // notifiers take, so a state change cannot slip between check and
             // park. The poll interval remains a backstop, not a requirement.
@@ -1836,7 +1902,8 @@ impl JournalCoordinator {
                     "journal is poisoned after a failed commit",
                 ));
             }
-            // A stopped committer falls through to a direct commit, but a
+            // A stopped committer falls through to a direct commit, preserving
+            // the historical no-committer behavior and error text, but a
             // committer that failed must not be silently papered over.
             if let Some(failure) = self.background_failure() {
                 return Err(failure.into_io());
@@ -1844,6 +1911,14 @@ impl JournalCoordinator {
             if !self.has_background_committer() {
                 drop(guard);
                 return self.sync_through(target);
+            }
+            // Only with a live committer is an unpublished target validated
+            // here; the no-committer path above reaches `sync_through` first.
+            if target > self.published_lsn.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sync target has not been published",
+                ));
             }
             self.durable_cv.wait_for(&mut guard, DURABILITY_WAIT_POLL);
         }
@@ -1861,9 +1936,6 @@ impl JournalCoordinator {
     /// # Errors
     /// Propagates a durable-commit failure from [`Self::sync_through`].
     pub fn flush_durable(&self) -> io::Result<Option<CommitReceipt>> {
-        // Re-arm the threshold wake before capturing, so publishes landing
-        // during this flush can trigger the next one.
-        self.threshold_notified.store(false, Ordering::Release);
         let target = self.capture_sync_target();
         if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
             return Ok(None);
@@ -1917,7 +1989,11 @@ impl JournalCoordinator {
             return Ok(());
         }
         *self.background_failure.lock() = None;
-        self.threshold_notified.store(false, Ordering::Release);
+        // A failed run can leave the notification epoch equal to the current
+        // commit epoch, which would suppress the first threshold wake after a
+        // restart. Reset it so the first crossing always wakes.
+        self.threshold_notified_epoch
+            .store(u64::MAX, Ordering::Release);
         let stop = Arc::new(AtomicBool::new(false));
         let weak = Arc::downgrade(self);
         let stop_clone = Arc::clone(&stop);
@@ -1985,13 +2061,17 @@ impl JournalCoordinator {
             // wrapper; joining still succeeds and the failure is surfaced below.
             let _ = handle.join();
         }
-        {
+        // Transition `Stopping -> Stopped` and take the recorded failure under
+        // one `background` lock. Otherwise a `start_background_committer` that
+        // sees `Stopped` can clear `background_failure` in the window between
+        // the transition and the take, silently losing the worker's failure.
+        let failure = {
             let mut slot = self.background.lock();
             if matches!(*slot, BackgroundState::Stopping) {
                 *slot = BackgroundState::Stopped;
             }
-        }
-        let failure = self.background_failure.lock().take();
+            self.background_failure.lock().take()
+        };
         self.flush_durable()?;
         if let Some(failure) = failure {
             return Err(failure.into_io());
@@ -2002,17 +2082,23 @@ impl JournalCoordinator {
     /// Mark the committer slot stopped, publish any terminal failure, and wake
     /// waiters. Called by the worker itself as it exits.
     fn finish_background(&self, failure: Option<BackgroundFailure>) {
+        // Transition, publish the failure, and clear the wake threshold under a
+        // single `background` lock. A concurrent `start_background_committer`
+        // (which holds that lock to clear `background_failure` and set its own
+        // threshold) therefore either sees this worker still `Running` and does
+        // nothing, or runs after the failure is already recorded; it cannot
+        // erase the failure or have its threshold zeroed by this exiting worker.
         {
             let mut slot = self.background.lock();
             // Leave `Stopping` alone: `stop_background_committer` owns that
-            // transition and only clears it after joining this thread.
+            // transition and takes the failure after joining this thread.
             if matches!(*slot, BackgroundState::Running(_)) {
                 *slot = BackgroundState::Stopped;
+                self.committer_wake_threshold.store(0, Ordering::Release);
             }
-        }
-        self.committer_wake_threshold.store(0, Ordering::Release);
-        if let Some(failure) = failure {
-            *self.background_failure.lock() = Some(failure);
+            if let Some(failure) = failure {
+                *self.background_failure.lock() = Some(failure);
+            }
         }
         self.wake_durable_waiters();
     }
@@ -3133,13 +3219,17 @@ impl SharedWalLock {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupCommitConfig, Journal, JournalCoordinator, Mutation};
+    use super::{
+        BackgroundFailure, BackgroundState, GroupCommitConfig, Journal, JournalCoordinator,
+        Mutation,
+    };
     #[cfg(feature = "multi-reader")]
     use super::{TxnStage, TxnStageState};
     use std::fs;
     use std::io::Write as _;
     #[cfg(feature = "multi-reader")]
     use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -4356,5 +4446,376 @@ mod tests {
         let token = coordinator.request_durable(lsn);
         assert!(token.is_satisfied_by(coordinator.committed_lsn()));
         assert_eq!(token.lsn(), lsn);
+    }
+
+    #[test]
+    fn explicit_sync_advances_the_epoch_and_rearms_the_wake() {
+        use std::sync::atomic::Ordering;
+
+        let coordinator = open_arc("bg_epoch_explicit");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+
+        // Pretend a wake was already claimed for the current epoch. From here
+        // only a commit that advances the epoch can re-arm the crossing; a
+        // burst alone must not wake the committer.
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+
+        let lsn = coordinator.publish(put(1, 10, b"mid"), |_| {}).unwrap();
+        coordinator.sync_through(lsn).unwrap();
+        assert_eq!(coordinator.background_commits(), 0);
+
+        // The explicit commit above advanced the epoch, so this burst wakes it.
+        for node in 20..24u8 {
+            coordinator
+                .publish(put(1, node, b"second"), |_| {})
+                .unwrap();
+        }
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.background_commits() >= 1
+            },
+            "background flush after an explicit commit re-armed the wake",
+        );
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn threshold_wakes_again_after_a_background_flush() {
+        let coordinator = open_arc("bg_epoch_background");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+
+        for (burst, expected) in (0u64..2).enumerate() {
+            let base = u8::try_from(burst).unwrap() * 10;
+            for node in 0..4u8 {
+                coordinator
+                    .publish(put(2, base + node, b"burst"), |_| {})
+                    .unwrap();
+            }
+            wait_until(
+                {
+                    let committed = coordinator.clone();
+                    let want = expected + 1;
+                    move || committed.background_commits() >= want
+                },
+                "background burst flush",
+            );
+        }
+        assert_eq!(coordinator.background_commits(), 2);
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn commit_leaving_a_backlog_wakes_a_parked_committer() {
+        use std::sync::atomic::Ordering;
+
+        let coordinator = open_arc("bg_epoch_backlog");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+        // Let the committer park so that only an explicit wake can move it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Suppress the publish wake for this epoch, modelling publishers that
+        // arrived during an fsync and read the pre-commit epoch.
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let mut lsns = Vec::new();
+        for node in 0..8u8 {
+            lsns.push(
+                coordinator
+                    .publish(put(3, node, b"window"), |_| {})
+                    .unwrap(),
+            );
+        }
+        // The suppressed burst must not have woken the committer.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            coordinator.background_commits(),
+            0,
+            "a suppressed burst must not flush before the explicit commit"
+        );
+
+        // Commit the first half explicitly. Four records remain pending, at the
+        // bound; the post-commit recheck, not a publish, must wake the committer.
+        coordinator.sync_through(lsns[3]).unwrap();
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.background_commits() >= 1
+            },
+            "post-commit backlog wake",
+        );
+        assert_eq!(coordinator.pending_count(), 0);
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn start_during_stopping_is_a_noop() {
+        let coordinator = open_arc("bg_start_stopping");
+        // Simulate the join window: the slot is `Stopping` while the old worker
+        // exits, before `stop_background_committer` has joined it.
+        *coordinator.background.lock() = BackgroundState::Stopping;
+
+        // The exiting worker must leave the transition to the stopper.
+        coordinator.finish_background(None);
+        assert!(matches!(
+            *coordinator.background.lock(),
+            BackgroundState::Stopping
+        ));
+
+        // A concurrent start must not spawn a second worker.
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+        assert!(matches!(
+            *coordinator.background.lock(),
+            BackgroundState::Stopping
+        ));
+        assert!(!coordinator.has_background_committer());
+        assert_eq!(coordinator.background_commits(), 0);
+
+        // The stop path owns `Stopping -> Stopped` and still completes.
+        coordinator.stop_background_committer().unwrap();
+        assert!(matches!(
+            *coordinator.background.lock(),
+            BackgroundState::Stopped
+        ));
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn worker_failure_is_surfaced_and_cleared_by_restart() {
+        let coordinator = open_arc("bg_failure_restart");
+        coordinator.finish_background(Some(BackgroundFailure {
+            kind: std::io::ErrorKind::Other,
+            message: "boom".to_owned(),
+        }));
+
+        // A waiter must observe the terminal failure rather than block. The
+        // failure check precedes publication validation by contract, so even a
+        // never-published target reports the worker's failure, not InvalidInput.
+        let error = coordinator
+            .wait_durable(coordinator.request_durable(999))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("boom"));
+
+        // A worker that died before committing can leave the notification epoch
+        // equal to the current commit epoch. Without the start reset, the first
+        // threshold wake after restart would be suppressed until the timer.
+        {
+            use std::sync::atomic::Ordering;
+            coordinator.threshold_notified_epoch.store(
+                coordinator.commit_epoch.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 1,
+            })
+            .unwrap();
+        assert!(coordinator.background_failure().is_none());
+        let lsn = coordinator.publish(put(5, 1, b"restart"), |_| {}).unwrap();
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.committed_lsn() >= lsn
+            },
+            "first threshold wake after a restart",
+        );
+        coordinator
+            .wait_durable(coordinator.request_durable(lsn))
+            .unwrap();
+        assert!(coordinator.committed_lsn() >= lsn);
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn wait_durable_unpublished_target_has_a_stable_error() {
+        // Without a committer the call falls through to `sync_through`.
+        let coordinator = open_arc("bg_unpublished_none");
+        let error = coordinator
+            .wait_durable(coordinator.request_durable(1234))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("has not been published"));
+        fs::remove_file(coordinator.path()).unwrap();
+
+        // With a committer the unpublished target is rejected under the lock.
+        let coordinator = open_arc("bg_unpublished_committer");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+        let error = coordinator
+            .wait_durable(coordinator.request_durable(1234))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("has not been published"));
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn explicit_commit_advances_epoch_and_rearms_the_threshold_wake() {
+        let coordinator = open_arc("bg_epoch_explicit_only");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+        // A wake was already claimed for the current epoch, and no background
+        // commit has happened: only an explicit commit can re-arm it.
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let lsn = coordinator.publish(put(6, 0, b"explicit"), |_| {}).unwrap();
+        coordinator.sync_through(lsn).unwrap();
+        assert_eq!(coordinator.background_commits(), 0);
+
+        for node in 1..5u8 {
+            coordinator.publish(put(6, node, b"burst"), |_| {}).unwrap();
+        }
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.background_commits() >= 1
+            },
+            "threshold wake re-armed by an explicit commit",
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn commit_wakes_a_committer_left_parked_above_the_threshold() {
+        let coordinator = open_arc("bg_postcommit_wake");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 3,
+            })
+            .unwrap();
+        // Model publishers that arrived during an fsync: they saw the
+        // pre-commit epoch as already claimed, so every wake was suppressed.
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        // Let the committer reach its wait: on entry it checks pending itself.
+        std::thread::sleep(Duration::from_millis(100));
+        for node in 0..4u8 {
+            coordinator.publish(put(7, node, b"stale"), |_| {}).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(coordinator.background_commits(), 0);
+
+        // A commit that leaves pending at or above the bound must wake the
+        // parked committer itself; no publisher will.
+        coordinator.sync_through(1).unwrap();
+        assert!(coordinator.pending_count() >= 3);
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.background_commits() >= 1
+            },
+            "post-commit wake of a parked committer",
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn restart_resets_the_notification_epoch() {
+        let coordinator = open_arc("bg_restart_epoch");
+        let config = GroupCommitConfig {
+            interval: Duration::from_secs(60),
+            max_pending: 3,
+        };
+        coordinator.start_background_committer(config).unwrap();
+        // A run that claimed a wake and died before committing leaves the
+        // notification epoch equal to the (unchanged) commit epoch.
+        coordinator.stop_background_committer().unwrap();
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+
+        coordinator.start_background_committer(config).unwrap();
+        // Let the committer park: on entry it checks pending itself, which
+        // would flush the burst and mask a suppressed wake.
+        std::thread::sleep(Duration::from_millis(100));
+        for node in 0..3u8 {
+            coordinator
+                .publish(put(8, node, b"restart"), |_| {})
+                .unwrap();
+        }
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.background_commits() >= 1
+            },
+            "first threshold wake after a restart",
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn claim_retries_when_a_commit_lands_between_claim_and_recheck() {
+        let coordinator = open_arc("bg_claim_race");
+        let mut fired = false;
+        let won = coordinator.claim_threshold_wake_with(|| {
+            if !fired {
+                fired = true;
+                coordinator.commit_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        // The commit invalidated the first claim; the retry claims the new
+        // epoch, so the wake is not suppressed.
+        assert!(won);
+        assert_eq!(
+            coordinator.threshold_notified_epoch.load(Ordering::Acquire),
+            coordinator.commit_epoch.load(Ordering::Acquire)
+        );
+        // Same epoch again: exactly one wake per epoch.
+        assert!(!coordinator.claim_threshold_wake());
+        fs::remove_file(coordinator.path()).unwrap();
     }
 }
