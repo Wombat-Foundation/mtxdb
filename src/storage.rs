@@ -548,6 +548,57 @@ pub enum StorageError {
     Collision(String),
 }
 
+pub(crate) fn collect_missing_established_records<F>(
+    records: &[(NodeId, NodeData)],
+    mut lookup: F,
+) -> Result<Vec<(NodeId, NodeData)>, StorageError>
+where
+    F: FnMut(&NodeId) -> Result<Option<NodeData>, StorageError>,
+{
+    let mut missing = Vec::with_capacity(records.len());
+    for (id, data) in records {
+        if let Some(existing) = lookup(id)? {
+            if existing.bytes != data.bytes {
+                return Err(StorageError::Collision(format!(
+                    "record collision on node {}",
+                    hex16(id)
+                )));
+            }
+        } else {
+            missing.push((*id, data.clone()));
+        }
+    }
+    Ok(missing)
+}
+
+pub(crate) fn validate_established_upsert_inputs(
+    collection_id: &NodeId,
+    metadata: &CollectionMetadata,
+    node_id: &NodeId,
+) -> Result<(), StorageError> {
+    if node_id == &COLLECTION_METADATA_RECORD_ID {
+        return Err(StorageError::Internal(
+            "cannot write application record to reserved collection metadata node id".to_owned(),
+        ));
+    }
+    if !metadata.verify_collection_id(collection_id) {
+        return Err(StorageError::Internal(
+            "collection metadata does not reproduce collection id".to_owned(),
+        ));
+    }
+    if metadata.collection_canonical_id.is_empty() {
+        return Err(StorageError::Internal(
+            "collection metadata has empty canonical id".to_owned(),
+        ));
+    }
+    if metadata.record_id_rule.policy != FrameIdPolicy::Key {
+        return Err(StorageError::Internal(
+            "create_or_upsert_established_validated requires FrameIdPolicy::Key".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -761,17 +812,10 @@ impl StorageEngine for InMemoryStorage {
             ));
         }
 
-        for (id, data) in records {
-            if let Some(existing_rec) = collection.get(id) {
-                if existing_rec.bytes != data.bytes {
-                    return Err(StorageError::Collision(format!(
-                        "record collision on node {}",
-                        hex16(id)
-                    )));
-                }
-            } else {
-                collection.insert(*id, data.clone());
-            }
+        for (id, data) in
+            collect_missing_established_records(records, |id| Ok(collection.get(id).cloned()))?
+        {
+            collection.insert(id, data);
         }
         Ok(())
     }
@@ -784,27 +828,7 @@ impl StorageEngine for InMemoryStorage {
         data: &NodeData,
         validate: &mut dyn FnMut(Option<&NodeData>) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
-        if node_id == &COLLECTION_METADATA_RECORD_ID {
-            return Err(StorageError::Internal(
-                "cannot write application record to reserved collection metadata node id"
-                    .to_owned(),
-            ));
-        }
-        if !metadata.verify_collection_id(collection_id) {
-            return Err(StorageError::Internal(
-                "collection metadata does not reproduce collection id".to_owned(),
-            ));
-        }
-        if metadata.collection_canonical_id.is_empty() {
-            return Err(StorageError::Internal(
-                "collection metadata has empty canonical id".to_owned(),
-            ));
-        }
-        if metadata.record_id_rule.policy != FrameIdPolicy::Key {
-            return Err(StorageError::Internal(
-                "create_or_upsert_established_validated requires FrameIdPolicy::Key".to_owned(),
-            ));
-        }
+        validate_established_upsert_inputs(collection_id, metadata, node_id)?;
 
         let mut collections = self.collections.write();
         let exists = collections

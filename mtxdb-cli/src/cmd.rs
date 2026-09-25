@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
-use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
+use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
@@ -1794,38 +1794,10 @@ fn cmd_collections_coalesced(
             };
             let canonical_map: HashMap<[u8; 16], String> = if canonical {
                 PackfileStorage::open_read_only(pool_dir.clone())
-                        .ok()
-                        .map(|store| {
-                            summaries
-                                .iter()
-                                .map(|(id, _, _, _)| {
-                                    let display = store.get_collection_metadata(id).ok().flatten().map_or_else(
-                                        || "[unregistered]".to_owned(),
-                                        |metadata| {
-                                            let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
-                                            if metadata.verify_collection_id(id) {
-                                                if let Some(role) = &metadata.role {
-                                                    format!(
-                                                        "{raw} ({})",
-                                                        display_collection_role(role)
-                                                    )
-                                                } else {
-                                                    raw.into_owned()
-                                                }
-                                            } else {
-                                                eprintln!(
-                                                    "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
-                                                    format_id(id)
-                                                );
-                                                format!("[mismatch: {raw}]")
-                                            }
-                                        },
-                                    );
-                                    (*id, display)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
+                    .ok()
+                    .map_or_else(HashMap::new, |store| {
+                        canonical_collection_ids(&store, &summaries)
+                    })
             } else {
                 HashMap::new()
             };
@@ -2075,6 +2047,40 @@ fn cmd_collections_single(
     cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, canonical, sort, limit)
 }
 
+fn canonical_collection_ids(
+    store: &PackfileStorage,
+    collections: &[CollectionSummary],
+) -> HashMap<[u8; 16], String> {
+    collections
+        .iter()
+        .map(|(id, _, _, _)| {
+            let display = store
+                .get_collection_metadata(id)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || "[unregistered]".to_owned(),
+                    |metadata| {
+                        let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
+                        if metadata.verify_collection_id(id) {
+                            metadata.role.as_ref().map_or_else(
+                                || raw.clone().into_owned(),
+                                |role| format!("{raw} ({})", display_collection_role(role)),
+                            )
+                        } else {
+                            eprintln!(
+                                "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
+                                format_id(id)
+                            );
+                            format!("[mismatch: {raw}]")
+                        }
+                    },
+                );
+            (*id, display)
+        })
+        .collect()
+}
+
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
 /// avoided: each pool owns an independent 16-byte namespace and lifecycle.
 #[allow(
@@ -2111,38 +2117,9 @@ fn cmd_collections_in_dir(
     let canonical_ids: HashMap<[u8; 16], String> = if canonical {
         PackfileStorage::open_read_only(dir.to_path_buf())
             .ok()
-            .map(|store| {
-                collections
-                    .iter()
-                    .map(|(id, _, _, _)| {
-                        let display = store
-                            .get_collection_metadata(id)
-                            .ok()
-                            .flatten()
-                            .map_or_else(
-                                || "[unregistered]".to_owned(),
-                                |metadata| {
-                                    let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
-                                    if metadata.verify_collection_id(id) {
-                                            if let Some(role) = &metadata.role {
-                                                format!("{raw} ({})", display_collection_role(role))
-                                        } else {
-                                            raw.into_owned()
-                                        }
-                                    } else {
-                                        eprintln!(
-                                            "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
-                                            format_id(id)
-                                        );
-                                        format!("[mismatch: {raw}]")
-                                    }
-                                },
-                            );
-                        (*id, display)
-                    })
-                    .collect()
+            .map_or_else(HashMap::new, |store| {
+                canonical_collection_ids(&store, &collections)
             })
-            .unwrap_or_default()
     } else {
         HashMap::new()
     };
@@ -6287,51 +6264,7 @@ fn scan_pack(
         );
         if opts.header {
             if let Some(record) = &data {
-                if *node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
-                    if let Some(meta) = CollectionMetadata::decode(&record.data) {
-                        let pool = meta.member_namespace.as_ref().map_or_else(
-                            || "none".to_owned(),
-                            |d| String::from_utf8_lossy(d).into_owned(),
-                        );
-                        let role = meta.role.as_ref().map_or_else(
-                            || "unspecified".to_owned(),
-                            std::string::ToString::to_string,
-                        );
-                        let schema = meta.schema.as_deref().unwrap_or("none");
-                        let verified = meta.verify_collection_id(collection_id);
-                        let verify_str = if verified {
-                            "valid"
-                        } else {
-                            "MISMATCH / CORRUPT"
-                        };
-                        println!(
-                            "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
-                            String::from_utf8_lossy(&meta.collection_canonical_id)
-                        );
-                    } else {
-                        println!("    [header] genesis metadata (corrupt TLV block)");
-                    }
-                } else if let Some(meta) = &record.metadata {
-                    let mut details = Vec::new();
-                    if let Some(logical_id) = &meta.logical_id {
-                        details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
-                    }
-                    if let Some(content_digest) = &meta.content_digest {
-                        details.push(format!("digest: 0x{}", hex::encode(content_digest)));
-                    }
-                    if let Some(role) = &meta.role {
-                        details.push(format!("role: {}", String::from_utf8_lossy(role)));
-                    }
-                    if details.is_empty() {
-                        println!(
-                            "    [header] frame metadata block present (no recognized fields)"
-                        );
-                    } else {
-                        println!("    [header] frame metadata: {}", details.join(", "));
-                    }
-                } else {
-                    println!("    [header] standard frame (no metadata block)");
-                }
+                print_scan_record_header(record, collection_id);
             }
         }
         let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
@@ -6731,49 +6664,7 @@ fn print_collection_record(
     );
     if context.header {
         if let Some(record) = &data {
-            if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
-                if let Some(meta) = CollectionMetadata::decode(&record.data) {
-                    let pool = meta.member_namespace.as_ref().map_or_else(
-                        || "none".to_owned(),
-                        |d| String::from_utf8_lossy(d).into_owned(),
-                    );
-                    let role = meta.role.as_ref().map_or_else(
-                        || "unspecified".to_owned(),
-                        std::string::ToString::to_string,
-                    );
-                    let schema = meta.schema.as_deref().unwrap_or("none");
-                    let verified = meta.verify_collection_id(&context.collection_id);
-                    let verify_str = if verified {
-                        "valid"
-                    } else {
-                        "MISMATCH / CORRUPT"
-                    };
-                    println!(
-                        "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
-                        String::from_utf8_lossy(&meta.collection_canonical_id)
-                    );
-                } else {
-                    println!("    [header] genesis metadata (corrupt TLV block)");
-                }
-            } else if let Some(meta) = &record.metadata {
-                let mut details = Vec::new();
-                if let Some(logical_id) = &meta.logical_id {
-                    details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
-                }
-                if let Some(content_digest) = &meta.content_digest {
-                    details.push(format!("digest: 0x{}", hex::encode(content_digest)));
-                }
-                if let Some(role) = &meta.role {
-                    details.push(format!("role: {}", String::from_utf8_lossy(role)));
-                }
-                if details.is_empty() {
-                    println!("    [header] frame metadata block present (no recognized fields)");
-                } else {
-                    println!("    [header] frame metadata: {}", details.join(", "));
-                }
-            } else {
-                println!("    [header] standard frame (no metadata block)");
-            }
+            print_scan_record_header(record, &context.collection_id);
         }
     }
     let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
@@ -6785,6 +6676,52 @@ fn print_collection_record(
         }
     }
     Ok(())
+}
+
+fn print_scan_record_header(record: &mtxdb::packfile::Record, collection_id: &[u8; 16]) {
+    if *collection_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+        if let Some(meta) = CollectionMetadata::decode(&record.data) {
+            let pool = meta.member_namespace.as_ref().map_or_else(
+                || "none".to_owned(),
+                |d| String::from_utf8_lossy(d).into_owned(),
+            );
+            let role = meta.role.as_ref().map_or_else(
+                || "unspecified".to_owned(),
+                std::string::ToString::to_string,
+            );
+            let schema = meta.schema.as_deref().unwrap_or("none");
+            let verified = meta.verify_collection_id(collection_id);
+            let verify_str = if verified {
+                "valid"
+            } else {
+                "MISMATCH / CORRUPT"
+            };
+            println!(
+                "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
+                String::from_utf8_lossy(&meta.collection_canonical_id)
+            );
+        } else {
+            println!("    [header] genesis metadata (corrupt TLV block)");
+        }
+    } else if let Some(meta) = &record.metadata {
+        let mut details = Vec::new();
+        if let Some(logical_id) = &meta.logical_id {
+            details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
+        }
+        if let Some(content_digest) = &meta.content_digest {
+            details.push(format!("digest: 0x{}", hex::encode(content_digest)));
+        }
+        if let Some(role) = &meta.role {
+            details.push(format!("role: {}", String::from_utf8_lossy(role)));
+        }
+        if details.is_empty() {
+            println!("    [header] frame metadata block present (no recognized fields)");
+        } else {
+            println!("    [header] frame metadata: {}", details.join(", "));
+        }
+    } else {
+        println!("    [header] standard frame (no metadata block)");
+    }
 }
 
 fn scan_limit(limit: i64) -> usize {

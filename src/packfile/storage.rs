@@ -21,10 +21,11 @@ use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
 use crate::storage::{
-    hex16, validate_established_batch_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
+    collect_missing_established_records, hex16, validate_established_batch_inputs,
+    validate_established_upsert_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
     StorageEngine, StorageError,
 };
-use crate::template::{CollectionMetadata, FrameIdPolicy, COLLECTION_METADATA_RECORD_ID};
+use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
 mod read_journal;
 use read_journal::ReadJournal;
@@ -7187,19 +7188,8 @@ impl StorageEngine for PackfileStorage {
             ));
         }
 
-        let mut to_append = Vec::with_capacity(records.len());
-        for (id, data) in records {
-            if let Some(existing_rec) = self.get(collection_id, id)? {
-                if existing_rec.bytes != data.bytes {
-                    return Err(StorageError::Collision(format!(
-                        "record collision on node {}",
-                        hex16(id)
-                    )));
-                }
-            } else {
-                to_append.push((*id, data.clone()));
-            }
-        }
+        let to_append =
+            collect_missing_established_records(records, |id| self.get(collection_id, id))?;
         if !to_append.is_empty() {
             let written = self.put_many_internal_locked(collection_id, &to_append, None)?;
             if written > 0 {
@@ -7226,27 +7216,7 @@ impl StorageEngine for PackfileStorage {
         data: &NodeData,
         validate: &mut dyn FnMut(Option<&NodeData>) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
-        if node_id == &COLLECTION_METADATA_RECORD_ID {
-            return Err(StorageError::Internal(
-                "cannot write application record to reserved collection metadata node id"
-                    .to_owned(),
-            ));
-        }
-        if !metadata.verify_collection_id(collection_id) {
-            return Err(StorageError::Internal(
-                "collection metadata does not reproduce collection id".to_owned(),
-            ));
-        }
-        if metadata.collection_canonical_id.is_empty() {
-            return Err(StorageError::Internal(
-                "collection metadata has empty canonical id".to_owned(),
-            ));
-        }
-        if metadata.record_id_rule.policy != FrameIdPolicy::Key {
-            return Err(StorageError::Internal(
-                "create_or_upsert_established_validated requires FrameIdPolicy::Key".to_owned(),
-            ));
-        }
+        validate_established_upsert_inputs(collection_id, metadata, node_id)?;
 
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
