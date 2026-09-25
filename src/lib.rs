@@ -60,6 +60,7 @@ pub use database::{DatabaseTransaction, PoolPolicies, PoolPolicy, SharedDatabase
 pub use index::LossyIndex;
 #[cfg(feature = "multi-reader")]
 pub use journal::SharedWalLock;
+pub use journal::{DurabilityToken, GroupCommitConfig};
 #[cfg(feature = "multi-reader")]
 pub use journal::{TxnStage, TxnStageState};
 pub use layout::{enclosing_root, read_wal_layout, DatabaseLayout, ShardType, WalLayout};

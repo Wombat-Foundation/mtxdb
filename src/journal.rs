@@ -10,9 +10,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::layout::ShardType;
 
@@ -810,6 +811,79 @@ struct CoverageState {
     covered: HashMap<ShardType, u64>,
 }
 
+/// Maximum time [`JournalCoordinator::wait_durable`] sleeps before re-checking
+/// the durable boundary, poison bit, and committer presence. Bounds how long a
+/// waiter can lag a commit and how quickly it notices a stopped committer.
+const DURABILITY_WAIT_POLL: Duration = Duration::from_millis(50);
+
+/// Bounded group-commit policy for
+/// [`JournalCoordinator::start_background_committer`].
+///
+/// The committer fsyncs at most once per `interval`, coalescing every mutation
+/// published in that window into one group. It flushes early when the number of
+/// published-but-uncommitted records reaches `max_pending`, so an unbroken
+/// burst cannot grow the pending queue without bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupCommitConfig {
+    /// Maximum time a published mutation waits before the committer fsyncs it.
+    /// Also the crash-loss window when the process dies before a flush.
+    pub interval: Duration,
+    /// Published-but-uncommitted record count that forces an early flush.
+    pub max_pending: u64,
+}
+
+impl Default for GroupCommitConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(1),
+            max_pending: 4096,
+        }
+    }
+}
+
+impl GroupCommitConfig {
+    /// A policy that fsyncs under a fixed interval with the default
+    /// `max_pending` bound.
+    #[must_use]
+    pub const fn with_interval(interval: Duration) -> Self {
+        Self {
+            interval,
+            max_pending: 4096,
+        }
+    }
+}
+
+/// A handle to a durability request registered with
+/// [`JournalCoordinator::request_durable`].
+///
+/// Holding a token is not itself durable: pass it to
+/// [`JournalCoordinator::wait_durable`] to block until the group covering its
+/// LSN has been fsynced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurabilityToken {
+    lsn: u64,
+}
+
+impl DurabilityToken {
+    /// The LSN this token requests durability through.
+    #[must_use]
+    pub const fn lsn(self) -> u64 {
+        self.lsn
+    }
+
+    /// Whether a durable boundary of `committed_lsn` already satisfies this
+    /// token.
+    #[must_use]
+    pub const fn is_satisfied_by(self, committed_lsn: u64) -> bool {
+        self.lsn <= committed_lsn
+    }
+}
+
+struct BackgroundCommitter {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
 /// Serializes mutation publication and durable commits for one journal.
 ///
 /// Mutations are assigned LSNs under a short queue lock. A sync caller captures
@@ -873,6 +947,26 @@ pub struct JournalCoordinator {
     /// Number of requests covered without appending or fsyncing themselves.
     coalesced_syncs: AtomicU64,
     sync_in_flight: AtomicU64,
+    /// Highest LSN a caller has asked to become durable through
+    /// [`Self::request_durable`]. Purely a wake-up/observability bound: the
+    /// background committer commits the whole published prefix, not this
+    /// exact value.
+    durable_requested: AtomicU64,
+    /// Guards [`Self::durable_cv`]. The condvar carries no state of its own;
+    /// waiters re-check [`Self::committed_lsn`] and the committer's presence
+    /// after every wake, so this only provides the required mutex pairing.
+    durable_lock: Mutex<()>,
+    /// Signals `wait_durable` callers and the background committer when the
+    /// durable boundary may have advanced or the committer has stopped.
+    durable_cv: Condvar,
+    /// The running background committer, if [`Self::start_background_committer`]
+    /// was called. Additive: a coordinator without one keeps the historical
+    /// blocking-barrier behavior for `wait_durable`/`sync_through`.
+    background: Mutex<Option<BackgroundCommitter>>,
+    /// Number of background group commits that appended and fsynced a group.
+    background_commits: AtomicU64,
+    /// Number of background commit attempts already covered by a durable group.
+    background_coalesced: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -916,6 +1010,12 @@ impl JournalCoordinator {
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
             sync_in_flight: AtomicU64::new(0),
+            durable_requested: AtomicU64::new(committed_lsn),
+            durable_lock: Mutex::new(()),
+            durable_cv: Condvar::new(),
+            background: Mutex::new(None),
+            background_commits: AtomicU64::new(0),
+            background_coalesced: AtomicU64::new(0),
         }
     }
 
@@ -1563,6 +1663,228 @@ impl JournalCoordinator {
     pub fn sync(&self) -> io::Result<Option<CommitReceipt>> {
         let target = self.capture_sync_target();
         self.sync_through(target)
+    }
+
+    /// Register `target_lsn` as a durability request without blocking.
+    ///
+    /// Returns a [`DurabilityToken`] to pass to [`Self::wait_durable`]. The
+    /// request is additive: it never weakens [`Self::sync_through`] /
+    /// [`Self::sync`], which remain immediate barriers. With a background
+    /// committer running, `wait_durable` blocks until the committer's group
+    /// covers the token; without one it performs the blocking commit itself.
+    #[must_use]
+    pub fn request_durable(&self, target_lsn: u64) -> DurabilityToken {
+        self.durable_requested
+            .fetch_max(target_lsn, Ordering::AcqRel);
+        // Wake the committer (for a threshold flush) and any waiters parked on
+        // the old boundary.
+        self.durable_cv.notify_all();
+        DurabilityToken { lsn: target_lsn }
+    }
+
+    /// Highest LSN any caller has requested through [`Self::request_durable`].
+    #[must_use]
+    pub fn durable_requested(&self) -> u64 {
+        self.durable_requested.load(Ordering::Acquire)
+    }
+
+    /// Number of published mutations not yet durably committed. Used as the
+    /// background committer's early-flush bound.
+    #[must_use]
+    pub fn pending_count(&self) -> u64 {
+        self.published_lsn
+            .load(Ordering::Acquire)
+            .saturating_sub(self.committed_lsn.load(Ordering::Acquire))
+    }
+
+    /// Whether a background committer is currently running.
+    #[must_use]
+    pub fn has_background_committer(&self) -> bool {
+        self.background.lock().is_some()
+    }
+
+    /// Number of background group commits that appended and fsynced a group.
+    #[must_use]
+    pub fn background_commits(&self) -> u64 {
+        self.background_commits.load(Ordering::Relaxed)
+    }
+
+    /// Number of background commit attempts already covered by a durable group.
+    #[must_use]
+    pub fn background_coalesced(&self) -> u64 {
+        self.background_coalesced.load(Ordering::Relaxed)
+    }
+
+    /// Block until the group covering `token` is durable.
+    ///
+    /// With a background committer running this waits for it to flush; the
+    /// bounded poll interval lets the waiter notice a committer that stopped or
+    /// a poisoned journal. Without one, this is exactly [`Self::sync_through`]
+    /// on the token's LSN — the historical blocking behavior, so a caller that
+    /// never opts into background commits is unaffected.
+    ///
+    /// # Errors
+    /// Returns an error if the target was never published, the journal is
+    /// poisoned, or the committing sync fails.
+    pub fn wait_durable(&self, token: DurabilityToken) -> io::Result<Option<CommitReceipt>> {
+        let target = token.lsn;
+        if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        loop {
+            if target <= self.committed_lsn.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "journal is poisoned after a failed commit",
+                ));
+            }
+            if !self.has_background_committer() {
+                return self.sync_through(target);
+            }
+            if target > self.published_lsn.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sync target has not been published",
+                ));
+            }
+            let mut guard = self.durable_lock.lock();
+            if target <= self.committed_lsn.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            self.durable_cv.wait_for(&mut guard, DURABILITY_WAIT_POLL);
+        }
+    }
+
+    /// Perform one bounded group commit over everything published so far.
+    ///
+    /// Used by the background committer's timer and by
+    /// [`Self::stop_background_committer`]. A no-op returning `None` when
+    /// nothing is pending. This is the journal-level durability boundary; a
+    /// caller that also needs its packfile checkpoint rewritten should use the
+    /// storage-level sync path instead.
+    ///
+    /// # Errors
+    /// Propagates a durable-commit failure from [`Self::sync_through`].
+    pub fn flush_durable(&self) -> io::Result<Option<CommitReceipt>> {
+        let target = self.capture_sync_target();
+        if target == 0 {
+            return Ok(None);
+        }
+        let receipt = self.sync_through(target)?;
+        if receipt.is_some() {
+            self.background_commits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.background_coalesced.fetch_add(1, Ordering::Relaxed);
+        }
+        // A group commit may cover waiters parked on a boundary below `target`.
+        self.durable_cv.notify_all();
+        Ok(receipt)
+    }
+
+    /// Start a background thread that fsyncs the pending WAL group on a bounded
+    /// interval, coalescing every mutation published in the window into one
+    /// group. Idempotent: a second call while one is running is a no-op.
+    ///
+    /// The thread holds only a [`Weak`] reference between iterations, so
+    /// dropping the last `Arc<JournalCoordinator>` stops it within one interval
+    /// without a cycle. [`Self::stop_background_committer`] should still be
+    /// called at shutdown to flush the final group and join deterministically.
+    ///
+    /// # Errors
+    /// Returns an error if the committer thread cannot be spawned.
+    pub fn start_background_committer(
+        self: &Arc<Self>,
+        config: GroupCommitConfig,
+    ) -> io::Result<()> {
+        let mut slot = self.background.lock();
+        if slot.is_some() {
+            return Ok(());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let weak = Arc::downgrade(self);
+        let stop_clone = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("mtxdb-journal-committer".to_owned())
+            .spawn(move || Self::background_committer_loop(&weak, config, &stop_clone))
+            .map_err(|error| {
+                io::Error::other(format!("failed to spawn journal committer: {error}"))
+            })?;
+        *slot = Some(BackgroundCommitter {
+            stop,
+            handle: Some(handle),
+        });
+        Ok(())
+    }
+
+    /// Signal the background committer to stop, join it, then flush any final
+    /// pending group so a quiet stream's last write is durable before this
+    /// returns. Safe to call when no committer is running (it still flushes).
+    ///
+    /// # Errors
+    /// Propagates a failure from the final [`Self::flush_durable`].
+    pub fn stop_background_committer(&self) -> io::Result<()> {
+        let committer = self.background.lock().take();
+        if let Some(mut committer) = committer {
+            committer.stop.store(true, Ordering::Release);
+            self.durable_cv.notify_all();
+            if let Some(handle) = committer.handle.take() {
+                // A panic in the committer must not wedge shutdown; the final
+                // flush below still runs and reports any real I/O failure.
+                let _ = handle.join();
+            }
+        }
+        self.flush_durable()?;
+        Ok(())
+    }
+
+    fn background_committer_loop(
+        weak: &Weak<Self>,
+        config: GroupCommitConfig,
+        stop: &Arc<AtomicBool>,
+    ) {
+        let interval = config.interval;
+        loop {
+            let Some(coordinator) = weak.upgrade() else {
+                break;
+            };
+            let now = std::time::Instant::now();
+            let deadline = now.checked_add(interval).unwrap_or(now);
+            {
+                let mut guard = coordinator.durable_lock.lock();
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if coordinator.poisoned.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if coordinator.pending_count() >= config.max_pending {
+                        break;
+                    }
+                    let timeout = deadline.saturating_duration_since(now);
+                    coordinator.durable_cv.wait_for(&mut guard, timeout);
+                }
+            }
+            if stop.load(Ordering::Acquire) || coordinator.poisoned.load(Ordering::Acquire) {
+                break;
+            }
+            // The final flush on stop is done by `stop_background_committer`
+            // after join, so a stop that lands here does not double-fsync.
+            if let Err(error) = coordinator.flush_durable() {
+                // Keep waiting for a later successful commit unless the journal
+                // is poisoned, in which case no progress is possible.
+                if coordinator.poisoned.load(Ordering::Acquire) {
+                    break;
+                }
+                let _ = error;
+            }
+        }
     }
 
     /// Compact the segment, dropping committed groups at or below
@@ -2636,15 +2958,15 @@ impl SharedWalLock {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalCoordinator, Mutation};
+    use super::{GroupCommitConfig, Journal, JournalCoordinator, Mutation};
     #[cfg(feature = "multi-reader")]
     use super::{TxnStage, TxnStageState};
     use std::fs;
     use std::io::Write as _;
     #[cfg(feature = "multi-reader")]
     use std::sync::atomic::AtomicU64;
-    #[cfg(feature = "multi-reader")]
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -3656,5 +3978,166 @@ mod tests {
             vec![2]
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn open_arc(label: &str) -> Arc<JournalCoordinator> {
+        let path = temp_path(label);
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        Arc::new(JournalCoordinator::new(journal, &scan))
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool, label: &str) {
+        let start = std::time::Instant::now();
+        let deadline = start.checked_add(Duration::from_secs(5)).unwrap_or(start);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {label}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn background_committer_batches_sequential_requests_into_one_commit() {
+        let coordinator = open_arc("bg_batch");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_millis(750),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let mut token = None;
+        for node in 0..8u8 {
+            let lsn = coordinator.publish(put(1, node, b"batch"), |_| {}).unwrap();
+            token = Some(coordinator.request_durable(lsn));
+        }
+        let token = token.unwrap();
+        coordinator.wait_durable(token).unwrap();
+
+        assert!(token.is_satisfied_by(coordinator.committed_lsn()));
+        assert_eq!(coordinator.pending_count(), 0);
+        assert_eq!(
+            coordinator.background_commits(),
+            1,
+            "sequential requests inside one window must coalesce into one group"
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn background_committer_flushes_a_quiet_stream_on_the_interval() {
+        let coordinator = open_arc("bg_quiet");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_millis(100),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let lsn = coordinator.publish(put(2, 1, b"quiet"), |_| {}).unwrap();
+        // No wait, no further request: the interval timer alone must flush it.
+        let committed = coordinator.clone();
+        wait_until(
+            move || committed.committed_lsn() >= lsn,
+            "quiet-stream interval flush",
+        );
+        assert!(coordinator.background_commits() >= 1);
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn background_committer_flushes_early_at_max_pending() {
+        let coordinator = open_arc("bg_threshold");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+
+        for node in 0..6u8 {
+            coordinator.publish(put(3, node, b"burst"), |_| {}).unwrap();
+        }
+        // The 60s interval cannot be the trigger; the pending bound must be.
+        let committed = coordinator.clone();
+        wait_until(
+            move || committed.pending_count() == 0 && committed.committed_lsn() > 0,
+            "max-pending early flush",
+        );
+        assert!(coordinator.background_commits() >= 1);
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn stop_background_committer_flushes_pending_before_returning() {
+        let coordinator = open_arc("bg_stop_flush");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let lsn = coordinator.publish(put(4, 1, b"final"), |_| {}).unwrap();
+        let _ = coordinator.request_durable(lsn);
+        coordinator.stop_background_committer().unwrap();
+
+        assert!(
+            coordinator.committed_lsn() >= lsn,
+            "stop must flush the final pending group"
+        );
+        assert!(!coordinator.has_background_committer());
+        assert!(coordinator.background_commits() >= 1);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn explicit_sync_through_remains_immediate_with_committer_running() {
+        let coordinator = open_arc("bg_explicit_sync");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let lsn = coordinator.publish(put(5, 1, b"explicit"), |_| {}).unwrap();
+        // The explicit barrier must not wait for the committer's interval.
+        coordinator.sync_through(lsn).unwrap();
+        assert!(coordinator.committed_lsn() >= lsn);
+        assert_eq!(
+            coordinator.background_commits(),
+            0,
+            "an explicit barrier is not a background commit"
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn wait_durable_without_committer_commits_directly() {
+        let coordinator = open_arc("no_committer_wait");
+        assert!(!coordinator.has_background_committer());
+        let lsn = coordinator.publish(put(6, 1, b"direct"), |_| {}).unwrap();
+        let token = coordinator.request_durable(lsn);
+        coordinator.wait_durable(token).unwrap();
+        assert!(coordinator.committed_lsn() >= lsn);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn durability_token_reports_an_already_committed_boundary() {
+        let coordinator = open_arc("token_committed");
+        let lsn = coordinator.publish(put(7, 1, b"done"), |_| {}).unwrap();
+        coordinator.sync().unwrap();
+        let token = coordinator.request_durable(lsn);
+        assert!(token.is_satisfied_by(coordinator.committed_lsn()));
+        assert_eq!(token.lsn(), lsn);
     }
 }

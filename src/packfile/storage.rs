@@ -16,7 +16,10 @@ use crate::index::format::DeltaFrame;
 use crate::index::{EntryUndo, InsertError, LossyIndex};
 #[cfg(feature = "multi-reader")]
 use crate::journal::pool_tag;
-use crate::journal::{pool_from_tag, Journal, JournalCoordinator, Mutation as JournalMutation};
+use crate::journal::{
+    pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator,
+    Mutation as JournalMutation,
+};
 use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
@@ -8022,6 +8025,50 @@ impl PackfileStorage {
         self.journal.lock().clone()
     }
 
+    /// Start a bounded background WAL group committer on this store's journal.
+    ///
+    /// Additive and opt-in: without it the store keeps the historical blocking
+    /// [`StorageEngine::sync`] behavior. The committer fsyncs the pending WAL
+    /// group at most once per [`GroupCommitConfig::interval`], coalescing every
+    /// mutation published in that window into one group, and flushes early once
+    /// [`GroupCommitConfig::max_pending`] records are outstanding. It commits
+    /// the journal only; packfile checkpointing and segment reclaim remain the
+    /// explicit `sync`/`sync_all` path. No-op when no journal is enabled.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committer thread cannot be spawned.
+    pub fn start_background_commit(&self, config: GroupCommitConfig) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .start_background_committer(config)
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop the background committer (if any), join it, and flush the final
+    /// pending WAL group so a quiet stream's last write is durable before this
+    /// returns. No-op when no journal is enabled.
+    ///
+    /// # Errors
+    /// Returns a storage error if the final flush fails.
+    pub fn stop_background_commit(&self) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .stop_background_committer()
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Register a non-blocking durability request through `target_lsn`,
+    /// returning `None` when no journal is enabled.
+    #[must_use]
+    pub fn request_durable(&self, target_lsn: u64) -> Option<DurabilityToken> {
+        self.journal()
+            .map(|journal| journal.request_durable(target_lsn))
+    }
+
     /// Enable the in-process read overlay for a published transaction that is
     /// still being materialized. The overlay is shared with the existing
     /// read-committed implementation, but ordinary reads consult it only
@@ -8655,6 +8702,12 @@ impl PackfileStorage {
             publish_time: std::time::Duration::from_nanos(
                 self.publish_time_ns.load(Ordering::Relaxed),
             ),
+            background_commits: self
+                .journal()
+                .map_or(0, |journal| journal.background_commits()),
+            background_coalesced: self
+                .journal()
+                .map_or(0, |journal| journal.background_coalesced()),
             repack: self.repack_stats(),
             cache,
             shards: self.shard_stats(),
@@ -8910,6 +8963,12 @@ pub struct RuntimeStats {
     pub publish_calls: u64,
     /// Cumulative time spent publishing mutations.
     pub publish_time: std::time::Duration,
+    /// Background WAL group commits that appended and fsynced a group (see
+    /// [`PackfileStorage::start_background_commit`]). Zero without a journal
+    /// or when the committer was never started.
+    pub background_commits: u64,
+    /// Background commit attempts already covered by a durable group.
+    pub background_coalesced: u64,
     /// Cumulative repack activity (persisted across opens).
     pub repack: RepackStats,
     /// Aggregate decoded-node cache hit/miss across loaded collections.
@@ -9013,6 +9072,8 @@ impl Default for RuntimeStats {
             sync_diagnostics: SyncDiagnosticsSnapshot::default(),
             publish_calls: 0,
             publish_time: std::time::Duration::ZERO,
+            background_commits: 0,
+            background_coalesced: 0,
             repack: RepackStats::default(),
             cache: CacheStats::default(),
             shards: Vec::new(),
