@@ -15479,19 +15479,20 @@ mod tests {
             .collect();
 
         let barrier = Arc::new(std::sync::Barrier::new(candidates.len()));
-        let handles: Vec<_> = candidates
-            .iter()
-            .cloned()
-            .map(|metadata| {
-                let store = Arc::clone(&store);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    store.ensure_collection_metadata(&collection, &metadata)
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = candidates
+                .iter()
+                .map(|metadata| {
+                    let store = Arc::clone(&store);
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.ensure_collection_metadata(&collection, metadata)
+                    })
                 })
-            })
-            .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
         assert_eq!(
             results.iter().filter(|r| r.is_ok()).count(),
