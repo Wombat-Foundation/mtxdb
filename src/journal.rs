@@ -2587,12 +2587,28 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
     {
         File::open(parent)?.sync_all()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Rust's portable std API has no directory-handle durability
-        // operation on non-Unix platforms. Refuse to enable the journal until
-        // a platform-specific implementation can uphold create/rotation
-        // durability; silently succeeding would weaken the contract.
+        // std exposes no directory-durability API, and Windows only lets you
+        // open a directory handle at all with FILE_FLAG_BACKUP_SEMANTICS.
+        // `sync_all` then maps to FlushFileBuffers on that handle, persisting
+        // the directory's entries — the same trick SQLite's Win32 VFS uses.
+        // `custom_flags` is safe, so this needs no FFI or extra dependency.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(parent)?
+            .sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No directory-handle durability operation is available on this
+        // platform. Refuse to enable the journal until one can uphold
+        // create/rotation durability; silently succeeding would weaken the
+        // contract.
         let _ = parent;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
