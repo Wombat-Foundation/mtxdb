@@ -4282,15 +4282,10 @@ fn meta_lock_line(path: &Path, report: &mut MetaReport) {
                 "not-found"
             };
             report.line(format!(
-                "lock {}: pid={} {} writer={} confidence={}",
+                "lock {}: pid={} {} confidence={}",
                 path.display(),
                 info.pid,
                 holder,
-                match mtxdb::ShardPool::lock_contended(path) {
-                    Some(true) => "active",
-                    Some(false) => "not-held",
-                    None => "unknown",
-                },
                 if info.has_starttime {
                     "full"
                 } else {
@@ -4527,16 +4522,19 @@ fn meta_checkpoints(root: &Path, report: &mut MetaReport) {
                 match meta_pack_fingerprint(&dir) {
                     Ok((fingerprint, issues)) => {
                         let issue_count = issues.len();
-                        let has_issues = issue_count != 0;
+                        let invalid_count = issues
+                            .iter()
+                            .filter(|(level, _)| matches!(level, PackIssueLevel::Warn))
+                            .count();
                         for (level, issue) in issues {
                             report.finding(level.as_str(), &dir, issue);
                         }
-                        if has_issues {
+                        if invalid_count != 0 {
                             report.finding(
                                 "NOTE",
                                 &dir,
                                 format!(
-                                    "fingerprint comparison skipped: {issue_count} pack issue(s)"
+                                    "fingerprint comparison skipped: {invalid_count} invalid pack issue(s); {issue_count} total pack issue(s)"
                                 ),
                             );
                         } else if fingerprint != checkpoint.fingerprint {
@@ -10011,7 +10009,6 @@ mod tests {
         assert_eq!(info.pid, std::process::id());
         assert!(info.running);
         assert!(!info.has_starttime);
-        assert_eq!(mtxdb::ShardPool::lock_contended(&path), Some(false));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10045,15 +10042,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_pack_comparison_reports_skip_note_for_pack_issue() {
+    fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() {
         let root = unique_temp_dir();
         let state = root.join("pools/state");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
         mtxdb::index::checkpoint::write_checkpoint(
             &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
-            mtxdb::index::checkpoint::pack_fingerprint(&[]),
-            mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            0xdead_beef,
+            0,
             &[],
             &[],
         )
@@ -10063,7 +10060,15 @@ mod tests {
         assert!(report
             .lines
             .iter()
-            .any(|line| line.contains("fingerprint comparison skipped: 1 pack issue(s)")));
+            .any(|line| line.contains("foreign.pack") && line.starts_with("[NOTE]")));
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint mismatch") && line.starts_with("[WARN]")));
+        assert!(!report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint comparison skipped")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10072,6 +10077,7 @@ mod tests {
         let root = unique_temp_dir();
         let state = root.join("pools/state");
         std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
         mtxdb::index::checkpoint::write_checkpoint(
             &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
             mtxdb::index::checkpoint::pack_fingerprint(&[]),
