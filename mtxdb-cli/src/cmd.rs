@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 
+use mtxdb::auxiliary::AuxiliaryIndex;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
@@ -22,6 +23,70 @@ use simd_json::prelude::*;
 use simd_json::OwnedValue;
 
 use crate::{Cli, Commands};
+
+const MAX_DEBUG_UNRESOLVED: usize = 20;
+const STATE_GROUP_DIGEST_BYTES: usize = 32;
+const BASE64_BITS_PER_CHARACTER: usize = 6;
+const STATE_GROUP_ID_LENGTH: usize =
+    (STATE_GROUP_DIGEST_BYTES * 8).div_ceil(BASE64_BITS_PER_CHARACTER);
+
+fn valid_state_group_id(value: &str) -> bool {
+    value.len() == STATE_GROUP_ID_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+enum StateGroupLoad {
+    Complete(HashMap<String, String>),
+    Missing,
+    Invalid {
+        event_id: String,
+        reason: &'static str,
+    },
+}
+
+fn load_state_groups(
+    aux: &AuxiliaryIndex<'_, PackfileStorage>,
+    event_ids: &[String],
+) -> Result<StateGroupLoad, mtxdb::storage::StorageError> {
+    if event_ids.is_empty() {
+        return Ok(StateGroupLoad::Complete(HashMap::new()));
+    }
+    let keys = event_ids.iter().map(String::as_bytes).collect::<Vec<_>>();
+    let values = aux.get_many(&keys)?;
+    if values.len() != event_ids.len() {
+        debug_assert_eq!(
+            values.len(),
+            event_ids.len(),
+            "auxiliary index get_many must preserve request cardinality"
+        );
+        return Ok(StateGroupLoad::Invalid {
+            event_id: "<batch>".to_owned(),
+            reason: "cache returned the wrong number of values",
+        });
+    }
+    let mut groups = HashMap::with_capacity(event_ids.len());
+    for (event_id, value) in event_ids.iter().zip(values) {
+        let Some(value) = value else {
+            return Ok(StateGroupLoad::Missing);
+        };
+        let Ok(value) = String::from_utf8(value) else {
+            return Ok(StateGroupLoad::Invalid {
+                event_id: event_id.clone(),
+                reason: "invalid UTF-8",
+            });
+        };
+        if !valid_state_group_id(&value) {
+            return Ok(StateGroupLoad::Invalid {
+                event_id: event_id.clone(),
+                reason: "invalid state-group ID format",
+            });
+        }
+        groups.insert(event_id.clone(), value);
+    }
+    Ok(StateGroupLoad::Complete(groups))
+}
 
 /// Human-readable byte count (`512 B`, `4.3 KB`, `1.2 MB`, `2.1 GB`) —
 /// raw byte counts in a shard listing are unreadable past a few digits.
@@ -7775,46 +7840,80 @@ fn import_pdu_events(
     persist_matrix_edges(&edge_store, template, events)?;
     edge_store.sync_all()?;
 
-    // Replayed batches still need state-group computation: an earlier partial
-    // import may have stored every event while omitting groups for an
-    // incomplete ancestry. A later complete export must be able to repair
-    // those derived mappings even when it writes zero new event records.
-    let graph_event_count = events
+    // Replayed batches still need state-group repair when the derived index is
+    // incomplete, but a complete replay should not rebuild the whole DAG.
+    // Read the existing mappings in one backend batch and only walk the DAG
+    // when at least one resolved mapping is absent. Resolved mappings are
+    // trusted as immutable federated-import results; unresolved events are
+    // deliberately left absent so a later import can repair them. Batches
+    // with unresolved events therefore pay the DAG-walk cost again on replay;
+    // skipping that safely would require persisting the missing-parent set.
+    let mut seen_state_event_ids = HashSet::new();
+    let graph_event_ids = events
         .iter()
         .chain(auth_chain.iter())
         .filter_map(event_id)
-        .collect::<HashSet<_>>()
-        .len();
-    let state_computation = compute_state_groups_partial(events, auth_chain);
-    if !state_computation.unresolved.is_empty() {
-        eprintln!(
-            "warning: partial state-group computation: {} event(s) have missing parents or are in cycles; resolvable components were retained",
-            state_computation.unresolved.len()
-        );
-        if crate::debug_enabled() {
-            let shown = state_computation.unresolved.iter().take(20);
-            eprintln!("debug: unresolved state events:");
-            for event_id in shown {
-                eprintln!("  {event_id}");
+        .map(str::to_owned)
+        .filter(|event_id| seen_state_event_ids.insert(event_id.clone()))
+        .collect::<Vec<_>>();
+    let mut state_groups = HashMap::new();
+    let mut loaded = false;
+    let aux = AuxiliaryIndex::open(state_store, "sys:matrix-state-groups");
+    if !graph_event_ids.is_empty() {
+        match load_state_groups(&aux, &graph_event_ids) {
+            Ok(StateGroupLoad::Complete(groups)) => {
+                state_groups = groups;
+                loaded = true;
             }
-            if state_computation.unresolved.len() > 20 {
+            Ok(StateGroupLoad::Missing) => {}
+            Ok(StateGroupLoad::Invalid { event_id, reason }) => {
                 eprintln!(
-                    "  ... {} more",
-                    state_computation.unresolved.len().saturating_sub(20)
+                    "warning: invalid cached state-group mapping for {event_id} ({reason}); recomputing state groups"
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: unable to read state-group mappings; recomputing state groups: {error}"
                 );
             }
         }
     }
-    let state_groups = state_computation.groups;
+    let unresolved_count = if loaded {
+        0
+    } else {
+        let state_computation = compute_state_groups_partial(events, auth_chain);
+        let unresolved = state_computation.unresolved;
+        state_groups = state_computation.groups;
+        if !unresolved.is_empty() {
+            eprintln!(
+                "warning: partial state-group computation: {} event(s) have missing parents or are in cycles; resolvable events were retained",
+                unresolved.len()
+            );
+            if crate::debug_enabled() {
+                let shown = unresolved.iter().take(MAX_DEBUG_UNRESOLVED);
+                eprintln!("debug: unresolved state events:");
+                for event_id in shown {
+                    eprintln!("  {event_id}");
+                }
+                if unresolved.len() > MAX_DEBUG_UNRESOLVED {
+                    eprintln!(
+                        "  ... {} more",
+                        unresolved.len().saturating_sub(MAX_DEBUG_UNRESOLVED)
+                    );
+                }
+            }
+        }
+        unresolved.len()
+    };
+    let graph_event_count = graph_event_ids.len();
     let mapped_event_count = state_groups.len();
     let unique_state_group_count = state_groups.values().collect::<HashSet<_>>().len();
     let stateless_event_count = graph_event_count.saturating_sub(mapped_event_count);
+    let source = if loaded { "loaded" } else { "computed" };
     eprintln!(
-        "  state groups: computed {unique_state_group_count} state groups across {mapped_event_count} events, {stateless_event_count} events stateless"
+        "  state groups: {source} {unique_state_group_count} state groups across {mapped_event_count} events, {stateless_event_count} events unmapped ({unresolved_count} unresolved)"
     );
-    if !state_groups.is_empty() {
-        use mtxdb::auxiliary::AuxiliaryIndex;
-        let aux = AuxiliaryIndex::open(state_store, "sys:matrix-state-groups");
+    if !loaded && !state_groups.is_empty() {
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
             .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
@@ -8353,6 +8452,16 @@ fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usiz
     )
 }
 
+/// Results from a partial state-group walk.
+///
+/// `groups` contains the `event_id` -> `state_group_id` mappings that could
+/// be resolved. `unresolved` contains events blocked by missing parents or
+/// cycles.
+struct PartialStateComputation {
+    groups: HashMap<String, String>,
+    unresolved: Vec<String>,
+}
+
 /// Compute state groups for a set of events by walking the event DAG in
 /// topological order.
 ///
@@ -8361,15 +8470,10 @@ fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usiz
 /// events contribute to the state set.
 ///
 /// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
-/// BLAKE3 digest of the state set). Each event inherits the state from
-/// its `prev_events` and applies its own state change (if it is a state
-/// event with `state_key`).
-///
-struct PartialStateComputation {
-    groups: HashMap<String, String>,
-    unresolved: Vec<String>,
-}
-
+/// BLAKE3 digest of the state set) for resolvable events. Each event inherits
+/// the state from its `prev_events` and applies its own state change (if it is
+/// a state event with `state_key`). Events blocked by missing parents or
+/// cycles are reported separately in `unresolved`.
 fn compute_state_groups_partial(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
@@ -8392,14 +8496,16 @@ fn compute_state_groups_partial_in_view(
         combined = events.iter().chain(auth_chain.iter()).cloned().collect();
         &combined
     };
-    let direct_missing = missing_prev_event_ids(all_owned);
-    if crate::debug_enabled() && !direct_missing.is_empty() {
-        eprintln!(
-            "debug: {} event(s) directly reference missing prev_events",
-            direct_missing.len()
-        );
+    if crate::debug_enabled() {
+        let direct_missing = missing_prev_event_ids(all_owned);
+        if !direct_missing.is_empty() {
+            eprintln!(
+                "debug: {} event(s) directly reference missing prev_events",
+                direct_missing.len()
+            );
+        }
     }
-    let (frontier, id_map, reverse_map) = build_event_dag(all_owned);
+    let (frontier, id_map, reverse_map) = build_event_dag_with_missing_edges(all_owned, true);
     if frontier.is_empty() {
         return PartialStateComputation {
             groups: HashMap::new(),
@@ -9897,13 +10003,14 @@ mod tests {
         default_matrix_import_template, derive_template_key, display_collection_role, event_id,
         event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
         format_canonical_display, format_id, glob_pack_files, import_pdu_events,
-        interleaving_worth_noting, listing_shard_types, matrix_batch_has_create,
+        interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
         matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints,
         meta_lock_line, meta_pools, meta_raw, pack_identity, parse_federation_input,
         parse_pack_id_selector, parse_pack_selectors, pretty_print_payload, redacted_event_bytes,
         resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        MatrixRoomExtension, MetaReport, PackIdentity, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+        template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
+        verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, PackIdentity,
+        StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -10020,7 +10127,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_lock_reports_pid_confidence_and_contention() {
+    fn meta_lock_reports_pid_confidence_without_probe() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(".mtxdb.lock");
@@ -10109,7 +10216,31 @@ mod tests {
         let mut report = MetaReport::default();
         meta_checkpoints(&root, &mut report);
         assert_eq!(report.warn_count, 0);
-        assert_eq!(report.note_count, 0);
+        assert_eq!(report.note_count, 1);
+        assert!(report.lines.iter().any(|line| line.contains("foreign.pack")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("pack_0000000000000001.pack"), b"not a pack").unwrap();
+        mtxdb::index::checkpoint::write_checkpoint(
+            &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+            mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut report = MetaReport::default();
+        meta_checkpoints(&root, &mut report);
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint comparison skipped")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10876,6 +11007,94 @@ mod tests {
             0,
             "a matching existing record must be classified present, not rewritten"
         );
+    }
+
+    #[test]
+    fn importer_loads_complete_cached_state_groups_without_recomputing() {
+        let (store, dir, path, template, collection_id) =
+            import_fixture("import_cached_state_groups");
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, "sys:matrix-state-groups");
+        aux.ensure_metadata().unwrap();
+        let event = import_event("$cached", "@alice", "!room");
+        let cached_group = "A".repeat(STATE_GROUP_ID_LENGTH);
+        aux.put(b"$cached", cached_group.as_bytes()).unwrap();
+        let state_writes_before = state_store.stats().put_many_calls;
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            std::slice::from_ref(&event),
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+
+        let loaded = load_state_groups(&aux, &["$cached".to_owned()]).unwrap();
+        let StateGroupLoad::Complete(loaded) = loaded else {
+            panic!("cached mapping should remain complete");
+        };
+        assert_eq!(loaded["$cached"], cached_group);
+        assert_eq!(
+            state_store.stats().put_many_calls,
+            state_writes_before,
+            "a complete cached mapping should not be recomputed or rewritten"
+        );
+    }
+
+    #[test]
+    fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
+        let (store, dir, path, template, collection_id) =
+            import_fixture("import_state_group_repair");
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, "sys:matrix-state-groups");
+        aux.ensure_metadata().unwrap();
+        let child = owned_value(
+            r#"{"event_id":"$child","sender":"@alice","room_id":"!room","type":"m.room.message","prev_events":["$parent"],"content":{"room_version":"11"}}"#,
+        );
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            std::slice::from_ref(&child),
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+        assert_eq!(aux.get(b"$child").unwrap(), None);
+
+        let repaired_parent = owned_value(
+            r#"{"event_id":"$parent","sender":"@server","room_id":"!room","type":"m.room.create","content":{"room_version":"11"}}"#,
+        );
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            &[repaired_parent, child],
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+        let state_group = aux.get(b"$child").unwrap().expect("repaired mapping");
+        assert!(valid_state_group_id(
+            std::str::from_utf8(&state_group).unwrap()
+        ));
     }
 
     /// Open every pack in a pool and total the records it physically holds.
@@ -12134,6 +12353,117 @@ mod tests {
     fn compute_state_groups_empty_input() {
         let groups = compute_state_groups_partial(&[], &[]).groups;
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn state_group_id_validation_requires_a_base64url_digest() {
+        let golden = StateSet::new().digest_base64url();
+        assert_eq!(golden.len(), STATE_GROUP_ID_LENGTH);
+        assert!(valid_state_group_id(&golden));
+        assert!(!valid_state_group_id(
+            &"A".repeat(golden.len().saturating_sub(1))
+        ));
+        assert!(!valid_state_group_id(
+            &"A".repeat(golden.len().saturating_add(1))
+        ));
+        assert!(!valid_state_group_id(&format!("{}$", "A".repeat(42))));
+        assert!(!valid_state_group_id(&format!("{}.", "A".repeat(42))));
+    }
+
+    #[test]
+    fn state_group_cache_loads_complete_values_and_falls_back_on_missing_or_invalid() {
+        let dir = unique_temp_dir().join("state_group_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, "sys:matrix-state-groups");
+        aux.ensure_metadata().unwrap();
+        let first = "A".repeat(STATE_GROUP_ID_LENGTH);
+        let second = "B".repeat(STATE_GROUP_ID_LENGTH);
+        aux.put_many(&[
+            (b"first".as_slice(), first.as_bytes()),
+            (b"second".as_slice(), second.as_bytes()),
+        ])
+        .unwrap();
+        let ids = vec!["first".to_owned(), "second".to_owned()];
+        let loaded = load_state_groups(&aux, &ids).unwrap();
+        let StateGroupLoad::Complete(loaded) = loaded else {
+            panic!("complete cache should load");
+        };
+        assert_eq!(loaded["first"], first);
+        assert_eq!(loaded["second"], second);
+
+        let missing = vec!["first".to_owned(), "absent".to_owned()];
+        assert!(matches!(
+            load_state_groups(&aux, &missing).unwrap(),
+            StateGroupLoad::Missing
+        ));
+        aux.put(b"invalid", &[0xff]).unwrap();
+        let invalid = vec!["invalid".to_owned()];
+        assert!(matches!(
+            load_state_groups(&aux, &invalid).unwrap(),
+            StateGroupLoad::Invalid { .. }
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn partial_state_groups_repair_when_a_missing_parent_arrives() {
+        let dir = unique_temp_dir().join("state_group_repair");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, "sys:matrix-state-groups");
+        aux.ensure_metadata().unwrap();
+        let incomplete = owned_value(
+            r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$parent"],"content":{}}"#,
+        );
+        let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[]);
+        assert!(!first.groups.contains_key("$child"));
+        assert!(!first.unresolved.is_empty());
+        assert_eq!(aux.get(b"$child").unwrap(), None);
+
+        let parent = owned_value(
+            r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.create","content":{}}"#,
+        );
+        let repaired = compute_state_groups_partial(&[parent, incomplete], &[]);
+        assert!(repaired.groups.contains_key("$child"));
+        assert!(repaired.unresolved.is_empty());
+        let entries: Vec<(&[u8], &[u8])> = repaired
+            .groups
+            .iter()
+            .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
+            .collect();
+        aux.put_many(&entries).unwrap();
+        let repaired_id = aux.get(b"$child").unwrap().unwrap();
+        assert_eq!(repaired_id.len(), STATE_GROUP_ID_LENGTH);
+        assert!(valid_state_group_id(
+            std::str::from_utf8(&repaired_id).unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn import_ordering_ignores_edges_to_absent_events() {
+        let known = owned_value(
+            r#"{"event_id":"$known","room_id":"!r:x","type":"m.room.create","content":{}}"#,
+        );
+        let child = owned_value(
+            r#"{"event_id":"$ordering-child","room_id":"!r:x","type":"m.room.message","prev_events":["$known","$absent"],"content":{}}"#,
+        );
+        let order = topological_event_order(&[known, child]).expect("in-batch parent");
+        assert!(order["$known"] < order["$ordering-child"]);
+    }
+
+    #[test]
+    fn partial_state_groups_report_cycles() {
+        let first = owned_value(
+            r#"{"event_id":"$first","room_id":"!r:x","type":"m.room.message","prev_events":["$second"],"content":{}}"#,
+        );
+        let second = owned_value(
+            r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.message","prev_events":["$first"],"content":{}}"#,
+        );
+        let result = compute_state_groups_partial(&[first, second], &[]);
+        assert!(result.groups.is_empty());
+        assert_eq!(result.unresolved.len(), 2);
     }
 
     #[test]
