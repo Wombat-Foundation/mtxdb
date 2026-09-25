@@ -61,11 +61,6 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: rust-${{ matrix.rust }}-${{ matrix.label }}
-
       - name: Toolchain Versions
         run: |
           rustc --version
@@ -123,11 +118,6 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: rust-${{ matrix.rust }}-all-features
-
       - name: Toolchain Versions
         run: |
           rustc --version
@@ -153,11 +143,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: rust-stable-summary
 
       - name: Install dependencies
         run: |
