@@ -8069,6 +8069,37 @@ impl PackfileStorage {
             .map(|journal| journal.request_durable(target_lsn))
     }
 
+    /// Block until the group covering `token` is durable. No-op when no journal
+    /// is enabled. Pair with [`Self::request_durable`].
+    ///
+    /// # Errors
+    /// Returns a storage error if the target was never published, the journal
+    /// is poisoned, the background committer failed, or the commit fails.
+    pub fn wait_durable(&self, token: DurabilityToken) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .wait_durable(token)
+                .map(|_| ())
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Perform one bounded WAL group commit over everything published so far.
+    /// No-op when no journal is enabled.
+    ///
+    /// # Errors
+    /// Returns a storage error if appending or fsyncing the group fails.
+    pub fn flush_durable(&self) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .flush_durable()
+                .map(|_| ())
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
     /// Enable the in-process read overlay for a published transaction that is
     /// still being materialized. The overlay is shared with the existing
     /// read-committed implementation, but ordinary reads consult it only

@@ -884,6 +884,40 @@ struct BackgroundCommitter {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Lifecycle of the background committer slot.
+///
+/// `Stopping` is held across the join so a concurrent
+/// [`JournalCoordinator::start_background_committer`] cannot spawn a second
+/// committer while the old thread is still winding down.
+enum BackgroundState {
+    Stopped,
+    Running(BackgroundCommitter),
+    Stopping,
+}
+
+/// A terminal failure of the background committer, recorded so `wait_durable`
+/// and `stop_background_committer` can surface it instead of waiting forever on
+/// a worker that is no longer running. A private snapshot of an [`io::Error`]
+/// (`io::Error` is not `Clone`).
+#[derive(Clone, Debug)]
+struct BackgroundFailure {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl BackgroundFailure {
+    fn from_io(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(self.kind, self.message)
+    }
+}
+
 /// Serializes mutation publication and durable commits for one journal.
 ///
 /// Mutations are assigned LSNs under a short queue lock. A sync caller captures
@@ -959,13 +993,21 @@ pub struct JournalCoordinator {
     /// Signals `wait_durable` callers and the background committer when the
     /// durable boundary may have advanced or the committer has stopped.
     durable_cv: Condvar,
-    /// The running background committer, if [`Self::start_background_committer`]
-    /// was called. Additive: a coordinator without one keeps the historical
+    /// Lifecycle of the background committer. Additive: a coordinator whose
+    /// state is [`BackgroundState::Stopped`] keeps the historical
     /// blocking-barrier behavior for `wait_durable`/`sync_through`.
-    background: Mutex<Option<BackgroundCommitter>>,
+    background: Mutex<BackgroundState>,
+    /// Terminal committer failure, surfaced by [`Self::wait_durable`] and
+    /// [`Self::stop_background_committer`]. Cleared when a committer is
+    /// (re)started.
+    background_failure: Mutex<Option<BackgroundFailure>>,
+    /// Published-but-uncommitted count at which `publish` wakes the committer
+    /// for an early flush. Zero when no committer is running (no wakeups).
+    committer_wake_threshold: AtomicU64,
     /// Number of background group commits that appended and fsynced a group.
     background_commits: AtomicU64,
-    /// Number of background commit attempts already covered by a durable group.
+    /// Number of background commit attempts already covered by a concurrent
+    /// durable group (never counted for idle timer ticks).
     background_coalesced: AtomicU64,
 }
 
@@ -1013,7 +1055,9 @@ impl JournalCoordinator {
             durable_requested: AtomicU64::new(committed_lsn),
             durable_lock: Mutex::new(()),
             durable_cv: Condvar::new(),
-            background: Mutex::new(None),
+            background: Mutex::new(BackgroundState::Stopped),
+            background_failure: Mutex::new(None),
+            committer_wake_threshold: AtomicU64::new(0),
             background_commits: AtomicU64::new(0),
             background_coalesced: AtomicU64::new(0),
         }
@@ -1213,6 +1257,19 @@ impl JournalCoordinator {
         pending.push((lsn, pool, mutation));
         self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn.store(lsn, Ordering::Release);
+        // Wake the committer only when a burst reaches its early-flush bound;
+        // `publish` is the hot path, so ordinary publishes must not pay a
+        // futex wake. `committer_wake_threshold` is zero when no committer is
+        // running.
+        let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
+        let wake = threshold > 0 && self.pending_count() >= threshold;
+        // Drop the pending-queue lock before taking `durable_lock`, keeping a
+        // single lock order (pending -> . . . is never followed by
+        // durable_lock) and off the publish path otherwise.
+        drop(pending);
+        if wake {
+            self.wake_durable_waiters();
+        }
         Ok(lsn)
     }
 
@@ -1678,7 +1735,7 @@ impl JournalCoordinator {
             .fetch_max(target_lsn, Ordering::AcqRel);
         // Wake the committer (for a threshold flush) and any waiters parked on
         // the old boundary.
-        self.durable_cv.notify_all();
+        self.wake_durable_waiters();
         DurabilityToken { lsn: target_lsn }
     }
 
@@ -1700,7 +1757,7 @@ impl JournalCoordinator {
     /// Whether a background committer is currently running.
     #[must_use]
     pub fn has_background_committer(&self) -> bool {
-        self.background.lock().is_some()
+        matches!(*self.background.lock(), BackgroundState::Running(_))
     }
 
     /// Number of background group commits that appended and fsynced a group.
@@ -1709,23 +1766,41 @@ impl JournalCoordinator {
         self.background_commits.load(Ordering::Relaxed)
     }
 
-    /// Number of background commit attempts already covered by a durable group.
+    /// Number of background commit attempts already covered by a concurrent
+    /// durable group. Idle timer ticks (nothing pending) are not counted.
     #[must_use]
     pub fn background_coalesced(&self) -> u64 {
         self.background_coalesced.load(Ordering::Relaxed)
+    }
+
+    fn background_failure(&self) -> Option<BackgroundFailure> {
+        self.background_failure.lock().clone()
+    }
+
+    /// Wake the committer and any `wait_durable` callers.
+    ///
+    /// Takes [`Self::durable_lock`] so the wake cannot be lost to the race
+    /// where a waiter checks its predicate and then parks after the notifier
+    /// has already notified: the notifier either holds the lock while the
+    /// waiter is parked (waking it) or blocks until the waiter releases it.
+    fn wake_durable_waiters(&self) {
+        let _guard = self.durable_lock.lock();
+        self.durable_cv.notify_all();
     }
 
     /// Block until the group covering `token` is durable.
     ///
     /// With a background committer running this waits for it to flush; the
     /// bounded poll interval lets the waiter notice a committer that stopped or
-    /// a poisoned journal. Without one, this is exactly [`Self::sync_through`]
-    /// on the token's LSN — the historical blocking behavior, so a caller that
-    /// never opts into background commits is unaffected.
+    /// a poisoned journal. A committer that failed terminally is reported
+    /// rather than waited on. Without a committer, this is exactly
+    /// [`Self::sync_through`] on the token's LSN — the historical blocking
+    /// behavior, so a caller that never opts into background commits is
+    /// unaffected.
     ///
     /// # Errors
     /// Returns an error if the target was never published, the journal is
-    /// poisoned, or the committing sync fails.
+    /// poisoned, the committer failed, or the committing sync fails.
     pub fn wait_durable(&self, token: DurabilityToken) -> io::Result<Option<CommitReceipt>> {
         let target = token.lsn;
         if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
@@ -1739,6 +1814,11 @@ impl JournalCoordinator {
                 return Err(io::Error::other(
                     "journal is poisoned after a failed commit",
                 ));
+            }
+            // A stopped committer falls through to a direct commit, but a
+            // committer that failed must not be silently papered over.
+            if let Some(failure) = self.background_failure() {
+                return Err(failure.into_io());
             }
             if !self.has_background_committer() {
                 return self.sync_through(target);
@@ -1761,7 +1841,8 @@ impl JournalCoordinator {
     ///
     /// Used by the background committer's timer and by
     /// [`Self::stop_background_committer`]. A no-op returning `None` when
-    /// nothing is pending. This is the journal-level durability boundary; a
+    /// nothing is pending (so an idle tick neither fsyncs nor inflates the
+    /// coalescing counter). This is the journal-level durability boundary; a
     /// caller that also needs its packfile checkpoint rewritten should use the
     /// storage-level sync path instead.
     ///
@@ -1769,49 +1850,87 @@ impl JournalCoordinator {
     /// Propagates a durable-commit failure from [`Self::sync_through`].
     pub fn flush_durable(&self) -> io::Result<Option<CommitReceipt>> {
         let target = self.capture_sync_target();
-        if target == 0 {
+        if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
             return Ok(None);
         }
         let receipt = self.sync_through(target)?;
         if receipt.is_some() {
             self.background_commits.fetch_add(1, Ordering::Relaxed);
         } else {
+            // Another caller's group covered this target first.
             self.background_coalesced.fetch_add(1, Ordering::Relaxed);
         }
         // A group commit may cover waiters parked on a boundary below `target`.
-        self.durable_cv.notify_all();
+        self.wake_durable_waiters();
         Ok(receipt)
     }
 
     /// Start a background thread that fsyncs the pending WAL group on a bounded
     /// interval, coalescing every mutation published in the window into one
-    /// group. Idempotent: a second call while one is running is a no-op.
+    /// group. Flushes early once `max_pending` records are outstanding.
+    /// Idempotent: a call while one is running (or stopping) is a no-op.
     ///
     /// The thread holds only a [`Weak`] reference between iterations, so
-    /// dropping the last `Arc<JournalCoordinator>` stops it within one interval
-    /// without a cycle. [`Self::stop_background_committer`] should still be
-    /// called at shutdown to flush the final group and join deterministically.
+    /// dropping the last `Arc<JournalCoordinator>` lets it exit within one
+    /// interval without an `Arc` cycle. That is a bounded delay, not immediate
+    /// teardown — call [`Self::stop_background_committer`] for deterministic
+    /// cleanup and a final flush.
     ///
     /// # Errors
-    /// Returns an error if the committer thread cannot be spawned.
+    /// Returns [`io::ErrorKind::InvalidInput`] if `interval` is zero or
+    /// `max_pending` is zero (both would busy-loop or flush continuously), or
+    /// another error if the committer thread cannot be spawned.
     pub fn start_background_committer(
         self: &Arc<Self>,
         config: GroupCommitConfig,
     ) -> io::Result<()> {
+        if config.interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background committer interval must be greater than zero",
+            ));
+        }
+        if config.max_pending == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background committer max_pending must be greater than zero",
+            ));
+        }
         let mut slot = self.background.lock();
-        if slot.is_some() {
+        // Running or Stopping: never spawn a second committer.
+        if !matches!(*slot, BackgroundState::Stopped) {
             return Ok(());
         }
+        *self.background_failure.lock() = None;
         let stop = Arc::new(AtomicBool::new(false));
         let weak = Arc::downgrade(self);
         let stop_clone = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("mtxdb-journal-committer".to_owned())
-            .spawn(move || Self::background_committer_loop(&weak, config, &stop_clone))
+            .spawn(move || {
+                // Catch a panic so the terminal failure is recorded and waiters
+                // are released instead of polling forever on a dead worker.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::background_committer_loop(&weak, config, &stop_clone)
+                }));
+                if let Some(coordinator) = weak.upgrade() {
+                    let failure = match outcome {
+                        Ok(Ok(())) => None,
+                        Ok(Err(failure)) => Some(failure),
+                        Err(_) => Some(BackgroundFailure {
+                            kind: io::ErrorKind::Other,
+                            message: "background committer panicked".to_owned(),
+                        }),
+                    };
+                    coordinator.finish_background(failure);
+                }
+            })
             .map_err(|error| {
                 io::Error::other(format!("failed to spawn journal committer: {error}"))
             })?;
-        *slot = Some(BackgroundCommitter {
+        self.committer_wake_threshold
+            .store(config.max_pending, Ordering::Release);
+        *slot = BackgroundState::Running(BackgroundCommitter {
             stop,
             handle: Some(handle),
         });
@@ -1822,42 +1941,79 @@ impl JournalCoordinator {
     /// pending group so a quiet stream's last write is durable before this
     /// returns. Safe to call when no committer is running (it still flushes).
     ///
+    /// The committer slot is held in a `Stopping` state across the join, so a
+    /// concurrent [`Self::start_background_committer`] cannot spawn a second
+    /// worker mid-teardown.
+    ///
     /// # Errors
-    /// Propagates a failure from the final [`Self::flush_durable`].
+    /// Propagates a failure from the final [`Self::flush_durable`], and surfaces
+    /// a terminal committer failure recorded by the worker.
     pub fn stop_background_committer(&self) -> io::Result<()> {
-        let committer = self.background.lock().take();
-        if let Some(mut committer) = committer {
-            committer.stop.store(true, Ordering::Release);
-            self.durable_cv.notify_all();
-            if let Some(handle) = committer.handle.take() {
-                // A panic in the committer must not wedge shutdown; the final
-                // flush below still runs and reports any real I/O failure.
-                let _ = handle.join();
+        let handle = {
+            let mut slot = self.background.lock();
+            match std::mem::replace(&mut *slot, BackgroundState::Stopping) {
+                BackgroundState::Running(mut committer) => {
+                    committer.stop.store(true, Ordering::Release);
+                    committer.handle.take()
+                }
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        };
+        self.committer_wake_threshold.store(0, Ordering::Release);
+        self.wake_durable_waiters();
+        if let Some(handle) = handle {
+            // A panic in the committer is caught and recorded by the worker's
+            // wrapper; joining still succeeds and the failure is surfaced below.
+            let _ = handle.join();
+        }
+        {
+            let mut slot = self.background.lock();
+            if matches!(*slot, BackgroundState::Stopping) {
+                *slot = BackgroundState::Stopped;
             }
         }
+        let failure = self.background_failure.lock().take();
         self.flush_durable()?;
+        if let Some(failure) = failure {
+            return Err(failure.into_io());
+        }
         Ok(())
+    }
+
+    /// Mark the committer slot stopped, publish any terminal failure, and wake
+    /// waiters. Called by the worker itself as it exits.
+    fn finish_background(&self, failure: Option<BackgroundFailure>) {
+        {
+            let mut slot = self.background.lock();
+            *slot = BackgroundState::Stopped;
+        }
+        self.committer_wake_threshold.store(0, Ordering::Release);
+        if let Some(failure) = failure {
+            *self.background_failure.lock() = Some(failure);
+        }
+        self.wake_durable_waiters();
     }
 
     fn background_committer_loop(
         weak: &Weak<Self>,
         config: GroupCommitConfig,
         stop: &Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), BackgroundFailure> {
         let interval = config.interval;
         loop {
             let Some(coordinator) = weak.upgrade() else {
-                break;
+                return Ok(());
             };
             let now = std::time::Instant::now();
             let deadline = now.checked_add(interval).unwrap_or(now);
             {
                 let mut guard = coordinator.durable_lock.lock();
                 loop {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if coordinator.poisoned.load(Ordering::Acquire) {
+                    if stop.load(Ordering::Acquire) || coordinator.poisoned.load(Ordering::Acquire)
+                    {
                         break;
                     }
                     let now = std::time::Instant::now();
@@ -1872,17 +2028,16 @@ impl JournalCoordinator {
                 }
             }
             if stop.load(Ordering::Acquire) || coordinator.poisoned.load(Ordering::Acquire) {
-                break;
+                return Ok(());
             }
             // The final flush on stop is done by `stop_background_committer`
             // after join, so a stop that lands here does not double-fsync.
             if let Err(error) = coordinator.flush_durable() {
-                // Keep waiting for a later successful commit unless the journal
-                // is poisoned, in which case no progress is possible.
                 if coordinator.poisoned.load(Ordering::Acquire) {
-                    break;
+                    // Poison is already reported to waiters via the poison bit.
+                    return Ok(());
                 }
-                let _ = error;
+                return Err(BackgroundFailure::from_io(&error));
             }
         }
     }
@@ -4046,6 +4201,14 @@ mod tests {
             "quiet-stream interval flush",
         );
         assert!(coordinator.background_commits() >= 1);
+        // Idle timer ticks after the flush must not register as coalesced work.
+        assert_eq!(coordinator.background_coalesced(), 0);
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            coordinator.background_coalesced(),
+            0,
+            "idle ticks must not inflate the coalescing counter"
+        );
         coordinator.stop_background_committer().unwrap();
         fs::remove_file(coordinator.path()).unwrap();
     }
@@ -4060,6 +4223,8 @@ mod tests {
             })
             .unwrap();
 
+        // Publish only: no request_durable call, so the threshold crossing in
+        // `publish` itself must be what wakes the committer.
         for node in 0..6u8 {
             coordinator.publish(put(3, node, b"burst"), |_| {}).unwrap();
         }
@@ -4070,7 +4235,31 @@ mod tests {
             "max-pending early flush",
         );
         assert!(coordinator.background_commits() >= 1);
+        assert_eq!(coordinator.background_coalesced(), 0);
         coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn background_committer_rejects_degenerate_config() {
+        let coordinator = open_arc("bg_bad_config");
+        let zero_interval = coordinator.start_background_committer(GroupCommitConfig {
+            interval: Duration::ZERO,
+            max_pending: 1,
+        });
+        assert_eq!(
+            zero_interval.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let zero_pending = coordinator.start_background_committer(GroupCommitConfig {
+            interval: Duration::from_secs(1),
+            max_pending: 0,
+        });
+        assert_eq!(
+            zero_pending.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(!coordinator.has_background_committer());
         fs::remove_file(coordinator.path()).unwrap();
     }
 
@@ -4108,8 +4297,16 @@ mod tests {
             .unwrap();
 
         let lsn = coordinator.publish(put(5, 1, b"explicit"), |_| {}).unwrap();
-        // The explicit barrier must not wait for the committer's interval.
+        // The explicit barrier must not wait for the committer's 60s interval:
+        // the committer cannot fire early here (max_pending is unbounded), so a
+        // barrier that returns promptly and satisfies `lsn` can only have done
+        // the commit itself.
+        let started = std::time::Instant::now();
         coordinator.sync_through(lsn).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "explicit barrier must not block on the background interval"
+        );
         assert!(coordinator.committed_lsn() >= lsn);
         assert_eq!(
             coordinator.background_commits(),
