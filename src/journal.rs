@@ -1004,6 +1004,9 @@ pub struct JournalCoordinator {
     /// Published-but-uncommitted count at which `publish` wakes the committer
     /// for an early flush. Zero when no committer is running (no wakeups).
     committer_wake_threshold: AtomicU64,
+    /// Set by the publish that crossed the threshold; cleared by the next
+    /// flush so a burst yields one wake, not one per event.
+    threshold_notified: AtomicBool,
     /// Number of background group commits that appended and fsynced a group.
     background_commits: AtomicU64,
     /// Number of background commit attempts already covered by a concurrent
@@ -1058,6 +1061,7 @@ impl JournalCoordinator {
             background: Mutex::new(BackgroundState::Stopped),
             background_failure: Mutex::new(None),
             committer_wake_threshold: AtomicU64::new(0),
+            threshold_notified: AtomicBool::new(false),
             background_commits: AtomicU64::new(0),
             background_coalesced: AtomicU64::new(0),
         }
@@ -1262,7 +1266,11 @@ impl JournalCoordinator {
         // futex wake. `committer_wake_threshold` is zero when no committer is
         // running.
         let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
-        let wake = threshold > 0 && self.pending_count() >= threshold;
+        // Only the publish that crosses the bound wakes; the flag stays set
+        // (suppressing further wakes in the burst) until the next flush.
+        let wake = threshold > 0
+            && self.pending_count() >= threshold
+            && !self.threshold_notified.swap(true, Ordering::AcqRel);
         // Drop the pending-queue lock before taking `durable_lock`, keeping a
         // single lock order (pending -> . . . is never followed by
         // durable_lock) and off the publish path otherwise.
@@ -1810,6 +1818,19 @@ impl JournalCoordinator {
             if target <= self.committed_lsn.load(Ordering::Acquire) {
                 return Ok(None);
             }
+            if target > self.published_lsn.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sync target has not been published",
+                ));
+            }
+            // Recheck every predicate under `durable_lock`, the same lock the
+            // notifiers take, so a state change cannot slip between check and
+            // park. The poll interval remains a backstop, not a requirement.
+            let mut guard = self.durable_lock.lock();
+            if target <= self.committed_lsn.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             if self.poisoned.load(Ordering::Acquire) {
                 return Err(io::Error::other(
                     "journal is poisoned after a failed commit",
@@ -1821,17 +1842,8 @@ impl JournalCoordinator {
                 return Err(failure.into_io());
             }
             if !self.has_background_committer() {
+                drop(guard);
                 return self.sync_through(target);
-            }
-            if target > self.published_lsn.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "sync target has not been published",
-                ));
-            }
-            let mut guard = self.durable_lock.lock();
-            if target <= self.committed_lsn.load(Ordering::Acquire) {
-                return Ok(None);
             }
             self.durable_cv.wait_for(&mut guard, DURABILITY_WAIT_POLL);
         }
@@ -1849,6 +1861,9 @@ impl JournalCoordinator {
     /// # Errors
     /// Propagates a durable-commit failure from [`Self::sync_through`].
     pub fn flush_durable(&self) -> io::Result<Option<CommitReceipt>> {
+        // Re-arm the threshold wake before capturing, so publishes landing
+        // during this flush can trigger the next one.
+        self.threshold_notified.store(false, Ordering::Release);
         let target = self.capture_sync_target();
         if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
             return Ok(None);
@@ -1902,6 +1917,7 @@ impl JournalCoordinator {
             return Ok(());
         }
         *self.background_failure.lock() = None;
+        self.threshold_notified.store(false, Ordering::Release);
         let stop = Arc::new(AtomicBool::new(false));
         let weak = Arc::downgrade(self);
         let stop_clone = Arc::clone(&stop);
@@ -1988,7 +2004,11 @@ impl JournalCoordinator {
     fn finish_background(&self, failure: Option<BackgroundFailure>) {
         {
             let mut slot = self.background.lock();
-            *slot = BackgroundState::Stopped;
+            // Leave `Stopping` alone: `stop_background_committer` owns that
+            // transition and only clears it after joining this thread.
+            if matches!(*slot, BackgroundState::Running(_)) {
+                *slot = BackgroundState::Stopped;
+            }
         }
         self.committer_wake_threshold.store(0, Ordering::Release);
         if let Some(failure) = failure {
