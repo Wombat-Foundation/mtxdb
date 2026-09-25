@@ -2433,7 +2433,7 @@ impl PackfileStorage {
             .and_then(|file| file.sync_all())
             .map_err(StorageError::Io)?;
         fs::rename(&tmp, &path).map_err(StorageError::Io)?;
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         Ok(())
     }
 
@@ -4015,7 +4015,7 @@ impl PackfileStorage {
         // this fsync commits either observes the rename (fingerprint gate
         // passes) or doesn't (falls back to the still-valid predecessor
         // checkpoint) — never a torn or partially-visible rename.
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         // The checkpoint naming `fingerprint` is now durably in place, so a
         // new collection publishing from here on lands after it — same
         // recovery story a reopen already has for any other post-checkpoint
@@ -4201,7 +4201,7 @@ impl PackfileStorage {
             &pack_table,
         )
         .map_err(StorageError::Io)?;
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         self.retire_delta_epoch(old_base_fingerprint);
         let guards = lock_arcs.iter().map(|m| m.lock()).collect::<Vec<_>>();
         let has_unfinished_work = {
@@ -4266,7 +4266,7 @@ impl PackfileStorage {
             &pack_table,
         )
         .map_err(StorageError::Io)?;
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         Ok((fingerprint, old_base_fingerprint))
     }
 
@@ -4286,7 +4286,7 @@ impl PackfileStorage {
             // one covers the unlink instead, so the retired epoch's file
             // doesn't linger past a crash — harmless either way (see the
             // doc comment above), but tidier.
-            let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+            let _ = crate::shard::sync_directory(&self.base_dir);
         }
     }
 

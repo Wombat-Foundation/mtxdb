@@ -47,6 +47,39 @@ fn kick_writeback(file: &File, offset: u64, len: u64) {
     };
 }
 
+/// Flush a directory's entries to stable storage.
+///
+/// Unix can fsync a directory descriptor directly. Windows has no std API for
+/// it, and only lets you open a directory handle at all with
+/// `FILE_FLAG_BACKUP_SEMANTICS`; `sync_all` then maps to `FlushFileBuffers`,
+/// which persists the directory's entries — the same approach SQLite's Win32
+/// VFS uses. `custom_flags` is safe, so this needs no FFI or new dependency.
+pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory sync is unsupported on this platform",
+        ))
+    }
+}
+
 /// Maximum number of shards in the pool.
 ///
 /// This is a runtime policy cap, not a format limit: the shard slot is a
@@ -1008,8 +1041,7 @@ impl ShardPool {
         shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
         next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
 
-        let dir = File::open(base_dir)?;
-        dir.sync_all()?;
+        sync_directory(base_dir)?;
         let initial_pack_create_time = t_initial_pack.elapsed();
 
         Ok((
@@ -1500,8 +1532,7 @@ impl ShardPool {
                 // Fsync the containing directory so the rename is durable
                 // across power loss — without this, a crash could leave the
                 // old pool.meta (or no file) in place, allowing pack_id reuse.
-                let dir = File::open(base_dir)?;
-                dir.sync_all()?;
+                sync_directory(base_dir)?;
             }
             Ok(())
         })();
