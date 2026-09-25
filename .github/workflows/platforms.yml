@@ -32,11 +32,6 @@ jobs:
         with:
           components: clippy
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: native-${{ matrix.os }}
-
       - name: Toolchain versions
         run: |
           rustc --version

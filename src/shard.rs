@@ -1351,39 +1351,31 @@ impl ShardPool {
     /// an older binary (bare PID, no starttime) has nothing to compare
     /// against and fails closed exactly as before, same as any other
     /// unparsable content.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn lock_holder_is_dead(lock_path: &Path) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            let Ok(contents) = fs::read_to_string(lock_path) else {
-                return false;
-            };
-            let mut fields = contents.split_whitespace();
-            let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
-                return false;
-            };
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                return true;
-            }
-            // The PID exists as a live process, but that alone doesn't mean
-            // it's still our original writer (see doc comment above) —
-            // disambiguate via starttime when we have one to compare.
-            match fields.next().and_then(|s| s.parse::<u64>().ok()) {
-                Some(recorded_start) => match Self::proc_start_time(&pid.to_string()) {
-                    Some(current_start) => current_start != recorded_start,
-                    // Couldn't read the current holder's stat (raced with
-                    // its own exit, permissions, ...) — fail closed.
-                    None => false,
-                },
-                // Old-format lock file, or starttime collection failed at
-                // creation time — nothing to disambiguate a reuse with.
-                None => false,
-            }
+        let Ok(contents) = fs::read_to_string(lock_path) else {
+            return false;
+        };
+        let mut fields = contents.split_whitespace();
+        let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = lock_path;
-            false
+        // The PID exists as a live process, but that alone doesn't mean
+        // it's still our original writer (see doc comment above) —
+        // disambiguate via starttime when we have one to compare.
+        match fields.next().and_then(|s| s.parse::<u64>().ok()) {
+            Some(recorded_start) => match Self::proc_start_time(&pid.to_string()) {
+                Some(current_start) => current_start != recorded_start,
+                // Couldn't read the current holder's stat (raced with
+                // its own exit, permissions, ...) — fail closed.
+                None => false,
+            },
+            // Old-format lock file, or starttime collection failed at
+            // creation time — nothing to disambiguate a reuse with.
+            None => false,
         }
     }
 
