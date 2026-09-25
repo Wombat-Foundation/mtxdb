@@ -78,19 +78,19 @@ jobs:
       # distinguished by `matrix.label`, not `matrix.rust`.
       - name: Lint (default features)
         if: matrix.label == 'MSRV (default features)'
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test (default features)
         if: matrix.label == 'MSRV (default features)'
-        run: cargo test --locked --workspace --lib --tests
+        run: cargo test --locked --lib --tests
 
       - name: Lint (cli feature)
         if: matrix.label == 'cli feature'
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test (cli feature)
         if: matrix.label == 'cli feature'
-        run: cargo test --locked --workspace --lib --tests
+        run: cargo test --locked --lib --tests
 
       - name: Build CLI
         if: matrix.label == 'cli feature'
@@ -133,10 +133,10 @@ jobs:
           cargo --version
 
       - name: Lint
-        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked --all-features --workspace --lib --tests
+        run: cargo test --locked --all-features --lib --tests
 
   checks:
     name: Format, Coverage, and Summary
@@ -163,7 +163,7 @@ jobs:
         run: make format && git diff --exit-code
 
       - name: Lint (Clippy)
-        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
       - name: Install nightly toolchain (for llvm-cov)
         run: rustup toolchain install nightly --profile minimal
@@ -172,7 +172,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test Suite
-        run: set -o pipefail; cargo test --locked --all-features --workspace --lib --tests 2>&1 | tee test-results.txt
+        run: set -o pipefail; cargo test --locked --all-features --lib --tests 2>&1 | tee test-results.txt
 
       - name: Code Coverage
         run: make cov
