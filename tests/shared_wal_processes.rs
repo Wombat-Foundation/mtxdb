@@ -236,6 +236,15 @@ fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
     db.publish_pending()
         .expect("writer publishes the pending group")
         .expect("a pending group exists to publish");
+
+    // Publication must advance the read-committed boundary without advancing
+    // the durable boundary. This distinguishes a visibility success from an
+    // accidental synchronous commit before the reader is allowed to proceed.
+    let journal = state.journal().expect("the shared WAL must be available");
+    assert!(
+        journal.visible_lsn() > journal.committed_lsn(),
+        "publication must make the group visible before it is durable"
+    );
     std::fs::write(root.path().join("published.done"), b"1").expect("signal publish");
 
     let status = reader.wait_bounded(
