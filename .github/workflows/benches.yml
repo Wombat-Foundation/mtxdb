@@ -42,10 +42,12 @@ jobs:
       - name: Run benchmarks (tee to file)
         # benches/ is a standalone crate outside the root [workspace] (see
         # root Cargo.toml), so the harness must be reached via
-        # --manifest-path. --all-features is deliberately omitted: it would
-        # pull in the opt-in `compare-external` feature (libmdbx/rusqlite/
-        # fjall), which needs sqlite3 dev headers this runner doesn't install.
-        run: set -o pipefail; cargo bench --manifest-path benches/Cargo.toml --profile release --all-targets --all-features --benches 2>&1 | tee bench-output.txt
+        # --manifest-path. libmdbx/rusqlite/fjall are unconditional
+        # dependencies -- there is no opt-in `compare-external` feature -- so
+        # this runner needs libsqlite3 dev headers for the non-bundled
+        # rusqlite link (Windows CI bundles SQLite instead; see
+        # benches/Cargo.toml).
+        run: set -o pipefail; cargo bench --manifest-path benches/Cargo.toml --profile release --all-targets --benches 2>&1 | tee bench-output.txt
 
       - name: Fetch previous best metrics
         # Previous best is tracked as bench.json on the `_metadata/badges` branch.

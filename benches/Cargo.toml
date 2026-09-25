@@ -21,13 +21,20 @@ publish = false
 # amalgamation from source on every build, on top of libsqlite3-sys's own
 # bindgen run. Linking the system libsqlite3 (found via pkg-config) skips that
 # compile step; it costs requiring sqlite3 dev headers to be installed where
-# benches are run.
+# benches are run. Windows has neither a system libsqlite3 nor pkg-config, so
+# it overrides this with the `bundled` feature below.
 bytes = "1.5"
 crc32fast = "1.4"
 fjall = "2.11.2"
 libmdbx = "0.6"
 mtxdb = { path = "..", features = ["multi-reader"] }
 rusqlite = "0.32"
+
+[target.'cfg(windows)'.dependencies]
+# No system SQLite and no pkg-config on Windows, so build and link the bundled
+# amalgamation instead (MSVC is available on the CI runner). Linux/macOS keep
+# the system library via the non-bundled dependency above.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # LINTS — mirrors the root workspace's [workspace.lints]; this crate no
 # longer shares that table since it's its own workspace root.
