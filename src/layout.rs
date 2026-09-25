@@ -182,9 +182,9 @@ impl ShardType {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::State => "state",
-            Self::EventDag => "event",
-            Self::Edges => "edges",
+            Self::State => "mtpl-state",
+            Self::EventDag => "mtpl-event",
+            Self::Edges => "mtpl-edges",
         }
     }
 
@@ -422,15 +422,15 @@ mod tests {
         }
         assert_eq!(
             layout.pool_dir(ShardType::State).unwrap(),
-            root.join("pools/state")
+            root.join("pools/mtpl-state")
         );
         assert_eq!(
             layout.pool_dir(ShardType::EventDag).unwrap(),
-            root.join("pools/event")
+            root.join("pools/mtpl-event")
         );
         assert_eq!(
             layout.pool_dir(ShardType::Edges).unwrap(),
-            root.join("pools/edges")
+            root.join("pools/mtpl-edges")
         );
     }
 

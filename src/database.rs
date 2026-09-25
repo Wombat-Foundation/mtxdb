@@ -1103,7 +1103,7 @@ mod tests {
             );
         }
 
-        let before = PackfileStorage::read_journal_lsn(&root.join("pools/state"));
+        let before = PackfileStorage::read_journal_lsn(&root.join("pools/mtpl-state"));
         assert!(
             before > 0,
             "state's durable checkpoint coverage must survive the reclaim"
@@ -1115,7 +1115,7 @@ mod tests {
         let db = SharedDatabase::open(root.clone()).unwrap();
         db.pool(ShardType::State).force_index_checkpoint().unwrap();
         assert_eq!(
-            PackfileStorage::read_journal_lsn(&root.join("pools/state")),
+            PackfileStorage::read_journal_lsn(&root.join("pools/mtpl-state")),
             before,
             "a checkpoint must never regress its covered LSN to zero"
         );
@@ -1132,7 +1132,7 @@ mod tests {
         // one shared LSN space.
         for (name, layout_code) in [("legacy_seed_perpool", 0u8), ("legacy_seed_shared", 1u8)] {
             let root = test_root(name);
-            std::fs::create_dir_all(root.join("pools/state")).unwrap();
+            std::fs::create_dir_all(root.join("pools/mtpl-state")).unwrap();
             let mut meta = Vec::from(b"MTXD".as_slice());
             meta.push(1);
             meta.extend_from_slice(&[0u8; 8]);
@@ -1140,7 +1140,11 @@ mod tests {
             meta.extend_from_slice(b"state\nevent\nedges\n");
             std::fs::write(root.join("db.meta"), meta).unwrap();
             // A checkpoint watermark recorded before the shared segment existed.
-            std::fs::write(root.join("pools/state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
+            std::fs::write(
+                root.join("pools/mtpl-state/journal.lsn"),
+                7u64.to_le_bytes(),
+            )
+            .unwrap();
 
             let db = SharedDatabase::open(root.clone()).unwrap();
             let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
@@ -1193,7 +1197,7 @@ mod tests {
         )
         .unwrap();
         // A stale per-pool WAL that must be ignored, not replayed.
-        let stale_pool = root.join("pools/state");
+        let stale_pool = root.join("pools/mtpl-state");
         std::fs::create_dir_all(&stale_pool).unwrap();
         std::fs::write(stale_pool.join("wal.bin"), b"not a real segment").unwrap();
 
@@ -1220,7 +1224,7 @@ mod tests {
         let db = SharedDatabase::open(root.clone()).unwrap();
         let err = db
             .pool(ShardType::State)
-            .enable_journal(root.join("pools/state/wal.bin"))
+            .enable_journal(root.join("pools/mtpl-state/wal.bin"))
             .unwrap_err();
         assert!(
             err.to_string().contains("inside database root"),

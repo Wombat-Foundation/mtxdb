@@ -36,7 +36,7 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        let state = root.join("pools/state");
+        let state = root.join("pools/mtpl-state");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("index.checkpoint"), b"corrupt checkpoint").unwrap();

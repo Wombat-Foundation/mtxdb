@@ -7511,10 +7511,10 @@ fn cmd_import_file(
         // Import auth chain events into the edges shard pool.
         if !federation.auth_chain.is_empty() {
             // Derive the edges pool dir from the event pool dir.
-            // pool_dir is {root}/pools/event; edges is {root}/pools/edges.
+            // pool_dir is {root}/pools/mtpl-event; edges is {root}/pools/mtpl-edges.
             let edges_dir = dir
                 .parent()
-                .map(|p| p.join("edges"))
+                .map(|p| p.join("mtpl-edges"))
                 .context("deriving edges pool path")?;
             fs::create_dir_all(&edges_dir)?;
             let auth_store = PackfileStorage::open(edges_dir).context("opening edges store")?;
@@ -7844,7 +7844,7 @@ fn import_pdu_events(
 
     let edge_dir = dir
         .parent()
-        .map(|parent| parent.join("edges"))
+        .map(|parent| parent.join("mtpl-edges"))
         .context("deriving edges pool path")?;
     fs::create_dir_all(&edge_dir)?;
     let edge_store = PackfileStorage::open(edge_dir)
@@ -10129,7 +10129,7 @@ mod tests {
     #[test]
     fn meta_raw_paginates_across_files() {
         let root = unique_temp_dir();
-        let state = root.join("pools/state");
+        let state = root.join("pools/mtpl-state");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(root.join("db.meta"), (0_u8..32).collect::<Vec<_>>()).unwrap();
         std::fs::write(state.join("pool.meta"), (32_u8..64).collect::<Vec<_>>()).unwrap();
@@ -10176,7 +10176,7 @@ mod tests {
     #[test]
     fn noncanonical_pack_identity_is_a_note() {
         let root = unique_temp_dir();
-        let state = root.join("pools/state");
+        let state = root.join("pools/mtpl-state");
         std::fs::create_dir_all(&state).unwrap();
         let path = state.join("foreign.pack");
         std::fs::write(&path, b"not a canonical pack").unwrap();
@@ -10193,7 +10193,7 @@ mod tests {
     #[test]
     fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() {
         let root = unique_temp_dir();
-        let state = root.join("pools/state");
+        let state = root.join("pools/mtpl-state");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
         mtxdb::index::checkpoint::write_checkpoint(
@@ -10224,7 +10224,7 @@ mod tests {
     #[test]
     fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
         let root = unique_temp_dir();
-        let state = root.join("pools/state");
+        let state = root.join("pools/mtpl-state");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
         mtxdb::index::checkpoint::write_checkpoint(
@@ -10249,7 +10249,7 @@ mod tests {
     #[test]
     fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
         let root = unique_temp_dir();
-        let state = root.join("pools/state");
+        let state = root.join("pools/mtpl-state");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("pack_0000000000000001.pack"), b"not a pack").unwrap();
         mtxdb::index::checkpoint::write_checkpoint(
@@ -11193,7 +11193,7 @@ mod tests {
     #[test]
     fn auth_chain_reimport_writes_nothing_new() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event");
+        let pool_dir = root.join("pools").join("mtpl-event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let input = root.join("export.json");
@@ -11238,7 +11238,7 @@ mod tests {
         )
         .unwrap();
 
-        let auth_dir = pool_dir.parent().unwrap().join("edges");
+        let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
         assert_eq!(
             count_pack_records(&auth_dir),
             2,
@@ -11258,7 +11258,7 @@ mod tests {
     #[test]
     fn import_establishment_persists_the_matrix_extension() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event");
+        let pool_dir = root.join("pools").join("mtpl-event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let input = root.join("export.json");
@@ -11621,7 +11621,7 @@ mod tests {
     #[test]
     fn import_v12_followup_batch_lands_in_the_create_collection() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event");
+        let pool_dir = root.join("pools").join("mtpl-event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let template = default_matrix_import_template();
@@ -11705,7 +11705,7 @@ mod tests {
     #[test]
     fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         let root = unique_temp_dir();
-        let pool_dir = root.join("pools").join("event");
+        let pool_dir = root.join("pools").join("mtpl-event");
         std::fs::create_dir_all(&pool_dir).unwrap();
         let store = PackfileStorage::open(pool_dir.clone()).unwrap();
         let template = default_matrix_import_template();
