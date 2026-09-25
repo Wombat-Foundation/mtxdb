@@ -2429,7 +2429,13 @@ impl PackfileStorage {
         let path = Self::journal_lsn_path(&self.base_dir);
         let tmp = path.with_extension("lsn.tmp");
         fs::write(&tmp, lsn.to_le_bytes()).map_err(StorageError::Io)?;
-        fs::File::open(&tmp)
+        // Windows requires a write-capable handle for FlushFileBuffers,
+        // which is what `sync_all` uses. A read-only handle works on Unix
+        // but fails with ERROR_ACCESS_DENIED on Windows.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp)
             .and_then(|file| file.sync_all())
             .map_err(StorageError::Io)?;
         fs::rename(&tmp, &path).map_err(StorageError::Io)?;
@@ -12640,6 +12646,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_get_many_prefetch_plan_counters() {
         let dir = test_dir("read_plan_counters");
         let writer = PackfileStorage::open(dir.clone()).unwrap();

@@ -97,6 +97,8 @@ pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
 /// `vm.max_map_count` first.
 pub const MAX_SHARDS: usize = 4096;
 
+const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
+
 /// Maximum number of shards as `u16`. Primary constant for shard IDs
 /// and modular arithmetic.
 pub(crate) const MAX_SHARDS_U16: u16 = 4096;
@@ -1310,7 +1312,13 @@ impl ShardPool {
             .open(lock_path)?;
 
         file.try_lock_exclusive().map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
+            // fs2 exposes Windows ERROR_LOCK_VIOLATION directly, while std
+            // does not map that Windows error to WouldBlock. Preserve the
+            // platform-independent lock contract.
+            let lock_contended = error.kind() == io::ErrorKind::WouldBlock
+                || (cfg!(target_os = "windows")
+                    && error.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION));
+            if lock_contended {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
@@ -2069,6 +2077,12 @@ impl ShardPool {
             // next flush attempt instead of silently discarding already
             // "successful" puts whose offsets the index has already
             // handed out.
+            // On Windows this is a seek followed by write_all rather than an
+            // append write. It is safe because append_lock serializes every
+            // flush and no other path moves the shared file pointer. The
+            // committed file_len is initialized from file metadata on reopen
+            // and advanced only after a successful flush, so this cannot
+            // overwrite data or leave a gap at the on-disk EOF frontier.
             let file = shard.file.try_clone()?;
             #[cfg(unix)]
             file.write_all_at(&pending_guard, committed)?;

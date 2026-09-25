@@ -1315,11 +1315,17 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 /// doesn't match what the filename says it should be.
 pub fn open_packfile(path: &Path, create: bool, pack_id: u64) -> io::Result<File> {
     if create {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).create(true);
+        // Unix flushes use positioned writes through the append-capable
+        // handle. Windows' append access masks FILE_WRITE_DATA, which is
+        // required by set_len during torn-tail rollback; its write path
+        // therefore opens an ordinary writable handle instead.
+        #[cfg(unix)]
+        options.append(true);
+        #[cfg(not(unix))]
+        options.write(true);
+        let mut file = options.open(path)?;
 
         if file.metadata()?.len() == 0 {
             write_header(&mut file, pack_id)?;
