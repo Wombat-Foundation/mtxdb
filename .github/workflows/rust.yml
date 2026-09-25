@@ -16,6 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # `rust-toolchain.toml` pins nightly-2026-08-20 and, as a directory
+      # override, outranks the `rustup default` the action installs -- so
+      # without this every row silently ran the pinned nightly. RUSTUP_TOOLCHAIN
+      # has the highest precedence, so matrix.rust actually takes effect.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       fail-fast: false
       matrix:
@@ -103,6 +109,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # See toolchain-checks: overrides the committed rust-toolchain.toml pin.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       fail-fast: false
       matrix:

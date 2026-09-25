@@ -23,6 +23,10 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     env:
+      # Workflow declares `stable`, but the committed rust-toolchain.toml pin
+      # (nightly-2026-08-20) outranks the installed default; RUSTUP_TOOLCHAIN
+      # wins over the file so these runners actually use stable.
+      RUSTUP_TOOLCHAIN: stable
       # `.cargo/config.toml` enables the host-native `rustc-wrapper` on every
       # platform, but Windows cannot execute its `.sh` (`%1 is not a valid
       # Win32 application`, os error 193), and Cargo has no OS-conditional
