@@ -476,19 +476,6 @@ impl SharedDatabase {
         Ok(())
     }
 
-    /// Publish all legacy pending mutations through the database coordinator.
-    ///
-    /// A shared database has one coordinator for all pools, so this is one
-    /// cross-pool visibility operation. It does not fsync; call `sync_all` or
-    /// the normal durability path separately.
-    ///
-    /// # Errors
-    /// Returns an error if the journal is poisoned or the pending queue cannot
-    /// be appended as one complete group.
-    pub fn publish_pending(&self) -> io::Result<Option<CommitReceipt>> {
-        self.coordinator.publish_pending()
-    }
-
     /// Publish one transaction-owned mutation group through the shared WAL.
     ///
     /// All mutations staged for the three pools are appended as one tagged
@@ -831,7 +818,6 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"old")),
             )
             .unwrap();
-        database.publish_pending().unwrap();
         let transaction = database.begin_transaction();
         transaction
             .put(

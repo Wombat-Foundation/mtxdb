@@ -244,6 +244,7 @@ pub struct SyncTimings {
     /// Time spent waiting for the journal's single-writer mutex.
     pub journal_lock_wait: std::time::Duration,
     /// Time spent waiting for the pending-mutation queue mutex.
+    // TODO: remove; always zero since the shared pending queue was deleted.
     pub journal_pending_wait: std::time::Duration,
     /// Time spent encoding and appending the journal group, excluding fsync.
     pub journal_append: std::time::Duration,
@@ -467,6 +468,7 @@ pub struct SyncTotalsSnapshot {
     /// Cumulative time waiting for the journal mutex.
     pub journal_lock_wait: std::time::Duration,
     /// Cumulative time waiting for the pending-mutation queue mutex.
+    // TODO: remove; always zero since the shared pending queue was deleted.
     pub journal_pending_wait: std::time::Duration,
     /// Cumulative journal append/encoding time, excluding fsync.
     pub journal_append: std::time::Duration,
@@ -556,6 +558,7 @@ pub struct SyncDiagnosticSample {
     /// Duration spent waiting to acquire the journal lock.
     pub journal_lock_wait: std::time::Duration,
     /// Duration spent waiting for pending journal batches.
+    // TODO: remove; always zero since the shared pending queue was deleted.
     pub journal_pending_wait: std::time::Duration,
     /// Duration spent appending journal records to the file.
     pub journal_append: std::time::Duration,
@@ -8294,19 +8297,26 @@ impl PackfileStorage {
         if self.replaying.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        // The live index is already updated synchronously on the write path,
-        // so the overlay callback has nothing to publish. On a shared journal,
-        // tag the frame with this store's pool so recovery can route it.
+        // The live index is already updated synchronously on the write path.
+        // Append this autocommit mutation as its own complete, visible group;
+        // durability remains separate so the background committer can batch
+        // several such groups into one fsync. On a shared journal, tag the
+        // frame with this store's pool so recovery can route it.
         #[cfg(feature = "multi-reader")]
         let result = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
-            Some(pool) => journal.publish_tagged(pool, mutation(), |_lsn| {}),
-            None => journal.publish(mutation(), |_lsn| {}),
+            Some(pool) => journal
+                .publish_group_tagged(pool, &[mutation()])
+                .map(|receipt| receipt.last_lsn),
+            None => journal
+                .publish_group(&[mutation()])
+                .map(|receipt| receipt.last_lsn),
         }
         .map(Some)
         .map_err(StorageError::Io);
         #[cfg(not(feature = "multi-reader"))]
         let result = journal
-            .publish(mutation(), |_lsn| {})
+            .publish_group(&[mutation()])
+            .map(|receipt| receipt.last_lsn)
             .map(Some)
             .map_err(StorageError::Io);
         if result.is_ok() {
@@ -12052,7 +12062,10 @@ mod tests {
         );
         assert_eq!(timings.journal_sync_calls, 1);
         assert!(timings.journal_records >= 1);
-        assert!(timings.journal_bytes > 0);
+        assert_eq!(
+            timings.journal_bytes, 0,
+            "the WAL group was appended during publication; sync only fsyncs it"
+        );
         assert!(timings.journal_fsync > Duration::ZERO);
         assert!(
             timings.journal_lock_wait + timings.journal_append + timings.journal_fsync
@@ -12142,6 +12155,64 @@ mod tests {
             "the post-checkpoint mutation must be replayed"
         );
         assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+
+    /// A single-pool journal may reclaim an older committed group while a
+    /// later group remains in the segment. Reopening that same store must
+    /// still replay the surviving suffix.
+    #[test]
+    fn single_pool_reclaim_then_replay_surviving_group() {
+        let dir = test_dir("single_pool_reclaim_replay");
+        let journal_path = dir.join("wal.bin");
+        let reclaimed_id = distinct_id(10);
+        let surviving_id = distinct_id(11);
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store.enable_journal(&journal_path).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(8),
+                    &NodeData::new(bytes::Bytes::from_static(b"checkpointed")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &reclaimed_id,
+                    &NodeData::new(bytes::Bytes::from_static(b"reclaimed")),
+                )
+                .unwrap();
+            let reclaimed_lsn = store.journal().unwrap().published_lsn();
+            store.sync_all().unwrap();
+
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &surviving_id,
+                    &NodeData::new(bytes::Bytes::from_static(b"surviving")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+            let journal = store.journal().unwrap();
+            let surviving_lsn = journal.published_lsn();
+            assert!(surviving_lsn > reclaimed_lsn);
+            journal.reclaim_through(reclaimed_lsn).unwrap();
+        }
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.enable_journal(&journal_path).unwrap();
+        assert_eq!(reopened.replay_journal().unwrap(), 1);
+        assert!(reopened
+            .get(&TEST_COLLECTION, &surviving_id)
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .get(&TEST_COLLECTION, &reclaimed_id)
+            .unwrap()
+            .is_some());
     }
 
     /// A checkpoint must bound journal replay by the LSN that is actually
@@ -15834,8 +15905,8 @@ mod tests {
     }
 
     /// Two stores attached to one shared coordinator: a single pool's sync
-    /// commits both pools' pending mutations in one group, and a later reopen
-    /// replays only each pool's own tagged frames.
+    /// commits both pools' published mutations in one durability barrier, and
+    /// a later reopen replays only each pool's own tagged frames.
     #[test]
     #[cfg(feature = "multi-reader")]
     fn shared_journal_fences_all_pools_and_routes_replay_by_pool() {
@@ -15872,24 +15943,20 @@ mod tests {
         )
         .unwrap();
 
-        // One pool's sync fences the other pool's pending mutation too.
-        a.sync_all().unwrap();
+        // One durability barrier fences the other pool's published mutation
+        // too, without checkpointing either pool and triggering reclaim.
+        coordinator.sync().unwrap();
         assert_eq!(
             coordinator.committed_lsn(),
             coordinator.published_lsn(),
             "one barrier must commit every pool's published mutation"
         );
-        drop(a);
-        drop(b);
-
-        // A fresh session over the shared segment: one group, both pools.
+        // A fresh session over the shared segment: each autocommit write is
+        // its own complete group; one fsync covered both.
         let (journal, scan) = Journal::open_shared(&wal).unwrap();
-        assert_eq!(scan.groups.len(), 1, "one fence wrote one group");
-        assert_eq!(
-            scan.groups[0].entries.len(),
-            2,
-            "the single group carries both pools' mutations"
-        );
+        assert_eq!(scan.groups.len(), 2, "one group per autocommit write");
+        assert_eq!(scan.groups[0].entries.len(), 1);
+        assert_eq!(scan.groups[1].entries.len(), 1);
         let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
 
         let fresh_a = PackfileStorage::open(test_dir("shared_journal_fresh_a")).unwrap();
@@ -15926,6 +15993,99 @@ mod tests {
             .get(&TEST_COLLECTION, &distinct_id(0))
             .unwrap()
             .is_none());
+        drop(fresh_a);
+        drop(fresh_b);
+        drop(a);
+        drop(b);
+    }
+
+    /// A single-pool autocommit group can be reclaimed on its own once its
+    /// pool checkpoints: a reopen replays only the surviving frames, and LSNs
+    /// continue past the reclaimed prefix without being reused.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_reclaim_replay_root");
+        let wal = root.join("wal.bin");
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let a = PackfileStorage::open(test_dir("shared_reclaim_replay_a")).unwrap();
+        let b = PackfileStorage::open(test_dir("shared_reclaim_replay_b")).unwrap();
+        a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        b.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        // LSN 1 is State's; LSNs 2 and 3 are EventDag's. Each autocommit
+        // write is its own group.
+        a.put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::new(bytes::Bytes::from_static(b"state")),
+        )
+        .unwrap();
+        for id in [1u8, 2] {
+            b.put(
+                &OTHER_COLLECTION,
+                &distinct_id(id),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        }
+        coordinator.sync().unwrap();
+        assert_eq!(coordinator.committed_lsn(), 3);
+
+        // State checkpoints through its own frame; EventDag has not. Only the
+        // covered single-pool group may be reclaimed.
+        coordinator.report_pool_coverage(ShardType::State, 1);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
+        drop(a);
+        drop(b);
+        drop(coordinator);
+
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        assert_eq!(scan.base_lsn, 2, "the state group is reclaimed");
+        assert_eq!(scan.groups.len(), 2, "both uncovered event groups survive");
+        assert_eq!(scan.groups[0].first_lsn, 2);
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+
+        // The reclaimed state frame is gone from the journal by design: its
+        // pool's checkpoint owns it, so a state store has nothing to replay.
+        let fresh_a = PackfileStorage::open(test_dir("shared_reclaim_replay_fresh_a")).unwrap();
+        fresh_a
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .unwrap();
+        assert_eq!(fresh_a.replay_journal().unwrap(), 0);
+
+        // The event store replays exactly the frames that survived.
+        let fresh_b = PackfileStorage::open(test_dir("shared_reclaim_replay_fresh_b")).unwrap();
+        fresh_b
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::EventDag)
+            .unwrap();
+        assert_eq!(fresh_b.replay_journal().unwrap(), 2);
+        for id in [1u8, 2] {
+            assert!(fresh_b
+                .get(&OTHER_COLLECTION, &distinct_id(id))
+                .unwrap()
+                .is_some());
+        }
+
+        // Numbering continues past the reclaimed prefix: no LSN is reused.
+        fresh_b
+            .put(
+                &OTHER_COLLECTION,
+                &distinct_id(3),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        assert_eq!(recovered.published_lsn(), 4);
+        drop(fresh_a);
+        drop(fresh_b);
     }
 
     /// A shared segment may only be reclaimed up to the minimum durable
@@ -16183,25 +16343,23 @@ mod tests {
         let (journal, scan) = Journal::open_shared(&wal).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
         coordinator
-            .publish_tagged(
+            .publish_group_tagged(
                 ShardType::State,
-                JournalMutation::Put {
+                &[JournalMutation::Put {
                     collection_id: TEST_COLLECTION,
                     node_id: distinct_id(0),
                     payload: b"state".to_vec(),
-                },
-                |_| {},
+                }],
             )
             .unwrap();
         coordinator
-            .publish_tagged(
+            .publish_group_tagged(
                 ShardType::EventDag,
-                JournalMutation::Put {
+                &[JournalMutation::Put {
                     collection_id: OTHER_COLLECTION,
                     node_id: distinct_id(1),
                     payload: b"event".to_vec(),
-                },
-                |_| {},
+                }],
             )
             .unwrap();
         coordinator.sync().unwrap();

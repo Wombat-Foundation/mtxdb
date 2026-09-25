@@ -574,7 +574,7 @@ impl TxnStage {
                                 .then_some((*pool, data.pools[index].as_slice()))
                         })
                         .collect::<Vec<_>>();
-                    let receipt = coordinator.append_pending_tagged_groups(&batches)?;
+                    let receipt = coordinator.publish_tagged_groups(&batches)?;
                     data.appended.fill(true);
                     data.receipt = Some(receipt);
                     self.mark_journal_published()?;
@@ -599,7 +599,7 @@ impl TxnStage {
             let coordinator = coordinators[ordered_index].ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "staged pool has no journal")
             })?;
-            let receipt = coordinator.append_pending_tagged(pool, &data.pools[index])?;
+            let receipt = coordinator.publish_group_tagged(pool, &data.pools[index])?;
             data.appended[index] = true;
             data.receipt = Some(receipt);
         }
@@ -719,6 +719,7 @@ pub struct JournalSyncTimings {
     /// Time spent waiting for the single-writer journal mutex.
     pub journal_lock_wait: std::time::Duration,
     /// Time spent waiting for the pending-mutation queue mutex.
+    // TODO: remove; always zero since the shared pending queue was deleted.
     pub journal_pending_wait: std::time::Duration,
     /// Time spent appending and encoding the group, excluding fsync.
     pub journal_append: std::time::Duration,
@@ -775,8 +776,6 @@ pub struct DurabilityStats {
     pub commit_records: u64,
     /// Most mutations made durable by a single fsync.
     pub max_commit_records: u64,
-    /// Staged transaction publishes refused because legacy mutations were pending.
-    pub staged_publish_refused: u64,
 }
 
 impl DurabilityStats {
@@ -886,6 +885,9 @@ pub struct Reclaim {
 pub struct Journal {
     path: PathBuf,
     file: File,
+    /// Current on-disk length tracked after open, append, and reclaim. Keeping
+    /// this in memory avoids an fstat on every group publication.
+    file_len: u64,
     /// On-disk format version of this segment.
     version: JournalVersion,
     next_sequence: u64,
@@ -1015,20 +1017,18 @@ impl BackgroundFailure {
 
 /// Serializes mutation publication and durable commits for one journal.
 ///
-/// Mutations are assigned LSNs under a short queue lock. A sync caller captures
-/// the published LSN, detaches the covered mutations, then commits them while
-/// holding the journal lock. Publishers can queue later mutations during the
-/// fsync, and concurrent sync callers recheck the committed LSN after taking
-/// the journal lock.
+/// Every publication (an autocommit mutation or a transaction group) appends
+/// one complete group under the `publication` lock, assigning its LSNs there,
+/// and becomes visible without an fsync. A sync caller captures the published
+/// LSN and fsyncs every visible group up to it in one call, so many small
+/// groups share one fsync. Concurrent sync callers recheck the committed LSN
+/// after taking the journal lock.
 pub struct JournalCoordinator {
     journal: Mutex<Journal>,
     path: PathBuf,
-    /// Serializes legacy queue publication with transaction-group publication.
+    /// Serializes every group publication: autocommit mutations and
+    /// transaction groups alike.
     publication: Mutex<()>,
-    pending: Mutex<Vec<(u64, Option<ShardType>, Mutation)>>,
-    /// Next LSN to assign. Advanced under `pending`, independently of journal
-    /// I/O, so a publish never blocks behind a sync's fsync.
-    next_lsn: AtomicU64,
     published_lsn: AtomicU64,
     /// Highest LSN whose group is complete (trailer appended) but not
     /// necessarily fsynced. Advanced between [`Journal::append_group`] and
@@ -1143,7 +1143,6 @@ pub struct JournalCoordinator {
     commit_records: AtomicU64,
     /// Largest durable-LSN advance made by one fsync.
     max_commit_records: AtomicU64,
-    staged_publish_refused: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -1151,7 +1150,6 @@ impl JournalCoordinator {
     #[must_use]
     pub fn new(journal: Journal, scan: &Scan) -> Self {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
-        let next_lsn = journal.next_lsn;
         let path = journal.path.clone();
         #[cfg(feature = "multi-reader")]
         let coverage = CoverageState::default();
@@ -1171,8 +1169,6 @@ impl JournalCoordinator {
             journal: Mutex::new(journal),
             path,
             publication: Mutex::new(()),
-            pending: Mutex::new(Vec::new()),
-            next_lsn: AtomicU64::new(next_lsn),
             published_lsn: AtomicU64::new(committed_lsn),
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
@@ -1207,7 +1203,6 @@ impl JournalCoordinator {
             commits: AtomicU64::new(0),
             commit_records: AtomicU64::new(0),
             max_commit_records: AtomicU64::new(0),
-            staged_publish_refused: AtomicU64::new(0),
         }
     }
 
@@ -1365,85 +1360,6 @@ impl JournalCoordinator {
         self.published_lsn.load(Ordering::Acquire)
     }
 
-    /// Assign an LSN, publish the mutation to the caller's live overlay, and
-    /// queue it for the next covering durable group.
-    ///
-    /// The callback runs while publication is serialized and before the LSN
-    /// becomes visible to sync callers. It must not call back into this
-    /// coordinator. Keeping overlay publication in this critical section
-    /// prevents a successful sync from racing ahead of a not-yet-visible put.
-    ///
-    /// # Errors
-    /// Returns an error if the journal has been poisoned by a failed commit or
-    /// if its LSN space is exhausted.
-    pub fn publish(
-        &self,
-        mutation: Mutation,
-        publish_overlay: impl FnOnce(u64),
-    ) -> io::Result<u64> {
-        self.publish_inner(None, mutation, publish_overlay)
-    }
-
-    /// Like [`Self::publish`], but records the frame's pool tag for a shared
-    /// pool-tagged segment. The tag is encoded into the frame and used by
-    /// recovery to route the mutation back to its pool.
-    ///
-    /// # Errors
-    /// Same as [`Self::publish`].
-    #[cfg(feature = "multi-reader")]
-    pub fn publish_tagged(
-        &self,
-        pool: ShardType,
-        mutation: Mutation,
-        publish_overlay: impl FnOnce(u64),
-    ) -> io::Result<u64> {
-        self.publish_inner(Some(pool), mutation, publish_overlay)
-    }
-
-    fn publish_inner(
-        &self,
-        pool: Option<ShardType>,
-        mutation: Mutation,
-        publish_overlay: impl FnOnce(u64),
-    ) -> io::Result<u64> {
-        let _publication = self.publication.lock();
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(io::Error::other(
-                "journal is poisoned after a failed commit",
-            ));
-        }
-        let mut pending = self.pending.lock();
-        let lsn = self.next_lsn.load(Ordering::Relaxed);
-        let next_lsn = lsn
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-        publish_overlay(lsn);
-        pending.push((lsn, pool, mutation));
-        self.next_lsn.store(next_lsn, Ordering::Relaxed);
-        self.published_lsn.store(lsn, Ordering::Release);
-        // Wake the committer only when a burst is at or above its early-flush
-        // bound; `publish` is the hot path, so ordinary publishes must not pay
-        // a futex wake. `committer_wake_threshold` is zero when no committer is
-        // running.
-        let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
-        // Only the first publish at or above the bound wakes in a given epoch,
-        // by claiming the current commit epoch. Any commit (background or explicit) advances
-        // the epoch and thereby re-arms the next crossing, so nothing needs an
-        // explicit clear.
-        let wake =
-            threshold > 0 && self.pending_count() >= threshold && self.claim_threshold_wake();
-        // Drop the pending-queue lock before taking `durable_lock`, keeping a
-        // single lock order (pending -> . . . is never followed by
-        // durable_lock) and off the publish path otherwise.
-        drop(pending);
-        if wake {
-            #[cfg(test)]
-            self.threshold_wakes.fetch_add(1, Ordering::Relaxed);
-            self.wake_durable_waiters();
-        }
-        Ok(lsn)
-    }
-
     /// Capture the latest fully published mutation as this sync caller's
     /// acknowledgement boundary.
     #[must_use]
@@ -1525,61 +1441,34 @@ impl JournalCoordinator {
             self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
             return Ok((None, timings));
         }
-        // Transaction-staged groups are already complete in the segment, so
-        // the coalesced sync only needs to make their bytes durable.
-        if target_lsn <= self.visible_lsn.load(Ordering::Acquire) {
-            let fsync_started = std::time::Instant::now();
-            if let Err(error) = journal.make_durable() {
-                self.poisoned.store(true, Ordering::Release);
-                return Err(error);
-            }
-            timings.journal_fsync = fsync_started.elapsed();
-            self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, &timings);
-            self.note_commit(target_lsn);
-            self.promote_pool_committed(target_lsn);
-            return Ok((None, timings));
+        // Every published group is already complete in the segment, so the
+        // sync only needs to make its bytes durable. `published_lsn` never
+        // runs ahead of `visible_lsn`; the check guards that invariant.
+        if target_lsn > self.visible_lsn.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "published sync target is not yet visible in the journal",
+            ));
         }
-        let batch = {
-            let pending_started = std::time::Instant::now();
-            let mut pending = self.pending.lock();
-            timings.journal_pending_wait = pending_started.elapsed();
-            let covered_count = pending
-                .iter()
-                .take_while(|(lsn, _, _)| *lsn <= target_lsn)
-                .count();
-            if covered_count == 0 {
-                // Another sync may have committed and drained this target
-                // after our first check but before we acquired the journal
-                // lock. In that case its durable group covers this caller.
-                if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-                    timings.journal_coalesced = true;
-                    self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
-                    return Ok((None, timings));
-                }
-                return Err(io::Error::other(
-                    "published sync target has no pending journal mutations",
-                ));
-            }
-            let first_lsn = pending[0].0;
-            let last_lsn = covered_count
-                .checked_sub(1)
-                .and_then(|last_index| pending.get(last_index))
-                .map(|(lsn, _, _)| *lsn)
-                .ok_or_else(|| io::Error::other("pending journal batch is incomplete"))?;
-            if first_lsn != journal.next_lsn || last_lsn != target_lsn {
-                return Err(io::Error::other(
-                    "journal pending LSN sequence does not cover sync target",
-                ));
-            }
-            pending.drain(..covered_count).collect::<Vec<_>>()
+        let previously_committed = self.committed_lsn.load(Ordering::Acquire);
+        let fsync_started = std::time::Instant::now();
+        if let Err(error) = journal.make_durable() {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+        timings.journal_fsync = fsync_started.elapsed();
+        timings.journal_records = target_lsn.saturating_sub(previously_committed);
+        self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, &timings);
+        self.note_commit(target_lsn);
+        self.promote_pool_committed(target_lsn);
+        // The groups were appended at publication, so this fsync wrote no
+        // bytes: the receipt reports the durable range this call advanced.
+        let receipt = CommitReceipt {
+            sequence: journal.next_sequence.saturating_sub(1),
+            first_lsn: previously_committed.saturating_add(1),
+            last_lsn: target_lsn,
+            bytes_written: 0,
         };
-        let record_count = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-        let result = self.append_and_sync_batch(&mut journal, batch, target_lsn, &mut timings);
-        timings.journal_records = record_count;
-        if let Ok(Some(receipt)) = &result {
-            timings.journal_bytes = receipt.bytes_written;
-        }
-        result.map(|receipt| (receipt, timings))
+        Ok((Some(receipt), timings))
     }
 
     /// Report an fsync slower than [`SLOW_FSYNC_WARN`] as it happens, with the
@@ -1600,217 +1489,77 @@ impl JournalCoordinator {
         }
     }
 
-    fn append_and_sync_batch(
-        &self,
-        journal: &mut Journal,
-        batch: Vec<(u64, Option<ShardType>, Mutation)>,
-        target_lsn: u64,
-        timings: &mut JournalSyncTimings,
-    ) -> io::Result<Option<CommitReceipt>> {
-        let mutations: Vec<(Option<ShardType>, Mutation)> = batch
-            .iter()
-            .map(|(_, pool, mutation)| (*pool, mutation.clone()))
-            .collect();
-        let sequence = self
-            .sequence
-            .as_ref()
-            .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
-        let append_started = std::time::Instant::now();
-        let receipt = match journal.append_group_for_current_mode(&mutations, sequence) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                if journal.poisoned {
-                    self.poisoned.store(true, Ordering::Release);
-                } else {
-                    let mut pending = self.pending.lock();
-                    pending.splice(0..0, batch);
-                }
-                return Err(error);
-            }
-        };
-        timings.journal_append = append_started.elapsed();
-        // The group is complete and readable by a read-only overlay, but not
-        // yet durable. Publish the visibility boundary before the fsync so
-        // workers can observe it. A crash before `make_durable` may lose it,
-        // which is safe: an unfsynced group is never acknowledged.
-        self.visible_lsn
-            .fetch_max(receipt.last_lsn, Ordering::Release);
-        let fsync_started = std::time::Instant::now();
-        if let Err(error) = journal.make_durable() {
-            self.poisoned.store(true, Ordering::Release);
-            return Err(error);
-        }
-        timings.journal_fsync = fsync_started.elapsed();
-        self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, timings);
-        // The group is durable, so record its extent before checking the
-        // receipt. This prevents a retry from re-appending committed entries.
-        self.note_commit(receipt.last_lsn);
-        let committed_count = usize::try_from(
-            receipt
-                .last_lsn
-                .saturating_sub(receipt.first_lsn)
-                .saturating_add(1),
-        )
-        .unwrap_or(batch.len())
-        .min(batch.len());
-        // Advance each pool's committed watermark over the durable prefix, and
-        // promote any earlier transaction group this fsync also made durable.
-        let extents = pool_extents(
-            receipt.last_lsn,
-            batch[..committed_count].iter().map(|(_, pool, _)| *pool),
-        );
-        if !extents.is_empty() {
-            self.pending_promotions
-                .lock()
-                .push((receipt.last_lsn, extents));
-        }
-        self.promote_pool_committed(receipt.last_lsn);
-        if committed_count < batch.len() {
-            let mut pending = self.pending.lock();
-            pending.splice(0..0, batch.into_iter().skip(committed_count));
-        }
-        if receipt.last_lsn != target_lsn || committed_count != mutations.len() {
-            return Err(io::Error::other(
-                "durable journal group did not cover requested sync target",
-            ));
-        }
-        Ok(Some(receipt))
-    }
-
-    /// Append a complete transaction group without fsyncing it.
+    /// Publish one autocommit mutation as its own complete group, without
+    /// fsyncing it.
     ///
-    /// Unlike [`Self::publish`], this does not add mutations to the legacy
-    /// queue: it appends queued legacy mutations first, followed by the staged
-    /// transaction mutations, in one complete group and then advances the
-    /// visible boundary. This preserves assigned LSN order and avoids making a
-    /// post-commit callback fail merely because background/legacy writes are
-    /// queued in the same pool.
+    /// The LSN is assigned under the publication lock and the group is
+    /// visible to read-only overlays when this returns. Durability is
+    /// separate: a later [`Self::sync_through`] or the background committer
+    /// fsyncs every visible group at once, so many small groups still share
+    /// one fsync.
     ///
     /// # Errors
-    /// Returns an error if queued LSNs are inconsistent, the journal is
-    /// poisoned, or the append fails. A partial append poisons the underlying
-    /// journal; subsequent publication is rejected until reopen/recovery.
-    pub fn append_pending(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.append_pending_inner(None, mutations)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot append an empty transaction group",
-            )
+    /// Returns an error if the journal is poisoned, its LSN space is
+    /// exhausted, or the append fails. A partial append poisons the
+    /// underlying journal; publication is rejected until reopen/recovery.
+    pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
+        self.publish_groups(&[(None, mutations)])?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
         })
     }
 
-    /// Append queued legacy mutations as a complete, read-committed group
-    /// without adding staged mutations or fsyncing. A later `sync_through`
-    /// makes the group durable. Returns `Ok(None)` if nothing is queued.
+    /// Like [`Self::publish_group`], tagging every mutation with `pool`.
+    /// Required when the coordinator's segment is pool-tagged; the pool-less
+    /// form would be rejected there.
     ///
     /// # Errors
-    /// Returns an error if queued LSNs are inconsistent, the journal is
-    /// poisoned, or the append fails. A partial append poisons the underlying
-    /// journal; subsequent publication is rejected until reopen/recovery.
-    pub fn publish_pending(&self) -> io::Result<Option<CommitReceipt>> {
-        self.append_pending_inner(None, &[])
-    }
-
-    /// Like [`Self::append_pending`], tagging every staged mutation with
-    /// `pool`. Required when the coordinator's segment is pool-tagged; the
-    /// pool-less [`Self::append_pending`] would be rejected there.
-    ///
-    /// # Errors
-    /// Same as [`Self::append_pending`].
+    /// Same as [`Self::publish_group`].
     #[cfg(feature = "multi-reader")]
-    pub fn append_pending_tagged(
+    pub fn publish_group_tagged(
         &self,
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.append_pending_inner(Some(pool), mutations)?
+        self.publish_groups(&[(Some(pool), mutations)])?
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot append an empty transaction group",
-                )
+                io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
     }
 
-    /// Append pending legacy mutations and several pool-tagged transaction
-    /// batches as one visible journal group.
+    /// Publish several pool-tagged transaction batches as one visible journal
+    /// group.
     ///
     /// This is the atomic publication boundary for a transaction that writes
     /// multiple pools through a shared coordinator. The caller must provide
     /// each pool at most once; empty batches are ignored.
     ///
     /// # Errors
-    /// Returns an error if the journal is poisoned, the pending LSN sequence
-    /// is inconsistent, or the group cannot be appended.
+    /// Returns an error if the journal is poisoned or the group cannot be
+    /// appended.
     #[cfg(feature = "multi-reader")]
-    pub fn append_pending_tagged_groups(
+    pub fn publish_tagged_groups(
         &self,
         batches: &[(ShardType, &[Mutation])],
     ) -> io::Result<CommitReceipt> {
-        let _publication = self.publication.lock();
-        // Never flush unrelated legacy writes here. They may belong to a
-        // different SQL transaction and must not become visible merely because
-        // this transaction committed. The caller must publish the legacy queue
-        // through its own lifecycle before retrying this transaction.
-        if !self.pending.lock().is_empty() {
-            self.staged_publish_refused.fetch_add(1, Ordering::Relaxed);
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "legacy journal mutations are pending; publish them before the staged transaction",
-            ));
-        }
         let staged = batches
             .iter()
             .map(|(pool, mutations)| (Some(*pool), *mutations))
             .collect::<Vec<_>>();
-        self.append_pending_groups(&staged)?.ok_or_else(|| {
+        self.publish_groups(&staged)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "cannot append an empty transaction group",
+                "cannot publish an empty transaction group",
             )
         })
     }
 
-    fn collect_group_mutations(
-        pending: &[(u64, Option<ShardType>, Mutation)],
-        next_lsn: u64,
-        staged: &[(Option<ShardType>, &[Mutation])],
-    ) -> io::Result<Vec<(Option<ShardType>, Mutation)>> {
-        let staged_len = staged
-            .iter()
-            .map(|(_, mutations)| mutations.len())
-            .sum::<usize>();
-        let mut group_mutations = Vec::with_capacity(pending.len().saturating_add(staged_len));
-        for (offset, (lsn, pool, mutation)) in pending.iter().enumerate() {
-            let expected = next_lsn
-                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
-                .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-            if *lsn != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "legacy journal queue is not contiguous with the journal tail",
-                ));
-            }
-            group_mutations.push((*pool, mutation.clone()));
-        }
-        for (pool, mutations) in staged {
-            group_mutations.extend(mutations.iter().cloned().map(|mutation| (*pool, mutation)));
-        }
-        Ok(group_mutations)
-    }
-
-    fn append_pending_inner(
-        &self,
-        staged_pool: Option<ShardType>,
-        mutations: &[Mutation],
-    ) -> io::Result<Option<CommitReceipt>> {
-        self.append_pending_groups(&[(staged_pool, mutations)])
-    }
-
-    fn append_pending_groups(
+    /// Single publication path. Holds `publication` for the whole append so
+    /// LSN assignment, the append and the visibility advance are one step.
+    fn publish_groups(
         &self,
         staged: &[(Option<ShardType>, &[Mutation])],
     ) -> io::Result<Option<CommitReceipt>> {
+        let _publication = self.publication.lock();
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -1822,16 +1571,13 @@ impl JournalCoordinator {
                 "journal is poisoned after a failed append",
             ));
         }
-        // Hold the queue lock through the append so a concurrent legacy
-        // publisher cannot assign an LSN between the queued and staged parts.
-        // Emptiness is decided under this lock too: a concurrent `sync_through`
-        // drains the queue only while holding the journal lock, so the check
-        // cannot race with a drain.
-        let mut pending = self.pending.lock();
-        if staged.iter().all(|(_, mutations)| mutations.is_empty()) && pending.is_empty() {
+        let group_mutations: Vec<(Option<ShardType>, Mutation)> = staged
+            .iter()
+            .flat_map(|(pool, mutations)| mutations.iter().cloned().map(|m| (*pool, m)))
+            .collect();
+        if group_mutations.is_empty() {
             return Ok(None);
         }
-        let group_mutations = Self::collect_group_mutations(&pending, journal.next_lsn, staged)?;
         let expected_first_lsn = journal.next_lsn;
         let expected_count = u64::try_from(group_mutations.len()).unwrap_or(u64::MAX);
         let sequence = self
@@ -1857,19 +1603,13 @@ impl JournalCoordinator {
                 .saturating_sub(receipt.first_lsn)
                 .saturating_add(1),
             expected_count,
-            "appended group must cover every queued and staged mutation"
+            "appended group must cover every mutation"
         );
-        let next_lsn = receipt
-            .last_lsn
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-        pending.clear();
-        self.next_lsn.store(next_lsn, Ordering::Relaxed);
         self.published_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
         self.visible_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
-        drop(pending);
+        drop(journal);
         // The group is visible but not yet durable; record its per-pool extents
         // so a later coalesced fsync can promote each pool's watermark.
         let extents = pool_extents(
@@ -1880,6 +1620,18 @@ impl JournalCoordinator {
             self.pending_promotions
                 .lock()
                 .push((receipt.last_lsn, extents));
+        }
+        // Wake the committer only when a burst is at or above its early-flush
+        // bound; this is the hot path, so ordinary publishes must not pay a
+        // futex wake. `committer_wake_threshold` is zero when no committer is
+        // running. Only the first publish at or above the bound wakes in a
+        // commit epoch; any commit advances the epoch and re-arms the next
+        // crossing.
+        let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
+        if threshold > 0 && self.pending_count() >= threshold && self.claim_threshold_wake() {
+            #[cfg(test)]
+            self.threshold_wakes.fetch_add(1, Ordering::Relaxed);
+            self.wake_durable_waiters();
         }
         Ok(Some(receipt))
     }
@@ -1933,7 +1685,6 @@ impl JournalCoordinator {
             commits: self.commits.load(Ordering::Relaxed),
             commit_records: self.commit_records.load(Ordering::Relaxed),
             max_commit_records: self.max_commit_records.load(Ordering::Relaxed),
-            staged_publish_refused: self.staged_publish_refused.load(Ordering::Relaxed),
         }
     }
 
@@ -2543,6 +2294,7 @@ impl Journal {
             Self {
                 path,
                 file,
+                file_len: scan.valid_len,
                 version,
                 next_sequence,
                 next_lsn,
@@ -2700,8 +2452,7 @@ impl Journal {
                 .saturating_add(trailer.len()),
         )
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group too large"))?;
-        let segment_size = self.file.metadata()?.len();
-        if segment_size.saturating_add(group_size) > MAX_SEGMENT_LEN {
+        if self.file_len.saturating_add(group_size) > MAX_SEGMENT_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "journal segment is full; drain/rotate before accepting more writes",
@@ -2714,16 +2465,25 @@ impl Journal {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
 
-        let write_result = (|| -> io::Result<()> {
-            self.file.write_all(&header)?;
-            self.file.write_all(&payload)?;
-            self.file.write_all(&trailer)?;
-            Ok(())
-        })();
+        // One write per group: every autocommit publish lands here, so the
+        // group goes out as a single contiguous buffer instead of three
+        // syscalls. A torn write still leaves an incomplete tail that recovery
+        // truncates, exactly as before.
+        let mut frame = Vec::with_capacity(
+            header
+                .len()
+                .saturating_add(payload.len())
+                .saturating_add(trailer.len()),
+        );
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&trailer);
+        let write_result = self.file.write_all(&frame);
         if let Err(error) = write_result {
             self.poisoned = true;
             return Err(error);
         }
+        self.file_len = self.file_len.saturating_add(group_size);
 
         self.next_sequence = next_sequence;
         self.next_lsn = next_lsn;
@@ -2870,6 +2630,7 @@ impl Journal {
             }
         };
         self.file = replacement;
+        self.file_len = u64::try_from(rebuilt.len()).unwrap_or(u64::MAX);
         if let Err(error) = sync_parent_dir(&self.path) {
             self.poisoned = true;
             return Err(error);
@@ -3527,7 +3288,8 @@ mod tests {
 
         // Group one: state only. Only state's watermark may advance past zero.
         coordinator
-            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
+            .map(|receipt| receipt.last_lsn)
             .unwrap();
         coordinator.sync().unwrap();
         let state_only = coordinator.committed_lsn();
@@ -3545,7 +3307,8 @@ mod tests {
 
         // Group two: event-DAG only. State's watermark must stay put.
         coordinator
-            .publish_tagged(ShardType::EventDag, put(2, 2, b"event"), |_| {})
+            .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+            .map(|receipt| receipt.last_lsn)
             .unwrap();
         coordinator.sync().unwrap();
         assert_eq!(
@@ -3556,10 +3319,10 @@ mod tests {
 
         // A group carrying both pools advances both to the group's own end.
         coordinator
-            .publish_tagged(ShardType::State, put(3, 3, b"s2"), |_| {})
-            .unwrap();
-        coordinator
-            .publish_tagged(ShardType::EventDag, put(4, 4, b"e2"), |_| {})
+            .publish_tagged_groups(&[
+                (ShardType::State, &[put(3, 3, b"s2")]),
+                (ShardType::EventDag, &[put(4, 4, b"e2")]),
+            ])
             .unwrap();
         coordinator.sync().unwrap();
         let shared = coordinator.committed_lsn();
@@ -3583,10 +3346,11 @@ mod tests {
         // A transaction stages an event-DAG frame without going through
         // `publish`; it must still block reclaim until event-DAG checkpoints.
         coordinator
-            .append_pending_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+            .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
             .unwrap();
         coordinator
-            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
+            .map(|receipt| receipt.last_lsn)
             .unwrap();
         coordinator.sync().unwrap();
         let committed = coordinator.committed_lsn();
@@ -3617,7 +3381,8 @@ mod tests {
 
         // State contributes only the first group, then goes idle.
         coordinator
-            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
+            .map(|receipt| receipt.last_lsn)
             .unwrap();
         coordinator.sync().unwrap();
         let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
@@ -3626,7 +3391,8 @@ mod tests {
         let mut event_lsn = 0;
         for id in 0..4u8 {
             coordinator
-                .publish_tagged(ShardType::EventDag, put(2, id, b"event"), |_| {})
+                .publish_group_tagged(ShardType::EventDag, &[put(2, id, b"event")])
+                .map(|receipt| receipt.last_lsn)
                 .unwrap();
             coordinator.sync().unwrap();
             event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
@@ -3705,10 +3471,10 @@ mod tests {
         let (journal, scan) = Journal::open_shared(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
         coordinator
-            .publish_tagged(ShardType::State, put(1, 1, b"a"), |_| {})
-            .unwrap();
-        coordinator
-            .publish_tagged(ShardType::Edges, put(3, 3, b"c"), |_| {})
+            .publish_tagged_groups(&[
+                (ShardType::State, &[put(1, 1, b"a")]),
+                (ShardType::Edges, &[put(3, 3, b"c")]),
+            ])
             .unwrap();
         coordinator.sync().unwrap();
 
@@ -3770,16 +3536,17 @@ mod tests {
 
     #[test]
     #[cfg(feature = "multi-reader")]
-    fn transaction_stage_rejects_legacy_pending_mutations() {
+    fn transaction_stage_publishes_after_autocommit_groups_in_lsn_order() {
         use crate::layout::ShardType;
 
-        let path = temp_path("txn_stage_legacy_boundary");
+        let path = temp_path("txn_stage_after_autocommit");
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open_shared(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
-        coordinator
-            .publish_tagged(ShardType::State, put(9, 9, b"legacy"), |_| {})
+        let autocommit = coordinator
+            .publish_group_tagged(ShardType::State, &[put(9, 9, b"autocommit")])
             .unwrap();
+        assert_eq!((autocommit.first_lsn, autocommit.last_lsn), (1, 1));
 
         let stage = TxnStage::new();
         stage
@@ -3790,29 +3557,19 @@ mod tests {
                 b"transaction".to_vec(),
             )
             .unwrap();
-        assert_eq!(
-            stage
-                .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        assert_eq!(
-            Journal::scan_read_only(&path).unwrap().groups.len(),
-            0,
-            "the staged publication must not flush legacy mutations"
-        );
-        coordinator.publish_pending().unwrap();
         stage
             .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
             .unwrap();
 
+        // The autocommit write keeps its own complete group ahead of the
+        // transaction's group; the transaction never absorbs it.
         let scan = Journal::scan_read_only(&path).unwrap();
         assert_eq!(scan.groups.len(), 2);
         assert_eq!(scan.groups[0].entries.len(), 1);
-        assert_eq!(scan.groups[1].entries.len(), 1);
         assert_eq!(scan.groups[0].entries[0].pool, Some(ShardType::State));
+        assert_eq!(scan.groups[1].entries.len(), 1);
         assert_eq!(scan.groups[1].entries[0].pool, Some(ShardType::EventDag));
+        assert_eq!(coordinator.visible_lsn(), 2);
         fs::remove_file(path).unwrap();
     }
 
@@ -3866,7 +3623,10 @@ mod tests {
         let (journal, scan) = Journal::open(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
         assert_eq!(coordinator.visible_lsn(), 0);
-        let lsn = coordinator.publish(put(1, 1, b"first"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         coordinator.sync().unwrap();
         assert_eq!(coordinator.visible_lsn(), lsn);
         assert_eq!(coordinator.committed_lsn(), lsn);
@@ -3876,57 +3636,52 @@ mod tests {
 
     #[test]
     #[cfg(feature = "multi-reader")]
-    fn publish_pending_flushes_tagged_queue_without_staging_or_fsync() {
+    fn published_groups_are_visible_not_durable_until_one_fsync_covers_them() {
         use crate::layout::ShardType;
-        let path = temp_path("publish_pending_tagged");
+        let path = temp_path("published_groups_one_fsync");
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open_shared(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
 
-        coordinator
-            .publish_tagged(ShardType::State, put(1, 1, b"state"), |_| {})
+        let first = coordinator
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
             .unwrap();
-        coordinator
-            .publish_tagged(ShardType::EventDag, put(2, 2, b"event"), |_| {})
+        let second = coordinator
+            .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
             .unwrap();
-        let receipt = coordinator
-            .publish_pending()
-            .unwrap()
-            .expect("queued mutations must produce a group");
-        assert_eq!((receipt.first_lsn, receipt.last_lsn), (1, 2));
+        assert_eq!((first.last_lsn, second.last_lsn), (1, 2));
         // Complete and visible to a read-only overlay, but not yet durable.
         assert_eq!(coordinator.visible_lsn(), 2);
         assert_eq!(coordinator.committed_lsn(), 0);
-        // The queue is drained: a second flush has nothing to append.
-        assert!(coordinator.publish_pending().unwrap().is_none());
 
-        // A later sync makes the whole group durable and promotes each pool.
+        // One sync makes both groups durable and promotes each pool.
         coordinator.sync_through(2).unwrap();
         assert_eq!(coordinator.committed_lsn(), 2);
-        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 2);
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 1);
         assert_eq!(coordinator.committed_lsn_for_pool(ShardType::EventDag), 2);
+        assert_eq!(coordinator.durability_stats().commits, 1);
         drop(coordinator);
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn empty_pending_flush_is_none_but_staged_append_still_rejects() {
-        let path = temp_path("publish_pending_empty");
+    fn empty_group_publication_is_rejected() {
+        let path = temp_path("publish_group_empty");
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
 
-        assert!(coordinator.publish_pending().unwrap().is_none());
-        let error = coordinator.append_pending(&[]).unwrap_err();
+        let error = coordinator.publish_group(&[]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         #[cfg(feature = "multi-reader")]
         {
             use crate::layout::ShardType;
             let error = coordinator
-                .append_pending_tagged(ShardType::State, &[])
+                .publish_group_tagged(ShardType::State, &[])
                 .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
+        assert_eq!(coordinator.visible_lsn(), 0);
         fs::remove_file(path).unwrap();
     }
 
@@ -4154,28 +3909,24 @@ mod tests {
         let coordinator = JournalCoordinator::new(journal, &scan);
 
         let first_lsn = coordinator
-            .publish(
-                Mutation::Put {
-                    collection_id: [1; 16],
-                    node_id: [1; 16],
-                    payload: b"first".to_vec(),
-                },
-                |_| {},
-            )
-            .unwrap();
+            .publish_group(&[Mutation::Put {
+                collection_id: [1; 16],
+                node_id: [1; 16],
+                payload: b"first".to_vec(),
+            }])
+            .unwrap()
+            .last_lsn;
         let first_target = coordinator.capture_sync_target();
         assert_eq!(first_target, first_lsn);
 
         let second_lsn = coordinator
-            .publish(
-                Mutation::Put {
-                    collection_id: [1; 16],
-                    node_id: [2; 16],
-                    payload: b"second".to_vec(),
-                },
-                |_| {},
-            )
-            .unwrap();
+            .publish_group(&[Mutation::Put {
+                collection_id: [1; 16],
+                node_id: [2; 16],
+                payload: b"second".to_vec(),
+            }])
+            .unwrap()
+            .last_lsn;
         assert_eq!(second_lsn, first_lsn.saturating_add(1));
 
         let first_commit = coordinator.sync_through(first_target).unwrap().unwrap();
@@ -4227,14 +3978,11 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for item in 0..per_thread {
                     coordinator
-                        .publish(
-                            Mutation::Put {
-                                collection_id: [thread; 16],
-                                node_id: [item; 16],
-                                payload: b"payload".to_vec(),
-                            },
-                            |_| {},
-                        )
+                        .publish_group(&[Mutation::Put {
+                            collection_id: [thread; 16],
+                            node_id: [item; 16],
+                            payload: b"payload".to_vec(),
+                        }])
                         .unwrap();
                     // Either this caller commits the group or a concurrent
                     // caller already committed one covering this LSN.
@@ -4362,7 +4110,10 @@ mod tests {
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
-        let lsn = coordinator.publish(put(1, 1, b"first"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         let receipt = coordinator.sync().unwrap().unwrap();
         assert_eq!(receipt.last_lsn, lsn);
 
@@ -4370,7 +4121,10 @@ mod tests {
         assert_eq!(reclaim.retained_groups, 0);
         assert_eq!(coordinator.committed_lsn(), receipt.last_lsn);
 
-        let next = coordinator.publish(put(1, 2, b"second"), |_| {}).unwrap();
+        let next = coordinator
+            .publish_group(&[put(1, 2, b"second")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         assert_eq!(next, lsn.saturating_add(1));
         coordinator.sync().unwrap();
         drop(coordinator);
@@ -4398,11 +4152,17 @@ mod tests {
 
         // Interleave commits; the shared counter hands out 1, 2, 3 so each
         // segment skips the values the other consumed.
-        a.publish(put(1, 1, b"a1"), |_| {}).unwrap();
+        a.publish_group(&[put(1, 1, b"a1")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         a.sync().unwrap();
-        b.publish(put(2, 1, b"b1"), |_| {}).unwrap();
+        b.publish_group(&[put(2, 1, b"b1")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         b.sync().unwrap();
-        a.publish(put(1, 2, b"a2"), |_| {}).unwrap();
+        a.publish_group(&[put(1, 2, b"a2")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         a.sync().unwrap();
 
         drop(a);
@@ -4478,7 +4238,8 @@ mod tests {
             let coordinator = coordinator.clone();
             handles.push(std::thread::spawn(move || {
                 let lsn = coordinator
-                    .publish(put(3, node, b"shared"), |_| {})
+                    .publish_group(&[put(3, node, b"shared")])
+                    .map(|receipt| receipt.last_lsn)
                     .unwrap();
                 let token = coordinator.request_durable(lsn);
                 coordinator.wait_durable(token).unwrap();
@@ -4519,7 +4280,10 @@ mod tests {
     #[test]
     fn durability_stats_count_already_durable_and_explicit_sync() {
         let coordinator = open_arc("dur_stats_explicit");
-        let lsn = coordinator.publish(put(4, 1, b"one"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(4, 1, b"one")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         let before = coordinator.durability_stats();
         assert_eq!(before.commits, 0);
 
@@ -4552,7 +4316,10 @@ mod tests {
 
         let mut token = None;
         for node in 0..8u8 {
-            let lsn = coordinator.publish(put(1, node, b"batch"), |_| {}).unwrap();
+            let lsn = coordinator
+                .publish_group(&[put(1, node, b"batch")])
+                .map(|receipt| receipt.last_lsn)
+                .unwrap();
             token = Some(coordinator.request_durable(lsn));
         }
         let token = token.unwrap();
@@ -4579,7 +4346,10 @@ mod tests {
             })
             .unwrap();
 
-        let lsn = coordinator.publish(put(2, 1, b"quiet"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(2, 1, b"quiet")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         // No wait, no further request: the interval timer alone must flush it.
         let committed = coordinator.clone();
         wait_until(
@@ -4619,12 +4389,18 @@ mod tests {
         // Publish only: no request_durable call, so the threshold crossing in
         // `publish` itself must be what wakes the committer.
         for node in 0..6u8 {
-            coordinator.publish(put(3, node, b"burst"), |_| {}).unwrap();
+            coordinator
+                .publish_group(&[put(3, node, b"burst")])
+                .map(|receipt| receipt.last_lsn)
+                .unwrap();
         }
         // The 60s interval cannot be the trigger; the pending bound must be.
+        // The wake fires on the fourth publish and the committer flushes
+        // through whatever is published by then, so later publishes may wait
+        // for the next crossing or the interval; the bound's worth must not.
         let committed = coordinator.clone();
         wait_until(
-            move || committed.pending_count() == 0 && committed.committed_lsn() > 0,
+            move || committed.committed_lsn() >= 4,
             "max-pending early flush",
         );
         assert!(coordinator.background_commits() >= 1);
@@ -4666,7 +4442,10 @@ mod tests {
             })
             .unwrap();
 
-        let lsn = coordinator.publish(put(4, 1, b"final"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(4, 1, b"final")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         let _ = coordinator.request_durable(lsn);
         coordinator.stop_background_committer().unwrap();
 
@@ -4689,7 +4468,10 @@ mod tests {
             })
             .unwrap();
 
-        let lsn = coordinator.publish(put(5, 1, b"explicit"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(5, 1, b"explicit")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         // The explicit barrier must not wait for the committer's 60s interval:
         // the committer cannot fire early here (max_pending is unbounded), so a
         // barrier that returns promptly and satisfies `lsn` can only have done
@@ -4714,7 +4496,10 @@ mod tests {
     fn wait_durable_without_committer_commits_directly() {
         let coordinator = open_arc("no_committer_wait");
         assert!(!coordinator.has_background_committer());
-        let lsn = coordinator.publish(put(6, 1, b"direct"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(6, 1, b"direct")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         let token = coordinator.request_durable(lsn);
         coordinator.wait_durable(token).unwrap();
         assert!(coordinator.committed_lsn() >= lsn);
@@ -4724,7 +4509,10 @@ mod tests {
     #[test]
     fn durability_token_reports_an_already_committed_boundary() {
         let coordinator = open_arc("token_committed");
-        let lsn = coordinator.publish(put(7, 1, b"done"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(7, 1, b"done")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         coordinator.sync().unwrap();
         let token = coordinator.request_durable(lsn);
         assert!(token.is_satisfied_by(coordinator.committed_lsn()));
@@ -4754,7 +4542,10 @@ mod tests {
             Ordering::Release,
         );
 
-        let lsn = coordinator.publish(put(1, 10, b"mid"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(1, 10, b"mid")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         coordinator.sync_through(lsn).unwrap();
         assert_eq!(coordinator.background_commits(), 0);
         assert_eq!(coordinator.threshold_wakes.load(Ordering::Relaxed), 0);
@@ -4762,7 +4553,8 @@ mod tests {
         // The explicit commit above advanced the epoch, so this burst wakes it.
         for node in 20..24u8 {
             coordinator
-                .publish(put(1, node, b"second"), |_| {})
+                .publish_group(&[put(1, node, b"second")])
+                .map(|receipt| receipt.last_lsn)
                 .unwrap();
         }
         wait_until(
@@ -4791,7 +4583,8 @@ mod tests {
             let base = u8::try_from(burst).unwrap() * 10;
             for node in 0..4u8 {
                 coordinator
-                    .publish(put(2, base + node, b"burst"), |_| {})
+                    .publish_group(&[put(2, base + node, b"burst")])
+                    .map(|receipt| receipt.last_lsn)
                     .unwrap();
             }
             wait_until(
@@ -4833,7 +4626,8 @@ mod tests {
         for node in 0..8u8 {
             lsns.push(
                 coordinator
-                    .publish(put(3, node, b"window"), |_| {})
+                    .publish_group(&[put(3, node, b"window")])
+                    .map(|receipt| receipt.last_lsn)
                     .unwrap(),
             );
         }
@@ -4945,7 +4739,10 @@ mod tests {
         // would otherwise flush the burst and mask a suppressed wake.
         wait_parked(&coordinator, parks_before);
         assert!(coordinator.background_failure_detail().is_none());
-        let lsn = coordinator.publish(put(5, 1, b"restart"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(5, 1, b"restart")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         wait_until(
             {
                 let committed = coordinator.clone();

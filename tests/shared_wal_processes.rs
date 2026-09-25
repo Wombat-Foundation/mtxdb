@@ -204,12 +204,12 @@ fn a_reader_process_sees_a_live_writers_committed_record() {
 }
 
 /// The same cross-process read, but the writer never makes the record durable:
-/// it appends the queued group only at the read-committed boundary
-/// (`publish_pending`, no `sync_all`). The worker's index predates the write,
-/// so the *only* way it can observe the record is the shared read-committed
-/// overlay. This is the guarantee the worker-mode publish path depends on:
-/// visibility is not gated on durability, and a stale worker's next read sees
-/// a committed-but-unfsynced write as soon as it is published.
+/// it publishes the group without making it durable (`no sync_all`). The
+/// worker's index predates the write, so the *only* way it can observe the
+/// record is the shared read-committed overlay. This is the guarantee the
+/// worker-mode publish path depends on: visibility is not gated on durability,
+/// and a stale worker's next read sees a committed-but-unfsynced write as soon
+/// as it is published.
 #[test]
 fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
     let root = TempRoot::new("published");
@@ -233,10 +233,6 @@ fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
             &NodeData::new(bytes::Bytes::from_static(PAYLOAD)),
         )
         .expect("writer commits a record");
-    db.publish_pending()
-        .expect("writer publishes the pending group")
-        .expect("a pending group exists to publish");
-
     // Publication must advance the read-committed boundary without advancing
     // the durable boundary. This distinguishes a visibility success from an
     // accidental synchronous commit before the reader is allowed to proceed.
