@@ -4643,10 +4643,7 @@ fn meta_pack_fingerprint(dir: &Path) -> anyhow::Result<(u64, Vec<(PackIssueLevel
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path
-            .extension()
-            .is_some_and(|extension| extension == "pack")
-        {
+        if path.extension().is_none_or(|extension| extension != "pack") {
             continue;
         }
         match pack_identity(&path) {
