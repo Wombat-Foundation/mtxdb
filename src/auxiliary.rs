@@ -115,13 +115,28 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         let digest = auxiliary_key_digest(key);
         let node_id = physical_id(&digest);
-        let Some(data) = self.engine.get(&self.collection_id, &node_id)? else {
-            return Ok(None);
-        };
-        if data.bytes.is_empty() {
-            return Ok(None);
-        }
-        decode_value(&digest, &data.bytes).map(Some)
+        let data = self.engine.get(&self.collection_id, &node_id)?;
+        decode_stored_value(&digest, data.as_ref())
+    }
+
+    /// Read several logical keys with one backend lookup.
+    ///
+    /// The returned values are in the same order as `keys`. Missing keys are
+    /// represented by `None`; stored envelopes are validated just like
+    /// [`Self::get`].
+    ///
+    /// # Errors
+    /// Returns a storage or auxiliary-envelope error.
+    pub fn get_many(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+        let digests: Vec<AuxiliaryKeyDigest> =
+            keys.iter().map(|key| auxiliary_key_digest(key)).collect();
+        let ids: Vec<NodeId> = digests.iter().map(physical_id).collect();
+        let existing = self.engine.get_many(&self.collection_id, &ids)?;
+        existing
+            .iter()
+            .zip(digests.iter())
+            .map(|(data, digest)| decode_stored_value(digest, data.as_ref()))
+            .collect()
     }
 
     /// Insert or update a value by its logical key.
@@ -257,10 +272,23 @@ fn decode_value(
     Ok(encoded[value_start..].to_vec())
 }
 
+fn decode_stored_value(
+    digest: &AuxiliaryKeyDigest,
+    data: Option<&NodeData>,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let Some(data) = data else {
+        return Ok(None);
+    };
+    if data.bytes.is_empty() {
+        return Ok(None);
+    }
+    decode_value(digest, &data.bytes).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::InMemoryStorage;
+    use crate::storage::{InMemoryStorage, StorageEngine};
     use crate::template::MEMBER_NAMESPACE_INTL;
 
     #[test]
@@ -272,6 +300,36 @@ mod tests {
         first.put(b"key", b"value").unwrap();
         assert_eq!(first.get(b"key").unwrap(), Some(b"value".to_vec()));
         assert_eq!(second.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn get_many_preserves_order_and_distinguishes_missing_and_empty_values() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "batch");
+        index.put(b"first", b"one").unwrap();
+        index.put(b"empty", b"").unwrap();
+
+        let values = index.get_many(&[b"empty", b"missing", b"first"]).unwrap();
+        assert_eq!(values[0], Some(Vec::new()));
+        assert_eq!(values[1], None);
+        assert_eq!(values[2], Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn get_many_rejects_a_corrupt_envelope() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "corrupt");
+        let digest = auxiliary_key_digest(b"bad");
+        let node_id = physical_id(&digest);
+        engine
+            .put(
+                &index.collection_id(),
+                &node_id,
+                &NodeData::new(VALUE_MAGIC.to_vec().into()),
+            )
+            .unwrap();
+
+        assert!(index.get_many(&[b"bad"]).is_err());
     }
 
     #[test]
