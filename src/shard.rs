@@ -556,7 +556,6 @@ pub(crate) struct WriterLock {
 /// symbolic rather than being reduced to constants.
 ///
 /// The active write shard rotates when it exceeds `MAX_SHARD_BYTES`.
-/// A named pool of append-only packfiles.
 pub struct ShardPool {
     /// Fixed-size array of shard slots. `None` means unused.
     shards: RwLock<Vec<Option<Arc<Shard>>>>,
@@ -1456,7 +1455,11 @@ impl ShardPool {
         Some(LockHolderInfo {
             pid,
             running: !Self::lock_holder_is_dead(lock_path),
-            has_starttime: contents.split_whitespace().nth(1).is_some(),
+            has_starttime: contents
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some(),
         })
     }
 
@@ -1464,19 +1467,27 @@ impl ShardPool {
     ///
     /// This opens the marker read-only, takes a shared lock only for the
     /// duration of the probe, and never changes the file. A stale marker with
-    /// no active advisory lock therefore reports `false`.
+    /// no active advisory lock therefore reports `Some(false)`.
+    ///
+    /// This is a best-effort instantaneous probe: a writer can acquire or
+    /// release the exclusive lock immediately before or after this call. The
+    /// result is diagnostic evidence, not a synchronization guarantee.
+    /// Because the writer uses a non-retrying exclusive try-lock, a probe that
+    /// races its acquisition can also make that writer report a transient
+    /// "already locked" failure. Callers should use this only for inspection,
+    /// never as a coordination protocol.
     #[must_use]
-    pub fn lock_contended(lock_path: &Path) -> bool {
+    pub fn lock_contended(lock_path: &Path) -> Option<bool> {
         let Ok(file) = File::options().read(true).open(lock_path) else {
-            return false;
+            return None;
         };
         match fs2::FileExt::try_lock_shared(&file) {
             Ok(()) => {
                 let _ = fs2::FileExt::unlock(&file);
-                false
+                Some(false)
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
-            Err(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Some(true),
+            Err(_) => None,
         }
     }
 
@@ -3074,6 +3085,7 @@ impl Drop for ShardPool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use fs2::FileExt as FileExtTrait;
 
     fn test_dir(name: &str) -> PathBuf {
         use std::sync::atomic::AtomicU64;
@@ -3705,16 +3717,24 @@ mod tests {
         let dir = test_dir("writer_lock_contention_probe");
         std::fs::create_dir_all(&dir).unwrap();
         let lock_path = dir.join(".mtxdb.lock");
-        std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+        #[cfg(target_os = "linux")]
+        let marker = format!(
+            "{} {}\n",
+            std::process::id(),
+            ShardPool::proc_start_time("self").unwrap()
+        );
+        #[cfg(not(target_os = "linux"))]
+        let marker = format!("{}\n", std::process::id());
+        std::fs::write(&lock_path, marker).unwrap();
         let file = File::options()
             .read(true)
             .write(true)
             .open(&lock_path)
             .unwrap();
-        file.try_lock_exclusive().unwrap();
-        assert!(ShardPool::lock_contended(&lock_path));
-        file.unlock().unwrap();
-        assert!(!ShardPool::lock_contended(&lock_path));
+        FileExtTrait::try_lock_exclusive(&file).unwrap();
+        assert_eq!(ShardPool::lock_contended(&lock_path), Some(true));
+        FileExtTrait::unlock(&file).unwrap();
+        assert_eq!(ShardPool::lock_contended(&lock_path), Some(false));
     }
 
     /// Dropping the writer releases its lock immediately (via

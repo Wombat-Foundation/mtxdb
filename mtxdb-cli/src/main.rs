@@ -3,10 +3,17 @@
 mod cmd;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
 use mtxdb::{ReadPlanPolicy, ShardType};
+
+static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn debug_enabled() -> bool {
+    DEBUG_ENABLED.get().copied().unwrap_or(false)
+}
 
 #[derive(Clone)]
 pub(crate) struct Cli {
@@ -264,6 +271,13 @@ fn global_args(cmd: Command) -> Command {
             .value_parser(["plain", "prefetch"])
             .global(true)
             .help("Merged read prefetch for batch reads: 'plain' (default, independent reads) or 'prefetch' to meld nearby candidates into sequential extents"),
+    )
+    .arg(
+        Arg::new("debug")
+            .long("debug")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Enable additional diagnostic output"),
     )
 }
 
@@ -733,6 +747,7 @@ fn parse_cli() -> Cli {
         .map(|vals| vals.map(PathBuf::from).collect())
         .unwrap_or_default();
     let coalesce = matches.get_flag("coalesce");
+    let _ = DEBUG_ENABLED.set(matches.get_flag("debug"));
     let read_plan = read_plan_from_mode(
         matches
             .get_one::<String>("read_plan")

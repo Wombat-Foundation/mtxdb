@@ -4060,6 +4060,7 @@ struct MetaReport {
     note_count: usize,
     warn_count: usize,
     error_count: usize,
+    unknown_count: usize,
     json_records: Vec<OwnedValue>,
 }
 
@@ -4078,14 +4079,19 @@ impl MetaReport {
             "NOTE" => self.note_count = self.note_count.saturating_add(1),
             "WARN" => self.warn_count = self.warn_count.saturating_add(1),
             "ERROR" => self.error_count = self.error_count.saturating_add(1),
-            _ => {}
+            _ => self.unknown_count = self.unknown_count.saturating_add(1),
         }
+        let severity = if matches!(level, "NOTE" | "WARN" | "ERROR") {
+            level
+        } else {
+            "UNKNOWN"
+        };
         let message = message.to_string();
         let path = path.display().to_string();
-        self.lines.push(format!("[{level}] {path}: {message}"));
+        self.lines.push(format!("[{severity}] {path}: {message}"));
         let mut fields = simd_json::owned::Object::new();
         fields.insert("kind".to_owned(), OwnedValue::from("diagnostic"));
-        fields.insert("severity".to_owned(), OwnedValue::from(level));
+        fields.insert("severity".to_owned(), OwnedValue::from(severity));
         fields.insert("path".to_owned(), OwnedValue::from(path));
         fields.insert("message".to_owned(), OwnedValue::from(message));
         self.json_records.push(OwnedValue::Object(Box::new(fields)));
@@ -4117,6 +4123,10 @@ impl MetaReport {
         summary.insert(
             "error".to_owned(),
             OwnedValue::from(u64::try_from(self.error_count).unwrap_or(u64::MAX)),
+        );
+        summary.insert(
+            "unknown".to_owned(),
+            OwnedValue::from(u64::try_from(self.unknown_count).unwrap_or(u64::MAX)),
         );
         records.insert(0, OwnedValue::Object(Box::new(summary)));
         OwnedValue::Array(Box::new(records))
@@ -4259,26 +4269,35 @@ fn meta_locks(root: &Path, report: &mut MetaReport) {
 
 fn meta_lock_line(path: &Path, report: &mut MetaReport) {
     match mtxdb::ShardPool::lock_holder_info(path) {
-        Some(info) => report.line(format!(
-            "lock {}: pid={} {} writer={} confidence={}",
-            path.display(),
-            info.pid,
-            if info.running {
-                "running"
+        Some(info) => {
+            let holder = if info.has_starttime {
+                if info.running {
+                    "running"
+                } else {
+                    "not-running"
+                }
+            } else if info.running {
+                "exists"
             } else {
-                "not-running"
-            },
-            if mtxdb::ShardPool::lock_contended(path) {
-                "active"
-            } else {
-                "not-held"
-            },
-            if info.has_starttime {
-                "full"
-            } else {
-                "limited"
-            }
-        )),
+                "not-found"
+            };
+            report.line(format!(
+                "lock {}: pid={} {} writer={} confidence={}",
+                path.display(),
+                info.pid,
+                holder,
+                match mtxdb::ShardPool::lock_contended(path) {
+                    Some(true) => "active",
+                    Some(false) => "not-held",
+                    None => "unknown",
+                },
+                if info.has_starttime {
+                    "full"
+                } else {
+                    "limited"
+                }
+            ));
+        }
         None => report.finding("WARN", path, "present but PID is unreadable"),
     }
 }
@@ -4309,44 +4328,83 @@ fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize,
         }
         for path in packs.into_iter().skip(offset).take(limit) {
             match pack_identity(&path) {
-                Ok((pack_id, length)) => report.line(format!(
+                PackIdentity::Valid { pack_id, length } => report.line(format!(
                     "  {}: {} bytes, pack_id={pack_id:#x}",
                     path.display(),
                     length
                 )),
-                Err(error) => report.finding("WARN", &path, error),
+                PackIdentity::NonCanonical(message) => {
+                    report.finding(PackIssueLevel::Note.as_str(), &path, message);
+                }
+                PackIdentity::Invalid(error) => {
+                    report.finding(PackIssueLevel::Warn.as_str(), &path, error);
+                }
             }
         }
     }
 }
 
-fn pack_identity(path: &Path) -> anyhow::Result<(u64, u64)> {
+enum PackIdentity {
+    Valid { pack_id: u64, length: u64 },
+    NonCanonical(String),
+    Invalid(anyhow::Error),
+}
+
+#[derive(Clone, Copy)]
+enum PackIssueLevel {
+    Note,
+    Warn,
+}
+
+impl PackIssueLevel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Note => "NOTE",
+            Self::Warn => "WARN",
+        }
+    }
+}
+
+fn pack_identity(path: &Path) -> PackIdentity {
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow!("pack filename is not valid UTF-8"))?;
-    let hex = stem.strip_prefix("pack_").ok_or_else(|| {
-        anyhow!("non-canonical pack filename; expected pack_<16 hex digits>.pack")
-    })?;
+        .map(str::to_owned);
+    let Some(stem) = stem else {
+        return PackIdentity::Invalid(anyhow!("pack filename is not valid UTF-8"));
+    };
+    let Some(hex) = stem.strip_prefix("pack_") else {
+        return PackIdentity::NonCanonical(format!(
+            "pack filename `{stem}` is non-canonical; expected pack_<16 hex digits>.pack"
+        ));
+    };
     if hex.len() != 16
         || !hex
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        bail!("non-canonical pack filename; expected pack_<16 lowercase hex digits>.pack");
+        return PackIdentity::NonCanonical(format!(
+            "pack filename `{stem}` is non-canonical; expected pack_<16 lowercase hex digits>.pack"
+        ));
     }
-    let filename_id = u64::from_str_radix(hex, 16)?;
-    let length = fs::metadata(path)?.len();
-    let mut file = BufReader::new(fs::File::open(path)?);
-    let header =
-        mtxdb::packfile::read_header(&mut file)?.ok_or_else(|| anyhow!("not a packfile"))?;
-    if header.pack_id != filename_id {
-        bail!(
-            "pack filename id {filename_id:#x} disagrees with header id {:#x}",
-            header.pack_id
-        );
+    let result = (|| -> anyhow::Result<(u64, u64)> {
+        let filename_id = u64::from_str_radix(hex, 16)?;
+        let length = fs::metadata(path)?.len();
+        let mut file = BufReader::new(fs::File::open(path)?);
+        let header =
+            mtxdb::packfile::read_header(&mut file)?.ok_or_else(|| anyhow!("not a packfile"))?;
+        if header.pack_id != filename_id {
+            bail!(
+                "pack filename id {filename_id:#x} disagrees with header id {:#x}",
+                header.pack_id
+            );
+        }
+        Ok((header.pack_id, length))
+    })();
+    match result {
+        Ok((pack_id, length)) => PackIdentity::Valid { pack_id, length },
+        Err(error) => PackIdentity::Invalid(error),
     }
-    Ok((header.pack_id, length))
 }
 
 fn meta_wal(
@@ -4468,10 +4526,20 @@ fn meta_checkpoints(root: &Path, report: &mut MetaReport) {
                 ));
                 match meta_pack_fingerprint(&dir) {
                     Ok((fingerprint, issues)) => {
-                        for issue in issues {
-                            report.finding("WARN", &dir, issue);
+                        let issue_count = issues.len();
+                        let has_issues = issue_count != 0;
+                        for (level, issue) in issues {
+                            report.finding(level.as_str(), &dir, issue);
                         }
-                        if fingerprint != checkpoint.fingerprint {
+                        if has_issues {
+                            report.finding(
+                                "NOTE",
+                                &dir,
+                                format!(
+                                    "fingerprint comparison skipped: {issue_count} pack issue(s)"
+                                ),
+                            );
+                        } else if fingerprint != checkpoint.fingerprint {
                             report.finding(
                                 "WARN",
                                 &path,
@@ -4490,7 +4558,7 @@ fn meta_checkpoints(root: &Path, report: &mut MetaReport) {
     }
 }
 
-fn meta_pack_fingerprint(dir: &Path) -> anyhow::Result<(u64, Vec<String>)> {
+fn meta_pack_fingerprint(dir: &Path) -> anyhow::Result<(u64, Vec<(PackIssueLevel, String)>)> {
     let mut packs = Vec::new();
     let mut issues = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -4503,8 +4571,14 @@ fn meta_pack_fingerprint(dir: &Path) -> anyhow::Result<(u64, Vec<String>)> {
             continue;
         }
         match pack_identity(&path) {
-            Ok(identity) => packs.push(identity),
-            Err(error) => issues.push(format!("{}: {error}", path.display())),
+            PackIdentity::Valid { pack_id, length } => packs.push((pack_id, length)),
+            PackIdentity::NonCanonical(message) => issues.push((
+                PackIssueLevel::Note,
+                format!("{}: {message}", path.display()),
+            )),
+            PackIdentity::Invalid(error) => {
+                issues.push((PackIssueLevel::Warn, format!("{}: {error}", path.display())));
+            }
         }
     }
     Ok((mtxdb::index::checkpoint::pack_fingerprint(&packs), issues))
@@ -7703,24 +7777,43 @@ fn import_pdu_events(
     persist_matrix_edges(&edge_store, template, events)?;
     edge_store.sync_all()?;
 
-    // A replayed batch cannot add any new state-group information. In
-    // particular, federation exports often replay a large auth chain around
-    // a handful of new PDUs; rebuilding that entire DAG for a zero-write
-    // batch only repeats work already done by the successful import.
-    let state_groups = if event_count == 0 {
-        HashMap::new()
-    } else {
-        match compute_state_groups(events, auth_chain) {
-            Ok(groups) => groups,
-            Err(cycle_events) => {
+    // Replayed batches still need state-group computation: an earlier partial
+    // import may have stored every event while omitting groups for an
+    // incomplete ancestry. A later complete export must be able to repair
+    // those derived mappings even when it writes zero new event records.
+    let graph_event_count = events
+        .iter()
+        .chain(auth_chain.iter())
+        .filter_map(event_id)
+        .collect::<HashSet<_>>()
+        .len();
+    let state_computation = compute_state_groups_partial(events, auth_chain);
+    if !state_computation.unresolved.is_empty() {
+        eprintln!(
+            "warning: partial state-group computation: {} event(s) have missing parents or are in cycles; resolvable components were retained",
+            state_computation.unresolved.len()
+        );
+        if crate::debug_enabled() {
+            let shown = state_computation.unresolved.iter().take(20);
+            eprintln!("debug: unresolved state events:");
+            for event_id in shown {
+                eprintln!("  {event_id}");
+            }
+            if state_computation.unresolved.len() > 20 {
                 eprintln!(
-                    "warning: skipping state-group computation: DAG has missing parents or cycles involving {} event(s)",
-                    cycle_events.len()
+                    "  ... {} more",
+                    state_computation.unresolved.len().saturating_sub(20)
                 );
-                HashMap::new()
             }
         }
-    };
+    }
+    let state_groups = state_computation.groups;
+    let mapped_event_count = state_groups.len();
+    let unique_state_group_count = state_groups.values().collect::<HashSet<_>>().len();
+    let stateless_event_count = graph_event_count.saturating_sub(mapped_event_count);
+    eprintln!(
+        "  state groups: computed {unique_state_group_count} state groups across {mapped_event_count} events, {stateless_event_count} events stateless"
+    );
     if !state_groups.is_empty() {
         use mtxdb::auxiliary::AuxiliaryIndex;
         let aux = AuxiliaryIndex::open(state_store, "sys:matrix-state-groups");
@@ -7728,15 +7821,8 @@ fn import_pdu_events(
             .iter()
             .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
             .collect();
-        let state_count = match aux.put_many(&entries) {
-            Ok(count) => count as u64,
-            Err(error) => {
-                eprintln!("warning: unable to persist state groups: {error}");
-                0
-            }
-        };
-        if state_count > 0 {
-            eprintln!("  state groups: {state_count}");
+        if let Err(error) = aux.put_many(&entries) {
+            eprintln!("warning: unable to persist state groups: {error}");
         }
     }
 
@@ -8261,21 +8347,23 @@ fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usiz
 /// its `prev_events` and applies its own state change (if it is a state
 /// event with `state_key`).
 ///
-/// # Errors
-/// Returns `Err` with involved event IDs if the DAG contains a cycle or
-/// references parents absent from the combined event set.
-fn compute_state_groups(
-    events: &[OwnedValue],
-    auth_chain: &[OwnedValue],
-) -> Result<HashMap<String, String>, Vec<String>> {
-    compute_state_groups_in_view(events, auth_chain, StateView::Federated)
+struct PartialStateComputation {
+    groups: HashMap<String, String>,
+    unresolved: Vec<String>,
 }
 
-fn compute_state_groups_in_view(
+fn compute_state_groups_partial(
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+) -> PartialStateComputation {
+    compute_state_groups_partial_in_view(events, auth_chain, StateView::Federated)
+}
+
+fn compute_state_groups_partial_in_view(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
     view: StateView,
-) -> Result<HashMap<String, String>, Vec<String>> {
+) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
     // rooms.
@@ -8286,16 +8374,22 @@ fn compute_state_groups_in_view(
         combined = events.iter().chain(auth_chain.iter()).cloned().collect();
         &combined
     };
-    let missing_parents = missing_prev_event_ids(all_owned);
-    if !missing_parents.is_empty() {
-        return Err(missing_parents);
+    let direct_missing = missing_prev_event_ids(all_owned);
+    if crate::debug_enabled() && !direct_missing.is_empty() {
+        eprintln!(
+            "debug: {} event(s) directly reference missing prev_events",
+            direct_missing.len()
+        );
     }
     let (frontier, id_map, reverse_map) = build_event_dag(all_owned);
     if frontier.is_empty() {
-        return Ok(HashMap::new());
+        return PartialStateComputation {
+            groups: HashMap::new(),
+            unresolved: Vec::new(),
+        };
     }
 
-    let sorted = topo_sort_dag(&frontier, &reverse_map)?;
+    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map);
 
     let mut events_by_sid: HashMap<u64, &OwnedValue> = HashMap::new();
     for ev in all_owned {
@@ -8306,11 +8400,26 @@ fn compute_state_groups_in_view(
         }
     }
 
+    let result = walk_state_groups(&frontier, &sorted, &reverse_map, &events_by_sid, view);
+
+    PartialStateComputation {
+        groups: result,
+        unresolved,
+    }
+}
+
+fn walk_state_groups(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    sorted: &[usize],
+    reverse_map: &HashMap<u64, String>,
+    events_by_sid: &HashMap<u64, &OwnedValue>,
+    view: StateView,
+) -> HashMap<String, String> {
     // How many resident children still need each event's state. Once the last
     // child is processed the state is dropped, so memory follows the DAG's
     // frontier width instead of holding one state per event for the whole run.
     let mut remaining_children: HashMap<u64, usize> = HashMap::new();
-    for &idx in &sorted {
+    for &idx in sorted {
         for edge in frontier.prev_edges(idx) {
             if edge.is_resident() {
                 let count = remaining_children
@@ -8325,9 +8434,8 @@ fn compute_state_groups_in_view(
     let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
     let mut result: HashMap<String, String> = HashMap::new();
 
-    for &idx in &sorted {
+    for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
-
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
         for edge in frontier.prev_edges(idx) {
@@ -8347,19 +8455,19 @@ fn compute_state_groups_in_view(
         let base: Arc<SharedState> = match parents.as_slice() {
             [] => Arc::clone(&empty),
             [only] => Arc::clone(only),
-            [first, rest @ ..] => {
+            [first, rest @ ..]
                 if rest
                     .iter()
-                    .all(|p| Arc::ptr_eq(p, first) || p.digest == first.digest)
-                {
-                    Arc::clone(first)
-                } else {
-                    let mut merged = StateSet::new();
-                    for parent in &parents {
-                        merged.merge(&parent.set);
-                    }
-                    SharedState::new(merged)
+                    .all(|p| Arc::ptr_eq(p, first) || p.digest == first.digest) =>
+            {
+                Arc::clone(first)
+            }
+            [..] => {
+                let mut merged = StateSet::new();
+                for parent in &parents {
+                    merged.merge(&parent.set);
                 }
+                SharedState::new(merged)
             }
         };
 
@@ -8379,7 +8487,6 @@ fn compute_state_groups_in_view(
         if let Some(eid) = reverse_map.get(&short_id) {
             result.insert(eid.clone(), state.digest.clone());
         }
-
         for parent_id in parent_ids {
             if let Some(count) = remaining_children.get_mut(&parent_id) {
                 *count = count.saturating_sub(1);
@@ -8392,14 +8499,12 @@ fn compute_state_groups_in_view(
             state_at.insert(short_id, state);
         }
     }
-
-    Ok(result)
+    result
 }
 
 /// Return the events whose `prev_events` reference a parent absent from this
-/// import batch. The DAG builder represents these as disk-resident edges and
-/// the topological sort will eventually reject the whole batch; checking here
-/// avoids building and sorting a large doomed frontier first.
+/// import batch. This remains useful for diagnostics even though the partial
+/// state walker no longer rejects the entire batch up front.
 fn missing_prev_event_ids(events: &[OwnedValue]) -> Vec<String> {
     let known: HashSet<&str> = events.iter().filter_map(event_id).collect();
     let mut missing = Vec::new();
@@ -8426,6 +8531,87 @@ fn missing_prev_event_ids(events: &[OwnedValue]) -> Vec<String> {
     }
     missing.sort();
     missing
+}
+
+/// Sort the resolvable portion of a DAG. Nodes with an absent parent, and all
+/// of their descendants, are excluded; a cycle and its descendants are also
+/// excluded. Independent components continue to be processed normally.
+fn partial_topo_sort_dag(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    reverse_map: &HashMap<u64, String>,
+) -> (Vec<usize>, Vec<String>) {
+    let n = frontier.nodes.len();
+    let mut in_degree = vec![0usize; n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut blocked = vec![false; n];
+    let mut blocked_queue = VecDeque::new();
+
+    for (idx, _node) in frontier.nodes.iter().enumerate() {
+        for edge in frontier.prev_edges(idx) {
+            if edge.is_resident() {
+                let parent_idx = edge.arena_index();
+                children[parent_idx].push(idx);
+                in_degree[idx] = in_degree[idx].saturating_add(1);
+            } else if !blocked[idx] {
+                blocked[idx] = true;
+                blocked_queue.push_back(idx);
+            }
+        }
+    }
+
+    while let Some(idx) = blocked_queue.pop_front() {
+        for &child in &children[idx] {
+            if !blocked[child] {
+                blocked[child] = true;
+                blocked_queue.push_back(child);
+            }
+        }
+    }
+
+    let mut queue: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
+    for (idx, &degree) in in_degree.iter().enumerate() {
+        if !blocked[idx] && degree == 0 {
+            let event_id = reverse_map
+                .get(&frontier.nodes[idx].short_id)
+                .cloned()
+                .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id));
+            queue.push(Reverse((event_id, idx)));
+        }
+    }
+
+    let mut sorted = Vec::with_capacity(n.saturating_sub(blocked.iter().filter(|&&v| v).count()));
+    let mut processed = vec![false; n];
+    while let Some(Reverse((_, idx))) = queue.pop() {
+        if processed[idx] {
+            continue;
+        }
+        processed[idx] = true;
+        sorted.push(idx);
+        for &child in &children[idx] {
+            in_degree[child] = in_degree[child].saturating_sub(1);
+            if !blocked[child] && in_degree[child] == 0 {
+                let event_id = reverse_map
+                    .get(&frontier.nodes[child].short_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[child].short_id));
+                queue.push(Reverse((event_id, child)));
+            }
+        }
+    }
+
+    let mut unresolved = processed
+        .iter()
+        .enumerate()
+        .filter(|&(_idx, done)| !done)
+        .map(|(idx, _done)| {
+            reverse_map
+                .get(&frontier.nodes[idx].short_id)
+                .cloned()
+                .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id))
+        })
+        .collect::<Vec<_>>();
+    unresolved.sort();
+    (sorted, unresolved)
 }
 
 /// A state set with its state-group digest computed once, so events that share
@@ -9688,18 +9874,18 @@ mod tests {
     use super::{
         blake3_digest, build_event_dag, canonical_column_width, cmd_collections, cmd_get,
         cmd_import_file, cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-        collection_canonical_id, compile_import_template, compute_state_groups,
+        collection_canonical_id, compile_import_template, compute_state_groups_partial,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
         default_matrix_import_template, derive_template_key, display_collection_role, event_id,
         event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
         format_canonical_display, format_id, glob_pack_files, import_pdu_events,
         interleaving_worth_noting, listing_shard_types, matrix_batch_has_create,
-        matrix_room_collection_id, matrix_room_extension_from_store, meta_raw,
-        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
-        redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-        split_canonical_display, template_collection_id, template_node_id, verify_auth_chain_edges,
-        CollectionTemplate, MatrixRoomExtension, MetaReport, StateSet,
-        MATRIX_ROOM_MEMBER_NAMESPACE,
+        matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints,
+        meta_lock_line, meta_pools, meta_raw, pack_identity, parse_federation_input,
+        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload, redacted_event_bytes,
+        resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
+        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
+        MatrixRoomExtension, MetaReport, PackIdentity, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -9794,7 +9980,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_raw_paginates_across_files_without_loading_the_whole_file() {
+    fn meta_raw_paginates_across_files() {
         let root = unique_temp_dir();
         let state = root.join("pools/state");
         std::fs::create_dir_all(&state).unwrap();
@@ -9825,7 +10011,79 @@ mod tests {
         assert_eq!(info.pid, std::process::id());
         assert!(info.running);
         assert!(!info.has_starttime);
-        assert!(!mtxdb::ShardPool::lock_contended(&path));
+        assert_eq!(mtxdb::ShardPool::lock_contended(&path), Some(false));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meta_lock_reports_full_confidence_for_starttime_marker() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".mtxdb.lock");
+        std::fs::write(&path, b"1 1\n").unwrap();
+        let mut report = MetaReport::default();
+        meta_lock_line(&path, &mut report);
+        assert!(report.lines[0].contains("confidence=full"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noncanonical_pack_identity_is_a_note() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = state.join("foreign.pack");
+        std::fs::write(&path, b"not a canonical pack").unwrap();
+        assert!(matches!(
+            pack_identity(&path),
+            PackIdentity::NonCanonical(_)
+        ));
+        let mut report = MetaReport::default();
+        meta_pools(&root, &mut report, usize::MAX, 0, true);
+        assert!(report.lines.iter().any(|line| line.starts_with("[NOTE]")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_pack_comparison_reports_skip_note_for_pack_issue() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
+        mtxdb::index::checkpoint::write_checkpoint(
+            &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+            mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut report = MetaReport::default();
+        meta_checkpoints(&root, &mut report);
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint comparison skipped: 1 pack issue(s)")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        mtxdb::index::checkpoint::write_checkpoint(
+            &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+            mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut report = MetaReport::default();
+        meta_checkpoints(&root, &mut report);
+        assert_eq!(report.warn_count, 0);
+        assert_eq!(report.note_count, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10557,6 +10815,11 @@ mod tests {
     #[test]
     fn import_keeps_existing_record_when_event_id_matches() {
         let (store, dir, path, template, collection_id) = import_fixture("import_keep_same_event");
+        // Keep the derived state-group index separate from the event store so
+        // this assertion measures whether the existing event record was
+        // rewritten.  Replaying the event may legitimately populate a
+        // missing state-group mapping.
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
         let event = import_event("$a", "@alice", "!room");
         let node_id = template_node_id(&template, &event).unwrap().unwrap();
         store
@@ -10571,7 +10834,7 @@ mod tests {
         established.insert(collection_id);
         import_pdu_events(
             &store,
-            &store,
+            &state_store,
             &dir,
             &path,
             &[event],
@@ -11756,7 +12019,7 @@ mod tests {
         expected.insert("$right".into(), right_state.digest_base64url());
         expected.insert("$merge".into(), left_state.digest_base64url());
 
-        let groups = compute_state_groups(&events, &[]).unwrap();
+        let groups = compute_state_groups_partial(&events, &[]).groups;
         assert_eq!(groups.len(), expected.len());
         for (event_id, want) in &expected {
             assert_eq!(&groups[event_id], want, "state group for {event_id}");
@@ -11779,7 +12042,7 @@ mod tests {
             let after = owned_value(
                 r#"{"event_id":"$after","room_id":"!r:x","type":"m.room.message","prev_events":["$bad"],"content":{}}"#,
             );
-            super::compute_state_groups_in_view(&[create, flagged, after], &[], view).unwrap()
+            super::compute_state_groups_partial_in_view(&[create, flagged, after], &[], view).groups
         };
         let federated = super::StateView::Federated;
         let client = super::StateView::Client;
@@ -11827,7 +12090,7 @@ mod tests {
         let msg = owned_value(
             r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join"],"content":{"body":"hi"}}"#,
         );
-        let groups = compute_state_groups(&[create, member, msg], &[]).unwrap();
+        let groups = compute_state_groups_partial(&[create, member, msg], &[]).groups;
         // All three events should have a state group.
         assert!(groups.contains_key("$create"));
         assert!(groups.contains_key("$join"));
@@ -11843,7 +12106,7 @@ mod tests {
 
     #[test]
     fn compute_state_groups_empty_input() {
-        let groups = compute_state_groups(&[], &[]).unwrap();
+        let groups = compute_state_groups_partial(&[], &[]).groups;
         assert!(groups.is_empty());
     }
 
@@ -11855,8 +12118,8 @@ mod tests {
         let member = owned_value(
             r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
         );
-        let g1 = compute_state_groups(&[create.clone(), member.clone()], &[]).unwrap();
-        let g2 = compute_state_groups(&[create, member], &[]).unwrap();
+        let g1 = compute_state_groups_partial(&[create.clone(), member.clone()], &[]).groups;
+        let g2 = compute_state_groups_partial(&[create, member], &[]).groups;
         assert_eq!(g1, g2);
     }
 
