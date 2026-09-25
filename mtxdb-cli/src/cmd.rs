@@ -2,14 +2,15 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 
+use mtxdb::auxiliary::AuxiliaryIndex;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
-use mtxdb::packfile::storage::{OpenPath, RuntimeStats};
+use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
@@ -22,6 +23,89 @@ use simd_json::prelude::*;
 use simd_json::OwnedValue;
 
 use crate::{Cli, Commands};
+
+const MAX_DEBUG_UNRESOLVED: usize = 20;
+const STATE_GROUP_DIGEST_BYTES: usize = 32;
+const BASE64_BITS_PER_CHARACTER: usize = 6;
+const STATE_GROUP_ID_LENGTH: usize =
+    (STATE_GROUP_DIGEST_BYTES * 8).div_ceil(BASE64_BITS_PER_CHARACTER);
+
+/// Auxiliary namespace for the derived `event_id -> state_group_id` cache.
+///
+/// The namespace is versioned. These values are derived data, so any change to
+/// the derivation (hashing, resolution rules, ordering) must bump the suffix.
+/// A new namespace starts empty and is repopulated by recomputation on the next
+/// import; this is the only safe invalidation, since a well-formed cached value
+/// that is semantically stale cannot be detected without recomputing it. For
+/// the same reason a corrupted-but-well-formed entry is not self-correcting;
+/// recovering from that requires purging the namespace.
+/// The previous unversioned namespace is intentionally left as dead weight;
+/// auxiliary indexes are not globally enumerated or garbage-collected here.
+const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
+
+fn valid_state_group_id(value: &str) -> bool {
+    value.len() == STATE_GROUP_ID_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+enum StateGroupLoad {
+    Complete(HashMap<String, String>),
+    Missing,
+    Invalid {
+        event_id: String,
+        reason: &'static str,
+    },
+}
+
+/// Map a batch of cache values (in `event_ids` order) to a [`StateGroupLoad`].
+///
+/// Split out from [`load_state_groups`] so the cardinality guard is testable
+/// without a storage backend that deliberately violates `StorageEngine::get_many`.
+fn state_groups_from_values(event_ids: &[String], values: Vec<Option<Vec<u8>>>) -> StateGroupLoad {
+    if values.len() != event_ids.len() {
+        // StorageEngine::get_many promises request cardinality. A mismatch is
+        // a broken-backend condition, not an ordinary cache miss; recompute
+        // safely instead.
+        return StateGroupLoad::Invalid {
+            event_id: "<batch>".to_owned(),
+            reason: "cache returned the wrong number of values",
+        };
+    }
+    let mut groups = HashMap::with_capacity(event_ids.len());
+    for (event_id, value) in event_ids.iter().zip(values) {
+        let Some(value) = value else {
+            return StateGroupLoad::Missing;
+        };
+        let Ok(value) = String::from_utf8(value) else {
+            return StateGroupLoad::Invalid {
+                event_id: event_id.clone(),
+                reason: "invalid UTF-8",
+            };
+        };
+        if !valid_state_group_id(&value) {
+            return StateGroupLoad::Invalid {
+                event_id: event_id.clone(),
+                reason: "invalid state-group ID format",
+            };
+        }
+        groups.insert(event_id.clone(), value);
+    }
+    StateGroupLoad::Complete(groups)
+}
+
+fn load_state_groups(
+    aux: &AuxiliaryIndex<'_, PackfileStorage>,
+    event_ids: &[String],
+) -> Result<StateGroupLoad, mtxdb::storage::StorageError> {
+    if event_ids.is_empty() {
+        return Ok(StateGroupLoad::Complete(HashMap::new()));
+    }
+    let keys = event_ids.iter().map(String::as_bytes).collect::<Vec<_>>();
+    let values = aux.get_many(&keys)?;
+    Ok(state_groups_from_values(event_ids, values))
+}
 
 /// Human-readable byte count (`512 B`, `4.3 KB`, `1.2 MB`, `2.1 GB`) —
 /// raw byte counts in a shard listing are unreadable past a few digits.
@@ -175,6 +259,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Info { .. } => "info",
         Commands::Sync { .. } => "sync",
         Commands::Stats { .. } => "stats",
+        Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
         Commands::Export { .. } => "export",
         Commands::Repack { .. } => "repack",
@@ -244,6 +329,13 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
+        Commands::Meta {
+            target,
+            json,
+            limit,
+            offset,
+            decode,
+        } => cmd_meta(cli, target, *json, *limit, *offset, decode.as_deref()),
         Commands::Info { collection, stats } => match collection {
             Some(collection) => cmd_info(cli, collection),
             None => cmd_info_default(cli, *stats),
@@ -1786,38 +1878,10 @@ fn cmd_collections_coalesced(
             };
             let canonical_map: HashMap<[u8; 16], String> = if canonical {
                 PackfileStorage::open_read_only(pool_dir.clone())
-                        .ok()
-                        .map(|store| {
-                            summaries
-                                .iter()
-                                .map(|(id, _, _, _)| {
-                                    let display = store.get_collection_metadata(id).ok().flatten().map_or_else(
-                                        || "[unregistered]".to_owned(),
-                                        |metadata| {
-                                            let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
-                                            if metadata.verify_collection_id(id) {
-                                                if let Some(role) = &metadata.role {
-                                                    format!(
-                                                        "{raw} ({})",
-                                                        display_collection_role(role)
-                                                    )
-                                                } else {
-                                                    raw.into_owned()
-                                                }
-                                            } else {
-                                                eprintln!(
-                                                    "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
-                                                    format_id(id)
-                                                );
-                                                format!("[mismatch: {raw}]")
-                                            }
-                                        },
-                                    );
-                                    (*id, display)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
+                    .ok()
+                    .map_or_else(HashMap::new, |store| {
+                        canonical_collection_ids(&store, &summaries)
+                    })
             } else {
                 HashMap::new()
             };
@@ -2067,6 +2131,40 @@ fn cmd_collections_single(
     cmd_collections_in_dir(&selected_pool_dir(cli)?, layout, canonical, sort, limit)
 }
 
+fn canonical_collection_ids(
+    store: &PackfileStorage,
+    collections: &[CollectionSummary],
+) -> HashMap<[u8; 16], String> {
+    collections
+        .iter()
+        .map(|(id, _, _, _)| {
+            let display = store
+                .get_collection_metadata(id)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || "[unregistered]".to_owned(),
+                    |metadata| {
+                        let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
+                        if metadata.verify_collection_id(id) {
+                            metadata.role.as_ref().map_or_else(
+                                || raw.clone().into_owned(),
+                                |role| format!("{raw} ({})", display_collection_role(role)),
+                            )
+                        } else {
+                            eprintln!(
+                                "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
+                                format_id(id)
+                            );
+                            format!("[mismatch: {raw}]")
+                        }
+                    },
+                );
+            (*id, display)
+        })
+        .collect()
+}
+
 /// List logical collections from one pool. Cross-pool aggregation is deliberately
 /// avoided: each pool owns an independent 16-byte namespace and lifecycle.
 #[allow(
@@ -2103,38 +2201,9 @@ fn cmd_collections_in_dir(
     let canonical_ids: HashMap<[u8; 16], String> = if canonical {
         PackfileStorage::open_read_only(dir.to_path_buf())
             .ok()
-            .map(|store| {
-                collections
-                    .iter()
-                    .map(|(id, _, _, _)| {
-                        let display = store
-                            .get_collection_metadata(id)
-                            .ok()
-                            .flatten()
-                            .map_or_else(
-                                || "[unregistered]".to_owned(),
-                                |metadata| {
-                                    let raw = String::from_utf8_lossy(&metadata.collection_canonical_id);
-                                    if metadata.verify_collection_id(id) {
-                                            if let Some(role) = &metadata.role {
-                                                format!("{raw} ({})", display_collection_role(role))
-                                        } else {
-                                            raw.into_owned()
-                                        }
-                                    } else {
-                                        eprintln!(
-                                            "warning: collection {} canonical ID `{raw}` fails derivation verification (CORRUPT)",
-                                            format_id(id)
-                                        );
-                                        format!("[mismatch: {raw}]")
-                                    }
-                                },
-                            );
-                        (*id, display)
-                    })
-                    .collect()
+            .map_or_else(HashMap::new, |store| {
+                canonical_collection_ids(&store, &collections)
             })
-            .unwrap_or_default()
     } else {
         HashMap::new()
     };
@@ -4016,6 +4085,815 @@ fn metadata_file_summary(path: &Path) -> String {
     )
 }
 
+/// Inspect on-disk artifacts without opening a writer or acquiring any of the
+/// database locks. This intentionally works when the normal database opener
+/// cannot validate one of the files: `meta` is a recovery aid, not another
+/// database-open path.
+fn cmd_meta(
+    cli: &Cli,
+    target: &str,
+    json: bool,
+    limit: i64,
+    offset: i64,
+    decode: Option<&str>,
+) -> anyhow::Result<()> {
+    if cli.dirs.len() > 1 {
+        bail!("`mtxdb meta` accepts only one --dir target");
+    }
+    let root = cli.single_dir();
+    let limit = if limit <= 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    };
+    let offset = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+    let mut report = MetaReport::default();
+
+    match target {
+        "overview" => {
+            meta_db(root, &mut report);
+            meta_sidecars(root, &mut report);
+            meta_locks(root, &mut report);
+            meta_pools(root, &mut report, limit, offset, false);
+            meta_wal(root, &mut report, limit, offset, decode);
+            meta_checkpoints(root, &mut report);
+            meta_deltas(root, &mut report, limit, offset);
+            meta_health(root, &mut report);
+        }
+        "db" => meta_db(root, &mut report),
+        "wal" => meta_wal(root, &mut report, limit, offset, decode),
+        "checkpoint" => meta_checkpoints(root, &mut report),
+        "delta" => meta_deltas(root, &mut report, limit, offset),
+        "sidecars" => meta_sidecars(root, &mut report),
+        "packs" => meta_pools(root, &mut report, limit, offset, true),
+        "locks" => meta_locks(root, &mut report),
+        "raw" => meta_raw(root, &mut report, limit, offset),
+        _ => unreachable!("clap validates meta target"),
+    }
+
+    report.print(json);
+    Ok(())
+}
+
+#[derive(Default)]
+struct MetaReport {
+    lines: Vec<String>,
+    note_count: usize,
+    warn_count: usize,
+    error_count: usize,
+    unknown_count: usize,
+    json_records: Vec<OwnedValue>,
+}
+
+impl MetaReport {
+    fn line(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        self.lines.push(line.clone());
+        let mut fields = simd_json::owned::Object::new();
+        fields.insert("kind".to_owned(), OwnedValue::from("text"));
+        fields.insert("message".to_owned(), OwnedValue::from(line));
+        self.json_records.push(OwnedValue::Object(Box::new(fields)));
+    }
+
+    fn finding(&mut self, level: &str, path: &Path, message: impl std::fmt::Display) {
+        match level {
+            "NOTE" => self.note_count = self.note_count.saturating_add(1),
+            "WARN" => self.warn_count = self.warn_count.saturating_add(1),
+            "ERROR" => self.error_count = self.error_count.saturating_add(1),
+            _ => self.unknown_count = self.unknown_count.saturating_add(1),
+        }
+        let severity = if matches!(level, "NOTE" | "WARN" | "ERROR") {
+            level
+        } else {
+            "UNKNOWN"
+        };
+        let message = message.to_string();
+        let path = path.display().to_string();
+        self.lines.push(format!("[{severity}] {path}: {message}"));
+        let mut fields = simd_json::owned::Object::new();
+        fields.insert("kind".to_owned(), OwnedValue::from("diagnostic"));
+        fields.insert("severity".to_owned(), OwnedValue::from(severity));
+        fields.insert("path".to_owned(), OwnedValue::from(path));
+        fields.insert("message".to_owned(), OwnedValue::from(message));
+        self.json_records.push(OwnedValue::Object(Box::new(fields)));
+    }
+
+    fn print(self, json: bool) {
+        if json {
+            let value = self.json_value();
+            println!("{}", value.encode());
+        } else {
+            for line in self.lines {
+                println!("{line}");
+            }
+        }
+    }
+
+    fn json_value(self) -> OwnedValue {
+        let mut records = self.json_records;
+        let mut summary = simd_json::owned::Object::new();
+        summary.insert("kind".to_owned(), OwnedValue::from("summary"));
+        summary.insert(
+            "note".to_owned(),
+            OwnedValue::from(u64::try_from(self.note_count).unwrap_or(u64::MAX)),
+        );
+        summary.insert(
+            "warn".to_owned(),
+            OwnedValue::from(u64::try_from(self.warn_count).unwrap_or(u64::MAX)),
+        );
+        summary.insert(
+            "error".to_owned(),
+            OwnedValue::from(u64::try_from(self.error_count).unwrap_or(u64::MAX)),
+        );
+        summary.insert(
+            "unknown".to_owned(),
+            OwnedValue::from(u64::try_from(self.unknown_count).unwrap_or(u64::MAX)),
+        );
+        records.insert(0, OwnedValue::Object(Box::new(summary)));
+        OwnedValue::Array(Box::new(records))
+    }
+}
+
+fn meta_pool_dirs(root: &Path) -> impl Iterator<Item = (ShardType, PathBuf)> + '_ {
+    ShardType::ALL
+        .into_iter()
+        .map(|pool| (pool, root.join("pools").join(pool.as_str())))
+}
+
+fn meta_sidecars(root: &Path, report: &mut MetaReport) {
+    report.line(format!("database: {}", root.display()));
+    meta_file(root, "db.meta", report);
+    for (pool, dir) in meta_pool_dirs(root) {
+        report.line(format!("pool: {} ({})", pool.as_str(), dir.display()));
+        for name in [
+            "pool.meta",
+            "store.meta",
+            "journal.lsn",
+            "shard_stats.bin",
+            "shard_collections.bin",
+        ] {
+            meta_file(&dir, name, report);
+        }
+    }
+}
+
+fn meta_db(root: &Path, report: &mut MetaReport) {
+    let path = root.join(mtxdb::layout::DB_META_FILENAME);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.finding("WARN", &path, "missing database descriptor");
+            return;
+        }
+        Err(error) => {
+            report.finding("ERROR", &path, error);
+            return;
+        }
+    };
+    let layout = match mtxdb::layout::read_wal_layout(root) {
+        Ok(Some(layout)) => match layout {
+            mtxdb::WalLayout::Shared => "shared",
+            mtxdb::WalLayout::PerPool => "per-pool",
+        },
+        Ok(None) => "unknown",
+        Err(error) => {
+            report.finding("WARN", &path, error);
+            "invalid"
+        }
+    };
+    let pools = bytes.get(13..).map_or_else(
+        || "<truncated>".to_owned(),
+        |bytes| String::from_utf8_lossy(bytes).replace('\n', ", "),
+    );
+    report.line(format!(
+        "db.meta: {} bytes ({}, wal_layout={layout}, pools={pools})",
+        bytes.len(),
+        metadata_magic(&bytes),
+    ));
+}
+
+fn meta_file(dir: &Path, name: &str, report: &mut MetaReport) {
+    let path = dir.join(name);
+    match fs::metadata(&path) {
+        Ok(metadata) => {
+            if name == "journal.lsn" {
+                match fs::read(&path) {
+                    Ok(bytes) if bytes.len() >= 8 => report.line(format!(
+                        "  {name}: {} (covered_lsn={})",
+                        metadata.len(),
+                        u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
+                    )),
+                    Ok(_) => report.finding("WARN", &path, "truncated journal.lsn"),
+                    Err(error) => report.finding("ERROR", &path, error),
+                }
+            } else if name == "shard_collections.bin" {
+                match mtxdb::packfile::storage::read_persisted_shard_collections(dir) {
+                    Some(directory) => report.line(format!(
+                        "  {name}: {} bytes (fingerprint={:#x}, records={}, persisted_at={})",
+                        metadata.len(),
+                        directory.fingerprint,
+                        directory.records.len(),
+                        directory.persisted_at
+                    )),
+                    None => report.finding("WARN", &path, "invalid or unsupported sidecar"),
+                }
+            } else {
+                let mut header = [0_u8; 5];
+                match fs::File::open(&path).and_then(|mut file| {
+                    use std::io::Read as _;
+                    file.read_exact(&mut header)
+                }) {
+                    Ok(()) => report.line(format!(
+                        "  {name}: {} bytes ({})",
+                        metadata.len(),
+                        metadata_magic(&header)
+                    )),
+                    Err(error) => report.finding("WARN", &path, error),
+                }
+                if name == "store.meta" {
+                    if let Some(version) = mtxdb::shard::store_created_by_version(dir) {
+                        report.line(format!("    created_by: {version}"));
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.line(format!("  {name}: missing"));
+        }
+        Err(error) => report.finding("ERROR", &path, error),
+    }
+}
+
+fn metadata_magic(bytes: &[u8]) -> String {
+    let magic = bytes.get(..4).map_or_else(
+        || "<short>".to_owned(),
+        |raw| String::from_utf8_lossy(raw).into_owned(),
+    );
+    let version = bytes
+        .get(4)
+        .map_or_else(|| "?".to_owned(), std::string::ToString::to_string);
+    format!("magic={magic:?} version={version}")
+}
+
+fn meta_locks(root: &Path, report: &mut MetaReport) {
+    let wal_lock = root.join(".mtxdb.wal.lock");
+    if wal_lock.exists() {
+        meta_lock_line(&wal_lock, report);
+    }
+    for (_, dir) in meta_pool_dirs(root) {
+        let path = dir.join(".mtxdb.lock");
+        if path.exists() {
+            meta_lock_line(&path, report);
+        }
+    }
+}
+
+fn meta_lock_line(path: &Path, report: &mut MetaReport) {
+    match mtxdb::ShardPool::lock_holder_info(path) {
+        Some(info) => {
+            let holder = if info.has_starttime {
+                if info.running {
+                    "running"
+                } else {
+                    "not-running"
+                }
+            } else if info.running {
+                "exists"
+            } else {
+                "not-found"
+            };
+            report.line(format!(
+                "lock {}: pid={} {} confidence={}",
+                path.display(),
+                info.pid,
+                holder,
+                if info.has_starttime {
+                    "full"
+                } else {
+                    "limited"
+                }
+            ));
+        }
+        None => report.finding("WARN", path, "present but PID is unreadable"),
+    }
+}
+
+fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize, enumerate: bool) {
+    for (pool, dir) in meta_pool_dirs(root) {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                report.finding("ERROR", &dir, error);
+                continue;
+            }
+        };
+        let mut packs = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+            .collect::<Vec<_>>();
+        packs.sort();
+        report.line(format!(
+            "pool {}: {} pack file(s)",
+            pool.as_str(),
+            packs.len()
+        ));
+        if !enumerate {
+            continue;
+        }
+        for path in packs.into_iter().skip(offset).take(limit) {
+            match pack_identity(&path) {
+                PackIdentity::Valid { pack_id, length } => report.line(format!(
+                    "  {}: {} bytes, pack_id={pack_id:#x}",
+                    path.display(),
+                    length
+                )),
+                PackIdentity::NonCanonical(message) => {
+                    report.finding(PackIssueLevel::Note.as_str(), &path, message);
+                }
+                PackIdentity::Invalid(error) => {
+                    report.finding(PackIssueLevel::Warn.as_str(), &path, error);
+                }
+            }
+        }
+    }
+}
+
+enum PackIdentity {
+    Valid { pack_id: u64, length: u64 },
+    NonCanonical(String),
+    Invalid(anyhow::Error),
+}
+
+#[derive(Clone, Copy)]
+enum PackIssueLevel {
+    Note,
+    Warn,
+}
+
+impl PackIssueLevel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Note => "NOTE",
+            Self::Warn => "WARN",
+        }
+    }
+}
+
+fn pack_identity(path: &Path) -> PackIdentity {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned);
+    let Some(stem) = stem else {
+        return PackIdentity::Invalid(anyhow!("pack filename is not valid UTF-8"));
+    };
+    let Some(hex) = stem.strip_prefix("pack_") else {
+        return PackIdentity::NonCanonical(format!(
+            "pack filename `{stem}` is non-canonical; expected pack_<16 hex digits>.pack"
+        ));
+    };
+    if hex.len() != 16
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return PackIdentity::NonCanonical(format!(
+            "pack filename `{stem}` is non-canonical; expected pack_<16 lowercase hex digits>.pack"
+        ));
+    }
+    let result = (|| -> anyhow::Result<(u64, u64)> {
+        let filename_id = u64::from_str_radix(hex, 16)?;
+        let length = fs::metadata(path)?.len();
+        let mut file = BufReader::new(fs::File::open(path)?);
+        let header =
+            mtxdb::packfile::read_header(&mut file)?.ok_or_else(|| anyhow!("not a packfile"))?;
+        if header.pack_id != filename_id {
+            bail!(
+                "pack filename id {filename_id:#x} disagrees with header id {:#x}",
+                header.pack_id
+            );
+        }
+        Ok((header.pack_id, length))
+    })();
+    match result {
+        Ok((pack_id, length)) => PackIdentity::Valid { pack_id, length },
+        Err(error) => PackIdentity::Invalid(error),
+    }
+}
+
+fn meta_wal(
+    root: &Path,
+    report: &mut MetaReport,
+    limit: usize,
+    offset: usize,
+    decode: Option<&str>,
+) {
+    let mut paths = vec![root.join("wal.bin")];
+    paths.extend(meta_pool_dirs(root).map(|(_, dir)| dir.join("wal.bin")));
+    paths.sort();
+    paths.dedup();
+    if root.join("wal.bin").is_file() {
+        for (_, dir) in meta_pool_dirs(root) {
+            let legacy = dir.join("wal.bin");
+            if legacy.is_file() {
+                report.finding(
+                    "WARN",
+                    &legacy,
+                    "per-pool WAL is present but ignored because root wal.bin selects shared WAL",
+                );
+            }
+        }
+    }
+    for path in paths.into_iter().filter(|path| path.is_file()) {
+        match mtxdb::journal::Journal::scan_read_only(&path) {
+            Ok(scan) => {
+                report.line(format!(
+                    "wal {}: {} group(s), valid_len={}, base_lsn={}, truncated_tail={}",
+                    path.display(),
+                    scan.groups.len(),
+                    scan.valid_len,
+                    scan.base_lsn,
+                    scan.truncated_tail
+                ));
+                if scan.truncated_tail {
+                    report.finding(
+                        "WARN",
+                        &path,
+                        "truncated tail; complete groups were retained",
+                    );
+                }
+                for group in scan
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.entries.iter())
+                    .skip(offset)
+                    .take(limit)
+                {
+                    report.line(format!(
+                        "  lsn={} offset={} frame_len={} pool={:?} {}",
+                        group.lsn,
+                        group.offset,
+                        group.frame_len,
+                        group.pool,
+                        format_mutation(&group.mutation, decode)
+                    ));
+                }
+            }
+            Err(error) => report.finding("WARN", &path, error),
+        }
+    }
+}
+
+fn format_mutation(mutation: &mtxdb::journal::Mutation, decode: Option<&str>) -> String {
+    match mutation {
+        mtxdb::journal::Mutation::Put {
+            collection_id,
+            node_id,
+            payload,
+        } => {
+            let mut line = format!(
+                "kind=put collection=0x{} node=0x{} payload_len={}",
+                hex::encode(collection_id),
+                hex::encode(node_id),
+                payload.len()
+            );
+            if let Some(format) = decode {
+                match format {
+                    "raw" => {
+                        let _ = write!(line, " payload_hex=0x{}", hex::encode(payload));
+                    }
+                    "json" | "auto" => {
+                        let mut bytes = payload.clone();
+                        if std::str::from_utf8(&bytes).is_ok() {
+                            if let Ok(value) = simd_json::to_owned_value(&mut bytes) {
+                                let _ = write!(line, " payload={value}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            line
+        }
+        mtxdb::journal::Mutation::DeleteCollection { collection_id } => format!(
+            "kind=delete_collection collection=0x{}",
+            hex::encode(collection_id)
+        ),
+    }
+}
+
+fn meta_checkpoints(root: &Path, report: &mut MetaReport) {
+    for (_, dir) in meta_pool_dirs(root) {
+        let path = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
+        if !path.is_file() {
+            continue;
+        }
+        match mtxdb::index::checkpoint::read_checkpoint(&path) {
+            Some(checkpoint) => {
+                report.line(format!(
+                    "checkpoint {}: covered_lsn={} fingerprint={:#x} collections={} packs={}",
+                    path.display(),
+                    checkpoint.covered_lsn,
+                    checkpoint.fingerprint,
+                    checkpoint.collections.len(),
+                    checkpoint.pack_table.len()
+                ));
+                match meta_pack_fingerprint(&dir) {
+                    Ok((fingerprint, issues)) => {
+                        let issue_count = issues.len();
+                        let invalid_count = issues
+                            .iter()
+                            .filter(|(level, _)| matches!(level, PackIssueLevel::Warn))
+                            .count();
+                        for (level, issue) in issues {
+                            report.finding(level.as_str(), &dir, issue);
+                        }
+                        if invalid_count != 0 {
+                            report.finding(
+                                "NOTE",
+                                &dir,
+                                format!(
+                                    "fingerprint comparison skipped: {invalid_count} invalid pack issue(s); {issue_count} total pack issue(s)"
+                                ),
+                            );
+                        } else if fingerprint != checkpoint.fingerprint {
+                            report.finding(
+                                "WARN",
+                                &path,
+                                format!(
+                                    "fingerprint mismatch: checkpoint={:#x} packs={:#x}",
+                                    checkpoint.fingerprint, fingerprint
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => report.finding("WARN", &dir, error),
+                }
+            }
+            None => report.finding("WARN", &path, "invalid, corrupt, or unsupported checkpoint"),
+        }
+    }
+}
+
+fn meta_pack_fingerprint(dir: &Path) -> anyhow::Result<(u64, Vec<(PackIssueLevel, String)>)> {
+    let mut packs = Vec::new();
+    let mut issues = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "pack")
+        {
+            continue;
+        }
+        match pack_identity(&path) {
+            PackIdentity::Valid { pack_id, length } => packs.push((pack_id, length)),
+            PackIdentity::NonCanonical(message) => issues.push((
+                PackIssueLevel::Note,
+                format!("{}: {message}", path.display()),
+            )),
+            PackIdentity::Invalid(error) => {
+                issues.push((PackIssueLevel::Warn, format!("{}: {error}", path.display())));
+            }
+        }
+    }
+    Ok((mtxdb::index::checkpoint::pack_fingerprint(&packs), issues))
+}
+
+fn meta_health(root: &Path, report: &mut MetaReport) {
+    let shared_wal = root.join("wal.bin");
+    for (pool, dir) in meta_pool_dirs(root) {
+        let checkpoint_path = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
+        let checkpoint = mtxdb::index::checkpoint::read_checkpoint(&checkpoint_path);
+        let journal_lsn = PackfileStorage::read_journal_lsn(&dir);
+        let wal_path = if shared_wal.is_file() {
+            shared_wal.clone()
+        } else {
+            dir.join("wal.bin")
+        };
+        let Ok(scan) = mtxdb::journal::Journal::scan_read_only(&wal_path) else {
+            continue;
+        };
+        let wal_lsn = scan.groups.last().map(|group| group.last_lsn);
+        if checkpoint.is_some() || journal_lsn != 0 || wal_lsn.is_some() {
+            report.line(format!(
+                "health {}: journal.lsn={} checkpoint.covered_lsn={} wal.last_lsn={}",
+                pool.as_str(),
+                journal_lsn,
+                checkpoint.as_ref().map_or(0, |value| value.covered_lsn),
+                wal_lsn.map_or_else(|| "header-only/empty".to_owned(), |lsn| lsn.to_string())
+            ));
+        }
+        if journal_lsn < checkpoint.as_ref().map_or(0, |value| value.covered_lsn) {
+            report.finding("NOTE", &dir, "journal.lsn is behind checkpoint coverage (may be transient during checkpoint persistence)");
+        }
+        if wal_lsn.is_some_and(|lsn| lsn < journal_lsn) {
+            report.finding("WARN", &wal_path, "WAL last LSN is behind journal.lsn");
+        }
+    }
+}
+
+fn meta_deltas(root: &Path, report: &mut MetaReport, limit: usize, offset: usize) {
+    for (_, dir) in meta_pool_dirs(root) {
+        let epochs = match mtxdb::index::delta::list_epochs(&dir) {
+            Ok(epochs) => epochs,
+            Err(error) => {
+                report.finding("ERROR", &dir, error);
+                continue;
+            }
+        };
+        let checkpoint_fingerprint = mtxdb::index::checkpoint::read_checkpoint(
+            &dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+        )
+        .map(|checkpoint| checkpoint.fingerprint);
+        for (fingerprint, path) in epochs {
+            if checkpoint_fingerprint != Some(fingerprint) {
+                report.finding(
+                    "NOTE",
+                    &path,
+                    format!("epoch is not selected by current checkpoint fingerprint ({checkpoint_fingerprint:?}); likely orphaned or stale"),
+                );
+            }
+            if let Some(log) = mtxdb::index::delta::read_delta_log_v3(&path) {
+                report.line(format!(
+                "delta {} epoch={fingerprint:#x}: v3 operations={} base={:#x} tail={:#x} committed_len={} torn_tail={}",
+                path.display(),
+                log.operations.len(),
+                log.base_fingerprint,
+                log.tail_fingerprint,
+                log.file_len,
+                log.torn_tail
+            ));
+                if log.torn_tail {
+                    report.finding(
+                        "WARN",
+                        &path,
+                        "truncated or invalid tail; committed prefix decoded",
+                    );
+                }
+                for operation in log.operations.iter().skip(offset).take(limit) {
+                    report.line(format!("  {}", format_delta_operation(operation)));
+                }
+            } else if let Some(log) = mtxdb::index::delta::read_delta_log(&path) {
+                report.line(format!(
+                    "delta {}: v2 frames={} base={:#x} tail={:#x} committed_len={} torn_tail={}",
+                    path.display(),
+                    log.frames.len(),
+                    log.base_fingerprint,
+                    log.tail_fingerprint,
+                    log.file_len,
+                    log.torn_tail
+                ));
+                if log.torn_tail {
+                    report.finding(
+                        "WARN",
+                        &path,
+                        "truncated or invalid tail; committed prefix decoded",
+                    );
+                }
+                for frame in log.frames.iter().skip(offset).take(limit) {
+                    report.line(format!("  {}", format_delta_frame(frame)));
+                }
+            } else {
+                report.finding("WARN", &path, "invalid, corrupt, or unsupported delta log");
+            }
+        }
+    }
+}
+
+fn format_delta_frame(frame: &mtxdb::index::format::DeltaFrame) -> String {
+    format!(
+        "kind=incremental collection=0x{} bucket={} generation={} slot={:#x}",
+        hex::encode(frame.collection_id),
+        frame.bucket,
+        frame.generation,
+        frame.slot
+    )
+}
+
+fn format_delta_operation(operation: &mtxdb::index::delta::DeltaOperation) -> String {
+    use mtxdb::index::delta::DeltaOperation;
+    match operation {
+        DeltaOperation::Incremental(frame) => format_delta_frame(frame),
+        DeltaOperation::CollectionSnapshot {
+            collection_id,
+            generation,
+            order_key,
+            index_blob,
+        } => format!(
+            "kind=collection_snapshot collection=0x{} generation={} order_key={} index_blob_len={}",
+            hex::encode(collection_id),
+            generation,
+            order_key,
+            index_blob.len()
+        ),
+        DeltaOperation::CollectionTombstone {
+            collection_id,
+            generation,
+        } => format!(
+            "kind=collection_tombstone collection=0x{} generation={}",
+            hex::encode(collection_id),
+            generation
+        ),
+    }
+}
+
+fn meta_raw(root: &Path, report: &mut MetaReport, limit: usize, offset: usize) {
+    let mut files = vec![
+        root.join(mtxdb::layout::DB_META_FILENAME),
+        root.join("wal.bin"),
+    ];
+    files.extend(meta_pool_dirs(root).flat_map(|(_, dir)| {
+        [
+            "pool.meta",
+            "store.meta",
+            "journal.lsn",
+            "index.checkpoint",
+            "shard_stats.bin",
+            "shard_collections.bin",
+        ]
+        .into_iter()
+        .map(move |name| dir.join(name))
+    }));
+    for (_, dir) in meta_pool_dirs(root) {
+        if let Ok(epochs) = mtxdb::index::delta::list_epochs(&dir) {
+            files.extend(epochs.into_iter().map(|(_, path)| path));
+        }
+    }
+    let mut remaining_offset = offset;
+    let mut remaining_limit = limit;
+    for path in files.into_iter().filter(|path| path.is_file()) {
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report.finding("ERROR", &path, error);
+                continue;
+            }
+        };
+        report.line(format!("raw {} ({} bytes)", path.display(), metadata.len()));
+        if remaining_limit == 0 {
+            break;
+        }
+        let total_chunks =
+            usize::try_from(metadata.len().saturating_add(15) / 16).unwrap_or(usize::MAX);
+        let skip = remaining_offset.min(total_chunks);
+        remaining_offset = remaining_offset.saturating_sub(skip);
+        let available = total_chunks.saturating_sub(skip);
+        let take = available.min(remaining_limit);
+        if take == 0 {
+            continue;
+        }
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                report.finding("ERROR", &path, error);
+                continue;
+            }
+        };
+        if let Err(error) = file.seek(SeekFrom::Start(
+            u64::try_from(skip).unwrap_or(u64::MAX).saturating_mul(16),
+        )) {
+            report.finding("ERROR", &path, error);
+            continue;
+        }
+        let byte_count = take.saturating_mul(16);
+        let mut bytes = vec![0_u8; byte_count];
+        let read = match file.read(&mut bytes) {
+            Ok(read) => read,
+            Err(error) => {
+                report.finding("ERROR", &path, error);
+                continue;
+            }
+        };
+        bytes.truncate(read);
+        for (index, chunk) in bytes.chunks(16).enumerate() {
+            let hex = chunk
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii = chunk
+                .iter()
+                .map(|byte| {
+                    if byte.is_ascii_graphic() {
+                        *byte as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect::<String>();
+            report.line(format!(
+                "  {:08x}  {hex:<47}  |{ascii}|",
+                skip.saturating_add(index).saturating_mul(16)
+            ));
+        }
+        remaining_limit = remaining_limit.saturating_sub(bytes.chunks(16).count());
+    }
+}
+
 fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
     let root = cli.single_dir();
@@ -4040,7 +4918,7 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
         let collection_count =
             PackfileStorage::collection_summaries_from_disk(&dir).map(|summaries| summaries.len());
         let checkpoint = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
-        let delta = dir.join(mtxdb::index::delta::INDEX_DELTA_FILE);
+        let delta_epochs = mtxdb::index::delta::list_epochs(&dir).unwrap_or_default();
 
         println!("pool: {} ({})", shard_type.as_str(), dir.display());
         println!(
@@ -4067,10 +4945,14 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
             } else {
                 "missing".to_owned()
             },
-            if delta.is_file() {
-                fmt_bytes(fs::metadata(&delta)?.len())
-            } else {
+            if delta_epochs.is_empty() {
                 "missing".to_owned()
+            } else {
+                let bytes = delta_epochs
+                    .iter()
+                    .filter_map(|(_, path)| fs::metadata(path).ok().map(|meta| meta.len()))
+                    .sum::<u64>();
+                format!("{} epoch(s), {}", delta_epochs.len(), fmt_bytes(bytes))
             }
         );
         println!(
@@ -5535,51 +6417,7 @@ fn scan_pack(
         );
         if opts.header {
             if let Some(record) = &data {
-                if *node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
-                    if let Some(meta) = CollectionMetadata::decode(&record.data) {
-                        let pool = meta.member_namespace.as_ref().map_or_else(
-                            || "none".to_owned(),
-                            |d| String::from_utf8_lossy(d).into_owned(),
-                        );
-                        let role = meta.role.as_ref().map_or_else(
-                            || "unspecified".to_owned(),
-                            std::string::ToString::to_string,
-                        );
-                        let schema = meta.schema.as_deref().unwrap_or("none");
-                        let verified = meta.verify_collection_id(collection_id);
-                        let verify_str = if verified {
-                            "valid"
-                        } else {
-                            "MISMATCH / CORRUPT"
-                        };
-                        println!(
-                            "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
-                            String::from_utf8_lossy(&meta.collection_canonical_id)
-                        );
-                    } else {
-                        println!("    [header] genesis metadata (corrupt TLV block)");
-                    }
-                } else if let Some(meta) = &record.metadata {
-                    let mut details = Vec::new();
-                    if let Some(logical_id) = &meta.logical_id {
-                        details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
-                    }
-                    if let Some(content_digest) = &meta.content_digest {
-                        details.push(format!("digest: 0x{}", hex::encode(content_digest)));
-                    }
-                    if let Some(role) = &meta.role {
-                        details.push(format!("role: {}", String::from_utf8_lossy(role)));
-                    }
-                    if details.is_empty() {
-                        println!(
-                            "    [header] frame metadata block present (no recognized fields)"
-                        );
-                    } else {
-                        println!("    [header] frame metadata: {}", details.join(", "));
-                    }
-                } else {
-                    println!("    [header] standard frame (no metadata block)");
-                }
+                print_scan_record_header(record, collection_id);
             }
         }
         let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
@@ -5979,49 +6817,7 @@ fn print_collection_record(
     );
     if context.header {
         if let Some(record) = &data {
-            if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
-                if let Some(meta) = CollectionMetadata::decode(&record.data) {
-                    let pool = meta.member_namespace.as_ref().map_or_else(
-                        || "none".to_owned(),
-                        |d| String::from_utf8_lossy(d).into_owned(),
-                    );
-                    let role = meta.role.as_ref().map_or_else(
-                        || "unspecified".to_owned(),
-                        std::string::ToString::to_string,
-                    );
-                    let schema = meta.schema.as_deref().unwrap_or("none");
-                    let verified = meta.verify_collection_id(&context.collection_id);
-                    let verify_str = if verified {
-                        "valid"
-                    } else {
-                        "MISMATCH / CORRUPT"
-                    };
-                    println!(
-                        "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
-                        String::from_utf8_lossy(&meta.collection_canonical_id)
-                    );
-                } else {
-                    println!("    [header] genesis metadata (corrupt TLV block)");
-                }
-            } else if let Some(meta) = &record.metadata {
-                let mut details = Vec::new();
-                if let Some(logical_id) = &meta.logical_id {
-                    details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
-                }
-                if let Some(content_digest) = &meta.content_digest {
-                    details.push(format!("digest: 0x{}", hex::encode(content_digest)));
-                }
-                if let Some(role) = &meta.role {
-                    details.push(format!("role: {}", String::from_utf8_lossy(role)));
-                }
-                if details.is_empty() {
-                    println!("    [header] frame metadata block present (no recognized fields)");
-                } else {
-                    println!("    [header] frame metadata: {}", details.join(", "));
-                }
-            } else {
-                println!("    [header] standard frame (no metadata block)");
-            }
+            print_scan_record_header(record, &context.collection_id);
         }
     }
     let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
@@ -6033,6 +6829,52 @@ fn print_collection_record(
         }
     }
     Ok(())
+}
+
+fn print_scan_record_header(record: &mtxdb::packfile::Record, collection_id: &[u8; 16]) {
+    if *collection_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+        if let Some(meta) = CollectionMetadata::decode(&record.data) {
+            let pool = meta.member_namespace.as_ref().map_or_else(
+                || "none".to_owned(),
+                |d| String::from_utf8_lossy(d).into_owned(),
+            );
+            let role = meta.role.as_ref().map_or_else(
+                || "unspecified".to_owned(),
+                std::string::ToString::to_string,
+            );
+            let schema = meta.schema.as_deref().unwrap_or("none");
+            let verified = meta.verify_collection_id(collection_id);
+            let verify_str = if verified {
+                "valid"
+            } else {
+                "MISMATCH / CORRUPT"
+            };
+            println!(
+                "    [header] genesis metadata: pool {pool}, role {role}, schema {schema}, canonical id {} ({verify_str})",
+                String::from_utf8_lossy(&meta.collection_canonical_id)
+            );
+        } else {
+            println!("    [header] genesis metadata (corrupt TLV block)");
+        }
+    } else if let Some(meta) = &record.metadata {
+        let mut details = Vec::new();
+        if let Some(logical_id) = &meta.logical_id {
+            details.push(format!("logical_id: 0x{}", hex::encode(logical_id)));
+        }
+        if let Some(content_digest) = &meta.content_digest {
+            details.push(format!("digest: 0x{}", hex::encode(content_digest)));
+        }
+        if let Some(role) = &meta.role {
+            details.push(format!("role: {}", String::from_utf8_lossy(role)));
+        }
+        if details.is_empty() {
+            println!("    [header] frame metadata block present (no recognized fields)");
+        } else {
+            println!("    [header] frame metadata: {}", details.join(", "));
+        }
+    } else {
+        println!("    [header] standard frame (no metadata block)");
+    }
 }
 
 fn scan_limit(limit: i64) -> usize {
@@ -7014,40 +7856,89 @@ fn import_pdu_events(
     persist_matrix_edges(&edge_store, template, events)?;
     edge_store.sync_all()?;
 
-    // A replayed batch cannot add any new state-group information. In
-    // particular, federation exports often replay a large auth chain around
-    // a handful of new PDUs; rebuilding that entire DAG for a zero-write
-    // batch only repeats work already done by the successful import.
-    let state_groups = if event_count == 0 {
-        HashMap::new()
-    } else {
-        match compute_state_groups(events, auth_chain) {
-            Ok(groups) => groups,
-            Err(cycle_events) => {
+    // Replayed batches still need state-group repair when the derived index is
+    // incomplete, but a complete replay should not rebuild the whole DAG.
+    // Read the existing mappings in one backend batch and only walk the DAG
+    // when at least one resolved mapping is absent. Resolved mappings are
+    // trusted as immutable federated-import results; unresolved events are
+    // deliberately left absent so a later import can repair them. Batches
+    // with unresolved events therefore pay the DAG-walk cost again on replay;
+    // skipping that safely would require persisting the missing-parent set.
+    let mut seen_state_event_ids = HashSet::new();
+    let graph_event_ids = events
+        .iter()
+        .chain(auth_chain.iter())
+        .filter_map(event_id)
+        .map(str::to_owned)
+        .filter(|event_id| seen_state_event_ids.insert(event_id.clone()))
+        .collect::<Vec<_>>();
+    let mut state_groups = HashMap::new();
+    let mut loaded = false;
+    let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+    if !graph_event_ids.is_empty() {
+        match load_state_groups(&aux, &graph_event_ids) {
+            Ok(StateGroupLoad::Complete(groups)) => {
+                state_groups = groups;
+                loaded = true;
+            }
+            Ok(StateGroupLoad::Missing) => {}
+            Ok(StateGroupLoad::Invalid { event_id, reason }) => {
                 eprintln!(
-                    "warning: skipping state-group computation: DAG has missing parents or cycles involving {} event(s)",
-                    cycle_events.len()
+                    "warning: invalid cached state-group mapping for {event_id} ({reason}); recomputing state groups"
                 );
-                HashMap::new()
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: unable to read state-group mappings; recomputing state groups: {error}"
+                );
             }
         }
+    }
+    let unresolved_count = if loaded {
+        0
+    } else {
+        let state_computation = compute_state_groups_partial(events, auth_chain);
+        let unresolved = state_computation.unresolved;
+        state_groups = state_computation.groups;
+        if !unresolved.is_empty() {
+            eprintln!(
+                "warning: partial state-group computation: {} event(s) have missing parents or are in cycles; resolvable events were retained",
+                unresolved.len()
+            );
+            if crate::debug_enabled() {
+                let shown = unresolved.iter().take(MAX_DEBUG_UNRESOLVED);
+                eprintln!("debug: unresolved state events:");
+                for event_id in shown {
+                    eprintln!("  {event_id}");
+                }
+                if unresolved.len() > MAX_DEBUG_UNRESOLVED {
+                    eprintln!(
+                        "  ... {} more",
+                        unresolved.len().saturating_sub(MAX_DEBUG_UNRESOLVED)
+                    );
+                }
+            }
+        }
+        unresolved.len()
     };
-    if !state_groups.is_empty() {
-        use mtxdb::auxiliary::AuxiliaryIndex;
-        let aux = AuxiliaryIndex::open(state_store, "sys:matrix-state-groups");
+    let graph_event_count = graph_event_ids.len();
+    let mapped_event_count = state_groups.len();
+    let unique_state_group_count = state_groups.values().collect::<HashSet<_>>().len();
+    let stateless_event_count = graph_event_count.saturating_sub(mapped_event_count);
+    let source = if loaded { "loaded" } else { "computed" };
+    eprintln!(
+        "  state groups: {source} {unique_state_group_count} state groups across {mapped_event_count} events, {stateless_event_count} events unmapped ({unresolved_count} unresolved)"
+    );
+    if !loaded && !state_groups.is_empty() {
+        // State-group derivation is a function of each event's ancestry, not
+        // batch composition, so concurrent imports writing the same keys have
+        // a benign last-writer win.
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
             .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
             .collect();
-        let state_count = match aux.put_many(&entries) {
-            Ok(count) => count as u64,
-            Err(error) => {
-                eprintln!("warning: unable to persist state groups: {error}");
-                0
-            }
-        };
-        if state_count > 0 {
-            eprintln!("  state groups: {state_count}");
+        if let Err(error) = aux.put_many(&entries) {
+            eprintln!("warning: unable to persist state groups: {error}");
         }
     }
 
@@ -7410,6 +8301,21 @@ fn build_event_dag(
     HashMap<String, u64>,
     HashMap<u64, String>,
 ) {
+    build_event_dag_with_missing_edges(events, false)
+}
+
+/// Build a DAG with optional synthetic IDs for edges to events outside the
+/// input batch. State-group computation enables these IDs so absent parents
+/// remain non-resident and block descendants; import ordering leaves them out
+/// so older parents do not disable the existing in-batch topological order.
+fn build_event_dag_with_missing_edges(
+    events: &[OwnedValue],
+    include_missing_edges: bool,
+) -> (
+    mtxdb::dag::ActiveRoomFrontier,
+    HashMap<String, u64>,
+    HashMap<u64, String>,
+) {
     use mtxdb::dag::ActiveRoomFrontier;
 
     let mut frontier = ActiveRoomFrontier::new();
@@ -7427,10 +8333,11 @@ fn build_event_dag(
         let Some(&short_id) = id_map.get(eid) else {
             continue;
         };
-        let raw_prevs = extract_event_edge_ids(ev, "prev_events", &id_map);
-        let raw_auths = extract_event_edge_ids(ev, "auth_events", &id_map);
+        let raw_prevs = extract_event_edge_ids(ev, "prev_events", &id_map, include_missing_edges);
+        let raw_auths = extract_event_edge_ids(ev, "auth_events", &id_map, include_missing_edges);
         frontier.insert_event(short_id, &raw_prevs, &raw_auths);
     }
+    frontier.rebind_resident_edges();
     let reverse_map: HashMap<u64, String> = id_map
         .iter()
         .map(|(eid, &sid)| (sid, eid.clone()))
@@ -7443,6 +8350,7 @@ fn extract_event_edge_ids(
     event: &OwnedValue,
     field: &str,
     id_map: &HashMap<String, u64>,
+    include_missing_edges: bool,
 ) -> Vec<u64> {
     let OwnedValue::Object(fields) = event else {
         return Vec::new();
@@ -7457,7 +8365,11 @@ fn extract_event_edge_ids(
                 OwnedValue::Array(parts) => parts.first().and_then(|v| v.as_str()),
                 _ => None,
             };
-            eid.and_then(|eid| id_map.get(eid).copied())
+            eid.and_then(|eid| match id_map.get(eid).copied() {
+                Some(short_id) => Some(short_id),
+                None if include_missing_edges => Some(event_short_id(eid)),
+                None => None,
+            })
         })
         .collect()
 }
@@ -7562,6 +8474,16 @@ fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usiz
     )
 }
 
+/// Results from a partial state-group walk.
+///
+/// `groups` contains the `event_id` -> `state_group_id` mappings that could
+/// be resolved. `unresolved` contains events blocked by missing parents or
+/// cycles.
+struct PartialStateComputation {
+    groups: HashMap<String, String>,
+    unresolved: Vec<String>,
+}
+
 /// Compute state groups for a set of events by walking the event DAG in
 /// topological order.
 ///
@@ -7570,25 +8492,22 @@ fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usiz
 /// events contribute to the state set.
 ///
 /// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
-/// BLAKE3 digest of the state set). Each event inherits the state from
-/// its `prev_events` and applies its own state change (if it is a state
-/// event with `state_key`).
-///
-/// # Errors
-/// Returns `Err` with involved event IDs if the DAG contains a cycle or
-/// references parents absent from the combined event set.
-fn compute_state_groups(
+/// BLAKE3 digest of the state set) for resolvable events. Each event inherits
+/// the state from its `prev_events` and applies its own state change (if it is
+/// a state event with `state_key`). Events blocked by missing parents or
+/// cycles are reported separately in `unresolved`.
+fn compute_state_groups_partial(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
-) -> Result<HashMap<String, String>, Vec<String>> {
-    compute_state_groups_in_view(events, auth_chain, StateView::Federated)
+) -> PartialStateComputation {
+    compute_state_groups_partial_in_view(events, auth_chain, StateView::Federated)
 }
 
-fn compute_state_groups_in_view(
+fn compute_state_groups_partial_in_view(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
     view: StateView,
-) -> Result<HashMap<String, String>, Vec<String>> {
+) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
     // rooms.
@@ -7599,16 +8518,24 @@ fn compute_state_groups_in_view(
         combined = events.iter().chain(auth_chain.iter()).cloned().collect();
         &combined
     };
-    let missing_parents = missing_prev_event_ids(all_owned);
-    if !missing_parents.is_empty() {
-        return Err(missing_parents);
+    if crate::debug_enabled() {
+        let direct_missing = missing_prev_event_ids(all_owned);
+        if !direct_missing.is_empty() {
+            eprintln!(
+                "debug: {} event(s) directly reference missing prev_events",
+                direct_missing.len()
+            );
+        }
     }
-    let (frontier, id_map, reverse_map) = build_event_dag(all_owned);
+    let (frontier, id_map, reverse_map) = build_event_dag_with_missing_edges(all_owned, true);
     if frontier.is_empty() {
-        return Ok(HashMap::new());
+        return PartialStateComputation {
+            groups: HashMap::new(),
+            unresolved: Vec::new(),
+        };
     }
 
-    let sorted = topo_sort_dag(&frontier, &reverse_map)?;
+    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map);
 
     let mut events_by_sid: HashMap<u64, &OwnedValue> = HashMap::new();
     for ev in all_owned {
@@ -7619,11 +8546,26 @@ fn compute_state_groups_in_view(
         }
     }
 
+    let result = walk_state_groups(&frontier, &sorted, &reverse_map, &events_by_sid, view);
+
+    PartialStateComputation {
+        groups: result,
+        unresolved,
+    }
+}
+
+fn walk_state_groups(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    sorted: &[usize],
+    reverse_map: &HashMap<u64, String>,
+    events_by_sid: &HashMap<u64, &OwnedValue>,
+    view: StateView,
+) -> HashMap<String, String> {
     // How many resident children still need each event's state. Once the last
     // child is processed the state is dropped, so memory follows the DAG's
     // frontier width instead of holding one state per event for the whole run.
     let mut remaining_children: HashMap<u64, usize> = HashMap::new();
-    for &idx in &sorted {
+    for &idx in sorted {
         for edge in frontier.prev_edges(idx) {
             if edge.is_resident() {
                 let count = remaining_children
@@ -7638,9 +8580,8 @@ fn compute_state_groups_in_view(
     let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
     let mut result: HashMap<String, String> = HashMap::new();
 
-    for &idx in &sorted {
+    for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
-
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
         for edge in frontier.prev_edges(idx) {
@@ -7654,25 +8595,27 @@ fn compute_state_groups_in_view(
             }
         }
 
-        // Union of the parents' states, first parent winning on conflict. An
-        // event whose parents all agree shares their state instead of copying
-        // it, so a plain message event costs no allocation.
+        // Union of the parents' states, with the first parent winning on a
+        // conflicting key. This is a temporary simplification of Matrix
+        // state resolution; changing it requires a state-group namespace bump.
+        // An event whose parents all agree shares their state instead of
+        // copying it, so a plain message event costs no allocation.
         let base: Arc<SharedState> = match parents.as_slice() {
             [] => Arc::clone(&empty),
             [only] => Arc::clone(only),
-            [first, rest @ ..] => {
+            [first, rest @ ..]
                 if rest
                     .iter()
-                    .all(|p| Arc::ptr_eq(p, first) || p.digest == first.digest)
-                {
-                    Arc::clone(first)
-                } else {
-                    let mut merged = StateSet::new();
-                    for parent in &parents {
-                        merged.merge(&parent.set);
-                    }
-                    SharedState::new(merged)
+                    .all(|p| Arc::ptr_eq(p, first) || p.digest == first.digest) =>
+            {
+                Arc::clone(first)
+            }
+            [..] => {
+                let mut merged = StateSet::new();
+                for parent in &parents {
+                    merged.merge(&parent.set);
                 }
+                SharedState::new(merged)
             }
         };
 
@@ -7692,7 +8635,6 @@ fn compute_state_groups_in_view(
         if let Some(eid) = reverse_map.get(&short_id) {
             result.insert(eid.clone(), state.digest.clone());
         }
-
         for parent_id in parent_ids {
             if let Some(count) = remaining_children.get_mut(&parent_id) {
                 *count = count.saturating_sub(1);
@@ -7705,14 +8647,12 @@ fn compute_state_groups_in_view(
             state_at.insert(short_id, state);
         }
     }
-
-    Ok(result)
+    result
 }
 
 /// Return the events whose `prev_events` reference a parent absent from this
-/// import batch. The DAG builder represents these as disk-resident edges and
-/// the topological sort will eventually reject the whole batch; checking here
-/// avoids building and sorting a large doomed frontier first.
+/// import batch. This remains useful for diagnostics even though the partial
+/// state walker no longer rejects the entire batch up front.
 fn missing_prev_event_ids(events: &[OwnedValue]) -> Vec<String> {
     let known: HashSet<&str> = events.iter().filter_map(event_id).collect();
     let mut missing = Vec::new();
@@ -7739,6 +8679,87 @@ fn missing_prev_event_ids(events: &[OwnedValue]) -> Vec<String> {
     }
     missing.sort();
     missing
+}
+
+/// Sort the resolvable portion of a DAG. Nodes with an absent parent, and all
+/// of their descendants, are excluded; a cycle and its descendants are also
+/// excluded. Independent components continue to be processed normally.
+fn partial_topo_sort_dag(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    reverse_map: &HashMap<u64, String>,
+) -> (Vec<usize>, Vec<String>) {
+    let n = frontier.nodes.len();
+    let mut in_degree = vec![0usize; n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut blocked = vec![false; n];
+    let mut blocked_queue = VecDeque::new();
+
+    for (idx, _node) in frontier.nodes.iter().enumerate() {
+        for edge in frontier.prev_edges(idx) {
+            if edge.is_resident() {
+                let parent_idx = edge.arena_index();
+                children[parent_idx].push(idx);
+                in_degree[idx] = in_degree[idx].saturating_add(1);
+            } else if !blocked[idx] {
+                blocked[idx] = true;
+                blocked_queue.push_back(idx);
+            }
+        }
+    }
+
+    while let Some(idx) = blocked_queue.pop_front() {
+        for &child in &children[idx] {
+            if !blocked[child] {
+                blocked[child] = true;
+                blocked_queue.push_back(child);
+            }
+        }
+    }
+
+    let mut queue: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
+    for (idx, &degree) in in_degree.iter().enumerate() {
+        if !blocked[idx] && degree == 0 {
+            let event_id = reverse_map
+                .get(&frontier.nodes[idx].short_id)
+                .cloned()
+                .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id));
+            queue.push(Reverse((event_id, idx)));
+        }
+    }
+
+    let mut sorted = Vec::with_capacity(n.saturating_sub(blocked.iter().filter(|&&v| v).count()));
+    let mut processed = vec![false; n];
+    while let Some(Reverse((_, idx))) = queue.pop() {
+        if processed[idx] {
+            continue;
+        }
+        processed[idx] = true;
+        sorted.push(idx);
+        for &child in &children[idx] {
+            in_degree[child] = in_degree[child].saturating_sub(1);
+            if !blocked[child] && in_degree[child] == 0 {
+                let event_id = reverse_map
+                    .get(&frontier.nodes[child].short_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[child].short_id));
+                queue.push(Reverse((event_id, child)));
+            }
+        }
+    }
+
+    let mut unresolved = processed
+        .iter()
+        .enumerate()
+        .filter(|&(_idx, done)| !done)
+        .map(|(idx, _done)| {
+            reverse_map
+                .get(&frontier.nodes[idx].short_id)
+                .cloned()
+                .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id))
+        })
+        .collect::<Vec<_>>();
+    unresolved.sort();
+    (sorted, unresolved)
 }
 
 /// A state set with its state-group digest computed once, so events that share
@@ -9001,17 +10022,20 @@ mod tests {
     use super::{
         blake3_digest, build_event_dag, canonical_column_width, cmd_collections, cmd_get,
         cmd_import_file, cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-        collection_canonical_id, compile_import_template, compute_state_groups,
+        collection_canonical_id, compile_import_template, compute_state_groups_partial,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
         default_matrix_import_template, derive_template_key, display_collection_role, event_id,
         event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
         format_canonical_display, format_id, glob_pack_files, import_pdu_events,
-        interleaving_worth_noting, listing_shard_types, matrix_batch_has_create,
-        matrix_room_collection_id, matrix_room_extension_from_store, parse_federation_input,
+        interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
+        matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints,
+        meta_lock_line, meta_pools, meta_raw, pack_identity, parse_federation_input,
         parse_pack_id_selector, parse_pack_selectors, pretty_print_payload, redacted_event_bytes,
         resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        MatrixRoomExtension, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+        template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
+        verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, PackIdentity,
+        StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+        STATE_GROUP_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -9024,7 +10048,7 @@ mod tests {
         content_digest, derive_collection_id, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion,
         ShardType,
     };
-    use simd_json::prelude::{ValueObjectAccess, Writable};
+    use simd_json::prelude::{ValueAsScalar, ValueObjectAccess, Writable};
     use simd_json::OwnedValue;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -9078,6 +10102,182 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn meta_json_summary_has_numeric_severity_counts() {
+        let mut report = MetaReport::default();
+        report.finding("NOTE", Path::new("note"), "transient");
+        report.finding("WARN", Path::new("warn"), "mismatch");
+        report.finding("ERROR", Path::new("error"), "unreadable");
+        let value = report.json_value();
+        let encoded = value.encode();
+        let mut bytes = encoded.into_bytes();
+        let parsed = simd_json::to_owned_value(&mut bytes).expect("meta JSON must parse");
+        let simd_json::OwnedValue::Array(records) = parsed else {
+            panic!("meta JSON must be an array");
+        };
+        let simd_json::OwnedValue::Object(summary) = &records[0] else {
+            panic!("summary must be an object");
+        };
+        assert_eq!(
+            summary.get("kind").and_then(OwnedValue::as_str),
+            Some("summary")
+        );
+        assert_eq!(summary.get("note").and_then(OwnedValue::as_u64), Some(1));
+        assert_eq!(summary.get("warn").and_then(OwnedValue::as_u64), Some(1));
+        assert_eq!(summary.get("error").and_then(OwnedValue::as_u64), Some(1));
+    }
+
+    #[test]
+    fn meta_raw_paginates_across_files() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(root.join("db.meta"), (0_u8..32).collect::<Vec<_>>()).unwrap();
+        std::fs::write(state.join("pool.meta"), (32_u8..64).collect::<Vec<_>>()).unwrap();
+        let mut report = MetaReport::default();
+        meta_raw(&root, &mut report, 3, 1);
+        let raw_lines = report
+            .lines
+            .iter()
+            .filter(|line| line.contains('|'))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(raw_lines.len(), 3);
+        assert!(raw_lines[0].contains("00000010"));
+        assert!(raw_lines[1].contains("00000000"));
+        assert!(raw_lines[2].contains("00000010"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meta_lock_reports_pid_confidence_without_probe() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".mtxdb.lock");
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        let info = mtxdb::ShardPool::lock_holder_info(&path).expect("PID marker");
+        assert_eq!(info.pid, std::process::id());
+        assert!(info.running);
+        assert!(!info.has_starttime);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meta_lock_reports_full_confidence_for_starttime_marker() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".mtxdb.lock");
+        std::fs::write(&path, b"1 1\n").unwrap();
+        let mut report = MetaReport::default();
+        meta_lock_line(&path, &mut report);
+        assert!(report.lines[0].contains("confidence=full"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noncanonical_pack_identity_is_a_note() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = state.join("foreign.pack");
+        std::fs::write(&path, b"not a canonical pack").unwrap();
+        assert!(matches!(
+            pack_identity(&path),
+            PackIdentity::NonCanonical(_)
+        ));
+        let mut report = MetaReport::default();
+        meta_pools(&root, &mut report, usize::MAX, 0, true);
+        assert!(report.lines.iter().any(|line| line.starts_with("[NOTE]")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
+        mtxdb::index::checkpoint::write_checkpoint(
+            &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+            0xdead_beef,
+            0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut report = MetaReport::default();
+        meta_checkpoints(&root, &mut report);
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("foreign.pack") && line.starts_with("[NOTE]")));
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint mismatch") && line.starts_with("[WARN]")));
+        assert!(!report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint comparison skipped")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
+        mtxdb::index::checkpoint::write_checkpoint(
+            &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+            mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut report = MetaReport::default();
+        meta_checkpoints(&root, &mut report);
+        assert_eq!(report.warn_count, 0);
+        assert_eq!(report.note_count, 1);
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("foreign.pack")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("pack_0000000000000001.pack"), b"not a pack").unwrap();
+        mtxdb::index::checkpoint::write_checkpoint(
+            &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+            mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut report = MetaReport::default();
+        meta_checkpoints(&root, &mut report);
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint comparison skipped")));
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.starts_with("[WARN]") && line.contains("pack_0000000000000001.pack")));
+        assert!(!report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint mismatch")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn compile_reject(template: &[u8]) -> anyhow::Result<CollectionTemplate> {
@@ -9808,6 +11008,11 @@ mod tests {
     #[test]
     fn import_keeps_existing_record_when_event_id_matches() {
         let (store, dir, path, template, collection_id) = import_fixture("import_keep_same_event");
+        // Keep the derived state-group index separate from the event store so
+        // this assertion measures whether the existing event record was
+        // rewritten.  Replaying the event may legitimately populate a
+        // missing state-group mapping.
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
         let event = import_event("$a", "@alice", "!room");
         let node_id = template_node_id(&template, &event).unwrap().unwrap();
         store
@@ -9822,7 +11027,7 @@ mod tests {
         established.insert(collection_id);
         import_pdu_events(
             &store,
-            &store,
+            &state_store,
             &dir,
             &path,
             &[event],
@@ -9838,6 +11043,133 @@ mod tests {
             0,
             "a matching existing record must be classified present, not rewritten"
         );
+    }
+
+    #[test]
+    fn importer_loads_complete_cached_state_groups_without_recomputing() {
+        let (store, dir, path, template, collection_id) =
+            import_fixture("import_cached_state_groups");
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+        aux.ensure_metadata().unwrap();
+        let event = import_event("$cached", "@alice", "!room");
+        let cached_group = "A".repeat(STATE_GROUP_ID_LENGTH);
+        aux.put(b"$cached", cached_group.as_bytes()).unwrap();
+        let state_writes_before = state_store.stats().put_many_calls;
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            std::slice::from_ref(&event),
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+
+        let loaded = load_state_groups(&aux, &["$cached".to_owned()]).unwrap();
+        let StateGroupLoad::Complete(loaded) = loaded else {
+            panic!("cached mapping should remain complete");
+        };
+        assert_eq!(loaded["$cached"], cached_group);
+        assert_eq!(
+            state_store.stats().put_many_calls,
+            state_writes_before,
+            "a complete cached mapping should not be recomputed or rewritten"
+        );
+    }
+
+    #[test]
+    fn importer_ignores_the_previous_unversioned_state_group_cache() {
+        const OLD_NAMESPACE: &str = "sys:matrix-state-groups";
+        let (store, dir, path, template, collection_id) =
+            import_fixture("import_old_namespace_state_groups");
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+        let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, OLD_NAMESPACE);
+        old_aux.ensure_metadata().unwrap();
+        let stale = "A".repeat(STATE_GROUP_ID_LENGTH);
+        old_aux.put(b"$cached", stale.as_bytes()).unwrap();
+        let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+
+        let event = import_event("$cached", "@alice", "!room");
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            std::slice::from_ref(&event),
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+
+        // v1 cannot see the old entry, so the import recomputes and persists a
+        // real digest; the old namespace is left untouched as dead weight.
+        let recomputed = new_aux.get(b"$cached").unwrap().expect("v1 mapping");
+        assert_ne!(recomputed.as_slice(), stale.as_bytes());
+        assert!(valid_state_group_id(
+            std::str::from_utf8(&recomputed).unwrap()
+        ));
+        assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.into_bytes()));
+    }
+
+    #[test]
+    fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
+        let (store, dir, path, template, collection_id) =
+            import_fixture("import_state_group_repair");
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+        aux.ensure_metadata().unwrap();
+        let child = owned_value(
+            r#"{"event_id":"$child","sender":"@alice","room_id":"!room","type":"m.room.message","prev_events":["$parent"],"content":{"room_version":"11"}}"#,
+        );
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            std::slice::from_ref(&child),
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+        assert_eq!(aux.get(b"$child").unwrap(), None);
+
+        let repaired_parent = owned_value(
+            r#"{"event_id":"$parent","sender":"@server","room_id":"!room","type":"m.room.create","content":{"room_version":"11"}}"#,
+        );
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            &[repaired_parent, child],
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+        let state_group = aux.get(b"$child").unwrap().expect("repaired mapping");
+        assert!(valid_state_group_id(
+            std::str::from_utf8(&state_group).unwrap()
+        ));
     }
 
     /// Open every pack in a pool and total the records it physically holds.
@@ -11007,7 +12339,7 @@ mod tests {
         expected.insert("$right".into(), right_state.digest_base64url());
         expected.insert("$merge".into(), left_state.digest_base64url());
 
-        let groups = compute_state_groups(&events, &[]).unwrap();
+        let groups = compute_state_groups_partial(&events, &[]).groups;
         assert_eq!(groups.len(), expected.len());
         for (event_id, want) in &expected {
             assert_eq!(&groups[event_id], want, "state group for {event_id}");
@@ -11030,7 +12362,7 @@ mod tests {
             let after = owned_value(
                 r#"{"event_id":"$after","room_id":"!r:x","type":"m.room.message","prev_events":["$bad"],"content":{}}"#,
             );
-            super::compute_state_groups_in_view(&[create, flagged, after], &[], view).unwrap()
+            super::compute_state_groups_partial_in_view(&[create, flagged, after], &[], view).groups
         };
         let federated = super::StateView::Federated;
         let client = super::StateView::Client;
@@ -11078,7 +12410,7 @@ mod tests {
         let msg = owned_value(
             r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join"],"content":{"body":"hi"}}"#,
         );
-        let groups = compute_state_groups(&[create, member, msg], &[]).unwrap();
+        let groups = compute_state_groups_partial(&[create, member, msg], &[]).groups;
         // All three events should have a state group.
         assert!(groups.contains_key("$create"));
         assert!(groups.contains_key("$join"));
@@ -11094,8 +12426,144 @@ mod tests {
 
     #[test]
     fn compute_state_groups_empty_input() {
-        let groups = compute_state_groups(&[], &[]).unwrap();
+        let groups = compute_state_groups_partial(&[], &[]).groups;
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn state_group_id_validation_requires_a_base64url_digest() {
+        let golden = StateSet::new().digest_base64url();
+        assert_eq!(golden.len(), STATE_GROUP_ID_LENGTH);
+        assert!(valid_state_group_id(&golden));
+        assert!(!valid_state_group_id(
+            &"A".repeat(golden.len().saturating_sub(1))
+        ));
+        assert!(!valid_state_group_id(
+            &"A".repeat(golden.len().saturating_add(1))
+        ));
+        let almost_digest = "A".repeat(golden.len().saturating_sub(1));
+        assert!(!valid_state_group_id(&format!("{almost_digest}$")));
+        assert!(!valid_state_group_id(&format!("{almost_digest}.")));
+    }
+
+    #[test]
+    fn state_group_cache_loads_complete_values_and_falls_back_on_missing_or_invalid() {
+        let dir = unique_temp_dir().join("state_group_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, STATE_GROUP_NAMESPACE);
+        aux.ensure_metadata().unwrap();
+        let first = "A".repeat(STATE_GROUP_ID_LENGTH);
+        let second = "B".repeat(STATE_GROUP_ID_LENGTH);
+        aux.put_many(&[
+            (b"first".as_slice(), first.as_bytes()),
+            (b"second".as_slice(), second.as_bytes()),
+        ])
+        .unwrap();
+        let ids = vec!["first".to_owned(), "second".to_owned()];
+        let loaded = load_state_groups(&aux, &ids).unwrap();
+        let StateGroupLoad::Complete(loaded) = loaded else {
+            panic!("complete cache should load");
+        };
+        assert_eq!(loaded["first"], first);
+        assert_eq!(loaded["second"], second);
+
+        let missing = vec!["first".to_owned(), "absent".to_owned()];
+        assert!(matches!(
+            load_state_groups(&aux, &missing).unwrap(),
+            StateGroupLoad::Missing
+        ));
+        aux.put(b"invalid", &[0xff]).unwrap();
+        let invalid = vec!["invalid".to_owned()];
+        assert!(matches!(
+            load_state_groups(&aux, &invalid).unwrap(),
+            StateGroupLoad::Invalid { .. }
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn state_groups_from_values_treats_a_cardinality_mismatch_as_invalid() {
+        let ids = vec!["first".to_owned(), "second".to_owned()];
+        let value = Some("A".repeat(STATE_GROUP_ID_LENGTH).into_bytes());
+        assert!(matches!(
+            super::state_groups_from_values(&ids, vec![value.clone()]),
+            StateGroupLoad::Invalid { .. }
+        ));
+        assert!(matches!(
+            super::state_groups_from_values(&["only".to_owned()], vec![None, None]),
+            StateGroupLoad::Invalid { .. }
+        ));
+        assert!(matches!(
+            super::state_groups_from_values(&ids, vec![value.clone(), None]),
+            StateGroupLoad::Missing
+        ));
+        let StateGroupLoad::Complete(groups) =
+            super::state_groups_from_values(&ids, vec![value.clone(), value])
+        else {
+            panic!("matching cardinality with valid values should load");
+        };
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn partial_state_groups_repair_when_a_missing_parent_arrives() {
+        let dir = unique_temp_dir().join("state_group_repair");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, STATE_GROUP_NAMESPACE);
+        aux.ensure_metadata().unwrap();
+        let incomplete = owned_value(
+            r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$parent"],"content":{}}"#,
+        );
+        let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[]);
+        assert!(!first.groups.contains_key("$child"));
+        assert!(!first.unresolved.is_empty());
+        assert_eq!(aux.get(b"$child").unwrap(), None);
+
+        let parent = owned_value(
+            r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.create","content":{}}"#,
+        );
+        let repaired = compute_state_groups_partial(&[parent, incomplete], &[]);
+        assert!(repaired.groups.contains_key("$child"));
+        assert!(repaired.unresolved.is_empty());
+        let entries: Vec<(&[u8], &[u8])> = repaired
+            .groups
+            .iter()
+            .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
+            .collect();
+        aux.put_many(&entries).unwrap();
+        let repaired_id = aux.get(b"$child").unwrap().unwrap();
+        assert_eq!(repaired_id.len(), STATE_GROUP_ID_LENGTH);
+        assert!(valid_state_group_id(
+            std::str::from_utf8(&repaired_id).unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn import_ordering_ignores_edges_to_absent_events() {
+        let known = owned_value(
+            r#"{"event_id":"$known","room_id":"!r:x","type":"m.room.create","content":{}}"#,
+        );
+        let child = owned_value(
+            r#"{"event_id":"$ordering-child","room_id":"!r:x","type":"m.room.message","prev_events":["$known","$absent"],"content":{}}"#,
+        );
+        let order = topological_event_order(&[child, known]).expect("in-batch parent");
+        assert!(order["$known"] < order["$ordering-child"]);
+    }
+
+    #[test]
+    fn partial_state_groups_report_cycles() {
+        let first = owned_value(
+            r#"{"event_id":"$first","room_id":"!r:x","type":"m.room.message","prev_events":["$second"],"content":{}}"#,
+        );
+        let second = owned_value(
+            r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.message","prev_events":["$first"],"content":{}}"#,
+        );
+        let result = compute_state_groups_partial(&[first, second], &[]);
+        assert!(result.groups.is_empty());
+        assert_eq!(result.unresolved.len(), 2);
     }
 
     #[test]
@@ -11106,9 +12574,147 @@ mod tests {
         let member = owned_value(
             r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
         );
-        let g1 = compute_state_groups(&[create.clone(), member.clone()], &[]).unwrap();
-        let g2 = compute_state_groups(&[create, member], &[]).unwrap();
+        let g1 = compute_state_groups_partial(&[create.clone(), member.clone()], &[]).groups;
+        let g2 = compute_state_groups_partial(&[create, member], &[]).groups;
         assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn compute_state_groups_is_stable_across_overlapping_batches() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
+        );
+        let member = owned_value(
+            r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
+        );
+        let sibling = owned_value(
+            r#"{"event_id":"$sibling","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let branch_a = owned_value(
+            r#"{"event_id":"$branch-a","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let branch_b = owned_value(
+            r#"{"event_id":"$branch-b","room_id":"!r:x","type":"m.room.name","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let merge = owned_value(
+            r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$branch-a","$branch-b"],"content":{}}"#,
+        );
+        let orphan = owned_value(
+            r#"{"event_id":"$orphan","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$missing"],"content":{}}"#,
+        );
+
+        let base = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+            ],
+            &[],
+        );
+        let with_fork = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+                sibling.clone(),
+            ],
+            &[],
+        );
+        let with_orphan = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+                orphan,
+            ],
+            &[],
+        );
+        let with_auth_chain = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+            ],
+            &[sibling],
+        );
+        let reordered = compute_state_groups_partial(
+            &[
+                merge.clone(),
+                branch_b.clone(),
+                branch_a.clone(),
+                member.clone(),
+                create.clone(),
+            ],
+            &[],
+        );
+        let without_branch_b = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                merge.clone(),
+            ],
+            &[],
+        );
+
+        assert_eq!(base.groups["$join"], with_fork.groups["$join"]);
+        assert_eq!(base.groups["$join"], with_orphan.groups["$join"]);
+        assert_eq!(base.groups["$join"], with_auth_chain.groups["$join"]);
+        assert_eq!(base.groups["$merge"], with_fork.groups["$merge"]);
+        assert_eq!(base.groups["$merge"], with_orphan.groups["$merge"]);
+        assert_eq!(base.groups["$merge"], with_auth_chain.groups["$merge"]);
+        assert_eq!(base.groups["$merge"], reordered.groups["$merge"]);
+        assert_ne!(base.groups["$merge"], base.groups["$branch-a"]);
+        assert_ne!(base.groups["$merge"], base.groups["$branch-b"]);
+        assert!(without_branch_b.groups.contains_key("$branch-a"));
+        assert!(!without_branch_b.groups.contains_key("$merge"));
+        assert!(without_branch_b.unresolved.iter().any(|id| id == "$merge"));
+        assert!(!with_orphan.groups.contains_key("$orphan"));
+        assert!(with_orphan.unresolved.iter().any(|id| id == "$orphan"));
+    }
+
+    #[test]
+    fn compute_state_groups_uses_first_prev_as_tie_break_for_now() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
+        );
+        let first = owned_value(
+            r#"{"event_id":"$first","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let second = owned_value(
+            r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let merge_first = owned_value(
+            r#"{"event_id":"$merge-first","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$first","$second"],"content":{}}"#,
+        );
+        let merge_second = owned_value(
+            r#"{"event_id":"$merge-second","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$second","$first"],"content":{}}"#,
+        );
+
+        // The walker currently resolves a same-key conflict by taking the
+        // first prev_events entry. This is not full Matrix state resolution;
+        // changing it requires a state-group namespace bump.
+        let first_groups = compute_state_groups_partial(
+            &[create.clone(), first.clone(), second.clone(), merge_first],
+            &[],
+        )
+        .groups;
+        let second_groups =
+            compute_state_groups_partial(&[create, first, second, merge_second], &[]).groups;
+
+        assert_ne!(first_groups["$first"], first_groups["$second"]);
+        assert_eq!(first_groups["$merge-first"], first_groups["$first"]);
+        assert_ne!(first_groups["$merge-first"], first_groups["$second"]);
+        assert_eq!(second_groups["$merge-second"], second_groups["$second"]);
+        assert_ne!(second_groups["$merge-second"], second_groups["$first"]);
     }
 
     #[test]

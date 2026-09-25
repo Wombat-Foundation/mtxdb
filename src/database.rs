@@ -545,7 +545,7 @@ const fn shard_index(shard: ShardType) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{shard_index, SharedDatabase};
+    use super::{shard_index, DatabaseTransaction, SharedDatabase, TransactionOverlayGuard};
     use crate::journal::Journal;
     use crate::layout::ShardType;
     use crate::packfile::storage::PackfileStorage;
@@ -558,6 +558,48 @@ mod tests {
             std::env::temp_dir().join(format!("mtxdb-shared-db-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         path
+    }
+
+    fn prepare_partial_materialization(
+        database: &SharedDatabase,
+        transaction: &DatabaseTransaction<'_>,
+        overlay: &mut Option<TransactionOverlayGuard>,
+        state_collection: [u8; 16],
+        event_collection: [u8; 16],
+    ) {
+        transaction
+            .put(
+                ShardType::State,
+                state_collection,
+                node(1),
+                &NodeData::new(bytes::Bytes::from_static(b"state")),
+            )
+            .unwrap();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                node(2),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        *overlay = Some(database.activate_transaction_overlay().unwrap());
+        database.publish_transaction(&transaction.stage).unwrap();
+        transaction.stage.begin_materialization().unwrap();
+        let receipt = transaction.stage.published_receipt().unwrap();
+        database
+            .register_new_recovery_stage(Arc::clone(&transaction.stage), receipt, overlay)
+            .unwrap();
+        let mutation =
+            transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
+        database
+            .pool(ShardType::State)
+            .apply_transaction_mutation(&mutation)
+            .unwrap();
+        transaction
+            .stage
+            .mark_mutation_applied(ShardType::State, 0)
+            .unwrap();
     }
 
     fn node(id: u8) -> NodeId {
@@ -879,30 +921,14 @@ mod tests {
         let state_node = node(1);
         let event_node = node(2);
         let transaction = database.begin_transaction();
-        transaction
-            .put(
-                ShardType::State,
-                state_collection,
-                state_node,
-                &NodeData::new(bytes::Bytes::from_static(b"state")),
-            )
-            .unwrap();
-        transaction
-            .put(
-                ShardType::EventDag,
-                event_collection,
-                event_node,
-                &NodeData::new(bytes::Bytes::from_static(b"event")),
-            )
-            .unwrap();
-
-        let mut overlay = Some(database.activate_transaction_overlay().unwrap());
-        database.publish_transaction(&transaction.stage).unwrap();
-        transaction.stage.begin_materialization().unwrap();
-        let receipt = transaction.stage.published_receipt().unwrap();
-        database
-            .register_new_recovery_stage(Arc::clone(&transaction.stage), receipt, &mut overlay)
-            .unwrap();
+        let mut overlay = None;
+        prepare_partial_materialization(
+            &database,
+            &transaction,
+            &mut overlay,
+            state_collection,
+            event_collection,
+        );
         let state_mutation =
             transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
         database
@@ -966,30 +992,14 @@ mod tests {
         let state_node = node(1);
         let event_node = node(2);
         let transaction = database.begin_transaction();
-        transaction
-            .put(
-                ShardType::State,
-                state_collection,
-                state_node,
-                &NodeData::new(bytes::Bytes::from_static(b"state")),
-            )
-            .unwrap();
-        transaction
-            .put(
-                ShardType::EventDag,
-                event_collection,
-                event_node,
-                &NodeData::new(bytes::Bytes::from_static(b"event")),
-            )
-            .unwrap();
-
-        let mut overlay = Some(database.activate_transaction_overlay().unwrap());
-        database.publish_transaction(&transaction.stage).unwrap();
-        transaction.stage.begin_materialization().unwrap();
-        let receipt = transaction.stage.published_receipt().unwrap();
-        database
-            .register_new_recovery_stage(Arc::clone(&transaction.stage), receipt, &mut overlay)
-            .unwrap();
+        let mut overlay = None;
+        prepare_partial_materialization(
+            &database,
+            &transaction,
+            &mut overlay,
+            state_collection,
+            event_collection,
+        );
         let state_mutation =
             transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
         database

@@ -74,7 +74,7 @@ pub use packfile::{
     storage::{PackfileStorage, ReadPlanPolicy},
     FrameMetadata, Record,
 };
-pub use shard::ShardPool;
+pub use shard::{LockHolderInfo, ShardPool};
 pub use storage::{
     content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,
 };

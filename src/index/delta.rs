@@ -43,6 +43,43 @@ use super::format::{DeltaFrame, DELTA_FRAME_LEN};
 
 /// File name of the incremental index delta log inside a store's base dir.
 pub const INDEX_DELTA_FILE: &str = "index.delta";
+
+/// Discover fingerprint-named delta-log epochs in a store directory.
+///
+/// Epoch files are named `index.delta.<16 lowercase hex digits>`. The
+/// fingerprinted name lets an interrupted checkpoint handoff leave old and
+/// new epochs side by side without making either one ambiguous to a reader.
+///
+/// # Errors
+///
+/// Returns an I/O error when the directory cannot be read or an epoch filename
+/// contains a hexadecimal fingerprint that cannot be parsed.
+pub fn list_epochs(base_dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let prefix = format!("{INDEX_DELTA_FILE}.");
+    let mut epochs = Vec::new();
+    for entry in fs::read_dir(base_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(hex) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if hex.len() != 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let fingerprint = u64::from_str_radix(hex, 16).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid delta epoch filename {name}: {error}"),
+            )
+        })?;
+        epochs.push((fingerprint, path));
+    }
+    epochs.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+    Ok(epochs)
+}
 /// Bytes in one log header: magic(4) + version(1) + reserved(3) + base fingerprint(8).
 pub const DELTA_LOG_HEADER_LEN: usize = 16;
 /// Bytes in one batch header: magic(4) + `frame_count`(4). Determines the

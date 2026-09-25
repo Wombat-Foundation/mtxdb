@@ -21,6 +21,17 @@ extern "C" {
     fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i32;
 }
 
+/// Diagnostic information recovered from a lock marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockHolderInfo {
+    /// PID recorded by the writer.
+    pub pid: u32,
+    /// Whether the recorded process identity is currently alive.
+    pub running: bool,
+    /// Whether the marker includes a Linux process starttime.
+    pub has_starttime: bool,
+}
+
 /// Probe: start writeback for a just-flushed range before the next flush, to
 /// test whether keeping the dirty frontier ahead of the writer shrinks the
 /// `folio_wait_bit` stall. Enabled by `MTXDB_SYNC_FILE_RANGE=1`. A pure hint:
@@ -1332,7 +1343,14 @@ impl ShardPool {
         })?;
 
         file.set_len(0)?;
-        file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+        #[cfg(target_os = "linux")]
+        let marker = Self::proc_start_time("self").map_or_else(
+            || format!("{}\n", std::process::id()),
+            |start| format!("{} {start}\n", std::process::id()),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let marker = format!("{}\n", std::process::id());
+        file.write_all(marker.as_bytes())?;
         file.sync_all()?;
 
         Ok(WriterLock { _file: file })
@@ -1354,7 +1372,7 @@ impl ShardPool {
     /// classic `/proc/stat` parsing bug. Field 22 is the 20th
     /// whitespace-separated token after that closing paren (field 3 is the
     /// first token after it).
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn proc_start_time(pid_or_self: &str) -> Option<u64> {
         let contents = fs::read_to_string(format!("/proc/{pid_or_self}/stat")).ok()?;
         let after_comm = contents.rsplit_once(')')?.1;
@@ -1391,32 +1409,66 @@ impl ShardPool {
     /// an older binary (bare PID, no starttime) has nothing to compare
     /// against and fails closed exactly as before, same as any other
     /// unparsable content.
-    #[cfg(all(test, target_os = "linux"))]
-    fn lock_holder_is_dead(lock_path: &Path) -> bool {
-        let Ok(contents) = fs::read_to_string(lock_path) else {
-            return false;
-        };
-        let mut fields = contents.split_whitespace();
-        let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
-            return false;
-        };
-        if !Path::new(&format!("/proc/{pid}")).exists() {
-            return true;
-        }
-        // The PID exists as a live process, but that alone doesn't mean
-        // it's still our original writer (see doc comment above) —
-        // disambiguate via starttime when we have one to compare.
-        match fields.next().and_then(|s| s.parse::<u64>().ok()) {
-            Some(recorded_start) => match Self::proc_start_time(&pid.to_string()) {
-                Some(current_start) => current_start != recorded_start,
-                // Couldn't read the current holder's stat (raced with
-                // its own exit, permissions, ...) — fail closed.
+    #[must_use]
+    pub fn lock_holder_is_dead(lock_path: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(contents) = fs::read_to_string(lock_path) else {
+                return false;
+            };
+            let mut fields = contents.split_whitespace();
+            let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+                return false;
+            };
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return true;
+            }
+            // The PID exists as a live process, but that alone doesn't mean
+            // it's still our original writer (see doc comment above) —
+            // disambiguate via starttime when we have one to compare.
+            match fields.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(recorded_start) => match Self::proc_start_time(&pid.to_string()) {
+                    Some(current_start) => current_start != recorded_start,
+                    // Couldn't read the current holder's stat (raced with
+                    // its own exit, permissions, ...) — fail closed.
+                    None => false,
+                },
+                // Old-format lock file, or starttime collection failed at
+                // creation time — nothing to disambiguate a reuse with.
                 None => false,
-            },
-            // Old-format lock file, or starttime collection failed at
-            // creation time — nothing to disambiguate a reuse with.
-            None => false,
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = lock_path;
+            false
+        }
+    }
+
+    /// Read the PID recorded in a lock marker and classify its holder.
+    ///
+    /// Returns `None` for a missing or unparsable marker. The liveness result
+    /// is advisory and never acquires, removes, or modifies the lock.
+    #[must_use]
+    pub fn lock_holder_status(lock_path: &Path) -> Option<(u32, bool)> {
+        let info = Self::lock_holder_info(lock_path)?;
+        Some((info.pid, info.running))
+    }
+
+    /// Read the lock marker with confidence information for diagnostics.
+    #[must_use]
+    pub fn lock_holder_info(lock_path: &Path) -> Option<LockHolderInfo> {
+        let contents = fs::read_to_string(lock_path).ok()?;
+        let pid = contents.split_whitespace().next()?.parse().ok()?;
+        Some(LockHolderInfo {
+            pid,
+            running: !Self::lock_holder_is_dead(lock_path),
+            has_starttime: contents
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some(),
+        })
     }
 
     /// Discovers new pack files on disk and adds them to the pool.

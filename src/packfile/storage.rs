@@ -24,10 +24,11 @@ use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
 use crate::storage::{
-    hex16, validate_established_batch_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
+    collect_missing_established_records, hex16, validate_established_batch_inputs,
+    validate_established_upsert_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
     StorageEngine, StorageError,
 };
-use crate::template::{CollectionMetadata, FrameIdPolicy, COLLECTION_METADATA_RECORD_ID};
+use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
 mod read_journal;
 use read_journal::ReadJournal;
@@ -1031,35 +1032,44 @@ fn check_index_offset(slot: u16, hash: &[u8; 16], offset: u64) -> Result<(), Sto
     Ok(())
 }
 
+/// One persisted `(pack, collection)` bookkeeping record.
 #[derive(Clone, Copy)]
-struct PersistedShardRoom {
-    pack_id: u64,
-    collection_id: [u8; 16],
-    count: u64,
-    insertion_order: u64,
-    disk_bytes: u64,
+pub struct PersistedShardRoom {
+    /// Packfile identity.
+    pub pack_id: u64,
+    /// Collection identity.
+    pub collection_id: [u8; 16],
+    /// Number of records attributed to this collection in the pack.
+    pub count: u64,
+    /// Stable collection insertion order.
+    pub insertion_order: u64,
+    /// Physical bytes attributed to this collection.
+    pub disk_bytes: u64,
 }
 
 /// A decoded shard→collection directory: the pack set it was written
 /// against, when it was written, and the per-(pack, collection) records.
 #[derive(Clone)]
-struct PersistedShardDirectory {
+pub struct PersistedShardDirectory {
     /// The `pack_fingerprint` of the `(pack_id, file_len)` set the counts
     /// apply to. Only a directory whose fingerprint equals the index
     /// checkpoint's may serve open's per-shard bookkeeping without re-walking
     /// every slot — any other directory is stale (or corrupt) and must be
     /// ignored in favor of the slot walk.
-    fingerprint: u64,
+    pub fingerprint: u64,
     /// Unix-seconds timestamp of when the directory was persisted.
-    persisted_at: u64,
+    pub persisted_at: u64,
     /// One record per (pack, collection) the store contains.
-    records: Vec<PersistedShardRoom>,
+    pub records: Vec<PersistedShardRoom>,
 }
 
 /// Decode the small inspection sidecar. This is deliberately shared by all
 /// read-only CLI summary helpers so they agree on validation and format
 /// compatibility.
-fn read_persisted_shard_collections(base_dir: &std::path::Path) -> Option<PersistedShardDirectory> {
+#[must_use]
+pub fn read_persisted_shard_collections(
+    base_dir: &std::path::Path,
+) -> Option<PersistedShardDirectory> {
     let buf = fs::read(base_dir.join("shard_collections.bin")).ok()?;
     if buf.len() < SHARD_ROOMS_HEADER_LEN
         || &buf[0..4] != SHARD_ROOMS_MAGIC
@@ -2447,7 +2457,7 @@ impl PackfileStorage {
     }
 
     /// The journal LSN the on-disk checkpoint covers (0 when none is recorded).
-    pub(crate) fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
+    pub fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
         fs::read(Self::journal_lsn_path(base_dir))
             .ok()
             .and_then(|bytes| bytes.get(..8).map(<[u8; 8]>::try_from))
@@ -7187,19 +7197,8 @@ impl StorageEngine for PackfileStorage {
             ));
         }
 
-        let mut to_append = Vec::with_capacity(records.len());
-        for (id, data) in records {
-            if let Some(existing_rec) = self.get(collection_id, id)? {
-                if existing_rec.bytes != data.bytes {
-                    return Err(StorageError::Collision(format!(
-                        "record collision on node {}",
-                        hex16(id)
-                    )));
-                }
-            } else {
-                to_append.push((*id, data.clone()));
-            }
-        }
+        let to_append =
+            collect_missing_established_records(records, |id| self.get(collection_id, id))?;
         if !to_append.is_empty() {
             let written = self.put_many_internal_locked(collection_id, &to_append, None)?;
             if written > 0 {
@@ -7226,27 +7225,7 @@ impl StorageEngine for PackfileStorage {
         data: &NodeData,
         validate: &mut dyn FnMut(Option<&NodeData>) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
-        if node_id == &COLLECTION_METADATA_RECORD_ID {
-            return Err(StorageError::Internal(
-                "cannot write application record to reserved collection metadata node id"
-                    .to_owned(),
-            ));
-        }
-        if !metadata.verify_collection_id(collection_id) {
-            return Err(StorageError::Internal(
-                "collection metadata does not reproduce collection id".to_owned(),
-            ));
-        }
-        if metadata.collection_canonical_id.is_empty() {
-            return Err(StorageError::Internal(
-                "collection metadata has empty canonical id".to_owned(),
-            ));
-        }
-        if metadata.record_id_rule.policy != FrameIdPolicy::Key {
-            return Err(StorageError::Internal(
-                "create_or_upsert_established_validated requires FrameIdPolicy::Key".to_owned(),
-            ));
-        }
+        validate_established_upsert_inputs(collection_id, metadata, node_id)?;
 
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();

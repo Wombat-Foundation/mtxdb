@@ -3,10 +3,17 @@
 mod cmd;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
 use mtxdb::{ReadPlanPolicy, ShardType};
+
+static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn debug_enabled() -> bool {
+    DEBUG_ENABLED.get().copied().unwrap_or(false)
+}
 
 #[derive(Clone)]
 pub(crate) struct Cli {
@@ -105,6 +112,13 @@ pub(crate) enum Commands {
     Stats {
         json: bool,
     },
+    Meta {
+        target: String,
+        json: bool,
+        limit: i64,
+        offset: i64,
+        decode: Option<String>,
+    },
     Info {
         collection: Option<String>,
         stats: bool,
@@ -197,6 +211,7 @@ fn build_cli() -> Command {
         .subcommand(sub_shards())
         .subcommand(sub_collections())
         .subcommand(sub_stats())
+        .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
         .subcommand(sub_import())
@@ -257,6 +272,13 @@ fn global_args(cmd: Command) -> Command {
             .global(true)
             .help("Merged read prefetch for batch reads: 'plain' (default, independent reads) or 'prefetch' to meld nearby candidates into sequential extents"),
     )
+    .arg(
+        Arg::new("debug")
+            .long("debug")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Enable additional diagnostic output"),
+    )
 }
 
 fn sub_shards() -> Command {
@@ -283,6 +305,51 @@ fn sub_stats() -> Command {
                 .long("json")
                 .action(ArgAction::SetTrue)
                 .help("Emit machine-readable JSON instead of a table"),
+        )
+}
+
+fn sub_meta() -> Command {
+    Command::new("meta")
+        .about("Inspect on-disk metadata and durability artifacts (read-only)")
+        .arg(
+            Arg::new("target")
+                .value_name("TARGET")
+                .default_value("overview")
+                .value_parser([
+                    "overview",
+                    "db",
+                    "wal",
+                    "checkpoint",
+                    "delta",
+                    "sidecars",
+                    "packs",
+                    "locks",
+                    "raw",
+                ])
+                .help("Artifact group to inspect (default: overview)"),
+        )
+        .arg(limit_arg())
+        .arg(
+            Arg::new("offset")
+                .long("offset")
+                .default_value("0")
+                .value_parser(clap::value_parser!(i64))
+                .help("Number of decoded records to skip"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Emit diagnostic records as JSON"),
+        )
+        .arg(
+            Arg::new("decode")
+                .long("decode")
+                .value_name("FORMAT")
+                .num_args(0..=1)
+                .default_missing_value("auto")
+                .value_parser(["auto", "json", "raw"])
+                .help("Decode WAL payloads when possible (json or raw)"),
         )
 }
 
@@ -680,6 +747,7 @@ fn parse_cli() -> Cli {
         .map(|vals| vals.map(PathBuf::from).collect())
         .unwrap_or_default();
     let coalesce = matches.get_flag("coalesce");
+    let _ = DEBUG_ENABLED.set(matches.get_flag("debug"));
     let read_plan = read_plan_from_mode(
         matches
             .get_one::<String>("read_plan")
@@ -732,6 +800,17 @@ fn parse_cli() -> Cli {
         },
         Some(("stats", m)) => Commands::Stats {
             json: m.get_flag("json"),
+        },
+        Some(("meta", m)) => Commands::Meta {
+            target: m.get_one::<String>("target").unwrap().clone(),
+            json: m.get_flag("json"),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+            offset: *m
+                .get_one::<i64>("offset")
+                .expect("clap supplies a default offset"),
+            decode: m.get_one::<String>("decode").cloned(),
         },
         Some(("info", m)) => Commands::Info {
             collection: m.get_one::<String>("collection").cloned(),
