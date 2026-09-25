@@ -8318,10 +8318,7 @@ impl PackfileStorage {
     /// a checkpoint; oversized v3 batches fall back from the append helper.
     fn delta_state_needs_full_rewrite(&self) -> bool {
         let state = self.delta_state.lock();
-        if state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty() {
-            return true;
-        }
-        false
+        state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty()
     }
 
     /// Persist the dirty index state for a sync barrier — a delta append when
