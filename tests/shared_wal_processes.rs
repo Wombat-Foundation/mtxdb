@@ -248,4 +248,13 @@ fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
         b"ok",
         "the stale worker must see the published-but-unsynced record"
     );
+
+    // Make "published but not durable" explicit rather than inferred: the
+    // writer never synced, so the stale worker's visibility came from the
+    // journal overlay alone.
+    let fsyncs: u64 = ShardType::ALL
+        .iter()
+        .map(|shard| db.pool(*shard).stats().sync_totals.calls)
+        .sum();
+    assert_eq!(fsyncs, 0, "the published record must not have been fsynced");
 }
