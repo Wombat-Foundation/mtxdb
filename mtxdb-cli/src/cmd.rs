@@ -8181,6 +8181,21 @@ fn build_event_dag(
     HashMap<String, u64>,
     HashMap<u64, String>,
 ) {
+    build_event_dag_with_missing_edges(events, false)
+}
+
+/// Build a DAG with optional synthetic IDs for edges to events outside the
+/// input batch. State-group computation enables these IDs so absent parents
+/// remain non-resident and block descendants; import ordering leaves them out
+/// so older parents do not disable the existing in-batch topological order.
+fn build_event_dag_with_missing_edges(
+    events: &[OwnedValue],
+    include_missing_edges: bool,
+) -> (
+    mtxdb::dag::ActiveRoomFrontier,
+    HashMap<String, u64>,
+    HashMap<u64, String>,
+) {
     use mtxdb::dag::ActiveRoomFrontier;
 
     let mut frontier = ActiveRoomFrontier::new();
@@ -8198,8 +8213,8 @@ fn build_event_dag(
         let Some(&short_id) = id_map.get(eid) else {
             continue;
         };
-        let raw_prevs = extract_event_edge_ids(ev, "prev_events", &id_map);
-        let raw_auths = extract_event_edge_ids(ev, "auth_events", &id_map);
+        let raw_prevs = extract_event_edge_ids(ev, "prev_events", &id_map, include_missing_edges);
+        let raw_auths = extract_event_edge_ids(ev, "auth_events", &id_map, include_missing_edges);
         frontier.insert_event(short_id, &raw_prevs, &raw_auths);
     }
     let reverse_map: HashMap<u64, String> = id_map
@@ -8214,6 +8229,7 @@ fn extract_event_edge_ids(
     event: &OwnedValue,
     field: &str,
     id_map: &HashMap<String, u64>,
+    include_missing_edges: bool,
 ) -> Vec<u64> {
     let OwnedValue::Object(fields) = event else {
         return Vec::new();
@@ -8228,7 +8244,11 @@ fn extract_event_edge_ids(
                 OwnedValue::Array(parts) => parts.first().and_then(|v| v.as_str()),
                 _ => None,
             };
-            eid.and_then(|eid| id_map.get(eid).copied())
+            eid.and_then(|eid| match id_map.get(eid).copied() {
+                Some(short_id) => Some(short_id),
+                None if include_missing_edges => Some(event_short_id(eid)),
+                None => None,
+            })
         })
         .collect()
 }
