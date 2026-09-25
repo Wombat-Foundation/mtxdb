@@ -27,12 +27,12 @@ completions = ["dep:clap_complete"]
 anyhow = "1.0"
 base64 = "0.23.1"
 bytes = "1.5"
-clap = { version = "=4.6.6", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
-clap_complete = { version = "=4.6.9", optional = true }
+clap = { version = "=4.5.48", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
+clap_complete = { version = "=4.5.48", optional = true }
 hex = "0.4"
 mtxdb = { path = ".." }
 rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
-simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
+simd-json = { version = "=0.13.10", default-features = false, features = ["runtime-detection"] }
 
 [lints]
 workspace = true
