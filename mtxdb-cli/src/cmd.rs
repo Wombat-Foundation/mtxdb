@@ -10990,10 +10990,10 @@ mod tests {
         // Fork off the tip: two branches set the same key differently, then a
         // merge event lists both parents. The first parent must win.
         let mut left_state = StateSet::new();
-        left_state.entries = expected_state.entries.clone();
+        left_state.entries.clone_from(&expected_state.entries);
         left_state.set("m.room.topic", "", "$left".to_owned());
         let mut right_state = StateSet::new();
-        right_state.entries = expected_state.entries.clone();
+        right_state.entries.clone_from(&expected_state.entries);
         right_state.set("m.room.topic", "", "$right".to_owned());
         events.push(owned_value(&format!(
             r#"{{"event_id":"$left","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
