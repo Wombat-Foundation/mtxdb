@@ -650,6 +650,110 @@ impl SyncDiagnostics {
     }
 }
 
+/// Fixed latency buckets used by public operation diagnostics. Buckets are
+/// non-cumulative: `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperationLatency {
+    /// Number of timed operations.
+    pub calls: u64,
+    /// Sum of operation wall time.
+    pub total: std::time::Duration,
+    /// Counts for `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
+    pub buckets: [u64; 5],
+}
+
+#[derive(Default)]
+struct OperationLatencyTotals {
+    calls: AtomicU64,
+    total_ns: AtomicU64,
+    buckets: [AtomicU64; 5],
+}
+
+impl OperationLatencyTotals {
+    fn observe(&self, duration: std::time::Duration) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let micros = duration.as_micros();
+        let bucket = if micros < 1_000 {
+            0
+        } else if micros < 10_000 {
+            1
+        } else if micros < 100_000 {
+            2
+        } else if micros < 1_000_000 {
+            3
+        } else {
+            4
+        };
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> OperationLatency {
+        OperationLatency {
+            calls: self.calls.load(Ordering::Relaxed),
+            total: std::time::Duration::from_nanos(self.total_ns.load(Ordering::Relaxed)),
+            buckets: std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
+        }
+    }
+
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+        self.total_ns.store(0, Ordering::Relaxed);
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Default)]
+struct OperationTimings {
+    get: OperationLatencyTotals,
+    get_many: OperationLatencyTotals,
+    put: OperationLatencyTotals,
+    put_many: OperationLatencyTotals,
+}
+
+impl OperationTimings {
+    fn reset(&self) {
+        self.get.reset();
+        self.get_many.reset();
+        self.put.reset();
+        self.put_many.reset();
+    }
+}
+
+struct OperationTimer<'a> {
+    started: Option<std::time::Instant>,
+    totals: Option<&'a OperationLatencyTotals>,
+}
+
+impl<'a> OperationTimer<'a> {
+    fn disabled() -> Self {
+        Self {
+            started: None,
+            totals: None,
+        }
+    }
+
+    fn new(totals: &'a OperationLatencyTotals) -> Self {
+        Self {
+            started: Some(std::time::Instant::now()),
+            totals: Some(totals),
+        }
+    }
+}
+
+impl Drop for OperationTimer<'_> {
+    fn drop(&mut self) {
+        if let (Some(totals), Some(started)) = (self.totals, self.started) {
+            totals.observe(started.elapsed());
+        }
+    }
+}
+
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
 ///
 /// Without a cap, a walk whose `stop_at` set is never reached (e.g. the
@@ -1372,6 +1476,10 @@ pub struct PackfileStorage {
     /// on a write-locked or per-call path, never per-record on the hot read
     /// path). See [`Self::set_stats_enabled`].
     stats_enabled: AtomicBool,
+    /// Opt-in wall-clock latency accounting for the public storage operations.
+    /// The timer is created only while `stats_enabled` is true so normal
+    /// deployments pay no `Instant` cost for this diagnostic.
+    operation_timings: OperationTimings,
     /// Whether [`Self::get_many_with_refresh`] may rescan a collection when
     /// the caller's in-memory snapshot misses. On by default. A single-writer
     /// store sets this `false`: its in-memory index is authoritative for every
@@ -2366,6 +2474,7 @@ impl PackfileStorage {
             checkpoint_bytes_at_last_rewrite: AtomicU64::new(0),
             checkpoint_skips: AtomicU64::new(0),
             stats_enabled: AtomicBool::new(false),
+            operation_timings: OperationTimings::default(),
             refresh_on_miss: AtomicBool::new(true),
             open_count: AtomicU64::new(1),
             get_calls: AtomicU64::new(0),
@@ -7283,6 +7392,12 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get)
+        } else {
+            OperationTimer::disabled()
+        };
         if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
             return Ok(self
                 .get_read_committed(collection_id, std::slice::from_ref(id))?
@@ -7290,7 +7405,6 @@ impl StorageEngine for PackfileStorage {
                 .next()
                 .flatten());
         }
-        let track = self.stats_enabled.load(Ordering::Relaxed);
         // A concurrent repack can swap the generation and retire the shard ids
         // its index pointed at. Pin the candidate shards and confirm the
         // generation did not change between the index lookup and the pin
@@ -7345,10 +7459,15 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get_many)
+        } else {
+            OperationTimer::disabled()
+        };
         if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
             return self.get_read_committed(collection_id, ids);
         }
-        let track = self.stats_enabled.load(Ordering::Relaxed);
         // As in `get`: pin the candidate shards and retry if a concurrent
         // repack swapped the generation (and so may have retired them) between
         // the index lookups and the pin.
@@ -7474,6 +7593,11 @@ impl StorageEngine for PackfileStorage {
         id: &NodeId,
         data: &NodeData,
     ) -> Result<(), StorageError> {
+        let _latency = if self.stats_enabled.load(Ordering::Relaxed) {
+            OperationTimer::new(&self.operation_timings.put)
+        } else {
+            OperationTimer::disabled()
+        };
         self.put_internal(collection_id, id, data, None)
     }
 
@@ -7482,6 +7606,11 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError> {
+        let _latency = if self.stats_enabled.load(Ordering::Relaxed) {
+            OperationTimer::new(&self.operation_timings.put_many)
+        } else {
+            OperationTimer::disabled()
+        };
         self.put_many_internal(collection_id, entries, None)
     }
 
@@ -8604,8 +8733,11 @@ impl PackfileStorage {
     /// batch, and sync counters are always on regardless.
     ///
     /// Changing the flag is safe at any point and affects only subsequent
-    /// reads; counters are monotone, so reads disabled by a false-to-true
-    /// transition are reflected as fewer `get_*` calls, not as zeros.
+    /// operations; logical read counters are monotone, so reads disabled by a
+    /// false-to-true transition are reflected as fewer `get_*` calls, not as
+    /// zeros.
+    /// When enabled, it also records wall-clock totals and fixed latency
+    /// buckets for `get`, `get_many`, `put`, and `put_many` in [`Self::stats`].
     pub fn set_stats_enabled(&self, enabled: bool) {
         self.stats_enabled.store(enabled, Ordering::Relaxed);
     }
@@ -8704,6 +8836,10 @@ impl PackfileStorage {
             read_reload_failures: self.read_reload_failures.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
+            get_latency: self.operation_timings.get.snapshot(),
+            get_many_latency: self.operation_timings.get_many.snapshot(),
+            put_latency: self.operation_timings.put.snapshot(),
+            put_many_latency: self.operation_timings.put_many.snapshot(),
             last_open_timings: self.open_timings(),
             last_sync_timings: self.sync_timings(),
             sync_totals: self.sync_totals.snapshot(),
@@ -8800,6 +8936,7 @@ impl PackfileStorage {
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        self.operation_timings.reset();
         *self.last_open_timings.lock() = None;
         *self.last_sync_timings.lock() = None;
         self.sync_totals.reset();
@@ -8958,6 +9095,14 @@ pub struct RuntimeStats {
     pub sidecar_writes: u64,
     /// `sync`/`sync_all` calls.
     pub sync_calls: u64,
+    /// Opt-in wall-clock latency for single-record reads.
+    pub get_latency: OperationLatency,
+    /// Opt-in wall-clock latency for batched reads.
+    pub get_many_latency: OperationLatency,
+    /// Opt-in wall-clock latency for single-record writes.
+    pub put_latency: OperationLatency,
+    /// Opt-in wall-clock latency for batched writes.
+    pub put_many_latency: OperationLatency,
     /// Per-phase breakdown of the most recent open.
     pub last_open_timings: Option<OpenTimings>,
     /// Per-phase breakdown of the most recent sync.
@@ -9076,6 +9221,10 @@ impl Default for RuntimeStats {
             read_reload_failures: 0,
             sidecar_writes: 0,
             sync_calls: 0,
+            get_latency: OperationLatency::default(),
+            get_many_latency: OperationLatency::default(),
+            put_latency: OperationLatency::default(),
+            put_many_latency: OperationLatency::default(),
             last_open_timings: None,
             last_sync_timings: None,
             sync_totals: SyncTotalsSnapshot::default(),
@@ -12419,6 +12568,9 @@ mod tests {
         let snapshot = store.stats();
         assert_eq!(snapshot.get_calls, 2);
         assert_eq!(snapshot.get_misses, 1);
+        assert_eq!(snapshot.get_latency.calls, 2);
+        assert!(snapshot.get_latency.total > std::time::Duration::ZERO);
+        assert_eq!(snapshot.get_latency.buckets.iter().sum::<u64>(), 2);
 
         // Batched writes against an already-materialized (non-mmap) index
         // mutate it in place and roll back via an undo log on failure,
@@ -12451,6 +12603,8 @@ mod tests {
         // already-owned, non-mmap index and takes the in-place fast path.
         assert_eq!(snapshot.put_many_clone_path_calls, 1);
         assert_eq!(snapshot.put_many_fast_path_calls, 7);
+        assert_eq!(snapshot.put_many_latency.calls, 8);
+        assert_eq!(snapshot.put_many_latency.buckets.iter().sum::<u64>(), 8);
         // 64 distinct records into a floor-sized 64-slot index must cross the
         // grow threshold at least once.
         assert!(snapshot.index_grow_count >= 1);
@@ -12471,6 +12625,8 @@ mod tests {
         assert_eq!(snapshot.put_many_calls, 0);
         assert_eq!(snapshot.get_calls, 0);
         assert_eq!(snapshot.get_misses, 0);
+        assert_eq!(snapshot.get_latency.calls, 0);
+        assert_eq!(snapshot.put_many_latency.calls, 0);
 
         // Sync accounting: the first (structurally invalidated) sync rewrites
         // the checkpoint; a later clean batch sync appends the delta log.

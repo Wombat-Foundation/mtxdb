@@ -71,7 +71,7 @@ pub use matrix_policy::{
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
 };
 pub use packfile::{
-    storage::{PackfileStorage, ReadPlanPolicy},
+    storage::{OperationLatency, PackfileStorage, ReadPlanPolicy},
     FrameMetadata, Record,
 };
 pub use shard::{LockHolderInfo, ShardPool};
