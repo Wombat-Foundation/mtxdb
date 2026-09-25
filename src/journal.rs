@@ -1965,8 +1965,19 @@ impl JournalCoordinator {
         self.background_coalesced.load(Ordering::Relaxed)
     }
 
-    fn background_failure(&self) -> Option<BackgroundFailure> {
+    fn background_failure_detail(&self) -> Option<BackgroundFailure> {
         self.background_failure.lock().clone()
+    }
+
+    /// Return the terminal background-committer failure, if any, without
+    /// consuming it. Callers use this to retain dirty work and retry through
+    /// their own scheduling layer; `wait_durable` remains the blocking API.
+    #[must_use]
+    pub fn background_failure_message(&self) -> Option<String> {
+        self.background_failure
+            .lock()
+            .as_ref()
+            .map(|failure| failure.message.clone())
     }
 
     /// Wake the committer and any `wait_durable` callers.
@@ -2074,7 +2085,7 @@ impl JournalCoordinator {
             // A stopped committer falls through to a direct commit, preserving
             // the historical no-committer behavior and error text, but a
             // committer that failed must not be silently papered over.
-            if let Some(failure) = self.background_failure() {
+            if let Some(failure) = self.background_failure_detail() {
                 return Err(failure.into_io());
             }
             if !self.has_background_committer() {
@@ -4902,6 +4913,10 @@ mod tests {
             kind: std::io::ErrorKind::Other,
             message: "boom".to_owned(),
         }));
+        assert_eq!(
+            coordinator.background_failure_message().as_deref(),
+            Some("boom")
+        );
 
         // A waiter must observe the terminal failure rather than block. The
         // failure check precedes publication validation by contract, so even a
@@ -4929,7 +4944,7 @@ mod tests {
         // Let the committer park before publishing: its entry-time pending check
         // would otherwise flush the burst and mask a suppressed wake.
         wait_parked(&coordinator, parks_before);
-        assert!(coordinator.background_failure().is_none());
+        assert!(coordinator.background_failure_detail().is_none());
         let lsn = coordinator.publish(put(5, 1, b"restart"), |_| {}).unwrap();
         wait_until(
             {
