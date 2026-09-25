@@ -25,6 +25,7 @@ const NODE: [u8; 16] = [0x33; 16];
 const PAYLOAD: &[u8] = b"committed by the writer process";
 const READER_ENV: &str = "MTXDB_SHARED_READER_ROOT";
 const STALE_READER_ENV: &str = "MTXDB_SHARED_STALE_READER_ROOT";
+const READER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The reader-process entry point. Runs only when re-executed with
 /// [`READER_ENV`] set; a normal test run (no env) returns immediately.
@@ -92,23 +93,81 @@ fn stale_reader_process_baselines_then_rereads_after_publish() {
     std::fs::write(&result, outcome).expect("write reader result");
 }
 
-/// Re-execute this test binary to run only [`reader_process_enters_and_reads`]
-/// against `root`, returning whether that process succeeded.
-fn spawn_reader(root: &Path) -> bool {
-    spawn_reader_entry("reader_process_enters_and_reads", READER_ENV, root)
-        .wait()
-        .expect("wait for the reader process")
-        .success()
+/// A test temp root that removes itself on drop, including when an assertion
+/// panics, so failed runs do not leak stores into the temp directory.
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(tag: &str) -> Self {
+        let root =
+            std::env::temp_dir().join(format!("mtxdb-shared-wal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        Self(root)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A spawned reader process that kills and reaps itself on drop, so a failed
+/// handshake (for example, a panic in [`wait_for`]) cannot strand a reader.
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    /// Wait for the child with a deadline, returning its exit status.
+    ///
+    /// A plain `Child::wait()` can block forever, and this guard's `Drop`
+    /// cannot run while the parent is parked inside it, so the bound has to
+    /// live here: poll `try_wait`, and on timeout kill and reap before
+    /// panicking.
+    fn wait_bounded(&mut self, what: &str, timeout: Duration) -> std::process::ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.0.try_wait().expect("poll the reader process") {
+                return status;
+            }
+            if started.elapsed() >= timeout {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                panic!("{what} did not exit within {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Spawn `entry` as a separate process with its root-directory env var set.
-fn spawn_reader_entry(entry: &str, env_var: &str, root: &Path) -> std::process::Child {
+fn spawn_reader_entry(entry: &str, env_var: &str, root: &Path) -> ChildGuard {
     let exe = std::env::current_exe().expect("current test executable");
-    std::process::Command::new(exe)
+    let child = std::process::Command::new(exe)
         .args(["--exact", entry, "--nocapture", "--test-threads=1"])
         .env(env_var, root)
         .spawn()
-        .expect("spawn the reader process")
+        .expect("spawn the reader process");
+    ChildGuard(child)
+}
+
+/// Re-execute this test binary to run only [`reader_process_enters_and_reads`]
+/// against `root`, returning whether that process succeeded.
+fn spawn_reader(root: &Path) -> bool {
+    let mut reader = spawn_reader_entry("reader_process_enters_and_reads", READER_ENV, root);
+    reader
+        .wait_bounded("reader_process_enters_and_reads", READER_TIMEOUT)
+        .success()
 }
 
 /// Block until `path` exists, panicking on timeout.
@@ -126,10 +185,8 @@ fn wait_for(path: &Path, timeout: Duration) {
 
 #[test]
 fn a_reader_process_sees_a_live_writers_committed_record() {
-    let root = std::env::temp_dir().join(format!("mtxdb-shared-wal-procs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-
-    let db = SharedDatabase::open(root.clone()).expect("writer opens the shared root");
+    let root = TempRoot::new("procs");
+    let db = SharedDatabase::open(root.path().to_path_buf()).expect("writer opens the shared root");
     let state = db.pool(ShardType::State);
     state
         .put(
@@ -141,12 +198,9 @@ fn a_reader_process_sees_a_live_writers_committed_record() {
     state.sync_all().expect("writer makes it durable");
 
     assert!(
-        spawn_reader(&root),
+        spawn_reader(root.path()),
         "the reader process must succeed after a durable write"
     );
-
-    drop(db);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The same cross-process read, but the writer never makes the record durable:
@@ -158,11 +212,8 @@ fn a_reader_process_sees_a_live_writers_committed_record() {
 /// a committed-but-unfsynced write as soon as it is published.
 #[test]
 fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
-    let root =
-        std::env::temp_dir().join(format!("mtxdb-shared-wal-published-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-
-    let db = SharedDatabase::open(root.clone()).expect("writer opens the shared root");
+    let root = TempRoot::new("published");
+    let db = SharedDatabase::open(root.path().to_path_buf()).expect("writer opens the shared root");
     let state = db.pool(ShardType::State);
 
     // Start the worker while the store is still empty, so its index snapshot
@@ -170,10 +221,10 @@ fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
     let mut reader = spawn_reader_entry(
         "stale_reader_process_baselines_then_rereads_after_publish",
         STALE_READER_ENV,
-        &root,
+        root.path(),
     );
-    let baseline_done = root.join("baseline.done");
-    wait_for(&baseline_done, Duration::from_secs(30));
+    let baseline_done = root.path().join("baseline.done");
+    wait_for(&baseline_done, READER_TIMEOUT);
 
     state
         .put(
@@ -185,16 +236,16 @@ fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
     db.publish_pending()
         .expect("writer publishes the pending group")
         .expect("a pending group exists to publish");
-    std::fs::write(root.join("published.done"), b"1").expect("signal publish");
+    std::fs::write(root.path().join("published.done"), b"1").expect("signal publish");
 
-    let status = reader.wait().expect("wait for the reader process");
+    let status = reader.wait_bounded(
+        "stale_reader_process_baselines_then_rereads_after_publish",
+        READER_TIMEOUT,
+    );
     assert!(status.success(), "the reader process must succeed");
     assert_eq!(
-        std::fs::read(root.join("reader.result")).expect("reader result"),
+        std::fs::read(root.path().join("reader.result")).expect("reader result"),
         b"ok",
         "the stale worker must see the published-but-unsynced record"
     );
-
-    drop(db);
-    let _ = std::fs::remove_dir_all(&root);
 }
