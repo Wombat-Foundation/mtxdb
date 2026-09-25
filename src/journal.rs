@@ -775,6 +775,8 @@ pub struct DurabilityStats {
     pub commit_records: u64,
     /// Most mutations made durable by a single fsync.
     pub max_commit_records: u64,
+    /// Staged transaction publishes refused because legacy mutations were pending.
+    pub staged_publish_refused: u64,
 }
 
 impl DurabilityStats {
@@ -1141,6 +1143,7 @@ pub struct JournalCoordinator {
     commit_records: AtomicU64,
     /// Largest durable-LSN advance made by one fsync.
     max_commit_records: AtomicU64,
+    staged_publish_refused: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -1204,6 +1207,7 @@ impl JournalCoordinator {
             commits: AtomicU64::new(0),
             commit_records: AtomicU64::new(0),
             max_commit_records: AtomicU64::new(0),
+            staged_publish_refused: AtomicU64::new(0),
         }
     }
 
@@ -1749,6 +1753,7 @@ impl JournalCoordinator {
         // this transaction committed. The caller must publish the legacy queue
         // through its own lifecycle before retrying this transaction.
         if !self.pending.lock().is_empty() {
+            self.staged_publish_refused.fetch_add(1, Ordering::Relaxed);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "legacy journal mutations are pending; publish them before the staged transaction",
@@ -1928,6 +1933,7 @@ impl JournalCoordinator {
             commits: self.commits.load(Ordering::Relaxed),
             commit_records: self.commit_records.load(Ordering::Relaxed),
             max_commit_records: self.max_commit_records.load(Ordering::Relaxed),
+            staged_publish_refused: self.staged_publish_refused.load(Ordering::Relaxed),
         }
     }
 
