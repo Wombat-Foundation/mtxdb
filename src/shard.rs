@@ -21,6 +21,17 @@ extern "C" {
     fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i32;
 }
 
+/// Diagnostic information recovered from a lock marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockHolderInfo {
+    /// PID recorded by the writer.
+    pub pid: u32,
+    /// Whether the recorded process identity is currently alive.
+    pub running: bool,
+    /// Whether the marker includes a Linux process starttime.
+    pub has_starttime: bool,
+}
+
 /// Probe: start writeback for a just-flushed range before the next flush, to
 /// test whether keeping the dirty frontier ahead of the writer shrinks the
 /// `folio_wait_bit` stall. Enabled by `MTXDB_SYNC_FILE_RANGE=1`. A pure hint:
@@ -512,6 +523,7 @@ pub(crate) struct WriterLock {
 /// symbolic rather than being reduced to constants.
 ///
 /// The active write shard rotates when it exceeds `MAX_SHARD_BYTES`.
+/// A named pool of append-only packfiles.
 pub struct ShardPool {
     /// Fixed-size array of shard slots. `None` means unused.
     shards: RwLock<Vec<Option<Arc<Shard>>>>,
@@ -1400,9 +1412,40 @@ impl ShardPool {
     /// is advisory and never acquires, removes, or modifies the lock.
     #[must_use]
     pub fn lock_holder_status(lock_path: &Path) -> Option<(u32, bool)> {
+        let info = Self::lock_holder_info(lock_path)?;
+        Some((info.pid, info.running))
+    }
+
+    /// Read the lock marker with confidence information for diagnostics.
+    #[must_use]
+    pub fn lock_holder_info(lock_path: &Path) -> Option<LockHolderInfo> {
         let contents = fs::read_to_string(lock_path).ok()?;
         let pid = contents.split_whitespace().next()?.parse().ok()?;
-        Some((pid, !Self::lock_holder_is_dead(lock_path)))
+        Some(LockHolderInfo {
+            pid,
+            running: !Self::lock_holder_is_dead(lock_path),
+            has_starttime: contents.split_whitespace().nth(1).is_some(),
+        })
+    }
+
+    /// Probe whether an exclusive writer currently holds `lock_path`.
+    ///
+    /// This opens the marker read-only, takes a shared lock only for the
+    /// duration of the probe, and never changes the file. A stale marker with
+    /// no active advisory lock therefore reports `false`.
+    #[must_use]
+    pub fn lock_contended(lock_path: &Path) -> bool {
+        let Ok(file) = File::options().read(true).open(lock_path) else {
+            return false;
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&file);
+                false
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        }
     }
 
     /// Discovers new pack files on disk and adds them to the pool.
@@ -3624,6 +3667,23 @@ mod tests {
             second.is_err(),
             "a second writer must not be able to open the same base_dir concurrently"
         );
+    }
+
+    #[test]
+    fn test_lock_contention_probe_distinguishes_held_marker() {
+        let dir = test_dir("writer_lock_contention_probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join(".mtxdb.lock");
+        std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        file.try_lock_exclusive().unwrap();
+        assert!(ShardPool::lock_contended(&lock_path));
+        file.unlock().unwrap();
+        assert!(!ShardPool::lock_contended(&lock_path));
     }
 
     /// Dropping the writer releases its lock immediately (via

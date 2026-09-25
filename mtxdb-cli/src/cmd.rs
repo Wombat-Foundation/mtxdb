@@ -4080,7 +4080,9 @@ fn cmd_meta(
 #[derive(Default)]
 struct MetaReport {
     lines: Vec<String>,
-    findings: usize,
+    note_count: usize,
+    warn_count: usize,
+    error_count: usize,
     json_records: Vec<OwnedValue>,
 }
 
@@ -4095,7 +4097,12 @@ impl MetaReport {
     }
 
     fn finding(&mut self, level: &str, path: &Path, message: impl std::fmt::Display) {
-        self.findings = self.findings.saturating_add(1);
+        match level {
+            "NOTE" => self.note_count = self.note_count.saturating_add(1),
+            "WARN" => self.warn_count = self.warn_count.saturating_add(1),
+            "ERROR" => self.error_count = self.error_count.saturating_add(1),
+            _ => {}
+        }
         let message = message.to_string();
         let path = path.display().to_string();
         self.lines.push(format!("[{level}] {path}: {message}"));
@@ -4109,21 +4116,33 @@ impl MetaReport {
 
     fn print(self, json: bool) {
         if json {
-            let mut records = self.json_records;
-            let mut summary = simd_json::owned::Object::new();
-            summary.insert("kind".to_owned(), OwnedValue::from("summary"));
-            summary.insert(
-                "findings".to_owned(),
-                OwnedValue::from(self.findings.to_string()),
-            );
-            records.insert(0, OwnedValue::Object(Box::new(summary)));
-            let value = OwnedValue::Array(Box::new(records));
+            let value = self.json_value();
             println!("{}", value.encode());
         } else {
             for line in self.lines {
                 println!("{line}");
             }
         }
+    }
+
+    fn json_value(self) -> OwnedValue {
+        let mut records = self.json_records;
+        let mut summary = simd_json::owned::Object::new();
+        summary.insert("kind".to_owned(), OwnedValue::from("summary"));
+        summary.insert(
+            "note".to_owned(),
+            OwnedValue::from(u64::try_from(self.note_count).unwrap_or(u64::MAX)),
+        );
+        summary.insert(
+            "warn".to_owned(),
+            OwnedValue::from(u64::try_from(self.warn_count).unwrap_or(u64::MAX)),
+        );
+        summary.insert(
+            "error".to_owned(),
+            OwnedValue::from(u64::try_from(self.error_count).unwrap_or(u64::MAX)),
+        );
+        records.insert(0, OwnedValue::Object(Box::new(summary)));
+        OwnedValue::Array(Box::new(records))
     }
 }
 
@@ -4262,11 +4281,26 @@ fn meta_locks(root: &Path, report: &mut MetaReport) {
 }
 
 fn meta_lock_line(path: &Path, report: &mut MetaReport) {
-    match mtxdb::ShardPool::lock_holder_status(path) {
-        Some((pid, alive)) => report.line(format!(
-            "lock {}: present pid={pid} status={}",
+    match mtxdb::ShardPool::lock_holder_info(path) {
+        Some(info) => report.line(format!(
+            "lock {}: pid={} {} writer={} confidence={}",
             path.display(),
-            if alive { "alive" } else { "dead/stale" }
+            info.pid,
+            if info.running {
+                "running"
+            } else {
+                "not-running"
+            },
+            if mtxdb::ShardPool::lock_contended(path) {
+                "active"
+            } else {
+                "not-held"
+            },
+            if info.has_starttime {
+                "full"
+            } else {
+                "limited"
+            }
         )),
         None => report.finding("WARN", path, "present but PID is unreadable"),
     }
@@ -4297,30 +4331,45 @@ fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize,
             continue;
         }
         for path in packs.into_iter().skip(offset).take(limit) {
-            match fs::metadata(&path) {
-                Ok(metadata) => {
-                    let mut file = BufReader::new(match fs::File::open(&path) {
-                        Ok(file) => file,
-                        Err(error) => {
-                            report.finding("ERROR", &path, error);
-                            continue;
-                        }
-                    });
-                    match mtxdb::packfile::read_header(&mut file) {
-                        Ok(Some(header)) => report.line(format!(
-                            "  {}: {} bytes, pack_id={:#x}",
-                            path.display(),
-                            metadata.len(),
-                            header.pack_id
-                        )),
-                        Ok(None) => report.finding("WARN", &path, "not a packfile"),
-                        Err(error) => report.finding("WARN", &path, error),
-                    }
-                }
-                Err(error) => report.finding("ERROR", &path, error),
+            match pack_identity(&path) {
+                Ok((pack_id, length)) => report.line(format!(
+                    "  {}: {} bytes, pack_id={pack_id:#x}",
+                    path.display(),
+                    length
+                )),
+                Err(error) => report.finding("WARN", &path, error),
             }
         }
     }
+}
+
+fn pack_identity(path: &Path) -> anyhow::Result<(u64, u64)> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("pack filename is not valid UTF-8"))?;
+    let hex = stem.strip_prefix("pack_").ok_or_else(|| {
+        anyhow!("non-canonical pack filename; expected pack_<16 hex digits>.pack")
+    })?;
+    if hex.len() != 16
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("non-canonical pack filename; expected pack_<16 lowercase hex digits>.pack");
+    }
+    let filename_id = u64::from_str_radix(hex, 16)?;
+    let length = fs::metadata(path)?.len();
+    let mut file = BufReader::new(fs::File::open(path)?);
+    let header =
+        mtxdb::packfile::read_header(&mut file)?.ok_or_else(|| anyhow!("not a packfile"))?;
+    if header.pack_id != filename_id {
+        bail!(
+            "pack filename id {filename_id:#x} disagrees with header id {:#x}",
+            header.pack_id
+        );
+    }
+    Ok((header.pack_id, length))
 }
 
 fn meta_wal(
@@ -4476,42 +4525,8 @@ fn meta_pack_fingerprint(dir: &Path) -> anyhow::Result<(u64, Vec<String>)> {
         {
             continue;
         }
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let Some(hex) = stem.strip_prefix("pack_") else {
-            issues.push(format!(
-                "skipped non-canonical pack filename {}",
-                path.display()
-            ));
-            continue;
-        };
-        let Ok(pack_id) = u64::from_str_radix(hex, 16) else {
-            issues.push(format!("skipped invalid pack filename {}", path.display()));
-            continue;
-        };
-        let length = match fs::metadata(&path) {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                issues.push(format!("skipped {}: {error}", path.display()));
-                continue;
-            }
-        };
-        let mut file = match fs::File::open(&path) {
-            Ok(file) => BufReader::new(file),
-            Err(error) => {
-                issues.push(format!("skipped {}: {error}", path.display()));
-                continue;
-            }
-        };
-        match mtxdb::packfile::read_header(&mut file) {
-            Ok(Some(header)) if header.pack_id == pack_id => packs.push((pack_id, length)),
-            Ok(Some(header)) => issues.push(format!(
-                "pack filename id {pack_id:#x} disagrees with header id {:#x} ({})",
-                header.pack_id,
-                path.display()
-            )),
-            Ok(None) => issues.push(format!("{} is not a packfile", path.display())),
+        match pack_identity(&path) {
+            Ok(identity) => packs.push(identity),
             Err(error) => issues.push(format!("{}: {error}", path.display())),
         }
     }
@@ -4543,7 +4558,7 @@ fn meta_health(root: &Path, report: &mut MetaReport) {
             ));
         }
         if journal_lsn < checkpoint.as_ref().map_or(0, |value| value.covered_lsn) {
-            report.finding("WARN", &dir, "journal.lsn is behind checkpoint coverage");
+            report.finding("NOTE", &dir, "journal.lsn is behind checkpoint coverage (may be transient during checkpoint persistence)");
         }
         if wal_lsn.is_some_and(|lsn| lsn < journal_lsn) {
             report.finding("WARN", &wal_path, "WAL last LSN is behind journal.lsn");
@@ -9742,11 +9757,12 @@ mod tests {
         event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
         format_canonical_display, format_id, glob_pack_files, import_pdu_events,
         interleaving_worth_noting, listing_shard_types, matrix_batch_has_create,
-        matrix_room_collection_id, matrix_room_extension_from_store, parse_federation_input,
-        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload, redacted_event_bytes,
-        resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-        template_collection_id, template_node_id, verify_auth_chain_edges, CollectionTemplate,
-        MatrixRoomExtension, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+        matrix_room_collection_id, matrix_room_extension_from_store, meta_raw,
+        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+        split_canonical_display, template_collection_id, template_node_id, verify_auth_chain_edges,
+        CollectionTemplate, MatrixRoomExtension, MetaReport, StateSet,
+        MATRIX_ROOM_MEMBER_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -9759,7 +9775,7 @@ mod tests {
         content_digest, derive_collection_id, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion,
         ShardType,
     };
-    use simd_json::prelude::{ValueObjectAccess, Writable};
+    use simd_json::prelude::{ValueAsScalar, ValueObjectAccess, Writable};
     use simd_json::OwnedValue;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -9813,6 +9829,67 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn meta_json_summary_has_numeric_severity_counts() {
+        let mut report = MetaReport::default();
+        report.finding("NOTE", Path::new("note"), "transient");
+        report.finding("WARN", Path::new("warn"), "mismatch");
+        report.finding("ERROR", Path::new("error"), "unreadable");
+        let value = report.json_value();
+        let encoded = value.encode();
+        let mut bytes = encoded.into_bytes();
+        let parsed = simd_json::to_owned_value(&mut bytes).expect("meta JSON must parse");
+        let simd_json::OwnedValue::Array(records) = parsed else {
+            panic!("meta JSON must be an array");
+        };
+        let simd_json::OwnedValue::Object(summary) = &records[0] else {
+            panic!("summary must be an object");
+        };
+        assert_eq!(
+            summary.get("kind").and_then(OwnedValue::as_str),
+            Some("summary")
+        );
+        assert_eq!(summary.get("note").and_then(OwnedValue::as_u64), Some(1));
+        assert_eq!(summary.get("warn").and_then(OwnedValue::as_u64), Some(1));
+        assert_eq!(summary.get("error").and_then(OwnedValue::as_u64), Some(1));
+    }
+
+    #[test]
+    fn meta_raw_paginates_across_files_without_loading_the_whole_file() {
+        let root = unique_temp_dir();
+        let state = root.join("pools/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(root.join("db.meta"), (0_u8..32).collect::<Vec<_>>()).unwrap();
+        std::fs::write(state.join("pool.meta"), (32_u8..64).collect::<Vec<_>>()).unwrap();
+        let mut report = MetaReport::default();
+        meta_raw(&root, &mut report, 3, 1);
+        let raw_lines = report
+            .lines
+            .iter()
+            .filter(|line| line.contains('|'))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(raw_lines.len(), 3);
+        assert!(raw_lines[0].contains("00000010"));
+        assert!(raw_lines[1].contains("00000000"));
+        assert!(raw_lines[2].contains("00000010"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meta_lock_reports_pid_confidence_and_contention() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".mtxdb.lock");
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        let info = mtxdb::ShardPool::lock_holder_info(&path).expect("PID marker");
+        assert_eq!(info.pid, std::process::id());
+        assert!(info.running);
+        assert!(!info.has_starttime);
+        assert!(!mtxdb::ShardPool::lock_contended(&path));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn compile_reject(template: &[u8]) -> anyhow::Result<CollectionTemplate> {
