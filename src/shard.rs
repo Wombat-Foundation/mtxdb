@@ -52,7 +52,7 @@ fn kick_writeback(file: &File, offset: u64, len: u64) {
 /// Unix can fsync a directory descriptor directly. Windows has no std API for
 /// it, and only lets you open a directory handle at all with
 /// `FILE_FLAG_BACKUP_SEMANTICS`; `sync_all` then maps to `FlushFileBuffers`,
-/// which persists the directory's entries — the same approach SQLite's Win32
+/// which persists the directory's entries — the same approach `SQLite`'s Win32
 /// VFS uses. `custom_flags` is safe, so this needs no FFI or new dependency.
 pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]

@@ -2340,10 +2340,7 @@ fn cmd_collections_in_dir(
 fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if !path
-            .extension()
-            .is_some_and(|extension| extension == "pack")
-        {
+        if path.extension().is_none_or(|extension| extension != "pack") {
             continue;
         }
         let file = fs::File::open(&path)
@@ -3627,7 +3624,7 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "pack") {
+        if path.extension().is_none_or(|e| e != "pack") {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -4748,7 +4745,7 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
                 let newer = stats
                     .members
                     .get(state_key)
-                    .map_or(true, |(seen, _)| when >= *seen);
+                    .is_none_or(|(seen, _)| when >= *seen);
                 if newer {
                     stats
                         .members
@@ -4758,7 +4755,7 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
                 let newer = stats
                     .room_state
                     .get(kind)
-                    .map_or(true, |(seen, _)| when >= *seen);
+                    .is_none_or(|(seen, _)| when >= *seen);
                 if newer {
                     if let Some(content) = fields.get("content") {
                         stats
@@ -5457,8 +5454,8 @@ fn scan_pack(
         let (record_collection, record_id, offset) = record?;
         // TODO: tied to MSRV 1.81.0 — replace with .is_none_or() once the
         // minimum is bumped to 1.82+.
-        if !collection_filter.map_or(true, |wanted| record_collection == wanted)
-            || !opts.node_id.map_or(true, |wanted| record_id == wanted)
+        if collection_filter.is_some_and(|wanted| record_collection != wanted)
+            || opts.node_id.is_some_and(|wanted| record_id != wanted)
         {
             continue;
         }
@@ -5918,7 +5915,7 @@ fn scan_collection_shard(
     let mut matched_pack = false;
     for record in records {
         let (record_collection_id, record_id, offset) = record?;
-        let id_matches = context.node_id.map_or(true, |wanted| record_id == wanted);
+        let id_matches = context.node_id.is_none_or(|wanted| record_id == wanted);
         if record_collection_id != context.collection_id || !id_matches {
             continue;
         }
@@ -7245,7 +7242,9 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
     let deleted_path = dir.join("deleted.collections");
     let deleted_bytes = fs::read(&deleted_path).unwrap_or_default();
     let deleted: HashSet<[u8; 16]> = deleted_bytes
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|chunk| {
             let mut id = [0u8; 16];
             id.copy_from_slice(chunk);
@@ -8732,7 +8731,7 @@ fn cmd_repack_target(
                 .shard_summaries()
                 .into_iter()
                 .find(|summary| summary.slot == *slot)
-                .map_or(true, |summary| !preview.pack_ids.contains(&summary.pack_id))
+                .is_none_or(|summary| !preview.pack_ids.contains(&summary.pack_id))
         });
     if grew {
         println!(

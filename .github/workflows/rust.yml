@@ -29,25 +29,12 @@ jobs:
         include:
           - rust: "1.81.0"
             label: "MSRV (default features)"
-          # `cli` is tested at the same 1.81.0 MSRV as the default build.
-          # This used to be pinned higher (1.82.0, briefly investigated as
-          # possibly needing 1.85.0) because of a transitive `zeroize` 1.9.0
-          # (declares `rust-version = "1.85"`) that had crept into
-          # Cargo.lock. That zeroize edge turned out to come from
-          # `ed25519-consensus` (a *dev*-dependency used for differential
-          # signing tests, unrelated to `cli`/ureq), not from ureq/rustls,
-          # and it broke even the plain 1.81.0 default-features job once
-          # `cargo clippy --all-targets` pulled dev-deps in. Fixed by
-          # pinning zeroize back to 1.8.1 (`rust-version = "1.60"`) via
-          # `cargo update -p zeroize --precise 1.8.1`. With that pin,
-          # `cargo metadata --features cli` shows the highest declared
-          # `rust-version` in the whole `cli` dependency tree is `clap` at
-          # 1.74, below the crate's own 1.81 -- so 1.81.0 is the verified
-          # real floor for `cli`, not just a re-labeling. Re-run
-          # `cargo metadata --format-version=1 --features cli` and check
-          # each package's `rust_version` before loosening the zeroize pin
-          # or changing this bound.
-          - rust: "1.81.0"
+          # The CLI lives in its own workspace (see mtxdb-cli/Cargo.toml): its
+          # edition-2024 deps (clap 4.6) and simd-json 0.18 set its floor at
+          # 1.88. It cannot share the `toolchain-checks` workspace because
+          # Cargo parses every member's graph + the shared lock, which would
+          # drag these library rows up to 1.85+ too.
+          - rust: "1.88.0"
             label: "cli feature"
           # The cross-process read-committed overlay (`multi-reader`) has its
           # own submodule (`packfile::storage::read_journal`) gated out of the
@@ -73,10 +60,9 @@ jobs:
           rustc --version
           cargo --version
 
-      # rustc 1.81.0 is the library's MSRV (enables core::error::Error), and
-      # (as of the zeroize 1.8.1 pin above) also the verified floor for the
-      # `cli` feature -- so both matrix rows share this toolchain and are
-      # distinguished by `matrix.label`, not `matrix.rust`.
+      # 1.81.0 is the library's MSRV (enables core::error::Error) and stays
+      # reachable only because mtxdb-cli is its own workspace. The `cli
+      # feature` row runs at 1.88.0, the CLI's own floor.
       - name: Lint (default features)
         if: matrix.label == 'MSRV (default features)'
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -87,7 +73,7 @@ jobs:
 
       - name: Lint (cli feature)
         if: matrix.label == 'cli feature'
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --manifest-path mtxdb-cli/Cargo.toml -- -D warnings
 
       - name: Test (cli feature)
         if: matrix.label == 'cli feature'
@@ -95,7 +81,7 @@ jobs:
 
       - name: Build CLI
         if: matrix.label == 'cli feature'
-        run: cargo build --release --manifest-path mtxdb-cli/Cargo.toml
+        run: cargo build --release --locked --manifest-path mtxdb-cli/Cargo.toml
 
       - name: Lint (multi-reader feature)
         if: matrix.label == 'multi-reader feature'
