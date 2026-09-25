@@ -131,16 +131,10 @@ pub const fn wrapping_add_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
     let b2 = u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
     let b3 = u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]]);
 
-    let (r0, c0) = a0.overflowing_add(b0);
-
-    let (t1, c1a) = a1.overflowing_add(b1);
-    let (r1, c1b) = t1.overflowing_add(c0 as u64);
-
-    let (t2, c2a) = a2.overflowing_add(b2);
-    let (r2, c2b) = t2.overflowing_add((c1a as u64) | (c1b as u64));
-
-    let (t3, _c3a) = a3.overflowing_add(b3);
-    let (r3, _c3b) = t3.overflowing_add((c2a as u64) | (c2b as u64));
+    let (r0, carry0) = a0.overflowing_add(b0);
+    let (r1, carry1) = add_with_carry(a1, b1, carry0);
+    let (r2, carry2) = add_with_carry(a2, b2, carry1);
+    let (r3, _carry3) = add_with_carry(a3, b3, carry2);
 
     let o0 = r0.to_le_bytes();
     let o1 = r1.to_le_bytes();
@@ -152,6 +146,13 @@ pub const fn wrapping_add_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
         o1[5], o1[6], o1[7], o2[0], o2[1], o2[2], o2[3], o2[4], o2[5], o2[6], o2[7], o3[0], o3[1],
         o3[2], o3[3], o3[4], o3[5], o3[6], o3[7],
     ]
+}
+
+#[inline]
+const fn add_with_carry(left: u64, right: u64, carry: bool) -> (u64, bool) {
+    let (sum, left_right_carry) = left.overflowing_add(right);
+    let (sum, carry_carry) = sum.overflowing_add(carry as u64);
+    (sum, left_right_carry || carry_carry)
 }
 
 /// Domain prefix for collection group canonical identity hashing.
