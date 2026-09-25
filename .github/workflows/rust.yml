@@ -1,5 +1,5 @@
 ---
-name: Rust
+name: PR Checks
 
 on:
   push:
