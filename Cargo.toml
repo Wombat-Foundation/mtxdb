@@ -92,12 +92,19 @@ parking_lot = "0.12"
 sha2 = "0.10"
 zstd = { version = "0.13", default-features = false, optional = true }
 
-# Native builds link the system libzstd via pkg-config (already installed
-# at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
-# `zstd`/`zstd-safe` don't forward a "pkg-config" feature of their own, so
-# this reaches it by depending on `zstd-sys` directly at the same version
-# zstd-safe resolves to — Cargo unifies the two into one build.
+# `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their
+# own, so reach `zstd-sys` directly at the same version zstd-safe resolves to
+# — Cargo unifies the two into one build. Unix hosts link the system libzstd
+# via pkg-config (already installed at /usr/local/lib here) instead of
+# compiling zstd's C sources ourselves; Windows has neither pkg-config nor a
+# system zstd, so it vendors and builds them with MSVC. zstd-sys lets
+# `vendored` win over `pkg-config`, but neither is target-conditional inside
+# the crate, so the choice is made here with two cfg tables.
+[target.'cfg(not(windows))'.dependencies]
 zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
 [lints]
 workspace = true
