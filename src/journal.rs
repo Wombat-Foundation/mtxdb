@@ -2583,38 +2583,7 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    #[cfg(unix)]
-    {
-        File::open(parent)?.sync_all()
-    }
-    #[cfg(windows)]
-    {
-        // std exposes no directory-durability API, and Windows only lets you
-        // open a directory handle at all with FILE_FLAG_BACKUP_SEMANTICS.
-        // `sync_all` then maps to FlushFileBuffers on that handle, persisting
-        // the directory's entries — the same trick SQLite's Win32 VFS uses.
-        // `custom_flags` is safe, so this needs no FFI or extra dependency.
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(parent)?
-            .sync_all()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        // No directory-handle durability operation is available on this
-        // platform. Refuse to enable the journal until one can uphold
-        // create/rotation durability; silently succeeding would weaken the
-        // contract.
-        let _ = parent;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable journal creation requires platform directory sync support",
-        ))
-    }
+    crate::shard::sync_directory(parent)
 }
 
 fn invalid_data(message: &'static str) -> io::Error {
@@ -2681,7 +2650,10 @@ mod tests {
         std::env::temp_dir().join(format!(
             "mtxdb_journal_{label}_{}_{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
         ))
     }
 
