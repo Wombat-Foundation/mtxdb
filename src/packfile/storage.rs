@@ -8875,6 +8875,9 @@ impl PackfileStorage {
             background_coalesced: self
                 .journal()
                 .map_or(0, |journal| journal.background_coalesced()),
+            durability: self
+                .journal()
+                .map_or_else(Default::default, |journal| journal.durability_stats()),
             repack: self.repack_stats(),
             cache,
             shards: self.shard_stats(),
@@ -9150,6 +9153,9 @@ pub struct RuntimeStats {
     pub background_commits: u64,
     /// Background commit attempts already covered by a durable group.
     pub background_coalesced: u64,
+    /// Lifetime journal durability accounting (requests versus real fsyncs,
+    /// records per fsync, blocked-wait latency). Default without a journal.
+    pub durability: crate::journal::DurabilityStats,
     /// Cumulative repack activity (persisted across opens).
     pub repack: RepackStats,
     /// Aggregate decoded-node cache hit/miss across loaded collections.
@@ -9260,6 +9266,7 @@ impl Default for RuntimeStats {
             publish_time: std::time::Duration::ZERO,
             background_commits: 0,
             background_coalesced: 0,
+            durability: crate::journal::DurabilityStats::default(),
             repack: RepackStats::default(),
             cache: CacheStats::default(),
             shards: Vec::new(),

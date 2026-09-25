@@ -736,6 +736,99 @@ pub struct JournalSyncTimings {
     pub journal_in_flight: u64,
 }
 
+/// Latency of blocked [`JournalCoordinator::wait_durable`] calls, in fixed
+/// non-cumulative buckets: `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
+///
+/// Sized for fsync-scale waits, unlike the sub-millisecond storage-operation
+/// buckets. The total observation count is the sum of all five entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DurableWaitLatency {
+    /// Number of waits that had to block for a durable group.
+    pub calls: u64,
+    /// Sum of wait wall time.
+    pub total: std::time::Duration,
+    /// Largest single wait.
+    pub max: std::time::Duration,
+    /// Counts for `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
+    pub buckets: [u64; 5],
+}
+
+/// Lifetime durability accounting for one journal: how many requests shared
+/// how many real fsyncs. Counters are monotone and never reset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DurabilityStats {
+    /// [`JournalCoordinator::request_durable`] calls.
+    pub durable_requests: u64,
+    /// `wait_durable` calls already satisfied at entry (no blocking).
+    pub durable_waits_already_durable: u64,
+    /// Latency of `wait_durable` calls that had to block.
+    pub durable_wait: DurableWaitLatency,
+    /// Sync-barrier entries (`sync_through*`), including coalesced ones.
+    pub sync_requests: u64,
+    /// Sync-barrier entries that found the journal mutex occupied.
+    pub sync_waiters: u64,
+    /// Sync-barrier entries covered by another caller's fsync.
+    pub sync_coalesced: u64,
+    /// Real journal fsyncs that advanced the durable boundary.
+    pub commits: u64,
+    /// Mutations made durable across all commits (durable-LSN advance).
+    pub commit_records: u64,
+    /// Most mutations made durable by a single fsync.
+    pub max_commit_records: u64,
+}
+
+impl DurabilityStats {
+    /// Mean mutations made durable per real fsync, or `0.0` before any commit.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn records_per_commit(&self) -> f64 {
+        if self.commits == 0 {
+            0.0
+        } else {
+            self.commit_records as f64 / self.commits as f64
+        }
+    }
+}
+
+#[derive(Default)]
+struct DurableWaitTotals {
+    calls: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    buckets: [AtomicU64; 5],
+}
+
+impl DurableWaitTotals {
+    fn observe(&self, duration: std::time::Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(nanos, Ordering::Relaxed);
+        self.max_ns.fetch_max(nanos, Ordering::Relaxed);
+        let micros = duration.as_micros();
+        let bucket = if micros < 1_000 {
+            0
+        } else if micros < 10_000 {
+            1
+        } else if micros < 100_000 {
+            2
+        } else if micros < 1_000_000 {
+            3
+        } else {
+            4
+        };
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> DurableWaitLatency {
+        DurableWaitLatency {
+            calls: self.calls.load(Ordering::Relaxed),
+            total: std::time::Duration::from_nanos(self.total_ns.load(Ordering::Relaxed)),
+            max: std::time::Duration::from_nanos(self.max_ns.load(Ordering::Relaxed)),
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
+        }
+    }
+}
+
 struct SyncInFlightGuard<'a>(&'a AtomicU64);
 
 impl Drop for SyncInFlightGuard<'_> {
@@ -1036,6 +1129,18 @@ pub struct JournalCoordinator {
     /// Number of background commit attempts already covered by a concurrent
     /// durable group (never counted for idle timer ticks).
     background_coalesced: AtomicU64,
+    /// `request_durable` calls.
+    durable_requests: AtomicU64,
+    /// `wait_durable` calls satisfied without blocking.
+    durable_waits_already_durable: AtomicU64,
+    /// Latency of `wait_durable` calls that blocked.
+    durable_wait: DurableWaitTotals,
+    /// Real fsyncs that advanced the durable boundary.
+    commits: AtomicU64,
+    /// Durable-LSN advance summed over all commits.
+    commit_records: AtomicU64,
+    /// Largest durable-LSN advance made by one fsync.
+    max_commit_records: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -1093,6 +1198,12 @@ impl JournalCoordinator {
             threshold_wakes: AtomicU64::new(0),
             background_commits: AtomicU64::new(0),
             background_coalesced: AtomicU64::new(0),
+            durable_requests: AtomicU64::new(0),
+            durable_waits_already_durable: AtomicU64::new(0),
+            durable_wait: DurableWaitTotals::default(),
+            commits: AtomicU64::new(0),
+            commit_records: AtomicU64::new(0),
+            max_commit_records: AtomicU64::new(0),
         }
     }
 
@@ -1134,6 +1245,11 @@ impl JournalCoordinator {
     fn note_commit(&self, through_lsn: u64) {
         let previous = self.committed_lsn.fetch_max(through_lsn, Ordering::AcqRel);
         if through_lsn > previous {
+            let covered = through_lsn.saturating_sub(previous);
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.commit_records.fetch_add(covered, Ordering::Relaxed);
+            self.max_commit_records
+                .fetch_max(covered, Ordering::Relaxed);
             self.commit_epoch.fetch_add(1, Ordering::AcqRel);
             self.wake_committer_if_backlogged();
         }
@@ -1781,6 +1897,7 @@ impl JournalCoordinator {
     /// covers the token; without one it performs the blocking commit itself.
     #[must_use]
     pub fn request_durable(&self, target_lsn: u64) -> DurabilityToken {
+        self.durable_requests.fetch_add(1, Ordering::Relaxed);
         self.durable_requested
             .fetch_max(target_lsn, Ordering::AcqRel);
         // Wake the committer (for a threshold flush) and any waiters parked on
@@ -1793,6 +1910,25 @@ impl JournalCoordinator {
     #[must_use]
     pub fn durable_requested(&self) -> u64 {
         self.durable_requested.load(Ordering::Acquire)
+    }
+
+    /// Lifetime durability accounting: requests versus real fsyncs, records
+    /// per fsync, and blocked-wait latency.
+    #[must_use]
+    pub fn durability_stats(&self) -> DurabilityStats {
+        DurabilityStats {
+            durable_requests: self.durable_requests.load(Ordering::Relaxed),
+            durable_waits_already_durable: self
+                .durable_waits_already_durable
+                .load(Ordering::Relaxed),
+            durable_wait: self.durable_wait.snapshot(),
+            sync_requests: self.sync_calls.load(Ordering::Relaxed),
+            sync_waiters: self.journal_waiters.load(Ordering::Relaxed),
+            sync_coalesced: self.coalesced_syncs.load(Ordering::Relaxed),
+            commits: self.commits.load(Ordering::Relaxed),
+            commit_records: self.commit_records.load(Ordering::Relaxed),
+            max_commit_records: self.max_commit_records.load(Ordering::Relaxed),
+        }
     }
 
     /// Number of published mutations not yet durably committed. Used as the
@@ -1902,8 +2038,17 @@ impl JournalCoordinator {
     pub fn wait_durable(&self, token: DurabilityToken) -> io::Result<Option<CommitReceipt>> {
         let target = token.lsn;
         if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
+            self.durable_waits_already_durable
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
+        let started = std::time::Instant::now();
+        let result = self.wait_durable_blocking(target);
+        self.durable_wait.observe(started.elapsed());
+        result
+    }
+
+    fn wait_durable_blocking(&self, target: u64) -> io::Result<Option<CommitReceipt>> {
         loop {
             if target <= self.committed_lsn.load(Ordering::Acquire) {
                 return Ok(None);
@@ -4298,6 +4443,84 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn durability_stats_show_requests_sharing_few_fsyncs() {
+        const WRITERS: u8 = 16;
+        let coordinator = open_arc("dur_stats_shared");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_millis(200),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for node in 0..WRITERS {
+            let coordinator = coordinator.clone();
+            handles.push(std::thread::spawn(move || {
+                let lsn = coordinator
+                    .publish(put(3, node, b"shared"), |_| {})
+                    .unwrap();
+                let token = coordinator.request_durable(lsn);
+                coordinator.wait_durable(token).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let stats = coordinator.durability_stats();
+        assert_eq!(stats.durable_requests, u64::from(WRITERS));
+        assert_eq!(
+            stats.durable_wait.calls + stats.durable_waits_already_durable,
+            u64::from(WRITERS),
+            "every wait is either blocked or already durable"
+        );
+        assert_eq!(
+            stats.durable_wait.buckets.iter().sum::<u64>(),
+            stats.durable_wait.calls
+        );
+        assert_eq!(stats.commit_records, u64::from(WRITERS));
+        assert!(
+            stats.commits >= 1 && stats.commits < u64::from(WRITERS),
+            "{WRITERS} requests must share fewer fsyncs, saw {}",
+            stats.commits
+        );
+        assert!(stats.max_commit_records > 1);
+        assert!(stats.records_per_commit() > 1.0);
+        assert!(
+            stats.durable_wait.max
+                >= stats.durable_wait.total
+                    / u32::try_from(stats.durable_wait.calls.max(1)).unwrap()
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn durability_stats_count_already_durable_and_explicit_sync() {
+        let coordinator = open_arc("dur_stats_explicit");
+        let lsn = coordinator.publish(put(4, 1, b"one"), |_| {}).unwrap();
+        let before = coordinator.durability_stats();
+        assert_eq!(before.commits, 0);
+
+        coordinator.sync_through(lsn).unwrap();
+        let token = coordinator.request_durable(lsn);
+        coordinator.wait_durable(token).unwrap();
+        // A second barrier on the same LSN is covered, not a new fsync.
+        coordinator.sync_through(lsn).unwrap();
+
+        let stats = coordinator.durability_stats();
+        assert_eq!(stats.commits, 1);
+        assert_eq!(stats.commit_records, 1);
+        assert_eq!(stats.durable_requests, 1);
+        assert_eq!(stats.durable_waits_already_durable, 1);
+        assert_eq!(stats.durable_wait.calls, 0);
+        assert_eq!(stats.sync_requests, 2);
+        assert_eq!(stats.sync_coalesced, 1);
+        fs::remove_file(coordinator.path()).unwrap();
     }
 
     #[test]
