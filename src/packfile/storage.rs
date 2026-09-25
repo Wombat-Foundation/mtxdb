@@ -13286,6 +13286,11 @@ mod tests {
         std::fs::write(dir.join("aabb_00.pack"), b"").unwrap();
         std::fs::write(dir.join("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_00.pack"), b"").unwrap();
         std::fs::write(dir.join("00000000000000000000000000000000_gg.pack"), b"").unwrap();
+        // A filename that isn't valid UTF-8 is only creatable on filesystems
+        // that accept arbitrary bytes (Linux/BSD). APFS on macOS rejects it
+        // with EILSEQ (os error 92), and Windows has no `std::os::unix`; the
+        // ASCII-only malformed names above still cover the skip path there.
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
