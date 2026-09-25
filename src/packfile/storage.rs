@@ -8327,10 +8327,7 @@ impl PackfileStorage {
     /// a checkpoint; oversized v3 batches fall back from the append helper.
     fn delta_state_needs_full_rewrite(&self) -> bool {
         let state = self.delta_state.lock();
-        if state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty() {
-            return true;
-        }
-        false
+        state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty()
     }
 
     /// Persist the dirty index state for a sync barrier — a delta append when
@@ -13295,6 +13292,11 @@ mod tests {
         std::fs::write(dir.join("aabb_00.pack"), b"").unwrap();
         std::fs::write(dir.join("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_00.pack"), b"").unwrap();
         std::fs::write(dir.join("00000000000000000000000000000000_gg.pack"), b"").unwrap();
+        // A filename that isn't valid UTF-8 is only creatable on filesystems
+        // that accept arbitrary bytes (Linux/BSD). APFS on macOS rejects it
+        // with EILSEQ (os error 92), and Windows has no `std::os::unix`; the
+        // ASCII-only malformed names above still cover the skip path there.
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
@@ -15486,19 +15488,20 @@ mod tests {
             .collect();
 
         let barrier = Arc::new(std::sync::Barrier::new(candidates.len()));
-        let handles: Vec<_> = candidates
-            .iter()
-            .cloned()
-            .map(|metadata| {
-                let store = Arc::clone(&store);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    store.ensure_collection_metadata(&collection, &metadata)
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = candidates
+                .iter()
+                .map(|metadata| {
+                    let store = Arc::clone(&store);
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.ensure_collection_metadata(&collection, metadata)
+                    })
                 })
-            })
-            .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
         assert_eq!(
             results.iter().filter(|r| r.is_ok()).count(),

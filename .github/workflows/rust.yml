@@ -1,5 +1,5 @@
 ---
-name: Rust
+name: PR Checks
 
 on:
   push:
@@ -16,6 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # `rust-toolchain.toml` pins nightly-2026-08-20 and, as a directory
+      # override, outranks the `rustup default` the action installs -- so
+      # without this every row silently ran the pinned nightly. RUSTUP_TOOLCHAIN
+      # has the highest precedence, so matrix.rust actually takes effect.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,11 +67,6 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: rust-${{ matrix.rust }}-${{ matrix.label }}
-
       - name: Toolchain Versions
         run: |
           rustc --version
@@ -77,19 +78,19 @@ jobs:
       # distinguished by `matrix.label`, not `matrix.rust`.
       - name: Lint (default features)
         if: matrix.label == 'MSRV (default features)'
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test (default features)
         if: matrix.label == 'MSRV (default features)'
-        run: cargo test --locked --workspace --lib --tests
+        run: cargo test --locked --lib --tests
 
       - name: Lint (cli feature)
         if: matrix.label == 'cli feature'
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test (cli feature)
         if: matrix.label == 'cli feature'
-        run: cargo test --locked --workspace --lib --tests
+        run: cargo test --locked --lib --tests
 
       - name: Build CLI
         if: matrix.label == 'cli feature'
@@ -108,10 +109,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # See toolchain-checks: overrides the committed rust-toolchain.toml pin.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.92.0", "stable", "beta", "nightly"]
+        rust: ["1.81.0", "1.82.0", "1.85.0", "1.92.0", "1.98.1", "stable", "nightly"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -123,21 +127,16 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: rust-${{ matrix.rust }}-all-features
-
       - name: Toolchain Versions
         run: |
           rustc --version
           cargo --version
 
       - name: Lint
-        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked --all-features --workspace --lib --tests
+        run: cargo test --locked --all-features --lib --tests
 
   checks:
     name: Format, Coverage, and Summary
@@ -154,11 +153,6 @@ jobs:
         with:
           components: clippy
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: rust-stable-summary
-
       - name: Install dependencies
         run: |
           pip install pre-commit
@@ -169,7 +163,7 @@ jobs:
         run: make format && git diff --exit-code
 
       - name: Lint (Clippy)
-        run: cargo clippy --locked --all-features --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
       - name: Install nightly toolchain (for llvm-cov)
         run: rustup toolchain install nightly --profile minimal
@@ -178,7 +172,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test Suite
-        run: set -o pipefail; cargo test --locked --all-features --workspace --lib --tests 2>&1 | tee test-results.txt
+        run: set -o pipefail; cargo test --locked --all-features --lib --tests 2>&1 | tee test-results.txt
 
       - name: Code Coverage
         run: make cov

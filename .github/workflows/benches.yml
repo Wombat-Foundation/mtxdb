@@ -26,6 +26,10 @@ env:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    env:
+      # Override the committed rust-toolchain.toml pin (nightly-2026-08-20) so
+      # benchmarks match the stable toolchain installed below.
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -34,18 +38,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: bench
-
       - name: Run benchmarks (tee to file)
         # benches/ is a standalone crate outside the root [workspace] (see
         # root Cargo.toml), so the harness must be reached via
         # --manifest-path. --all-features is deliberately omitted: it would
         # pull in the opt-in `compare-external` feature (libmdbx/rusqlite/
         # fjall), which needs sqlite3 dev headers this runner doesn't install.
-        run: set -o pipefail; cargo bench --manifest-path benches/Cargo.toml --profile release --benches 2>&1 | tee bench-output.txt
+        run: set -o pipefail; cargo bench --manifest-path benches/Cargo.toml --profile release --all-targets --all-features --benches 2>&1 | tee bench-output.txt
 
       - name: Fetch previous best metrics
         # Previous best is tracked as bench.json on the `_metadata/badges` branch.

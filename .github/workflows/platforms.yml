@@ -22,6 +22,17 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest]
+    env:
+      # Workflow declares `stable`, but the committed rust-toolchain.toml pin
+      # (nightly-2026-08-20) outranks the installed default; RUSTUP_TOOLCHAIN
+      # wins over the file so these runners actually use stable.
+      RUSTUP_TOOLCHAIN: stable
+      # `.cargo/config.toml` enables the host-native `rustc-wrapper` on every
+      # platform, but Windows cannot execute its `.sh` (`%1 is not a valid
+      # Win32 application`, os error 193), and Cargo has no OS-conditional
+      # `rustc-wrapper`. An empty RUSTC_WRAPPER env overrides the config value,
+      # so Windows builds portable while macOS keeps the native/mold wrapper.
+      RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && '.cargo/cargo-wrapper.sh' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,11 +42,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: native-${{ matrix.os }}
 
       - name: Toolchain versions
         run: |
