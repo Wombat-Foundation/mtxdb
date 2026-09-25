@@ -30,6 +30,19 @@ const BASE64_BITS_PER_CHARACTER: usize = 6;
 const STATE_GROUP_ID_LENGTH: usize =
     (STATE_GROUP_DIGEST_BYTES * 8).div_ceil(BASE64_BITS_PER_CHARACTER);
 
+/// Auxiliary namespace for the derived `event_id -> state_group_id` cache.
+///
+/// The namespace is versioned. These values are derived data, so any change to
+/// the derivation (hashing, resolution rules, ordering) must bump the suffix.
+/// A new namespace starts empty and is repopulated by recomputation on the next
+/// import; this is the only safe invalidation, since a well-formed cached value
+/// that is semantically stale cannot be detected without recomputing it. For
+/// the same reason a corrupted-but-well-formed entry is not self-correcting;
+/// recovering from that requires purging the namespace.
+/// The previous unversioned namespace is intentionally left as dead weight;
+/// auxiliary indexes are not globally enumerated or garbage-collected here.
+const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
+
 fn valid_state_group_id(value: &str) -> bool {
     value.len() == STATE_GROUP_ID_LENGTH
         && value
@@ -46,6 +59,42 @@ enum StateGroupLoad {
     },
 }
 
+/// Map a batch of cache values (in `event_ids` order) to a [`StateGroupLoad`].
+///
+/// Split out from [`load_state_groups`] so the cardinality guard is testable
+/// without a storage backend that deliberately violates `StorageEngine::get_many`.
+fn state_groups_from_values(event_ids: &[String], values: Vec<Option<Vec<u8>>>) -> StateGroupLoad {
+    if values.len() != event_ids.len() {
+        // StorageEngine::get_many promises request cardinality. A mismatch is
+        // a broken-backend condition, not an ordinary cache miss; recompute
+        // safely instead.
+        return StateGroupLoad::Invalid {
+            event_id: "<batch>".to_owned(),
+            reason: "cache returned the wrong number of values",
+        };
+    }
+    let mut groups = HashMap::with_capacity(event_ids.len());
+    for (event_id, value) in event_ids.iter().zip(values) {
+        let Some(value) = value else {
+            return StateGroupLoad::Missing;
+        };
+        let Ok(value) = String::from_utf8(value) else {
+            return StateGroupLoad::Invalid {
+                event_id: event_id.clone(),
+                reason: "invalid UTF-8",
+            };
+        };
+        if !valid_state_group_id(&value) {
+            return StateGroupLoad::Invalid {
+                event_id: event_id.clone(),
+                reason: "invalid state-group ID format",
+            };
+        }
+        groups.insert(event_id.clone(), value);
+    }
+    StateGroupLoad::Complete(groups)
+}
+
 fn load_state_groups(
     aux: &AuxiliaryIndex<'_, PackfileStorage>,
     event_ids: &[String],
@@ -55,37 +104,7 @@ fn load_state_groups(
     }
     let keys = event_ids.iter().map(String::as_bytes).collect::<Vec<_>>();
     let values = aux.get_many(&keys)?;
-    if values.len() != event_ids.len() {
-        debug_assert_eq!(
-            values.len(),
-            event_ids.len(),
-            "auxiliary index get_many must preserve request cardinality"
-        );
-        return Ok(StateGroupLoad::Invalid {
-            event_id: "<batch>".to_owned(),
-            reason: "cache returned the wrong number of values",
-        });
-    }
-    let mut groups = HashMap::with_capacity(event_ids.len());
-    for (event_id, value) in event_ids.iter().zip(values) {
-        let Some(value) = value else {
-            return Ok(StateGroupLoad::Missing);
-        };
-        let Ok(value) = String::from_utf8(value) else {
-            return Ok(StateGroupLoad::Invalid {
-                event_id: event_id.clone(),
-                reason: "invalid UTF-8",
-            });
-        };
-        if !valid_state_group_id(&value) {
-            return Ok(StateGroupLoad::Invalid {
-                event_id: event_id.clone(),
-                reason: "invalid state-group ID format",
-            });
-        }
-        groups.insert(event_id.clone(), value);
-    }
-    Ok(StateGroupLoad::Complete(groups))
+    Ok(state_groups_from_values(event_ids, values))
 }
 
 /// Human-readable byte count (`512 B`, `4.3 KB`, `1.2 MB`, `2.1 GB`) —
@@ -7858,7 +7877,7 @@ fn import_pdu_events(
         .collect::<Vec<_>>();
     let mut state_groups = HashMap::new();
     let mut loaded = false;
-    let aux = AuxiliaryIndex::open(state_store, "sys:matrix-state-groups");
+    let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     if !graph_event_ids.is_empty() {
         match load_state_groups(&aux, &graph_event_ids) {
             Ok(StateGroupLoad::Complete(groups)) => {
@@ -7914,6 +7933,9 @@ fn import_pdu_events(
         "  state groups: {source} {unique_state_group_count} state groups across {mapped_event_count} events, {stateless_event_count} events unmapped ({unresolved_count} unresolved)"
     );
     if !loaded && !state_groups.is_empty() {
+        // State-group derivation is a function of each event's ancestry, not
+        // batch composition, so concurrent imports writing the same keys have
+        // a benign last-writer win.
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
             .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
@@ -10011,6 +10033,7 @@ mod tests {
         template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
         verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, PackIdentity,
         StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+        STATE_GROUP_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -11025,7 +11048,7 @@ mod tests {
         let (store, dir, path, template, collection_id) =
             import_fixture("import_cached_state_groups");
         let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, "sys:matrix-state-groups");
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
         aux.ensure_metadata().unwrap();
         let event = import_event("$cached", "@alice", "!room");
         let cached_group = "A".repeat(STATE_GROUP_ID_LENGTH);
@@ -11060,11 +11083,50 @@ mod tests {
     }
 
     #[test]
+    fn importer_ignores_the_previous_unversioned_state_group_cache() {
+        const OLD_NAMESPACE: &str = "sys:matrix-state-groups";
+        let (store, dir, path, template, collection_id) =
+            import_fixture("import_old_namespace_state_groups");
+        let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+        let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, OLD_NAMESPACE);
+        old_aux.ensure_metadata().unwrap();
+        let stale = "A".repeat(STATE_GROUP_ID_LENGTH);
+        old_aux.put(b"$cached", stale.as_bytes()).unwrap();
+        let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+
+        let event = import_event("$cached", "@alice", "!room");
+        let mut established = HashSet::new();
+        established.insert(collection_id);
+        import_pdu_events(
+            &store,
+            &state_store,
+            &dir,
+            &path,
+            std::slice::from_ref(&event),
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+
+        // v1 cannot see the old entry, so the import recomputes and persists a
+        // real digest; the old namespace is left untouched as dead weight.
+        let recomputed = new_aux.get(b"$cached").unwrap().expect("v1 mapping");
+        assert_ne!(recomputed.as_slice(), stale.as_bytes());
+        assert!(valid_state_group_id(
+            std::str::from_utf8(&recomputed).unwrap()
+        ));
+        assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.into_bytes()));
+    }
+
+    #[test]
     fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
         let (store, dir, path, template, collection_id) =
             import_fixture("import_state_group_repair");
         let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, "sys:matrix-state-groups");
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
         aux.ensure_metadata().unwrap();
         let child = owned_value(
             r#"{"event_id":"$child","sender":"@alice","room_id":"!room","type":"m.room.message","prev_events":["$parent"],"content":{"room_version":"11"}}"#,
@@ -12387,7 +12449,7 @@ mod tests {
         let dir = unique_temp_dir().join("state_group_cache");
         std::fs::create_dir_all(&dir).unwrap();
         let store = PackfileStorage::open(dir.clone()).unwrap();
-        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, "sys:matrix-state-groups");
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, STATE_GROUP_NAMESPACE);
         aux.ensure_metadata().unwrap();
         let first = "A".repeat(STATE_GROUP_ID_LENGTH);
         let second = "B".repeat(STATE_GROUP_ID_LENGTH);
@@ -12419,11 +12481,35 @@ mod tests {
     }
 
     #[test]
+    fn state_groups_from_values_treats_a_cardinality_mismatch_as_invalid() {
+        let ids = vec!["first".to_owned(), "second".to_owned()];
+        let value = Some("A".repeat(STATE_GROUP_ID_LENGTH).into_bytes());
+        assert!(matches!(
+            super::state_groups_from_values(&ids, vec![value.clone()]),
+            StateGroupLoad::Invalid { .. }
+        ));
+        assert!(matches!(
+            super::state_groups_from_values(&["only".to_owned()], vec![None, None]),
+            StateGroupLoad::Invalid { .. }
+        ));
+        assert!(matches!(
+            super::state_groups_from_values(&ids, vec![value.clone(), None]),
+            StateGroupLoad::Missing
+        ));
+        let StateGroupLoad::Complete(groups) =
+            super::state_groups_from_values(&ids, vec![value.clone(), value])
+        else {
+            panic!("matching cardinality with valid values should load");
+        };
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
     fn partial_state_groups_repair_when_a_missing_parent_arrives() {
         let dir = unique_temp_dir().join("state_group_repair");
         std::fs::create_dir_all(&dir).unwrap();
         let store = PackfileStorage::open(dir.clone()).unwrap();
-        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, "sys:matrix-state-groups");
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, STATE_GROUP_NAMESPACE);
         aux.ensure_metadata().unwrap();
         let incomplete = owned_value(
             r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$parent"],"content":{}}"#,
@@ -12489,6 +12575,35 @@ mod tests {
         let g1 = compute_state_groups_partial(&[create.clone(), member.clone()], &[]).groups;
         let g2 = compute_state_groups_partial(&[create, member], &[]).groups;
         assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn compute_state_groups_is_stable_across_overlapping_batches() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
+        );
+        let member = owned_value(
+            r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
+        );
+        let sibling = owned_value(
+            r#"{"event_id":"$sibling","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let orphan = owned_value(
+            r#"{"event_id":"$orphan","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$missing"],"content":{}}"#,
+        );
+
+        let base = compute_state_groups_partial(&[create.clone(), member.clone()], &[]);
+        let with_fork =
+            compute_state_groups_partial(&[create.clone(), member.clone(), sibling.clone()], &[]);
+        let with_orphan =
+            compute_state_groups_partial(&[create.clone(), member.clone(), orphan], &[]);
+        let with_auth_chain = compute_state_groups_partial(&[create, member], &[sibling]);
+
+        assert_eq!(base.groups["$join"], with_fork.groups["$join"]);
+        assert_eq!(base.groups["$join"], with_orphan.groups["$join"]);
+        assert_eq!(base.groups["$join"], with_auth_chain.groups["$join"]);
+        assert!(!with_orphan.groups.contains_key("$orphan"));
+        assert!(with_orphan.unresolved.iter().any(|id| id == "$orphan"));
     }
 
     #[test]
