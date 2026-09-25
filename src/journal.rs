@@ -1024,6 +1024,13 @@ pub struct JournalCoordinator {
     /// instead of sleeping. Absent from non-test builds.
     #[cfg(test)]
     committer_parks: AtomicU64,
+    /// Test-only: threshold wakes whose send path `publish` selected.
+    /// Incremented inline, so a test can assert a burst selected (or
+    /// suppressed) its wake without waiting for the committer to react.
+    /// `notify_all` has no observable success/failure, so this counts decisions,
+    /// not deliveries.
+    #[cfg(test)]
+    threshold_wakes: AtomicU64,
     /// Number of background group commits that appended and fsynced a group.
     background_commits: AtomicU64,
     /// Number of background commit attempts already covered by a concurrent
@@ -1082,6 +1089,8 @@ impl JournalCoordinator {
             threshold_notified_epoch: AtomicU64::new(u64::MAX),
             #[cfg(test)]
             committer_parks: AtomicU64::new(0),
+            #[cfg(test)]
+            threshold_wakes: AtomicU64::new(0),
             background_commits: AtomicU64::new(0),
             background_coalesced: AtomicU64::new(0),
         }
@@ -1308,6 +1317,8 @@ impl JournalCoordinator {
         // durable_lock) and off the publish path otherwise.
         drop(pending);
         if wake {
+            #[cfg(test)]
+            self.threshold_wakes.fetch_add(1, Ordering::Relaxed);
             self.wake_durable_waiters();
         }
         Ok(lsn)
@@ -4506,6 +4517,7 @@ mod tests {
         let lsn = coordinator.publish(put(1, 10, b"mid"), |_| {}).unwrap();
         coordinator.sync_through(lsn).unwrap();
         assert_eq!(coordinator.background_commits(), 0);
+        assert_eq!(coordinator.threshold_wakes.load(Ordering::Relaxed), 0);
 
         // The explicit commit above advanced the epoch, so this burst wakes it.
         for node in 20..24u8 {
@@ -4585,8 +4597,14 @@ mod tests {
                     .unwrap(),
             );
         }
-        // The committer is parked and the suppressed burst sent no wake, so no
-        // background flush can have happened.
+        // `publish` computes its wake inline, so this is exact: the suppressed
+        // burst selected none. (`background_commits` alone could not prove that, as
+        // a wrongly woken committer needs time to flush.)
+        assert_eq!(
+            coordinator.threshold_wakes.load(Ordering::Relaxed),
+            0,
+            "a suppressed burst must not select a threshold wake"
+        );
         assert_eq!(
             coordinator.background_commits(),
             0,
