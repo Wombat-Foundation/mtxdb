@@ -192,6 +192,11 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     /// Existing records are still checked for full-digest collisions, but
     /// callers avoid one storage round trip per auxiliary entry.
     ///
+    /// Writes are last-writer-wins per record and are not serialized against
+    /// other writers: if two `put_many` calls race on the same key, the value
+    /// from the batch the backing store commits last is retained. Callers must
+    /// not rely on any ordering between concurrent writers.
+    ///
     /// # Errors
     /// Returns [`StorageError::Corrupt`] for malformed existing envelopes or
     /// digest collisions, and propagates storage errors.
