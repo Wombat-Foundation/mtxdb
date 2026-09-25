@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::layout::ShardType;
 
@@ -838,6 +838,19 @@ impl Drop for SyncInFlightGuard<'_> {
     }
 }
 
+/// What a sync captured under the journal lock so it can flush without it.
+struct SyncCapture {
+    /// Duplicate of the segment file handle current at capture time.
+    file: File,
+    /// Newest visible LSN at capture time; the fsync makes everything at or
+    /// below it durable.
+    through_lsn: u64,
+    /// Sequence of the newest appended group, for the receipt.
+    sequence: u64,
+    /// Segment path, for slow-fsync reporting.
+    path: PathBuf,
+}
+
 /// Result of validating a journal file.
 #[derive(Debug)]
 pub struct Scan {
@@ -1081,6 +1094,20 @@ pub struct JournalCoordinator {
     /// background committer commits the whole published prefix, not this
     /// exact value.
     durable_requested: AtomicU64,
+    /// Serializes fsyncs and segment replacement, and is held across the whole
+    /// fsync. Publishers never take it, so they make progress while the device
+    /// flushes. A sync caller takes it, rechecks `committed_lsn` (a concurrent
+    /// fsync usually covered it), then briefly takes `journal` to clone the
+    /// file handle and capture the newest visible LSN.
+    ///
+    /// Lock order: `sync_lock` -> `journal`. Reclaim takes `sync_lock` first so
+    /// the segment cannot be replaced under an in-flight fsync. Nothing may
+    /// take `sync_lock` while holding `journal`.
+    sync_lock: Mutex<()>,
+    /// Test-only hook run after the file handle is cloned and before the
+    /// fsync, with `journal` released, so a test can park a sync mid-flight.
+    #[cfg(test)]
+    fsync_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Guards [`Self::durable_cv`]. The condvar carries no state of its own;
     /// waiters re-check [`Self::committed_lsn`] and the committer's presence
     /// after every wake, so this only provides the required mutex pairing.
@@ -1184,6 +1211,9 @@ impl JournalCoordinator {
             coalesced_syncs: AtomicU64::new(0),
             sync_in_flight: AtomicU64::new(0),
             durable_requested: AtomicU64::new(committed_lsn),
+            sync_lock: Mutex::new(()),
+            #[cfg(test)]
+            fsync_hook: Mutex::new(None),
             durable_lock: Mutex::new(()),
             durable_cv: Condvar::new(),
             background: Mutex::new(BackgroundState::Stopped),
@@ -1400,75 +1430,152 @@ impl JournalCoordinator {
             .saturating_add(1);
         timings.journal_in_flight = in_flight;
         let _in_flight_guard = SyncInFlightGuard(&self.sync_in_flight);
-        if target_lsn == 0 {
-            timings.journal_coalesced = true;
-            self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
-            return Ok((None, timings));
-        }
         if target_lsn > self.published_lsn.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "sync target has not been published",
             ));
         }
+        if self.covered_by_prior_commit(target_lsn, &mut timings) {
+            return Ok((None, timings));
+        }
+        self.reject_if_poisoned()?;
+
+        let _sync = self.acquire_sync_lock(&mut timings);
+        self.reject_if_poisoned()?;
+        // A concurrent fsync that finished while we waited usually covered us.
+        if self.covered_by_prior_commit(target_lsn, &mut timings) {
+            return Ok((None, timings));
+        }
+        let previously_committed = self.committed_lsn.load(Ordering::Acquire);
+
+        let capture = self.capture_sync_range(target_lsn)?;
+        self.flush_captured_file(&capture, &mut timings)?;
+        let receipt = self.record_durable_range(previously_committed, &capture, &mut timings);
+        Ok((Some(receipt), timings))
+    }
+
+    /// Whether an earlier commit already made `target_lsn` durable. A `0`
+    /// target is always covered. Records the coalescing in `timings` and the
+    /// coordinator's counter when it is.
+    fn covered_by_prior_commit(&self, target_lsn: u64, timings: &mut JournalSyncTimings) -> bool {
         if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
             timings.journal_coalesced = true;
             self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
-            return Ok((None, timings));
+            return true;
         }
+        false
+    }
+
+    /// Fail if a failed commit or append poisoned the journal.
+    fn reject_if_poisoned(&self) -> io::Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed commit",
             ));
         }
+        Ok(())
+    }
 
+    /// Take [`Self::sync_lock`], counting this caller as a waiter when another
+    /// fsync is in flight, and record how long the wait took.
+    fn acquire_sync_lock(&self, timings: &mut JournalSyncTimings) -> MutexGuard<'_, ()> {
         let lock_started = std::time::Instant::now();
-        let mut journal = if let Some(guard) = self.journal.try_lock() {
+        let guard = if let Some(guard) = self.sync_lock.try_lock() {
             guard
         } else {
             timings.journal_waiter = true;
             self.journal_waiters.fetch_add(1, Ordering::Relaxed);
-            self.journal.lock()
+            self.sync_lock.lock()
         };
         timings.journal_lock_wait = lock_started.elapsed();
-        if self.poisoned.load(Ordering::Acquire) {
+        guard
+    }
+
+    /// Capture what a sync needs, under the journal lock.
+    ///
+    /// Every published group is already complete in the segment, so the
+    /// sync only needs to make its bytes durable. Under the journal lock,
+    /// capture the newest visible LSN (everything at or below it has been
+    /// fully written), the group sequence, and a handle to the current
+    /// file; then release the lock so publishers run during the fsync.
+    /// Syncing through the newest visible LSN, not just `target_lsn`, lets
+    /// one fsync cover every caller that queued behind the previous one.
+    fn capture_sync_range(&self, target_lsn: u64) -> io::Result<SyncCapture> {
+        let mut journal = self.journal.lock();
+        if journal.poisoned {
             return Err(io::Error::other(
-                "journal is poisoned after a failed commit",
+                "journal handle is poisoned after an earlier failed commit",
             ));
         }
-        if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-            timings.journal_coalesced = true;
-            self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
-            return Ok((None, timings));
-        }
-        // Every published group is already complete in the segment, so the
-        // sync only needs to make its bytes durable. `published_lsn` never
-        // runs ahead of `visible_lsn`; the check guards that invariant.
-        if target_lsn > self.visible_lsn.load(Ordering::Acquire) {
+        let through_lsn = self.visible_lsn.load(Ordering::Acquire);
+        if target_lsn > through_lsn {
             return Err(io::Error::other(
                 "published sync target is not yet visible in the journal",
             ));
         }
-        let previously_committed = self.committed_lsn.load(Ordering::Acquire);
+        let file = match journal.file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                self.poisoned.store(true, Ordering::Release);
+                journal.poisoned = true;
+                return Err(error);
+            }
+        };
+        Ok(SyncCapture {
+            file,
+            through_lsn,
+            sequence: journal.next_sequence.saturating_sub(1),
+            path: journal.path.clone(),
+        })
+    }
+
+    /// Fsync the captured handle with no journal lock held, recording the
+    /// fsync time in `timings`.
+    fn flush_captured_file(
+        &self,
+        capture: &SyncCapture,
+        timings: &mut JournalSyncTimings,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let hook = self.fsync_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let fsync_started = std::time::Instant::now();
-        if let Err(error) = journal.make_durable() {
+        if let Err(error) = capture.file.sync_all() {
+            // Never retry a failed fsync and report success: the kernel may
+            // have dropped the dirty pages. Poison until reopen and rescan.
             self.poisoned.store(true, Ordering::Release);
+            self.journal.lock().poisoned = true;
             return Err(error);
         }
         timings.journal_fsync = fsync_started.elapsed();
-        timings.journal_records = target_lsn.saturating_sub(previously_committed);
-        self.warn_if_slow_fsync(journal.path.as_path(), target_lsn, &timings);
-        self.note_commit(target_lsn);
-        self.promote_pool_committed(target_lsn);
+        Ok(())
+    }
+
+    /// Publish the durable boundary a successful fsync established and build
+    /// the receipt for the range this call advanced.
+    fn record_durable_range(
+        &self,
+        previously_committed: u64,
+        capture: &SyncCapture,
+        timings: &mut JournalSyncTimings,
+    ) -> CommitReceipt {
+        timings.journal_records = capture.through_lsn.saturating_sub(previously_committed);
+        self.warn_if_slow_fsync(capture.path.as_path(), capture.through_lsn, timings);
+        self.note_commit(capture.through_lsn);
+        self.promote_pool_committed(capture.through_lsn);
         // The groups were appended at publication, so this fsync wrote no
         // bytes: the receipt reports the durable range this call advanced.
-        let receipt = CommitReceipt {
-            sequence: journal.next_sequence.saturating_sub(1),
+        CommitReceipt {
+            sequence: capture.sequence,
             first_lsn: previously_committed.saturating_add(1),
-            last_lsn: target_lsn,
+            last_lsn: capture.through_lsn,
             bytes_written: 0,
-        };
-        Ok((Some(receipt), timings))
+        }
     }
 
     /// Report an fsync slower than [`SLOW_FSYNC_WARN`] as it happens, with the
@@ -1605,13 +1712,10 @@ impl JournalCoordinator {
             expected_count,
             "appended group must cover every mutation"
         );
-        self.published_lsn
-            .fetch_max(receipt.last_lsn, Ordering::Release);
-        self.visible_lsn
-            .fetch_max(receipt.last_lsn, Ordering::Release);
-        drop(journal);
-        // The group is visible but not yet durable; record its per-pool extents
-        // so a later coalesced fsync can promote each pool's watermark.
+        // Queue this group's per-pool extents before it becomes visible, still
+        // under the journal lock. A sync that captures the new visible LSN
+        // then always finds the extents and promotes each pool's watermark;
+        // queuing after the visibility advance would let a sync race past them.
         let extents = pool_extents(
             receipt.last_lsn,
             group_mutations.iter().map(|(pool, _)| *pool),
@@ -1621,6 +1725,11 @@ impl JournalCoordinator {
                 .lock()
                 .push((receipt.last_lsn, extents));
         }
+        self.published_lsn
+            .fetch_max(receipt.last_lsn, Ordering::Release);
+        self.visible_lsn
+            .fetch_max(receipt.last_lsn, Ordering::Release);
+        drop(journal);
         // Wake the committer only when a burst is at or above its early-flush
         // bound; this is the hot path, so ordinary publishes must not pay a
         // futex wake. `committer_wake_threshold` is zero when no committer is
@@ -2094,6 +2203,9 @@ impl JournalCoordinator {
     /// Returns an error if the journal is poisoned or the segment cannot be
     /// rewritten.
     pub fn reclaim_through(&self, covered_lsn: u64) -> io::Result<Reclaim> {
+        // Wait out any in-flight fsync: the rewrite replaces the segment file,
+        // and a sync must not flush a handle to the replaced inode.
+        let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
         journal.reclaim_through(covered_lsn)
     }
@@ -3902,7 +4014,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_commits_only_through_the_captured_sync_boundary() {
+    fn sync_commits_through_the_newest_visible_lsn() {
         let path = temp_path("coordinator_boundary");
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open(&path).unwrap();
@@ -3929,14 +4041,15 @@ mod tests {
             .last_lsn;
         assert_eq!(second_lsn, first_lsn.saturating_add(1));
 
+        // A sync commits through the newest visible LSN, not just the
+        // caller's target: one fsync covers everything already appended, and
+        // later callers find their target already durable.
         let first_commit = coordinator.sync_through(first_target).unwrap().unwrap();
         assert_eq!(first_commit.first_lsn, first_lsn);
-        assert_eq!(first_commit.last_lsn, first_target);
+        assert_eq!(first_commit.last_lsn, second_lsn);
+        assert_eq!(coordinator.committed_lsn(), second_lsn);
         assert!(coordinator.sync_through(first_target).unwrap().is_none());
-
-        let second_commit = coordinator.sync().unwrap().unwrap();
-        assert_eq!(second_commit.first_lsn, second_lsn);
-        assert_eq!(second_commit.last_lsn, second_lsn);
+        assert!(coordinator.sync().unwrap().is_none());
 
         drop(coordinator);
         let (_journal, recovered) = Journal::open(&path).unwrap();
@@ -3944,6 +4057,151 @@ mod tests {
         assert_eq!(recovered.groups[0].last_lsn, first_target);
         assert_eq!(recovered.groups[1].first_lsn, second_lsn);
         fs::remove_file(path).unwrap();
+    }
+
+    /// Park the next sync between its handle clone and its fsync, with the
+    /// journal lock released. Returns a receiver that fires once a sync is
+    /// parked and a sender that releases it.
+    fn park_next_fsync(
+        coordinator: &JournalCoordinator,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked_tx = std::sync::Mutex::new(parked_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *coordinator.fsync_hook.lock() = Some(Arc::new(move || {
+            parked_tx.lock().unwrap().send(()).ok();
+            release_rx.lock().unwrap().recv().ok();
+        }));
+        (parked_rx, release_tx)
+    }
+
+    /// The regression this change exists for: a publisher must not stall
+    /// behind an fsync in flight. The sync is parked mid-fsync and a publish
+    /// must still complete; that later group is then correctly left for the
+    /// next sync because it was appended after the range was captured.
+    #[test]
+    fn publish_makes_progress_while_an_fsync_is_in_flight() {
+        let coordinator = open_arc("publish_during_fsync");
+        let first = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .unwrap()
+            .last_lsn;
+        let (parked, release) = park_next_fsync(&coordinator);
+
+        let syncer = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || coordinator.sync().unwrap())
+        };
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sync must reach its fsync");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let publisher = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || {
+                let receipt = coordinator.publish_group(&[put(1, 2, b"second")]).unwrap();
+                done_tx.send(receipt.last_lsn).unwrap();
+            })
+        };
+        let second = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a publish must not block behind an in-flight fsync");
+        assert_eq!(second, first + 1);
+        assert_eq!(coordinator.visible_lsn(), second);
+        assert_eq!(coordinator.committed_lsn(), 0, "the fsync is still parked");
+
+        release.send(()).unwrap();
+        syncer.join().unwrap();
+        publisher.join().unwrap();
+        assert_eq!(
+            coordinator.committed_lsn(),
+            first,
+            "the parked sync captured its range before the second publish"
+        );
+
+        *coordinator.fsync_hook.lock() = None;
+        coordinator.sync().unwrap();
+        assert_eq!(coordinator.committed_lsn(), second);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    /// Reclaim replaces the segment file, so it must wait for an in-flight
+    /// fsync instead of swapping the inode under it.
+    #[test]
+    fn reclaim_blocks_behind_an_in_flight_fsync() {
+        let coordinator = open_arc("reclaim_behind_fsync");
+        let first = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .unwrap()
+            .last_lsn;
+        let (parked, release) = park_next_fsync(&coordinator);
+
+        let syncer = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || coordinator.sync().unwrap())
+        };
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sync must reach its fsync");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reclaimer = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || {
+                coordinator.reclaim_through(first).unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "reclaim must wait for the in-flight fsync"
+        );
+
+        release.send(()).unwrap();
+        syncer.join().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reclaim must run once the fsync finishes");
+        reclaimer.join().unwrap();
+        assert_eq!(coordinator.committed_lsn(), first);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    /// Concurrent callers that queue behind an in-flight fsync must share the
+    /// next one instead of each starting their own.
+    #[test]
+    fn concurrent_syncs_coalesce_into_few_fsyncs() {
+        const WRITERS: u8 = 8;
+        let coordinator = open_arc("concurrent_sync_coalesce");
+        // A slow fsync gives the other writers time to publish and queue.
+        *coordinator.fsync_hook.lock() = Some(Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(40));
+        }));
+        let start = Arc::new(std::sync::Barrier::new(usize::from(WRITERS)));
+        let mut handles = Vec::new();
+        for node in 0..WRITERS {
+            let coordinator = coordinator.clone();
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                coordinator.publish_group(&[put(2, node, b"w")]).unwrap();
+                coordinator.sync().unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(coordinator.committed_lsn(), u64::from(WRITERS));
+        let stats = coordinator.durability_stats();
+        assert!(
+            stats.commits <= 4,
+            "{WRITERS} concurrent syncs used {} fsyncs; they must coalesce",
+            stats.commits
+        );
+        *coordinator.fsync_hook.lock() = None;
+        fs::remove_file(coordinator.path()).unwrap();
     }
 
     /// A target that was never published is a caller bug, not a durable commit.
@@ -4623,7 +4881,7 @@ mod tests {
             Ordering::Release,
         );
         let mut lsns = Vec::new();
-        for node in 0..8u8 {
+        for node in 0..4u8 {
             lsns.push(
                 coordinator
                     .publish_group(&[put(3, node, b"window")])
@@ -4645,9 +4903,22 @@ mod tests {
             "a suppressed burst must not flush before the explicit commit"
         );
 
-        // Commit the first half explicitly. Four records remain pending, at the
-        // bound; the post-commit recheck, not a publish, must wake the committer.
+        // Commit the first half explicitly while publishers add four more
+        // during the fsync (the journal lock is released for it). Those four
+        // arrive after the sync captured its range, so four records remain
+        // pending at the bound; the post-commit recheck, not a publish, must
+        // wake the committer.
+        let publisher = coordinator.clone();
+        let during_fsync = std::sync::Once::new();
+        *coordinator.fsync_hook.lock() = Some(Arc::new(move || {
+            during_fsync.call_once(|| {
+                for node in 4..8u8 {
+                    publisher.publish_group(&[put(3, node, b"window")]).unwrap();
+                }
+            });
+        }));
         coordinator.sync_through(lsns[3]).unwrap();
+        *coordinator.fsync_hook.lock() = None;
         wait_until(
             {
                 let committed = coordinator.clone();
