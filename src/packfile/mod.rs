@@ -1581,7 +1581,8 @@ mod tests {
     fn test_dir(name: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("mdb_test_pf_{name}_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("mdb_test_pf_{name}_{}_{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

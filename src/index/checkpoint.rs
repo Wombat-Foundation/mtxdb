@@ -932,7 +932,8 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_missing_file() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_missing");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_ckpt_fp_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -945,7 +946,7 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_truncated() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_trunc");
+        let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_trunc_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -959,7 +960,8 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_invalid_magic() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_badmagic");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_ckpt_fp_badmagic_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -975,7 +977,7 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_valid_roundtrip() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_valid");
+        let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_valid_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -1003,7 +1005,8 @@ mod tests {
 
     #[test]
     fn read_durable_fingerprint_no_checkpoint() {
-        let dir = std::env::temp_dir().join("mtxdb_durable_no_ckpt");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_durable_no_ckpt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -1015,7 +1018,8 @@ mod tests {
 
     #[test]
     fn read_durable_fingerprint_checkpoint_only() {
-        let dir = std::env::temp_dir().join("mtxdb_durable_ckpt_only");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_durable_ckpt_only_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
