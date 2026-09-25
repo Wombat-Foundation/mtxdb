@@ -10217,7 +10217,10 @@ mod tests {
         meta_checkpoints(&root, &mut report);
         assert_eq!(report.warn_count, 0);
         assert_eq!(report.note_count, 1);
-        assert!(report.lines.iter().any(|line| line.contains("foreign.pack")));
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("foreign.pack")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10241,6 +10244,14 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("fingerprint comparison skipped")));
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.starts_with("[WARN]") && line.contains("pack_0000000000000001.pack")));
+        assert!(!report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint mismatch")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -12366,8 +12377,9 @@ mod tests {
         assert!(!valid_state_group_id(
             &"A".repeat(golden.len().saturating_add(1))
         ));
-        assert!(!valid_state_group_id(&format!("{}$", "A".repeat(42))));
-        assert!(!valid_state_group_id(&format!("{}.", "A".repeat(42))));
+        let almost_digest = "A".repeat(golden.len().saturating_sub(1));
+        assert!(!valid_state_group_id(&format!("{almost_digest}$")));
+        assert!(!valid_state_group_id(&format!("{almost_digest}.")));
     }
 
     #[test]
