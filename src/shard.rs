@@ -1292,7 +1292,14 @@ impl ShardPool {
         })?;
 
         file.set_len(0)?;
-        file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+        #[cfg(target_os = "linux")]
+        let marker = Self::proc_start_time("self").map_or_else(
+            || format!("{}\n", std::process::id()),
+            |start| format!("{} {start}\n", std::process::id()),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let marker = format!("{}\n", std::process::id());
+        file.write_all(marker.as_bytes())?;
         file.sync_all()?;
 
         Ok(WriterLock { _file: file })
@@ -1314,7 +1321,7 @@ impl ShardPool {
     /// classic `/proc/stat` parsing bug. Field 22 is the 20th
     /// whitespace-separated token after that closing paren (field 3 is the
     /// first token after it).
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn proc_start_time(pid_or_self: &str) -> Option<u64> {
         let contents = fs::read_to_string(format!("/proc/{pid_or_self}/stat")).ok()?;
         let after_comm = contents.rsplit_once(')')?.1;
@@ -1351,8 +1358,8 @@ impl ShardPool {
     /// an older binary (bare PID, no starttime) has nothing to compare
     /// against and fails closed exactly as before, same as any other
     /// unparsable content.
-    #[cfg(test)]
-    fn lock_holder_is_dead(lock_path: &Path) -> bool {
+    #[must_use]
+    pub fn lock_holder_is_dead(lock_path: &Path) -> bool {
         #[cfg(target_os = "linux")]
         {
             let Ok(contents) = fs::read_to_string(lock_path) else {
@@ -1385,6 +1392,17 @@ impl ShardPool {
             let _ = lock_path;
             false
         }
+    }
+
+    /// Read the PID recorded in a lock marker and classify its holder.
+    ///
+    /// Returns `None` for a missing or unparsable marker. The liveness result
+    /// is advisory and never acquires, removes, or modifies the lock.
+    #[must_use]
+    pub fn lock_holder_status(lock_path: &Path) -> Option<(u32, bool)> {
+        let contents = fs::read_to_string(lock_path).ok()?;
+        let pid = contents.split_whitespace().next()?.parse().ok()?;
+        Some((pid, !Self::lock_holder_is_dead(lock_path)))
     }
 
     /// Discovers new pack files on disk and adds them to the pool.

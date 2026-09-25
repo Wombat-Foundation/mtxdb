@@ -105,6 +105,13 @@ pub(crate) enum Commands {
     Stats {
         json: bool,
     },
+    Meta {
+        target: String,
+        json: bool,
+        limit: i64,
+        offset: i64,
+        decode: Option<String>,
+    },
     Info {
         collection: Option<String>,
         stats: bool,
@@ -197,6 +204,7 @@ fn build_cli() -> Command {
         .subcommand(sub_shards())
         .subcommand(sub_collections())
         .subcommand(sub_stats())
+        .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
         .subcommand(sub_import())
@@ -283,6 +291,51 @@ fn sub_stats() -> Command {
                 .long("json")
                 .action(ArgAction::SetTrue)
                 .help("Emit machine-readable JSON instead of a table"),
+        )
+}
+
+fn sub_meta() -> Command {
+    Command::new("meta")
+        .about("Inspect on-disk metadata and durability artifacts (read-only)")
+        .arg(
+            Arg::new("target")
+                .value_name("TARGET")
+                .default_value("overview")
+                .value_parser([
+                    "overview",
+                    "db",
+                    "wal",
+                    "checkpoint",
+                    "delta",
+                    "sidecars",
+                    "packs",
+                    "locks",
+                    "raw",
+                ])
+                .help("Artifact group to inspect (default: overview)"),
+        )
+        .arg(limit_arg())
+        .arg(
+            Arg::new("offset")
+                .long("offset")
+                .default_value("0")
+                .value_parser(clap::value_parser!(i64))
+                .help("Number of decoded records to skip"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Emit diagnostic records as JSON"),
+        )
+        .arg(
+            Arg::new("decode")
+                .long("decode")
+                .value_name("FORMAT")
+                .num_args(0..=1)
+                .default_missing_value("auto")
+                .value_parser(["auto", "json", "raw"])
+                .help("Decode WAL payloads when possible (json or raw)"),
         )
 }
 
@@ -732,6 +785,17 @@ fn parse_cli() -> Cli {
         },
         Some(("stats", m)) => Commands::Stats {
             json: m.get_flag("json"),
+        },
+        Some(("meta", m)) => Commands::Meta {
+            target: m.get_one::<String>("target").unwrap().clone(),
+            json: m.get_flag("json"),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+            offset: *m
+                .get_one::<i64>("offset")
+                .expect("clap supplies a default offset"),
+            decode: m.get_one::<String>("decode").cloned(),
         },
         Some(("info", m)) => Commands::Info {
             collection: m.get_one::<String>("collection").cloned(),

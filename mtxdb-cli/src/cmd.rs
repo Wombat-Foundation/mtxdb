@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -175,6 +175,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Info { .. } => "info",
         Commands::Sync { .. } => "sync",
         Commands::Stats { .. } => "stats",
+        Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
         Commands::Export { .. } => "export",
         Commands::Repack { .. } => "repack",
@@ -244,6 +245,13 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
+        Commands::Meta {
+            target,
+            json,
+            limit,
+            offset,
+            decode,
+        } => cmd_meta(cli, target, *json, *limit, *offset, decode.as_deref()),
         Commands::Info { collection, stats } => match collection {
             Some(collection) => cmd_info(cli, collection),
             None => cmd_info_default(cli, *stats),
@@ -4019,6 +4027,728 @@ fn metadata_file_summary(path: &Path) -> String {
     )
 }
 
+/// Inspect on-disk artifacts without opening a writer or acquiring any of the
+/// database locks. This intentionally works when the normal database opener
+/// cannot validate one of the files: `meta` is a recovery aid, not another
+/// database-open path.
+fn cmd_meta(
+    cli: &Cli,
+    target: &str,
+    json: bool,
+    limit: i64,
+    offset: i64,
+    decode: Option<&str>,
+) -> anyhow::Result<()> {
+    if cli.dirs.len() > 1 {
+        bail!("`mtxdb meta` accepts only one --dir target");
+    }
+    let root = cli.single_dir();
+    let limit = if limit <= 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    };
+    let offset = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+    let mut report = MetaReport::default();
+
+    match target {
+        "overview" => {
+            meta_db(root, &mut report);
+            meta_sidecars(root, &mut report);
+            meta_locks(root, &mut report);
+            meta_pools(root, &mut report, limit, offset, false);
+            meta_wal(root, &mut report, limit, offset, decode);
+            meta_checkpoints(root, &mut report);
+            meta_deltas(root, &mut report, limit, offset);
+            meta_health(root, &mut report);
+        }
+        "db" => meta_db(root, &mut report),
+        "wal" => meta_wal(root, &mut report, limit, offset, decode),
+        "checkpoint" => meta_checkpoints(root, &mut report),
+        "delta" => meta_deltas(root, &mut report, limit, offset),
+        "sidecars" => meta_sidecars(root, &mut report),
+        "packs" => meta_pools(root, &mut report, limit, offset, true),
+        "locks" => meta_locks(root, &mut report),
+        "raw" => meta_raw(root, &mut report, limit, offset),
+        _ => unreachable!("clap validates meta target"),
+    }
+
+    report.print(json);
+    Ok(())
+}
+
+#[derive(Default)]
+struct MetaReport {
+    lines: Vec<String>,
+    findings: usize,
+    json_records: Vec<OwnedValue>,
+}
+
+impl MetaReport {
+    fn line(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        self.lines.push(line.clone());
+        let mut fields = simd_json::owned::Object::new();
+        fields.insert("kind".to_owned(), OwnedValue::from("text"));
+        fields.insert("message".to_owned(), OwnedValue::from(line));
+        self.json_records.push(OwnedValue::Object(Box::new(fields)));
+    }
+
+    fn finding(&mut self, level: &str, path: &Path, message: impl std::fmt::Display) {
+        self.findings = self.findings.saturating_add(1);
+        let message = message.to_string();
+        let path = path.display().to_string();
+        self.lines.push(format!("[{level}] {path}: {message}"));
+        let mut fields = simd_json::owned::Object::new();
+        fields.insert("kind".to_owned(), OwnedValue::from("diagnostic"));
+        fields.insert("severity".to_owned(), OwnedValue::from(level));
+        fields.insert("path".to_owned(), OwnedValue::from(path));
+        fields.insert("message".to_owned(), OwnedValue::from(message));
+        self.json_records.push(OwnedValue::Object(Box::new(fields)));
+    }
+
+    fn print(self, json: bool) {
+        if json {
+            let mut records = self.json_records;
+            let mut summary = simd_json::owned::Object::new();
+            summary.insert("kind".to_owned(), OwnedValue::from("summary"));
+            summary.insert(
+                "findings".to_owned(),
+                OwnedValue::from(self.findings.to_string()),
+            );
+            records.insert(0, OwnedValue::Object(Box::new(summary)));
+            let value = OwnedValue::Array(Box::new(records));
+            println!("{}", value.encode());
+        } else {
+            for line in self.lines {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+fn meta_pool_dirs(root: &Path) -> impl Iterator<Item = (ShardType, PathBuf)> + '_ {
+    ShardType::ALL
+        .into_iter()
+        .map(|pool| (pool, root.join("pools").join(pool.as_str())))
+}
+
+fn meta_sidecars(root: &Path, report: &mut MetaReport) {
+    report.line(format!("database: {}", root.display()));
+    meta_file(root, "db.meta", report);
+    for (pool, dir) in meta_pool_dirs(root) {
+        report.line(format!("pool: {} ({})", pool.as_str(), dir.display()));
+        for name in [
+            "pool.meta",
+            "store.meta",
+            "journal.lsn",
+            "shard_stats.bin",
+            "shard_collections.bin",
+        ] {
+            meta_file(&dir, name, report);
+        }
+    }
+}
+
+fn meta_db(root: &Path, report: &mut MetaReport) {
+    let path = root.join(mtxdb::layout::DB_META_FILENAME);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.finding("WARN", &path, "missing database descriptor");
+            return;
+        }
+        Err(error) => {
+            report.finding("ERROR", &path, error);
+            return;
+        }
+    };
+    let layout = match mtxdb::layout::read_wal_layout(root) {
+        Ok(Some(layout)) => match layout {
+            mtxdb::WalLayout::Shared => "shared",
+            mtxdb::WalLayout::PerPool => "per-pool",
+        },
+        Ok(None) => "unknown",
+        Err(error) => {
+            report.finding("WARN", &path, error);
+            "invalid"
+        }
+    };
+    let pools = bytes.get(13..).map_or_else(
+        || "<truncated>".to_owned(),
+        |bytes| String::from_utf8_lossy(bytes).replace('\n', ", "),
+    );
+    report.line(format!(
+        "db.meta: {} bytes ({}, wal_layout={layout}, pools={pools})",
+        bytes.len(),
+        metadata_magic(&bytes),
+    ));
+}
+
+fn meta_file(dir: &Path, name: &str, report: &mut MetaReport) {
+    let path = dir.join(name);
+    match fs::metadata(&path) {
+        Ok(metadata) => {
+            if name == "journal.lsn" {
+                match fs::read(&path) {
+                    Ok(bytes) if bytes.len() >= 8 => report.line(format!(
+                        "  {name}: {} (covered_lsn={})",
+                        metadata.len(),
+                        u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
+                    )),
+                    Ok(_) => report.finding("WARN", &path, "truncated journal.lsn"),
+                    Err(error) => report.finding("ERROR", &path, error),
+                }
+            } else if name == "shard_collections.bin" {
+                match mtxdb::packfile::storage::read_persisted_shard_collections(dir) {
+                    Some(directory) => report.line(format!(
+                        "  {name}: {} bytes (fingerprint={:#x}, records={}, persisted_at={})",
+                        metadata.len(),
+                        directory.fingerprint,
+                        directory.records.len(),
+                        directory.persisted_at
+                    )),
+                    None => report.finding("WARN", &path, "invalid or unsupported sidecar"),
+                }
+            } else {
+                let mut header = [0_u8; 5];
+                match fs::File::open(&path).and_then(|mut file| {
+                    use std::io::Read as _;
+                    file.read_exact(&mut header)
+                }) {
+                    Ok(()) => report.line(format!(
+                        "  {name}: {} bytes ({})",
+                        metadata.len(),
+                        metadata_magic(&header)
+                    )),
+                    Err(error) => report.finding("WARN", &path, error),
+                }
+                if name == "store.meta" {
+                    if let Some(version) = mtxdb::shard::store_created_by_version(dir) {
+                        report.line(format!("    created_by: {version}"));
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.line(format!("  {name}: missing"));
+        }
+        Err(error) => report.finding("ERROR", &path, error),
+    }
+}
+
+fn metadata_magic(bytes: &[u8]) -> String {
+    let magic = bytes.get(..4).map_or_else(
+        || "<short>".to_owned(),
+        |raw| String::from_utf8_lossy(raw).into_owned(),
+    );
+    let version = bytes
+        .get(4)
+        .map_or_else(|| "?".to_owned(), std::string::ToString::to_string);
+    format!("magic={magic:?} version={version}")
+}
+
+fn meta_locks(root: &Path, report: &mut MetaReport) {
+    let wal_lock = root.join(".mtxdb.wal.lock");
+    if wal_lock.exists() {
+        meta_lock_line(&wal_lock, report);
+    }
+    for (_, dir) in meta_pool_dirs(root) {
+        let path = dir.join(".mtxdb.lock");
+        if path.exists() {
+            meta_lock_line(&path, report);
+        }
+    }
+}
+
+fn meta_lock_line(path: &Path, report: &mut MetaReport) {
+    match mtxdb::ShardPool::lock_holder_status(path) {
+        Some((pid, alive)) => report.line(format!(
+            "lock {}: present pid={pid} status={}",
+            path.display(),
+            if alive { "alive" } else { "dead/stale" }
+        )),
+        None => report.finding("WARN", path, "present but PID is unreadable"),
+    }
+}
+
+fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize, enumerate: bool) {
+    for (pool, dir) in meta_pool_dirs(root) {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                report.finding("ERROR", &dir, error);
+                continue;
+            }
+        };
+        let mut packs = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+            .collect::<Vec<_>>();
+        packs.sort();
+        report.line(format!(
+            "pool {}: {} pack file(s)",
+            pool.as_str(),
+            packs.len()
+        ));
+        if !enumerate {
+            continue;
+        }
+        for path in packs.into_iter().skip(offset).take(limit) {
+            match fs::metadata(&path) {
+                Ok(metadata) => {
+                    let mut file = BufReader::new(match fs::File::open(&path) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            report.finding("ERROR", &path, error);
+                            continue;
+                        }
+                    });
+                    match mtxdb::packfile::read_header(&mut file) {
+                        Ok(Some(header)) => report.line(format!(
+                            "  {}: {} bytes, pack_id={:#x}",
+                            path.display(),
+                            metadata.len(),
+                            header.pack_id
+                        )),
+                        Ok(None) => report.finding("WARN", &path, "not a packfile"),
+                        Err(error) => report.finding("WARN", &path, error),
+                    }
+                }
+                Err(error) => report.finding("ERROR", &path, error),
+            }
+        }
+    }
+}
+
+fn meta_wal(
+    root: &Path,
+    report: &mut MetaReport,
+    limit: usize,
+    offset: usize,
+    decode: Option<&str>,
+) {
+    let mut paths = vec![root.join("wal.bin")];
+    paths.extend(meta_pool_dirs(root).map(|(_, dir)| dir.join("wal.bin")));
+    paths.sort();
+    paths.dedup();
+    if root.join("wal.bin").is_file() {
+        for (_, dir) in meta_pool_dirs(root) {
+            let legacy = dir.join("wal.bin");
+            if legacy.is_file() {
+                report.finding(
+                    "WARN",
+                    &legacy,
+                    "per-pool WAL is present but ignored because root wal.bin selects shared WAL",
+                );
+            }
+        }
+    }
+    for path in paths.into_iter().filter(|path| path.is_file()) {
+        match mtxdb::journal::Journal::scan_read_only(&path) {
+            Ok(scan) => {
+                report.line(format!(
+                    "wal {}: {} group(s), valid_len={}, base_lsn={}, truncated_tail={}",
+                    path.display(),
+                    scan.groups.len(),
+                    scan.valid_len,
+                    scan.base_lsn,
+                    scan.truncated_tail
+                ));
+                if scan.truncated_tail {
+                    report.finding(
+                        "WARN",
+                        &path,
+                        "truncated tail; complete groups were retained",
+                    );
+                }
+                for group in scan
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.entries.iter())
+                    .skip(offset)
+                    .take(limit)
+                {
+                    report.line(format!(
+                        "  lsn={} offset={} frame_len={} pool={:?} {}",
+                        group.lsn,
+                        group.offset,
+                        group.frame_len,
+                        group.pool,
+                        format_mutation(&group.mutation, decode)
+                    ));
+                }
+            }
+            Err(error) => report.finding("WARN", &path, error),
+        }
+    }
+}
+
+fn format_mutation(mutation: &mtxdb::journal::Mutation, decode: Option<&str>) -> String {
+    match mutation {
+        mtxdb::journal::Mutation::Put {
+            collection_id,
+            node_id,
+            payload,
+        } => {
+            let mut line = format!(
+                "kind=put collection=0x{} node=0x{} payload_len={}",
+                hex::encode(collection_id),
+                hex::encode(node_id),
+                payload.len()
+            );
+            if let Some(format) = decode {
+                match format {
+                    "raw" => {
+                        let _ = write!(line, " payload_hex=0x{}", hex::encode(payload));
+                    }
+                    "json" | "auto" => {
+                        let mut bytes = payload.clone();
+                        if std::str::from_utf8(&bytes).is_ok() {
+                            if let Ok(value) = simd_json::to_owned_value(&mut bytes) {
+                                let _ = write!(line, " payload={value}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            line
+        }
+        mtxdb::journal::Mutation::DeleteCollection { collection_id } => format!(
+            "kind=delete_collection collection=0x{}",
+            hex::encode(collection_id)
+        ),
+    }
+}
+
+fn meta_checkpoints(root: &Path, report: &mut MetaReport) {
+    for (_, dir) in meta_pool_dirs(root) {
+        let path = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
+        if !path.is_file() {
+            continue;
+        }
+        match mtxdb::index::checkpoint::read_checkpoint(&path) {
+            Some(checkpoint) => {
+                report.line(format!(
+                    "checkpoint {}: covered_lsn={} fingerprint={:#x} collections={} packs={}",
+                    path.display(),
+                    checkpoint.covered_lsn,
+                    checkpoint.fingerprint,
+                    checkpoint.collections.len(),
+                    checkpoint.pack_table.len()
+                ));
+                match meta_pack_fingerprint(&dir) {
+                    Ok((fingerprint, issues)) => {
+                        for issue in issues {
+                            report.finding("WARN", &dir, issue);
+                        }
+                        if fingerprint != checkpoint.fingerprint {
+                            report.finding(
+                                "WARN",
+                                &path,
+                                format!(
+                                    "fingerprint mismatch: checkpoint={:#x} packs={:#x}",
+                                    checkpoint.fingerprint, fingerprint
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => report.finding("WARN", &dir, error),
+                }
+            }
+            None => report.finding("WARN", &path, "invalid, corrupt, or unsupported checkpoint"),
+        }
+    }
+}
+
+fn meta_pack_fingerprint(dir: &Path) -> anyhow::Result<(u64, Vec<String>)> {
+    let mut packs = Vec::new();
+    let mut issues = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "pack")
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(hex) = stem.strip_prefix("pack_") else {
+            issues.push(format!(
+                "skipped non-canonical pack filename {}",
+                path.display()
+            ));
+            continue;
+        };
+        let Ok(pack_id) = u64::from_str_radix(hex, 16) else {
+            issues.push(format!("skipped invalid pack filename {}", path.display()));
+            continue;
+        };
+        let length = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                issues.push(format!("skipped {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => BufReader::new(file),
+            Err(error) => {
+                issues.push(format!("skipped {}: {error}", path.display()));
+                continue;
+            }
+        };
+        match mtxdb::packfile::read_header(&mut file) {
+            Ok(Some(header)) if header.pack_id == pack_id => packs.push((pack_id, length)),
+            Ok(Some(header)) => issues.push(format!(
+                "pack filename id {pack_id:#x} disagrees with header id {:#x} ({})",
+                header.pack_id,
+                path.display()
+            )),
+            Ok(None) => issues.push(format!("{} is not a packfile", path.display())),
+            Err(error) => issues.push(format!("{}: {error}", path.display())),
+        }
+    }
+    Ok((mtxdb::index::checkpoint::pack_fingerprint(&packs), issues))
+}
+
+fn meta_health(root: &Path, report: &mut MetaReport) {
+    let shared_wal = root.join("wal.bin");
+    for (pool, dir) in meta_pool_dirs(root) {
+        let checkpoint_path = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
+        let checkpoint = mtxdb::index::checkpoint::read_checkpoint(&checkpoint_path);
+        let journal_lsn = PackfileStorage::read_journal_lsn(&dir);
+        let wal_path = if shared_wal.is_file() {
+            shared_wal.clone()
+        } else {
+            dir.join("wal.bin")
+        };
+        let Ok(scan) = mtxdb::journal::Journal::scan_read_only(&wal_path) else {
+            continue;
+        };
+        let wal_lsn = scan.groups.last().map(|group| group.last_lsn);
+        if checkpoint.is_some() || journal_lsn != 0 || wal_lsn.is_some() {
+            report.line(format!(
+                "health {}: journal.lsn={} checkpoint.covered_lsn={} wal.last_lsn={}",
+                pool.as_str(),
+                journal_lsn,
+                checkpoint.as_ref().map_or(0, |value| value.covered_lsn),
+                wal_lsn.map_or_else(|| "header-only/empty".to_owned(), |lsn| lsn.to_string())
+            ));
+        }
+        if journal_lsn < checkpoint.as_ref().map_or(0, |value| value.covered_lsn) {
+            report.finding("WARN", &dir, "journal.lsn is behind checkpoint coverage");
+        }
+        if wal_lsn.is_some_and(|lsn| lsn < journal_lsn) {
+            report.finding("WARN", &wal_path, "WAL last LSN is behind journal.lsn");
+        }
+    }
+}
+
+fn meta_deltas(root: &Path, report: &mut MetaReport, limit: usize, offset: usize) {
+    for (_, dir) in meta_pool_dirs(root) {
+        let epochs = match mtxdb::index::delta::list_epochs(&dir) {
+            Ok(epochs) => epochs,
+            Err(error) => {
+                report.finding("ERROR", &dir, error);
+                continue;
+            }
+        };
+        let checkpoint_fingerprint = mtxdb::index::checkpoint::read_checkpoint(
+            &dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+        )
+        .map(|checkpoint| checkpoint.fingerprint);
+        for (fingerprint, path) in epochs {
+            if checkpoint_fingerprint != Some(fingerprint) {
+                report.finding(
+                    "NOTE",
+                    &path,
+                    format!("epoch is not selected by current checkpoint fingerprint ({checkpoint_fingerprint:?}); likely orphaned or stale"),
+                );
+            }
+            if let Some(log) = mtxdb::index::delta::read_delta_log_v3(&path) {
+                report.line(format!(
+                "delta {} epoch={fingerprint:#x}: v3 operations={} base={:#x} tail={:#x} committed_len={} torn_tail={}",
+                path.display(),
+                log.operations.len(),
+                log.base_fingerprint,
+                log.tail_fingerprint,
+                log.file_len,
+                log.torn_tail
+            ));
+                if log.torn_tail {
+                    report.finding(
+                        "WARN",
+                        &path,
+                        "truncated or invalid tail; committed prefix decoded",
+                    );
+                }
+                for operation in log.operations.iter().skip(offset).take(limit) {
+                    report.line(format!("  {}", format_delta_operation(operation)));
+                }
+            } else if let Some(log) = mtxdb::index::delta::read_delta_log(&path) {
+                report.line(format!(
+                    "delta {}: v2 frames={} base={:#x} tail={:#x} committed_len={} torn_tail={}",
+                    path.display(),
+                    log.frames.len(),
+                    log.base_fingerprint,
+                    log.tail_fingerprint,
+                    log.file_len,
+                    log.torn_tail
+                ));
+                if log.torn_tail {
+                    report.finding(
+                        "WARN",
+                        &path,
+                        "truncated or invalid tail; committed prefix decoded",
+                    );
+                }
+                for frame in log.frames.iter().skip(offset).take(limit) {
+                    report.line(format!("  {}", format_delta_frame(frame)));
+                }
+            } else {
+                report.finding("WARN", &path, "invalid, corrupt, or unsupported delta log");
+            }
+        }
+    }
+}
+
+fn format_delta_frame(frame: &mtxdb::index::format::DeltaFrame) -> String {
+    format!(
+        "kind=incremental collection=0x{} bucket={} generation={} slot={:#x}",
+        hex::encode(frame.collection_id),
+        frame.bucket,
+        frame.generation,
+        frame.slot
+    )
+}
+
+fn format_delta_operation(operation: &mtxdb::index::delta::DeltaOperation) -> String {
+    use mtxdb::index::delta::DeltaOperation;
+    match operation {
+        DeltaOperation::Incremental(frame) => format_delta_frame(frame),
+        DeltaOperation::CollectionSnapshot {
+            collection_id,
+            generation,
+            order_key,
+            index_blob,
+        } => format!(
+            "kind=collection_snapshot collection=0x{} generation={} order_key={} index_blob_len={}",
+            hex::encode(collection_id),
+            generation,
+            order_key,
+            index_blob.len()
+        ),
+        DeltaOperation::CollectionTombstone {
+            collection_id,
+            generation,
+        } => format!(
+            "kind=collection_tombstone collection=0x{} generation={}",
+            hex::encode(collection_id),
+            generation
+        ),
+    }
+}
+
+fn meta_raw(root: &Path, report: &mut MetaReport, limit: usize, offset: usize) {
+    let mut files = vec![
+        root.join(mtxdb::layout::DB_META_FILENAME),
+        root.join("wal.bin"),
+    ];
+    files.extend(meta_pool_dirs(root).flat_map(|(_, dir)| {
+        [
+            "pool.meta",
+            "store.meta",
+            "journal.lsn",
+            "index.checkpoint",
+            "shard_stats.bin",
+            "shard_collections.bin",
+        ]
+        .into_iter()
+        .map(move |name| dir.join(name))
+    }));
+    for (_, dir) in meta_pool_dirs(root) {
+        if let Ok(epochs) = mtxdb::index::delta::list_epochs(&dir) {
+            files.extend(epochs.into_iter().map(|(_, path)| path));
+        }
+    }
+    let mut remaining_offset = offset;
+    let mut remaining_limit = limit;
+    for path in files.into_iter().filter(|path| path.is_file()) {
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report.finding("ERROR", &path, error);
+                continue;
+            }
+        };
+        report.line(format!("raw {} ({} bytes)", path.display(), metadata.len()));
+        if remaining_limit == 0 {
+            break;
+        }
+        let total_chunks =
+            usize::try_from(metadata.len().saturating_add(15) / 16).unwrap_or(usize::MAX);
+        let skip = remaining_offset.min(total_chunks);
+        remaining_offset = remaining_offset.saturating_sub(skip);
+        let available = total_chunks.saturating_sub(skip);
+        let take = available.min(remaining_limit);
+        if take == 0 {
+            continue;
+        }
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                report.finding("ERROR", &path, error);
+                continue;
+            }
+        };
+        if let Err(error) = file.seek(SeekFrom::Start(
+            u64::try_from(skip).unwrap_or(u64::MAX).saturating_mul(16),
+        )) {
+            report.finding("ERROR", &path, error);
+            continue;
+        }
+        let byte_count = take.saturating_mul(16);
+        let mut bytes = vec![0_u8; byte_count];
+        let read = match file.read(&mut bytes) {
+            Ok(read) => read,
+            Err(error) => {
+                report.finding("ERROR", &path, error);
+                continue;
+            }
+        };
+        bytes.truncate(read);
+        for (index, chunk) in bytes.chunks(16).enumerate() {
+            let hex = chunk
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii = chunk
+                .iter()
+                .map(|byte| {
+                    if byte.is_ascii_graphic() {
+                        *byte as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect::<String>();
+            report.line(format!(
+                "  {:08x}  {hex:<47}  |{ascii}|",
+                skip.saturating_add(index).saturating_mul(16)
+            ));
+        }
+        remaining_limit = remaining_limit.saturating_sub(bytes.chunks(16).count());
+    }
+}
+
 fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
     let root = cli.single_dir();
@@ -4043,7 +4773,7 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
         let collection_count =
             PackfileStorage::collection_summaries_from_disk(&dir).map(|summaries| summaries.len());
         let checkpoint = dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE);
-        let delta = dir.join(mtxdb::index::delta::INDEX_DELTA_FILE);
+        let delta_epochs = mtxdb::index::delta::list_epochs(&dir).unwrap_or_default();
 
         println!("pool: {} ({})", shard_type.as_str(), dir.display());
         println!(
@@ -4070,10 +4800,14 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
             } else {
                 "missing".to_owned()
             },
-            if delta.is_file() {
-                fmt_bytes(fs::metadata(&delta)?.len())
-            } else {
+            if delta_epochs.is_empty() {
                 "missing".to_owned()
+            } else {
+                let bytes = delta_epochs
+                    .iter()
+                    .filter_map(|(_, path)| fs::metadata(path).ok().map(|meta| meta.len()))
+                    .sum::<u64>();
+                format!("{} epoch(s), {}", delta_epochs.len(), fmt_bytes(bytes))
             }
         );
         println!(
