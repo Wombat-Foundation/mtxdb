@@ -16,7 +16,7 @@ keywords = ["database", "matrix", "cli"]
 categories = ["database", "cli"]
 readme = "../README.md"
 
-# Standalone workspace root, like mtxdb-ffi/benches: the parent `[workspace]`
+# Standalone workspace root, like benches/: the parent `[workspace]`
 # must not include this crate, or its edition-2024 deps would raise the
 # whole repo's Cargo floor to 1.85 (see the root Cargo.toml comment).
 [workspace]

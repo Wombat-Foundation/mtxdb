@@ -6,7 +6,7 @@ rust-version = "1.81"
 publish = false
 
 # Deliberately outside the root [workspace]'s `members` — same reasoning as
-# mtxdb-ffi/mtxdb-wasm (see the root Cargo.toml's [workspace] comment): a
+# mtxdb-cli (see the root Cargo.toml's [workspace] comment): a
 # standalone `[workspace]` table here stops Cargo's upward search, so this
 # crate is its own workspace root. That means `cargo build/check/clippy
 # --workspace --all-targets --all-features` from the repo root never touches
