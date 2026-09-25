@@ -8338,6 +8338,7 @@ fn build_event_dag_with_missing_edges(
         let raw_auths = extract_event_edge_ids(ev, "auth_events", &id_map, include_missing_edges);
         frontier.insert_event(short_id, &raw_prevs, &raw_auths);
     }
+    frontier.rebind_resident_edges();
     let reverse_map: HashMap<u64, String> = id_map
         .iter()
         .map(|(eid, &sid)| (sid, eid.clone()))
@@ -8595,9 +8596,11 @@ fn walk_state_groups(
             }
         }
 
-        // Union of the parents' states, first parent winning on conflict. An
-        // event whose parents all agree shares their state instead of copying
-        // it, so a plain message event costs no allocation.
+        // Union of the parents' states, with the first parent winning on a
+        // conflicting key. This is a temporary simplification of Matrix
+        // state resolution; changing it requires a state-group namespace bump.
+        // An event whose parents all agree shares their state instead of
+        // copying it, so a plain message event costs no allocation.
         let base: Arc<SharedState> = match parents.as_slice() {
             [] => Arc::clone(&empty),
             [only] => Arc::clone(only),
@@ -12547,7 +12550,7 @@ mod tests {
         let child = owned_value(
             r#"{"event_id":"$ordering-child","room_id":"!r:x","type":"m.room.message","prev_events":["$known","$absent"],"content":{}}"#,
         );
-        let order = topological_event_order(&[known, child]).expect("in-batch parent");
+        let order = topological_event_order(&[child, known]).expect("in-batch parent");
         assert!(order["$known"] < order["$ordering-child"]);
     }
 
@@ -12588,22 +12591,131 @@ mod tests {
         let sibling = owned_value(
             r#"{"event_id":"$sibling","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
         );
+        let branch_a = owned_value(
+            r#"{"event_id":"$branch-a","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let branch_b = owned_value(
+            r#"{"event_id":"$branch-b","room_id":"!r:x","type":"m.room.name","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let merge = owned_value(
+            r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$branch-a","$branch-b"],"content":{}}"#,
+        );
         let orphan = owned_value(
             r#"{"event_id":"$orphan","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$missing"],"content":{}}"#,
         );
 
-        let base = compute_state_groups_partial(&[create.clone(), member.clone()], &[]);
-        let with_fork =
-            compute_state_groups_partial(&[create.clone(), member.clone(), sibling.clone()], &[]);
-        let with_orphan =
-            compute_state_groups_partial(&[create.clone(), member.clone(), orphan], &[]);
-        let with_auth_chain = compute_state_groups_partial(&[create, member], &[sibling]);
+        let base = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+            ],
+            &[],
+        );
+        let with_fork = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+                sibling.clone(),
+            ],
+            &[],
+        );
+        let with_orphan = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+                orphan,
+            ],
+            &[],
+        );
+        let with_auth_chain = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                branch_b.clone(),
+                merge.clone(),
+            ],
+            &[sibling],
+        );
+        let reordered = compute_state_groups_partial(
+            &[
+                merge.clone(),
+                branch_b.clone(),
+                branch_a.clone(),
+                member.clone(),
+                create.clone(),
+            ],
+            &[],
+        );
+        let without_branch_b = compute_state_groups_partial(
+            &[
+                create.clone(),
+                member.clone(),
+                branch_a.clone(),
+                merge.clone(),
+            ],
+            &[],
+        );
 
         assert_eq!(base.groups["$join"], with_fork.groups["$join"]);
         assert_eq!(base.groups["$join"], with_orphan.groups["$join"]);
         assert_eq!(base.groups["$join"], with_auth_chain.groups["$join"]);
+        assert_eq!(base.groups["$merge"], with_fork.groups["$merge"]);
+        assert_eq!(base.groups["$merge"], with_orphan.groups["$merge"]);
+        assert_eq!(base.groups["$merge"], with_auth_chain.groups["$merge"]);
+        assert_eq!(base.groups["$merge"], reordered.groups["$merge"]);
+        assert_ne!(base.groups["$merge"], base.groups["$branch-a"]);
+        assert_ne!(base.groups["$merge"], base.groups["$branch-b"]);
+        assert!(without_branch_b.groups.contains_key("$branch-a"));
+        assert!(!without_branch_b.groups.contains_key("$merge"));
+        assert!(without_branch_b.unresolved.iter().any(|id| id == "$merge"));
         assert!(!with_orphan.groups.contains_key("$orphan"));
         assert!(with_orphan.unresolved.iter().any(|id| id == "$orphan"));
+    }
+
+    #[test]
+    fn compute_state_groups_uses_first_prev_as_tie_break_for_now() {
+        let create = owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
+        );
+        let first = owned_value(
+            r#"{"event_id":"$first","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let second = owned_value(
+            r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["$create"],"content":{}}"#,
+        );
+        let merge_first = owned_value(
+            r#"{"event_id":"$merge-first","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$first","$second"],"content":{}}"#,
+        );
+        let merge_second = owned_value(
+            r#"{"event_id":"$merge-second","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$second","$first"],"content":{}}"#,
+        );
+
+        // The walker currently resolves a same-key conflict by taking the
+        // first prev_events entry. This is not full Matrix state resolution;
+        // changing it requires a state-group namespace bump.
+        let first_groups = compute_state_groups_partial(
+            &[create.clone(), first.clone(), second.clone(), merge_first],
+            &[],
+        )
+        .groups;
+        let second_groups =
+            compute_state_groups_partial(&[create, first, second, merge_second], &[]).groups;
+
+        assert_ne!(first_groups["$first"], first_groups["$second"]);
+        assert_eq!(first_groups["$merge-first"], first_groups["$first"]);
+        assert_ne!(first_groups["$merge-first"], first_groups["$second"]);
+        assert_eq!(second_groups["$merge-second"], second_groups["$second"]);
+        assert_ne!(second_groups["$merge-second"], second_groups["$first"]);
     }
 
     #[test]
