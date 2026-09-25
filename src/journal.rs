@@ -838,6 +838,11 @@ impl Drop for SyncInFlightGuard<'_> {
     }
 }
 
+/// Test-only hook run between a sync's handle clone and its fsync; an `Err` it
+/// returns stands in for the fsync failing.
+#[cfg(test)]
+type FsyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// What a sync captured under the journal lock so it can flush without it.
 struct SyncCapture {
     /// Duplicate of the segment file handle current at capture time.
@@ -1106,8 +1111,9 @@ pub struct JournalCoordinator {
     sync_lock: Mutex<()>,
     /// Test-only hook run after the file handle is cloned and before the
     /// fsync, with `journal` released, so a test can park a sync mid-flight.
+    /// An `Err` it returns is treated as the fsync failing.
     #[cfg(test)]
-    fsync_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    fsync_hook: Mutex<Option<FsyncHook>>,
     /// Guards [`Self::durable_cv`]. The condvar carries no state of its own;
     /// waiters re-check [`Self::committed_lsn`] and the committer's presence
     /// after every wake, so this only provides the required mutex pairing.
@@ -1401,9 +1407,10 @@ impl JournalCoordinator {
     ///
     /// Calls with the same or an earlier target are covered by an already
     /// completed group. Later published mutations are left for a later group.
-    /// The journal mutex serializes the disk commit; concurrent sync callers
-    /// wait for it and then recheck the committed LSN before deciding whether
-    /// to write.
+    /// `sync_lock` serializes the fsync (the journal mutex is held only briefly
+    /// to capture the range, so publishers keep appending); concurrent sync
+    /// callers wait for it and then recheck the committed LSN before deciding
+    /// whether to flush.
     ///
     /// # Errors
     /// Returns an error if the target was never published, the journal is
@@ -1537,15 +1544,12 @@ impl JournalCoordinator {
         capture: &SyncCapture,
         timings: &mut JournalSyncTimings,
     ) -> io::Result<()> {
-        #[cfg(test)]
-        {
-            let hook = self.fsync_hook.lock().clone();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
         let fsync_started = std::time::Instant::now();
-        if let Err(error) = capture.file.sync_all() {
+        #[cfg(test)]
+        let hooked = self.run_fsync_hook();
+        #[cfg(not(test))]
+        let hooked: io::Result<()> = Ok(());
+        if let Err(error) = hooked.and_then(|()| capture.file.sync_all()) {
             // Never retry a failed fsync and report success: the kernel may
             // have dropped the dirty pages. Poison until reopen and rescan.
             self.poisoned.store(true, Ordering::Release);
@@ -1554,6 +1558,17 @@ impl JournalCoordinator {
         }
         timings.journal_fsync = fsync_started.elapsed();
         Ok(())
+    }
+
+    /// Run the test-only fsync hook, if one is set, so a test can park the
+    /// sync before its fsync or make it fail.
+    #[cfg(test)]
+    fn run_fsync_hook(&self) -> io::Result<()> {
+        let hook = self.fsync_hook.lock().clone();
+        match hook {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
     }
 
     /// Publish the durable boundary a successful fsync established and build
@@ -4072,6 +4087,7 @@ mod tests {
         *coordinator.fsync_hook.lock() = Some(Arc::new(move || {
             parked_tx.lock().unwrap().send(()).ok();
             release_rx.lock().unwrap().recv().ok();
+            Ok(())
         }));
         (parked_rx, release_tx)
     }
@@ -4091,7 +4107,7 @@ mod tests {
 
         let syncer = {
             let coordinator = coordinator.clone();
-            std::thread::spawn(move || coordinator.sync().unwrap())
+            std::thread::spawn(move || coordinator.sync().unwrap().unwrap())
         };
         parked
             .recv_timeout(Duration::from_secs(5))
@@ -4113,18 +4129,93 @@ mod tests {
         assert_eq!(coordinator.committed_lsn(), 0, "the fsync is still parked");
 
         release.send(()).unwrap();
-        syncer.join().unwrap();
+        let parked_receipt = syncer.join().unwrap();
         publisher.join().unwrap();
+        assert_eq!(
+            (parked_receipt.first_lsn, parked_receipt.last_lsn),
+            (first, first),
+            "the parked sync's receipt covers only the range it captured"
+        );
         assert_eq!(
             coordinator.committed_lsn(),
             first,
-            "the parked sync captured its range before the second publish"
+            "the group published during the fsync is visible but not committed"
         );
 
         *coordinator.fsync_hook.lock() = None;
-        coordinator.sync().unwrap();
+        let later = coordinator.sync().unwrap().unwrap();
+        assert_eq!((later.first_lsn, later.last_lsn), (second, second));
         assert_eq!(coordinator.committed_lsn(), second);
         fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    /// An fsync error must never be reported as durable, and must poison the
+    /// journal so no later publish or sync can succeed on top of it: the
+    /// kernel may have dropped the dirty pages, so a retry could falsely pass.
+    /// The error is injected through the fsync hook, which stands in for
+    /// `sync_all` failing; it exercises the production poison path, not the
+    /// kernel's behavior.
+    #[test]
+    fn an_injected_fsync_error_poisons_and_is_never_reported_durable() {
+        let coordinator = open_arc("failed_fsync_poison");
+        coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        *coordinator.fsync_hook.lock() = Some(Arc::new(|| Err(std::io::Error::other("injected"))));
+
+        assert!(coordinator.sync().is_err());
+        assert_eq!(
+            coordinator.committed_lsn(),
+            0,
+            "a failed fsync is not marked durable"
+        );
+        assert!(
+            coordinator.publish_group(&[put(1, 2, b"second")]).is_err(),
+            "publication must be rejected after a failed fsync"
+        );
+
+        // Even with the fault gone, the poison persists: no retry may report
+        // the earlier data durable.
+        *coordinator.fsync_hook.lock() = None;
+        assert!(coordinator.sync().is_err());
+        assert_eq!(coordinator.committed_lsn(), 0);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    /// Torn-tail recovery on hand-built truncated images. It writes two
+    /// groups, cuts a copy at the boundary before the second group (and again
+    /// inside it, as a torn write), and checks that recovery keeps exactly the
+    /// earlier prefix and continues numbering from it. It says nothing about
+    /// what an actual crash would leave on disk after an in-flight fsync.
+    #[test]
+    fn recovery_discards_a_clean_or_torn_tail_group() {
+        let coordinator = open_arc("torn_tail_recovery");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        let second = coordinator.publish_group(&[put(1, 2, b"second")]).unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let prefix_len = super::FILE_HEADER_LEN as u64 + first.bytes_written;
+        let full_len = prefix_len + second.bytes_written;
+        assert_eq!(fs::metadata(&path).unwrap().len(), full_len);
+        for cut in [prefix_len, prefix_len + second.bytes_written / 2] {
+            let copy = temp_path("torn_tail_recovery_copy");
+            fs::copy(&path, &copy).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&copy)
+                .unwrap()
+                .set_len(cut)
+                .unwrap();
+            let (journal, scan) = Journal::open(&copy).unwrap();
+            assert_eq!(scan.groups.len(), 1, "only the intact prefix is recovered");
+            assert_eq!(scan.groups[0].last_lsn, first.last_lsn);
+            let recovered = JournalCoordinator::new(journal, &scan);
+            let next = recovered.publish_group(&[put(1, 3, b"third")]).unwrap();
+            assert_eq!(next.first_lsn, first.last_lsn + 1, "numbering continues");
+            drop(recovered);
+            fs::remove_file(copy).unwrap();
+        }
+        fs::remove_file(path).unwrap();
     }
 
     /// Reclaim replaces the segment file, so it must wait for an in-flight
@@ -4170,35 +4261,63 @@ mod tests {
     }
 
     /// Concurrent callers that queue behind an in-flight fsync must share the
-    /// next one instead of each starting their own.
+    /// next one instead of each starting their own. The first fsync is parked
+    /// until every other writer has published and is waiting on `sync_lock`,
+    /// so the outcome is exact: the first fsync covers only the first group,
+    /// and one more fsync covers the other seven.
     #[test]
-    fn concurrent_syncs_coalesce_into_few_fsyncs() {
+    fn concurrent_syncs_coalesce_into_one_follow_up_fsync() {
         const WRITERS: u8 = 8;
         let coordinator = open_arc("concurrent_sync_coalesce");
-        // A slow fsync gives the other writers time to publish and queue.
-        *coordinator.fsync_hook.lock() = Some(Arc::new(|| {
-            std::thread::sleep(Duration::from_millis(40));
-        }));
-        let start = Arc::new(std::sync::Barrier::new(usize::from(WRITERS)));
-        let mut handles = Vec::new();
-        for node in 0..WRITERS {
+        let (parked, release) = park_next_fsync(&coordinator);
+
+        let leader = {
             let coordinator = coordinator.clone();
-            let start = Arc::clone(&start);
-            handles.push(std::thread::spawn(move || {
-                start.wait();
+            std::thread::spawn(move || {
+                coordinator.publish_group(&[put(2, 0, b"w")]).unwrap();
+                coordinator.sync().unwrap();
+            })
+        };
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first sync must reach its fsync");
+
+        let mut followers = Vec::new();
+        for node in 1..WRITERS {
+            let coordinator = coordinator.clone();
+            followers.push(std::thread::spawn(move || {
                 coordinator.publish_group(&[put(2, node, b"w")]).unwrap();
                 coordinator.sync().unwrap();
             }));
         }
-        for handle in handles {
-            handle.join().unwrap();
+        // Each follower counts itself as a waiter before blocking on
+        // `sync_lock`, which the parked leader holds.
+        let waiting = coordinator.clone();
+        wait_until(
+            move || waiting.journal_waiters.load(Ordering::Relaxed) == u64::from(WRITERS - 1),
+            "every follower to queue behind the parked fsync",
+        );
+        assert_eq!(coordinator.committed_lsn(), 0);
+
+        // Let the parked fsync finish, and every later fsync run unparked
+        // (a dropped sender makes the hook's wait return at once).
+        release.send(()).unwrap();
+        drop(release);
+        leader.join().unwrap();
+        for follower in followers {
+            follower.join().unwrap();
         }
+
         assert_eq!(coordinator.committed_lsn(), u64::from(WRITERS));
         let stats = coordinator.durability_stats();
-        assert!(
-            stats.commits <= 4,
-            "{WRITERS} concurrent syncs used {} fsyncs; they must coalesce",
-            stats.commits
+        assert_eq!(
+            stats.commits, 2,
+            "the leader's fsync plus one shared follow-up"
+        );
+        assert_eq!(
+            stats.sync_coalesced,
+            u64::from(WRITERS - 2),
+            "all but the follow-up's leader found their target already marked durable"
         );
         *coordinator.fsync_hook.lock() = None;
         fs::remove_file(coordinator.path()).unwrap();
@@ -4585,6 +4704,14 @@ mod tests {
 
         assert!(token.is_satisfied_by(coordinator.committed_lsn()));
         assert_eq!(coordinator.pending_count(), 0);
+        // `background_commits` is bumped after the committer's sync returns,
+        // which is after the durable boundary a waiter observes. Wait for the
+        // counter instead of racing it.
+        let counted = coordinator.clone();
+        wait_until(
+            move || counted.background_commits() >= 1,
+            "background commit to be counted",
+        );
         assert_eq!(
             coordinator.background_commits(),
             1,
@@ -4614,7 +4741,13 @@ mod tests {
             move || committed.committed_lsn() >= lsn,
             "quiet-stream interval flush",
         );
-        assert!(coordinator.background_commits() >= 1);
+        // The committer bumps `background_commits` after its sync returns,
+        // which is after the durable boundary observed above.
+        let counted = coordinator.clone();
+        wait_until(
+            move || counted.background_commits() >= 1,
+            "background commit to be counted",
+        );
         // Idle timer ticks after the flush must not register as coalesced work.
         assert_eq!(coordinator.background_coalesced(), 0);
         let parks_before = coordinator.committer_parks.load(Ordering::Acquire);
@@ -4661,7 +4794,13 @@ mod tests {
             move || committed.committed_lsn() >= 4,
             "max-pending early flush",
         );
-        assert!(coordinator.background_commits() >= 1);
+        // The committer bumps `background_commits` after its sync returns,
+        // which is after the durable boundary observed above.
+        let counted = coordinator.clone();
+        wait_until(
+            move || counted.background_commits() >= 1,
+            "background commit to be counted",
+        );
         assert_eq!(coordinator.background_coalesced(), 0);
         coordinator.stop_background_committer().unwrap();
         fs::remove_file(coordinator.path()).unwrap();
@@ -4916,6 +5055,7 @@ mod tests {
                     publisher.publish_group(&[put(3, node, b"window")]).unwrap();
                 }
             });
+            Ok(())
         }));
         coordinator.sync_through(lsns[3]).unwrap();
         *coordinator.fsync_hook.lock() = None;
