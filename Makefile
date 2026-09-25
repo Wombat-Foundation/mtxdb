@@ -61,11 +61,18 @@ doc: ##H Build docs
 # Test & bench
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+# Optional Cargo profile for `make test` / `make cov`. Empty means Cargo's own
+# default; local `.env` may set it (e.g. dev-quick). The flag is only emitted
+# when the variable is non-empty — an unset `--profile` makes Cargo consume the
+# next argument (here `-p`) as its value and fail with a bogus subcommand.
 MTXDB_TEST_PROFILE ?=
+ifneq ($(strip $(MTXDB_TEST_PROFILE)),)
+MTXDB_TEST_PROFILE_FLAG := --profile $(MTXDB_TEST_PROFILE)
+endif
 
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(CARGO) test --profile $(MTXDB_TEST_PROFILE) --workspace --all-features --lib --tests --timings
+	$(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
@@ -74,7 +81,7 @@ LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 cov: ##H Run code coverage and generate HTML report
 	# TODO: include `src/bin/` in coverage
 	# Run coverage
-	$(CARGO) llvm-cov --profile $(MTXDB_TEST_PROFILE) \
+	$(CARGO) llvm-cov $(MTXDB_TEST_PROFILE_FLAG) \
 		-p mtxdb --lib --tests \
 		--html --output-dir .coverage \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'

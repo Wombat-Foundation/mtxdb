@@ -22,6 +22,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest]
+    env:
+      # `.cargo/config.toml` enables the host-native `rustc-wrapper` on every
+      # platform, but Windows cannot execute its `.sh` (`%1 is not a valid
+      # Win32 application`, os error 193), and Cargo has no OS-conditional
+      # `rustc-wrapper`. An empty RUSTC_WRAPPER env overrides the config value,
+      # so Windows builds portable while macOS keeps the native/mold wrapper.
+      RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && '.cargo/cargo-wrapper.sh' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
