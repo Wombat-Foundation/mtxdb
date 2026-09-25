@@ -651,22 +651,25 @@ impl SyncDiagnostics {
 }
 
 /// Fixed latency buckets used by public operation diagnostics. Buckets are
-/// non-cumulative: `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
+/// non-cumulative: `<50us`, `<100us`, `<250us`, `<1ms`, `<10ms`, and `>=10ms`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OperationLatency {
     /// Number of timed operations.
     pub calls: u64,
     /// Sum of operation wall time.
     pub total: std::time::Duration,
-    /// Counts for `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
-    pub buckets: [u64; 5],
+    /// Largest observed operation wall time.
+    pub max: std::time::Duration,
+    /// Counts for `<50us`, `<100us`, `<250us`, `<1ms`, `<10ms`, and `>=10ms`.
+    pub buckets: [u64; 6],
 }
 
 #[derive(Default)]
 struct OperationLatencyTotals {
     calls: AtomicU64,
     total_ns: AtomicU64,
-    buckets: [AtomicU64; 5],
+    max_ns: AtomicU64,
+    buckets: [AtomicU64; 6],
 }
 
 impl OperationLatencyTotals {
@@ -676,17 +679,23 @@ impl OperationLatencyTotals {
             u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        self.max_ns.fetch_max(
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let micros = duration.as_micros();
-        let bucket = if micros < 1_000 {
+        let bucket = if micros < 50 {
             0
-        } else if micros < 10_000 {
+        } else if micros < 100 {
             1
-        } else if micros < 100_000 {
+        } else if micros < 250 {
             2
-        } else if micros < 1_000_000 {
+        } else if micros < 1_000 {
             3
-        } else {
+        } else if micros < 10_000 {
             4
+        } else {
+            5
         };
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
@@ -695,6 +704,7 @@ impl OperationLatencyTotals {
         OperationLatency {
             calls: self.calls.load(Ordering::Relaxed),
             total: std::time::Duration::from_nanos(self.total_ns.load(Ordering::Relaxed)),
+            max: std::time::Duration::from_nanos(self.max_ns.load(Ordering::Relaxed)),
             buckets: std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
         }
     }
@@ -702,6 +712,7 @@ impl OperationLatencyTotals {
     fn reset(&self) {
         self.calls.store(0, Ordering::Relaxed);
         self.total_ns.store(0, Ordering::Relaxed);
+        self.max_ns.store(0, Ordering::Relaxed);
         for bucket in &self.buckets {
             bucket.store(0, Ordering::Relaxed);
         }
@@ -712,6 +723,7 @@ impl OperationLatencyTotals {
 struct OperationTimings {
     get: OperationLatencyTotals,
     get_many: OperationLatencyTotals,
+    get_many_with_refresh: OperationLatencyTotals,
     put: OperationLatencyTotals,
     put_many: OperationLatencyTotals,
 }
@@ -720,6 +732,7 @@ impl OperationTimings {
     fn reset(&self) {
         self.get.reset();
         self.get_many.reset();
+        self.get_many_with_refresh.reset();
         self.put.reset();
         self.put_many.reset();
     }
@@ -6604,6 +6617,12 @@ impl PackfileStorage {
         if !self.refresh_on_miss.load(Ordering::Relaxed) {
             return self.get_many(collection_id, ids);
         }
+        let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get_many_with_refresh)
+        } else {
+            OperationTimer::disabled()
+        };
         let mut results = self.get_many(collection_id, ids)?;
         let mut missing: Vec<usize> = results
             .iter()
@@ -8737,7 +8756,8 @@ impl PackfileStorage {
     /// false-to-true transition are reflected as fewer `get_*` calls, not as
     /// zeros.
     /// When enabled, it also records wall-clock totals and fixed latency
-    /// buckets for `get`, `get_many`, `put`, and `put_many` in [`Self::stats`].
+    /// buckets plus maxima for `get`, `get_many`, `get_many_with_refresh`,
+    /// `put`, and `put_many` in [`Self::stats`].
     pub fn set_stats_enabled(&self, enabled: bool) {
         self.stats_enabled.store(enabled, Ordering::Relaxed);
     }
@@ -8838,6 +8858,7 @@ impl PackfileStorage {
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
             get_latency: self.operation_timings.get.snapshot(),
             get_many_latency: self.operation_timings.get_many.snapshot(),
+            get_many_with_refresh_latency: self.operation_timings.get_many_with_refresh.snapshot(),
             put_latency: self.operation_timings.put.snapshot(),
             put_many_latency: self.operation_timings.put_many.snapshot(),
             last_open_timings: self.open_timings(),
@@ -9099,6 +9120,11 @@ pub struct RuntimeStats {
     pub get_latency: OperationLatency,
     /// Opt-in wall-clock latency for batched reads.
     pub get_many_latency: OperationLatency,
+    /// Opt-in inclusive wall-clock latency for refresh-aware batched reads,
+    /// including any inner `get_many`, stale-index refresh, and retry work.
+    /// This overlaps [`Self::get_many_latency`] when refresh is enabled and
+    /// must not be added to it.
+    pub get_many_with_refresh_latency: OperationLatency,
     /// Opt-in wall-clock latency for single-record writes.
     pub put_latency: OperationLatency,
     /// Opt-in wall-clock latency for batched writes.
@@ -9223,6 +9249,7 @@ impl Default for RuntimeStats {
             sync_calls: 0,
             get_latency: OperationLatency::default(),
             get_many_latency: OperationLatency::default(),
+            get_many_with_refresh_latency: OperationLatency::default(),
             put_latency: OperationLatency::default(),
             put_many_latency: OperationLatency::default(),
             last_open_timings: None,
@@ -12570,6 +12597,9 @@ mod tests {
         assert_eq!(snapshot.get_misses, 1);
         assert_eq!(snapshot.get_latency.calls, 2);
         assert!(snapshot.get_latency.total > std::time::Duration::ZERO);
+        assert!(snapshot.get_latency.max > std::time::Duration::ZERO);
+        assert!(snapshot.get_latency.max >= snapshot.get_latency.total / 2);
+        assert!(snapshot.get_latency.max <= snapshot.get_latency.total);
         assert_eq!(snapshot.get_latency.buckets.iter().sum::<u64>(), 2);
 
         // Batched writes against an already-materialized (non-mmap) index
@@ -12626,6 +12656,7 @@ mod tests {
         assert_eq!(snapshot.get_calls, 0);
         assert_eq!(snapshot.get_misses, 0);
         assert_eq!(snapshot.get_latency.calls, 0);
+        assert_eq!(snapshot.get_latency.max, std::time::Duration::ZERO);
         assert_eq!(snapshot.put_many_latency.calls, 0);
 
         // Sync accounting: the first (structurally invalidated) sync rewrites
