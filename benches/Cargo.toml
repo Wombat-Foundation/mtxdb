@@ -118,3 +118,9 @@ harness = false
 name = "txn_contention"
 path = "txn_contention.rs"
 harness = false
+
+# Long-running writes and syncs against one shared WAL: the segment must stay bounded.
+[[bench]]
+name = "wal_steady_state"
+path = "wal_steady_state.rs"
+harness = false
