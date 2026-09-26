@@ -1060,6 +1060,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The owned transaction is what crosses an FFI boundary, which needs it to
+    /// be both `Send` and `Sync`. This fails to compile if that stops holding.
+    #[test]
+    fn an_owned_transaction_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DatabaseTransaction<'static>>();
+    }
+
     fn node(id: u8) -> NodeId {
         let mut bytes = [0u8; 16];
         bytes[15] = id;
