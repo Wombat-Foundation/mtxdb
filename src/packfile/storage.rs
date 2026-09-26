@@ -38,6 +38,11 @@ thread_local! {
     /// its already-staged mutations to the live pack/index state. The outer
     /// transaction publishes the complete batch exactly once afterward.
     static JOURNAL_SUPPRESSED: Cell<bool> = const { Cell::new(false) };
+    /// Set while a read-committed lookup falls back to the live index. That
+    /// fallback reads through `get_many`, which redirects to the overlay path
+    /// while a transaction is active, so without this flag the two would call
+    /// each other until the stack overflowed.
+    static READ_COMMITTED_FALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Callback that rewrites a node's child references given resolved child data,
@@ -1646,6 +1651,17 @@ pub struct PackfileStorage {
     /// being materialized. While non-zero, ordinary reads consult the journal
     /// overlay before the live index.
     transaction_overlay_users: AtomicU64,
+    /// The transaction overlay while no transaction uses it. It is kept out of
+    /// `read_journal` so read-committed reads on the writer skip the journal
+    /// refresh, and kept at all so the next activation resumes its scan
+    /// position instead of rescanning the segment.
+    #[cfg(feature = "multi-reader")]
+    parked_transaction_overlay: parking_lot::Mutex<Option<ReadJournal>>,
+    /// Serializes overlay activation and deactivation, so the overlay moves
+    /// between `read_journal` and the parking slot exactly once per 0 <-> 1
+    /// transition of `transaction_overlay_users`.
+    #[cfg(feature = "multi-reader")]
+    transaction_overlay_lifecycle: parking_lot::Mutex<()>,
     /// Test-only total of segment bytes the transaction overlay has scanned,
     /// across activations, whether the overlay was retained or rebuilt.
     #[cfg(all(test, feature = "multi-reader"))]
@@ -2439,6 +2455,10 @@ impl PackfileStorage {
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
             read_journal: parking_lot::Mutex::new(None),
+            #[cfg(feature = "multi-reader")]
+            parked_transaction_overlay: parking_lot::Mutex::new(None),
+            #[cfg(feature = "multi-reader")]
+            transaction_overlay_lifecycle: parking_lot::Mutex::new(()),
             transaction_overlay_users: AtomicU64::new(0),
             #[cfg(all(test, feature = "multi-reader"))]
             transaction_overlay_scanned: AtomicU64::new(0),
@@ -7389,7 +7409,7 @@ impl StorageEngine for PackfileStorage {
         } else {
             OperationTimer::disabled()
         };
-        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+        if self.overlay_reads_active() {
             return Ok(self
                 .get_read_committed(collection_id, std::slice::from_ref(id))?
                 .into_iter()
@@ -7456,7 +7476,7 @@ impl StorageEngine for PackfileStorage {
         } else {
             OperationTimer::disabled()
         };
-        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+        if self.overlay_reads_active() {
             return self.get_read_committed(collection_id, ids);
         }
         // As in `get`: pin the candidate shards and retry if a concurrent
@@ -8199,6 +8219,14 @@ impl PackfileStorage {
         }
     }
 
+    /// Whether ordinary reads must go through the transaction overlay: a
+    /// transaction is using it, and this read is not the overlay path's own
+    /// fallback to the live index.
+    fn overlay_reads_active(&self) -> bool {
+        self.transaction_overlay_users.load(Ordering::Acquire) != 0
+            && !READ_COMMITTED_FALLBACK.with(Cell::get)
+    }
+
     /// Enable the in-process read overlay for a published transaction that is
     /// still being materialized. The overlay is shared with the existing
     /// read-committed implementation, but ordinary reads consult it only
@@ -8209,6 +8237,7 @@ impl PackfileStorage {
         wal_path: &Path,
         pool: crate::layout::ShardType,
     ) -> Result<(), StorageError> {
+        let _lifecycle = self.transaction_overlay_lifecycle.lock();
         let previous = self
             .transaction_overlay_users
             .fetch_add(1, Ordering::AcqRel);
@@ -8222,6 +8251,12 @@ impl PackfileStorage {
         Ok(())
     }
 
+    /// Whether a journal overlay is installed on the read path.
+    #[cfg(all(test, feature = "multi-reader"))]
+    pub(crate) fn read_journal_installed(&self) -> bool {
+        self.read_journal.lock().is_some()
+    }
+
     /// Total segment bytes the retained transaction overlay has scanned.
     #[cfg(all(test, feature = "multi-reader"))]
     pub(crate) fn transaction_overlay_scanned_bytes(&self) -> u64 {
@@ -8233,6 +8268,7 @@ impl PackfileStorage {
     /// before journal publication.
     #[cfg(feature = "multi-reader")]
     pub(crate) fn deactivate_transaction_overlay(&self) {
+        let _lifecycle = self.transaction_overlay_lifecycle.lock();
         let mut users = self.transaction_overlay_users.load(Ordering::Acquire);
         loop {
             let next = users
@@ -8247,6 +8283,9 @@ impl PackfileStorage {
                 Ok(_) => break,
                 Err(current) => users = current,
             }
+        }
+        if users == 1 {
+            self.park_transaction_overlay();
         }
     }
 

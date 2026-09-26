@@ -1397,6 +1397,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// While a transaction holds the overlay it is on the read path, so its
+    /// staged group is visible before materialization; once the last user
+    /// releases it, the overlay leaves the read path, and writer reads stop
+    /// refreshing a journal that only repeats the index.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn transaction_overlay_is_on_the_read_path_only_while_a_transaction_uses_it() {
+        let root = test_root("overlay_read_path");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x76; 16];
+        let pool = db.pool(ShardType::EventDag);
+        assert!(!pool.read_journal_installed());
+        let txn = db.begin_transaction();
+        txn.put(ShardType::EventDag, collection, node(1), &data(b"staged"))
+            .unwrap();
+        let overlay = db.activate_transaction_overlay().unwrap();
+        db.publish_transaction(&txn.stage).unwrap();
+        assert!(pool.read_journal_installed());
+        let visible = pool.get_read_committed(&collection, &[node(1)]).unwrap();
+        assert_eq!(payload_of(visible[0].as_ref()), Some(b"staged".to_vec()));
+        drop(overlay);
+        assert!(!pool.read_journal_installed());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// After many lone commits and a checkpoint, a writer's read-committed reads
+    /// must not have a journal overlay installed, and must still return every
+    /// committed record.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn writer_reads_leave_the_overlay_off_after_commits_and_sync() {
+        let root = test_root("overlay_writer_reads");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x77; 16];
+        let pool = db.pool(ShardType::EventDag);
+        for seq in 0..200u8 {
+            let txn = db.begin_transaction();
+            txn.put(ShardType::EventDag, collection, node(seq), &data(b"value"))
+                .unwrap();
+            txn.commit().unwrap();
+            assert!(!pool.read_journal_installed());
+        }
+        pool.sync_all().unwrap();
+        for seq in 0..200u8 {
+            let read = pool.get_read_committed(&collection, &[node(seq)]).unwrap();
+            assert!(read[0].is_some(), "record {seq} must stay readable");
+        }
+        assert!(!pool.read_journal_installed());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One thread commits while another reads: a reader must see every commit
+    /// the writer has finished, whether or not the overlay is installed at that
+    /// moment.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn concurrent_reads_see_every_finished_commit() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let root = test_root("overlay_concurrent");
+        let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+        let collection = [0x78; 16];
+        let finished = Arc::new(AtomicU8::new(0));
+        let writer = {
+            let db = Arc::clone(&db);
+            let finished = Arc::clone(&finished);
+            std::thread::Builder::new()
+                .stack_size(16 << 20)
+                .spawn(move || {
+                    for seq in 1..=200u8 {
+                        let txn = db.begin_transaction();
+                        txn.put(ShardType::EventDag, collection, node(seq), &data(b"value"))
+                            .unwrap();
+                        txn.commit().unwrap();
+                        finished.store(seq, Ordering::Release);
+                    }
+                })
+                .unwrap()
+        };
+        let pool = Arc::clone(db.pool(ShardType::EventDag));
+        while finished.load(Ordering::Acquire) < 200 {
+            let done = finished.load(Ordering::Acquire);
+            if done > 0 {
+                let read = pool.get_read_committed(&collection, &[node(done)]).unwrap();
+                assert!(
+                    read[0].is_some(),
+                    "commit {done} finished but is unreadable"
+                );
+            }
+        }
+        writer.join().unwrap();
+        drop(pool);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// While a transaction overlay is active, a read of a key the overlay does
+    /// not hold must fall through to the live index once, not bounce between
+    /// the overlay path and the durable path until the stack overflows.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn reading_an_unstaged_key_during_an_active_overlay_reaches_the_index() {
+        let root = test_root("overlay_unstaged_read");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x79; 16];
+        let pool = db.pool(ShardType::EventDag);
+        pool.put(&collection, &node(1), &data(b"durable")).unwrap();
+        let txn = db.begin_transaction();
+        txn.put(ShardType::EventDag, collection, node(2), &data(b"staged"))
+            .unwrap();
+        let overlay = db.activate_transaction_overlay().unwrap();
+        db.publish_transaction(&txn.stage).unwrap();
+        let by_get = pool.get(&collection, &node(1)).unwrap();
+        assert_eq!(payload_of(by_get.as_ref()), Some(b"durable".to_vec()));
+        let by_many = pool.get_many(&collection, &[node(1), node(3)]).unwrap();
+        assert_eq!(payload_of(by_many[0].as_ref()), Some(b"durable".to_vec()));
+        assert!(by_many[1].is_none());
+        drop(overlay);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn transaction_commit_applies_and_publishes_once() {
         let root = test_root("transaction_commit");

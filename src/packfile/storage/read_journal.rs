@@ -199,6 +199,30 @@ pub(super) struct ReadJournal {
     /// checkpoint covers the delete, because the durable index may still hold
     /// pre-delete records. A later put does not clear it.
     pub(super) delete_lsn: HashMap<[u8; 16], u64>,
+    /// Whether this is the writer's transaction overlay, which is parked when
+    /// no transaction uses it, and not a read-only worker's overlay.
+    #[cfg(feature = "multi-reader")]
+    pub(super) transaction: bool,
+}
+
+/// Marks the current thread as inside a read-committed fallback to the live
+/// index for the guard's lifetime, restoring the previous value on drop.
+struct FallbackReadGuard {
+    previous: bool,
+}
+
+impl FallbackReadGuard {
+    fn enter() -> Self {
+        Self {
+            previous: super::READ_COMMITTED_FALLBACK.with(|flag| flag.replace(true)),
+        }
+    }
+}
+
+impl Drop for FallbackReadGuard {
+    fn drop(&mut self) {
+        super::READ_COMMITTED_FALLBACK.with(|flag| flag.set(self.previous));
+    }
 }
 
 impl ReadJournal {
@@ -231,6 +255,8 @@ impl ReadJournal {
             tail_scratch: Vec::new(),
             puts: HashMap::new(),
             delete_lsn: HashMap::new(),
+            #[cfg(feature = "multi-reader")]
+            transaction: false,
         }
     }
 
@@ -805,7 +831,7 @@ impl PackfileStorage {
         // position lets this refresh scan just the groups appended since, not
         // the whole segment from the checkpoint. A reclaimed or replaced
         // segment fails the length and fingerprint checks and rebuilds.
-        let mut overlay = match self.read_journal.lock().take() {
+        let mut overlay = match self.parked_transaction_overlay.lock().take() {
             Some(mut previous)
                 if previous.pool == Some(pool) && previous.path.as_path() == path =>
             {
@@ -821,6 +847,7 @@ impl PackfileStorage {
         // observed nothing and accepts the prefix, so the only outcome besides
         // an error is `Applied`; anything else is a broken assumption and is
         // surfaced instead of installing an overlay that was never built.
+        overlay.transaction = true;
         #[cfg(test)]
         let scanned_before = overlay.scanned_bytes;
         let refreshed = overlay.refresh(true)?;
@@ -840,6 +867,26 @@ impl PackfileStorage {
         }
         *self.read_journal.lock() = Some(overlay);
         Ok(())
+    }
+
+    /// Take the transaction overlay out of the read path once no transaction
+    /// uses it. Its entries are materialized in the writer's index, so leaving
+    /// it installed would make every read-committed read refresh and consult a
+    /// journal that can only repeat what the index holds. Its scan position is
+    /// kept for the next activation.
+    #[cfg(feature = "multi-reader")]
+    pub(super) fn park_transaction_overlay(&self) {
+        let mut installed = self.read_journal.lock();
+        if installed
+            .as_ref()
+            .is_some_and(|overlay| overlay.transaction)
+        {
+            if let Some(mut overlay) = installed.take() {
+                overlay.puts.clear();
+                overlay.delete_lsn.clear();
+                *self.parked_transaction_overlay.lock() = Some(overlay);
+            }
+        }
     }
 
     fn enable_read_journal_inner(
@@ -924,6 +971,9 @@ impl PackfileStorage {
 
         if !unresolved.is_empty() {
             let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();
+            // Read the live index directly: `get_many` would redirect back here
+            // while a transaction overlay is active.
+            let _fallback = FallbackReadGuard::enter();
             let durable = self.get_many_with_refresh(collection_id, &durable_ids)?;
             for (index, value) in unresolved.into_iter().zip(durable) {
                 results[index] = value;
