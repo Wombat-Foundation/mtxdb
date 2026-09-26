@@ -170,7 +170,10 @@ pub(super) struct ReadJournal {
     /// inode numbers, to exercise the no-identity path on unix.
     #[cfg(test)]
     pub(super) force_no_identity: bool,
-    /// Test-only count of descriptor opens used to record the tail.
+    /// Test-only count of descriptors opened to record a tail. It does not
+    /// count the fresh open a no-identity comparison makes (see
+    /// `observed_tail_changed`), so `0` means "no descriptor is kept", not
+    /// "the file is never opened".
     #[cfg(test)]
     pub(super) tail_opens: u64,
     /// Test-only count of overlay rebuilds forced by a changed tail.
@@ -1019,14 +1022,6 @@ mod tests {
         assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
         assert!(overlay.tail_stamp.is_none(), "no stamp without an identity");
         assert!(overlay.tail_file.is_none(), "no descriptor may be held");
-        assert_eq!(
-            overlay.tail_opens, 0,
-            "recording must not open a descriptor"
-        );
-        assert_eq!(
-            overlay.tail_opens, 0,
-            "no-identity recording opens no handle"
-        );
 
         // Build the same-length replacement beside the segment and rename it
         // over the original, so the path now names a different inode.
@@ -1038,9 +1033,11 @@ mod tests {
         overlay.refresh(true).unwrap();
         assert_eq!(value(&overlay), Some(b"fresh-".to_vec()));
         assert_eq!(overlay.tail_resets, 1);
+        // The counter only rises, so this also covers the first refresh: no
+        // descriptor was opened to record a tail at any point.
         assert_eq!(
             overlay.tail_opens, 0,
-            "no-identity refreshes do not retain opens"
+            "no descriptor is opened to record a tail without an identity"
         );
     }
 
@@ -1069,15 +1066,13 @@ mod tests {
     /// one the overlay was built from, so the overlay is rebuilt. The reverse
     /// flip is handled by the same arm.
     #[test]
+    #[cfg(unix)]
     fn a_stamp_that_vanishes_between_refreshes_forces_a_rebuild() {
         let wal = temp_wal("identity_flip");
         write_two_groups(&wal);
         let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
         overlay.refresh(true).unwrap();
-        if overlay.tail_stamp.is_none() {
-            eprintln!("skipped: this platform records no file identity");
-            return;
-        }
+        assert!(overlay.tail_stamp.is_some());
         overlay.force_no_identity = true;
         overlay.refresh(true).unwrap();
         assert_eq!(overlay.tail_resets, 1);
@@ -1086,6 +1081,7 @@ mod tests {
             overlay.tail_stamp.is_none(),
             "the rebuild records without an identity"
         );
+        assert!(overlay.tail_file.is_none());
     }
 
     /// Without a file identity an unchanged segment is not rebuilt: the window
@@ -1101,31 +1097,12 @@ mod tests {
             overlay.refresh(true).unwrap();
         }
         assert_eq!(overlay.tail_resets, 0);
-        assert_eq!(overlay.tail_opens, 0, "no descriptor is ever kept");
         assert_eq!(overlay.tail_reads, 10, "one comparison per refresh");
         assert_eq!(
             overlay.tail_opens, 0,
-            "no-identity refreshes do not retain opens"
+            "no descriptor is retained; fresh compare opens are not counted"
         );
         assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
-    }
-
-    /// Losing a previously available identity must force a comparison rather
-    /// than trusting the descriptor recorded while identity was available.
-    #[test]
-    #[cfg(unix)]
-    fn identity_disappearing_forces_a_tail_rebuild() {
-        let wal = temp_wal("identity_disappears");
-        write_two_groups(&wal);
-        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
-        overlay.refresh(true).unwrap();
-        assert!(overlay.tail_stamp.is_some());
-
-        overlay.force_no_identity = true;
-        overlay.refresh(true).unwrap();
-        assert_eq!(overlay.tail_resets, 1);
-        assert!(overlay.tail_stamp.is_none());
-        assert!(overlay.tail_file.is_none());
     }
 
     /// State-model test, not a real recording: the stamp is flipped to
