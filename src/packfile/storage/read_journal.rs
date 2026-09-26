@@ -39,9 +39,10 @@ impl FileStamp {
     }
 
     /// Whether the last change is older than [`QUIET_AFTER`], so any later
-    /// write is guaranteed a different change time whatever the filesystem's
-    /// timestamp granularity. A change inside that window could share a tick
-    /// with a later write, so the stamp is not trusted yet.
+    /// write gets a different change time, provided the filesystem's timestamp
+    /// granularity is no coarser than [`QUIET_AFTER`]. A change inside that
+    /// window could share a tick with a later write, so the stamp is not
+    /// trusted yet.
     ///
     /// This reads the wall clock. A backwards step makes the age negative and
     /// the stamp counts as not quiet, which is the safe direction. A forward
@@ -62,7 +63,13 @@ impl FileStamp {
 
 /// How long a file must have been unchanged before an equal [`FileStamp`] is
 /// trusted to mean it was not rewritten in between.
-const QUIET_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
+///
+/// This assumes the filesystem's change-time granularity is at most this long.
+/// Two seconds covers the coarse cases (FAT-class mounts, NFS, FUSE), and the
+/// fine ones (ext4, xfs, btrfs, tmpfs, NTFS) are far below it. The cost of
+/// being generous is only that a read-mostly file takes this long after its
+/// last write to reach the no-read fast path.
+const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The stamp of `meta`, when the platform exposes a reliable file identity.
 /// Inode 0 is not a real identity (some filesystems report it for every file),
@@ -932,6 +939,37 @@ mod tests {
             .get(&COLLECTION)
             .and_then(|nodes| nodes.get(&REUSED))
             .map(|(bytes, _)| bytes.to_vec())
+    }
+
+    /// The quiet margin is what the fast path rests on: a change younger than it
+    /// is never trusted, so a coarse-granularity filesystem cannot let a rewrite
+    /// share the recorded change time and go unnoticed.
+    #[test]
+    fn a_stamp_is_quiet_only_once_older_than_the_margin() {
+        let stamp_aged = |age: Duration| {
+            let changed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .checked_sub(age)
+                .unwrap();
+            FileStamp {
+                dev: 1,
+                ino: 1,
+                len: 1,
+                ctime_secs: i64::try_from(changed.as_secs()).unwrap(),
+                ctime_nanos: i64::from(changed.subsec_nanos()),
+            }
+        };
+        assert!(!stamp_aged(Duration::ZERO).is_quiet());
+        assert!(
+            !stamp_aged(QUIET_AFTER / 2).is_quiet(),
+            "half the margin is not enough"
+        );
+        assert!(
+            !stamp_aged(Duration::from_millis(1500)).is_quiet(),
+            "a one-second-granularity change could still be in the same tick"
+        );
+        assert!(stamp_aged(QUIET_AFTER + Duration::from_millis(100)).is_quiet());
     }
 
     /// A file that has been quiet longer than the timestamp granularity is
