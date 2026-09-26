@@ -3056,10 +3056,9 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
         fmt_ms(stats.dirty_lock_wait)
     );
     println!(
-        "    journal          {} calls / {} records / {}   waiters {}   coalesced {}",
+        "    journal          {} calls / {} records   waiters {}   coalesced {}",
         stats.sync_totals.journal_sync_calls,
         stats.sync_totals.journal_records,
-        fmt_bytes(stats.sync_totals.journal_bytes),
         stats.sync_totals.journal_waiters,
         stats.sync_totals.journal_coalesced
     );
@@ -3075,11 +3074,9 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
         stats.sync_totals.journal_sync_calls
     );
     println!(
-        "      wal            total {}   lock wait {}   pending wait {}   append {}   fsync {}",
+        "      wal            total {}   lock wait {}   fsync {}",
         fmt_ms(stats.sync_totals.wal),
         fmt_ms(stats.sync_totals.journal_lock_wait),
-        fmt_ms(stats.sync_totals.journal_pending_wait),
-        fmt_ms(stats.sync_totals.journal_append),
         fmt_ms(stats.sync_totals.journal_fsync)
     );
     println!(
@@ -3105,20 +3102,17 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
     );
     if let Some(timings) = stats.last_sync_timings {
         println!(
-            "    last journal     {}   wal {}   lock wait {}   pending wait {}   append {}   fsync {}   records {}   bytes {}",
+            "    last journal     {}   wal {}   lock wait {}   fsync {}   records {}",
             if timings.failed { "FAILED" } else { "ok" },
             fmt_ms(timings.wal),
             fmt_ms(timings.journal_lock_wait),
-            fmt_ms(timings.journal_pending_wait),
-            fmt_ms(timings.journal_append),
             fmt_ms(timings.journal_fsync),
-            timings.journal_records,
-            fmt_bytes(timings.journal_bytes)
+            timings.journal_records
         );
     }
     for (index, sample) in stats.sync_diagnostics.worst_syncs.iter().enumerate() {
         println!(
-            "    worst[{index:>2}]       {} pid {} total {} wal {} fsync {} lock {} sidecar {} delta {} checkpoint {} in-flight {} records {} bytes {} path {}",
+            "    worst[{index:>2}]       {} pid {} total {} wal {} fsync {} lock {} sidecar {} delta {} checkpoint {} in-flight {} records {} path {}",
             if sample.failed { "FAILED" } else { "ok" },
             sample.process_id,
             fmt_ms(sample.total),
@@ -3130,7 +3124,6 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
             fmt_ms(sample.checkpoint),
             sample.journal_in_flight,
             sample.journal_records,
-            fmt_bytes(sample.journal_bytes),
             sample.journal_path.as_deref().unwrap_or("-")
         );
     }
@@ -3308,18 +3301,6 @@ fn stats_json_object(
                 stats.sync_totals.journal_lock_wait.as_nanos().to_string(),
             ),
             (
-                "journal_pending_wait_ns",
-                stats
-                    .sync_totals
-                    .journal_pending_wait
-                    .as_nanos()
-                    .to_string(),
-            ),
-            (
-                "journal_append_ns",
-                stats.sync_totals.journal_append.as_nanos().to_string(),
-            ),
-            (
                 "journal_fsync_ns",
                 stats.sync_totals.journal_fsync.as_nanos().to_string(),
             ),
@@ -3327,7 +3308,6 @@ fn stats_json_object(
                 "journal_sync_calls",
                 stats.sync_totals.journal_sync_calls.to_string(),
             ),
-            ("journal_bytes", stats.sync_totals.journal_bytes.to_string()),
             (
                 "journal_records",
                 stats.sync_totals.journal_records.to_string(),
@@ -3377,19 +3357,10 @@ fn stats_json_object(
                         timings.journal_lock_wait.as_nanos().to_string(),
                     ),
                     (
-                        "journal_pending_wait_ns",
-                        timings.journal_pending_wait.as_nanos().to_string(),
-                    ),
-                    (
-                        "journal_append_ns",
-                        timings.journal_append.as_nanos().to_string(),
-                    ),
-                    (
                         "journal_fsync_ns",
                         timings.journal_fsync.as_nanos().to_string(),
                     ),
                     ("journal_sync_calls", timings.journal_sync_calls.to_string()),
-                    ("journal_bytes", timings.journal_bytes.to_string()),
                     ("journal_records", timings.journal_records.to_string()),
                     ("journal_in_flight", timings.journal_in_flight.to_string()),
                     ("journal_waiters", timings.journal_waiters.to_string()),
@@ -3444,19 +3415,10 @@ fn stats_json_object(
                             sample.journal_lock_wait.as_nanos().to_string(),
                         ),
                         (
-                            "journal_pending_wait_ns",
-                            sample.journal_pending_wait.as_nanos().to_string(),
-                        ),
-                        (
-                            "journal_append_ns",
-                            sample.journal_append.as_nanos().to_string(),
-                        ),
-                        (
                             "journal_fsync_ns",
                             sample.journal_fsync.as_nanos().to_string(),
                         ),
                         ("journal_records", sample.journal_records.to_string()),
-                        ("journal_bytes", sample.journal_bytes.to_string()),
                         ("journal_in_flight", sample.journal_in_flight.to_string()),
                         ("journal_waiters", sample.journal_waiters.to_string()),
                         ("journal_coalesced", sample.journal_coalesced.to_string()),

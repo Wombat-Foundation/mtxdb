@@ -818,20 +818,15 @@ pub struct CommitReceipt {
 /// Breakdown and counters for one journal durability request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JournalSyncTimings {
-    /// Time spent waiting for the single-writer journal mutex.
+    /// Time spent waiting for the sync lock, which serializes fsyncs.
     pub journal_lock_wait: std::time::Duration,
-    /// Time spent waiting for the pending-mutation queue mutex.
-    // TODO: remove; always zero since the shared pending queue was deleted.
-    pub journal_pending_wait: std::time::Duration,
-    /// Time spent appending and encoding the group, excluding fsync.
-    pub journal_append: std::time::Duration,
     /// Time spent making the journal file durable.
     pub journal_fsync: std::time::Duration,
-    /// Number of mutations included in a newly appended group.
+    /// Number of mutations this fsync made durable: the LSNs it advanced the
+    /// durable boundary over, not a count of records it wrote (groups are
+    /// appended when they are published, not when they are synced).
     pub journal_records: u64,
-    /// Bytes included in a newly appended group, including framing.
-    pub journal_bytes: u64,
-    /// Whether this request had to wait for the journal mutex.
+    /// Whether this request had to wait for the sync lock.
     pub journal_waiter: bool,
     /// Whether this request was already covered by another durable request.
     pub journal_coalesced: bool,
@@ -1749,12 +1744,10 @@ impl JournalCoordinator {
     fn warn_if_slow_fsync(&self, path: &Path, target_lsn: u64, timings: &JournalSyncTimings) {
         if timings.journal_fsync >= SLOW_FSYNC_WARN {
             eprintln!(
-                "mtxdb: slow WAL fsync {}ms (through lsn {target_lsn}, lock wait {}ms, append {}ms, {} records, {} bytes, in-flight {}, waiters {}, {})",
+                "mtxdb: slow WAL fsync {}ms (through lsn {target_lsn}, lock wait {}ms, {} records, in-flight {}, waiters {}, {})",
                 timings.journal_fsync.as_millis(),
                 timings.journal_lock_wait.as_millis(),
-                timings.journal_append.as_millis(),
                 timings.journal_records,
-                timings.journal_bytes,
                 timings.journal_in_flight,
                 self.journal_waiters.load(Ordering::Relaxed),
                 path.display(),
