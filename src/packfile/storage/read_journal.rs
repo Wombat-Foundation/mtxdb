@@ -69,7 +69,21 @@ impl FileStamp {
 /// fine ones (ext4, xfs, btrfs, tmpfs, NTFS) are far below it. The cost of
 /// being generous is only that a read-mostly file takes this long after its
 /// last write to reach the no-read fast path.
+#[cfg(not(test))]
 const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+// The shortened test window must not leak into a real build, and the window
+// must stay above a one-second timestamp granularity.
+#[cfg(not(test))]
+const _: () = assert!(
+    QUIET_AFTER.as_secs() >= 2,
+    "the quiet window must stay above a one-second timestamp granularity"
+);
+/// Tests sleep past this window to reach the quiet fast path, and their files
+/// live on filesystems with fine timestamps, so a short window keeps them fast
+/// without changing what they check: an age above the window is quiet, below
+/// it is not.
+#[cfg(test)]
+const QUIET_AFTER: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// The stamp of `meta`, when the platform exposes a reliable file identity.
 /// Inode 0 is not a real identity (some filesystems report it for every file),
@@ -1062,8 +1076,8 @@ mod tests {
             "half the margin is not enough"
         );
         assert!(
-            !stamp_aged(Duration::from_millis(1500)).is_quiet(),
-            "a one-second-granularity change could still be in the same tick"
+            !stamp_aged(QUIET_AFTER * 3 / 4).is_quiet(),
+            "a change inside the margin could still share a timestamp tick"
         );
         assert!(stamp_aged(QUIET_AFTER + Duration::from_millis(100)).is_quiet());
     }
