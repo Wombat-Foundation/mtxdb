@@ -154,7 +154,9 @@ struct RecoveryItem {
 }
 
 struct TransactionOverlayGuard {
-    pools: [Arc<PackfileStorage>; 3],
+    /// The pools whose overlay this guard holds: only those the transaction
+    /// stages writes for.
+    pools: Vec<Arc<PackfileStorage>>,
 }
 
 impl Drop for TransactionOverlayGuard {
@@ -287,7 +289,10 @@ impl DatabaseTransaction<'_> {
                 return Ok(());
             }
             let started = Instant::now();
-            let mut overlay = Some(self.database.activate_transaction_overlay()?);
+            let mut overlay = Some(
+                self.database
+                    .activate_transaction_overlay(self.stage.touched_pools())?,
+            );
             self.database.commit_phases.overlay.add(started.elapsed());
             let started = Instant::now();
             let published = self.database.publish_transaction(&self.stage);
@@ -520,24 +525,30 @@ impl SharedDatabase {
         }
     }
 
-    fn activate_transaction_overlay(&self) -> Result<TransactionOverlayGuard, StorageError> {
+    /// Activate the read overlay on each pool in `touched` (indexed like
+    /// [`ShardType::ALL`]). A pool with no staged writes has nothing the
+    /// overlay would need to show, so activating it would only rescan the
+    /// journal for no reader.
+    fn activate_transaction_overlay(
+        &self,
+        touched: [bool; 3],
+    ) -> Result<TransactionOverlayGuard, StorageError> {
         let wal_path = self.layout.shared_wal_path();
-        let mut activated = 0usize;
-        for pool in ShardType::ALL {
-            if let Err(error) = self
-                .pool(pool)
-                .activate_transaction_overlay(&wal_path, pool)
-            {
-                for previous in ShardType::ALL.into_iter().take(activated) {
-                    self.pool(previous).deactivate_transaction_overlay();
+        let mut held: Vec<Arc<PackfileStorage>> = Vec::with_capacity(touched.len());
+        for (index, pool) in ShardType::ALL.into_iter().enumerate() {
+            if !touched.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let storage = Arc::clone(&self.pools[index]);
+            if let Err(error) = storage.activate_transaction_overlay(&wal_path, pool) {
+                for previous in &held {
+                    previous.deactivate_transaction_overlay();
                 }
                 return Err(error);
             }
-            activated = activated.saturating_add(1);
+            held.push(storage);
         }
-        Ok(TransactionOverlayGuard {
-            pools: std::array::from_fn(|index| Arc::clone(&self.pools[index])),
-        })
+        Ok(TransactionOverlayGuard { pools: held })
     }
 
     fn register_new_recovery_stage(
@@ -749,7 +760,7 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"event")),
             )
             .unwrap();
-        *overlay = Some(database.activate_transaction_overlay().unwrap());
+        *overlay = Some(activate_for(database, &transaction.stage));
         database.publish_transaction(&transaction.stage).unwrap();
         transaction.stage.begin_materialization().unwrap();
         let receipt = transaction.stage.published_receipt().unwrap();
@@ -783,6 +794,17 @@ mod tests {
         id: NodeId,
     ) -> Option<Vec<u8>> {
         payload_of(database.pool(pool).get(&collection, &id).unwrap().as_ref())
+    }
+
+    /// Activate the overlay for exactly the pools `stage` has writes for, as
+    /// commit does.
+    fn activate_for(
+        database: &SharedDatabase,
+        stage: &crate::journal::TxnStage,
+    ) -> TransactionOverlayGuard {
+        database
+            .activate_transaction_overlay(stage.touched_pools())
+            .unwrap()
     }
 
     fn own_get(
@@ -1412,7 +1434,7 @@ mod tests {
         let txn = db.begin_transaction();
         txn.put(ShardType::EventDag, collection, node(1), &data(b"staged"))
             .unwrap();
-        let overlay = db.activate_transaction_overlay().unwrap();
+        let overlay = activate_for(&db, &txn.stage);
         db.publish_transaction(&txn.stage).unwrap();
         assert!(pool.read_journal_installed());
         let visible = pool.get_read_committed(&collection, &[node(1)]).unwrap();
@@ -1508,7 +1530,7 @@ mod tests {
         let txn = db.begin_transaction();
         txn.put(ShardType::EventDag, collection, node(2), &data(b"staged"))
             .unwrap();
-        let overlay = db.activate_transaction_overlay().unwrap();
+        let overlay = activate_for(&db, &txn.stage);
         db.publish_transaction(&txn.stage).unwrap();
         let by_get = pool.get(&collection, &node(1)).unwrap();
         assert_eq!(payload_of(by_get.as_ref()), Some(b"durable".to_vec()));
@@ -1520,17 +1542,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// `sync_all` after the first checkpoint only appends index deltas, which do
-    /// not record journal coverage, so the shared WAL was never reclaimed again
-    /// and grew until commits failed with "journal segment is full". A large
-    /// segment must force a full checkpoint so the WAL stays bounded.
+    /// Write committed transactions that stage into each of the `active` pools
+    /// and sync every round, idle pools first while the segment is still
+    /// large. Returns the largest WAL seen after a round's syncs (past round
+    /// 0) and asserts that no idle pool ever rewrites its checkpoint or moves its
+    /// `journal.lsn` after its first checkpoint, while every active pool does
+    /// checkpoint once the segment is large. The segment can only be reclaimed
+    /// once all the active pools have reported coverage.
     #[cfg(feature = "multi-reader")]
-    #[test]
-    fn repeated_syncs_keep_the_shared_wal_bounded() {
-        let root = test_root("wal_bounded");
+    fn run_bounded_wal_rounds(name: &str, active: &[ShardType]) -> u64 {
+        use crate::PackfileStorage;
+        assert!(!active.is_empty(), "at least one pool must be active");
+        for (index, pool) in active.iter().enumerate() {
+            assert!(
+                !active.iter().take(index).any(|earlier| earlier == pool),
+                "duplicate active pool: {pool:?}"
+            );
+        }
+        let root = test_root(name);
         let db = SharedDatabase::open(root.clone()).unwrap();
         let collection = [0x7a; 16];
         let wal = db.layout().shared_wal_path();
+        let mut order: Vec<ShardType> = ShardType::ALL
+            .into_iter()
+            .filter(|pool| !active.contains(pool))
+            .collect();
+        order.extend_from_slice(active);
+        let lsn_of = |pool: ShardType| {
+            PackfileStorage::read_journal_lsn(&db.layout().pool_dir(pool).unwrap())
+        };
+        let mut idle_lsn: Vec<Option<u64>> = vec![None; ShardType::ALL.len()];
+        let mut active_checkpointed = vec![false; ShardType::ALL.len()];
         let mut next = 0u64;
         let mut largest_after_sync = 0u64;
         for round in 0..8 {
@@ -1539,30 +1581,124 @@ mod tests {
                 for _ in 0..20 {
                     let mut id = [0u8; 16];
                     id[..8].copy_from_slice(&next.to_le_bytes());
-                    next += 1;
-                    txn.put(
-                        ShardType::EventDag,
-                        collection,
-                        id,
-                        &NodeData::from_slice(&[0x5a; 256]),
-                    )
-                    .unwrap();
+                    next = next.saturating_add(1);
+                    for pool in active {
+                        txn.put(*pool, collection, id, &NodeData::from_slice(&[0x5a; 256]))
+                            .unwrap();
+                    }
                 }
                 txn.commit().unwrap();
             }
-            for pool in ShardType::ALL {
-                db.pool(pool).sync_all().unwrap();
+            for pool in &order {
+                db.pool(*pool).sync_all().unwrap();
+                let checkpointed = !db.pool(*pool).sync_timings().unwrap().checkpoint.is_zero();
+                let index = ShardType::ALL
+                    .iter()
+                    .position(|known| known == pool)
+                    .unwrap();
+                if active.contains(pool) {
+                    active_checkpointed[index] |= round > 0 && checkpointed;
+                } else if round == 0 {
+                    idle_lsn[index] = Some(lsn_of(*pool));
+                } else {
+                    assert!(!checkpointed, "round {round}: idle {pool:?} checkpointed");
+                    assert_eq!(
+                        Some(lsn_of(*pool)),
+                        idle_lsn[index],
+                        "round {round}: idle {pool:?} moved its journal.lsn"
+                    );
+                }
             }
             if round > 0 {
                 largest_after_sync = largest_after_sync.max(std::fs::metadata(&wal).unwrap().len());
             }
         }
+        for pool in active {
+            let index = ShardType::ALL
+                .iter()
+                .position(|known| known == pool)
+                .unwrap();
+            assert!(
+                active_checkpointed[index],
+                "{pool:?} never took the size-triggered checkpoint"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        largest_after_sync
+    }
+
+    /// The WAL must stay below the reclaim trigger after every sync.
+    #[cfg(feature = "multi-reader")]
+    fn assert_wal_bounded(name: &str, active: &[ShardType]) {
+        let largest = run_bounded_wal_rounds(name, active);
         assert!(
-            largest_after_sync < crate::journal::RECLAIM_TRIGGER_LEN,
-            "the WAL stayed at {largest_after_sync} bytes after syncs; it must be reclaimed \
-             once past {} bytes",
+            largest < crate::journal::RECLAIM_TRIGGER_LEN,
+            "{active:?}: the WAL stayed at {largest} bytes after a round's syncs; it must be \
+             reclaimed once past {} bytes",
             crate::journal::RECLAIM_TRIGGER_LEN
         );
+    }
+
+    /// `sync_all` after the first checkpoint only appends index deltas, which do
+    /// not record journal coverage, so the shared WAL was never reclaimed again
+    /// and grew until commits failed with "journal segment is full". A large
+    /// segment must force a full checkpoint so the WAL stays bounded, whichever
+    /// pool carries the frames: each pool must be compared with its own
+    /// committed LSN and its own `journal.lsn`.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn repeated_syncs_keep_the_shared_wal_bounded_with_only_state_active() {
+        assert_wal_bounded("wal_bounded_state", &[ShardType::State]);
+    }
+
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn repeated_syncs_keep_the_shared_wal_bounded_with_only_event_dag_active() {
+        assert_wal_bounded("wal_bounded_event", &[ShardType::EventDag]);
+    }
+
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn repeated_syncs_keep_the_shared_wal_bounded_with_only_edges_active() {
+        assert_wal_bounded("wal_bounded_edges", &[ShardType::Edges]);
+    }
+
+    /// With two contributing pools the segment is only reclaimable once both
+    /// have reported coverage, and the third stays idle throughout.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn repeated_syncs_keep_the_shared_wal_bounded_with_two_pools_active() {
+        assert_wal_bounded("wal_bounded_two", &[ShardType::State, ShardType::EventDag]);
+    }
+
+    /// A transaction that stages writes for one pool must not activate (and so
+    /// rescan the journal for) the overlay on the others.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
+        let root = test_root("overlay_touched_pools");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x7b; 16];
+        let txn = db.begin_transaction();
+        txn.put(ShardType::EventDag, collection, node(1), &data(b"staged"))
+            .unwrap();
+        assert_eq!(txn.stage.touched_pools(), [false, true, false]);
+        let overlay = activate_for(&db, &txn.stage);
+        assert!(db.pool(ShardType::EventDag).read_journal_installed());
+        assert!(!db.pool(ShardType::State).read_journal_installed());
+        assert!(!db.pool(ShardType::Edges).read_journal_installed());
+        drop(overlay);
+        assert!(!db.pool(ShardType::EventDag).read_journal_installed());
+        // A transaction that stages for two pools touches exactly those two.
+        let mixed = db.begin_transaction();
+        mixed
+            .put(ShardType::State, collection, node(2), &data(b"state"))
+            .unwrap();
+        mixed
+            .put(ShardType::Edges, collection, node(3), &data(b"edge"))
+            .unwrap();
+        assert_eq!(mixed.stage.touched_pools(), [true, false, true]);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1647,7 +1783,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut overlay = Some(database.activate_transaction_overlay().unwrap());
+        let mut overlay = Some(activate_for(&database, &transaction.stage));
         database.publish_transaction(&transaction.stage).unwrap();
         transaction.stage.begin_materialization().unwrap();
         let receipt = transaction.stage.published_receipt().unwrap();
@@ -1734,7 +1870,7 @@ mod tests {
         // Keep the database alive separately: the transaction borrows it and
         // its overlay must remain active while the published group is not yet
         // materialized into either live index.
-        let mut overlay = Some(database.activate_transaction_overlay().unwrap());
+        let mut overlay = Some(activate_for(&database, &transaction.stage));
         database.publish_transaction(&transaction.stage).unwrap();
         let receipt = transaction.stage.published_receipt().unwrap();
 

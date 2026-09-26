@@ -389,6 +389,14 @@ impl TxnStage {
         self.data.lock().receipt
     }
 
+    /// Which pools (in [`ShardType::ALL`] order) have at least one staged
+    /// mutation.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn touched_pools(&self) -> [bool; 3] {
+        let data = self.data.lock();
+        std::array::from_fn(|index| data.pools.get(index).is_some_and(|pool| !pool.is_empty()))
+    }
+
     /// Whether this stage has no mutations to publish or materialize.
     #[cfg(feature = "multi-reader")]
     pub(crate) fn is_empty(&self) -> bool {
@@ -982,6 +990,59 @@ struct SyncCapture {
     file_len: u64,
 }
 
+/// Bit in [`GroupMark::pools`] for a frame with no pool tag, which no pool's
+/// coverage can account for.
+const UNATTRIBUTED_POOL_BIT: u8 = 0x80;
+
+/// What the group directory says about reclaiming a shared segment.
+#[cfg(feature = "multi-reader")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedBoundary {
+    /// The directory does not match the file, so it cannot decide.
+    Untrusted,
+    /// Even the first group is still needed (or the segment is empty).
+    NothingCovered,
+    /// Every group through this LSN may be dropped.
+    Through(u64),
+}
+
+/// The bit standing for `pool` in [`GroupMark::pools`].
+fn pool_bit(pool: Option<ShardType>) -> u8 {
+    pool.and_then(|pool| ShardType::ALL.into_iter().position(|known| known == pool))
+        .map_or(UNATTRIBUTED_POOL_BIT, |index| 1_u8 << index)
+}
+
+/// What the in-memory directory remembers about one complete group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GroupMark {
+    sequence: u64,
+    first_lsn: u64,
+    last_lsn: u64,
+    /// Offset just after the group, so the bytes of every later group start
+    /// here.
+    end_offset: u64,
+    /// Which pools have a frame in the group, as [`pool_bit`] bits.
+    pools: u8,
+}
+
+/// The directory entries for the groups a scan returned.
+fn marks_from_scan(scan: &Scan) -> Vec<GroupMark> {
+    scan.groups
+        .iter()
+        .zip(&scan.group_ends)
+        .map(|(group, end_offset)| GroupMark {
+            sequence: group.sequence,
+            first_lsn: group.first_lsn,
+            last_lsn: group.last_lsn,
+            end_offset: *end_offset,
+            pools: group
+                .entries
+                .iter()
+                .fold(0, |mask, entry| mask | pool_bit(entry.pool)),
+        })
+        .collect()
+}
+
 /// Result of validating a journal file.
 #[derive(Debug)]
 pub struct Scan {
@@ -1002,6 +1063,8 @@ pub struct Scan {
     /// compares the disk against the bytes it actually built from instead of
     /// against a separate read that could race a rewrite.
     pub(crate) consumed_tail: Vec<u8>,
+    /// Absolute offset just after each group in `groups`, in the same order.
+    pub(crate) group_ends: Vec<u64>,
 }
 
 /// How many bytes ending at the last consumed group a read-only overlay
@@ -1029,6 +1092,7 @@ impl Scan {
             truncated_tail: false,
             base_lsn: 0,
             consumed_tail: Vec::new(),
+            group_ends: Vec::new(),
         }
     }
 }
@@ -1064,6 +1128,21 @@ pub struct Journal {
     next_sequence: u64,
     next_lsn: u64,
     poisoned: bool,
+    /// In-memory directory of the complete groups in the segment, in order.
+    ///
+    /// It is a cache of what a scan of the file would find, built when the
+    /// segment opens and extended on every append. Reclaim uses it to pick the
+    /// boundary and to read only the retained suffix. It is trusted only while
+    /// its last group ends exactly at `file_len`; otherwise reclaim falls back
+    /// to scanning the file.
+    ///
+    /// This relies on this handle being the only writer of the segment: the
+    /// root's writer lock keeps a second writer out, and readers never modify
+    /// it. A file rewritten behind the handle to the same length would not be
+    /// noticed by the length check. That is unsupported, but the retained suffix
+    /// is still decoded and checked before it is copied, so a damaged group
+    /// there is reported instead of being carried into the new segment.
+    groups: Vec<GroupMark>,
 }
 
 /// An fsync at least this slow is reported on stderr when it happens.
@@ -1476,6 +1555,25 @@ impl JournalCoordinator {
     /// Propagates a scan or segment-rewrite failure from [`Self::reclaim_through`].
     #[cfg(feature = "multi-reader")]
     pub fn reclaim_shared(&self) -> io::Result<Option<Reclaim>> {
+        // The group directory answers this without reading the segment. The
+        // lock order matches `reclaim_through`: the sync lock, then the journal,
+        // and coverage last.
+        {
+            let _sync = self.sync_lock.lock();
+            let mut journal = self.journal.lock();
+            let boundary = {
+                let coverage = self.coverage.lock();
+                journal.shared_reclaim_boundary(&coverage.covered)
+            };
+            match boundary {
+                SharedBoundary::Through(covered_lsn) => {
+                    return journal.reclaim_through(covered_lsn).map(Some);
+                }
+                SharedBoundary::NothingCovered => return Ok(None),
+                SharedBoundary::Untrusted => {}
+            }
+        }
+        // The directory did not match the file: decide from a scan of it.
         let scan = Journal::scan_read_only(&self.path)?;
         let boundary = {
             let coverage = self.coverage.lock();
@@ -2467,6 +2565,7 @@ impl Journal {
                 truncated_tail: false,
                 base_lsn,
                 consumed_tail: Vec::new(),
+                group_ends: Vec::new(),
             });
         }
         file.seek(SeekFrom::Start(start))?;
@@ -2670,6 +2769,7 @@ impl Journal {
             next_sequence,
             next_lsn,
             poisoned: false,
+            groups: marks_from_scan(&scan),
         };
         if !scan.groups.is_empty() {
             // Recovery fsynced what it kept above, so record that in the mark.
@@ -2858,6 +2958,7 @@ impl Journal {
             return Err(error);
         }
         self.file_len = self.file_len.saturating_add(group_size);
+        self.note_appended_group(sequence, first_lsn, last_lsn, mutations);
 
         self.next_sequence = next_sequence;
         self.next_lsn = next_lsn;
@@ -2989,6 +3090,143 @@ impl Journal {
                 "cannot reclaim an LSN that has not been committed",
             ));
         }
+        if self.directory_matches_file() {
+            self.reclaim_through_directory(covered_lsn)
+        } else {
+            self.reclaim_through_scan(covered_lsn)
+        }
+    }
+
+    /// Record a group just appended, ending at `file_len`, in the directory.
+    fn note_appended_group(
+        &mut self,
+        sequence: u64,
+        first_lsn: u64,
+        last_lsn: u64,
+        mutations: &[(Option<ShardType>, Mutation)],
+    ) {
+        self.groups.push(GroupMark {
+            sequence,
+            first_lsn,
+            last_lsn,
+            end_offset: self.file_len,
+            pools: mutations
+                .iter()
+                .fold(0, |mask, (pool, _)| mask | pool_bit(*pool)),
+        });
+    }
+
+    /// Whether the in-memory group directory describes the file exactly: its
+    /// last group ends where the file ends.
+    fn directory_matches_file(&self) -> bool {
+        let directory_end = self
+            .groups
+            .last()
+            .map_or(FILE_HEADER_LEN as u64, |group| group.end_offset);
+        directory_end == self.file_len
+    }
+
+    /// The newest LSN through which a shared segment may be reclaimed, given
+    /// each pool's reported coverage: the last group of the longest prefix in
+    /// which every pool with a frame has covered the group. The directory being
+    /// stale is reported apart from nothing being covered, so the caller can
+    /// scan the file in that case.
+    #[cfg(feature = "multi-reader")]
+    fn shared_reclaim_boundary(&self, covered: &HashMap<ShardType, u64>) -> SharedBoundary {
+        if !self.directory_matches_file() {
+            return SharedBoundary::Untrusted;
+        }
+        let mut boundary = None;
+        'groups: for group in &self.groups {
+            for (index, pool) in ShardType::ALL.into_iter().enumerate() {
+                if group.pools & (1_u8 << index) != 0
+                    && !covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn)
+                {
+                    break 'groups;
+                }
+            }
+            // A frame with no pool tag cannot be attributed to any pool's
+            // coverage, so it is never dropped.
+            if group.pools & UNATTRIBUTED_POOL_BIT != 0 {
+                break 'groups;
+            }
+            boundary = Some(group.last_lsn);
+        }
+        boundary.map_or(SharedBoundary::NothingCovered, SharedBoundary::Through)
+    }
+
+    /// Reclaim using the group directory: pick the cut from it and read only
+    /// the retained suffix from disk. The dropped prefix is never read.
+    fn reclaim_through_directory(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
+        let cut = self
+            .groups
+            .partition_point(|group| group.last_lsn <= covered_lsn);
+        let Some(last_dropped) = cut.checked_sub(1).and_then(|index| self.groups.get(index)) else {
+            return Ok(Reclaim {
+                retained_groups: u64::try_from(self.groups.len()).unwrap_or(u64::MAX),
+                reclaimed_bytes: 0,
+            });
+        };
+        let header_len = FILE_HEADER_LEN as u64;
+        let cut_offset = last_dropped.end_offset;
+        let retained = self.groups.get(cut..).unwrap_or_default();
+        let (new_base_sequence, new_base_lsn) = retained
+            .first()
+            .map_or((self.next_sequence, self.next_lsn), |group| {
+                (group.sequence, group.first_lsn)
+            });
+        let mut rebuilt = file_header_bytes(self.version, new_base_sequence, new_base_lsn);
+        if let Some(first) = retained.first() {
+            let suffix = read_range(
+                &self.path,
+                cut_offset,
+                self.file_len.saturating_sub(cut_offset),
+            )?;
+            // The suffix is copied byte for byte, so check it the way the full
+            // scan would have: it must hold exactly the groups the directory
+            // says, each valid. Anything else means the directory is stale, and
+            // the scan path decides instead.
+            let checked = scan_groups_from(
+                &suffix,
+                cut_offset,
+                first.sequence,
+                first.first_lsn,
+                new_base_lsn,
+                self.version,
+                || u64::MAX,
+            )?;
+            if checked.groups.len() != retained.len()
+                || checked.valid_len != self.file_len
+                || checked.truncated_tail
+            {
+                return self.reclaim_through_scan(covered_lsn);
+            }
+            rebuilt.extend_from_slice(&suffix);
+        }
+        let reclaimed_bytes = self
+            .file_len
+            .saturating_sub(u64::try_from(rebuilt.len()).unwrap_or(u64::MAX));
+        let retained_groups = u64::try_from(retained.len()).unwrap_or(u64::MAX);
+        let shift = cut_offset.saturating_sub(header_len);
+        let survivors = retained
+            .iter()
+            .map(|group| GroupMark {
+                end_offset: group.end_offset.saturating_sub(shift),
+                ..*group
+            })
+            .collect::<Vec<_>>();
+        self.install_rebuilt(rebuilt, new_base_sequence, new_base_lsn)?;
+        self.groups = survivors;
+        Ok(Reclaim {
+            retained_groups,
+            reclaimed_bytes,
+        })
+    }
+
+    /// Reclaim by reading and decoding the whole segment. Used when the group
+    /// directory cannot be trusted, and it rebuilds the directory from what it
+    /// finds.
+    fn reclaim_through_scan(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
         let bytes = fs::read(&self.path)?;
         let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
         // Reclaim rewrites the segment from its own live file, so any invalid
@@ -3001,6 +3239,7 @@ impl Journal {
             .filter(|group| group.last_lsn > covered_lsn)
             .collect::<Vec<_>>();
         if retained.len() == scan.groups.len() {
+            self.groups = marks_from_scan(&scan);
             return Ok(Reclaim {
                 retained_groups: u64::try_from(retained.len()).unwrap_or(u64::MAX),
                 reclaimed_bytes: 0,
@@ -3013,9 +3252,39 @@ impl Journal {
                 (group.sequence, group.first_lsn)
             });
         let mut rebuilt = file_header_bytes(self.version, new_base_sequence, new_base_lsn);
+        let mut survivors = Vec::with_capacity(retained.len());
         for group in &retained {
             encode_group(group, self.version, &mut rebuilt)?;
+            survivors.push(GroupMark {
+                sequence: group.sequence,
+                first_lsn: group.first_lsn,
+                last_lsn: group.last_lsn,
+                end_offset: u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
+                pools: group
+                    .entries
+                    .iter()
+                    .fold(0, |mask, entry| mask | pool_bit(entry.pool)),
+            });
         }
+        let retained_groups = u64::try_from(retained.len()).unwrap_or(u64::MAX);
+        let reclaimed_bytes =
+            u64::try_from(bytes.len().saturating_sub(rebuilt.len())).unwrap_or(u64::MAX);
+        self.install_rebuilt(rebuilt, new_base_sequence, new_base_lsn)?;
+        self.groups = survivors;
+        Ok(Reclaim {
+            retained_groups,
+            reclaimed_bytes,
+        })
+    }
+
+    /// Durably replace the segment with `rebuilt` (a new header plus the
+    /// retained groups) and point this handle at it.
+    fn install_rebuilt(
+        &mut self,
+        mut rebuilt: Vec<u8>,
+        new_base_sequence: u64,
+        new_base_lsn: u64,
+    ) -> io::Result<()> {
         // The rebuilt file is fsynced before it replaces the segment, so all of
         // it is durable. Put its mark inside it, first generation, so the mark
         // is durable with the data and the old segment's marks, which described
@@ -3070,12 +3339,17 @@ impl Journal {
             self.poisoned = true;
             return Err(error);
         }
-        Ok(Reclaim {
-            retained_groups: u64::try_from(retained.len()).unwrap_or(u64::MAX),
-            reclaimed_bytes: u64::try_from(bytes.len().saturating_sub(rebuilt.len()))
-                .unwrap_or(u64::MAX),
-        })
+        Ok(())
     }
+}
+
+/// Read `len` bytes of the file at `path` starting at `start`.
+fn read_range(path: &Path, start: u64, len: u64) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buffer = vec![0_u8; usize::try_from(len).map_err(|_| invalid_data("range too large"))?];
+    file.read_exact(&mut buffer)?;
+    Ok(buffer)
 }
 
 fn file_header_bytes(version: JournalVersion, base_sequence: u64, base_lsn: u64) -> Vec<u8> {
@@ -3524,6 +3798,7 @@ fn scan_groups_from(
     let mut cursor = 0usize;
     let mut valid_len = base_offset;
     let mut groups = Vec::new();
+    let mut group_ends = Vec::new();
     let mut truncated_tail = false;
 
     while cursor < bytes.len() {
@@ -3566,6 +3841,7 @@ fn scan_groups_from(
         });
         cursor = cursor.saturating_add(total_len);
         valid_len = base_offset.saturating_add(u64::try_from(cursor).unwrap_or(u64::MAX));
+        group_ends.push(valid_len);
         expected_sequence = group
             .sequence
             .checked_add(1)
@@ -3583,6 +3859,7 @@ fn scan_groups_from(
         truncated_tail,
         base_lsn: segment_base_lsn,
         consumed_tail,
+        group_ends,
     })
 }
 
@@ -6283,5 +6560,171 @@ mod tests {
         // Same epoch again: exactly one wake per epoch.
         assert!(!coordinator.claim_threshold_wake());
         fs::remove_file(coordinator.path()).unwrap();
+    }
+    /// A shared segment with tagged groups spread across the three pools.
+    #[cfg(feature = "multi-reader")]
+    fn shared_journal_with_groups(label: &str, groups: u8) -> (Journal, std::path::PathBuf) {
+        use crate::layout::ShardType;
+        let path = temp_path(label);
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open_shared(&path).unwrap();
+        for i in 0..groups {
+            let first = ShardType::ALL[usize::from(i) % 3];
+            let second = ShardType::ALL[(usize::from(i) + 1) % 3];
+            journal
+                .append_group_tagged_with_sequence(
+                    &[
+                        (Some(first), put(1, i, b"first-frame")),
+                        (Some(second), put(2, i, b"second-frame")),
+                    ],
+                    None,
+                )
+                .unwrap();
+        }
+        journal.make_durable().unwrap();
+        (journal, path)
+    }
+
+    #[cfg(feature = "multi-reader")]
+    fn directory_of_file(path: &std::path::Path) -> Vec<super::GroupMark> {
+        super::marks_from_scan(&Journal::scan_read_only(path).unwrap())
+    }
+
+    /// The directory built on append, and the one built when reopening, must
+    /// both equal what a scan of the file finds.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn group_directory_matches_a_scan_of_the_file() {
+        let (journal, path) = shared_journal_with_groups("dir_matches_scan", 9);
+        assert!(journal.directory_matches_file());
+        assert_eq!(journal.groups, directory_of_file(&path));
+        drop(journal);
+        let (reopened, _) = Journal::open_shared(&path).unwrap();
+        assert!(reopened.directory_matches_file());
+        assert_eq!(reopened.groups, directory_of_file(&path));
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// Reclaiming through the directory must leave exactly the bytes the
+    /// full-scan reclaim leaves, report the same result, and keep appends and a
+    /// later reclaim working.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn directory_reclaim_writes_the_same_file_as_the_scan_reclaim() {
+        // Groups carry two LSNs each, so LSN 7 ends the fourth group.
+        for covered in [0_u64, 1, 6, 7, 8, 17, 18] {
+            let (mut by_directory, dir_path) =
+                shared_journal_with_groups(&format!("reclaim_dir_{covered}"), 9);
+            let (mut by_scan, scan_path) =
+                shared_journal_with_groups(&format!("reclaim_scan_{covered}"), 9);
+            let expected = by_scan.reclaim_through_scan(covered).unwrap();
+            let actual = by_directory.reclaim_through(covered).unwrap();
+            assert_eq!(actual, expected, "covered {covered}");
+            assert_eq!(
+                fs::read(&dir_path).unwrap(),
+                fs::read(&scan_path).unwrap(),
+                "covered {covered}: reclaimed file"
+            );
+            assert_eq!(by_directory.groups, by_scan.groups, "covered {covered}");
+            assert!(by_directory.directory_matches_file());
+            assert_eq!(by_directory.groups, directory_of_file(&dir_path));
+
+            // The handle keeps working: append to both, then reclaim again.
+            for journal in [&mut by_directory, &mut by_scan] {
+                journal
+                    .append_group_tagged_with_sequence(
+                        &[(Some(crate::layout::ShardType::State), put(3, 9, b"after"))],
+                        None,
+                    )
+                    .unwrap();
+                journal.make_durable().unwrap();
+            }
+            assert_eq!(
+                fs::read(&dir_path).unwrap(),
+                fs::read(&scan_path).unwrap(),
+                "covered {covered}: after append"
+            );
+            let next_covered = by_directory.next_lsn.saturating_sub(2);
+            let again_expected = by_scan.reclaim_through_scan(next_covered).unwrap();
+            let again_actual = by_directory.reclaim_through(next_covered).unwrap();
+            assert_eq!(again_actual, again_expected, "covered {covered}: second");
+            assert_eq!(
+                fs::read(&dir_path).unwrap(),
+                fs::read(&scan_path).unwrap(),
+                "covered {covered}: second reclaim"
+            );
+            drop((by_directory, by_scan));
+            // A reopen after the reclaim recovers the same groups.
+            let (reopened, _) = Journal::open_shared(&dir_path).unwrap();
+            assert_eq!(reopened.groups, directory_of_file(&dir_path));
+            fs::remove_file(&dir_path).unwrap();
+            fs::remove_file(&scan_path).unwrap();
+        }
+    }
+
+    /// A directory that disagrees with the file must not be trusted: reclaim
+    /// falls back to the scan, gets the right answer, and repairs the directory.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_stale_directory_falls_back_to_the_scan() {
+        let (mut journal, path) = shared_journal_with_groups("dir_stale", 6);
+        journal.groups.pop();
+        assert!(!journal.directory_matches_file());
+        let reclaimed = journal.reclaim_through(5).unwrap();
+        assert_eq!(reclaimed.retained_groups, 4);
+        assert!(journal.directory_matches_file());
+        assert_eq!(journal.groups, directory_of_file(&path));
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// The boundary the directory yields must equal the one a scan of the file
+    /// yields, for every coverage combination.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn directory_boundary_equals_the_scan_boundary() {
+        use crate::layout::ShardType;
+        use std::collections::HashMap;
+        let (journal, path) = shared_journal_with_groups("dir_boundary", 12);
+        let scan = Journal::scan_read_only(&path).unwrap();
+        let by_scan = |covered: &HashMap<ShardType, u64>| {
+            let mut boundary = None;
+            'groups: for group in &scan.groups {
+                for entry in &group.entries {
+                    match entry.pool {
+                        Some(pool)
+                            if covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn) => {}
+                        _ => break 'groups,
+                    }
+                }
+                boundary = Some(group.last_lsn);
+            }
+            boundary
+        };
+        let levels = [None, Some(0_u64), Some(6), Some(13), Some(24)];
+        for state in levels {
+            for event_dag in levels {
+                for edges in levels {
+                    let mut covered = HashMap::new();
+                    for (pool, level) in [
+                        (ShardType::State, state),
+                        (ShardType::EventDag, event_dag),
+                        (ShardType::Edges, edges),
+                    ] {
+                        if let Some(lsn) = level {
+                            covered.insert(pool, lsn);
+                        }
+                    }
+                    assert_eq!(
+                        journal.shared_reclaim_boundary(&covered),
+                        by_scan(&covered).map_or(
+                            super::SharedBoundary::NothingCovered,
+                            super::SharedBoundary::Through
+                        ),
+                        "coverage {covered:?}"
+                    );
+                }
+            }
+        }
+        fs::remove_file(&path).unwrap();
     }
 }

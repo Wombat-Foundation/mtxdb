@@ -8550,6 +8550,25 @@ impl PackfileStorage {
         state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty()
     }
 
+    /// Whether this sync must take a full checkpoint so the journal can be
+    /// reclaimed: the segment is large, and this pool has journal frames its
+    /// last checkpoint does not yet cover. A pool with nothing new to cover
+    /// gains nothing from a rewrite and never holds the segment back, since its
+    /// earlier coverage is already reported.
+    fn journal_needs_reclaim_checkpoint(&self) -> bool {
+        let Some(journal) = self.journal() else {
+            return false;
+        };
+        if journal.segment_len() <= crate::journal::RECLAIM_TRIGGER_LEN {
+            return false;
+        }
+        #[cfg(feature = "multi-reader")]
+        if let Some(pool) = pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+            return journal.committed_lsn_for_pool(pool) > Self::read_journal_lsn(&self.base_dir);
+        }
+        true
+    }
+
     /// Persist the dirty index state for a sync barrier — a delta append when
     /// the log can be continued, otherwise a full checkpoint rewrite — and
     /// record which path ran in `timings`. No-op when nothing is dirty.
@@ -8570,12 +8589,11 @@ impl PackfileStorage {
         let _persist_guard = self.index_persist_lock.lock();
         // A delta append does not advance the journal coverage, so on its own it
         // never lets the segment shrink and the journal would fill to its hard
-        // limit. Once the segment is large, take the full checkpoint (which
-        // records coverage and reclaims), even if this pool's index is clean:
-        // a shared segment is only reclaimed once every pool has reported.
-        let journal_needs_reclaim = self
-            .journal()
-            .is_some_and(|journal| journal.segment_len() > crate::journal::RECLAIM_TRIGGER_LEN);
+        // limit. Once the segment is large, a pool with journal frames its
+        // checkpoint does not yet cover takes the full checkpoint (which records
+        // coverage and reclaims), even if its index is clean; a shared segment is
+        // only reclaimed once every such pool has reported.
+        let journal_needs_reclaim = self.journal_needs_reclaim_checkpoint();
         if journal_needs_reclaim {
             self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
@@ -10462,6 +10480,7 @@ mod tests {
             truncated_tail: false,
             base_lsn: 3,
             consumed_tail: Vec::new(),
+            group_ends: Vec::new(),
         };
         let per_pool = |covered: u64| ReadJournal::empty(std::path::PathBuf::new(), covered, None);
         let shared = |covered: u64| {
