@@ -33,16 +33,52 @@ done
 # features the target cannot execute, and mold is not a valid linker for every
 # target (e.g. Mach-O).
 #
+# A global `RUSTFLAGS="-C target-cpu=native"` (e.g. from a direnv `.env`) is
+# applied by cargo to *every* target, including cross targets, and cannot be
+# removed by config -- cargo appends RUSTFLAGS to the rustc command line, so
+# for cross builds the offending flags are stripped from "$@" here.
+#
+# If `rustc -vV` fails, HOST_TRIPLE is empty and IS_HOST stays 0: every build
+# then takes the cross-filtering path, so mold/target-cpu=native are silently
+# omitted. That is the intended fail-safe -- never emit host flags blindly.
+IS_HOST=0
+if [[ -n "$HOST_TRIPLE" && "$TARGET_TRIPLE" == "$HOST_TRIPLE" ]]; then
+	IS_HOST=1
+fi
+
 # These flags must come *after* the passthrough args ("$@"), not before: when
 # invoked through clippy-driver, $RUSTC is clippy-driver itself and the real
 # rustc path is the first element of "$@" -- it must immediately follow, or
 # clippy-driver misparses it as an input filename.
-TARGET_FLAGS=()
-if [[ -n "$HOST_TRIPLE" && "$TARGET_TRIPLE" == "$HOST_TRIPLE" ]]; then
+if ((IS_HOST)); then
+	TARGET_FLAGS=()
 	if command -v mold >/dev/null 2>&1; then
 		TARGET_FLAGS+=("-C" "link-arg=-fuse-ld=mold")
 	fi
 	TARGET_FLAGS+=("-C" "target-cpu=native")
+	exec "${CMD[@]}" "$@" "${TARGET_FLAGS[@]}"
 fi
 
-exec "${CMD[@]}" "$@" "${TARGET_FLAGS[@]}"
+# Cross target: drop host-only codegen flags that leaked in via RUSTFLAGS,
+# in both the split ("-C target-cpu=native") and joined ("-Ctarget-cpu=native")
+# forms.
+FILTERED=()
+while (($#)); do
+	case "$1" in
+		-C)
+			case "${2-}" in
+				target-cpu=native | link-arg=-fuse-ld=mold)
+					shift 2
+					continue
+					;;
+			esac
+			;;
+		-Ctarget-cpu=native | -Clink-arg=-fuse-ld=mold)
+			shift
+			continue
+			;;
+	esac
+	FILTERED+=("$1")
+	shift
+done
+exec "${CMD[@]}" "${FILTERED[@]}"

@@ -1,8 +1,11 @@
 [package]
 name = "mtxdb-cli"
-version.workspace = true
+version = "0.1.0-beta.1"
 edition = "2021"
-rust-version = "1.81"
+# Unlike the library (1.81), the CLI's deps are higher: clap 4.6 needs 1.85
+# (edition 2024) and simd-json 0.18 declares `rust-version = "1.88"`, so the
+# CLI floor is 1.88.
+rust-version = "1.88"
 publish = false
 
 repository = "https://github.com/Wombat-Foundation/mtxdb"
@@ -13,26 +16,96 @@ keywords = ["database", "matrix", "cli"]
 categories = ["database", "cli"]
 readme = "../README.md"
 
+# Standalone workspace root, like benches/: the parent `[workspace]`
+# must not include this crate, or its edition-2024 deps would raise the
+# whole repo's Cargo floor to 1.85 (see the root Cargo.toml comment).
+[workspace]
+resolver = "2"
+
+# Custom build profiles. Cargo resolves `--profile` against the workspace root
+# manifest, and this crate *is* its own root, so the parent manifest's
+# `[profile.*]` tables never reach it. Mirror the repo root's custom profiles
+# here or `cargo install --profile dev-quick --path mtxdb-cli` (i.e.
+# `make install MTXDB_INSTALL_PROFILE=dev-quick`) fails with
+# "profile `dev-quick` is not defined". Keep these in sync with the root
+# Cargo.toml.
+[profile.dev-quick]
+inherits = "dev"
+codegen-units = 256
+debug = "line-tables-only"
+incremental = true
+lto = "off"
+opt-level = 0
+strip = "symbols"
+
+[profile.release-quick]
+inherits = "release"
+debug = "full"
+debug-assertions = false
+incremental = true
+lto = "off"
+opt-level = 1
+strip = "none"
+
+[profile.release-max-perf]
+inherits = "release"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
 [[bin]]
 name = "mtxdb"
 path = "src/main.rs"
 
+[features]
+default = ["completions"]
+# Shell-completion script generation. On by default; disable with
+# `default-features = false` to drop `clap_complete` from a lean CLI build.
+completions = ["dep:clap_complete"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.23.1"
-blake2 = { version = "0.10", default-features = false }
-blake3 = "1"
 bytes = "1.5"
 clap = { version = "=4.6.6", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
-clap_complete = "=4.6.9"
+clap_complete = { version = "=4.6.9", optional = true }
 hex = "0.4"
 mtxdb = { path = ".." }
-sha2 = "0.10"
+rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
 simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
-[dev-dependencies]
-# rezzy = { path = "../../rezzy" }
-rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "dev" }
+# LINTS — mirrors the root workspace's [workspace.lints]; this crate no
+# longer shares that table since it's its own workspace root (same as
+# benches/Cargo.toml).
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(coverage)",
+    "cfg(coverage_nightly)",
+    "cfg(tarpaulin)",
+] }
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+get_unwrap = "warn"
+mutex_atomic = "warn"
+missing_assert_message = "warn"
+str_to_string = "warn"
+tests_outside_test_module = "warn"
+verbose_file_reads = "warn"

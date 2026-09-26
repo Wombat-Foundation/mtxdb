@@ -179,7 +179,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_layout_{}_{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let collection_a = [0xA1; 16];
@@ -198,6 +201,7 @@ mod tests {
                         collection_id,
                         hash: [u8::try_from(index).expect("fixture index fits in u8"); 16],
                         data: Bytes::from_static(b"payload"),
+                        metadata: None,
                     },
                 )
                 .unwrap();
@@ -239,7 +243,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_layout_foreign_{}_{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("other-app.pack"), b"not an mdb pack").unwrap();

@@ -44,7 +44,7 @@ impl Rng {
 }
 
 /// Well-mixed 64-bit permutation (splitmix64). Real content-address hashes
-/// (BLAKE2b/SHA-256) are uniformly distributed, so the synthetic node IDs
+/// (SHA-256) are uniformly distributed, so the synthetic node IDs
 /// must be too — otherwise the lossy index's `hash[..8]` bucket selection
 /// collapses every entry into one linear-probe cluster.
 fn splitmix64(mut x: u64) -> u64 {
@@ -143,9 +143,16 @@ impl DagGenerator {
         // orphan chains are reachable without putting an oversized prev list
         // on the last ordinary event.
         if remaining.is_empty() {
-            debug_assert_eq!(prev_events.len(), total_events);
+            debug_assert_eq!(
+                prev_events.len(),
+                total_events,
+                "no orphans remained, so no synthetic absorb nodes should have been added"
+            );
         } else {
-            debug_assert!(prev_events.len() > total_events);
+            debug_assert!(
+                prev_events.len() > total_events,
+                "orphans remained, so at least one synthetic absorb node must have been added"
+            );
         }
 
         Self {

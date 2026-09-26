@@ -23,7 +23,7 @@ pub const PACK_TABLE_ENTRY_LEN: usize = 12;
 /// slots during linear probing — not the hash's home bucket. `replay_frames`
 /// writes directly to it, so a producer logging a frame at the home bucket
 /// instead would place the delta at the wrong slot. `slot` is the packed
-/// [`crate::index::IndexSlot`] representation stored there. `generation`
+/// [`crate::index::IndexEntry`] representation stored there. `generation`
 /// prevents a delta for a pre-resize table being applied to a resized or
 /// repacked collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub struct DeltaFrame {
     pub bucket: u32,
     /// The collection-index generation this frame applies to.
     pub generation: u64,
-    /// The packed `IndexSlot` value to store.
+    /// The packed `IndexEntry` value to store.
     pub slot: u64,
 }
 
@@ -148,7 +148,7 @@ impl CheckpointHeader {
 /// local `ShardPool` slot for a live pack at checkpoint-write time, and that
 /// pack's stable, monotonically-allocated identity (`ShardPool::next_pack_id`
 /// is persisted and never decremented or reused within a pool — see
-/// `shard.rs`). A reader translates every checkpoint-encoded `shard_id`
+/// `shard.rs`). A reader translates every checkpoint-encoded `slot`
 /// through this table into its own local slot for the same `pack_id`,
 /// rather than trusting the writer's raw slot number directly — slot
 /// numbers are a process-local, ephemeral handle, not identity, and drift
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(DeltaFrame::decode(&delta.encode()), Some(delta));
 
         let header = CheckpointHeader {
-            magic: *b"MTXIDX01",
+            magic: *b"MTXI0001",
             version: 4,
             collection_count: 2,
             directory_bytes: 112,

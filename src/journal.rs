@@ -5,29 +5,115 @@
 //! which captures each sync caller's
 //! target LSN and releases it only after a durable group covers that target.
 
+use std::collections::HashMap;
+#[cfg(feature = "multi-reader")]
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::layout::ShardType;
 
 use crc32fast::Hasher;
 
 const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
-/// Bumped to 2 when the header gained the base sequence/LSN a rotated segment
-/// needs to keep numbering global across a rewrite.
-const FILE_VERSION: u32 = 2;
-// magic(8) + version(4) + base_sequence(8) + base_lsn(8) + header CRC(4).
-const FILE_HEADER_LEN: usize = 32;
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
-const GROUP_HEADER_LEN: usize = 48;
 const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
-const GROUP_TRAILER_LEN: usize = 16;
-const FRAME_FIXED_LEN: usize = 48;
+
+/// On-disk journal format version. The single place that decides frame
+/// dialect: callers match on this rather than comparing raw version numbers,
+/// so a future bump only has to add a variant here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalVersion {
+    /// Per-pool segment. Mutation frames are untagged and the flag byte must be
+    /// zero. Bumped to 2 when the header gained the base sequence/LSN a rotated
+    /// segment needs to keep numbering global across a rewrite.
+    V2,
+    /// Shared multi-pool segment. Every mutation frame carries a mandatory pool
+    /// tag in the flag byte, so one physical WAL can carry the state,
+    /// event-DAG, and edges pools and recovery can route each frame back
+    /// to its pool.
+    V3PoolTagged,
+}
+
+impl JournalVersion {
+    /// Version a freshly created per-pool segment uses.
+    const fn per_pool() -> Self {
+        Self::V2
+    }
+
+    /// Version a freshly created shared (multi-pool) segment uses.
+    #[cfg(feature = "multi-reader")]
+    const fn shared() -> Self {
+        Self::V3PoolTagged
+    }
+
+    const fn as_u32(self) -> u32 {
+        match self {
+            Self::V2 => 2,
+            Self::V3PoolTagged => 3,
+        }
+    }
+
+    fn from_u32(value: u32) -> io::Result<Self> {
+        match value {
+            2 => Ok(Self::V2),
+            3 => Ok(Self::V3PoolTagged),
+            _ => Err(invalid_data("unsupported journal version")),
+        }
+    }
+
+    /// Whether every mutation frame in this segment must carry a pool tag.
+    const fn is_pool_tagged(self) -> bool {
+        matches!(self, Self::V3PoolTagged)
+    }
+}
+
+// File header field byte ranges. `FILE_HEADER_LEN` is the sum of the fields.
+const FH_MAGIC: std::ops::Range<usize> = 0..8;
+const FH_VERSION: std::ops::Range<usize> = 8..12;
+const FH_BASE_SEQUENCE: std::ops::Range<usize> = 12..20;
+const FH_BASE_LSN: std::ops::Range<usize> = 20..28;
+const FH_CRC: std::ops::Range<usize> = 28..32;
+/// Header bytes covered by the trailing CRC (everything before it).
+const FH_CRC_COVERED: std::ops::Range<usize> = 0..FH_CRC.start;
+const FILE_HEADER_LEN: usize = FH_CRC.end;
+
+// Group header field byte ranges (`GROUP_HEADER_LEN` is the sum of the fields).
+const GH_MAGIC: std::ops::Range<usize> = 0..4;
+const GH_HEADER_LEN: std::ops::Range<usize> = 4..8;
+const GH_SEQUENCE: std::ops::Range<usize> = 8..16;
+const GH_FIRST_LSN: std::ops::Range<usize> = 16..24;
+const GH_LAST_LSN: std::ops::Range<usize> = 24..32;
+const GH_PAYLOAD_LEN: std::ops::Range<usize> = 32..40;
+const GH_RECORD_COUNT: std::ops::Range<usize> = 40..44;
+const GH_CRC: std::ops::Range<usize> = 44..48;
+/// Group-header bytes covered by `GH_CRC` (everything before it).
+const GH_CRC_COVERED: std::ops::Range<usize> = 0..GH_CRC.start;
+const GROUP_HEADER_LEN: usize = GH_CRC.end;
+
+// Group commit-trailer field byte ranges.
+const GT_MAGIC: std::ops::Range<usize> = 0..4;
+const GT_SEQUENCE: std::ops::Range<usize> = 4..12;
+const GT_CRC: std::ops::Range<usize> = 12..16;
+const GROUP_TRAILER_LEN: usize = GT_CRC.end;
+
+// Mutation frame field byte ranges. A frame is `FRAME_FIXED_LEN` fixed bytes,
+// then the payload, then `FRAME_TRAILER_LEN` CRC bytes.
+const MF_KIND: std::ops::Range<usize> = 0..1;
+/// Pool tag (version 3) or reserved zero (version 2).
+const MF_POOL: std::ops::Range<usize> = 1..2;
+const MF_FLAGS: std::ops::Range<usize> = 2..4;
+const MF_LSN: std::ops::Range<usize> = 4..12;
+const MF_COLLECTION: std::ops::Range<usize> = 12..28;
+const MF_NODE: std::ops::Range<usize> = 28..44;
+const MF_PAYLOAD_LEN: std::ops::Range<usize> = 44..48;
+const FRAME_FIXED_LEN: usize = MF_PAYLOAD_LEN.end;
 const FRAME_TRAILER_LEN: usize = 4;
 /// Smallest possible encoded mutation frame: fixed fields plus its CRC.
 const MIN_FRAME_LEN: usize = FRAME_FIXED_LEN + FRAME_TRAILER_LEN;
@@ -61,10 +147,17 @@ pub enum Mutation {
 pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 
 /// Lifecycle of a transaction's staged journal mutations.
+#[cfg(feature = "multi-reader")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnStageState {
     /// The SQL transaction attempt is active and may add mutations.
     Active,
+    /// The published journal group is being materialized into pack/index
+    /// storage. Per-mutation progress makes retries resumable.
+    Materializing,
+    /// The journal group is published; pack/index application is still
+    /// pending or retrying.
+    JournalPublished,
     /// The SQL attempt failed; retained callbacks must not publish its data.
     Discarded,
     /// Every per-pool group was appended successfully.
@@ -72,44 +165,66 @@ pub enum TxnStageState {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "multi-reader")]
 struct TxnStageData {
     pools: [Vec<Mutation>; 3],
+    applied: [Vec<bool>; 3],
     bytes: usize,
     /// Successful pool appends. Retrying a callback after a partial error
     /// resumes at the failed pool instead of duplicating earlier groups.
     appended: [bool; 3],
+    /// Receipt identifying the published journal group owned by this stage.
+    receipt: Option<CommitReceipt>,
 }
 
-/// Transaction-local **journal** publication buffer -- not a storage
-/// transaction.
+/// What a transaction's staged mutations say about one record.
+#[cfg(feature = "multi-reader")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StagedLookup {
+    /// The newest staged mutation for the record is a put of this payload.
+    Put(Vec<u8>),
+    /// A staged collection delete hides the record, and nothing newer puts it
+    /// back.
+    Deleted,
+    /// Nothing staged names the record; the live store decides.
+    Absent,
+}
+
+/// Transaction-local mutation buffer used by
+/// [`crate::database::DatabaseTransaction`].
 ///
 /// Journal entries for a SQL transaction are buffered here and published from
 /// its post-commit callback. Call [`Self::discard`] from the transaction's
 /// error callback; that is required because Synapse retains after-callbacks
 /// across retry attempts.
 ///
-/// # Not a rollback
+/// # Storage boundary
 ///
-/// [`Self::discard`] drops only the buffered journal mutations. It does not
-/// touch packs or the live index, because this buffer never writes them; the
-/// deferred-publication redesign (prepare/commit) will route the pack/index
-/// mutation through this buffer's commit path. Until that lands, no
-/// production caller stages through here.
+/// [`Self::discard`] drops only buffered mutations. The database transaction
+/// applies them to packs and indexes only after its caller declares commit,
+/// then publishes the resulting shared-WAL group.
+#[cfg(feature = "multi-reader")]
 pub struct TxnStage {
     state: std::sync::atomic::AtomicU8,
     data: Mutex<TxnStageData>,
+    #[cfg(test)]
+    lookup_many_calls: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(feature = "multi-reader")]
 impl Default for TxnStage {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "multi-reader")]
 impl TxnStage {
     const ACTIVE: u8 = 0;
     const DISCARDED: u8 = 1;
     const PUBLISHED: u8 = 2;
+    const MATERIALIZING: u8 = 3;
+    const JOURNAL_PUBLISHED: u8 = 4;
 
     /// Create an empty stage for one transaction attempt.
     #[must_use]
@@ -118,9 +233,13 @@ impl TxnStage {
             state: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
             data: Mutex::new(TxnStageData {
                 pools: std::array::from_fn(|_| Vec::new()),
+                applied: std::array::from_fn(|_| Vec::new()),
                 bytes: 0,
                 appended: [false; 3],
+                receipt: None,
             }),
+            #[cfg(test)]
+            lookup_many_calls: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -130,8 +249,93 @@ impl TxnStage {
         match self.state.load(Ordering::Acquire) {
             Self::DISCARDED => TxnStageState::Discarded,
             Self::PUBLISHED => TxnStageState::Published,
+            Self::MATERIALIZING => TxnStageState::Materializing,
+            Self::JOURNAL_PUBLISHED => TxnStageState::JournalPublished,
             _ => TxnStageState::Active,
         }
+    }
+
+    /// Look one record up in the mutations staged for `pool`. See
+    /// [`Self::lookup_many`], which this calls.
+    #[must_use]
+    pub fn lookup(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+    ) -> StagedLookup {
+        self.lookup_many(pool, collection_id, std::slice::from_ref(node_id))
+            .pop()
+            .unwrap_or(StagedLookup::Absent)
+    }
+
+    /// Look several records up in the mutations staged for `pool`, in the order
+    /// of `node_ids`, taking the stage lock once and scanning the staged
+    /// mutations once however many records are asked for.
+    ///
+    /// This is what lets a transaction read its own uncommitted writes. The
+    /// staged mutations are in append order, so the newest one that names a
+    /// record wins. A staged `DeleteCollection` for the record's collection
+    /// hides everything older, both earlier staged puts and whatever the live
+    /// pool holds, while a put staged after it is newer and is seen. Only an
+    /// active stage answers: once the stage is discarded, or publication has
+    /// begun, every record is `Absent` and the caller reads the live store,
+    /// which by then serves the group through the transaction overlay.
+    ///
+    /// The single pass keeps the newest put position for each wanted record
+    /// and the position of the last delete for the collection, so the cost is
+    /// the staged mutations plus the records asked for, not their product.
+    /// Payloads are cloned only for records that resolve to a put.
+    #[must_use]
+    pub fn lookup_many(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[[u8; 16]],
+    ) -> Vec<StagedLookup> {
+        #[cfg(test)]
+        self.lookup_many_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE || node_ids.is_empty() {
+            return vec![StagedLookup::Absent; node_ids.len()];
+        }
+        let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
+        let mut newest_put: HashMap<[u8; 16], (usize, &Vec<u8>)> = HashMap::new();
+        let mut last_delete: Option<usize> = None;
+        for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
+            match mutation {
+                Mutation::Put {
+                    collection_id: staged_collection,
+                    node_id,
+                    payload,
+                } if staged_collection == collection_id && wanted.contains(node_id) => {
+                    newest_put.insert(*node_id, (position, payload));
+                }
+                Mutation::DeleteCollection {
+                    collection_id: staged_collection,
+                } if staged_collection == collection_id => last_delete = Some(position),
+                _ => {}
+            }
+        }
+        node_ids
+            .iter()
+            .map(|node_id| match (newest_put.get(node_id), last_delete) {
+                // A put older than the delete is hidden by it.
+                (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
+                (Some((_, payload)), _) => StagedLookup::Put((*payload).clone()),
+                (None, Some(_)) => StagedLookup::Deleted,
+                (None, None) => StagedLookup::Absent,
+            })
+            .collect()
+    }
+
+    /// Number of batch lookup passes, for complexity tests only.
+    #[cfg(test)]
+    #[must_use]
+    pub fn lookup_many_calls(&self) -> u64 {
+        self.lookup_many_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Discard an active attempt. Safe to call more than once.
@@ -142,8 +346,116 @@ impl TxnStage {
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) == Self::ACTIVE {
             data.pools.iter_mut().for_each(Vec::clear);
+            data.applied.iter_mut().for_each(Vec::clear);
             data.bytes = 0;
             self.state.store(Self::DISCARDED, Ordering::Release);
+        }
+    }
+
+    /// Snapshot staged mutations for application to storage at commit time.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; 3] {
+        self.data.lock().pools.clone()
+    }
+
+    /// Receipt identifying this stage's published journal group.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn published_receipt(&self) -> Option<CommitReceipt> {
+        self.data.lock().receipt
+    }
+
+    /// Whether this stage has no mutations to publish or materialize.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data.lock().pools.iter().all(Vec::is_empty)
+    }
+
+    /// Return whether one staged mutation has already been applied to storage.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn mutation_applied(&self, pool: ShardType, index: usize) -> bool {
+        self.data.lock().applied[pool_index(pool)]
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Record successful application of one staged mutation. This makes a
+    /// retry after a later mutation fails resume at the failed mutation.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn mark_mutation_applied(&self, pool: ShardType, index: usize) -> io::Result<()> {
+        let mut data = self.data.lock();
+        let applied = data.applied[pool_index(pool)]
+            .get_mut(index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "staged mutation index out of bounds",
+                )
+            })?;
+        *applied = true;
+        Ok(())
+    }
+
+    /// Begin pack/index materialization after the journal group is published.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn begin_materialization(&self) -> io::Result<()> {
+        let state = self.state.load(Ordering::Acquire);
+        match state {
+            Self::ACTIVE | Self::JOURNAL_PUBLISHED => {
+                self.state.store(Self::MATERIALIZING, Ordering::Release);
+                Ok(())
+            }
+            Self::MATERIALIZING | Self::PUBLISHED => Ok(()),
+            Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
+            _ => Err(io::Error::other("invalid transaction stage state")),
+        }
+    }
+
+    /// Mark the journal group published while storage application remains
+    /// retryable.
+    pub(crate) fn mark_journal_published(&self) -> io::Result<()> {
+        match self.state.load(Ordering::Acquire) {
+            Self::ACTIVE => {
+                self.state.store(Self::JOURNAL_PUBLISHED, Ordering::Release);
+                Ok(())
+            }
+            Self::JOURNAL_PUBLISHED | Self::MATERIALIZING | Self::PUBLISHED => Ok(()),
+            Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
+            _ => Err(io::Error::other("invalid transaction stage state")),
+        }
+    }
+
+    /// Complete an active no-op transaction without creating a journal group.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn mark_empty_published(&self) -> io::Result<()> {
+        let data = self.data.lock();
+        if data.pools.iter().any(|pool| !pool.is_empty()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot complete a transaction with staged mutations as empty",
+            ));
+        }
+        match self.state.load(Ordering::Acquire) {
+            Self::ACTIVE | Self::PUBLISHED => {
+                self.state.store(Self::PUBLISHED, Ordering::Release);
+                Ok(())
+            }
+            Self::DISCARDED => Err(io::Error::other("transaction stage was discarded")),
+            _ => Err(io::Error::other(
+                "transaction stage is not empty and active",
+            )),
+        }
+    }
+
+    /// Mark both journal publication and storage application complete.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn mark_published(&self) -> io::Result<()> {
+        match self.state.load(Ordering::Acquire) {
+            Self::MATERIALIZING | Self::PUBLISHED => {
+                self.state.store(Self::PUBLISHED, Ordering::Release);
+                Ok(())
+            }
+            _ => Err(io::Error::other("transaction storage has not been applied")),
         }
     }
 
@@ -207,6 +519,7 @@ impl TxnStage {
             node_id,
             payload,
         });
+        data.applied[pool_index(pool)].push(false);
         data.bytes = total;
         Ok(())
     }
@@ -255,6 +568,7 @@ impl TxnStage {
             node_id: *node_id,
             payload: payload.clone(),
         }));
+        data.applied[pool_index(pool)].extend(vec![false; entries.len()]);
         data.bytes = total;
         Ok(())
     }
@@ -288,11 +602,12 @@ impl TxnStage {
             ));
         }
         data.pools[pool_index(pool)].push(Mutation::DeleteCollection { collection_id });
+        data.applied[pool_index(pool)].push(false);
         data.bytes = total;
         Ok(())
     }
 
-    /// Append staged pool groups in dependency order: auth-chain, event-DAG,
+    /// Append staged pool groups in dependency order: edges, event-DAG,
     /// then state. Does not fsync; the ordinary coalesced sync remains the
     /// durability boundary. Repeated calls are safe, including after a
     /// partial error.
@@ -302,23 +617,81 @@ impl TxnStage {
     /// cannot append the group's complete framing and trailer.
     pub fn publish(
         &self,
-        auth_chain: Option<&JournalCoordinator>,
+        edges: Option<&JournalCoordinator>,
         event_dag: Option<&JournalCoordinator>,
         state: Option<&JournalCoordinator>,
     ) -> io::Result<()> {
         let mut data = self.data.lock();
         match self.state.load(Ordering::Acquire) {
-            Self::DISCARDED | Self::PUBLISHED => return Ok(()),
+            Self::DISCARDED | Self::JOURNAL_PUBLISHED | Self::MATERIALIZING | Self::PUBLISHED => {
+                return Ok(())
+            }
             _ => {}
         }
-        let coordinators = [auth_chain, event_dag, state];
+        let coordinators = [edges, event_dag, state];
         if coordinators.iter().all(Option::is_none) {
             // Journaling is disabled process-wide, so there is no journal to
             // publish into.
             self.state.store(Self::PUBLISHED, Ordering::Release);
             return Ok(());
         }
-        let pools = [ShardType::AuthChain, ShardType::EventDag, ShardType::State];
+        let pools = [ShardType::Edges, ShardType::EventDag, ShardType::State];
+
+        // A shared-WAL database gives every pool the same coordinator. Keep
+        // the transaction as one journal group in that case, so readers never
+        // observe only a prefix of a cross-pool commit. Standalone/per-pool
+        // journals cannot provide that boundary and retain the ordered,
+        // retry-safe fallback below.
+        let active_pool_count = pools
+            .iter()
+            .filter(|pool| {
+                let index = pool_index(**pool);
+                !data.appended[index] && !data.pools[index].is_empty()
+            })
+            .count();
+        if active_pool_count == 0 {
+            self.state.store(Self::PUBLISHED, Ordering::Release);
+            return Ok(());
+        }
+        let active_coordinators = pools
+            .iter()
+            .filter_map(|pool| {
+                let index = pool_index(*pool);
+                (!data.appended[index] && !data.pools[index].is_empty())
+                    .then(|| coordinators[index])
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        if active_coordinators.len() == active_pool_count {
+            if let Some(coordinator) = active_coordinators.first().copied() {
+                if active_coordinators
+                    .iter()
+                    .all(|candidate| std::ptr::eq(*candidate, coordinator))
+                {
+                    let batches = pools
+                        .iter()
+                        .filter_map(|pool| {
+                            let index = pool_index(*pool);
+                            (!data.appended[index] && !data.pools[index].is_empty())
+                                .then_some((*pool, data.pools[index].as_slice()))
+                        })
+                        .collect::<Vec<_>>();
+                    let receipt = coordinator.publish_tagged_groups(&batches)?;
+                    data.appended.fill(true);
+                    data.receipt = Some(receipt);
+                    self.mark_journal_published()?;
+                    return Ok(());
+                }
+            }
+        }
+
+        if active_pool_count > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cross-pool transactions require one shared journal coordinator",
+            ));
+        }
+
         for (ordered_index, pool) in pools.into_iter().enumerate() {
             let index = pool_index(pool);
             if data.appended[index] || data.pools[index].is_empty() {
@@ -328,20 +701,71 @@ impl TxnStage {
             let coordinator = coordinators[ordered_index].ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "staged pool has no journal")
             })?;
-            coordinator.append_pending(&data.pools[index])?;
+            let receipt = coordinator.publish_group_tagged(pool, &data.pools[index])?;
             data.appended[index] = true;
+            data.receipt = Some(receipt);
         }
-        self.state.store(Self::PUBLISHED, Ordering::Release);
+        self.mark_journal_published()?;
         Ok(())
     }
 }
 
+#[cfg(feature = "multi-reader")]
 const fn pool_index(pool: ShardType) -> usize {
     match pool {
         ShardType::State => 0,
         ShardType::EventDag => 1,
-        ShardType::AuthChain => 2,
+        ShardType::Edges => 2,
     }
+}
+
+/// Wire code for a pool tag in a pool-tagged (`FILE_VERSION_POOL_TAGGED`)
+/// mutation frame's previously reserved flag byte.
+///
+/// `0` is reserved for "untagged", which only a version-2 segment may contain;
+/// a version-3 frame must carry `1..=3`.
+pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
+    match pool {
+        ShardType::State => 1,
+        ShardType::EventDag => 2,
+        ShardType::Edges => 3,
+    }
+}
+
+/// Inverse of [`pool_tag`]. `0` (untagged) maps to `None`; any other
+/// out-of-range code is rejected by the frame decoder.
+pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
+    match tag {
+        1 => Some(ShardType::State),
+        2 => Some(ShardType::EventDag),
+        3 => Some(ShardType::Edges),
+        _ => None,
+    }
+}
+
+/// One appended group's `last_lsn` and the distinct pools it carried, each
+/// mapped to that same `last_lsn`. See [`JournalCoordinator::pending_promotions`].
+type PendingPromotion = (u64, Vec<(ShardType, u64)>);
+
+/// Distinct pools carried by one committed group, each mapped to the group's
+/// `last_lsn`. A group is reclaimed atomically, so a pool's watermark must be
+/// the whole group's end, not the LSN of its own frame within it: the group may
+/// only be dropped once every pool in it has reported coverage through
+/// `last_lsn`.
+fn pool_extents(
+    last_lsn: u64,
+    pools: impl Iterator<Item = Option<ShardType>>,
+) -> Vec<(ShardType, u64)> {
+    let mut extents: Vec<(ShardType, u64)> = Vec::new();
+    for pool in pools {
+        let Some(pool) = pool else {
+            continue;
+        };
+        if !extents.iter().any(|(existing, _)| *existing == pool) {
+            extents.push((pool, last_lsn));
+        }
+    }
+    extents
 }
 
 /// One decoded mutation frame, with the byte range it occupied in the segment
@@ -354,6 +778,9 @@ pub struct JournalEntry {
     pub offset: u64,
     /// Encoded frame length in bytes (fixed fields + payload + CRC).
     pub frame_len: u64,
+    /// Pool the frame belongs to. `None` for a version-2 (per-pool) segment;
+    /// `Some` for every frame of a pool-tagged version-3 segment.
+    pub pool: Option<ShardType>,
     /// Decoded mutation.
     pub mutation: Mutation,
 }
@@ -384,6 +811,158 @@ pub struct CommitReceipt {
     pub first_lsn: u64,
     /// Last mutation LSN in the group.
     pub last_lsn: u64,
+    /// Bytes appended for this complete group, including header and trailer.
+    pub bytes_written: u64,
+}
+
+/// Breakdown and counters for one journal durability request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JournalSyncTimings {
+    /// Time spent waiting for the single-writer journal mutex.
+    pub journal_lock_wait: std::time::Duration,
+    /// Time spent waiting for the pending-mutation queue mutex.
+    // TODO: remove; always zero since the shared pending queue was deleted.
+    pub journal_pending_wait: std::time::Duration,
+    /// Time spent appending and encoding the group, excluding fsync.
+    pub journal_append: std::time::Duration,
+    /// Time spent making the journal file durable.
+    pub journal_fsync: std::time::Duration,
+    /// Number of mutations included in a newly appended group.
+    pub journal_records: u64,
+    /// Bytes included in a newly appended group, including framing.
+    pub journal_bytes: u64,
+    /// Whether this request had to wait for the journal mutex.
+    pub journal_waiter: bool,
+    /// Whether this request was already covered by another durable request.
+    pub journal_coalesced: bool,
+    /// Number of journal sync callers active when this request entered.
+    pub journal_in_flight: u64,
+}
+
+/// Latency of blocked [`JournalCoordinator::wait_durable`] calls, in fixed
+/// non-cumulative buckets: `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
+///
+/// Sized for fsync-scale waits, unlike the sub-millisecond storage-operation
+/// buckets. The total observation count is the sum of all five entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DurableWaitLatency {
+    /// Number of waits that had to block for a durable group.
+    pub calls: u64,
+    /// Sum of wait wall time.
+    pub total: std::time::Duration,
+    /// Largest single wait.
+    pub max: std::time::Duration,
+    /// Counts for `<1ms`, `<10ms`, `<100ms`, `<1s`, and `>=1s`.
+    pub buckets: [u64; 5],
+}
+
+/// Lifetime durability accounting for one journal: how many requests shared
+/// how many real fsyncs. Counters are monotone and never reset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DurabilityStats {
+    /// [`JournalCoordinator::request_durable`] calls.
+    pub durable_requests: u64,
+    /// `wait_durable` calls already satisfied at entry (no blocking).
+    pub durable_waits_already_durable: u64,
+    /// Latency of `wait_durable` calls that had to block.
+    pub durable_wait: DurableWaitLatency,
+    /// Sync-barrier entries (`sync_through*`), including coalesced ones.
+    pub sync_requests: u64,
+    /// Sync-barrier entries that found the journal mutex occupied.
+    pub sync_waiters: u64,
+    /// Sync-barrier entries covered by another caller's fsync.
+    pub sync_coalesced: u64,
+    /// Real journal fsyncs that advanced the durable boundary.
+    pub commits: u64,
+    /// Mutations made durable across all commits (durable-LSN advance).
+    pub commit_records: u64,
+    /// Most mutations made durable by a single fsync.
+    pub max_commit_records: u64,
+}
+
+impl DurabilityStats {
+    /// Mean mutations made durable per real fsync, or `0.0` before any commit.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn records_per_commit(&self) -> f64 {
+        if self.commits == 0 {
+            0.0
+        } else {
+            self.commit_records as f64 / self.commits as f64
+        }
+    }
+}
+
+#[derive(Default)]
+struct DurableWaitTotals {
+    calls: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    buckets: [AtomicU64; 5],
+}
+
+impl DurableWaitTotals {
+    fn observe(&self, duration: std::time::Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(nanos, Ordering::Relaxed);
+        self.max_ns.fetch_max(nanos, Ordering::Relaxed);
+        let micros = duration.as_micros();
+        let bucket = if micros < 1_000 {
+            0
+        } else if micros < 10_000 {
+            1
+        } else if micros < 100_000 {
+            2
+        } else if micros < 1_000_000 {
+            3
+        } else {
+            4
+        };
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> DurableWaitLatency {
+        DurableWaitLatency {
+            calls: self.calls.load(Ordering::Relaxed),
+            total: std::time::Duration::from_nanos(self.total_ns.load(Ordering::Relaxed)),
+            max: std::time::Duration::from_nanos(self.max_ns.load(Ordering::Relaxed)),
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
+        }
+    }
+}
+
+struct SyncInFlightGuard<'a>(&'a AtomicU64);
+
+impl Drop for SyncInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Test-only hook run between a sync's handle clone and its fsync; an `Err` it
+/// returns stands in for the fsync failing.
+#[cfg(test)]
+type FsyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+/// What a sync captured under the journal lock so it can flush without it.
+struct SyncCapture {
+    /// Duplicate of the segment file handle current at capture time.
+    file: File,
+    /// Newest visible LSN at capture time; the fsync makes everything at or
+    /// below it durable.
+    through_lsn: u64,
+    /// Sequence of the newest appended group, for the receipt.
+    sequence: u64,
+    /// Segment path, for slow-fsync reporting and the durability hint.
+    path: PathBuf,
+    /// Length of the segment when the handle was cloned. Everything appended
+    /// before that point is covered by the fsync, so this is what the
+    /// durability hint may claim once the fsync returns.
+    file_len: u64,
+    /// The segment's base sequence and LSN, which key the durability hint.
+    base_sequence: u64,
+    base_lsn: u64,
 }
 
 /// Result of validating a journal file.
@@ -400,6 +979,26 @@ pub struct Scan {
     /// there are no groups to compare but the base still moved past what the
     /// reader's index incorporated.
     pub base_lsn: u64,
+    /// The last bytes (up to [`CONSUMED_TAIL_LEN`]) of the complete groups this
+    /// scan consumed, never reaching into the file header. A read-only overlay
+    /// remembers them, appended to what it already remembered, so it later
+    /// compares the disk against the bytes it actually built from instead of
+    /// against a separate read that could race a rewrite.
+    pub(crate) consumed_tail: Vec<u8>,
+}
+
+/// How many bytes ending at the last consumed group a read-only overlay
+/// remembers to notice that the consumed prefix was rewritten.
+pub(crate) const CONSUMED_TAIL_LEN: usize = 1024;
+
+/// How long the remembered window is for a segment whose last complete group
+/// ends at `valid_len`: the last [`CONSUMED_TAIL_LEN`] bytes, but never
+/// reaching into the file header.
+#[must_use]
+pub(crate) fn consumed_tail_len(valid_len: u64) -> usize {
+    let header_len = u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX);
+    let available = valid_len.saturating_sub(header_len);
+    usize::try_from(available).map_or(CONSUMED_TAIL_LEN, |len| len.min(CONSUMED_TAIL_LEN))
 }
 
 impl Scan {
@@ -412,6 +1011,7 @@ impl Scan {
             valid_len: 0,
             truncated_tail: false,
             base_lsn: 0,
+            consumed_tail: Vec::new(),
         }
     }
 }
@@ -433,24 +1033,154 @@ pub struct Reclaim {
 pub struct Journal {
     path: PathBuf,
     file: File,
+    /// Current on-disk length tracked after open, append, and reclaim. Keeping
+    /// this in memory avoids an fstat on every group publication.
+    file_len: u64,
+    /// Base sequence and LSN from the file header, which key the durability
+    /// hint to this incarnation of the segment.
+    base_sequence: u64,
+    base_lsn: u64,
+    /// On-disk format version of this segment.
+    version: JournalVersion,
     next_sequence: u64,
     next_lsn: u64,
     poisoned: bool,
 }
 
+/// An fsync at least this slow is reported on stderr when it happens.
+const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Cross-pool coverage bookkeeping for reclaiming a shared segment.
+#[cfg(feature = "multi-reader")]
+#[derive(Default)]
+struct CoverageState {
+    /// Highest durable checkpoint coverage reported per pool. A group is
+    /// reclaimable only once every pool that contributed a frame to it has
+    /// reported coverage through the group's `last_lsn`.
+    covered: HashMap<ShardType, u64>,
+}
+
+/// Maximum time [`JournalCoordinator::wait_durable`] sleeps before re-checking
+/// the durable boundary, poison bit, and committer presence. Bounds how long a
+/// waiter can lag a commit and how quickly it notices a stopped committer.
+const DURABILITY_WAIT_POLL: Duration = Duration::from_millis(50);
+
+/// Bounded group-commit policy for
+/// [`JournalCoordinator::start_background_committer`].
+///
+/// The committer fsyncs at most once per `interval`, coalescing every mutation
+/// published in that window into one group. It flushes early when the number of
+/// published-but-uncommitted records reaches `max_pending`, so an unbroken
+/// burst cannot grow the pending queue without bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupCommitConfig {
+    /// Maximum time a published mutation waits before the committer fsyncs it.
+    /// Also the crash-loss window when the process dies before a flush.
+    pub interval: Duration,
+    /// Published-but-uncommitted record count that forces an early flush.
+    pub max_pending: u64,
+}
+
+impl Default for GroupCommitConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(1),
+            max_pending: 4096,
+        }
+    }
+}
+
+impl GroupCommitConfig {
+    /// A policy that fsyncs under a fixed interval with the default
+    /// `max_pending` bound.
+    #[must_use]
+    pub const fn with_interval(interval: Duration) -> Self {
+        Self {
+            interval,
+            max_pending: 4096,
+        }
+    }
+}
+
+/// A handle to a durability request registered with
+/// [`JournalCoordinator::request_durable`].
+///
+/// Holding a token is not itself durable: pass it to
+/// [`JournalCoordinator::wait_durable`] to block until the group covering its
+/// LSN has been fsynced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurabilityToken {
+    lsn: u64,
+}
+
+impl DurabilityToken {
+    /// The LSN this token requests durability through.
+    #[must_use]
+    pub const fn lsn(self) -> u64 {
+        self.lsn
+    }
+
+    /// Whether a durable boundary of `committed_lsn` already satisfies this
+    /// token.
+    #[must_use]
+    pub const fn is_satisfied_by(self, committed_lsn: u64) -> bool {
+        self.lsn <= committed_lsn
+    }
+}
+
+struct BackgroundCommitter {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Lifecycle of the background committer slot.
+///
+/// `Stopping` is held across the join so a concurrent
+/// [`JournalCoordinator::start_background_committer`] cannot spawn a second
+/// committer while the old thread is still winding down.
+enum BackgroundState {
+    Stopped,
+    Running(BackgroundCommitter),
+    Stopping,
+}
+
+/// A terminal failure of the background committer, recorded so `wait_durable`
+/// and `stop_background_committer` can surface it instead of waiting forever on
+/// a worker that is no longer running. A private snapshot of an [`io::Error`]
+/// (`io::Error` is not `Clone`).
+#[derive(Clone, Debug)]
+struct BackgroundFailure {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl BackgroundFailure {
+    fn from_io(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(self.kind, self.message)
+    }
+}
+
 /// Serializes mutation publication and durable commits for one journal.
 ///
-/// Mutations are assigned LSNs under a short queue lock. A sync caller captures
-/// the published LSN, detaches the covered mutations, then commits them while
-/// holding the journal lock. Publishers can queue later mutations during the
-/// fsync, and concurrent sync callers recheck the committed LSN after taking
-/// the journal lock.
+/// Every publication (an autocommit mutation or a transaction group) appends
+/// one complete group under the `publication` lock, assigning its LSNs there,
+/// and becomes visible without an fsync. A sync caller captures the published
+/// LSN and fsyncs every visible group up to it in one call, so many small
+/// groups share one fsync. Concurrent sync callers recheck the committed LSN
+/// after taking the journal lock.
 pub struct JournalCoordinator {
     journal: Mutex<Journal>,
-    pending: Mutex<Vec<(u64, Mutation)>>,
-    /// Next LSN to assign. Advanced under `pending`, independently of journal
-    /// I/O, so a publish never blocks behind a sync's fsync.
-    next_lsn: AtomicU64,
+    path: PathBuf,
+    /// Serializes every group publication: autocommit mutations and
+    /// transaction groups alike.
+    publication: Mutex<()>,
     published_lsn: AtomicU64,
     /// Highest LSN whose group is complete (trailer appended) but not
     /// necessarily fsynced. Advanced between [`Journal::append_group`] and
@@ -463,9 +1193,123 @@ pub struct JournalCoordinator {
     /// segment's own counter, so groups across several pool segments share one
     /// global order. See [`Self::with_shared_sequence`].
     sequence: Option<Arc<AtomicU64>>,
+    /// Per-pool durable coverage, used to reclaim a shared segment only up to
+    /// the point every pool present in it has materialized. See
+    /// [`Self::report_pool_coverage`] and [`Self::reclaim_shared`].
+    #[cfg(feature = "multi-reader")]
+    coverage: Mutex<CoverageState>,
+    /// Highest committed group `last_lsn` that carried a frame for each pool.
+    ///
+    /// A pool's checkpoint may only record this, never the global
+    /// [`Self::committed_lsn`]: one shared group can interleave several pools'
+    /// frames, so the global value can include LSNs whose frames this pool's
+    /// index has not materialized. Recording the global value would both claim
+    /// coverage the checkpoint lacks and let reclaim drop another pool's
+    /// uncovered frames. See [`Self::committed_lsn_for_pool`].
+    pool_committed: Mutex<HashMap<ShardType, u64>>,
+    /// Appended-but-not-yet-committed groups, with the highest LSN each carried
+    /// per pool. Appending a transaction group makes it visible before it is
+    /// fsynced; when a later durable commit passes it,
+    /// [`Self::promote_pool_committed`] drains the entry so every pool's
+    /// watermark still advances from a coalesced fsync.
+    pending_promotions: Mutex<Vec<PendingPromotion>>,
+    /// Committed groups recovered when this coordinator's segment was opened.
+    /// Retained so a store attaching to a coordinator it did not construct
+    /// (the shared-WAL path, where one coordinator serves every pool) can seed
+    /// its replay set from the same scan.
+    recovered: Vec<CommittedGroup>,
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
+    /// Number of sync requests entering the coordinator.
+    sync_calls: AtomicU64,
+    /// Number of sync requests that found the journal mutex occupied.
+    journal_waiters: AtomicU64,
+    /// Number of requests covered without appending or fsyncing themselves.
+    coalesced_syncs: AtomicU64,
+    sync_in_flight: AtomicU64,
+    /// Highest LSN a caller has asked to become durable through
+    /// [`Self::request_durable`]. Purely a wake-up/observability bound: the
+    /// background committer commits the whole published prefix, not this
+    /// exact value.
+    durable_requested: AtomicU64,
+    /// Serializes fsyncs and segment replacement, and is held across the whole
+    /// fsync. Publishers never take it, so they make progress while the device
+    /// flushes. A sync caller takes it, rechecks `committed_lsn` (a concurrent
+    /// fsync usually covered it), then briefly takes `journal` to clone the
+    /// file handle and capture the newest visible LSN.
+    ///
+    /// Lock order: `sync_lock` -> `journal`. Reclaim takes `sync_lock` first so
+    /// the segment cannot be replaced under an in-flight fsync. Nothing may
+    /// take `sync_lock` while holding `journal`.
+    sync_lock: Mutex<()>,
+    /// Test-only hook run after the file handle is cloned and before the
+    /// fsync, with `journal` released, so a test can park a sync mid-flight.
+    /// An `Err` it returns is treated as the fsync failing.
+    #[cfg(test)]
+    fsync_hook: Mutex<Option<FsyncHook>>,
+    /// Guards [`Self::durable_cv`]. The condvar carries no state of its own;
+    /// waiters re-check [`Self::committed_lsn`] and the committer's presence
+    /// after every wake, so this only provides the required mutex pairing.
+    ///
+    /// Lock order: `journal` may be held while acquiring `durable_lock` (the
+    /// commit path wakes waiters after recording the commit). The reverse is
+    /// forbidden: never acquire `journal` while holding `durable_lock`. Both
+    /// the committer loop and `wait_durable` drop the guard before entering
+    /// journal I/O.
+    durable_lock: Mutex<()>,
+    /// Signals `wait_durable` callers and the background committer when the
+    /// durable boundary may have advanced or the committer has stopped.
+    durable_cv: Condvar,
+    /// Lifecycle of the background committer. Additive: a coordinator whose
+    /// state is [`BackgroundState::Stopped`] keeps the historical
+    /// blocking-barrier behavior for `wait_durable`/`sync_through`.
+    background: Mutex<BackgroundState>,
+    /// Terminal committer failure, surfaced by [`Self::wait_durable`] and
+    /// [`Self::stop_background_committer`]. Cleared when a committer is
+    /// (re)started.
+    background_failure: Mutex<Option<BackgroundFailure>>,
+    /// Published-but-uncommitted count at which `publish` wakes the committer
+    /// for an early flush. Zero when no committer is running (no wakeups).
+    committer_wake_threshold: AtomicU64,
+    /// Monotonic commit generation, bumped whenever `committed_lsn` advances
+    /// (background, explicit, or fallback commit). A new epoch re-arms the
+    /// threshold wake without any explicit clear step.
+    commit_epoch: AtomicU64,
+    /// Commit epoch of the last threshold-crossing wake. Publishers wake only
+    /// when it differs from the current [`Self::commit_epoch`], so a burst
+    /// yields one wake. Initialised to `u64::MAX`, so it never matches epoch 0
+    /// and the first crossing always wakes.
+    threshold_notified_epoch: AtomicU64,
+    /// Test-only readiness signal: incremented, under `durable_lock`, each time
+    /// the committer is about to park. Lets tests wait for a parked worker
+    /// instead of sleeping. Absent from non-test builds.
+    #[cfg(test)]
+    committer_parks: AtomicU64,
+    /// Test-only: threshold wakes whose send path `publish` selected.
+    /// Incremented inline, so a test can assert a burst selected (or
+    /// suppressed) its wake without waiting for the committer to react.
+    /// `notify_all` has no observable success/failure, so this counts decisions,
+    /// not deliveries.
+    #[cfg(test)]
+    threshold_wakes: AtomicU64,
+    /// Number of background group commits that appended and fsynced a group.
+    background_commits: AtomicU64,
+    /// Number of background commit attempts already covered by a concurrent
+    /// durable group (never counted for idle timer ticks).
+    background_coalesced: AtomicU64,
+    /// `request_durable` calls.
+    durable_requests: AtomicU64,
+    /// `wait_durable` calls satisfied without blocking.
+    durable_waits_already_durable: AtomicU64,
+    /// Latency of `wait_durable` calls that blocked.
+    durable_wait: DurableWaitTotals,
+    /// Real fsyncs that advanced the durable boundary.
+    commits: AtomicU64,
+    /// Durable-LSN advance summed over all commits.
+    commit_records: AtomicU64,
+    /// Largest durable-LSN advance made by one fsync.
+    max_commit_records: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -473,16 +1317,171 @@ impl JournalCoordinator {
     #[must_use]
     pub fn new(journal: Journal, scan: &Scan) -> Self {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
-        let next_lsn = journal.next_lsn;
+        let path = journal.path.clone();
+        #[cfg(feature = "multi-reader")]
+        let coverage = CoverageState::default();
+        // Seed each pool's committed watermark from the recovered groups, so a
+        // fresh coordinator over a pre-existing segment reports the same
+        // coverage the segment already carries.
+        let mut pool_committed: HashMap<ShardType, u64> = HashMap::new();
+        for group in &scan.groups {
+            for entry in &group.entries {
+                if let Some(pool) = entry.pool {
+                    let watermark = pool_committed.entry(pool).or_insert(0);
+                    *watermark = (*watermark).max(group.last_lsn);
+                }
+            }
+        }
         Self {
             journal: Mutex::new(journal),
-            pending: Mutex::new(Vec::new()),
-            next_lsn: AtomicU64::new(next_lsn),
+            path,
+            publication: Mutex::new(()),
             published_lsn: AtomicU64::new(committed_lsn),
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             sequence: None,
+            #[cfg(feature = "multi-reader")]
+            coverage: Mutex::new(coverage),
+            pool_committed: Mutex::new(pool_committed),
+            pending_promotions: Mutex::new(Vec::new()),
+            recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
+            sync_calls: AtomicU64::new(0),
+            journal_waiters: AtomicU64::new(0),
+            coalesced_syncs: AtomicU64::new(0),
+            sync_in_flight: AtomicU64::new(0),
+            durable_requested: AtomicU64::new(committed_lsn),
+            sync_lock: Mutex::new(()),
+            #[cfg(test)]
+            fsync_hook: Mutex::new(None),
+            durable_lock: Mutex::new(()),
+            durable_cv: Condvar::new(),
+            background: Mutex::new(BackgroundState::Stopped),
+            background_failure: Mutex::new(None),
+            committer_wake_threshold: AtomicU64::new(0),
+            commit_epoch: AtomicU64::new(0),
+            threshold_notified_epoch: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            committer_parks: AtomicU64::new(0),
+            #[cfg(test)]
+            threshold_wakes: AtomicU64::new(0),
+            background_commits: AtomicU64::new(0),
+            background_coalesced: AtomicU64::new(0),
+            durable_requests: AtomicU64::new(0),
+            durable_waits_already_durable: AtomicU64::new(0),
+            durable_wait: DurableWaitTotals::default(),
+            commits: AtomicU64::new(0),
+            commit_records: AtomicU64::new(0),
+            max_commit_records: AtomicU64::new(0),
+        }
+    }
+
+    /// The committed groups recovered when this coordinator's segment was
+    /// opened, in sequence order. A store attaching to a coordinator it did
+    /// not construct (the shared-WAL path) uses this to seed its replay set.
+    #[must_use]
+    pub fn recovered_groups(&self) -> Vec<CommittedGroup> {
+        self.recovered.clone()
+    }
+
+    /// Record that `pool`'s durable checkpoint has materialized every frame it
+    /// owns through `lsn`. Coverage only advances. A pool with no reported
+    /// coverage never blocks a group that does not carry its frames.
+    #[cfg(feature = "multi-reader")]
+    pub fn report_pool_coverage(&self, pool: ShardType, lsn: u64) {
+        let mut coverage = self.coverage.lock();
+        let entry = coverage.covered.entry(pool).or_insert(0);
+        *entry = (*entry).max(lsn);
+    }
+
+    /// Highest committed group `last_lsn` that carried at least one frame for
+    /// `pool`, or 0 when no committed group has yet.
+    ///
+    /// A pool checkpoint must record this, not [`Self::committed_lsn`]. One
+    /// shared group can interleave several pools' frames, so the global
+    /// committed LSN can run ahead of what this pool's index has materialized;
+    /// recording it would claim coverage the checkpoint does not have and let
+    /// reclaim drop another pool's uncovered frames.
+    #[must_use]
+    #[cfg(feature = "multi-reader")]
+    pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
+        self.pool_committed.lock().get(&pool).copied().unwrap_or(0)
+    }
+
+    /// Record a durable commit and advance the generation that re-arms the
+    /// background committer's threshold wake. Centralised so every commit path
+    /// — background, explicit `sync_through`, and fallback — re-arms alike.
+    fn note_commit(&self, through_lsn: u64) {
+        let previous = self.committed_lsn.fetch_max(through_lsn, Ordering::AcqRel);
+        if through_lsn > previous {
+            let covered = through_lsn.saturating_sub(previous);
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.commit_records.fetch_add(covered, Ordering::Relaxed);
+            self.max_commit_records
+                .fetch_max(covered, Ordering::Relaxed);
+            self.commit_epoch.fetch_add(1, Ordering::AcqRel);
+            self.wake_committer_if_backlogged();
+        }
+    }
+
+    /// Advance per-pool committed watermarks for every appended group whose
+    /// `last_lsn` is at or below `through_lsn`.
+    fn promote_pool_committed(&self, through_lsn: u64) {
+        let mut promotions = self.pending_promotions.lock();
+        let mut watermarks = self.pool_committed.lock();
+        let (ready, pending): (Vec<PendingPromotion>, Vec<PendingPromotion>) = promotions
+            .drain(..)
+            .partition(|(last_lsn, _)| *last_lsn <= through_lsn);
+        *promotions = pending;
+        for (_, extents) in ready {
+            for (pool, lsn) in extents {
+                let entry = watermarks.entry(pool).or_insert(0);
+                *entry = (*entry).max(lsn);
+            }
+        }
+    }
+
+    /// Reclaim the longest prefix of the shared segment whose every group is
+    /// durably covered by all of that group's own pools, returning the reclaim
+    /// result or `None` when nothing is reclaimable yet.
+    ///
+    /// A group is reclaimed atomically, so it may only be dropped once every
+    /// pool that contributed a frame to it has reported coverage through the
+    /// group's `last_lsn`. The pools in one group are independent of the pools
+    /// in another, so the reclaimable prefix is **not** a single minimum across
+    /// every pool: an idle pool whose last frame sits in an early group must not
+    /// pin later groups that its frames never reached. Walk the live groups in
+    /// order and stop at the first one any contributing pool has not covered.
+    ///
+    /// # Errors
+    /// Propagates a scan or segment-rewrite failure from [`Self::reclaim_through`].
+    #[cfg(feature = "multi-reader")]
+    pub fn reclaim_shared(&self) -> io::Result<Option<Reclaim>> {
+        let scan = Journal::scan_read_only(&self.path)?;
+        let boundary = {
+            let coverage = self.coverage.lock();
+            let mut boundary = None;
+            'groups: for group in &scan.groups {
+                for entry in &group.entries {
+                    match entry.pool {
+                        Some(pool)
+                            if coverage
+                                .covered
+                                .get(&pool)
+                                .is_some_and(|lsn| *lsn >= group.last_lsn) => {}
+                        // Either the contributing pool has not reported coverage
+                        // through this group, or a frame carries no pool tag and
+                        // so cannot be attributed. Stop before dropping it.
+                        _ => break 'groups,
+                    }
+                }
+                boundary = Some(group.last_lsn);
+            }
+            boundary
+        };
+        match boundary {
+            Some(covered_lsn) => self.reclaim_through(covered_lsn).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -495,6 +1494,7 @@ impl JournalCoordinator {
     /// in a single segment's group sequence are then expected; recovery
     /// permits them.
     #[must_use]
+    #[cfg(feature = "multi-reader")]
     pub fn with_shared_sequence(journal: Journal, scan: &Scan, sequence: Arc<AtomicU64>) -> Self {
         let mut coordinator = Self::new(journal, scan);
         coordinator.sequence = Some(sequence);
@@ -505,6 +1505,12 @@ impl JournalCoordinator {
     #[must_use]
     pub fn committed_lsn(&self) -> u64 {
         self.committed_lsn.load(Ordering::Acquire)
+    }
+
+    /// Path of the journal segment used by this coordinator.
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
     }
 
     /// Highest LSN whose journal group is complete (commit trailer appended),
@@ -524,39 +1530,6 @@ impl JournalCoordinator {
         self.published_lsn.load(Ordering::Acquire)
     }
 
-    /// Assign an LSN, publish the mutation to the caller's live overlay, and
-    /// queue it for the next covering durable group.
-    ///
-    /// The callback runs while publication is serialized and before the LSN
-    /// becomes visible to sync callers. It must not call back into this
-    /// coordinator. Keeping overlay publication in this critical section
-    /// prevents a successful sync from racing ahead of a not-yet-visible put.
-    ///
-    /// # Errors
-    /// Returns an error if the journal has been poisoned by a failed commit or
-    /// if its LSN space is exhausted.
-    pub fn publish(
-        &self,
-        mutation: Mutation,
-        publish_overlay: impl FnOnce(u64),
-    ) -> io::Result<u64> {
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(io::Error::other(
-                "journal is poisoned after a failed commit",
-            ));
-        }
-        let mut pending = self.pending.lock();
-        let lsn = self.next_lsn.load(Ordering::Relaxed);
-        let next_lsn = lsn
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-        publish_overlay(lsn);
-        pending.push((lsn, mutation));
-        self.next_lsn.store(next_lsn, Ordering::Relaxed);
-        self.published_lsn.store(lsn, Ordering::Release);
-        Ok(lsn)
-    }
-
     /// Capture the latest fully published mutation as this sync caller's
     /// acknowledgement boundary.
     #[must_use]
@@ -568,161 +1541,294 @@ impl JournalCoordinator {
     ///
     /// Calls with the same or an earlier target are covered by an already
     /// completed group. Later published mutations are left for a later group.
-    /// The journal mutex serializes the disk commit; concurrent sync callers
-    /// wait for it and then recheck the committed LSN before deciding whether
-    /// to write.
+    /// `sync_lock` serializes the fsync (the journal mutex is held only briefly
+    /// to capture the range, so publishers keep appending); concurrent sync
+    /// callers wait for it and then recheck the committed LSN before deciding
+    /// whether to flush.
     ///
     /// # Errors
     /// Returns an error if the target was never published, the journal is
     /// poisoned, or writing/syncing the covering group fails.
     pub fn sync_through(&self, target_lsn: u64) -> io::Result<Option<CommitReceipt>> {
-        if target_lsn == 0 {
-            return Ok(None);
-        }
+        self.sync_through_timed(target_lsn)
+            .map(|(receipt, _)| receipt)
+    }
+
+    /// Durably commit pending mutations and report where the time went.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the target is invalid, the journal is poisoned,
+    /// or appending/fsyncing the group fails.
+    pub fn sync_through_timed(
+        &self,
+        target_lsn: u64,
+    ) -> io::Result<(Option<CommitReceipt>, JournalSyncTimings)> {
+        self.sync_calls.fetch_add(1, Ordering::Relaxed);
+        let mut timings = JournalSyncTimings::default();
+        let in_flight = self
+            .sync_in_flight
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        timings.journal_in_flight = in_flight;
+        let _in_flight_guard = SyncInFlightGuard(&self.sync_in_flight);
         if target_lsn > self.published_lsn.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "sync target has not been published",
             ));
         }
-        if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-            return Ok(None);
+        if self.covered_by_prior_commit(target_lsn, &mut timings) {
+            return Ok((None, timings));
         }
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(io::Error::other(
-                "journal is poisoned after a failed commit",
-            ));
-        }
+        self.reject_if_poisoned()?;
 
-        let mut journal = self.journal.lock();
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(io::Error::other(
-                "journal is poisoned after a failed commit",
-            ));
+        let _sync = self.acquire_sync_lock(&mut timings);
+        self.reject_if_poisoned()?;
+        // A concurrent fsync that finished while we waited usually covered us.
+        if self.covered_by_prior_commit(target_lsn, &mut timings) {
+            return Ok((None, timings));
         }
-        if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        // Transaction-staged groups are already complete in the segment, so
-        // the coalesced sync only needs to make their bytes durable.
-        if target_lsn <= self.visible_lsn.load(Ordering::Acquire) {
-            if let Err(error) = journal.make_durable() {
-                self.poisoned.store(true, Ordering::Release);
-                return Err(error);
-            }
-            self.committed_lsn.store(target_lsn, Ordering::Release);
-            return Ok(None);
-        }
-        let batch = {
-            let mut pending = self.pending.lock();
-            let covered_count = pending
-                .iter()
-                .take_while(|(lsn, _)| *lsn <= target_lsn)
-                .count();
-            if covered_count == 0 {
-                // Another sync may have committed and drained this target
-                // after our first check but before we acquired the journal
-                // lock. In that case its durable group covers this caller.
-                if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
-                    return Ok(None);
-                }
-                return Err(io::Error::other(
-                    "published sync target has no pending journal mutations",
-                ));
-            }
-            let first_lsn = pending[0].0;
-            let last_lsn = covered_count
-                .checked_sub(1)
-                .and_then(|last_index| pending.get(last_index))
-                .map(|(lsn, _)| *lsn)
-                .ok_or_else(|| io::Error::other("pending journal batch is incomplete"))?;
-            if first_lsn != journal.next_lsn || last_lsn != target_lsn {
-                return Err(io::Error::other(
-                    "journal pending LSN sequence does not cover sync target",
-                ));
-            }
-            pending.drain(..covered_count).collect::<Vec<_>>()
-        };
-        self.append_and_sync_batch(&mut journal, batch, target_lsn)
+        let previously_committed = self.committed_lsn.load(Ordering::Acquire);
+
+        let capture = self.capture_sync_range(target_lsn)?;
+        self.flush_captured_file(&capture, &mut timings)?;
+        let receipt = self.record_durable_range(previously_committed, &capture, &mut timings);
+        Ok((Some(receipt), timings))
     }
 
-    fn append_and_sync_batch(
-        &self,
-        journal: &mut Journal,
-        batch: Vec<(u64, Mutation)>,
-        target_lsn: u64,
-    ) -> io::Result<Option<CommitReceipt>> {
-        let mutations: Vec<Mutation> = batch.iter().map(|(_, mutation)| mutation.clone()).collect();
-        let sequence = self
-            .sequence
-            .as_ref()
-            .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
-        let receipt = match journal.append_group_with_sequence(&mutations, sequence) {
-            Ok(receipt) => receipt,
+    /// Whether an earlier commit already made `target_lsn` durable. A `0`
+    /// target is always covered. Records the coalescing in `timings` and the
+    /// coordinator's counter when it is.
+    fn covered_by_prior_commit(&self, target_lsn: u64, timings: &mut JournalSyncTimings) -> bool {
+        if target_lsn <= self.committed_lsn.load(Ordering::Acquire) {
+            timings.journal_coalesced = true;
+            self.coalesced_syncs.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Fail if a failed commit or append poisoned the journal.
+    fn reject_if_poisoned(&self) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "journal is poisoned after a failed commit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Take [`Self::sync_lock`], counting this caller as a waiter when another
+    /// fsync is in flight, and record how long the wait took.
+    fn acquire_sync_lock(&self, timings: &mut JournalSyncTimings) -> MutexGuard<'_, ()> {
+        let lock_started = std::time::Instant::now();
+        let guard = if let Some(guard) = self.sync_lock.try_lock() {
+            guard
+        } else {
+            timings.journal_waiter = true;
+            self.journal_waiters.fetch_add(1, Ordering::Relaxed);
+            self.sync_lock.lock()
+        };
+        timings.journal_lock_wait = lock_started.elapsed();
+        guard
+    }
+
+    /// Capture what a sync needs, under the journal lock.
+    ///
+    /// Every published group is already complete in the segment, so the
+    /// sync only needs to make its bytes durable. Under the journal lock,
+    /// capture the newest visible LSN (everything at or below it has been
+    /// fully written), the group sequence, and a handle to the current
+    /// file; then release the lock so publishers run during the fsync.
+    /// Syncing through the newest visible LSN, not just `target_lsn`, lets
+    /// one fsync cover every caller that queued behind the previous one.
+    fn capture_sync_range(&self, target_lsn: u64) -> io::Result<SyncCapture> {
+        let mut journal = self.journal.lock();
+        if journal.poisoned {
+            return Err(io::Error::other(
+                "journal handle is poisoned after an earlier failed commit",
+            ));
+        }
+        let through_lsn = self.visible_lsn.load(Ordering::Acquire);
+        if target_lsn > through_lsn {
+            return Err(io::Error::other(
+                "published sync target is not yet visible in the journal",
+            ));
+        }
+        let file = match journal.file.try_clone() {
+            Ok(file) => file,
             Err(error) => {
-                if journal.poisoned {
-                    self.poisoned.store(true, Ordering::Release);
-                } else {
-                    let mut pending = self.pending.lock();
-                    pending.splice(0..0, batch);
-                }
+                self.poisoned.store(true, Ordering::Release);
+                journal.poisoned = true;
                 return Err(error);
             }
         };
-        // The group is complete and readable by a read-only overlay, but not
-        // yet durable. Publish the visibility boundary before the fsync so
-        // workers can observe it. A crash before `make_durable` may lose it,
-        // which is safe: an unfsynced group is never acknowledged.
-        self.visible_lsn
-            .fetch_max(receipt.last_lsn, Ordering::Release);
-        if let Err(error) = journal.make_durable() {
+        Ok(SyncCapture {
+            file,
+            through_lsn,
+            sequence: journal.next_sequence.saturating_sub(1),
+            path: journal.path.clone(),
+            file_len: journal.file_len,
+            base_sequence: journal.base_sequence,
+            base_lsn: journal.base_lsn,
+        })
+    }
+
+    /// Fsync the captured handle with no journal lock held, recording the
+    /// fsync time in `timings`.
+    fn flush_captured_file(
+        &self,
+        capture: &SyncCapture,
+        timings: &mut JournalSyncTimings,
+    ) -> io::Result<()> {
+        let fsync_started = std::time::Instant::now();
+        #[cfg(test)]
+        let hooked = self.run_fsync_hook();
+        #[cfg(not(test))]
+        let hooked: io::Result<()> = Ok(());
+        if let Err(error) = hooked.and_then(|()| capture.file.sync_all()) {
+            // Never retry a failed fsync and report success: the kernel may
+            // have dropped the dirty pages. Poison until reopen and rescan.
             self.poisoned.store(true, Ordering::Release);
+            self.journal.lock().poisoned = true;
             return Err(error);
         }
-        // The group is durable, so record its extent before checking the
-        // receipt. This prevents a retry from re-appending committed entries.
-        self.committed_lsn
-            .store(receipt.last_lsn, Ordering::Release);
-        let committed_count = usize::try_from(
-            receipt
-                .last_lsn
-                .saturating_sub(receipt.first_lsn)
-                .saturating_add(1),
-        )
-        .unwrap_or(batch.len())
-        .min(batch.len());
-        if committed_count < batch.len() {
-            let mut pending = self.pending.lock();
-            pending.splice(0..0, batch.into_iter().skip(committed_count));
-        }
-        if receipt.last_lsn != target_lsn || committed_count != mutations.len() {
-            return Err(io::Error::other(
-                "durable journal group did not cover requested sync target",
-            ));
-        }
-        Ok(Some(receipt))
+        timings.journal_fsync = fsync_started.elapsed();
+        Ok(())
     }
 
-    /// Append a complete transaction group without fsyncing it.
+    /// Run the test-only fsync hook, if one is set, so a test can park the
+    /// sync before its fsync or make it fail.
+    #[cfg(test)]
+    fn run_fsync_hook(&self) -> io::Result<()> {
+        let hook = self.fsync_hook.lock().clone();
+        match hook {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
+    }
+
+    /// Publish the durable boundary a successful fsync established and build
+    /// the receipt for the range this call advanced.
+    fn record_durable_range(
+        &self,
+        previously_committed: u64,
+        capture: &SyncCapture,
+        timings: &mut JournalSyncTimings,
+    ) -> CommitReceipt {
+        timings.journal_records = capture.through_lsn.saturating_sub(previously_committed);
+        self.warn_if_slow_fsync(capture.path.as_path(), capture.through_lsn, timings);
+        self.note_commit(capture.through_lsn);
+        self.promote_pool_committed(capture.through_lsn);
+        // The fsync has returned, so every byte up to the captured length is
+        // durable. Record that, after the fact and without an fsync of its own,
+        // so recovery can tell a crash tail above it from corruption below it.
+        write_durable_hint(
+            &capture.path,
+            capture.base_sequence,
+            capture.base_lsn,
+            capture.file_len,
+            capture.through_lsn,
+        );
+        // The groups were appended at publication, so this fsync wrote no
+        // bytes: the receipt reports the durable range this call advanced.
+        CommitReceipt {
+            sequence: capture.sequence,
+            first_lsn: previously_committed.saturating_add(1),
+            last_lsn: capture.through_lsn,
+            bytes_written: 0,
+        }
+    }
+
+    /// Report an fsync slower than [`SLOW_FSYNC_WARN`] as it happens, with the
+    /// lock wait and waiter count needed to tell contention from disk latency.
+    fn warn_if_slow_fsync(&self, path: &Path, target_lsn: u64, timings: &JournalSyncTimings) {
+        if timings.journal_fsync >= SLOW_FSYNC_WARN {
+            eprintln!(
+                "mtxdb: slow WAL fsync {}ms (through lsn {target_lsn}, lock wait {}ms, append {}ms, {} records, {} bytes, in-flight {}, waiters {}, {})",
+                timings.journal_fsync.as_millis(),
+                timings.journal_lock_wait.as_millis(),
+                timings.journal_append.as_millis(),
+                timings.journal_records,
+                timings.journal_bytes,
+                timings.journal_in_flight,
+                self.journal_waiters.load(Ordering::Relaxed),
+                path.display(),
+            );
+        }
+    }
+
+    /// Publish one autocommit mutation as its own complete group, without
+    /// fsyncing it.
     ///
-    /// Unlike [`Self::publish`], this does not add mutations to the legacy
-    /// queue: it appends queued legacy mutations first, followed by the staged
-    /// transaction mutations, in one complete group and then advances the
-    /// visible boundary. This preserves assigned LSN order and avoids making a
-    /// post-commit callback fail merely because background/legacy writes are
-    /// queued in the same pool.
+    /// The LSN is assigned under the publication lock and the group is
+    /// visible to read-only overlays when this returns. Durability is
+    /// separate: a later [`Self::sync_through`] or the background committer
+    /// fsyncs every visible group at once, so many small groups still share
+    /// one fsync.
     ///
     /// # Errors
-    /// Returns an error if queued LSNs are inconsistent, the journal is
-    /// poisoned, or the append fails. A partial append poisons the underlying
-    /// journal; subsequent publication is rejected until reopen/recovery.
-    pub fn append_pending(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        if mutations.is_empty() {
-            return Err(io::Error::new(
+    /// Returns an error if the journal is poisoned, its LSN space is
+    /// exhausted, or the append fails. A partial append poisons the
+    /// underlying journal; publication is rejected until reopen/recovery.
+    pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
+        self.publish_groups(&[(None, mutations)])?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
+        })
+    }
+
+    /// Like [`Self::publish_group`], tagging every mutation with `pool`.
+    /// Required when the coordinator's segment is pool-tagged; the pool-less
+    /// form would be rejected there.
+    ///
+    /// # Errors
+    /// Same as [`Self::publish_group`].
+    #[cfg(feature = "multi-reader")]
+    pub fn publish_group_tagged(
+        &self,
+        pool: ShardType,
+        mutations: &[Mutation],
+    ) -> io::Result<CommitReceipt> {
+        self.publish_groups(&[(Some(pool), mutations)])?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
+            })
+    }
+
+    /// Publish several pool-tagged transaction batches as one visible journal
+    /// group.
+    ///
+    /// This is the atomic publication boundary for a transaction that writes
+    /// multiple pools through a shared coordinator. The caller must provide
+    /// each pool at most once; empty batches are ignored.
+    ///
+    /// # Errors
+    /// Returns an error if the journal is poisoned or the group cannot be
+    /// appended.
+    #[cfg(feature = "multi-reader")]
+    pub fn publish_tagged_groups(
+        &self,
+        batches: &[(ShardType, &[Mutation])],
+    ) -> io::Result<CommitReceipt> {
+        let staged = batches
+            .iter()
+            .map(|(pool, mutations)| (Some(*pool), *mutations))
+            .collect::<Vec<_>>();
+        self.publish_groups(&staged)?.ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "cannot append an empty transaction group",
-            ));
-        }
+                "cannot publish an empty transaction group",
+            )
+        })
+    }
+
+    /// Single publication path. Holds `publication` for the whole append so
+    /// LSN assignment, the append and the visibility advance are one step.
+    fn publish_groups(
+        &self,
+        staged: &[(Option<ShardType>, &[Mutation])],
+    ) -> io::Result<Option<CommitReceipt>> {
+        let _publication = self.publication.lock();
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -734,31 +1840,20 @@ impl JournalCoordinator {
                 "journal is poisoned after a failed append",
             ));
         }
-        // Hold the queue lock through the append so a concurrent legacy
-        // publisher cannot assign an LSN between the queued and staged parts.
-        let mut pending = self.pending.lock();
-        let mut group_mutations = Vec::with_capacity(pending.len().saturating_add(mutations.len()));
-        for (offset, (lsn, mutation)) in pending.iter().enumerate() {
-            let expected = journal
-                .next_lsn
-                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
-                .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-            if *lsn != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "legacy journal queue is not contiguous with the journal tail",
-                ));
-            }
-            group_mutations.push(mutation.clone());
+        let group_mutations: Vec<(Option<ShardType>, Mutation)> = staged
+            .iter()
+            .flat_map(|(pool, mutations)| mutations.iter().cloned().map(|m| (*pool, m)))
+            .collect();
+        if group_mutations.is_empty() {
+            return Ok(None);
         }
-        group_mutations.extend_from_slice(mutations);
         let expected_first_lsn = journal.next_lsn;
         let expected_count = u64::try_from(group_mutations.len()).unwrap_or(u64::MAX);
         let sequence = self
             .sequence
             .as_ref()
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed));
-        let receipt = match journal.append_group_with_sequence(&group_mutations, sequence) {
+        let receipt = match journal.append_group_for_current_mode(&group_mutations, sequence) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if journal.poisoned {
@@ -777,20 +1872,39 @@ impl JournalCoordinator {
                 .saturating_sub(receipt.first_lsn)
                 .saturating_add(1),
             expected_count,
-            "appended group must cover every queued and staged mutation"
+            "appended group must cover every mutation"
         );
-        let next_lsn = receipt
-            .last_lsn
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-        pending.clear();
-        self.next_lsn.store(next_lsn, Ordering::Relaxed);
+        // Queue this group's per-pool extents before it becomes visible, still
+        // under the journal lock. A sync that captures the new visible LSN
+        // then always finds the extents and promotes each pool's watermark;
+        // queuing after the visibility advance would let a sync race past them.
+        let extents = pool_extents(
+            receipt.last_lsn,
+            group_mutations.iter().map(|(pool, _)| *pool),
+        );
+        if !extents.is_empty() {
+            self.pending_promotions
+                .lock()
+                .push((receipt.last_lsn, extents));
+        }
         self.published_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
         self.visible_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
-        drop(pending);
-        Ok(receipt)
+        drop(journal);
+        // Wake the committer only when a burst is at or above its early-flush
+        // bound; this is the hot path, so ordinary publishes must not pay a
+        // futex wake. `committer_wake_threshold` is zero when no committer is
+        // running. Only the first publish at or above the bound wakes in a
+        // commit epoch; any commit advances the epoch and re-arms the next
+        // crossing.
+        let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
+        if threshold > 0 && self.pending_count() >= threshold && self.claim_threshold_wake() {
+            #[cfg(test)]
+            self.threshold_wakes.fetch_add(1, Ordering::Relaxed);
+            self.wake_durable_waiters();
+        }
+        Ok(Some(receipt))
     }
 
     /// Capture the current boundary and wait for a durable group covering it.
@@ -800,6 +1914,442 @@ impl JournalCoordinator {
     pub fn sync(&self) -> io::Result<Option<CommitReceipt>> {
         let target = self.capture_sync_target();
         self.sync_through(target)
+    }
+
+    /// Register `target_lsn` as a durability request without blocking.
+    ///
+    /// Returns a [`DurabilityToken`] to pass to [`Self::wait_durable`]. The
+    /// request is additive: it never weakens [`Self::sync_through`] /
+    /// [`Self::sync`], which remain immediate barriers. With a background
+    /// committer running, `wait_durable` blocks until the committer's group
+    /// covers the token; without one it performs the blocking commit itself.
+    #[must_use]
+    pub fn request_durable(&self, target_lsn: u64) -> DurabilityToken {
+        self.durable_requests.fetch_add(1, Ordering::Relaxed);
+        self.durable_requested
+            .fetch_max(target_lsn, Ordering::AcqRel);
+        // Wake the committer (for a threshold flush) and any waiters parked on
+        // the old boundary.
+        self.wake_durable_waiters();
+        DurabilityToken { lsn: target_lsn }
+    }
+
+    /// Highest LSN any caller has requested through [`Self::request_durable`].
+    #[must_use]
+    pub fn durable_requested(&self) -> u64 {
+        self.durable_requested.load(Ordering::Acquire)
+    }
+
+    /// Lifetime durability accounting: requests versus real fsyncs, records
+    /// per fsync, and blocked-wait latency.
+    #[must_use]
+    pub fn durability_stats(&self) -> DurabilityStats {
+        DurabilityStats {
+            durable_requests: self.durable_requests.load(Ordering::Relaxed),
+            durable_waits_already_durable: self
+                .durable_waits_already_durable
+                .load(Ordering::Relaxed),
+            durable_wait: self.durable_wait.snapshot(),
+            sync_requests: self.sync_calls.load(Ordering::Relaxed),
+            sync_waiters: self.journal_waiters.load(Ordering::Relaxed),
+            sync_coalesced: self.coalesced_syncs.load(Ordering::Relaxed),
+            commits: self.commits.load(Ordering::Relaxed),
+            commit_records: self.commit_records.load(Ordering::Relaxed),
+            max_commit_records: self.max_commit_records.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Number of published mutations not yet durably committed. Used as the
+    /// background committer's early-flush bound.
+    #[must_use]
+    pub fn pending_count(&self) -> u64 {
+        self.published_lsn
+            .load(Ordering::Acquire)
+            .saturating_sub(self.committed_lsn.load(Ordering::Acquire))
+    }
+
+    /// Whether a background committer is currently running.
+    #[must_use]
+    pub fn has_background_committer(&self) -> bool {
+        matches!(*self.background.lock(), BackgroundState::Running(_))
+    }
+
+    /// Number of background group commits that appended and fsynced a group.
+    #[must_use]
+    pub fn background_commits(&self) -> u64 {
+        self.background_commits.load(Ordering::Relaxed)
+    }
+
+    /// Number of background commit attempts already covered by a concurrent
+    /// durable group. Idle timer ticks (nothing pending) are not counted.
+    #[must_use]
+    pub fn background_coalesced(&self) -> u64 {
+        self.background_coalesced.load(Ordering::Relaxed)
+    }
+
+    fn background_failure_detail(&self) -> Option<BackgroundFailure> {
+        self.background_failure.lock().clone()
+    }
+
+    /// Return the terminal background-committer failure, if any, without
+    /// consuming it. Callers use this to retain dirty work and retry through
+    /// their own scheduling layer; `wait_durable` remains the blocking API.
+    #[must_use]
+    pub fn background_failure_message(&self) -> Option<String> {
+        self.background_failure
+            .lock()
+            .as_ref()
+            .map(|failure| failure.message.clone())
+    }
+
+    /// Wake the committer and any `wait_durable` callers.
+    ///
+    /// Takes [`Self::durable_lock`] so the wake cannot be lost to the race
+    /// where a waiter checks its predicate and then parks after the notifier
+    /// has already notified: the notifier either holds the lock while the
+    /// waiter is parked (waking it) or blocks until the waiter releases it.
+    fn wake_durable_waiters(&self) {
+        let _guard = self.durable_lock.lock();
+        self.durable_cv.notify_all();
+    }
+
+    /// Claim the wake for the current commit epoch.
+    ///
+    /// Returns `true` only for the publish that wakes the committer for this
+    /// epoch, so a burst costs one wake. The claim is retried because a commit
+    /// can advance the epoch between the load and the CAS; re-reading the epoch
+    /// after a successful claim ensures that newer commit also gets a wake
+    /// instead of being suppressed by a claim that was valid a moment earlier.
+    fn claim_threshold_wake(&self) -> bool {
+        self.claim_threshold_wake_with(|| {})
+    }
+
+    /// [`Self::claim_threshold_wake`] with a hook run between a successful claim
+    /// and the epoch recheck, so tests can force a commit into that window.
+    fn claim_threshold_wake_with(&self, mut between_claim_and_recheck: impl FnMut()) -> bool {
+        loop {
+            let notified = self.threshold_notified_epoch.load(Ordering::Acquire);
+            let epoch = self.commit_epoch.load(Ordering::Acquire);
+            if notified == epoch {
+                return false;
+            }
+            if self
+                .threshold_notified_epoch
+                .compare_exchange(notified, epoch, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                between_claim_and_recheck();
+                if self.commit_epoch.load(Ordering::Acquire) == epoch {
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Wake the committer and durability waiters when a durable commit left the
+    /// pending queue at or above the early-flush bound.
+    ///
+    /// Publishers that arrived during an fsync read the pre-commit epoch and
+    /// suppressed their wake, so nothing would re-arm the parked committer
+    /// until the next publish or timer tick. This closes that window from the
+    /// commit side, after the epoch has advanced. It is a no-op when no
+    /// committer is running (`committer_wake_threshold` is zero).
+    fn wake_committer_if_backlogged(&self) {
+        let threshold = self.committer_wake_threshold.load(Ordering::Relaxed);
+        if threshold > 0 && self.pending_count() >= threshold {
+            self.wake_durable_waiters();
+        }
+    }
+
+    /// Block until the group covering `token` is durable.
+    ///
+    /// With a background committer running this waits for it to flush; the
+    /// bounded poll interval lets the waiter notice a committer that stopped or
+    /// a poisoned journal. A committer that failed terminally is reported
+    /// rather than waited on. Without a committer, this is exactly
+    /// [`Self::sync_through`] on the token's LSN — the historical blocking
+    /// behavior, so a caller that never opts into background commits is
+    /// unaffected.
+    ///
+    /// # Errors
+    /// Returns an error if the target was never published, the journal is
+    /// poisoned, the committer failed, or the committing sync fails.
+    pub fn wait_durable(&self, token: DurabilityToken) -> io::Result<Option<CommitReceipt>> {
+        let target = token.lsn;
+        if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
+            self.durable_waits_already_durable
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let result = self.wait_durable_blocking(target);
+        self.durable_wait.observe(started.elapsed());
+        result
+    }
+
+    fn wait_durable_blocking(&self, target: u64) -> io::Result<Option<CommitReceipt>> {
+        loop {
+            if target <= self.committed_lsn.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            // Recheck every predicate under `durable_lock`, the same lock the
+            // notifiers take, so a state change cannot slip between check and
+            // park. The poll interval remains a backstop, not a requirement.
+            let mut guard = self.durable_lock.lock();
+            if target <= self.committed_lsn.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "journal is poisoned after a failed commit",
+                ));
+            }
+            // A stopped committer falls through to a direct commit, preserving
+            // the historical no-committer behavior and error text, but a
+            // committer that failed must not be silently papered over.
+            if let Some(failure) = self.background_failure_detail() {
+                return Err(failure.into_io());
+            }
+            if !self.has_background_committer() {
+                drop(guard);
+                return self.sync_through(target);
+            }
+            // Only with a live committer is an unpublished target validated
+            // here; the no-committer path above reaches `sync_through` first.
+            if target > self.published_lsn.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sync target has not been published",
+                ));
+            }
+            self.durable_cv.wait_for(&mut guard, DURABILITY_WAIT_POLL);
+        }
+    }
+
+    /// Perform one bounded group commit over everything published so far.
+    ///
+    /// Used by the background committer's timer and by
+    /// [`Self::stop_background_committer`]. A no-op returning `None` when
+    /// nothing is pending (so an idle tick neither fsyncs nor inflates the
+    /// coalescing counter). This is the journal-level durability boundary; a
+    /// caller that also needs its packfile checkpoint rewritten should use the
+    /// storage-level sync path instead.
+    ///
+    /// # Errors
+    /// Propagates a durable-commit failure from [`Self::sync_through`].
+    pub fn flush_durable(&self) -> io::Result<Option<CommitReceipt>> {
+        let target = self.capture_sync_target();
+        if target == 0 || target <= self.committed_lsn.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let receipt = self.sync_through(target)?;
+        if receipt.is_some() {
+            self.background_commits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Another caller's group covered this target first.
+            self.background_coalesced.fetch_add(1, Ordering::Relaxed);
+        }
+        // A group commit may cover waiters parked on a boundary below `target`.
+        self.wake_durable_waiters();
+        Ok(receipt)
+    }
+
+    /// Start a background thread that fsyncs the pending WAL group on a bounded
+    /// interval, coalescing every mutation published in the window into one
+    /// group. Flushes early once `max_pending` records are outstanding.
+    /// Idempotent: a call while one is running (or stopping) is a no-op.
+    ///
+    /// The thread holds only a [`Weak`] reference between iterations, so
+    /// dropping the last `Arc<JournalCoordinator>` lets it exit within one
+    /// interval without an `Arc` cycle. That is a bounded delay, not immediate
+    /// teardown — call [`Self::stop_background_committer`] for deterministic
+    /// cleanup and a final flush.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] if `interval` is zero or
+    /// `max_pending` is zero (both would busy-loop or flush continuously), or
+    /// another error if the committer thread cannot be spawned.
+    pub fn start_background_committer(
+        self: &Arc<Self>,
+        config: GroupCommitConfig,
+    ) -> io::Result<()> {
+        if config.interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background committer interval must be greater than zero",
+            ));
+        }
+        if config.max_pending == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background committer max_pending must be greater than zero",
+            ));
+        }
+        let mut slot = self.background.lock();
+        // Running or Stopping: never spawn a second committer.
+        if !matches!(*slot, BackgroundState::Stopped) {
+            return Ok(());
+        }
+        *self.background_failure.lock() = None;
+        // A failed run can leave the notification epoch equal to the current
+        // commit epoch, which would suppress the first threshold wake after a
+        // restart. Reset it so the first crossing always wakes.
+        self.threshold_notified_epoch
+            .store(u64::MAX, Ordering::Release);
+        let stop = Arc::new(AtomicBool::new(false));
+        let weak = Arc::downgrade(self);
+        let stop_clone = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("mtxdb-journal-committer".to_owned())
+            .spawn(move || {
+                // Catch a panic so the terminal failure is recorded and waiters
+                // are released instead of polling forever on a dead worker.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::background_committer_loop(&weak, config, &stop_clone)
+                }));
+                if let Some(coordinator) = weak.upgrade() {
+                    let failure = match outcome {
+                        Ok(Ok(())) => None,
+                        Ok(Err(failure)) => Some(failure),
+                        Err(_) => Some(BackgroundFailure {
+                            kind: io::ErrorKind::Other,
+                            message: "background committer panicked".to_owned(),
+                        }),
+                    };
+                    coordinator.finish_background(failure);
+                }
+            })
+            .map_err(|error| {
+                io::Error::other(format!("failed to spawn journal committer: {error}"))
+            })?;
+        self.committer_wake_threshold
+            .store(config.max_pending, Ordering::Release);
+        *slot = BackgroundState::Running(BackgroundCommitter {
+            stop,
+            handle: Some(handle),
+        });
+        Ok(())
+    }
+
+    /// Signal the background committer to stop, join it, then flush any final
+    /// pending group so a quiet stream's last write is durable before this
+    /// returns. Safe to call when no committer is running (it still flushes).
+    ///
+    /// The committer slot is held in a `Stopping` state across the join, so a
+    /// concurrent [`Self::start_background_committer`] cannot spawn a second
+    /// worker mid-teardown.
+    ///
+    /// # Errors
+    /// Propagates a failure from the final [`Self::flush_durable`], and surfaces
+    /// a terminal committer failure recorded by the worker.
+    pub fn stop_background_committer(&self) -> io::Result<()> {
+        let handle = {
+            let mut slot = self.background.lock();
+            match std::mem::replace(&mut *slot, BackgroundState::Stopping) {
+                BackgroundState::Running(mut committer) => {
+                    committer.stop.store(true, Ordering::Release);
+                    committer.handle.take()
+                }
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        };
+        self.committer_wake_threshold.store(0, Ordering::Release);
+        self.wake_durable_waiters();
+        if let Some(handle) = handle {
+            // A panic in the committer is caught and recorded by the worker's
+            // wrapper; joining still succeeds and the failure is surfaced below.
+            let _ = handle.join();
+        }
+        // Transition `Stopping -> Stopped` and take the recorded failure under
+        // one `background` lock. Otherwise a `start_background_committer` that
+        // sees `Stopped` can clear `background_failure` in the window between
+        // the transition and the take, silently losing the worker's failure.
+        let failure = {
+            let mut slot = self.background.lock();
+            if matches!(*slot, BackgroundState::Stopping) {
+                *slot = BackgroundState::Stopped;
+            }
+            self.background_failure.lock().take()
+        };
+        self.flush_durable()?;
+        if let Some(failure) = failure {
+            return Err(failure.into_io());
+        }
+        Ok(())
+    }
+
+    /// Mark the committer slot stopped, publish any terminal failure, and wake
+    /// waiters. Called by the worker itself as it exits.
+    fn finish_background(&self, failure: Option<BackgroundFailure>) {
+        // Transition, publish the failure, and clear the wake threshold under a
+        // single `background` lock. A concurrent `start_background_committer`
+        // (which holds that lock to clear `background_failure` and set its own
+        // threshold) therefore either sees this worker still `Running` and does
+        // nothing, or runs after the failure is already recorded; it cannot
+        // erase the failure or have its threshold zeroed by this exiting worker.
+        {
+            let mut slot = self.background.lock();
+            // Leave `Stopping` alone: `stop_background_committer` owns that
+            // transition and takes the failure after joining this thread.
+            if matches!(*slot, BackgroundState::Running(_)) {
+                *slot = BackgroundState::Stopped;
+                self.committer_wake_threshold.store(0, Ordering::Release);
+            }
+            if let Some(failure) = failure {
+                *self.background_failure.lock() = Some(failure);
+            }
+        }
+        self.wake_durable_waiters();
+    }
+
+    fn background_committer_loop(
+        weak: &Weak<Self>,
+        config: GroupCommitConfig,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<(), BackgroundFailure> {
+        let interval = config.interval;
+        loop {
+            let Some(coordinator) = weak.upgrade() else {
+                return Ok(());
+            };
+            let now = std::time::Instant::now();
+            let deadline = now.checked_add(interval).unwrap_or(now);
+            {
+                let mut guard = coordinator.durable_lock.lock();
+                loop {
+                    if stop.load(Ordering::Acquire) || coordinator.poisoned.load(Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if coordinator.pending_count() >= config.max_pending {
+                        break;
+                    }
+                    let timeout = deadline.saturating_duration_since(now);
+                    #[cfg(test)]
+                    coordinator.committer_parks.fetch_add(1, Ordering::Release);
+                    coordinator.durable_cv.wait_for(&mut guard, timeout);
+                }
+            }
+            if stop.load(Ordering::Acquire) || coordinator.poisoned.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // The final flush on stop is done by `stop_background_committer`
+            // after join, so a stop that lands here does not double-fsync.
+            if let Err(error) = coordinator.flush_durable() {
+                if coordinator.poisoned.load(Ordering::Acquire) {
+                    // Poison is already reported to waiters via the poison bit.
+                    return Ok(());
+                }
+                return Err(BackgroundFailure::from_io(&error));
+            }
+        }
     }
 
     /// Compact the segment, dropping committed groups at or below
@@ -815,6 +2365,9 @@ impl JournalCoordinator {
     /// Returns an error if the journal is poisoned or the segment cannot be
     /// rewritten.
     pub fn reclaim_through(&self, covered_lsn: u64) -> io::Result<Reclaim> {
+        // Wait out any in-flight fsync: the rewrite replaces the segment file,
+        // and a sync must not flush a handle to the replaced inode.
+        let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
         journal.reclaim_through(covered_lsn)
     }
@@ -839,6 +2392,7 @@ impl Journal {
     /// invalid, the segment is oversized, or a committed group fails
     /// validation.
     pub fn scan_read_only(path: impl AsRef<Path>) -> io::Result<Scan> {
+        let path = path.as_ref();
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Scan::empty()),
@@ -850,8 +2404,14 @@ impl Journal {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SEGMENT_LEN {
             return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
         }
-        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
-        scan_bytes(&bytes, base_sequence, base_lsn)
+        let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        let durable_len = read_durable_len(
+            path,
+            base_sequence,
+            base_lsn,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        );
+        scan_bytes(&bytes, base_sequence, base_lsn, version, durable_len)
     }
 
     /// Scan only the committed groups appended at or after `start`, a group
@@ -874,6 +2434,7 @@ impl Journal {
         start: u64,
         expected_lsn: u64,
     ) -> io::Result<Scan> {
+        let path = path.as_ref();
         let mut file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Scan::empty()),
@@ -886,19 +2447,84 @@ impl Journal {
         file.seek(SeekFrom::Start(0))?;
         let mut header = vec![0; FILE_HEADER_LEN];
         file.read_exact(&mut header)?;
-        let (_, base_lsn) = validate_file_header(&header)?;
+        let (version, base_sequence, base_lsn) = validate_file_header(&header)?;
+        let durable_len = read_durable_len(path, base_sequence, base_lsn, len);
         if start >= len {
             return Ok(Scan {
                 groups: Vec::new(),
                 valid_len: start.min(len),
                 truncated_tail: false,
                 base_lsn,
+                consumed_tail: Vec::new(),
             });
         }
         file.seek(SeekFrom::Start(start))?;
         let mut tail = Vec::new();
         file.read_to_end(&mut tail)?;
-        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn)
+        scan_groups_from(
+            &tail,
+            start,
+            0,
+            expected_lsn,
+            base_lsn,
+            version,
+            durable_len,
+        )
+    }
+
+    /// Read up to `max_len` bytes of the segment ending at `end_offset` from an
+    /// already-open `file` into `window`, never reaching back into the file
+    /// header. Returns `false` when the file is shorter than `end_offset` or
+    /// has no group bytes before it, leaving `window` unspecified.
+    ///
+    /// A read-only overlay keeps this window from the end of the last group it
+    /// consumed and compares it on later refreshes: file length alone cannot
+    /// show that the bytes already consumed are still the same ones. The
+    /// window is compared byte for byte instead of relying on the group
+    /// trailer, because the trailer is not a content fingerprint: the group
+    /// checksum covers `header || records` and every record already ends with
+    /// its own CRC32, so for groups of the same shape it comes out identical
+    /// whatever the payload. The window includes the last record's own CRC,
+    /// which does depend on the record's full content.
+    ///
+    /// Reads through the caller's descriptor with a positioned read, so the
+    /// refresh path pays one syscall and reuses `window`'s allocation instead
+    /// of opening the file each time. The caller must notice a replaced file
+    /// itself (its descriptor keeps the old inode). Never repairs or creates
+    /// the file.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the read fails.
+    pub(crate) fn read_tail_ending_at(
+        file: &File,
+        end_offset: u64,
+        max_len: u64,
+        window: &mut Vec<u8>,
+    ) -> io::Result<bool> {
+        let header_len = u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX);
+        if end_offset <= header_len {
+            return Ok(false);
+        }
+        let start = end_offset.saturating_sub(max_len).max(header_len);
+        let window_len = usize::try_from(end_offset.saturating_sub(start))
+            .map_err(|_| invalid_data("tail window exceeds the address space"))?;
+        window.clear();
+        window.resize(window_len, 0);
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_exact_at(file, window, start);
+        #[cfg(not(unix))]
+        let read = {
+            let mut handle = file;
+            handle
+                .seek(SeekFrom::Start(start))
+                .and_then(|_| handle.read_exact(window))
+        };
+        match read {
+            Ok(()) => Ok(true),
+            // The file is shorter than the window's end: the consumed prefix is gone.
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Open a journal and recover its committed groups.
@@ -914,6 +2540,54 @@ impl Journal {
     /// data-bearing segment's header is invalid, if any committed group fails
     /// validation, or if the segment exceeds `MAX_SEGMENT_LEN`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
+        Self::open_versioned(path, JournalVersion::per_pool(), 1)
+    }
+
+    /// Open a shared (multi-pool) journal segment, or create one if the file is
+    /// absent. The segment is created as `JournalVersion::V3PoolTagged`, so
+    /// every mutation frame appended through it must carry a pool tag.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`], plus `InvalidData` if an existing segment is not
+    /// the pool-tagged version.
+    #[cfg(feature = "multi-reader")]
+    pub fn open_shared(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
+        Self::open_versioned(path, JournalVersion::shared(), 1)
+    }
+
+    /// Like [`Self::open_shared`], but when the segment is first created its
+    /// LSN space begins at `base_lsn` rather than 1. An existing segment
+    /// ignores `base_lsn` and keeps its own.
+    ///
+    /// Internal to the root-level open path: an arbitrary `base_lsn` would let
+    /// a caller create a segment whose numbering does not line up with the
+    /// pools' recorded coverage, so this is not public. Callers that open a
+    /// database root should go through
+    /// [`crate::database::SharedDatabase::open`], which computes the seed from
+    /// the pools' `journal.lsn` and passes it here.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_shared`].
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn open_shared_with_base(
+        path: impl AsRef<Path>,
+        base_lsn: u64,
+    ) -> io::Result<(Self, Scan)> {
+        Self::open_versioned(path, JournalVersion::shared(), base_lsn.max(1))
+    }
+
+    /// Open a journal whose on-disk version must be `version`, creating it with
+    /// that version and base LSN `base_lsn` when the file is absent or shorter
+    /// than the header.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`], plus `InvalidData` if an existing complete
+    /// segment was written by a different version.
+    fn open_versioned(
+        path: impl AsRef<Path>,
+        version: JournalVersion,
+        base_lsn: u64,
+    ) -> io::Result<(Self, Scan)> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -934,21 +2608,50 @@ impl Journal {
             // failing open forever on a partial header.
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            write_file_header(&mut file, 1, 1)?;
+            write_file_header(&mut file, version, 1, base_lsn)?;
             file.sync_all()?;
             sync_parent_dir(&path)?;
         }
 
         let bytes = fs::read(&path)?;
-        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        let (found_version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        if found_version != version {
+            return Err(invalid_data(
+                "journal segment version does not match open mode",
+            ));
+        }
         if bytes.len() as u64 > MAX_SEGMENT_LEN {
             return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
         }
-        let scan = scan_bytes(&bytes, base_sequence, base_lsn)?;
+        let durable_len = read_durable_len(
+            &path,
+            base_sequence,
+            base_lsn,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        );
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn, version, durable_len)?;
         if scan.truncated_tail {
             file.set_len(scan.valid_len)?;
         }
         file.seek(SeekFrom::Start(scan.valid_len))?;
+        if scan.truncated_tail || !scan.groups.is_empty() {
+            // What recovery keeps may exist only in the page cache (a process
+            // crash leaves it there), yet the coordinator will report it
+            // committed. Make it durable now, and record that in the hint, so a
+            // later sync never claims bytes that were not fsynced. The same
+            // fsync makes a truncation durable, including one that dropped
+            // every group, so a dropped tail cannot reappear.
+            file.sync_all()?;
+            if let Some(last) = scan.groups.last() {
+                write_durable_hint(
+                    &path,
+                    base_sequence,
+                    base_lsn,
+                    scan.valid_len,
+                    last.last_lsn,
+                );
+            }
+        }
         let next_sequence = scan
             .groups
             .last()
@@ -962,6 +2665,10 @@ impl Journal {
             Self {
                 path,
                 file,
+                file_len: scan.valid_len,
+                base_sequence,
+                base_lsn,
+                version,
                 next_sequence,
                 next_lsn,
                 poisoned: false,
@@ -996,10 +2703,62 @@ impl Journal {
     ///
     /// # Errors
     /// Same as [`Self::append_group`], plus `InvalidInput` if `sequence` is
-    /// behind this segment's next sequence.
+    /// behind this segment's next sequence, or if this is a pool-tagged segment
+    /// (which requires the multi-reader-only
+    /// `append_group_tagged_with_sequence` method).
     pub fn append_group_with_sequence(
         &mut self,
         mutations: &[Mutation],
+        sequence: Option<u64>,
+    ) -> io::Result<CommitReceipt> {
+        let untagged = mutations
+            .iter()
+            .cloned()
+            .map(|mutation| (None, mutation))
+            .collect::<Vec<_>>();
+        self.append_group_inner(&untagged, sequence)
+    }
+
+    /// Append a pool-tagged group to a shared, pool-tagged segment.
+    ///
+    /// # Errors
+    /// Same as [`Self::append_group_with_sequence`], plus `InvalidInput` if
+    /// this segment is not pool-tagged.
+    #[cfg(feature = "multi-reader")]
+    pub fn append_group_tagged_with_sequence(
+        &mut self,
+        mutations: &[(Option<ShardType>, Mutation)],
+        sequence: Option<u64>,
+    ) -> io::Result<CommitReceipt> {
+        self.append_group_inner(mutations, sequence)
+    }
+
+    fn append_group_for_current_mode(
+        &mut self,
+        mutations: &[(Option<ShardType>, Mutation)],
+        sequence: Option<u64>,
+    ) -> io::Result<CommitReceipt> {
+        #[cfg(feature = "multi-reader")]
+        {
+            self.append_group_tagged_with_sequence(mutations, sequence)
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        {
+            let untagged = mutations
+                .iter()
+                .cloned()
+                .map(|(_, mutation)| mutation)
+                .collect::<Vec<_>>();
+            self.append_group_with_sequence(&untagged, sequence)
+        }
+    }
+
+    /// Shared implementation for a group of mutations, each paired with its
+    /// optional pool tag. The tag must match the segment's dialect (see
+    /// [`JournalVersion::is_pool_tagged`]).
+    fn append_group_inner(
+        &mut self,
+        mutations: &[(Option<ShardType>, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
         if self.poisoned {
@@ -1030,13 +2789,13 @@ impl Journal {
         }
 
         let mut payload = Vec::new();
-        for (index, mutation) in mutations.iter().enumerate() {
+        for (index, (pool, mutation)) in mutations.iter().enumerate() {
             let lsn = first_lsn
                 .checked_add(u64::try_from(index).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "mutation index exceeds u64")
                 })?)
                 .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-            encode_mutation(lsn, mutation, &mut payload)?;
+            encode_mutation(lsn, *pool, self.version, mutation, &mut payload)?;
             if u64::try_from(payload.len()).unwrap_or(u64::MAX) > MAX_GROUP_LEN {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1066,8 +2825,7 @@ impl Journal {
                 .saturating_add(trailer.len()),
         )
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group too large"))?;
-        let segment_size = self.file.metadata()?.len();
-        if segment_size.saturating_add(group_size) > MAX_SEGMENT_LEN {
+        if self.file_len.saturating_add(group_size) > MAX_SEGMENT_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "journal segment is full; drain/rotate before accepting more writes",
@@ -1080,16 +2838,25 @@ impl Journal {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
 
-        let write_result = (|| -> io::Result<()> {
-            self.file.write_all(&header)?;
-            self.file.write_all(&payload)?;
-            self.file.write_all(&trailer)?;
-            Ok(())
-        })();
+        // One write per group: every autocommit publish lands here, so the
+        // group goes out as a single contiguous buffer instead of three
+        // syscalls. A torn write still leaves an incomplete tail that recovery
+        // truncates, exactly as before.
+        let mut frame = Vec::with_capacity(
+            header
+                .len()
+                .saturating_add(payload.len())
+                .saturating_add(trailer.len()),
+        );
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&trailer);
+        let write_result = self.file.write_all(&frame);
         if let Err(error) = write_result {
             self.poisoned = true;
             return Err(error);
         }
+        self.file_len = self.file_len.saturating_add(group_size);
 
         self.next_sequence = next_sequence;
         self.next_lsn = next_lsn;
@@ -1098,6 +2865,7 @@ impl Journal {
             sequence,
             first_lsn,
             last_lsn,
+            bytes_written: group_size,
         })
     }
 
@@ -1120,6 +2888,15 @@ impl Journal {
             self.poisoned = true;
             return Err(error);
         }
+        // The fsync returned, so everything appended so far is durable: record
+        // that in the durability hint (see `HINT_MAGIC`), after the fact.
+        write_durable_hint(
+            &self.path,
+            self.base_sequence,
+            self.base_lsn,
+            self.file_len,
+            self.next_lsn.saturating_sub(1),
+        );
         Ok(())
     }
 
@@ -1147,7 +2924,7 @@ impl Journal {
     ///
     /// Callers sharing one cross-pool sequence allocator initialize it above
     /// the maximum of these across segments. See
-    /// [`JournalCoordinator::with_shared_sequence`].
+    /// `JournalCoordinator::with_shared_sequence`.
     #[must_use]
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
@@ -1183,8 +2960,11 @@ impl Journal {
             ));
         }
         let bytes = fs::read(&self.path)?;
-        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
-        let scan = scan_bytes(&bytes, base_sequence, base_lsn)?;
+        let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        // Reclaim rewrites the segment from its own live file, so any invalid
+        // group there is corruption, not a crash tail: treat every byte as
+        // durable and let it fail.
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn, version, u64::MAX)?;
         let retained = scan
             .groups
             .iter()
@@ -1202,9 +2982,9 @@ impl Journal {
             .map_or((self.next_sequence, self.next_lsn), |group| {
                 (group.sequence, group.first_lsn)
             });
-        let mut rebuilt = file_header_bytes(new_base_sequence, new_base_lsn);
+        let mut rebuilt = file_header_bytes(self.version, new_base_sequence, new_base_lsn);
         for group in &retained {
-            encode_group(group, &mut rebuilt)?;
+            encode_group(group, self.version, &mut rebuilt)?;
         }
 
         let temp_path = self.path.with_extension("rotate");
@@ -1235,6 +3015,21 @@ impl Journal {
             }
         };
         self.file = replacement;
+        self.file_len = u64::try_from(rebuilt.len()).unwrap_or(u64::MAX);
+        self.base_sequence = new_base_sequence;
+        self.base_lsn = new_base_lsn;
+        // The rebuilt file was fsynced before the rename, so all of it is
+        // durable. Re-key the hint to the new base: the old one described
+        // offsets that no longer exist and is ignored from here on.
+        write_durable_hint(
+            &self.path,
+            new_base_sequence,
+            new_base_lsn,
+            self.file_len,
+            retained
+                .last()
+                .map_or(new_base_lsn.saturating_sub(1), |group| group.last_lsn),
+        );
         if let Err(error) = sync_parent_dir(&self.path) {
             self.poisoned = true;
             return Err(error);
@@ -1251,43 +3046,49 @@ impl Journal {
     }
 }
 
-fn file_header_bytes(base_sequence: u64, base_lsn: u64) -> Vec<u8> {
-    let mut header = Vec::with_capacity(FILE_HEADER_LEN);
-    header.extend_from_slice(FILE_MAGIC);
-    header.extend_from_slice(&FILE_VERSION.to_le_bytes());
-    header.extend_from_slice(&base_sequence.to_le_bytes());
-    header.extend_from_slice(&base_lsn.to_le_bytes());
+fn file_header_bytes(version: JournalVersion, base_sequence: u64, base_lsn: u64) -> Vec<u8> {
+    let mut header = vec![0_u8; FILE_HEADER_LEN];
+    header[FH_MAGIC].copy_from_slice(FILE_MAGIC);
+    header[FH_VERSION].copy_from_slice(&version.as_u32().to_le_bytes());
+    header[FH_BASE_SEQUENCE].copy_from_slice(&base_sequence.to_le_bytes());
+    header[FH_BASE_LSN].copy_from_slice(&base_lsn.to_le_bytes());
     let mut crc = Hasher::new();
-    crc.update(&header);
-    header.extend_from_slice(&crc.finalize().to_le_bytes());
+    crc.update(&header[FH_CRC_COVERED]);
+    header[FH_CRC].copy_from_slice(&crc.finalize().to_le_bytes());
     header
 }
 
-fn write_file_header(file: &mut File, base_sequence: u64, base_lsn: u64) -> io::Result<()> {
-    file.write_all(&file_header_bytes(base_sequence, base_lsn))
+fn write_file_header(
+    file: &mut File,
+    version: JournalVersion,
+    base_sequence: u64,
+    base_lsn: u64,
+) -> io::Result<()> {
+    file.write_all(&file_header_bytes(version, base_sequence, base_lsn))
 }
 
 /// Validate the file header, returning the base `(sequence, lsn)` this segment
 /// starts numbering at. A rotated segment records the first surviving group's
 /// numbers here so scanning never has to assume the sequence begins at 1.
-fn validate_file_header(bytes: &[u8]) -> io::Result<(u64, u64)> {
+fn validate_file_header(bytes: &[u8]) -> io::Result<(JournalVersion, u64, u64)> {
     let Some(header) = bytes.get(..FILE_HEADER_LEN) else {
         return Err(invalid_data("truncated journal file header"));
     };
-    if &header[..8] != FILE_MAGIC {
+    if &header[FH_MAGIC] != FILE_MAGIC {
         return Err(invalid_data("invalid journal magic"));
     }
-    if u32::from_le_bytes(header[8..12].try_into().expect("fixed slice")) != FILE_VERSION {
-        return Err(invalid_data("unsupported journal version"));
-    }
+    let version = JournalVersion::from_u32(u32::from_le_bytes(
+        header[FH_VERSION].try_into().expect("fixed slice"),
+    ))?;
     let mut crc = Hasher::new();
-    crc.update(&header[..28]);
-    if u32::from_le_bytes(header[28..32].try_into().expect("fixed slice")) != crc.finalize() {
+    crc.update(&header[FH_CRC_COVERED]);
+    if u32::from_le_bytes(header[FH_CRC].try_into().expect("fixed slice")) != crc.finalize() {
         return Err(invalid_data("journal header checksum mismatch"));
     }
     Ok((
-        u64::from_le_bytes(header[12..20].try_into().expect("fixed slice")),
-        u64::from_le_bytes(header[20..28].try_into().expect("fixed slice")),
+        version,
+        u64::from_le_bytes(header[FH_BASE_SEQUENCE].try_into().expect("fixed slice")),
+        u64::from_le_bytes(header[FH_BASE_LSN].try_into().expect("fixed slice")),
     ))
 }
 
@@ -1300,33 +3101,43 @@ fn encode_group_header(
 ) -> [u8; GROUP_HEADER_LEN] {
     let mut header = [0_u8; GROUP_HEADER_LEN];
     let header_len = u32::try_from(GROUP_HEADER_LEN).expect("GROUP_HEADER_LEN must fit in a u32");
-    header[..4].copy_from_slice(GROUP_MAGIC);
-    header[4..8].copy_from_slice(&header_len.to_le_bytes());
-    header[8..16].copy_from_slice(&sequence.to_le_bytes());
-    header[16..24].copy_from_slice(&first_lsn.to_le_bytes());
-    header[24..32].copy_from_slice(&last_lsn.to_le_bytes());
-    header[32..40].copy_from_slice(&payload_len.to_le_bytes());
-    header[40..44].copy_from_slice(&record_count.to_le_bytes());
+    header[GH_MAGIC].copy_from_slice(GROUP_MAGIC);
+    header[GH_HEADER_LEN].copy_from_slice(&header_len.to_le_bytes());
+    header[GH_SEQUENCE].copy_from_slice(&sequence.to_le_bytes());
+    header[GH_FIRST_LSN].copy_from_slice(&first_lsn.to_le_bytes());
+    header[GH_LAST_LSN].copy_from_slice(&last_lsn.to_le_bytes());
+    header[GH_PAYLOAD_LEN].copy_from_slice(&payload_len.to_le_bytes());
+    header[GH_RECORD_COUNT].copy_from_slice(&record_count.to_le_bytes());
     let mut crc = Hasher::new();
-    crc.update(&header[..44]);
-    header[44..48].copy_from_slice(&crc.finalize().to_le_bytes());
+    crc.update(&header[GH_CRC_COVERED]);
+    header[GH_CRC].copy_from_slice(&crc.finalize().to_le_bytes());
     header
 }
 
 fn encode_group_trailer(sequence: u64, group_crc: u32) -> [u8; GROUP_TRAILER_LEN] {
     let mut trailer = [0_u8; GROUP_TRAILER_LEN];
-    trailer[..4].copy_from_slice(GROUP_COMMIT_MAGIC);
-    trailer[4..12].copy_from_slice(&sequence.to_le_bytes());
-    trailer[12..16].copy_from_slice(&group_crc.to_le_bytes());
+    trailer[GT_MAGIC].copy_from_slice(GROUP_COMMIT_MAGIC);
+    trailer[GT_SEQUENCE].copy_from_slice(&sequence.to_le_bytes());
+    trailer[GT_CRC].copy_from_slice(&group_crc.to_le_bytes());
     trailer
 }
 
 /// Re-encode a committed group with its original sequence and LSNs, for a
 /// segment rewrite. Mirrors exactly the framing `commit_group` writes.
-fn encode_group(group: &CommittedGroup, into: &mut Vec<u8>) -> io::Result<()> {
+fn encode_group(
+    group: &CommittedGroup,
+    version: JournalVersion,
+    into: &mut Vec<u8>,
+) -> io::Result<()> {
     let mut payload = Vec::new();
     for entry in &group.entries {
-        encode_mutation(entry.lsn, &entry.mutation, &mut payload)?;
+        encode_mutation(
+            entry.lsn,
+            entry.pool,
+            version,
+            &entry.mutation,
+            &mut payload,
+        )?;
     }
     let record_count = u32::try_from(group.entries.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many journal mutations"))?;
@@ -1349,36 +3160,67 @@ fn encode_group(group: &CommittedGroup, into: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-fn encode_mutation(lsn: u64, mutation: &Mutation, into: &mut Vec<u8>) -> io::Result<()> {
+fn encode_mutation(
+    lsn: u64,
+    pool: Option<ShardType>,
+    version: JournalVersion,
+    mutation: &Mutation,
+    into: &mut Vec<u8>,
+) -> io::Result<()> {
+    // The flag byte is the pool tag in a v3 segment and must be zero in a v2
+    // segment; enforce the pairing rather than silently writing an ambiguous
+    // frame.
+    let pool_byte = match (version.is_pool_tagged(), pool) {
+        (true, Some(pool)) => pool_tag(pool),
+        (true, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a pool-tagged journal frame requires a pool tag",
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a per-pool journal frame must not carry a pool tag",
+            ))
+        }
+        (false, None) => 0,
+    };
+
     let start = into.len();
-    match mutation {
-        Mutation::Put {
-            collection_id,
-            node_id,
-            payload,
-        } => {
-            into.push(1);
-            into.push(0);
-            into.extend_from_slice(&0_u16.to_le_bytes());
-            into.extend_from_slice(&lsn.to_le_bytes());
-            into.extend_from_slice(collection_id);
-            into.extend_from_slice(node_id);
-            let payload_len = u32::try_from(payload.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
-            })?;
-            into.extend_from_slice(&payload_len.to_le_bytes());
-            into.extend_from_slice(payload);
+    // Zeroed fixed area; `MF_FLAGS` and the DeleteCollection-only fields stay
+    // zero by construction. Index the fixed area by its named field ranges so
+    // no raw offset arithmetic is needed.
+    into.resize(start.saturating_add(FRAME_FIXED_LEN), 0);
+    let payload = {
+        let frame = &mut into[start..];
+        frame[MF_KIND].copy_from_slice(&match mutation {
+            Mutation::Put { .. } => [1],
+            Mutation::DeleteCollection { .. } => [2],
+        });
+        frame[MF_POOL].copy_from_slice(&[pool_byte]);
+        frame[MF_LSN].copy_from_slice(&lsn.to_le_bytes());
+        match mutation {
+            Mutation::Put {
+                collection_id,
+                node_id,
+                payload,
+            } => {
+                frame[MF_COLLECTION].copy_from_slice(collection_id);
+                frame[MF_NODE].copy_from_slice(node_id);
+                let payload_len = u32::try_from(payload.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
+                })?;
+                frame[MF_PAYLOAD_LEN].copy_from_slice(&payload_len.to_le_bytes());
+                payload.as_slice()
+            }
+            Mutation::DeleteCollection { collection_id } => {
+                frame[MF_COLLECTION].copy_from_slice(collection_id);
+                &[]
+            }
         }
-        Mutation::DeleteCollection { collection_id } => {
-            into.push(2);
-            into.push(0);
-            into.extend_from_slice(&0_u16.to_le_bytes());
-            into.extend_from_slice(&lsn.to_le_bytes());
-            into.extend_from_slice(collection_id);
-            into.extend_from_slice(&[0_u8; 16]);
-            into.extend_from_slice(&0_u32.to_le_bytes());
-        }
-    }
+    };
+    into.extend_from_slice(payload);
     let mut crc = Hasher::new();
     crc.update(&into[start..]);
     into.extend_from_slice(&crc.finalize().to_le_bytes());
@@ -1452,7 +3294,126 @@ fn verify_group_payload<'a>(
     Ok(payload)
 }
 
-fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Scan> {
+/// Sidecar that records how many bytes of the segment a completed fsync made
+/// durable, so recovery can tell a crash artifact from corruption.
+///
+/// An ordinary power loss can persist a later page of an append-only file while
+/// an earlier, never-fsynced page is missing, leaving a hole before groups that
+/// were never acknowledged. Without a durability mark that is indistinguishable
+/// from rot in acknowledged data, and failing closed would make the journal
+/// unopenable after an ordinary crash. With the mark, the region above it is
+/// known to be unacknowledged and is truncated, while the same damage below it
+/// is real corruption and still fails closed.
+///
+/// The hint is written *after* the fsync it describes returns, so it can only
+/// ever claim bytes that are already durable, and it needs no fsync of its own:
+/// if it is lost or torn the mark falls back to zero and recovery truncates at
+/// the first invalid group, as other write-ahead logs do. It is overwritten in
+/// place at a fixed 44 bytes (never truncated) and protected by its own CRC.
+///
+/// It is keyed by the segment's base sequence and base LSN, so a hint left over
+/// from before a reclaim rewrote the segment (moving every offset) is ignored.
+///
+/// **Limit:** the mark lags the true durable point, so damage inside the most
+/// recent, not-yet-marked sync interval looks like a crash tail and is
+/// truncated. That is the cost of not fsyncing the hint, and it replaces a
+/// journal that cannot be opened after an ordinary power loss.
+const HINT_MAGIC: &[u8; 4] = b"MDHT";
+const HINT_LEN: usize = 44;
+
+/// Path of the durability hint next to the segment at `path`.
+fn durable_hint_path(path: &Path) -> PathBuf {
+    path.with_extension("durable")
+}
+
+fn encode_durable_hint(
+    base_sequence: u64,
+    base_lsn: u64,
+    synced_bytes: u64,
+    through_lsn: u64,
+) -> [u8; HINT_LEN] {
+    let mut hint = [0_u8; HINT_LEN];
+    hint[..4].copy_from_slice(HINT_MAGIC);
+    hint[4..12].copy_from_slice(&base_sequence.to_le_bytes());
+    hint[12..20].copy_from_slice(&base_lsn.to_le_bytes());
+    hint[20..28].copy_from_slice(&synced_bytes.to_le_bytes());
+    hint[28..36].copy_from_slice(&through_lsn.to_le_bytes());
+    let mut crc = Hasher::new();
+    crc.update(&hint[..36]);
+    hint[36..40].copy_from_slice(&crc.finalize().to_le_bytes());
+    // Bytes 40..44 stay zero: reserved.
+    hint
+}
+
+/// The number of leading bytes of the segment known to be durable, or `0` when
+/// nothing is known. A missing, torn, foreign or stale hint yields `0`, and so
+/// does one that claims more than the file holds; every one of those can only
+/// widen what recovery is willing to truncate, never cause a false failure.
+fn read_durable_len(path: &Path, base_sequence: u64, base_lsn: u64, file_len: u64) -> u64 {
+    let Ok(hint) = fs::read(durable_hint_path(path)) else {
+        return 0;
+    };
+    if hint.len() != HINT_LEN || &hint[..4] != HINT_MAGIC {
+        return 0;
+    }
+    let mut crc = Hasher::new();
+    crc.update(&hint[..36]);
+    if u32::from_le_bytes(hint[36..40].try_into().expect("fixed slice")) != crc.finalize() {
+        return 0;
+    }
+    let field = |range: std::ops::Range<usize>| {
+        u64::from_le_bytes(hint[range].try_into().expect("fixed slice"))
+    };
+    if field(4..12) != base_sequence || field(12..20) != base_lsn {
+        return 0;
+    }
+    let durable_len = field(20..28);
+    if durable_len > file_len {
+        return 0;
+    }
+    durable_len
+}
+
+/// Record that `durable_len` bytes of the segment are durable. Write a complete
+/// fixed-size replacement and atomically rename it over the old hint, so
+/// readers see either a checksum-valid old mark or a checksum-valid new one;
+/// a crash may still lose the rename, which safely falls back to truncation.
+/// Best effort: a failed write leaves the previous, lower mark, which is safe.
+fn write_durable_hint(
+    path: &Path,
+    base_sequence: u64,
+    base_lsn: u64,
+    synced_bytes: u64,
+    through_lsn: u64,
+) {
+    let hint = encode_durable_hint(base_sequence, base_lsn, synced_bytes, through_lsn);
+    let path = durable_hint_path(path);
+    let temp_path = path.with_extension("durable.tmp");
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp_path)
+    else {
+        return;
+    };
+    if file.write_all(&hint).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return;
+    }
+    drop(file);
+    if fs::rename(&temp_path, &path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+}
+
+fn scan_bytes(
+    bytes: &[u8],
+    base_sequence: u64,
+    base_lsn: u64,
+    version: JournalVersion,
+    durable_len: u64,
+) -> io::Result<Scan> {
     if bytes.len() < FILE_HEADER_LEN {
         return Err(invalid_data("truncated journal file header"));
     }
@@ -1462,7 +3423,99 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
         base_sequence,
         base_lsn,
         base_lsn,
+        version,
+        durable_len,
     )
+}
+
+/// What validating one group at a cursor found.
+enum GroupStep {
+    /// A complete, valid group that occupies `total_len` bytes.
+    Group {
+        group: GroupHeader,
+        entries: Vec<JournalEntry>,
+        total_len: usize,
+    },
+    /// Not enough bytes remain for a complete group.
+    Incomplete,
+}
+
+/// Why a group failed validation, split by whether a crash can explain it.
+enum GroupFault {
+    /// Damage that a torn or missing page can produce: a bad group header or a
+    /// bad commit trailer or checksum. Above the durable mark this is an
+    /// unacknowledged crash tail; at or below it, it is corruption.
+    Crash(io::Error),
+    /// A group whose header checksum verified but whose contents are wrong
+    /// (sequence or LSN regression, impossible bounds, undecodable records).
+    /// A crash cannot do that to an append-only file, so this is a bug or real
+    /// corruption wherever it appears and is never truncated.
+    Fatal(io::Error),
+}
+
+/// Validate the group starting at `cursor` in `bytes`.
+fn scan_one_group(
+    bytes: &[u8],
+    cursor: usize,
+    base_offset: u64,
+    expected_sequence: u64,
+    expected_lsn: u64,
+    version: JournalVersion,
+) -> Result<GroupStep, GroupFault> {
+    let remaining = bytes.len().saturating_sub(cursor);
+    if remaining < GROUP_HEADER_LEN {
+        return Ok(GroupStep::Incomplete);
+    }
+    let header = bytes
+        .get(cursor..cursor.saturating_add(GROUP_HEADER_LEN))
+        .ok_or_else(|| GroupFault::Crash(invalid_data("truncated journal group header")))?;
+    let group = parse_group_header(header).map_err(GroupFault::Crash)?;
+    if group.sequence < expected_sequence
+        || group.first_lsn != expected_lsn
+        || group.last_lsn < group.first_lsn
+        || group
+            .last_lsn
+            .saturating_sub(group.first_lsn)
+            .saturating_add(1)
+            != u64::from(group.record_count)
+        || group.record_count == 0
+        || group.payload_len > MAX_GROUP_LEN
+        || u64::from(group.record_count).saturating_mul(MIN_FRAME_LEN as u64) > group.payload_len
+    {
+        return Err(GroupFault::Fatal(invalid_data(
+            "invalid journal sequence or group bounds",
+        )));
+    }
+    let payload_len = usize::try_from(group.payload_len).map_err(|_| {
+        GroupFault::Fatal(invalid_data("journal group length exceeds address space"))
+    })?;
+    let total_len = GROUP_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|len| len.checked_add(GROUP_TRAILER_LEN))
+        .ok_or_else(|| GroupFault::Fatal(invalid_data("journal group length overflow")))?;
+    if remaining < total_len {
+        return Ok(GroupStep::Incomplete);
+    }
+    let payload_index = cursor.saturating_add(GROUP_HEADER_LEN);
+    let payload = verify_group_payload(bytes, header, &group, payload_index, payload_len)
+        .map_err(GroupFault::Crash)?;
+    let payload_offset = base_offset
+        .saturating_add(u64::try_from(payload_index).unwrap_or(u64::MAX))
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let entries = decode_mutations(
+        payload,
+        group.first_lsn,
+        group.record_count,
+        payload_offset,
+        version,
+    )
+    .map_err(GroupFault::Fatal)?;
+    Ok(GroupStep::Group {
+        group,
+        entries,
+        total_len,
+    })
 }
 
 /// Scan complete groups from `bytes`, which begins at absolute file offset
@@ -1472,12 +3525,23 @@ fn scan_bytes(bytes: &[u8], base_sequence: u64, base_lsn: u64) -> io::Result<Sca
 /// global sequence with other pools may skip values. `expected_lsn` must match
 /// the first group's `first_lsn` exactly, since LSNs stay contiguous within a
 /// segment. `Scan::valid_len` is absolute in the file, not relative to `bytes`.
+///
+/// `durable_len` is the durability mark (see [`HINT_MAGIC`]): how many leading
+/// bytes of the file a completed fsync covered. A group that fails validation
+/// in a way a crash can explain ([`GroupFault::Crash`]) at or above it was never
+/// acknowledged, so the scan stops there and reports a truncated tail, dropping
+/// everything after it, even later groups that happen to be intact. The same
+/// failure below it is corruption and is returned as an error. Pass `u64::MAX`
+/// to treat every byte as durable, so any invalid group fails; pass `0` when
+/// nothing is known, so the first invalid group ends the scan.
 fn scan_groups_from(
     bytes: &[u8],
     base_offset: u64,
     mut expected_sequence: u64,
     mut expected_lsn: u64,
     segment_base_lsn: u64,
+    version: JournalVersion,
+    durable_len: u64,
 ) -> io::Result<Scan> {
     let mut cursor = 0usize;
     let mut valid_len = base_offset;
@@ -1485,48 +3549,33 @@ fn scan_groups_from(
     let mut truncated_tail = false;
 
     while cursor < bytes.len() {
-        let remaining = bytes.len().saturating_sub(cursor);
-        if remaining < GROUP_HEADER_LEN {
-            truncated_tail = true;
-            break;
-        }
-        let header = bytes
-            .get(cursor..cursor.saturating_add(GROUP_HEADER_LEN))
-            .ok_or_else(|| invalid_data("truncated journal group header"))?;
-        let group = parse_group_header(header)?;
-        if group.sequence < expected_sequence
-            || group.first_lsn != expected_lsn
-            || group.last_lsn < group.first_lsn
-            || group
-                .last_lsn
-                .saturating_sub(group.first_lsn)
-                .saturating_add(1)
-                != u64::from(group.record_count)
-            || group.record_count == 0
-            || group.payload_len > MAX_GROUP_LEN
-            || u64::from(group.record_count).saturating_mul(MIN_FRAME_LEN as u64)
-                > group.payload_len
-        {
-            return Err(invalid_data("invalid journal sequence or group bounds"));
-        }
-        let payload_len = usize::try_from(group.payload_len)
-            .map_err(|_| invalid_data("journal group length exceeds address space"))?;
-        let total_len = GROUP_HEADER_LEN
-            .checked_add(payload_len)
-            .and_then(|len| len.checked_add(GROUP_TRAILER_LEN))
-            .ok_or_else(|| invalid_data("journal group length overflow"))?;
-        if remaining < total_len {
-            truncated_tail = true;
-            break;
-        }
-        let payload_index = cursor.saturating_add(GROUP_HEADER_LEN);
-        let payload = verify_group_payload(bytes, header, &group, payload_index, payload_len)?;
-        let payload_offset = base_offset
-            .saturating_add(u64::try_from(payload_index).unwrap_or(u64::MAX))
-            .try_into()
-            .unwrap_or(usize::MAX);
-        let entries =
-            decode_mutations(payload, group.first_lsn, group.record_count, payload_offset)?;
+        let (group, entries, total_len) = match scan_one_group(
+            bytes,
+            cursor,
+            base_offset,
+            expected_sequence,
+            expected_lsn,
+            version,
+        ) {
+            Ok(GroupStep::Group {
+                group,
+                entries,
+                total_len,
+            }) => (group, entries, total_len),
+            Ok(GroupStep::Incomplete) => {
+                truncated_tail = true;
+                break;
+            }
+            Err(GroupFault::Fatal(error)) => return Err(error),
+            Err(GroupFault::Crash(error)) => {
+                let at = base_offset.saturating_add(u64::try_from(cursor).unwrap_or(u64::MAX));
+                if at >= durable_len {
+                    truncated_tail = true;
+                    break;
+                }
+                return Err(error);
+            }
+        };
         groups.push(CommittedGroup {
             sequence: group.sequence,
             first_lsn: group.first_lsn,
@@ -1545,11 +3594,13 @@ fn scan_groups_from(
             .ok_or_else(|| invalid_data("journal LSN overflow"))?;
     }
 
+    let consumed_tail = bytes[cursor.saturating_sub(CONSUMED_TAIL_LEN)..cursor].to_vec();
     Ok(Scan {
         groups,
         valid_len,
         truncated_tail,
         base_lsn: segment_base_lsn,
+        consumed_tail,
     })
 }
 
@@ -1558,6 +3609,7 @@ fn decode_mutations(
     first_lsn: u64,
     record_count: u32,
     payload_offset: usize,
+    version: JournalVersion,
 ) -> io::Result<Vec<JournalEntry>> {
     let mut cursor = 0_usize;
     let mut entries = Vec::with_capacity(usize::try_from(record_count).unwrap_or(0));
@@ -1572,22 +3624,33 @@ fn decode_mutations(
         let frame = payload
             .get(cursor..fixed_end)
             .ok_or_else(|| invalid_data("truncated journal mutation frame"))?;
-        let kind = frame[0];
-        let flags = frame[1];
-        if flags != 0 || frame[2..4] != [0, 0] {
+        let kind = frame[MF_KIND.start];
+        let tag = frame[MF_POOL.start];
+        if frame[MF_FLAGS] != [0, 0] {
             return Err(invalid_data("unsupported journal mutation flags"));
         }
-        let lsn = u64::from_le_bytes(frame[4..12].try_into().expect("fixed slice"));
+        let pool = if version.is_pool_tagged() {
+            if !matches!(tag, 1..=3) {
+                return Err(invalid_data("pool-tagged frame has no valid pool tag"));
+            }
+            pool_from_tag(tag)
+        } else {
+            if tag != 0 {
+                return Err(invalid_data("untagged frame has a nonzero flag byte"));
+            }
+            None
+        };
+        let lsn = u64::from_le_bytes(frame[MF_LSN].try_into().expect("fixed slice"));
         let expected = first_lsn
             .checked_add(u64::from(index))
             .ok_or_else(|| invalid_data("journal mutation LSN overflow"))?;
         if lsn != expected {
             return Err(invalid_data("journal mutation LSN out of order"));
         }
-        let collection_id: [u8; 16] = frame[12..28].try_into().expect("fixed slice");
-        let node_id: [u8; 16] = frame[28..44].try_into().expect("fixed slice");
+        let collection_id: [u8; 16] = frame[MF_COLLECTION].try_into().expect("fixed slice");
+        let node_id: [u8; 16] = frame[MF_NODE].try_into().expect("fixed slice");
         let payload_len = usize::try_from(u32::from_le_bytes(
-            frame[44..48].try_into().expect("fixed slice"),
+            frame[MF_PAYLOAD_LEN].try_into().expect("fixed slice"),
         ))
         .map_err(|_| invalid_data("journal mutation payload length exceeds address space"))?;
         let frame_end = fixed_end
@@ -1626,6 +3689,7 @@ fn decode_mutations(
             lsn,
             offset: u64::try_from(payload_offset.saturating_add(start)).unwrap_or(u64::MAX),
             frame_len: u64::try_from(crc_end.saturating_sub(start)).unwrap_or(u64::MAX),
+            pool,
             mutation,
         });
         cursor = crc_end;
@@ -1641,41 +3705,83 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    #[cfg(unix)]
-    {
-        File::open(parent)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        // Rust's portable std API has no directory-handle durability
-        // operation on non-Unix platforms. Refuse to enable the journal until
-        // a platform-specific implementation can uphold create/rotation
-        // durability; silently succeeding would weaken the contract.
-        let _ = parent;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable journal creation requires platform directory sync support",
-        ))
-    }
+    crate::shard::sync_directory(parent)
 }
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Exclusive writer claim on a database root's shared WAL.
+///
+/// One shared segment serves every pool, so a single writer process must own
+/// it. This takes the same crash-safe `{pid, starttime}` lock the per-pool
+/// writer lock uses, at `<db_root>/.mtxdb.wal.lock`, and releases it on drop
+/// (see `ShardPool::acquire_writer_lock` for the staleness contract). The
+/// holder opens the segment with [`Journal::open_shared`], builds one
+/// [`JournalCoordinator`], and attaches each pool with
+/// `PackfileStorage::enable_shared_journal`.
+#[cfg(feature = "multi-reader")]
+pub struct SharedWalLock {
+    _lock: crate::shard::WriterLock,
+}
+
+#[cfg(feature = "multi-reader")]
+impl SharedWalLock {
+    /// Acquire the root shared-WAL writer lock.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock` if another live writer holds it, or an I/O error
+    /// if the lock file cannot be created.
+    pub fn acquire(db_root: impl AsRef<Path>) -> io::Result<Self> {
+        let db_root = db_root.as_ref();
+        // Require a database root. A root that predates the shared layout
+        // (marker `PerPool`) is accepted: it is driven through a fresh
+        // root-level shared segment like any other, and its old per-pool WALs
+        // are ignored.
+        if crate::layout::read_wal_layout(db_root)?.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is not an mtxdb database root (missing {}); initialize it first",
+                    db_root.display(),
+                    crate::layout::DB_META_FILENAME
+                ),
+            ));
+        }
+        let path = db_root.join(".mtxdb.wal.lock");
+        Ok(Self {
+            _lock: crate::shard::ShardPool::acquire_lock_path(&path)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalCoordinator, Mutation};
+    use super::{
+        durable_hint_path, encode_durable_hint, encode_group, read_durable_len, write_durable_hint,
+        BackgroundFailure, BackgroundState, CommittedGroup, GroupCommitConfig, Journal,
+        JournalCoordinator, JournalEntry, JournalVersion, Mutation, HINT_LEN,
+    };
+    #[cfg(feature = "multi-reader")]
+    use super::{TxnStage, TxnStageState};
     use std::fs;
     use std::io::Write as _;
+    use std::path::Path;
+    #[cfg(feature = "multi-reader")]
     use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "mtxdb_journal_{label}_{}_{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
         ))
     }
 
@@ -1713,6 +3819,356 @@ mod tests {
             node_id: [node; 16],
             payload: payload.to_vec(),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_segment_round_trips_pool_tags() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_pool_tags");
+        let _ = fs::remove_file(&path);
+
+        let (mut journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups.len(), 0);
+        let tagged = [
+            (Some(ShardType::State), put(1, 1, b"state")),
+            (Some(ShardType::EventDag), put(2, 2, b"event")),
+            (Some(ShardType::Edges), put(3, 3, b"edges")),
+        ];
+        journal
+            .append_group_tagged_with_sequence(&tagged, None)
+            .unwrap();
+        journal.make_durable().unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        let pools: Vec<_> = scan.groups[0]
+            .entries
+            .iter()
+            .map(|entry| entry.pool)
+            .collect();
+        assert_eq!(
+            pools,
+            vec![
+                Some(ShardType::State),
+                Some(ShardType::EventDag),
+                Some(ShardType::Edges),
+            ]
+        );
+
+        // Recovery must preserve the tags so each frame can be routed.
+        let (_journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups[0].entries[1].pool, Some(ShardType::EventDag));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_segment_rejects_untagged_frames() {
+        let path = temp_path("shared_untagged");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open_shared(&path).unwrap();
+        assert!(
+            journal.append_group(&[put(1, 1, b"x")]).is_err(),
+            "a pool-tagged segment must reject an untagged frame"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_committed_watermark_is_per_pool() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_pool_watermark");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        // Group one: state only. Only state's watermark may advance past zero.
+        coordinator
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        coordinator.sync().unwrap();
+        let state_only = coordinator.committed_lsn();
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::State),
+            state_only,
+            "the state frame's group advances state's watermark"
+        );
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::EventDag),
+            0,
+            "another pool's group must not advance event-DAG's watermark"
+        );
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::Edges), 0);
+
+        // Group two: event-DAG only. State's watermark must stay put.
+        coordinator
+            .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        coordinator.sync().unwrap();
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::State),
+            state_only
+        );
+        assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > state_only);
+
+        // A group carrying both pools advances both to the group's own end.
+        coordinator
+            .publish_tagged_groups(&[
+                (ShardType::State, &[put(3, 3, b"s2")]),
+                (ShardType::EventDag, &[put(4, 4, b"e2")]),
+            ])
+            .unwrap();
+        coordinator.sync().unwrap();
+        let shared = coordinator.committed_lsn();
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), shared);
+        assert_eq!(
+            coordinator.committed_lsn_for_pool(ShardType::EventDag),
+            shared
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_reclaim_waits_for_a_staged_pools_frame() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_staged_required");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        // A transaction stages an event-DAG frame without going through
+        // `publish`; it must still block reclaim until event-DAG checkpoints.
+        coordinator
+            .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+            .unwrap();
+        coordinator
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        coordinator.sync().unwrap();
+        let committed = coordinator.committed_lsn();
+        assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > 0);
+
+        // State checkpoints, event-DAG does not: the staged frame's group must
+        // survive, because event-DAG has no durable coverage for it yet.
+        coordinator.report_pool_coverage(ShardType::State, committed);
+        assert!(
+            coordinator.reclaim_shared().unwrap().is_none(),
+            "a staged pool without coverage must block reclaim"
+        );
+
+        // Once every pool reports, the prefix can go.
+        coordinator.report_pool_coverage(ShardType::EventDag, committed);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_reclaim_does_not_wait_for_an_idle_pool() {
+        use crate::layout::ShardType;
+        let path = temp_path("shared_idle_pool_reclaim");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        // State contributes only the first group, then goes idle.
+        coordinator
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        coordinator.sync().unwrap();
+        let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
+
+        // Event-DAG writes several later groups that never carry a state frame.
+        let mut event_lsn = 0;
+        for id in 0..4u8 {
+            coordinator
+                .publish_group_tagged(ShardType::EventDag, &[put(2, id, b"event")])
+                .map(|receipt| receipt.last_lsn)
+                .unwrap();
+            coordinator.sync().unwrap();
+            event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
+        }
+        assert!(event_lsn > state_lsn);
+
+        // State covers only its own group. Reclaim must advance through that
+        // group and stop at the first uncovered event-DAG group — not refuse to
+        // advance at all because some pool is behind.
+        coordinator.report_pool_coverage(ShardType::State, state_lsn);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 4, "uncovered event groups must survive");
+        assert_eq!(
+            scan.base_lsn,
+            state_lsn + 1,
+            "the covered state group is reclaimed independently"
+        );
+
+        // Once event-DAG covers its frames, the idle state pool must not pin
+        // the later groups its frames never reached.
+        coordinator.report_pool_coverage(ShardType::EventDag, event_lsn);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert!(
+            scan.groups.is_empty(),
+            "an idle pool must not block later groups it never contributed to"
+        );
+        assert_eq!(scan.base_lsn, event_lsn + 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn per_pool_segment_rejects_tagged_frames() {
+        use crate::layout::ShardType;
+        let path = temp_path("perpool_tagged");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        let tagged = [(Some(ShardType::State), put(1, 1, b"x"))];
+        assert!(
+            journal
+                .append_group_tagged_with_sequence(&tagged, None)
+                .is_err(),
+            "a per-pool segment must reject a tagged frame"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn open_mode_must_match_segment_version() {
+        let path = temp_path("version_mismatch");
+        let _ = fs::remove_file(&path);
+        Journal::open(&path).unwrap();
+        assert!(
+            Journal::open_shared(&path).is_err(),
+            "a per-pool segment must not open as shared"
+        );
+        fs::remove_file(&path).unwrap();
+
+        Journal::open_shared(&path).unwrap();
+        assert!(
+            Journal::open(&path).is_err(),
+            "a shared segment must not open as per-pool"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn coordinator_publishes_tagged_frames() {
+        use crate::layout::ShardType;
+        let path = temp_path("coordinator_tagged");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        coordinator
+            .publish_tagged_groups(&[
+                (ShardType::State, &[put(1, 1, b"a")]),
+                (ShardType::Edges, &[put(3, 3, b"c")]),
+            ])
+            .unwrap();
+        coordinator.sync().unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        let pools: Vec<_> = scan.groups[0]
+            .entries
+            .iter()
+            .map(|entry| entry.pool)
+            .collect();
+        assert_eq!(pools, vec![Some(ShardType::State), Some(ShardType::Edges)]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn transaction_stage_publishes_all_pools_as_one_shared_group() {
+        use crate::layout::ShardType;
+
+        let path = temp_path("txn_stage_shared_group");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        let stage = TxnStage::new();
+        stage
+            .stage_put(ShardType::State, [1; 16], [1; 16], b"state".to_vec())
+            .unwrap();
+        stage
+            .stage_put(ShardType::EventDag, [2; 16], [2; 16], b"event".to_vec())
+            .unwrap();
+        stage
+            .stage_put(ShardType::Edges, [3; 16], [3; 16], b"edge".to_vec())
+            .unwrap();
+
+        stage
+            .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+            .unwrap();
+        stage
+            .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+            .unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(scan.groups[0].entries.len(), 3);
+        assert_eq!(
+            scan.groups[0]
+                .entries
+                .iter()
+                .map(|entry| entry.pool)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(ShardType::Edges),
+                Some(ShardType::EventDag),
+                Some(ShardType::State)
+            ]
+        );
+        assert_eq!(stage.state(), TxnStageState::JournalPublished);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn transaction_stage_publishes_after_autocommit_groups_in_lsn_order() {
+        use crate::layout::ShardType;
+
+        let path = temp_path("txn_stage_after_autocommit");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        let autocommit = coordinator
+            .publish_group_tagged(ShardType::State, &[put(9, 9, b"autocommit")])
+            .unwrap();
+        assert_eq!((autocommit.first_lsn, autocommit.last_lsn), (1, 1));
+
+        let stage = TxnStage::new();
+        stage
+            .stage_put(
+                ShardType::EventDag,
+                [2; 16],
+                [2; 16],
+                b"transaction".to_vec(),
+            )
+            .unwrap();
+        stage
+            .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+            .unwrap();
+
+        // The autocommit write keeps its own complete group ahead of the
+        // transaction's group; the transaction never absorbs it.
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 2);
+        assert_eq!(scan.groups[0].entries.len(), 1);
+        assert_eq!(scan.groups[0].entries[0].pool, Some(ShardType::State));
+        assert_eq!(scan.groups[1].entries.len(), 1);
+        assert_eq!(scan.groups[1].entries[0].pool, Some(ShardType::EventDag));
+        assert_eq!(coordinator.visible_lsn(), 2);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1765,11 +4221,65 @@ mod tests {
         let (journal, scan) = Journal::open(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
         assert_eq!(coordinator.visible_lsn(), 0);
-        let lsn = coordinator.publish(put(1, 1, b"first"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         coordinator.sync().unwrap();
         assert_eq!(coordinator.visible_lsn(), lsn);
         assert_eq!(coordinator.committed_lsn(), lsn);
         drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn published_groups_are_visible_not_durable_until_one_fsync_covers_them() {
+        use crate::layout::ShardType;
+        let path = temp_path("published_groups_one_fsync");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        let first = coordinator
+            .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
+            .unwrap();
+        let second = coordinator
+            .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+            .unwrap();
+        assert_eq!((first.last_lsn, second.last_lsn), (1, 2));
+        // Complete and visible to a read-only overlay, but not yet durable.
+        assert_eq!(coordinator.visible_lsn(), 2);
+        assert_eq!(coordinator.committed_lsn(), 0);
+
+        // One sync makes both groups durable and promotes each pool.
+        coordinator.sync_through(2).unwrap();
+        assert_eq!(coordinator.committed_lsn(), 2);
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 1);
+        assert_eq!(coordinator.committed_lsn_for_pool(ShardType::EventDag), 2);
+        assert_eq!(coordinator.durability_stats().commits, 1);
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn empty_group_publication_is_rejected() {
+        let path = temp_path("publish_group_empty");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        let error = coordinator.publish_group(&[]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        #[cfg(feature = "multi-reader")]
+        {
+            use crate::layout::ShardType;
+            let error = coordinator
+                .publish_group_tagged(ShardType::State, &[])
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(coordinator.visible_lsn(), 0);
         fs::remove_file(path).unwrap();
     }
 
@@ -1990,45 +4500,42 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_commits_only_through_the_captured_sync_boundary() {
+    fn sync_commits_through_the_newest_visible_lsn() {
         let path = temp_path("coordinator_boundary");
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
 
         let first_lsn = coordinator
-            .publish(
-                Mutation::Put {
-                    collection_id: [1; 16],
-                    node_id: [1; 16],
-                    payload: b"first".to_vec(),
-                },
-                |_| {},
-            )
-            .unwrap();
+            .publish_group(&[Mutation::Put {
+                collection_id: [1; 16],
+                node_id: [1; 16],
+                payload: b"first".to_vec(),
+            }])
+            .unwrap()
+            .last_lsn;
         let first_target = coordinator.capture_sync_target();
         assert_eq!(first_target, first_lsn);
 
         let second_lsn = coordinator
-            .publish(
-                Mutation::Put {
-                    collection_id: [1; 16],
-                    node_id: [2; 16],
-                    payload: b"second".to_vec(),
-                },
-                |_| {},
-            )
-            .unwrap();
+            .publish_group(&[Mutation::Put {
+                collection_id: [1; 16],
+                node_id: [2; 16],
+                payload: b"second".to_vec(),
+            }])
+            .unwrap()
+            .last_lsn;
         assert_eq!(second_lsn, first_lsn.saturating_add(1));
 
+        // A sync commits through the newest visible LSN, not just the
+        // caller's target: one fsync covers everything already appended, and
+        // later callers find their target already durable.
         let first_commit = coordinator.sync_through(first_target).unwrap().unwrap();
         assert_eq!(first_commit.first_lsn, first_lsn);
-        assert_eq!(first_commit.last_lsn, first_target);
+        assert_eq!(first_commit.last_lsn, second_lsn);
+        assert_eq!(coordinator.committed_lsn(), second_lsn);
         assert!(coordinator.sync_through(first_target).unwrap().is_none());
-
-        let second_commit = coordinator.sync().unwrap().unwrap();
-        assert_eq!(second_commit.first_lsn, second_lsn);
-        assert_eq!(second_commit.last_lsn, second_lsn);
+        assert!(coordinator.sync().unwrap().is_none());
 
         drop(coordinator);
         let (_journal, recovered) = Journal::open(&path).unwrap();
@@ -2036,6 +4543,671 @@ mod tests {
         assert_eq!(recovered.groups[0].last_lsn, first_target);
         assert_eq!(recovered.groups[1].first_lsn, second_lsn);
         fs::remove_file(path).unwrap();
+    }
+
+    /// Park the next sync between its handle clone and its fsync, with the
+    /// journal lock released. Returns a receiver that fires once a sync is
+    /// parked and a sender that releases it.
+    fn park_next_fsync(
+        coordinator: &JournalCoordinator,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked_tx = std::sync::Mutex::new(parked_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *coordinator.fsync_hook.lock() = Some(Arc::new(move || {
+            parked_tx.lock().unwrap().send(()).ok();
+            release_rx.lock().unwrap().recv().ok();
+            Ok(())
+        }));
+        (parked_rx, release_tx)
+    }
+
+    /// The regression this change exists for: a publisher must not stall
+    /// behind an fsync in flight. The sync is parked mid-fsync and a publish
+    /// must still complete; that later group is then correctly left for the
+    /// next sync because it was appended after the range was captured.
+    #[test]
+    fn publish_makes_progress_while_an_fsync_is_in_flight() {
+        let coordinator = open_arc("publish_during_fsync");
+        let first = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .unwrap()
+            .last_lsn;
+        let (parked, release) = park_next_fsync(&coordinator);
+
+        let syncer = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || coordinator.sync().unwrap().unwrap())
+        };
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sync must reach its fsync");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let publisher = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || {
+                let receipt = coordinator.publish_group(&[put(1, 2, b"second")]).unwrap();
+                done_tx.send(receipt.last_lsn).unwrap();
+            })
+        };
+        let second = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a publish must not block behind an in-flight fsync");
+        assert_eq!(second, first + 1);
+        assert_eq!(coordinator.visible_lsn(), second);
+        assert_eq!(coordinator.committed_lsn(), 0, "the fsync is still parked");
+
+        release.send(()).unwrap();
+        let parked_receipt = syncer.join().unwrap();
+        publisher.join().unwrap();
+        assert_eq!(
+            (parked_receipt.first_lsn, parked_receipt.last_lsn),
+            (first, first),
+            "the parked sync's receipt covers only the range it captured"
+        );
+        assert_eq!(
+            coordinator.committed_lsn(),
+            first,
+            "the group published during the fsync is visible but not committed"
+        );
+
+        *coordinator.fsync_hook.lock() = None;
+        let later = coordinator.sync().unwrap().unwrap();
+        assert_eq!((later.first_lsn, later.last_lsn), (second, second));
+        assert_eq!(coordinator.committed_lsn(), second);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    /// An fsync error must never be reported as durable, and must poison the
+    /// journal so no later publish or sync can succeed on top of it: the
+    /// kernel may have dropped the dirty pages, so a retry could falsely pass.
+    /// The error is injected through the fsync hook, which stands in for
+    /// `sync_all` failing; it exercises the production poison path, not the
+    /// kernel's behavior.
+    #[test]
+    fn an_injected_fsync_error_poisons_and_is_never_reported_durable() {
+        let coordinator = open_arc("failed_fsync_poison");
+        coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        *coordinator.fsync_hook.lock() = Some(Arc::new(|| Err(std::io::Error::other("injected"))));
+
+        assert!(coordinator.sync().is_err());
+        assert_eq!(
+            coordinator.committed_lsn(),
+            0,
+            "a failed fsync is not marked durable"
+        );
+        assert!(
+            coordinator.publish_group(&[put(1, 2, b"second")]).is_err(),
+            "publication must be rejected after a failed fsync"
+        );
+
+        // Even with the fault gone, the poison persists: no retry may report
+        // the earlier data durable.
+        *coordinator.fsync_hook.lock() = None;
+        assert!(coordinator.sync().is_err());
+        assert_eq!(coordinator.committed_lsn(), 0);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    /// Torn-tail recovery on hand-built truncated images. It writes two
+    /// groups, cuts a copy at the boundary before the second group (and again
+    /// inside it, as a torn write), and checks that recovery keeps exactly the
+    /// earlier prefix and continues numbering from it. It says nothing about
+    /// what an actual crash would leave on disk after an in-flight fsync.
+    #[test]
+    fn recovery_discards_a_clean_or_torn_tail_group() {
+        let coordinator = open_arc("torn_tail_recovery");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        let second = coordinator.publish_group(&[put(1, 2, b"second")]).unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let prefix_len = super::FILE_HEADER_LEN as u64 + first.bytes_written;
+        let full_len = prefix_len + second.bytes_written;
+        assert_eq!(fs::metadata(&path).unwrap().len(), full_len);
+        for cut in [prefix_len, prefix_len + second.bytes_written / 2] {
+            let copy = temp_path("torn_tail_recovery_copy");
+            fs::copy(&path, &copy).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&copy)
+                .unwrap()
+                .set_len(cut)
+                .unwrap();
+            let (journal, scan) = Journal::open(&copy).unwrap();
+            assert_eq!(scan.groups.len(), 1, "only the intact prefix is recovered");
+            assert_eq!(scan.groups[0].last_lsn, first.last_lsn);
+            let recovered = JournalCoordinator::new(journal, &scan);
+            let next = recovered.publish_group(&[put(1, 3, b"third")]).unwrap();
+            assert_eq!(next.first_lsn, first.last_lsn + 1, "numbering continues");
+            drop(recovered);
+            fs::remove_file(copy).unwrap();
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A crash can persist a later page while an earlier one never reached the
+    /// disk, leaving a hole with intact groups after it. That is
+    /// indistinguishable from bit rot in acknowledged data, so the journal
+    /// fails closed: the read-only scan and recovery both refuse the segment
+    /// with `InvalidData` and neither repairs it, instead of silently dropping
+    /// the later groups. A hole with nothing valid after it is an ordinary torn
+    /// tail and is covered elsewhere. The image is built by zeroing the middle
+    /// group of a finished file; it says nothing about which pages a real crash
+    /// would leave behind.
+    #[test]
+    fn a_hole_before_a_later_intact_group_fails_closed() {
+        let coordinator = open_arc("hole_before_later_group");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
+        coordinator.publish_group(&[put(1, 3, b"last")]).unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let hole_start = super::FILE_HEADER_LEN as u64 + first.bytes_written;
+        let hole_len = usize::try_from(middle.bytes_written).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(hole_start)).unwrap();
+            file.write_all(&vec![0; hole_len]).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+
+        let scan_error = Journal::scan_read_only(&path).unwrap_err();
+        assert_eq!(scan_error.kind(), std::io::ErrorKind::InvalidData);
+        let open_error = Journal::open(&path)
+            .err()
+            .expect("recovery must refuse a hole");
+        assert_eq!(open_error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "neither the scan nor a failed recovery may modify the segment"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A scan reports the last bytes of the groups it consumed, never reaching
+    /// into the file header, whether it read the whole segment or only a tail.
+    #[test]
+    fn a_scan_reports_the_bytes_it_consumed() {
+        let path = temp_path("consumed_tail");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        journal.append_group(&[put(1, 1, b"small")]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert!(bytes.len() < super::FILE_HEADER_LEN + super::CONSUMED_TAIL_LEN);
+        assert_eq!(
+            scan.consumed_tail,
+            &bytes[super::FILE_HEADER_LEN..],
+            "a short segment reports everything after the header"
+        );
+        assert_eq!(
+            scan.consumed_tail.len(),
+            super::consumed_tail_len(scan.valid_len)
+        );
+
+        for node in 2..12u8 {
+            journal.append_group(&[put(1, node, &[node; 300])]).unwrap();
+        }
+        let bytes = fs::read(&path).unwrap();
+        let full = Journal::scan_read_only(&path).unwrap();
+        let valid = usize::try_from(full.valid_len).unwrap();
+        assert_eq!(
+            full.consumed_tail,
+            &bytes[valid - super::CONSUMED_TAIL_LEN..valid]
+        );
+
+        // An incremental scan reports only what it consumed from its start, so
+        // the window is the last `CONSUMED_TAIL_LEN` bytes of `start..valid`,
+        // or all of it when that range is shorter. The ten 300-byte groups
+        // above give a range longer than the window.
+        let start = scan.valid_len;
+        let tail = Journal::scan_read_only_from(&path, start, scan.groups[0].last_lsn + 1).unwrap();
+        let start = usize::try_from(start).unwrap();
+        let expected_start = valid.saturating_sub(super::CONSUMED_TAIL_LEN).max(start);
+        assert_eq!(
+            tail.consumed_tail,
+            &bytes[expected_start..valid],
+            "incremental scans report the exact consumed suffix"
+        );
+
+        // A small incremental scan consumes fewer bytes than the window, so it
+        // reports exactly those bytes and nothing from before its start.
+        let before_small = full.valid_len;
+        journal.append_group(&[put(1, 99, b"tiny")]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let small = Journal::scan_read_only_from(
+            &path,
+            before_small,
+            full.groups.last().unwrap().last_lsn + 1,
+        )
+        .unwrap();
+        let from = usize::try_from(before_small).unwrap();
+        let end = usize::try_from(small.valid_len).unwrap();
+        assert!(end - from < super::CONSUMED_TAIL_LEN);
+        assert_eq!(
+            small.consumed_tail,
+            &bytes[from..end],
+            "a scan shorter than the window reports exactly the bytes it consumed"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Zero `len` bytes of the file at `start`, standing in for a page that
+    /// never reached the disk.
+    fn punch_hole(path: &Path, start: u64, len: u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(start)).unwrap();
+        file.write_all(&vec![0; usize::try_from(len).unwrap()])
+            .unwrap();
+    }
+
+    /// The durable mark a segment's hint currently claims, for a per-pool
+    /// segment with the default base (sequence 1, LSN 1).
+    fn durable_mark(path: &Path) -> u64 {
+        read_durable_len(path, 1, 1, fs::metadata(path).unwrap().len())
+    }
+
+    /// A completed sync records, after its fsync, how much of the segment is
+    /// durable: everything appended when its handle was captured.
+    #[test]
+    fn a_sync_records_the_durable_mark_after_its_fsync() {
+        let coordinator = open_arc("hint_after_sync");
+        let path = coordinator.path().clone();
+        assert_eq!(durable_mark(&path), 0, "nothing is durable before a sync");
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        assert_eq!(durable_mark(&path), 0, "publishing is not durability");
+        coordinator.sync().unwrap();
+        assert_eq!(
+            durable_mark(&path),
+            super::FILE_HEADER_LEN as u64 + first.bytes_written
+        );
+        let hint = fs::read(durable_hint_path(&path)).unwrap();
+        assert_eq!(hint.len(), HINT_LEN);
+        assert_eq!(
+            u64::from_le_bytes(hint[28..36].try_into().unwrap()),
+            first.last_lsn,
+            "the hint records the LSN the fsync covered"
+        );
+        fs::remove_file(durable_hint_path(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The hint may only claim bytes an fsync has made durable, so a failed
+    /// fsync must leave it where it was.
+    #[test]
+    fn a_failed_fsync_does_not_advance_the_durable_mark() {
+        let coordinator = open_arc("hint_failed_fsync");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        coordinator.sync().unwrap();
+        let mark = durable_mark(&path);
+        assert_eq!(mark, super::FILE_HEADER_LEN as u64 + first.bytes_written);
+
+        coordinator.publish_group(&[put(1, 2, b"second")]).unwrap();
+        *coordinator.fsync_hook.lock() = Some(Arc::new(|| Err(std::io::Error::other("injected"))));
+        assert!(coordinator.sync().is_err());
+        assert_eq!(
+            durable_mark(&path),
+            mark,
+            "an fsync that failed claims nothing"
+        );
+        *coordinator.fsync_hook.lock() = None;
+        fs::remove_file(durable_hint_path(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The point of the mark: a crash can leave a hole with later groups intact
+    /// above the last fsync, and that was never acknowledged, so recovery
+    /// truncates it and carries on instead of refusing to open. The hole here
+    /// starts exactly at the mark, the boundary case.
+    #[test]
+    fn a_hole_above_the_durable_mark_is_truncated_and_recovery_continues() {
+        let coordinator = open_arc("hole_above_mark");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        coordinator.sync().unwrap();
+        let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
+        coordinator.publish_group(&[put(1, 3, b"last")]).unwrap();
+        drop(coordinator);
+        let hole_start = super::FILE_HEADER_LEN as u64 + first.bytes_written;
+        assert_eq!(durable_mark(&path), hole_start);
+        punch_hole(&path, hole_start, middle.bytes_written);
+        let before = fs::read(&path).unwrap();
+
+        // A read-only scan stops at the hole without repairing anything.
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert!(scan.truncated_tail);
+        assert_eq!(scan.valid_len, hole_start);
+        assert_eq!(fs::read(&path).unwrap(), before, "a scan must not repair");
+
+        // Recovery drops the hole and the later group, then numbers on.
+        let (journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), hole_start);
+        let recovered = JournalCoordinator::new(journal, &scan);
+        let next = recovered.publish_group(&[put(1, 9, b"again")]).unwrap();
+        assert_eq!(next.first_lsn, first.last_lsn + 1);
+        drop(recovered);
+        fs::remove_file(durable_hint_path(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The same damage below the mark is acknowledged data gone bad, and still
+    /// fails closed, for the scan and for recovery, without repairing.
+    #[test]
+    fn a_hole_below_the_durable_mark_still_fails_closed() {
+        let coordinator = open_arc("hole_below_mark");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
+        coordinator.publish_group(&[put(1, 3, b"last")]).unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+        punch_hole(
+            &path,
+            super::FILE_HEADER_LEN as u64 + first.bytes_written,
+            middle.bytes_written,
+        );
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            Journal::scan_read_only(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            Journal::open(&path).err().expect("must refuse").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing may be repaired");
+        fs::remove_file(durable_hint_path(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// With no usable hint nothing is known to be durable, so recovery falls back
+    /// to what other write-ahead logs do: the first invalid group ends the log.
+    /// A missing, torn, foreign or over-long hint can therefore only widen what
+    /// is truncated, never turn a crash into a failure.
+    #[test]
+    fn without_a_usable_hint_the_first_invalid_group_ends_recovery() {
+        let bad_hints: [(&str, Option<Vec<u8>>); 4] = [
+            ("missing", None),
+            ("torn", Some(vec![0xAB; 17])),
+            (
+                "corrupt",
+                Some({
+                    let mut hint = encode_durable_hint(1, 1, 10, 1).to_vec();
+                    hint[22] ^= 0xFF;
+                    hint
+                }),
+            ),
+            (
+                "beyond the file",
+                Some(encode_durable_hint(1, 1, u64::MAX / 2, 99).to_vec()),
+            ),
+        ];
+        for (label, hint) in bad_hints {
+            let coordinator = open_arc(&format!("hint_unusable_{}", label.replace(' ', "_")));
+            let path = coordinator.path().clone();
+            let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+            let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
+            coordinator.publish_group(&[put(1, 3, b"last")]).unwrap();
+            coordinator.sync().unwrap();
+            drop(coordinator);
+            match hint {
+                Some(bytes) => fs::write(durable_hint_path(&path), bytes).unwrap(),
+                None => fs::remove_file(durable_hint_path(&path)).unwrap(),
+            }
+            let hole_start = super::FILE_HEADER_LEN as u64 + first.bytes_written;
+            punch_hole(&path, hole_start, middle.bytes_written);
+
+            let (_journal, scan) =
+                Journal::open(&path).unwrap_or_else(|error| panic!("{label} hint: {error}"));
+            assert_eq!(scan.groups.len(), 1, "{label} hint");
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                hole_start,
+                "{label} hint"
+            );
+            let _ = fs::remove_file(durable_hint_path(&path));
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// A hint left over from before a reclaim moved every offset describes a
+    /// different segment and is ignored; reclaim writes a fresh one for the
+    /// rebuilt file, so a hole in retained, durable data still fails closed.
+    #[test]
+    fn reclaim_rekeys_the_durable_mark_to_the_rebuilt_segment() {
+        let coordinator = open_arc("hint_reclaim");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        let second = coordinator.publish_group(&[put(1, 2, b"second")]).unwrap();
+        let third = coordinator.publish_group(&[put(1, 3, b"third")]).unwrap();
+        coordinator.sync().unwrap();
+        let old_hint = fs::read(durable_hint_path(&path)).unwrap();
+
+        coordinator.reclaim_through(first.last_lsn).unwrap();
+        let len = fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            read_durable_len(&path, second.sequence, second.first_lsn, len),
+            len,
+            "the rebuilt segment is entirely durable"
+        );
+        assert_eq!(
+            read_durable_len(&path, 1, 1, len),
+            0,
+            "the old base no longer matches"
+        );
+        // Restoring the pre-reclaim hint must not be believed either.
+        fs::write(durable_hint_path(&path), old_hint).unwrap();
+        assert_eq!(
+            read_durable_len(&path, second.sequence, second.first_lsn, len),
+            0
+        );
+        write_durable_hint(
+            &path,
+            second.sequence,
+            second.first_lsn,
+            len,
+            third.last_lsn,
+        );
+        drop(coordinator);
+
+        punch_hole(&path, super::FILE_HEADER_LEN as u64, second.bytes_written);
+        assert_eq!(
+            Journal::open(&path).err().expect("must refuse").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::remove_file(durable_hint_path(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Only damage a crash can explain is truncated, and only above the mark.
+    /// A group whose header checksum verifies but whose LSN skips ahead cannot
+    /// be produced by a crash on an append-only file, so it stays fatal even
+    /// above the mark: dropping it would hide a writer bug.
+    #[test]
+    fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
+        let coordinator = open_arc("hint_fatal_class");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let bad_lsn = first.last_lsn + 5;
+        let group = CommittedGroup {
+            sequence: first.sequence + 1,
+            first_lsn: bad_lsn,
+            last_lsn: bad_lsn,
+            entries: vec![JournalEntry {
+                lsn: bad_lsn,
+                offset: 0,
+                frame_len: 0,
+                pool: None,
+                mutation: put(1, 2, b"skipped"),
+            }],
+        };
+        let mut bytes = Vec::new();
+        encode_group(&group, JournalVersion::per_pool(), &mut bytes).unwrap();
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        assert!(
+            fs::metadata(&path).unwrap().len() > durable_mark(&path),
+            "the bad group lies above the durable mark"
+        );
+        assert_eq!(
+            Journal::open(&path).err().expect("must refuse").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::remove_file(durable_hint_path(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Recovery can keep groups that exist only in the page cache (a process
+    /// crash leaves them there) while the coordinator reports them committed.
+    /// Opening must make them durable, and record that, so a later sync never
+    /// claims bytes that were not fsynced.
+    #[test]
+    fn recovery_makes_what_it_keeps_durable_and_marks_it() {
+        let path = temp_path("hint_recovery_marks");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(durable_hint_path(&path));
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        let receipt = journal.append_group(&[put(1, 1, b"cached")]).unwrap();
+        drop(journal);
+        assert_eq!(
+            durable_mark(&path),
+            0,
+            "appended, never synced, so unmarked"
+        );
+
+        let (_journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(
+            durable_mark(&path),
+            super::FILE_HEADER_LEN as u64 + receipt.bytes_written,
+            "recovery fsynced what it kept and recorded it"
+        );
+        fs::remove_file(durable_hint_path(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Reclaim replaces the segment file, so it must wait for an in-flight
+    /// fsync instead of swapping the inode under it.
+    #[test]
+    fn reclaim_blocks_behind_an_in_flight_fsync() {
+        let coordinator = open_arc("reclaim_behind_fsync");
+        let first = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .unwrap()
+            .last_lsn;
+        let (parked, release) = park_next_fsync(&coordinator);
+
+        let syncer = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || coordinator.sync().unwrap())
+        };
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sync must reach its fsync");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reclaimer = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || {
+                coordinator.reclaim_through(first).unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "reclaim must wait for the in-flight fsync"
+        );
+
+        release.send(()).unwrap();
+        syncer.join().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reclaim must run once the fsync finishes");
+        reclaimer.join().unwrap();
+        assert_eq!(coordinator.committed_lsn(), first);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    /// Concurrent callers that queue behind an in-flight fsync must share the
+    /// next one instead of each starting their own. The first fsync is parked
+    /// until every other writer has published and is waiting on `sync_lock`,
+    /// so the outcome is exact: the first fsync covers only the first group,
+    /// and one more fsync covers the other seven.
+    #[test]
+    fn concurrent_syncs_coalesce_into_one_follow_up_fsync() {
+        const WRITERS: u8 = 8;
+        let coordinator = open_arc("concurrent_sync_coalesce");
+        let (parked, release) = park_next_fsync(&coordinator);
+
+        let leader = {
+            let coordinator = coordinator.clone();
+            std::thread::spawn(move || {
+                coordinator.publish_group(&[put(2, 0, b"w")]).unwrap();
+                coordinator.sync().unwrap();
+            })
+        };
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first sync must reach its fsync");
+
+        let mut followers = Vec::new();
+        for node in 1..WRITERS {
+            let coordinator = coordinator.clone();
+            followers.push(std::thread::spawn(move || {
+                coordinator.publish_group(&[put(2, node, b"w")]).unwrap();
+                coordinator.sync().unwrap();
+            }));
+        }
+        // Each follower counts itself as a waiter before blocking on
+        // `sync_lock`, which the parked leader holds.
+        let waiting = coordinator.clone();
+        wait_until(
+            move || waiting.journal_waiters.load(Ordering::Relaxed) == u64::from(WRITERS - 1),
+            "every follower to queue behind the parked fsync",
+        );
+        assert_eq!(coordinator.committed_lsn(), 0);
+
+        // Let the parked fsync finish, and every later fsync run unparked
+        // (a dropped sender makes the hook's wait return at once).
+        release.send(()).unwrap();
+        drop(release);
+        leader.join().unwrap();
+        for follower in followers {
+            follower.join().unwrap();
+        }
+
+        assert_eq!(coordinator.committed_lsn(), u64::from(WRITERS));
+        let stats = coordinator.durability_stats();
+        assert_eq!(
+            stats.commits, 2,
+            "the leader's fsync plus one shared follow-up"
+        );
+        assert_eq!(
+            stats.sync_coalesced,
+            u64::from(WRITERS - 2),
+            "all but the follow-up's leader found their target already marked durable"
+        );
+        *coordinator.fsync_hook.lock() = None;
+        fs::remove_file(coordinator.path()).unwrap();
     }
 
     /// A target that was never published is a caller bug, not a durable commit.
@@ -2070,14 +5242,11 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for item in 0..per_thread {
                     coordinator
-                        .publish(
-                            Mutation::Put {
-                                collection_id: [thread; 16],
-                                node_id: [item; 16],
-                                payload: b"payload".to_vec(),
-                            },
-                            |_| {},
-                        )
+                        .publish_group(&[Mutation::Put {
+                            collection_id: [thread; 16],
+                            node_id: [item; 16],
+                            payload: b"payload".to_vec(),
+                        }])
                         .unwrap();
                     // Either this caller commits the group or a concurrent
                     // caller already committed one covering this LSN.
@@ -2205,7 +5374,10 @@ mod tests {
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
-        let lsn = coordinator.publish(put(1, 1, b"first"), |_| {}).unwrap();
+        let lsn = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         let receipt = coordinator.sync().unwrap().unwrap();
         assert_eq!(receipt.last_lsn, lsn);
 
@@ -2213,7 +5385,10 @@ mod tests {
         assert_eq!(reclaim.retained_groups, 0);
         assert_eq!(coordinator.committed_lsn(), receipt.last_lsn);
 
-        let next = coordinator.publish(put(1, 2, b"second"), |_| {}).unwrap();
+        let next = coordinator
+            .publish_group(&[put(1, 2, b"second")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         assert_eq!(next, lsn.saturating_add(1));
         coordinator.sync().unwrap();
         drop(coordinator);
@@ -2225,6 +5400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "multi-reader")]
     fn shared_sequence_orders_groups_across_segments_and_allows_gaps() {
         let dir = temp_path("shared_sequence");
         let _ = fs::remove_dir_all(&dir);
@@ -2240,11 +5416,17 @@ mod tests {
 
         // Interleave commits; the shared counter hands out 1, 2, 3 so each
         // segment skips the values the other consumed.
-        a.publish(put(1, 1, b"a1"), |_| {}).unwrap();
+        a.publish_group(&[put(1, 1, b"a1")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         a.sync().unwrap();
-        b.publish(put(2, 1, b"b1"), |_| {}).unwrap();
+        b.publish_group(&[put(2, 1, b"b1")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         b.sync().unwrap();
-        a.publish(put(1, 2, b"a2"), |_| {}).unwrap();
+        a.publish_group(&[put(1, 2, b"a2")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
         a.sync().unwrap();
 
         drop(a);
@@ -2267,5 +5449,664 @@ mod tests {
             vec![2]
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Block until the committer has parked at least once since `parks_before`,
+    /// then until it has released `durable_lock` into its wait, so a following
+    /// publish cannot race the committer's entry-time pending check.
+    fn wait_parked(coordinator: &Arc<JournalCoordinator>, parks_before: u64) {
+        wait_until(
+            {
+                let coordinator = coordinator.clone();
+                move || coordinator.committer_parks.load(Ordering::Acquire) > parks_before
+            },
+            "committer to park",
+        );
+        // The park counter is bumped under `durable_lock`; taking the lock here
+        // returns only once the committer is inside its condvar wait.
+        drop(coordinator.durable_lock.lock());
+    }
+
+    fn open_arc(label: &str) -> Arc<JournalCoordinator> {
+        let path = temp_path(label);
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        Arc::new(JournalCoordinator::new(journal, &scan))
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool, label: &str) {
+        let start = std::time::Instant::now();
+        let deadline = start.checked_add(Duration::from_secs(5)).unwrap_or(start);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {label}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn durability_stats_show_requests_sharing_few_fsyncs() {
+        const WRITERS: u8 = 16;
+        let coordinator = open_arc("dur_stats_shared");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_millis(200),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for node in 0..WRITERS {
+            let coordinator = coordinator.clone();
+            handles.push(std::thread::spawn(move || {
+                let lsn = coordinator
+                    .publish_group(&[put(3, node, b"shared")])
+                    .map(|receipt| receipt.last_lsn)
+                    .unwrap();
+                let token = coordinator.request_durable(lsn);
+                coordinator.wait_durable(token).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let stats = coordinator.durability_stats();
+        assert_eq!(stats.durable_requests, u64::from(WRITERS));
+        assert_eq!(
+            stats.durable_wait.calls + stats.durable_waits_already_durable,
+            u64::from(WRITERS),
+            "every wait is either blocked or already durable"
+        );
+        assert_eq!(
+            stats.durable_wait.buckets.iter().sum::<u64>(),
+            stats.durable_wait.calls
+        );
+        assert_eq!(stats.commit_records, u64::from(WRITERS));
+        assert!(
+            stats.commits >= 1 && stats.commits < u64::from(WRITERS),
+            "{WRITERS} requests must share fewer fsyncs, saw {}",
+            stats.commits
+        );
+        assert!(stats.max_commit_records > 1);
+        assert!(stats.records_per_commit() > 1.0);
+        assert!(
+            stats.durable_wait.max
+                >= stats.durable_wait.total
+                    / u32::try_from(stats.durable_wait.calls.max(1)).unwrap()
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn durability_stats_count_already_durable_and_explicit_sync() {
+        let coordinator = open_arc("dur_stats_explicit");
+        let lsn = coordinator
+            .publish_group(&[put(4, 1, b"one")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        let before = coordinator.durability_stats();
+        assert_eq!(before.commits, 0);
+
+        coordinator.sync_through(lsn).unwrap();
+        let token = coordinator.request_durable(lsn);
+        coordinator.wait_durable(token).unwrap();
+        // A second barrier on the same LSN is covered, not a new fsync.
+        coordinator.sync_through(lsn).unwrap();
+
+        let stats = coordinator.durability_stats();
+        assert_eq!(stats.commits, 1);
+        assert_eq!(stats.commit_records, 1);
+        assert_eq!(stats.durable_requests, 1);
+        assert_eq!(stats.durable_waits_already_durable, 1);
+        assert_eq!(stats.durable_wait.calls, 0);
+        assert_eq!(stats.sync_requests, 2);
+        assert_eq!(stats.sync_coalesced, 1);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn background_committer_batches_sequential_requests_into_one_commit() {
+        let coordinator = open_arc("bg_batch");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_millis(750),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let mut token = None;
+        for node in 0..8u8 {
+            let lsn = coordinator
+                .publish_group(&[put(1, node, b"batch")])
+                .map(|receipt| receipt.last_lsn)
+                .unwrap();
+            token = Some(coordinator.request_durable(lsn));
+        }
+        let token = token.unwrap();
+        coordinator.wait_durable(token).unwrap();
+
+        assert!(token.is_satisfied_by(coordinator.committed_lsn()));
+        assert_eq!(coordinator.pending_count(), 0);
+        // `background_commits` is bumped after the committer's sync returns,
+        // which is after the durable boundary a waiter observes. Wait for the
+        // counter instead of racing it.
+        let counted = coordinator.clone();
+        wait_until(
+            move || counted.background_commits() >= 1,
+            "background commit to be counted",
+        );
+        assert_eq!(
+            coordinator.background_commits(),
+            1,
+            "sequential requests inside one window must coalesce into one group"
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn background_committer_flushes_a_quiet_stream_on_the_interval() {
+        let coordinator = open_arc("bg_quiet");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_millis(100),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let lsn = coordinator
+            .publish_group(&[put(2, 1, b"quiet")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        // No wait, no further request: the interval timer alone must flush it.
+        let committed = coordinator.clone();
+        wait_until(
+            move || committed.committed_lsn() >= lsn,
+            "quiet-stream interval flush",
+        );
+        // The committer bumps `background_commits` after its sync returns,
+        // which is after the durable boundary observed above.
+        let counted = coordinator.clone();
+        wait_until(
+            move || counted.background_commits() >= 1,
+            "background commit to be counted",
+        );
+        // Idle timer ticks after the flush must not register as coalesced work.
+        assert_eq!(coordinator.background_coalesced(), 0);
+        let parks_before = coordinator.committer_parks.load(Ordering::Acquire);
+        wait_until(
+            {
+                let coordinator = coordinator.clone();
+                move || coordinator.committer_parks.load(Ordering::Acquire) >= parks_before + 2
+            },
+            "two idle interval ticks",
+        );
+        assert_eq!(
+            coordinator.background_coalesced(),
+            0,
+            "idle ticks must not inflate the coalescing counter"
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn background_committer_flushes_early_at_max_pending() {
+        let coordinator = open_arc("bg_threshold");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+
+        // Publish only: no request_durable call, so the threshold crossing in
+        // `publish` itself must be what wakes the committer.
+        for node in 0..6u8 {
+            coordinator
+                .publish_group(&[put(3, node, b"burst")])
+                .map(|receipt| receipt.last_lsn)
+                .unwrap();
+        }
+        // The 60s interval cannot be the trigger; the pending bound must be.
+        // The wake fires on the fourth publish and the committer flushes
+        // through whatever is published by then, so later publishes may wait
+        // for the next crossing or the interval; the bound's worth must not.
+        let committed = coordinator.clone();
+        wait_until(
+            move || committed.committed_lsn() >= 4,
+            "max-pending early flush",
+        );
+        // The committer bumps `background_commits` after its sync returns,
+        // which is after the durable boundary observed above.
+        let counted = coordinator.clone();
+        wait_until(
+            move || counted.background_commits() >= 1,
+            "background commit to be counted",
+        );
+        assert_eq!(coordinator.background_coalesced(), 0);
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn background_committer_rejects_degenerate_config() {
+        let coordinator = open_arc("bg_bad_config");
+        let zero_interval = coordinator.start_background_committer(GroupCommitConfig {
+            interval: Duration::ZERO,
+            max_pending: 1,
+        });
+        assert_eq!(
+            zero_interval.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let zero_pending = coordinator.start_background_committer(GroupCommitConfig {
+            interval: Duration::from_secs(1),
+            max_pending: 0,
+        });
+        assert_eq!(
+            zero_pending.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(!coordinator.has_background_committer());
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn stop_background_committer_flushes_pending_before_returning() {
+        let coordinator = open_arc("bg_stop_flush");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let lsn = coordinator
+            .publish_group(&[put(4, 1, b"final")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        let _ = coordinator.request_durable(lsn);
+        coordinator.stop_background_committer().unwrap();
+
+        assert!(
+            coordinator.committed_lsn() >= lsn,
+            "stop must flush the final pending group"
+        );
+        assert!(!coordinator.has_background_committer());
+        wait_until(
+            || coordinator.background_commits() >= 1,
+            "background commit to be counted after stop",
+        );
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn explicit_sync_through_remains_immediate_with_committer_running() {
+        let coordinator = open_arc("bg_explicit_sync");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+
+        let lsn = coordinator
+            .publish_group(&[put(5, 1, b"explicit")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        // The explicit barrier must not wait for the committer's 60s interval:
+        // the committer cannot fire early here (max_pending is unbounded), so a
+        // barrier that returns promptly and satisfies `lsn` can only have done
+        // the commit itself.
+        let started = std::time::Instant::now();
+        coordinator.sync_through(lsn).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "explicit barrier must not block on the background interval"
+        );
+        assert!(coordinator.committed_lsn() >= lsn);
+        assert_eq!(
+            coordinator.background_commits(),
+            0,
+            "an explicit barrier is not a background commit"
+        );
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn wait_durable_without_committer_commits_directly() {
+        let coordinator = open_arc("no_committer_wait");
+        assert!(!coordinator.has_background_committer());
+        let lsn = coordinator
+            .publish_group(&[put(6, 1, b"direct")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        let token = coordinator.request_durable(lsn);
+        coordinator.wait_durable(token).unwrap();
+        assert!(coordinator.committed_lsn() >= lsn);
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn durability_token_reports_an_already_committed_boundary() {
+        let coordinator = open_arc("token_committed");
+        let lsn = coordinator
+            .publish_group(&[put(7, 1, b"done")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        coordinator.sync().unwrap();
+        let token = coordinator.request_durable(lsn);
+        assert!(token.is_satisfied_by(coordinator.committed_lsn()));
+        assert_eq!(token.lsn(), lsn);
+    }
+
+    #[test]
+    fn explicit_sync_advances_the_epoch_and_rearms_the_wake() {
+        use std::sync::atomic::Ordering;
+
+        let coordinator = open_arc("bg_epoch_explicit");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+        // Park first: on entry the committer checks pending itself, which would
+        // flush the burst below and mask a missing epoch bump.
+        wait_parked(&coordinator, 0);
+
+        // Pretend a wake was already claimed for the current epoch. From here
+        // only a commit that advances the epoch can re-arm the crossing; a
+        // burst alone must not wake the committer.
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+
+        let lsn = coordinator
+            .publish_group(&[put(1, 10, b"mid")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        coordinator.sync_through(lsn).unwrap();
+        assert_eq!(coordinator.background_commits(), 0);
+        assert_eq!(coordinator.threshold_wakes.load(Ordering::Relaxed), 0);
+
+        // The explicit commit above advanced the epoch, so this burst wakes it.
+        for node in 20..24u8 {
+            coordinator
+                .publish_group(&[put(1, node, b"second")])
+                .map(|receipt| receipt.last_lsn)
+                .unwrap();
+        }
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.background_commits() >= 1
+            },
+            "background flush after an explicit commit re-armed the wake",
+        );
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn threshold_wakes_again_after_a_background_flush() {
+        let coordinator = open_arc("bg_epoch_background");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+
+        for (burst, expected) in (0u64..2).enumerate() {
+            let base = u8::try_from(burst).unwrap() * 10;
+            for node in 0..4u8 {
+                coordinator
+                    .publish_group(&[put(2, base + node, b"burst")])
+                    .map(|receipt| receipt.last_lsn)
+                    .unwrap();
+            }
+            wait_until(
+                {
+                    let committed = coordinator.clone();
+                    let want = expected + 1;
+                    move || committed.background_commits() >= want
+                },
+                "background burst flush",
+            );
+        }
+        assert_eq!(coordinator.background_commits(), 2);
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn commit_leaving_a_backlog_wakes_a_parked_committer() {
+        use std::sync::atomic::Ordering;
+
+        let coordinator = open_arc("bg_epoch_backlog");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 4,
+            })
+            .unwrap();
+        // Let the committer park so that only an explicit wake can move it.
+        wait_parked(&coordinator, 0);
+
+        // Suppress the publish wake for this epoch, modelling publishers that
+        // arrived during an fsync and read the pre-commit epoch.
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let mut lsns = Vec::new();
+        for node in 0..4u8 {
+            lsns.push(
+                coordinator
+                    .publish_group(&[put(3, node, b"window")])
+                    .map(|receipt| receipt.last_lsn)
+                    .unwrap(),
+            );
+        }
+        // `publish` computes its wake inline, so this is exact: the suppressed
+        // burst selected none. (`background_commits` alone could not prove that, as
+        // a wrongly woken committer needs time to flush.)
+        assert_eq!(
+            coordinator.threshold_wakes.load(Ordering::Relaxed),
+            0,
+            "a suppressed burst must not select a threshold wake"
+        );
+        assert_eq!(
+            coordinator.background_commits(),
+            0,
+            "a suppressed burst must not flush before the explicit commit"
+        );
+
+        // Commit the first half explicitly while publishers add four more
+        // during the fsync (the journal lock is released for it). Those four
+        // arrive after the sync captured its range, so four records remain
+        // pending at the bound; the post-commit recheck, not a publish, must
+        // wake the committer.
+        let publisher = coordinator.clone();
+        let during_fsync = std::sync::Once::new();
+        *coordinator.fsync_hook.lock() = Some(Arc::new(move || {
+            during_fsync.call_once(|| {
+                for node in 4..8u8 {
+                    publisher.publish_group(&[put(3, node, b"window")]).unwrap();
+                }
+            });
+            Ok(())
+        }));
+        coordinator.sync_through(lsns[3]).unwrap();
+        *coordinator.fsync_hook.lock() = None;
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.background_commits() >= 1
+            },
+            "post-commit backlog wake",
+        );
+        assert_eq!(coordinator.pending_count(), 0);
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn start_during_stopping_is_a_noop() {
+        let coordinator = open_arc("bg_start_stopping");
+        // Simulate the join window: the slot is `Stopping` while the old worker
+        // exits, before `stop_background_committer` has joined it.
+        *coordinator.background.lock() = BackgroundState::Stopping;
+
+        // The exiting worker must leave the transition to the stopper.
+        coordinator.finish_background(None);
+        assert!(matches!(
+            *coordinator.background.lock(),
+            BackgroundState::Stopping
+        ));
+
+        // A concurrent start must not spawn a second worker.
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+        assert!(matches!(
+            *coordinator.background.lock(),
+            BackgroundState::Stopping
+        ));
+        assert!(!coordinator.has_background_committer());
+        assert_eq!(coordinator.background_commits(), 0);
+
+        // The stop path owns `Stopping -> Stopped` and still completes.
+        coordinator.stop_background_committer().unwrap();
+        assert!(matches!(
+            *coordinator.background.lock(),
+            BackgroundState::Stopped
+        ));
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn worker_failure_is_surfaced_and_cleared_by_restart() {
+        use std::sync::atomic::Ordering;
+
+        let coordinator = open_arc("bg_failure_restart");
+        coordinator.finish_background(Some(BackgroundFailure {
+            kind: std::io::ErrorKind::Other,
+            message: "boom".to_owned(),
+        }));
+        assert_eq!(
+            coordinator.background_failure_message().as_deref(),
+            Some("boom")
+        );
+
+        // A waiter must observe the terminal failure rather than block. The
+        // failure check precedes publication validation by contract, so even a
+        // never-published target reports the worker's failure, not InvalidInput.
+        let error = coordinator
+            .wait_durable(coordinator.request_durable(999))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("boom"));
+
+        // A worker that died before committing can leave the notification epoch
+        // equal to the current commit epoch. Without the start reset, the first
+        // threshold wake after restart would be suppressed until the timer.
+        coordinator.threshold_notified_epoch.store(
+            coordinator.commit_epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let parks_before = coordinator.committer_parks.load(Ordering::Acquire);
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: 1,
+            })
+            .unwrap();
+        // Let the committer park before publishing: its entry-time pending check
+        // would otherwise flush the burst and mask a suppressed wake.
+        wait_parked(&coordinator, parks_before);
+        assert!(coordinator.background_failure_detail().is_none());
+        let lsn = coordinator
+            .publish_group(&[put(5, 1, b"restart")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        wait_until(
+            {
+                let committed = coordinator.clone();
+                move || committed.committed_lsn() >= lsn
+            },
+            "first threshold wake after a restart",
+        );
+        coordinator
+            .wait_durable(coordinator.request_durable(lsn))
+            .unwrap();
+        assert!(coordinator.committed_lsn() >= lsn);
+
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn wait_durable_unpublished_target_has_a_stable_error() {
+        // Without a committer the call falls through to `sync_through`.
+        let coordinator = open_arc("bg_unpublished_none");
+        let error = coordinator
+            .wait_durable(coordinator.request_durable(1234))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("has not been published"));
+        fs::remove_file(coordinator.path()).unwrap();
+
+        // With a committer the unpublished target is rejected under the lock.
+        let coordinator = open_arc("bg_unpublished_committer");
+        coordinator
+            .start_background_committer(GroupCommitConfig {
+                interval: Duration::from_secs(60),
+                max_pending: u64::MAX,
+            })
+            .unwrap();
+        let error = coordinator
+            .wait_durable(coordinator.request_durable(1234))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("has not been published"));
+        coordinator.stop_background_committer().unwrap();
+        fs::remove_file(coordinator.path()).unwrap();
+    }
+
+    #[test]
+    fn claim_retries_when_a_commit_lands_between_claim_and_recheck() {
+        let coordinator = open_arc("bg_claim_race");
+        let mut fired = false;
+        let won = coordinator.claim_threshold_wake_with(|| {
+            if !fired {
+                fired = true;
+                coordinator.commit_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        // The commit invalidated the first claim; the retry claims the new
+        // epoch, so the wake is not suppressed.
+        assert!(won);
+        assert_eq!(
+            coordinator.threshold_notified_epoch.load(Ordering::Acquire),
+            coordinator.commit_epoch.load(Ordering::Acquire)
+        );
+        // Same epoch again: exactly one wake per epoch.
+        assert!(!coordinator.claim_threshold_wake());
+        fs::remove_file(coordinator.path()).unwrap();
     }
 }

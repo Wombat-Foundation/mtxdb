@@ -21,11 +21,11 @@
 //! # Layout (all little-endian):
 //!
 //! ```text
-//!   [DeltaLogHeader 16B]       magic "MDLG" | version | reserved | base_fingerprint
-//!   [DeltaBatchHeader 8B]      magic "MDLB" | frame_count
+//!   [DeltaLogHeader 16B]       magic "MTXL" | version | reserved | base_fingerprint
+//!   [DeltaBatchHeader 8B]      magic "MTXB" | frame_count
 //!   [v2: DeltaFrame * frame_count] fixed 36B records
 //!   [v3: framed collection operations] variable-width records
-//!   [DeltaLogTrailer 16B]      magic "DLTR" | reserved | tail_fingerprint
+//!   [DeltaLogTrailer 16B]      magic "MTXT" | reserved | tail_fingerprint
 //!   [DeltaBatchHeader ..]*     -- further batches, each count-framed and trailer-terminated
 //! ```
 //!
@@ -43,6 +43,43 @@ use super::format::{DeltaFrame, DELTA_FRAME_LEN};
 
 /// File name of the incremental index delta log inside a store's base dir.
 pub const INDEX_DELTA_FILE: &str = "index.delta";
+
+/// Discover fingerprint-named delta-log epochs in a store directory.
+///
+/// Epoch files are named `index.delta.<16 lowercase hex digits>`. The
+/// fingerprinted name lets an interrupted checkpoint handoff leave old and
+/// new epochs side by side without making either one ambiguous to a reader.
+///
+/// # Errors
+///
+/// Returns an I/O error when the directory cannot be read or an epoch filename
+/// contains a hexadecimal fingerprint that cannot be parsed.
+pub fn list_epochs(base_dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let prefix = format!("{INDEX_DELTA_FILE}.");
+    let mut epochs = Vec::new();
+    for entry in fs::read_dir(base_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(hex) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if hex.len() != 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let fingerprint = u64::from_str_radix(hex, 16).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid delta epoch filename {name}: {error}"),
+            )
+        })?;
+        epochs.push((fingerprint, path));
+    }
+    epochs.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+    Ok(epochs)
+}
 /// Bytes in one log header: magic(4) + version(1) + reserved(3) + base fingerprint(8).
 pub const DELTA_LOG_HEADER_LEN: usize = 16;
 /// Bytes in one batch header: magic(4) + `frame_count`(4). Determines the
@@ -60,7 +97,7 @@ pub const DELTA_LOG_TRAILER_LEN: usize = 16;
 /// own cap so it never rejects a real log.
 const MAX_DELTA_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
-const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
+const DELTA_LOG_MAGIC: &[u8; 4] = b"MTXL";
 /// Current wire version (see the header's version byte).
 ///
 /// v2 repurposes the trailer's 4 reserved bytes as a CRC32 covering the
@@ -73,8 +110,8 @@ const DELTA_LOG_MAGIC: &[u8; 4] = b"MDLG";
 const DELTA_LOG_VERSION: u8 = 2;
 /// Current v3 delta-log version, with variable-length collection operations.
 const DELTA_LOG_VERSION_V3: u8 = 3;
-const DELTA_BATCH_MAGIC: &[u8; 4] = b"MDLB";
-const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"DLTR";
+const DELTA_BATCH_MAGIC: &[u8; 4] = b"MTXB";
+const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"MTXT";
 
 const BASE_FINGERPRINT_OFFSET: usize = 8;
 const TRAILER_FINGERPRINT_OFFSET: usize = 8;
@@ -1098,13 +1135,24 @@ pub enum DeltaReplayError {
     RequiresOwnedIndex,
     /// A frame carried the empty-slot sentinel (`0`). A legitimate insert
     /// never produces one — `record_delta` only ever logs a freshly built,
-    /// non-empty `IndexSlot` — so this can only be log corruption or a
+    /// non-empty `IndexEntry` — so this can only be log corruption or a
     /// structurally invalid frame. Storing it as-is would silently erase
     /// whatever live entry currently occupies that bucket and truncate the
     /// probe chain past it, stranding any entries beyond it.
     EmptySlot {
         /// The frame's target bucket.
         bucket: u32,
+    },
+    /// A frame's packed entry named a slot at or above
+    /// [`crate::shard::MAX_SHARDS`], which no live shard can occupy. A
+    /// legitimate writer never produces one (`IndexEntry::new` rejects it), so
+    /// this can only be log corruption or a structurally invalid frame.
+    /// Accepting it would install an entry the shard scan cannot resolve.
+    SlotOutOfRange {
+        /// The frame's target bucket.
+        bucket: u32,
+        /// The decoded slot, at or above `MAX_SHARDS`.
+        slot: u16,
     },
 }
 
@@ -1122,6 +1170,13 @@ impl std::fmt::Display for DeltaReplayError {
                 write!(
                     f,
                     "delta frame at bucket {bucket} carries the empty-slot sentinel"
+                )
+            }
+            Self::SlotOutOfRange { bucket, slot } => {
+                write!(
+                    f,
+                    "delta frame at bucket {bucket} names shard slot {slot}, \
+                     which is not below MAX_SHARDS"
                 )
             }
         }

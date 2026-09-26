@@ -19,13 +19,14 @@ categories = ["database-implementations", "storage"]
 
 [workspace]
 resolver = "2"
-members = ["mtxdb-cli"]
-# mtxdb-ffi and mtxdb-wasm deliberately stay out: a workspace member's own
-# [profile.*] is ignored (only the workspace root's applies), and
-# mtxdb-wasm's release profile (opt-level "z", lto, panic="abort") is
-# load-bearing for wasm binary size — folding it in here silently
-# discards it. They stay standalone builds, each with their own
-# [workspace] table, depending on the mtxdb library via a path dependency.
+# mtxdb-cli is deliberately *not* a member. Its deps (clap 4.6, simd-json
+# 0.18) use edition 2024, which Cargo < 1.85 cannot even parse, and Cargo
+# parses every member's graph plus the shared lock for every command -- so a
+# member there would drag the whole workspace's floor up to 1.85. Keeping it
+# out (like benches/, which has its own `[workspace]` table)
+# preserves the library's 1.81 MSRV. Build/lint/test it with
+# `--manifest-path mtxdb-cli/Cargo.toml`.
+members = []
 
 [workspace.package]
 version = "0.1.0-beta.1"
@@ -69,38 +70,55 @@ verbose_file_reads = "warn"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["zstd"]
+# Record-payload compression. On by default, so stores keep writing and reading
+# zstd frames; disable (with `default-features = false`) for builds that must
+# not carry zstd. A build without it always
+# writes raw frames and refuses to read compressed ones.
+zstd = ["dep:zstd", "dep:zstd-sys"]
+
+# Cross-process write-ahead journal + read-committed overlay, for a
+# single-writer/multi-reader deployment where separate OS processes need to
+# read a live writer's committed-but-not-yet-checkpointed data (e.g. a
+# Synapse worker deployment). Off by default: a genuinely single-process
+# embedded deployment never needs this, and it costs real code (journal.rs,
+# the read-journal overlay, the refresh-on-miss read path) that a
+# single-process build shouldn't have to carry. See docs/TODO.txt's
+# "process model" entries for the deployment-shape reasoning.
+multi-reader = []
+
 [dependencies]
 arc-swap = "1"
+blake3 = "=1.5.5"
 bytes = "1.5"
 crc32fast = "1.4"
-getrandom = "0.4"
+fs2 = "0.4"
 memmap2 = "0.9.11"
 parking_lot = "0.12"
 sha2 = "0.10"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13", default-features = false, optional = true }
 
-# Native builds link the system libzstd via pkg-config (already installed
-# at /usr/local/lib here) instead of compiling zstd's C sources ourselves.
-# `zstd`/`zstd-safe` don't forward a "pkg-config" feature of their own, so
-# this reaches it by depending on `zstd-sys` directly at the same version
-# zstd-safe resolves to — Cargo unifies the two into one build.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-zstd-sys = { version = "2.1", features = ["pkg-config"] }
+# `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their
+# own, so reach `zstd-sys` directly at the same version zstd-safe resolves to
+# — Cargo unifies the two into one build. Unix hosts link the system libzstd
+# via pkg-config (already installed at /usr/local/lib here) instead of
+# compiling zstd's C sources ourselves; Windows has neither pkg-config nor a
+# system zstd, so it vendors and builds them with MSVC. zstd-sys lets
+# `vendored` win over `pkg-config`, but neither is target-conditional inside
+# the crate, so the choice is made here with two cfg tables.
+[target.'cfg(not(windows))'.dependencies]
+zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
 
-# wasm targets have no libzstd to pkg-config against. `zstd-sys` ships a
-# "vendored" feature that forces its bundled C sources to be compiled from
-# source instead (overriding "pkg-config" outright, whichever target
-# enabled it) using its own `wasm-shim` — minimal libc stubs — so `cc`
-# can target wasm32 directly without a full WASI sysroot.
-[target.'cfg(target_family = "wasm")'.dependencies]
-zstd-sys = { version = "2.1", features = ["vendored"] }
+[target.'cfg(windows)'.dependencies]
+zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
 [lints]
 workspace = true
 
 # BENCHES live in `benches/`, which is its own standalone crate (see that
-# directory's Cargo.toml) outside this `[workspace]`'s `members` -- exactly
-# like mtxdb-ffi/mtxdb-wasm below -- so `--workspace --all-targets
+# directory's Cargo.toml) outside this `[workspace]`'s `members` -- so
+# `--workspace --all-targets
 # --all-features` from here never builds, lints, or ships them (nor their
 # libmdbx/rusqlite/fjall comparison deps). `cd benches` (or
 # `--manifest-path benches/Cargo.toml`) to reach them explicitly.
@@ -112,6 +130,16 @@ workspace = true
 [profile.release]
 strip = "symbols"
 lto = "thin"
+
+# Fast compile time with decent runtime performance and full debuginfo.
+[profile.release-quick]
+debug = "full"
+debug-assertions = false
+incremental = true
+inherits = "release"
+lto = "off"
+opt-level = 1
+strip = "none"
 
 [profile.release-max-perf]
 inherits = "release"
@@ -126,8 +154,16 @@ strip = "debuginfo"
 incremental = true
 codegen-units = 256
 
-[profile.test]
-debug = 0
-strip = "debuginfo"
-incremental = true
+# Fast compile-time development/testing profile. "quick" refers to compile
+# time, not runtime speed.
+[profile.dev-quick]
 codegen-units = 256
+debug = "line-tables-only"
+incremental = true
+inherits = "dev"
+lto = "off"
+opt-level = 0
+strip = "symbols"
+
+[profile.test]
+inherits = "dev"

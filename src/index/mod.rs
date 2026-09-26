@@ -23,7 +23,7 @@ pub struct IndexConfig {
     /// precomputation. See `index/mod.rs` seed docs.
     pub seed: u64,
     /// Minimum initial capacity for a newly created collection's index.
-    /// Composes with the hard 16-slot minimum: `effective_min = floor.max(16)`.
+    /// Composes with the hard 16-entry minimum: `effective_min = floor.max(16)`.
     pub floor: u32,
     /// Load factor (percent, 1..=90) at which the index grows.
     pub load_factor_percent: u8,
@@ -69,82 +69,93 @@ fn mix(x: u64) -> u64 {
     v ^ (v >> 31)
 }
 
-/// Per-slot entry in the lossy fanout index.
+/// Per-entry entry in the lossy fanout index.
 ///
-/// Layout: `[16-bit tag | 16-bit shard_id | 32-bit offset]` packed into a `u64`.
+/// Layout: `[16-bit tag | 16-bit slot | 32-bit offset]` packed into a `u64`.
 ///
 /// - **tag** (high 16 bits): truncated fingerprint for fast rejection.
-/// - **`shard_id`** (next 16 bits): which shard file this record lives in.
+/// - **`slot`** (next 16 bits): which shard file this record lives in. The
+///   field is a full 16 bits, but live shard IDs only ever reach
+///   `crate::shard::MAX_SHARDS` (4096), so the top 4 bits of this field are
+///   reserved — `IndexEntry::new` rejects a slot that is not a valid live ID.
+///   They are *not* reclaimed as extra offset bits: `slot()` still decodes
+///   all 16, and widening the offset would change the on-disk encoding.
 /// - **offset** (low 32 bits): byte offset within the shard, stored as
 ///   `offset + 1` so that the all-zeros encoding is reserved as the empty
 ///   sentinel. Actual offset 0 is stored as 1, and `offset()` subtracts 1
 ///   to recover the real value.
 ///
 /// Empty slots are all-zeros. This is safe regardless of tag value: the
-/// `offset + 1` encoding guarantees a live slot's low 32 bits are never zero,
+/// `offset + 1` encoding guarantees a live entry's low 32 bits are never zero,
 /// so the all-zeros pattern can never be produced by a real insert — the tag
 /// bits play no role in reserving the sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexSlot(u64);
+pub struct IndexEntry(u64);
 
-impl IndexSlot {
+impl IndexEntry {
     const EMPTY: Self = Self(0);
 
     /// Largest byte offset representable by the 32-bit offset field while
-    /// reserving the all-zeros encoding for the empty-slot sentinel.
+    /// reserving the all-zeros encoding for the empty-entry sentinel.
     pub const MAX_OFFSET: u64 = (1u64 << 32) - 2;
 
     const TAG_SHIFT: u64 = 48; // SHARD_BITS + OFFSET_BITS
     const SHARD_SHIFT: u64 = 32; // OFFSET_BITS
     const OFFSET_MASK: u64 = 0xFFFF_FFFF;
 
-    /// Create a new slot from its components.
+    /// Create a new entry from its components.
     ///
     /// The offset is stored as `offset + 1` so that the all-zeros `u64`
     /// encoding is reserved as the empty sentinel. Actual offset 0 is
-    /// stored as 1 in the slot.
+    /// stored as 1 in the entry.
     ///
     /// # Panics
-    /// Panics if `tag` exceeds 16 bits or `offset` exceeds [`Self::MAX_OFFSET`].
+    /// Panics if `tag` exceeds 16 bits, `slot` is not a valid live shard ID
+    /// (`>= crate::shard::MAX_SHARDS`), or `offset` exceeds
+    /// [`Self::MAX_OFFSET`].
     #[must_use]
-    pub fn new(tag: u32, shard_id: u16, offset: u64) -> Self {
+    pub fn new(tag: u32, slot: u16, offset: u64) -> Self {
         assert!(tag <= 0xFFFF, "tag must fit in 16 bits");
+        assert!(
+            usize::from(slot) < crate::shard::MAX_SHARDS,
+            "slot {slot} is not a valid live shard ID (must be < MAX_SHARDS)"
+        );
         assert!(
             offset <= Self::MAX_OFFSET,
             "offset must fit in 32 bits minus 1 (reserved for empty sentinel)"
         );
         Self(
             (u64::from(tag) << Self::TAG_SHIFT)
-                | (u64::from(shard_id) << Self::SHARD_SHIFT)
+                | (u64::from(slot) << Self::SHARD_SHIFT)
                 | ((offset.wrapping_add(1)) & Self::OFFSET_MASK),
         )
     }
 
-    /// The sentinel value representing an empty slot.
+    /// The sentinel value representing an empty entry.
     #[must_use]
     pub fn empty() -> Self {
         Self::EMPTY
     }
 
-    /// Returns `true` if this slot is the empty sentinel.
+    /// Returns `true` if this entry is the empty sentinel.
     #[must_use]
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
 
-    /// The 16-bit tag stored in this slot.
+    /// The 16-bit tag stored in this entry.
     #[must_use]
     pub fn tag(self) -> u32 {
         ((self.0 >> Self::TAG_SHIFT) & 0xFFFF) as u32
     }
 
-    /// The 16-bit shard ID stored in this slot.
+    /// The 16-bit shard ID stored in this entry.
     #[must_use]
-    pub fn shard_id(self) -> u16 {
+    pub fn slot(self) -> u16 {
         ((self.0 >> Self::SHARD_SHIFT) & 0xFFFF) as u16
     }
 
-    /// The byte offset within the shard stored in this slot.
+    /// The byte offset within the shard stored in this entry.
     #[must_use]
     pub fn offset(self) -> u64 {
         (self.0 & Self::OFFSET_MASK).wrapping_sub(1)
@@ -159,11 +170,11 @@ impl IndexSlot {
 ///
 /// Design decisions (from docs):
 /// - Partition by collection: ~8KB per 1000-node collection, 100 active collections < 1MB.
-/// - Empty slot terminates probe (write-once, no tombstones needed).
+/// - Empty entry terminates probe (write-once, no tombstones needed).
 /// - Tag collisions coexist in the probe chain; a tag is only a candidate
 ///   filter and never an overwrite/equality proof.
 /// - Owned indexes keep `homes` and `tails` identity side tables: two
-///   anonymous `u64`s (16 bytes) per slot beyond the packed slot array.
+///   anonymous `u64`s (16 bytes) per entry beyond the packed entry array.
 ///   Checkpoints retain only packed slots; identities are hydrated lazily
 ///   from authoritative frame headers when a writer needs them.
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
@@ -177,15 +188,15 @@ pub struct LossyIndex {
     shift: u32,
     /// Per-instance config: seed, floor, load factor.
     config: IndexConfig,
-    /// The flat slot array. Checkpoint-loaded indexes borrow the immutable
+    /// The flat entry array. Checkpoint-loaded indexes borrow the immutable
     /// raw slots from their mmap until their first write, which clones them
     /// into the owned atomic representation.
-    slots: SlotStorage,
-    /// The first 64 bits of each slot's hash. Index slots intentionally pack
+    slots: EntryStorage,
+    /// The first 64 bits of each entry's hash. Index slots intentionally pack
     /// only a tag, shard, and offset; retaining the home hash separately lets
     /// a live writer grow the table without rescanning the packfiles.
     homes: Mutex<Vec<u64>>,
-    /// The remaining 40 bits of each live slot's hash, plus a high-bit
+    /// The remaining 40 bits of each live entry's hash, plus a high-bit
     /// marker that says the identity is known. Together with `homes` and the
     /// packed tag this makes overwrite equality exact without putting
     /// full hashes in the checkpoint.
@@ -207,12 +218,12 @@ pub struct LossyIndex {
 }
 
 #[derive(Debug)]
-enum SlotStorage {
+enum EntryStorage {
     Owned(Vec<AtomicU64>),
     Mmap { mmap: Arc<Mmap>, offset: usize },
 }
 
-impl SlotStorage {
+impl EntryStorage {
     #[inline]
     fn get(&self, index: usize) -> u64 {
         match self {
@@ -221,7 +232,7 @@ impl SlotStorage {
                 let start = offset.saturating_add(index.saturating_mul(8));
                 let bytes: [u8; 8] = mmap[start..start.saturating_add(8)]
                     .try_into()
-                    .expect("validated checkpoint slot range");
+                    .expect("validated checkpoint entry range");
                 u64::from_le_bytes(bytes)
             }
         }
@@ -241,7 +252,7 @@ impl Clone for LossyIndex {
             mask: self.mask,
             shift: self.shift,
             config: self.config,
-            slots: SlotStorage::Owned(self.slots.materialize(self.capacity as usize)),
+            slots: EntryStorage::Owned(self.slots.materialize(self.capacity as usize)),
             // Checkpoint-backed indexes deliberately omit source hashes. On
             // their first write, clone their slots into owned storage but
             // keep an empty home table; `can_grow` remains false, so a later
@@ -263,8 +274,8 @@ impl Clone for LossyIndex {
     }
 }
 
-/// The slot plus its retained home-hash used by a live index generation.
-const LIVE_SLOT_BYTES: usize = std::mem::size_of::<IndexSlot>() + 2 * std::mem::size_of::<u64>();
+/// The entry plus its retained home-hash used by a live index generation.
+const LIVE_SLOT_BYTES: usize = std::mem::size_of::<IndexEntry>() + 2 * std::mem::size_of::<u64>();
 
 impl LossyIndex {
     /// Create a new index with at least `min_capacity` slots using default config.
@@ -287,7 +298,7 @@ impl LossyIndex {
 
     /// Create a new index with at least `min_capacity` slots using the given config.
     /// Capacity is rounded up to the next power of two. The configured `floor`
-    /// composes with the hard 16-slot minimum: `effective_min = floor.max(16)`.
+    /// composes with the hard 16-entry minimum: `effective_min = floor.max(16)`.
     ///
     /// # Panics
     /// Panics if `min_capacity` exceeds `u32::MAX` when rounded to a power of two,
@@ -304,7 +315,7 @@ impl LossyIndex {
             capacity,
             shift,
             config,
-            slots: SlotStorage::Owned((0..capacity_usize).map(|_| AtomicU64::new(0)).collect()),
+            slots: EntryStorage::Owned((0..capacity_usize).map(|_| AtomicU64::new(0)).collect()),
             homes: Mutex::new(vec![0; capacity_usize]),
             tails: Mutex::new(vec![0; capacity_usize]),
             can_grow: true,
@@ -313,7 +324,7 @@ impl LossyIndex {
         }
     }
 
-    /// This index's slot-table capacity (always a power of two).
+    /// This index's entry-table capacity (always a power of two).
     #[must_use]
     pub(crate) fn capacity(&self) -> u32 {
         self.capacity
@@ -379,13 +390,13 @@ impl LossyIndex {
         (mixed >> 48) as u32
     }
 
-    /// The packed-slot tag for `hash`, exposed to crate-local recovery code
-    /// that must validate a persisted slot against its authoritative frame.
+    /// The packed-entry tag for `hash`, exposed to crate-local recovery code
+    /// that must validate a persisted entry against its authoritative frame.
     ///
-    /// Must use this index's own seed: every stored slot's tag was computed
+    /// Must use this index's own seed: every stored entry's tag was computed
     /// via `self.tag(hash)` at insert time, so a recovery comparison against
     /// an unseeded (or differently-seeded) tag would fail closed on every
-    /// occupied slot, not just colliding ones.
+    /// occupied entry, not just colliding ones.
     #[inline]
     pub(crate) fn tag_for_hash(&self, hash: &[u8; 16]) -> u32 {
         self.tag(hash)
@@ -399,17 +410,17 @@ impl LossyIndex {
         KNOWN | u64::from_be_bytes(bytes)
     }
 
-    /// Insert a (hash → `shard_id`, offset) mapping.
+    /// Insert a (hash → `slot`, offset) mapping.
     ///
     /// # Errors
     /// Returns `InsertError::TableFull` if the table has less than 25% free slots
     /// and the hash is not already present (overwrites are always allowed).
-    pub fn insert(&self, hash: &[u8; 16], shard_id: u16, offset: u64) -> Result<(), InsertError> {
-        self.insert_tracked(hash, shard_id, offset).map(|_| ())
+    pub fn insert(&self, hash: &[u8; 16], slot: u16, offset: u64) -> Result<(), InsertError> {
+        self.insert_tracked(hash, slot, offset).map(|_| ())
     }
 
     /// Like [`Self::insert`], but also reports the write's exact landing spot —
-    /// the affected bucket and the packed slot value stored there — so the
+    /// the affected bucket and the packed entry value stored there — so the
     /// delta persistence layer can append a replay frame without re-probing.
     ///
     /// # Errors
@@ -421,15 +432,15 @@ impl LossyIndex {
     pub fn insert_tracked(
         &self,
         hash: &[u8; 16],
-        shard_id: u16,
+        slot: u16,
         offset: u64,
     ) -> Result<(u32, u64), InsertError> {
-        self.insert_undoable(hash, shard_id, offset)
+        self.insert_undoable(hash, slot, offset)
             .map(|(bucket, value, _undo)| (bucket, value))
     }
 
-    /// Like [`Self::insert_tracked`], but also returns a [`SlotUndo`]
-    /// capturing the slot's prior contents, so a caller that needs to
+    /// Like [`Self::insert_tracked`], but also returns a [`EntryUndo`]
+    /// capturing the entry's prior contents, so a caller that needs to
     /// mutate the live (not cloned) index for a multi-record batch can
     /// undo this one write if a later entry in the batch fails.
     ///
@@ -443,9 +454,9 @@ impl LossyIndex {
     pub fn insert_undoable(
         &self,
         hash: &[u8; 16],
-        shard_id: u16,
+        slot: u16,
         offset: u64,
-    ) -> Result<(u32, u64, SlotUndo), InsertError> {
+    ) -> Result<(u32, u64, EntryUndo), InsertError> {
         let tag = self.tag(hash);
         let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
         let home = self.mix_home(raw_home);
@@ -458,13 +469,13 @@ impl LossyIndex {
             // return/undo structs below don't each need a checked cast.
             let bucket_wire = u32::try_from(bucket)
                 .expect("bucket is masked by the u32 capacity, so it always fits");
-            let SlotStorage::Owned(slots) = &self.slots else {
+            let EntryStorage::Owned(slots) = &self.slots else {
                 self.bump_max_probe_len(probe_len);
                 return Err(InsertError::TableFull);
             };
-            let slot = IndexSlot(slots[bucket].load(Ordering::Acquire));
-            if slot.is_empty() {
-                // Only reject when actually inserting into a new slot
+            let entry = IndexEntry(slots[bucket].load(Ordering::Acquire));
+            if entry.is_empty() {
+                // Only reject when actually inserting into a new entry
                 let threshold = self
                     .capacity
                     .wrapping_mul(u32::from(self.config.load_factor_percent))
@@ -476,16 +487,16 @@ impl LossyIndex {
                 let old_home = self.homes.lock()[bucket];
                 let old_tail = self.tails.lock()[bucket];
                 // Writers are serialized by the collection put lock. Publish
-                // the slot last so concurrent readers see either the prior
-                // empty slot or a complete record location.
+                // the entry last so concurrent readers see either the prior
+                // empty entry or a complete record location.
                 self.homes.lock()[bucket] = home;
                 self.tails.lock()[bucket] = Self::tail(hash);
-                let value = IndexSlot::new(tag, shard_id, offset).0;
+                let value = IndexEntry::new(tag, slot, offset).0;
                 slots[bucket].store(value, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
-                let undo = SlotUndo {
+                let undo = EntryUndo {
                     bucket: bucket_wire,
-                    old_slot: 0,
+                    old_entry: 0,
                     old_home,
                     old_tail,
                     was_empty: true,
@@ -496,24 +507,24 @@ impl LossyIndex {
             // A tag only filters candidates; it never proves key equality.
             // Checkpoint-derived slots initially lack their 40-bit tail and
             // ask storage to hydrate it from the frame before deciding.
-            if slot.tag() == tag {
+            if entry.tag() == tag {
                 let tail = self.tails.lock()[bucket];
                 if tail == 0 {
                     self.bump_max_probe_len(probe_len);
                     return Err(InsertError::NeedsIdentity {
                         bucket: bucket_wire,
-                        shard_id: slot.shard_id(),
-                        offset: slot.offset(),
+                        slot: entry.slot(),
+                        offset: entry.offset(),
                     });
                 }
                 if self.homes.lock()[bucket] == home && tail == Self::tail(hash) {
-                    let old_slot = slot.0;
+                    let old_entry = entry.0;
                     let old_home = self.homes.lock()[bucket];
-                    let value = IndexSlot::new(tag, shard_id, offset).0;
+                    let value = IndexEntry::new(tag, slot, offset).0;
                     slots[bucket].store(value, Ordering::Release);
-                    let undo = SlotUndo {
+                    let undo = EntryUndo {
                         bucket: bucket_wire,
-                        old_slot,
+                        old_entry,
                         old_home,
                         old_tail: tail,
                         was_empty: false,
@@ -536,29 +547,29 @@ impl LossyIndex {
     /// Never panics; a no-op if called against a checkpoint-mmap-backed
     /// index, since [`Self::insert_undoable`] cannot have produced an undo
     /// entry against one (it errors with `TableFull` first).
-    pub fn rollback_slot(&self, undo: &SlotUndo) {
-        let SlotStorage::Owned(slots) = &self.slots else {
+    pub fn rollback_slot(&self, undo: &EntryUndo) {
+        let EntryStorage::Owned(slots) = &self.slots else {
             return;
         };
         let bucket = undo.bucket as usize;
         self.homes.lock()[bucket] = undo.old_home;
         self.tails.lock()[bucket] = undo.old_tail;
-        slots[bucket].store(undo.old_slot, Ordering::Release);
+        slots[bucket].store(undo.old_entry, Ordering::Release);
         if undo.was_empty {
             self.len.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
-    /// Mark a checkpoint-derived slot with the full identity recovered from
-    /// its authoritative frame. Returns `false` if the slot changed or the
-    /// supplied hash cannot describe that slot.
+    /// Mark a checkpoint-derived entry with the full identity recovered from
+    /// its authoritative frame. Returns `false` if the entry changed or the
+    /// supplied hash cannot describe that entry.
     pub(crate) fn hydrate_slot_identity(&self, bucket: u32, hash: &[u8; 16]) -> bool {
         let bucket = bucket as usize;
         if bucket >= self.capacity as usize {
             return false;
         }
-        let slot = IndexSlot(self.slot_at(bucket));
-        if slot.is_empty() || slot.tag() != self.tag(hash) {
+        let entry = IndexEntry(self.entry_at(bucket));
+        if entry.is_empty() || entry.tag() != self.tag(hash) {
             return false;
         }
         let raw_home = u64::from_be_bytes(hash[..8].try_into().expect("16-byte hash"));
@@ -573,22 +584,22 @@ impl LossyIndex {
     ///
     /// Only valid on an owned (materialized) index — callers must clone an
     /// mmap-backed index first. Frames are applied exactly as the live
-    /// session wrote them: an overwrite of a non-empty slot leaves the length
-    /// unchanged, a write into an empty slot increments it. The index's `len`
+    /// session wrote them: an overwrite of a non-empty entry leaves the length
+    /// unchanged, a write into an empty entry increments it. The index's `len`
     /// after replay therefore equals the checkpoint's occupancy plus the
-    /// number of fresh-slot writes, which is what the sidecar integrity sum
+    /// number of fresh-entry writes, which is what the sidecar integrity sum
     /// checks against.
     ///
     /// # Errors
     /// Returns `DeltaReplayError` if a frame targets a bucket outside this
-    /// index's capacity, or carries the empty-slot sentinel (either is a
+    /// index's capacity, or carries the empty-entry sentinel (either is a
     /// structurally inconsistent log, rejected wholesale), or the index is
     /// still mmap-backed.
     pub fn replay_frames(&self, frames: &[DeltaFrame]) -> Result<(), DeltaReplayError> {
-        let SlotStorage::Owned(slots) = &self.slots else {
+        let EntryStorage::Owned(slots) = &self.slots else {
             return Err(DeltaReplayError::RequiresOwnedIndex);
         };
-        // Validate every frame before mutating any slot: the contract is
+        // Validate every frame before mutating any entry: the contract is
         // wholesale rejection of a structurally inconsistent log, so a
         // caller must never observe a partially replayed index.
         for frame in frames {
@@ -607,6 +618,20 @@ impl LossyIndex {
                 // whole log instead of silently losing data.
                 return Err(DeltaReplayError::EmptySlot {
                     bucket: frame.bucket,
+                });
+            }
+            // The packed entry's slot field must name a live shard. A writer
+            // only ever encodes a slot from its own `ShardPool` (bounded by
+            // `MAX_SHARDS`; see `IndexEntry::new`), so a value at or above the
+            // cap can only be log corruption or a structurally invalid frame.
+            // Accepting it would install an entry no shard scan can resolve —
+            // `referenced_slot_ids` and friends skip `id >= MAX_SHARDS` — so
+            // the record would silently vanish from recovery.
+            let decoded = IndexEntry(frame.slot);
+            if usize::from(decoded.slot()) >= crate::shard::MAX_SHARDS {
+                return Err(DeltaReplayError::SlotOutOfRange {
+                    bucket: frame.bucket,
+                    slot: decoded.slot(),
                 });
             }
         }
@@ -631,24 +656,24 @@ impl LossyIndex {
         if !self.can_grow || self.capacity > u32::MAX / 2 {
             return None;
         }
-        let grown = Self::with_config(self.capacity as usize * 2, self.config);
+        let grown = Self::with_config((self.capacity as usize).saturating_mul(2), self.config);
         let homes = self.homes.lock();
         let tails = self.tails.lock();
         for (index, home) in homes.iter().copied().enumerate() {
-            let slot = IndexSlot(self.slots.get(index));
-            if slot.is_empty() {
+            let entry = IndexEntry(self.slots.get(index));
+            if entry.is_empty() {
                 continue;
             }
             let mut bucket = grown.bucket_for_home(home);
-            while !IndexSlot(grown.slot_at(bucket)).is_empty() {
+            while !IndexEntry(grown.entry_at(bucket)).is_empty() {
                 bucket = bucket.wrapping_add(1) & grown.mask as usize;
             }
             grown.homes.lock()[bucket] = home;
             grown.tails.lock()[bucket] = tails[index];
-            let SlotStorage::Owned(slots) = &grown.slots else {
+            let EntryStorage::Owned(slots) = &grown.slots else {
                 unreachable!("new index is owned")
             };
-            slots[bucket].store(slot.0, Ordering::Relaxed);
+            slots[bucket].store(entry.0, Ordering::Relaxed);
             grown.len.fetch_add(1, Ordering::Relaxed);
         }
         Some(grown)
@@ -659,7 +684,7 @@ impl LossyIndex {
     ///
     /// Checkpoint-backed indexes deliberately omit `homes`, so their first
     /// post-restart resize cannot use [`Self::grow`].  The packed slots still
-    /// retain every `(shard_id, offset)`, however.  A caller can therefore
+    /// retain every `(slot, offset)`, however.  A caller can therefore
     /// recover only the `len` source hashes from the authoritative records
     /// and rehash without rescanning every pack in the store. Locations are
     /// visited in `(shard, offset)` order rather than hash-table order, so a
@@ -679,30 +704,30 @@ impl LossyIndex {
 
         let mut locations = Vec::with_capacity(self.len());
         for index in 0..self.capacity as usize {
-            let slot = IndexSlot(self.slot_at(index));
-            if slot.is_empty() {
+            let entry = IndexEntry(self.entry_at(index));
+            if entry.is_empty() {
                 continue;
             }
-            locations.push((slot.shard_id(), slot.offset(), slot.tag()));
+            locations.push((entry.slot(), entry.offset(), entry.tag()));
         }
-        locations.sort_unstable_by_key(|(shard_id, offset, _)| (*shard_id, *offset));
+        locations.sort_unstable_by_key(|(slot, offset, _)| (*slot, *offset));
 
-        let grown = Self::with_config(self.capacity as usize * 2, self.config);
-        for (shard_id, offset, slot_tag) in locations {
-            let hash = hash_at(shard_id, offset, slot_tag)?;
+        let grown = Self::with_config((self.capacity as usize).saturating_mul(2), self.config);
+        for (slot, offset, slot_tag) in locations {
+            let hash = hash_at(slot, offset, slot_tag)?;
             // A doubled table is at most 37.5% full because insertion only
             // requests growth at 75%, so this cannot hit TableFull.
-            let _ = grown.insert(&hash, shard_id, offset);
+            let _ = grown.insert(&hash, slot, offset);
         }
         Ok(Some(grown))
     }
 
     /// Look up a hash in the index.
-    /// Returns `(shard_id, offset)` if found, `None` if absent.
+    /// Returns `(slot, offset)` if found, `None` if absent.
     ///
-    /// An empty slot terminates the probe — this is correct because:
+    /// An empty entry terminates the probe — this is correct because:
     /// 1. Class A tables are write-once with no deletes (no tombstones needed).
-    /// 2. An empty slot means the key was never inserted.
+    /// 2. An empty entry means the key was never inserted.
     #[inline]
     #[must_use]
     pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u16, u64)> {
@@ -713,14 +738,14 @@ impl LossyIndex {
     ///
     /// Candidates with hydrated in-memory identity (home + tail) are verified
     /// before yielding, so tag collisions in a live/warm index are filtered
-    /// out here rather than forcing the caller to disk. For a slot whose
+    /// out here rather than forcing the caller to disk. For a entry whose
     /// identity is not yet hydrated (e.g. a fresh checkpoint restore), the
     /// caller **must** verify the candidate against the caller-requested
     /// hash — a raw tag collision (~1/65536 at 16-bit tags) can still surface
     /// unverified.
     ///
-    /// Yields `(shard_id, offset)` for each slot whose tag matches and isn't
-    /// ruled out, then terminates at the first empty slot or after
+    /// Yields `(slot, offset)` for each entry whose tag matches and isn't
+    /// ruled out, then terminates at the first empty entry or after
     /// `capacity` probes.
     ///
     /// # Panics
@@ -797,17 +822,17 @@ impl LossyIndex {
             .checked_add(std::mem::size_of::<Self>())
     }
 
-    /// Returns which shard IDs are referenced by at least one occupied slot.
+    /// Returns which shard IDs are referenced by at least one occupied entry.
     ///
     /// Used by shard retirement to determine which shards are still live
-    /// across all collections before freeing a pool slot.
+    /// across all collections before freeing a pool entry.
     #[must_use]
-    pub fn referenced_shard_ids(&self) -> [bool; crate::shard::MAX_SHARDS] {
+    pub fn referenced_slot_ids(&self) -> [bool; crate::shard::MAX_SHARDS] {
         let mut seen = [false; crate::shard::MAX_SHARDS];
         for index in 0..self.capacity as usize {
-            let slot = IndexSlot(self.slot_at(index));
-            if !slot.is_empty() {
-                let id = slot.shard_id() as usize;
+            let entry = IndexEntry(self.entry_at(index));
+            if !entry.is_empty() {
+                let id = entry.slot() as usize;
                 if id < crate::shard::MAX_SHARDS {
                     seen[id] = true;
                 }
@@ -824,12 +849,12 @@ impl LossyIndex {
     /// contribution to record against that collection, without a second scan
     /// of the packfile itself.
     #[must_use]
-    pub fn shard_counts(&self) -> std::collections::HashMap<u16, u64> {
+    pub fn slot_counts(&self) -> std::collections::HashMap<u16, u64> {
         let mut counts = std::collections::HashMap::new();
         for index in 0..self.capacity as usize {
-            let slot = IndexSlot(self.slot_at(index));
-            if !slot.is_empty() {
-                let entry = counts.entry(slot.shard_id()).or_insert(0u64);
+            let entry = IndexEntry(self.entry_at(index));
+            if !entry.is_empty() {
+                let entry = counts.entry(entry.slot()).or_insert(0u64);
                 *entry = entry.saturating_add(1);
             }
         }
@@ -837,83 +862,83 @@ impl LossyIndex {
     }
 
     /// Whether this collection's index currently has any live entry pointing
-    /// into `shard_id`. Short-circuits on the first match — unlike
-    /// `referenced_shard_ids`, which always builds a full `MAX_SHARDS`
+    /// into `slot`. Short-circuits on the first match — unlike
+    /// `referenced_slot_ids`, which always builds a full `MAX_SHARDS`
     /// membership map, this is the cheap check for "does this one collection
     /// still reference this one shard," used to filter a shard-scan's
     /// candidate collection list down to collections that haven't already repacked
     /// past it.
     #[must_use]
-    pub fn references_shard(&self, shard_id: u16) -> bool {
+    pub fn references_slot(&self, slot: u16) -> bool {
         (0..self.capacity as usize).any(|index| {
-            let slot = IndexSlot(self.slot_at(index));
-            !slot.is_empty() && slot.shard_id() == shard_id
+            let entry = IndexEntry(self.entry_at(index));
+            !entry.is_empty() && entry.slot() == slot
         })
     }
 
-    /// Rewrites every occupied slot's `shard_id` through `remap`, in place.
+    /// Rewrites every occupied entry's `slot` through `remap`, in place.
     ///
-    /// A checkpoint-loaded index's `shard_id`s were encoded by the writer's
+    /// A checkpoint-loaded index's `slot`s were encoded by the writer's
     /// own local `ShardPool` slots at checkpoint-write time — a process-local
     /// handle, not a stable identity. `remap` (built by the caller from the
     /// checkpoint's persisted pack table, translated through this reader's
     /// own currently-open packs) reconciles that against this reader's own
-    /// slot numbering, which can differ once any shard has ever been retired
+    /// entry numbering, which can differ once any shard has ever been retired
     /// (see `CHECKPOINT_VERSION`'s v6 doc comment).
     ///
     /// Checks first without touching storage: the common case (no shard has
-    /// ever been retired, so a fresh reader's slot numbering already agrees
+    /// ever been retired, so a fresh reader's entry numbering already agrees
     /// with the checkpoint's) needs no rewrite at all, and mmap-backed
     /// indexes must stay mmap-backed when nothing actually changes — callers
     /// and tests depend on an unmodified checkpoint-loaded index staying
     /// zero-copy until its first real write. Only materializes into an owned
     /// copy (writes are never applied to the mmap) when at least one
-    /// occupied slot's `shard_id` actually needs to change.
+    /// occupied entry's `slot` actually needs to change.
     ///
-    /// Returns `false`, leaving the index unmodified, if any occupied slot's
-    /// `shard_id` has no entry in `remap` — the checkpoint's pack table
-    /// should cover every `shard_id` any of its own index entries use, so a
+    /// Returns `false`, leaving the index unmodified, if any occupied entry's
+    /// `slot` has no entry in `remap` — the checkpoint's pack table
+    /// should cover every `slot` any of its own index entries use, so a
     /// miss means the checkpoint is internally inconsistent and the caller
     /// should fall back to a full rescan rather than serve unresolvable
     /// slots.
     #[must_use]
-    pub fn remap_shard_ids(&mut self, remap: &std::collections::HashMap<u16, u16>) -> bool {
+    pub fn remap_slots(&mut self, remap: &std::collections::HashMap<u16, u16>) -> bool {
         let capacity = self.capacity as usize;
         let mut needs_rewrite = false;
         for index in 0..capacity {
-            let slot = IndexSlot(self.slots.get(index));
-            if slot.is_empty() {
+            let entry = IndexEntry(self.slots.get(index));
+            if entry.is_empty() {
                 continue;
             }
-            let Some(&new_shard_id) = remap.get(&slot.shard_id()) else {
+            let Some(&new_slot) = remap.get(&entry.slot()) else {
                 return false;
             };
-            if new_shard_id != slot.shard_id() {
+            if new_slot != entry.slot() {
                 needs_rewrite = true;
             }
         }
         if !needs_rewrite {
             return true;
         }
-        if !matches!(self.slots, SlotStorage::Owned(_)) {
-            self.slots = SlotStorage::Owned(self.slots.materialize(capacity));
+        if !matches!(self.slots, EntryStorage::Owned(_)) {
+            self.slots = EntryStorage::Owned(self.slots.materialize(capacity));
         }
-        let SlotStorage::Owned(slots) = &self.slots else {
+        let EntryStorage::Owned(slots) = &self.slots else {
             unreachable!("just materialized to Owned above");
         };
         for cell in slots {
             let raw = cell.load(Ordering::Acquire);
-            let slot = IndexSlot(raw);
-            if slot.is_empty() {
+            let entry = IndexEntry(raw);
+            if entry.is_empty() {
                 continue;
             }
-            let Some(&new_shard_id) = remap.get(&slot.shard_id()) else {
+            let Some(&new_slot) = remap.get(&entry.slot()) else {
                 return false;
             };
-            if new_shard_id == slot.shard_id() {
+            if new_slot == entry.slot() {
                 continue;
             }
-            let remapped = IndexSlot::new(slot.tag(), new_shard_id, slot.offset()).0;
+            let remapped = IndexEntry::new(entry.tag(), new_slot, entry.offset()).0;
             cell.store(remapped, Ordering::Relaxed);
         }
         true
@@ -936,8 +961,8 @@ impl LossyIndex {
         let mut buf = Vec::with_capacity(byte_len);
         buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
         for index in 0..cap {
-            let slot = IndexSlot(self.slot_at(index));
-            buf.extend_from_slice(&slot.0.to_le_bytes());
+            let entry = IndexEntry(self.entry_at(index));
+            buf.extend_from_slice(&entry.0.to_le_bytes());
         }
         let homes = self.homes.lock();
         let tails = self.tails.lock();
@@ -1004,11 +1029,11 @@ impl LossyIndex {
         for i in 0..capacity_usize {
             let offset = 8_usize.wrapping_add(i.wrapping_mul(8));
             let val = u64::from_le_bytes(data[offset..offset.wrapping_add(8)].try_into().unwrap());
-            let slot = IndexSlot(val);
-            if !slot.is_empty() {
+            let entry = IndexEntry(val);
+            if !entry.is_empty() {
                 len = len.wrapping_add(1);
             }
-            slots.push(AtomicU64::new(slot.0));
+            slots.push(AtomicU64::new(entry.0));
         }
 
         let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
@@ -1046,7 +1071,7 @@ impl LossyIndex {
             capacity,
             shift,
             config,
-            slots: SlotStorage::Owned(slots),
+            slots: EntryStorage::Owned(slots),
             homes: Mutex::new(homes),
             tails: Mutex::new(tails),
             can_grow: false,
@@ -1079,7 +1104,7 @@ impl LossyIndex {
             capacity,
             shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
             config,
-            slots: SlotStorage::Mmap { mmap, offset },
+            slots: EntryStorage::Mmap { mmap, offset },
             homes: Mutex::new(Vec::new()),
             tails: Mutex::new(Vec::new()),
             can_grow: false,
@@ -1130,7 +1155,7 @@ impl LossyIndex {
             capacity,
             shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
             config,
-            slots: SlotStorage::Mmap {
+            slots: EntryStorage::Mmap {
                 mmap,
                 offset: slots_offset,
             },
@@ -1145,25 +1170,34 @@ impl LossyIndex {
     /// True while the index borrows raw slots from a checkpoint mapping.
     #[must_use]
     pub fn is_mmap_backed(&self) -> bool {
-        matches!(self.slots, SlotStorage::Mmap { .. })
+        matches!(self.slots, EntryStorage::Mmap { .. })
     }
 
     #[inline]
-    fn slot_at(&self, index: usize) -> u64 {
+    fn entry_at(&self, index: usize) -> u64 {
         self.slots.get(index)
     }
 }
 
-/// Captures a single slot's prior contents so a live (uncloned) index write
+/// Captures a single entry's prior contents so a live (uncloned) index write
 /// made by [`LossyIndex::insert_undoable`] can be reversed by
 /// [`LossyIndex::rollback_slot`] if a later entry in the same batch fails.
 #[derive(Debug, Clone, Copy)]
-pub struct SlotUndo {
+pub struct EntryUndo {
     bucket: u32,
-    old_slot: u64,
+    old_entry: u64,
     old_home: u64,
     old_tail: u64,
     was_empty: bool,
+}
+
+impl EntryUndo {
+    /// Whether the insertion occupied an empty slot rather than overwriting
+    /// an existing key.
+    #[must_use]
+    pub fn was_empty(&self) -> bool {
+        self.was_empty
+    }
 }
 
 /// Errors that can occur while inserting into a [`LossyIndex`].
@@ -1172,13 +1206,13 @@ pub enum InsertError {
     /// The table has reached 75% occupancy.
     /// Returned when the table reaches 75% occupancy to keep probe sequences short.
     TableFull,
-    /// A checkpoint-derived same-tag slot needs its frame identity restored
+    /// A checkpoint-derived same-tag entry needs its frame identity restored
     /// before insertion can determine whether it is an overwrite.
     NeedsIdentity {
-        /// Probe bucket holding the candidate slot.
+        /// Probe bucket holding the candidate entry.
         bucket: u32,
         /// Candidate frame's shard.
-        shard_id: u16,
+        slot: u16,
         /// Candidate frame's offset.
         offset: u64,
     },
@@ -1188,7 +1222,7 @@ impl std::fmt::Display for InsertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TableFull => write!(f, "index table too full"),
-            Self::NeedsIdentity { .. } => write!(f, "index slot needs frame identity"),
+            Self::NeedsIdentity { .. } => write!(f, "index entry needs frame identity"),
         }
     }
 }
@@ -1219,9 +1253,9 @@ impl std::error::Error for DeserializationError {}
 
 /// Iterator over candidate offsets for a hash lookup.
 ///
-/// Yields `(shard_id, offset)` for each slot whose tag matches and whose
+/// Yields `(slot, offset)` for each entry whose tag matches and whose
 /// in-memory identity (home + tail) matches the query hash, terminating at
-/// the first empty slot or after the full capacity is probed.
+/// the first empty entry or after the full capacity is probed.
 ///
 /// When the index has hydrated identity (live/warm index), candidates are
 /// verified in-memory before yielding — this eliminates disk I/O for tag
@@ -1249,15 +1283,15 @@ impl Iterator for LookupIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.remaining > 0 {
             self.remaining = self.remaining.wrapping_sub(1);
-            let slot = IndexSlot(self.index.slot_at(self.bucket));
-            if slot.is_empty() {
+            let entry = IndexEntry(self.index.entry_at(self.bucket));
+            if entry.is_empty() {
                 self.index.bump_max_probe_len(self.steps);
                 return None;
             }
             self.steps = self.steps.saturating_add(1);
             let current = self.bucket;
             self.bucket = self.bucket.wrapping_add(1) & self.mask;
-            if slot.tag() != self.tag {
+            if entry.tag() != self.tag {
                 continue;
             }
             // Tag matches. For a live index with hydrated identity, verify
@@ -1281,7 +1315,7 @@ impl Iterator for LookupIter<'_> {
                 drop(homes);
                 if home == self.mixed_home && tail == self.expected_tail {
                     self.index.bump_max_probe_len(self.steps);
-                    return Some((slot.shard_id(), slot.offset()));
+                    return Some((entry.slot(), entry.offset()));
                 }
                 // Tag matched but home/tail didn't — false positive, skip.
                 continue;
@@ -1289,7 +1323,7 @@ impl Iterator for LookupIter<'_> {
             // Checkpoint-backed without hydrated identity — yield and let
             // the caller verify against the packfile.
             self.index.bump_max_probe_len(self.steps);
-            return Some((slot.shard_id(), slot.offset()));
+            return Some((entry.slot(), entry.offset()));
         }
         self.index.bump_max_probe_len(self.steps);
         None
@@ -1310,18 +1344,32 @@ mod tests {
 
     #[test]
     fn test_slot_packing() {
-        let slot = IndexSlot::new(0xCDEF, 42, 0x0FFF_FFF0);
-        assert_eq!(slot.tag(), 0xCDEF);
-        assert_eq!(slot.shard_id(), 42);
-        assert_eq!(slot.offset(), 0x0FFF_FFF0);
-        assert!(!slot.is_empty());
+        let entry = IndexEntry::new(0xCDEF, 42, 0x0FFF_FFF0);
+        assert_eq!(entry.tag(), 0xCDEF);
+        assert_eq!(entry.slot(), 42);
+        assert_eq!(entry.offset(), 0x0FFF_FFF0);
+        assert!(!entry.is_empty());
+    }
+
+    #[test]
+    fn new_accepts_the_highest_live_slot_and_rejects_the_next() {
+        let max_live = u16::try_from(crate::shard::MAX_SHARDS - 1).unwrap();
+        let entry = IndexEntry::new(0, max_live, 0);
+        assert_eq!(entry.slot(), max_live);
+
+        let out_of_range = u16::try_from(crate::shard::MAX_SHARDS).unwrap();
+        let result = std::panic::catch_unwind(|| IndexEntry::new(0, out_of_range, 0));
+        assert!(
+            result.is_err(),
+            "a slot at MAX_SHARDS is not a live shard and must be rejected"
+        );
     }
 
     #[test]
     fn test_slot_empty() {
-        let slot = IndexSlot::empty();
-        assert!(slot.is_empty());
-        assert_eq!(slot.tag(), 0);
+        let entry = IndexEntry::empty();
+        assert!(entry.is_empty());
+        assert_eq!(entry.tag(), 0);
     }
 
     #[test]
@@ -1361,9 +1409,9 @@ mod tests {
                 Ok::<_, ()>(hashes[&(shard, offset)])
             })
             .unwrap()
-            .expect("a 16-slot table can double");
+            .expect("a 16-entry table can double");
 
-        assert_eq!(recovered, 12, "recover exactly one hash per occupied slot");
+        assert_eq!(recovered, 12, "recover exactly one hash per occupied entry");
         assert_eq!(grown.capacity, 32);
         for ((shard, offset), hash) in hashes {
             assert_eq!(grown.lookup(&hash), Some((shard, offset)));
@@ -1510,7 +1558,7 @@ mod tests {
         assert_eq!(
             index.len(),
             1,
-            "rollback of a fresh-slot insert must restore len"
+            "rollback of a fresh-entry insert must restore len"
         );
         assert_eq!(
             index.lookup(&h2),
@@ -1520,7 +1568,7 @@ mod tests {
         assert_eq!(
             index.lookup(&h1),
             Some((0, 100)),
-            "rollback must not disturb an unrelated slot"
+            "rollback must not disturb an unrelated entry"
         );
     }
 
@@ -1589,18 +1637,18 @@ mod tests {
         checkpoint_source.insert(&first, 0, 100).unwrap();
         let checkpoint = LossyIndex::deserialize(&checkpoint_source.serialize()).unwrap();
 
-        // The live writer records the exact bucket/slot placement for the
+        // The live writer records the exact bucket/entry placement for the
         // second colliding identity. Replay must preserve that placement; it
         // must not re-run tag-only insertion and drop either record.
         let live = LossyIndex::new(16);
         live.insert(&first, 0, 100).unwrap();
-        let (bucket, slot) = live.insert_tracked(&second, 0, 200).unwrap();
+        let (bucket, entry) = live.insert_tracked(&second, 0, 200).unwrap();
         checkpoint
             .replay_frames(&[DeltaFrame {
                 collection_id: [0; 16],
                 bucket,
                 generation: 0,
-                slot,
+                slot: entry,
             }])
             .unwrap();
 
@@ -1638,6 +1686,37 @@ mod tests {
         // The index must be left untouched: an owned clone is made before
         // replay, so this checks the caller's rescan fallback has a live
         // checkpoint copy to fall back to, not a partially-erased one.
+        assert_eq!(checkpoint.len(), occupied_before);
+        assert_eq!(checkpoint.lookup(&hash), Some((0, 100)));
+    }
+
+    #[test]
+    fn replay_rejects_a_frame_naming_a_slot_above_max_shards() {
+        let mut hash = [0u8; 16];
+        hash[15] = 1;
+
+        let checkpoint_source = LossyIndex::new(16);
+        let (bucket, _slot) = checkpoint_source.insert_tracked(&hash, 0, 100).unwrap();
+        let checkpoint = LossyIndex::deserialize(&checkpoint_source.serialize()).unwrap();
+        let occupied_before = checkpoint.len();
+
+        // A frame whose packed entry decodes to a slot at MAX_SHARDS names no
+        // live shard; a writer can never emit one (`IndexEntry::new` rejects
+        // it), so replay must reject the whole log instead of installing an
+        // entry no shard scan can resolve.
+        let out_of_range = u16::try_from(crate::shard::MAX_SHARDS).unwrap();
+        let bad_entry = IndexEntry::new(0, 0, 0).0 | (u64::from(out_of_range) << 32);
+        let err = checkpoint
+            .replay_frames(&[DeltaFrame {
+                collection_id: [0; 16],
+                bucket,
+                generation: 0,
+                slot: bad_entry,
+            }])
+            .unwrap_err();
+        assert!(
+            matches!(err, DeltaReplayError::SlotOutOfRange { bucket: b, slot } if b == bucket && slot == out_of_range)
+        );
         assert_eq!(checkpoint.len(), occupied_before);
         assert_eq!(checkpoint.lookup(&hash), Some((0, 100)));
     }
@@ -1772,7 +1851,7 @@ mod tests {
 
     #[test]
     fn test_lookup_iter_exhausts_remaining() {
-        // Build a 16-slot index with all 16 slots occupied (no empty
+        // Build a 16-entry index with all 16 slots occupied (no empty
         // terminator) by constructing the serialized form directly.
         let capacity: u64 = 16;
         let mut bytes = Vec::with_capacity(8 + 16 * 8);
@@ -1781,12 +1860,12 @@ mod tests {
         for i in 0..16u64 {
             let h = splitmix_hash(i + 5000);
             let tag = tmp.tag(&h);
-            let slot = IndexSlot::new(tag, 0, i);
-            bytes.extend_from_slice(&slot.0.to_le_bytes());
+            let entry = IndexEntry::new(tag, 0, i);
+            bytes.extend_from_slice(&entry.0.to_le_bytes());
         }
         let restored = LossyIndex::deserialize(&bytes).unwrap();
         assert_eq!(restored.len(), 16);
-        // Query a hash whose tag does NOT match any slot — the iterator
+        // Query a hash whose tag does NOT match any entry — the iterator
         // must probe all 16 slots and return None.
         let mut query = [0xFFu8; 16];
         query[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());

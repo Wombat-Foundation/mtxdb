@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
@@ -12,16 +13,46 @@ use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
-use crate::index::{InsertError, LossyIndex, SlotUndo};
-use crate::journal::{Journal, JournalCoordinator, Mutation as JournalMutation};
-use crate::packfile::{self, Record};
+use crate::index::{EntryUndo, InsertError, LossyIndex};
+#[cfg(feature = "multi-reader")]
+use crate::journal::pool_tag;
+use crate::journal::{
+    pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator,
+    Mutation as JournalMutation,
+};
+use crate::packfile::{self, FrameMetadata, Record};
 use crate::shard;
 use crate::shard::{Shard, ShardPool};
-use crate::storage::{NodeData, NodeId, NodeRef, StorageEngine, StorageError};
+use crate::storage::{
+    collect_missing_established_records, hex16, validate_established_batch_inputs,
+    validate_established_upsert_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
+    StorageEngine, StorageError,
+};
+use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
+
+mod read_journal;
+use read_journal::ReadJournal;
+
+thread_local! {
+    /// Suppresses journal publication while a committed transaction applies
+    /// its already-staged mutations to the live pack/index state. The outer
+    /// transaction publishes the complete batch exactly once afterward.
+    static JOURNAL_SUPPRESSED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Callback that rewrites a node's child references given resolved child data,
 /// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
+
+/// Lowercase hex rendering of a 32-byte digest, for error messages.
+fn hex32(digest: &Digest32) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
 /// Result of [`PackfileStorage::plan_collection_repack`] — what a real repack
 /// of this collection would do, computed exactly (same scan + reachability
@@ -49,6 +80,23 @@ pub enum OpenPath {
     /// No usable checkpoint: every pack's records were scanned and the
     /// per-collection indexes rebuilt from scratch.
     FullScan,
+}
+
+/// How strictly `PackfileStorage::checkpoint_scan_out` validates the live pack
+/// set against a persisted checkpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReloadMode {
+    /// The live packs must match the checkpoint's fingerprint exactly, or a
+    /// delta log must bridge the checkpoint to them. Used by `open` and crash
+    /// recovery, where a mismatch means the checkpoint is stale and the caller
+    /// must rescan.
+    Strict,
+    /// Skip the exact-pack fingerprint gate and the delta-log replay; the
+    /// read-committed overlay is authoritative for the post-checkpoint suffix.
+    /// Used only by `reload_index_from_checkpoint`, where the writer is still
+    /// appending and its packs have already grown past the checkpoint (a strict
+    /// gate would fail the read closed).
+    JournalBound,
 }
 
 /// Where a checkpoint-path open sourced each collection's per-shard counts
@@ -121,6 +169,12 @@ pub struct OpenTimings {
     /// each affected collection (checkpoint path only; ZERO when there is no
     /// committed log to replay).
     pub delta_replay: std::time::Duration,
+    /// Number of delta-log operations validated and applied during this open:
+    /// v3 slot frames, collection snapshots, and tombstones, or v2 frames
+    /// (checkpoint path only; zero when no committed log was replayed). A
+    /// deterministic replay-path signal, unlike the `delta_replay` duration,
+    /// which can round to zero on a fast machine.
+    pub delta_replay_operations: u64,
     /// The full packfile scan + torn-tail recovery pass (fallback only).
     pub full_scan: std::time::Duration,
     /// Total synchronous wall time of the open.
@@ -155,6 +209,7 @@ impl Default for OpenTimings {
             fingerprint: std::time::Duration::ZERO,
             index_materialization: std::time::Duration::ZERO,
             delta_replay: std::time::Duration::ZERO,
+            delta_replay_operations: 0,
             full_scan: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
             path: OpenPath::FullScan,
@@ -169,6 +224,8 @@ impl Default for OpenTimings {
 /// separately) and the metadata phases from the sync method itself.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncTimings {
+    /// Whether this barrier returned an error after collecting its partial timings.
+    pub failed: bool,
     /// Writing buffered frames out to the pack files.
     pub pack_flush: std::time::Duration,
     /// fsync'ing the pack files.
@@ -184,6 +241,31 @@ pub struct SyncTimings {
     /// Committing the pending write-ahead journal group (one sequential
     /// fsync). Zero when no journal is configured.
     pub wal: std::time::Duration,
+    /// Time spent waiting for the journal's single-writer mutex.
+    pub journal_lock_wait: std::time::Duration,
+    /// Time spent waiting for the pending-mutation queue mutex.
+    // TODO: remove; always zero since the shared pending queue was deleted.
+    pub journal_pending_wait: std::time::Duration,
+    /// Time spent encoding and appending the journal group, excluding fsync.
+    pub journal_append: std::time::Duration,
+    /// Time spent making the journal file durable.
+    pub journal_fsync: std::time::Duration,
+    /// Number of journal sync calls represented by this operation.
+    pub journal_sync_calls: u64,
+    /// Bytes appended to the journal by this operation, including framing.
+    pub journal_bytes: u64,
+    /// Records appended to the journal by this operation.
+    pub journal_records: u64,
+    /// Whether this operation waited for the journal mutex.
+    pub journal_waiters: u64,
+    /// Whether this operation was already covered by another sync.
+    pub journal_coalesced: u64,
+    /// Number of journal sync callers active when this operation entered.
+    pub journal_in_flight: u64,
+    /// Time spent waiting for the shard pool's dirty-set lock in this barrier.
+    pub dirty_lock_wait: std::time::Duration,
+    /// Age of the oldest unpublished write when this barrier began.
+    pub pending_publish_age: std::time::Duration,
     /// Total wall time of the `sync_all` call.
     pub total: std::time::Duration,
 }
@@ -191,12 +273,25 @@ pub struct SyncTimings {
 impl Default for SyncTimings {
     fn default() -> Self {
         Self {
+            failed: false,
             pack_flush: std::time::Duration::ZERO,
             pack_fsync: std::time::Duration::ZERO,
             sidecar: std::time::Duration::ZERO,
             delta_log: std::time::Duration::ZERO,
             checkpoint: std::time::Duration::ZERO,
             wal: std::time::Duration::ZERO,
+            journal_lock_wait: std::time::Duration::ZERO,
+            journal_pending_wait: std::time::Duration::ZERO,
+            journal_append: std::time::Duration::ZERO,
+            journal_fsync: std::time::Duration::ZERO,
+            journal_sync_calls: 0,
+            journal_bytes: 0,
+            journal_records: 0,
+            journal_waiters: 0,
+            journal_coalesced: 0,
+            journal_in_flight: 0,
+            dirty_lock_wait: std::time::Duration::ZERO,
+            pending_publish_age: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
         }
     }
@@ -228,6 +323,19 @@ struct SyncTotals {
     checkpoint_ns: AtomicU64,
     /// Sum of [`SyncTimings::wal`].
     wal_ns: AtomicU64,
+    journal_lock_wait_ns: AtomicU64,
+    journal_pending_wait_ns: AtomicU64,
+    journal_append_ns: AtomicU64,
+    journal_fsync_ns: AtomicU64,
+    journal_sync_calls: AtomicU64,
+    journal_bytes: AtomicU64,
+    journal_records: AtomicU64,
+    journal_waiters: AtomicU64,
+    journal_coalesced: AtomicU64,
+    max_journal_lock_wait_ns: AtomicU64,
+    max_journal_fsync_ns: AtomicU64,
+    dirty_lock_wait_ns: AtomicU64,
+    pending_publish_age_ns: AtomicU64,
 }
 
 impl SyncTotals {
@@ -248,6 +356,30 @@ impl SyncTotals {
         Self::add_duration(&self.delta_log_ns, timings.delta_log);
         Self::add_duration(&self.checkpoint_ns, timings.checkpoint);
         Self::add_duration(&self.wal_ns, timings.wal);
+        Self::add_duration(&self.journal_lock_wait_ns, timings.journal_lock_wait);
+        Self::add_duration(&self.journal_pending_wait_ns, timings.journal_pending_wait);
+        Self::add_duration(&self.journal_append_ns, timings.journal_append);
+        Self::add_duration(&self.journal_fsync_ns, timings.journal_fsync);
+        self.journal_sync_calls
+            .fetch_add(timings.journal_sync_calls, Ordering::Relaxed);
+        self.journal_bytes
+            .fetch_add(timings.journal_bytes, Ordering::Relaxed);
+        self.journal_records
+            .fetch_add(timings.journal_records, Ordering::Relaxed);
+        self.journal_waiters
+            .fetch_add(timings.journal_waiters, Ordering::Relaxed);
+        self.journal_coalesced
+            .fetch_add(timings.journal_coalesced, Ordering::Relaxed);
+        self.max_journal_lock_wait_ns.fetch_max(
+            u64::try_from(timings.journal_lock_wait.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.max_journal_fsync_ns.fetch_max(
+            u64::try_from(timings.journal_fsync.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        Self::add_duration(&self.dirty_lock_wait_ns, timings.dirty_lock_wait);
+        Self::add_duration(&self.pending_publish_age_ns, timings.pending_publish_age);
     }
 
     fn snapshot(&self) -> SyncTotalsSnapshot {
@@ -262,6 +394,19 @@ impl SyncTotals {
             delta_log: duration(&self.delta_log_ns),
             checkpoint: duration(&self.checkpoint_ns),
             wal: duration(&self.wal_ns),
+            journal_lock_wait: duration(&self.journal_lock_wait_ns),
+            journal_pending_wait: duration(&self.journal_pending_wait_ns),
+            journal_append: duration(&self.journal_append_ns),
+            journal_fsync: duration(&self.journal_fsync_ns),
+            journal_sync_calls: self.journal_sync_calls.load(Ordering::Relaxed),
+            journal_bytes: self.journal_bytes.load(Ordering::Relaxed),
+            journal_records: self.journal_records.load(Ordering::Relaxed),
+            journal_waiters: self.journal_waiters.load(Ordering::Relaxed),
+            journal_coalesced: self.journal_coalesced.load(Ordering::Relaxed),
+            max_journal_lock_wait: duration(&self.max_journal_lock_wait_ns),
+            max_journal_fsync: duration(&self.max_journal_fsync_ns),
+            dirty_lock_wait: duration(&self.dirty_lock_wait_ns),
+            pending_publish_age: duration(&self.pending_publish_age_ns),
         }
     }
 
@@ -275,6 +420,19 @@ impl SyncTotals {
             &self.delta_log_ns,
             &self.checkpoint_ns,
             &self.wal_ns,
+            &self.journal_lock_wait_ns,
+            &self.journal_pending_wait_ns,
+            &self.journal_append_ns,
+            &self.journal_fsync_ns,
+            &self.journal_sync_calls,
+            &self.journal_bytes,
+            &self.journal_records,
+            &self.journal_waiters,
+            &self.journal_coalesced,
+            &self.max_journal_lock_wait_ns,
+            &self.max_journal_fsync_ns,
+            &self.dirty_lock_wait_ns,
+            &self.pending_publish_age_ns,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -284,7 +442,12 @@ impl SyncTotals {
 /// Plain, copyable lifetime totals of per-phase sync wall time — the cumulative
 /// counterpart to [`SyncTimings`]. `calls` counts every sync that accumulated,
 /// so phase averages are `phase / calls` and shares are `phase / total`.
+///
+/// Marked `#[non_exhaustive]` so new cumulative phases can be added without
+/// breaking downstream source builds. Read fields by name; construct test
+/// fixtures with [`SyncTotalsSnapshot::default`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SyncTotalsSnapshot {
     /// Number of syncs folded into these totals.
     pub calls: u64,
@@ -302,6 +465,309 @@ pub struct SyncTotalsSnapshot {
     pub checkpoint: std::time::Duration,
     /// Cumulative [`SyncTimings::wal`].
     pub wal: std::time::Duration,
+    /// Cumulative time waiting for the journal mutex.
+    pub journal_lock_wait: std::time::Duration,
+    /// Cumulative time waiting for the pending-mutation queue mutex.
+    // TODO: remove; always zero since the shared pending queue was deleted.
+    pub journal_pending_wait: std::time::Duration,
+    /// Cumulative journal append/encoding time, excluding fsync.
+    pub journal_append: std::time::Duration,
+    /// Cumulative journal fsync time.
+    pub journal_fsync: std::time::Duration,
+    /// Number of journal sync calls.
+    pub journal_sync_calls: u64,
+    /// Cumulative journal bytes appended, including framing.
+    pub journal_bytes: u64,
+    /// Cumulative journal records appended.
+    pub journal_records: u64,
+    /// Number of journal sync calls that waited for the journal mutex.
+    pub journal_waiters: u64,
+    /// Number of journal sync calls covered by another sync.
+    pub journal_coalesced: u64,
+    /// Largest single journal mutex wait observed.
+    pub max_journal_lock_wait: std::time::Duration,
+    /// Largest single journal fsync observed.
+    pub max_journal_fsync: std::time::Duration,
+    /// Cumulative dirty-set lock wait attributed to sync barriers.
+    pub dirty_lock_wait: std::time::Duration,
+    /// Cumulative age observed for pending writes at sync entry.
+    pub pending_publish_age: std::time::Duration,
+}
+
+/// Fixed latency buckets used by sync diagnostics: `<1ms`, `<10ms`,
+/// `<100ms`, `<1s`, and `>=1s`.
+///
+/// Buckets are **non-cumulative**: `buckets[i]` counts only the observations
+/// that fell inside bucket `i`'s own range, so the total observation count is
+/// the sum of all five entries, not the last one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncLatencyHistogram {
+    /// Per-bucket observation counts, indexed to match the ranges above
+    /// (`buckets[0]` = `<1ms` … `buckets[4]` = `>=1s`). Non-cumulative.
+    pub buckets: [u64; 5],
+}
+
+impl SyncLatencyHistogram {
+    fn observe(&mut self, duration: std::time::Duration) {
+        let micros = duration.as_micros();
+        let bucket = if micros < 1_000 {
+            0
+        } else if micros < 10_000 {
+            1
+        } else if micros < 100_000 {
+            2
+        } else if micros < 1_000_000 {
+            3
+        } else {
+            4
+        };
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+    }
+}
+
+/// One of the worst sync operations retained for post-run diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SyncDiagnosticSample {
+    /// Unix timestamp in milliseconds when the sync completed.
+    pub timestamp_ms: u128,
+    /// OS process ID that performed or coordinated the sync.
+    pub process_id: u32,
+    /// Path to the active journal segment file, if journal-backed.
+    pub journal_path: Option<String>,
+    /// Total duration of the sync operation.
+    pub total: std::time::Duration,
+    /// Whether the sync operation encountered an error or failed.
+    pub failed: bool,
+    /// Duration spent writing buffered packfile frames to disk.
+    pub pack_flush: std::time::Duration,
+    /// Duration spent issuing fsync on dirty packfiles.
+    pub pack_fsync: std::time::Duration,
+    /// Duration spent syncing collection sidecar state.
+    pub sidecar: std::time::Duration,
+    /// Duration spent appending to or flushing the index delta log.
+    pub delta_log: std::time::Duration,
+    /// Duration spent writing an index checkpoint.
+    pub checkpoint: std::time::Duration,
+    /// Duration spent waiting for the pool-wide dirty shard set lock.
+    pub dirty_lock_wait: std::time::Duration,
+    /// Age of the oldest pending uncommitted frame included in this sync.
+    pub pending_publish_age: std::time::Duration,
+    /// Duration spent on WAL sync (if WAL is enabled).
+    pub wal: std::time::Duration,
+    /// Duration spent waiting to acquire the journal lock.
+    pub journal_lock_wait: std::time::Duration,
+    /// Duration spent waiting for pending journal batches.
+    // TODO: remove; always zero since the shared pending queue was deleted.
+    pub journal_pending_wait: std::time::Duration,
+    /// Duration spent appending journal records to the file.
+    pub journal_append: std::time::Duration,
+    /// Duration spent issuing fsync on the journal file.
+    pub journal_fsync: std::time::Duration,
+    /// Number of journal records committed by this sync barrier.
+    pub journal_records: u64,
+    /// Total byte length of journal records committed by this sync barrier.
+    pub journal_bytes: u64,
+    /// Number of concurrent journal transactions in flight at sync time.
+    pub journal_in_flight: u64,
+    /// Number of concurrent callers waiting on this journal sync barrier.
+    pub journal_waiters: u64,
+    /// Number of sync callers whose sync was coalesced into this single physical fsync.
+    pub journal_coalesced: u64,
+}
+
+/// Runtime sync diagnostics retained after the operation that produced them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SyncDiagnosticsSnapshot {
+    /// Non-cumulative [`SyncLatencyHistogram`] of journal fsync latencies
+    /// observed during the interval ending at the take. See
+    /// [`SyncLatencyHistogram::buckets`] for bucket membership.
+    pub fsync_latency: SyncLatencyHistogram,
+    /// Non-cumulative [`SyncLatencyHistogram`] of journal lock-wait latencies
+    /// observed during the interval ending at the take. See
+    /// [`SyncLatencyHistogram::buckets`] for bucket membership.
+    pub lock_wait_latency: SyncLatencyHistogram,
+    /// Maximum journal in-flight count observed during this snapshot.
+    /// Unlike the lifetime maxima in [`SyncTotalsSnapshot`], this value is
+    /// cleared by [`PackfileStorage::take_sync_diagnostics`].
+    pub peak_journal_in_flight: u64,
+    /// Maximum journal lock wait observed during this snapshot.
+    /// Unlike the lifetime maxima in [`SyncTotalsSnapshot`], this value is
+    /// cleared by [`PackfileStorage::take_sync_diagnostics`].
+    pub max_journal_lock_wait: std::time::Duration,
+    /// Maximum journal fsync duration observed during this snapshot.
+    /// Unlike the lifetime maxima in [`SyncTotalsSnapshot`], this value is
+    /// cleared by [`PackfileStorage::take_sync_diagnostics`].
+    pub max_journal_fsync: std::time::Duration,
+    /// The up-to-16 slowest sync samples observed during this snapshot,
+    /// ordered from slowest to fastest. This is interval-scoped and bounded,
+    /// not a lifetime history.
+    pub worst_syncs: Vec<SyncDiagnosticSample>,
+}
+
+#[derive(Default)]
+struct SyncDiagnostics {
+    fsync_latency: SyncLatencyHistogram,
+    lock_wait_latency: SyncLatencyHistogram,
+    peak_journal_in_flight: u64,
+    max_journal_lock_wait: std::time::Duration,
+    max_journal_fsync: std::time::Duration,
+    worst_syncs: Vec<SyncDiagnosticSample>,
+}
+
+impl SyncDiagnostics {
+    const WORST_LIMIT: usize = 16;
+
+    fn record(&mut self, sample: SyncDiagnosticSample) {
+        if sample.journal_path.is_some() {
+            if sample.journal_coalesced == 0 && !sample.journal_fsync.is_zero() {
+                self.fsync_latency.observe(sample.journal_fsync);
+            }
+            if sample.journal_coalesced == 0 {
+                self.lock_wait_latency.observe(sample.journal_lock_wait);
+            }
+            self.peak_journal_in_flight = self.peak_journal_in_flight.max(sample.journal_in_flight);
+            self.max_journal_lock_wait = self.max_journal_lock_wait.max(sample.journal_lock_wait);
+            self.max_journal_fsync = self.max_journal_fsync.max(sample.journal_fsync);
+        }
+        self.worst_syncs.push(sample);
+        self.worst_syncs
+            .sort_unstable_by_key(|sample| std::cmp::Reverse(sample.total));
+        self.worst_syncs.truncate(Self::WORST_LIMIT);
+    }
+
+    fn snapshot(&self) -> SyncDiagnosticsSnapshot {
+        SyncDiagnosticsSnapshot {
+            fsync_latency: self.fsync_latency,
+            lock_wait_latency: self.lock_wait_latency,
+            peak_journal_in_flight: self.peak_journal_in_flight,
+            max_journal_lock_wait: self.max_journal_lock_wait,
+            max_journal_fsync: self.max_journal_fsync,
+            worst_syncs: self.worst_syncs.clone(),
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Fixed latency buckets used by public operation diagnostics. Buckets are
+/// non-cumulative: `<50us`, `<100us`, `<250us`, `<1ms`, `<10ms`, and `>=10ms`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperationLatency {
+    /// Number of timed operations.
+    pub calls: u64,
+    /// Sum of operation wall time.
+    pub total: std::time::Duration,
+    /// Largest observed operation wall time.
+    pub max: std::time::Duration,
+    /// Counts for `<50us`, `<100us`, `<250us`, `<1ms`, `<10ms`, and `>=10ms`.
+    pub buckets: [u64; 6],
+}
+
+#[derive(Default)]
+struct OperationLatencyTotals {
+    calls: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    buckets: [AtomicU64; 6],
+}
+
+impl OperationLatencyTotals {
+    fn observe(&self, duration: std::time::Duration) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.max_ns.fetch_max(
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let micros = duration.as_micros();
+        let bucket = if micros < 50 {
+            0
+        } else if micros < 100 {
+            1
+        } else if micros < 250 {
+            2
+        } else if micros < 1_000 {
+            3
+        } else if micros < 10_000 {
+            4
+        } else {
+            5
+        };
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> OperationLatency {
+        OperationLatency {
+            calls: self.calls.load(Ordering::Relaxed),
+            total: std::time::Duration::from_nanos(self.total_ns.load(Ordering::Relaxed)),
+            max: std::time::Duration::from_nanos(self.max_ns.load(Ordering::Relaxed)),
+            buckets: std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
+        }
+    }
+
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+        self.total_ns.store(0, Ordering::Relaxed);
+        self.max_ns.store(0, Ordering::Relaxed);
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Default)]
+struct OperationTimings {
+    get: OperationLatencyTotals,
+    get_many: OperationLatencyTotals,
+    get_many_with_refresh: OperationLatencyTotals,
+    put: OperationLatencyTotals,
+    put_many: OperationLatencyTotals,
+}
+
+impl OperationTimings {
+    fn reset(&self) {
+        self.get.reset();
+        self.get_many.reset();
+        self.get_many_with_refresh.reset();
+        self.put.reset();
+        self.put_many.reset();
+    }
+}
+
+struct OperationTimer<'a> {
+    started: Option<std::time::Instant>,
+    totals: Option<&'a OperationLatencyTotals>,
+}
+
+impl<'a> OperationTimer<'a> {
+    fn disabled() -> Self {
+        Self {
+            started: None,
+            totals: None,
+        }
+    }
+
+    fn new(totals: &'a OperationLatencyTotals) -> Self {
+        Self {
+            started: Some(std::time::Instant::now()),
+            totals: Some(totals),
+        }
+    }
+}
+
+impl Drop for OperationTimer<'_> {
+    fn drop(&mut self) {
+        if let (Some(totals), Some(started)) = (self.totals, self.started) {
+            totals.observe(started.elapsed());
+        }
+    }
 }
 
 /// Bounds on a [`PackfileStorage::walk_ancestors`] call.
@@ -357,12 +823,13 @@ type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
 /// Replacement index entries produced while copying one repack collection.
 type RepackOffsets = Vec<([u8; 16], u16, u64)>;
+type RepackCopiedRecord = ([u8; 16], u16, u64, u64);
 /// Return type of [`PackfileStorage::repack_scan_incremental`]: the merged
 /// live-location map and (on the incremental path) the previous cursor state
 /// that the adjacency helpers need to skip re-reading already-seen nodes.
 type RepackScanResult = (RepackRecordMap, Option<RepackIncrementalState>);
 
-/// One scanned record's `(shard_id, hash, offset)`, as accumulated per
+/// One scanned record's `(slot, hash, offset)`, as accumulated per
 /// collection during `PackfileStorage::open_with_options`'s initial scan.
 type ShardRecord = (u16, [u8; 16], u64, u64);
 /// `(collection_id, entry count, index memory usage in bytes, index capacity)`.
@@ -376,6 +843,30 @@ struct RoomScanOutput {
     collections: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
     shard_collections: HashMap<u64, HashMap<[u8; 16], u64>>,
     collection_shards: HashMap<[u8; 16], HashSet<u64>>,
+    collection_disk_bytes: HashMap<u64, HashMap<[u8; 16], u64>>,
+    /// A checkpoint-backed writable open found no valid shard→collection
+    /// sidecar, so the next sync must write one even if no index is dirty.
+    sidecar_missing: bool,
+    /// The physical scan needed to rebuild the sidecar's byte metrics failed.
+    /// Do not allow a sidecar containing zero-byte fallbacks to be persisted.
+    sidecar_recovery_failed: bool,
+}
+
+/// Per-pack, per-collection on-disk bytes as `physical_layout` reports them
+/// (every appended frame, superseded ones included).
+fn disk_bytes_from_physical(
+    physical: &crate::packfile::layout::PhysicalLayout,
+) -> HashMap<u64, HashMap<[u8; 16], u64>> {
+    let mut bytes: HashMap<u64, HashMap<[u8; 16], u64>> = HashMap::new();
+    for (collection_id, layout) in &physical.collections {
+        for (pack_id, pack_bytes) in &layout.pack_bytes {
+            bytes
+                .entry(*pack_id)
+                .or_default()
+                .insert(*collection_id, *pack_bytes);
+        }
+    }
+    bytes
 }
 
 /// Magic bytes + version identifying the persisted shard→collection directory
@@ -386,25 +877,26 @@ struct RoomScanOutput {
 /// `read_persisted_shard_collections`) — reset or let the next sync
 /// regenerate it, not a format this reader tries to still understand.
 /// This sidecar has changed shape three times already (adding insertion
-/// order, switching `shard_id` for `pack_id`, then v4 adding the
+/// order, switching `slot` for `pack_id`, then v4 adding the
 /// pack-fingerprint gate); none of that carries forward, since nothing
 /// depends on reading a store from before the current format existed.
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
-/// v4 pins the reduced bookkeeping to the exact `(pack_id, file_len)` set by
-/// carrying the same `pack_fingerprint` as the index checkpoint.
-const SHARD_ROOMS_VERSION: u8 = 4;
+/// v5 adds physical bytes to the reduced bookkeeping and pins it to the exact
+/// `(pack_id, file_len)` set by carrying the same `pack_fingerprint` as the
+/// index checkpoint.
+const SHARD_ROOMS_VERSION: u8 = 5;
 /// Header size: magic(4) + version(1) + `pack_fingerprint(8)` + `persisted_at(8)`.
 const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
 /// One entry: `pack_id`(8) + `collection_id`(16) + count(8) + the
 /// collection's stable insertion ordinal(8).
-const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8;
+const SHARD_ROOMS_RECORD_LEN: usize = 8 + 16 + 8 + 8 + 8;
 
-/// The largest record offset `IndexSlot` can represent: its 32-bit offset
+/// The largest record offset `IndexEntry` can represent: its 32-bit offset
 /// field stores `offset + 1`, reserving the all-zeros encoding for the empty
 /// sentinel. Offsets beyond this can only come from legacy or externally
 /// created oversized packs — this engine's own writes rotate long before
 /// reaching it (`MAX_SHARD_BYTES` caps each shard's file size).
-const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexSlot::MAX_OFFSET;
+const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexEntry::MAX_OFFSET;
 
 /// Byte ceiling for the incremental index delta log. Once a session's
 /// accumulated frames exceed this, the next `sync()` stops appending and does
@@ -423,46 +915,281 @@ const DELTA_LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// adjacency (that would require a per-candidate frame-length probe).
 const READ_RUN_GAP_BYTES: u64 = 128;
 
-/// Reject a record whose in-shard offset the 32-bit `IndexSlot` field cannot
+/// Largest on-disk size of a single frame: the 4-byte length prefix, a
+/// [`packfile::MAX_RECORD_LEN`]-bounded body, and the 4-byte CRC. Used as the
+/// per-candidate frame-length estimate when planning merged read extents: it
+/// over-approximates so the plan never advises short of a frame's true end,
+/// and it avoids a per-candidate length-prefix probe (which would fault in the
+/// very cold page the plan exists to prefetch).
+const MAX_FRAME_DISK_LEN: u64 = (packfile::MAX_RECORD_LEN + 8) as u64;
+
+/// Tuning for `get_many`'s merged read plan.
+///
+/// `get_many` probes the lossy index once per requested id, so a large batch
+/// yields many candidate `(shard, offset)` locations scattered across a few
+/// shards. Without a plan each candidate is read independently; on rotational
+/// media the per-candidate seeks dominate. When enabled, candidates on the same
+/// shard whose offsets are within [`Self::merge_gap_bytes`] of each other are
+/// melded into one contiguous extent, and each extent is prefetched with
+/// `madvise(MADV_WILLNEED)` before resolution — the kernel then reads it as one
+/// sequential run while the existing per-candidate decode path still verifies
+/// every requested hash (lossy-index false positives included).
+///
+/// # Measured behaviour (cold-cache, 1M records × 1 KiB, careful HDD vs SSD)
+///
+/// This plan is **rotational-media (HDD) only** and must not be enabled by
+/// default anywhere:
+///
+/// - **Wins on HDD** when target spacing is roughly 700 KiB or more: 1.9-3×
+///   faster than the `MADV_RANDOM` baseline, and 2.6-5× faster than
+///   independent reads. The win comes from prefetching target neighborhoods,
+///   not from reading through gaps — any gap from 0 to ~256 KiB performed about
+///   equally.
+/// - **Neutral on HDD** by ~174 KiB spacing (all policies ~1.0×): the batch is
+///   dense enough that independent reads already touch most pages.
+/// - **Loses on SSD** (0.6-0.85× vs `MADV_RANDOM`): there is no seek to avoid,
+///   so reading through gaps is pure waste, and the plan reads far more bytes
+///   than the readahead-suppressing alternative.
+///
+/// [`Self::random_advice`] — suppressing kernel readahead with `MADV_RANDOM`
+/// and no planning at all — is the portable win: 4.5-6.5× on SSD, 1.4-3.4× on
+/// sparse HDD, and neutral on dense HDD. Prefer it unless the workload is a
+/// sparse batch on rotational media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPlanPolicy {
+    /// Candidate offsets at most this far apart (start to start, on the same
+    /// shard) are melded into one prefetched extent. Reading through a gap can
+    /// be cheaper than a seek, but a gap far larger than the target spacing
+    /// makes the plan read through most of the file for no benefit — measured
+    /// on a cold-cache HDD, every gap from 0 to ~256 KiB performed about
+    /// equally, and a 2 MiB gap over-merged. [`ReadPlanPolicy::prefetch`] uses
+    /// 64 KiB; `0` melds only adjacent offsets.
+    pub merge_gap_bytes: u64,
+    /// Hard ceiling on one merged extent. Bounds the bytes read through gaps
+    /// and keeps a dense batch from collapsing into a single unbounded
+    /// prefetch. `0` disables prefetching entirely.
+    pub max_extent_bytes: u64,
+    /// Batches with fewer candidate locations than this skip planning: a
+    /// handful of reads gains nothing from a plan, and the grouping/sort is
+    /// pure overhead.
+    pub min_batch_candidates: usize,
+    /// When set, advise each shard mapping `MADV_RANDOM` before reading, with
+    /// no planning at all. A random-access hint suppresses the kernel's
+    /// sequential readahead, so a scattered `get_many` reads only the pages
+    /// it faults rather than having readahead amplify each one into a large
+    /// block read.
+    ///
+    /// This is the **portable** win and the one to reach for first: measured
+    /// at 4.5-6.5× faster than independent reads on SSD, 1.4-3.4× on sparse
+    /// HDD, and neutral on dense HDD, with no device-specific tuning. Extent
+    /// planning ([`Self::prefetch`]) only beats it on sparse rotational media.
+    /// `false` on the presets that plan.
+    ///
+    /// # Warm and untested cases
+    ///
+    /// A warm-cache run showed no regression from suppression (random vs
+    /// independent reads was 0.94-1.20× at 1-5 ms, i.e. within the spread), so
+    /// the cold win does not reverse when data is resident. But only sparse
+    /// *point* reads were tested: no warm dense case.
+    ///
+    /// # Persistent advice, and why this is not a default
+    ///
+    /// `madvise` is persistent mapping state, and repack/compaction read
+    /// records through the *same* shard mmap this sets (`scan_full_adjacency`,
+    /// `copy_record_to_shard`), so suppression can leak into them; nothing here
+    /// resets it. A repack benchmark (fresh store per pass, 5 passes, 1M
+    /// records) measured **no regression** — `REPACK_RANDOM_VS_PLAIN` = 0.998
+    /// with fully overlapping ranges — but that store had **no edges**, so the
+    /// mmap adjacency walk barely ran and the result mostly reflects
+    /// `scan_packfile`, which uses its own file handle and is unaffected. The
+    /// mmap walk path is therefore still unmeasured, and this null does not
+    /// clear suppression for the default.
+    ///
+    /// Keep this opt-in. Making it safe by default needs the advice scoped to
+    /// the point-read path — a separate mapping/fd for `get_many`, or an
+    /// explicit concurrency-safe reset (`MADV_NORMAL`/`SEQUENTIAL`) before
+    /// scan/compaction reads. Measurements are from one rotational HDD and one
+    /// cheap SATA SSD; `NVMe` and other drives are untested.
+    pub random_advice: bool,
+}
+
+impl Default for ReadPlanPolicy {
+    /// Disabled: the defaults change no behaviour, so nothing regresses on
+    /// existing callers. The portable improvement is
+    /// [`ReadPlanPolicy::random_advice`] (readahead suppression); extent
+    /// planning ([`ReadPlanPolicy::prefetch`]) is rotational-media only. A
+    /// store that wants either opts in explicitly.
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl ReadPlanPolicy {
+    /// A plan that never prefetches: no extent is ever built.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            merge_gap_bytes: 0,
+            max_extent_bytes: 0,
+            min_batch_candidates: usize::MAX,
+            random_advice: false,
+        }
+    }
+
+    /// No extent planning, but advise each shard `MADV_RANDOM` before reading
+    /// so kernel readahead does not amplify a scattered batch into large
+    /// sequential reads. The cheap baseline to compare a real plan against:
+    /// if this alone captures the win, the planner earns nothing.
+    #[must_use]
+    pub fn random_advice() -> Self {
+        Self {
+            merge_gap_bytes: 0,
+            max_extent_bytes: 0,
+            min_batch_candidates: usize::MAX,
+            random_advice: true,
+        }
+    }
+
+    /// A starting point for rotational (HDD) storage: meld candidates within
+    /// 64 KiB, up to an 8 MiB extent, once a batch has at least 16 candidate
+    /// locations. On a cold-cache HDD benchmark, any gap from 0 up to ~256 KiB
+    /// performed about equally well, while the earlier 2 MiB guess over-merged
+    /// and read through far more of the file than it saved in seeks. See the
+    /// type docs for the measured HDD-only results and why readahead
+    /// suppression ([`Self::random_advice`]) is the more portable win.
+    #[must_use]
+    pub fn prefetch() -> Self {
+        Self {
+            merge_gap_bytes: 64 * 1024,
+            max_extent_bytes: 8 * 1024 * 1024,
+            min_batch_candidates: 16,
+            random_advice: false,
+        }
+    }
+
+    /// Whether a batch with `candidate_count` candidate locations should be
+    /// planned.
+    fn wants(&self, candidate_count: usize) -> bool {
+        self.max_extent_bytes > 0 && candidate_count >= self.min_batch_candidates
+    }
+}
+
+/// One contiguous byte extent on a shard to prefetch as a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadExtent {
+    /// Shard slot the extent lives on.
+    slot: u16,
+    /// Inclusive start offset (a candidate frame's length prefix).
+    start: u64,
+    /// Exclusive end offset.
+    end: u64,
+}
+
+/// Meld a shard's sorted candidate offsets into prefetch extents.
+///
+/// `per_shard` maps each touched shard slot to its candidate offsets, each
+/// vector sorted ascending. A run starts at the first offset and absorbs the
+/// next while the start-to-start distance stays within
+/// [`ReadPlanPolicy::merge_gap_bytes`] and the resulting span stays within
+/// [`ReadPlanPolicy::max_extent_bytes`]. A run's end is its last offset plus
+/// [`MAX_FRAME_DISK_LEN`] (see that constant for why the frame length is
+/// estimated rather than probed).
+fn plan_read_extents(
+    per_shard: &HashMap<u16, Vec<u64>>,
+    policy: ReadPlanPolicy,
+) -> Vec<ReadExtent> {
+    let mut extents = Vec::new();
+    // A single candidate's extent is always `MAX_FRAME_DISK_LEN` long, so a
+    // cap below that would split every candidate onto its own extent. Floor it.
+    let cap = policy.max_extent_bytes.max(MAX_FRAME_DISK_LEN);
+    for (&slot, offsets) in per_shard {
+        let Some(&first) = offsets.first() else {
+            continue;
+        };
+        let mut run_start = first;
+        let mut run_last = first;
+        for &offset in &offsets[1..] {
+            let gap_ok = offset.saturating_sub(run_last) <= policy.merge_gap_bytes;
+            let span_ok = offset
+                .saturating_add(MAX_FRAME_DISK_LEN)
+                .saturating_sub(run_start)
+                <= cap;
+            if gap_ok && span_ok {
+                run_last = offset;
+            } else {
+                extents.push(ReadExtent {
+                    slot,
+                    start: run_start,
+                    end: run_last.saturating_add(MAX_FRAME_DISK_LEN),
+                });
+                run_start = offset;
+                run_last = offset;
+            }
+        }
+        extents.push(ReadExtent {
+            slot,
+            start: run_start,
+            end: run_last.saturating_add(MAX_FRAME_DISK_LEN),
+        });
+    }
+    // `per_shard` is a `HashMap`, so iteration (and therefore extent order)
+    // would otherwise be nondeterministic across runs. Prefetch order does not
+    // affect correctness, but a stable order keeps plans reproducible and
+    // testable.
+    extents.sort_unstable_by_key(|extent| (extent.slot, extent.start));
+    extents
+}
+
+/// Reject a record whose in-shard offset the 32-bit `IndexEntry` field cannot
 /// represent, so the caller surfaces a `StorageError::Corrupt` instead of
-/// silently dropping the record (or panicking in `IndexSlot::new`).
-fn check_index_offset(shard_id: u16, hash: &[u8; 16], offset: u64) -> Result<(), StorageError> {
+/// silently dropping the record (or panicking in `IndexEntry::new`).
+fn check_index_offset(slot: u16, hash: &[u8; 16], offset: u64) -> Result<(), StorageError> {
     if offset > PACK_INDEX_OFFSET_LIMIT {
         return Err(StorageError::Corrupt(format!(
-            "shard {shard_id} holds record {hash:?} at offset {offset}, beyond the index offset limit {PACK_INDEX_OFFSET_LIMIT}"
+            "shard {slot} holds record {hash:?} at offset {offset}, beyond the index offset limit {PACK_INDEX_OFFSET_LIMIT}"
         )));
     }
     Ok(())
 }
 
+/// One persisted `(pack, collection)` bookkeeping record.
 #[derive(Clone, Copy)]
-struct PersistedShardRoom {
-    pack_id: u64,
-    collection_id: [u8; 16],
-    count: u64,
-    insertion_order: u64,
+pub struct PersistedShardRoom {
+    /// Packfile identity.
+    pub pack_id: u64,
+    /// Collection identity.
+    pub collection_id: [u8; 16],
+    /// Number of records attributed to this collection in the pack.
+    pub count: u64,
+    /// Stable collection insertion order.
+    pub insertion_order: u64,
+    /// Physical bytes attributed to this collection.
+    pub disk_bytes: u64,
 }
 
 /// A decoded shard→collection directory: the pack set it was written
 /// against, when it was written, and the per-(pack, collection) records.
 #[derive(Clone)]
-struct PersistedShardDirectory {
+pub struct PersistedShardDirectory {
     /// The `pack_fingerprint` of the `(pack_id, file_len)` set the counts
     /// apply to. Only a directory whose fingerprint equals the index
     /// checkpoint's may serve open's per-shard bookkeeping without re-walking
     /// every slot — any other directory is stale (or corrupt) and must be
     /// ignored in favor of the slot walk.
-    fingerprint: u64,
+    pub fingerprint: u64,
     /// Unix-seconds timestamp of when the directory was persisted.
-    persisted_at: u64,
+    pub persisted_at: u64,
     /// One record per (pack, collection) the store contains.
-    records: Vec<PersistedShardRoom>,
+    pub records: Vec<PersistedShardRoom>,
 }
 
 /// Decode the small inspection sidecar. This is deliberately shared by all
 /// read-only CLI summary helpers so they agree on validation and format
 /// compatibility.
-fn read_persisted_shard_collections(base_dir: &std::path::Path) -> Option<PersistedShardDirectory> {
+#[must_use]
+pub fn read_persisted_shard_collections(
+    base_dir: &std::path::Path,
+) -> Option<PersistedShardDirectory> {
     let buf = fs::read(base_dir.join("shard_collections.bin")).ok()?;
     if buf.len() < SHARD_ROOMS_HEADER_LEN
         || &buf[0..4] != SHARD_ROOMS_MAGIC
@@ -484,11 +1211,13 @@ fn read_persisted_shard_collections(base_dir: &std::path::Path) -> Option<Persis
             collection_id.copy_from_slice(&chunk[8..24]);
             let count = u64::from_le_bytes(chunk[24..32].try_into().ok()?);
             let insertion_order = u64::from_le_bytes(chunk[32..40].try_into().ok()?);
+            let disk_bytes = u64::from_le_bytes(chunk[40..48].try_into().ok()?);
             Some(PersistedShardRoom {
                 pack_id,
                 collection_id,
                 count,
                 insertion_order,
+                disk_bytes,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -548,9 +1277,10 @@ struct PutManyProgress {
     structural_change: bool,
     index_needs_rebuild: bool,
     pending_deltas: Vec<(u32, u64)>,
-    pending_shard_collections: Vec<u64>,
+    pending_shard_collections: Vec<(u64, u64)>,
+    pending_shard_collection_counts: Vec<u64>,
     invalidate_delta: bool,
-    undo_log: Vec<SlotUndo>,
+    undo_log: Vec<EntryUndo>,
 }
 
 /// Index tables that must advance together when a reader reloads a checkpoint.
@@ -561,6 +1291,7 @@ struct IndexTables {
     collection_order: Vec<[u8; 16]>,
     shard_collections: HashMap<u64, HashMap<[u8; 16], u64>>,
     collection_shards: HashMap<[u8; 16], HashSet<u64>>,
+    collection_disk_bytes: HashMap<u64, HashMap<[u8; 16], u64>>,
 }
 
 /// Session state for the incremental index delta log (`index.delta`).
@@ -684,6 +1415,10 @@ pub struct PackfileStorage {
     /// Per-instance index config: seed from the pool's `pool.meta`, floor
     /// and load factor from defaults (or future tuning).
     index_config: crate::index::IndexConfig,
+    /// Merged-read-plan tuning for `get_many` (see [`ReadPlanPolicy`]).
+    /// Read once per batch; settable at runtime via
+    /// [`Self::set_read_plan_policy`].
+    read_plan: parking_lot::RwLock<ReadPlanPolicy>,
     /// Total number of `repack_collection_reachable` calls across all collections.
     repack_count: AtomicU64,
     /// Total records kept (rewritten into the new generation) across all repacks.
@@ -694,7 +1429,7 @@ pub struct PackfileStorage {
     repack_counts_by_collection: RwLock<HashMap<[u8; 16], u64>>,
     /// Per-collection incremental repack state. Each entry tracks the byte
     /// offset up to which each shard has been scanned for this collection and
-    /// the deduplicated hash → (`shard_id`, offset) map from the last repack.
+    /// the deduplicated hash → (`slot`, offset) map from the last repack.
     /// On the next repack, only bytes after these offsets are scanned and
     /// merged into the existing map — turning O(n²) full rescan into
     /// O(n) total work across all repack calls.
@@ -703,7 +1438,7 @@ pub struct PackfileStorage {
     /// and how many. Maintained incrementally (a plain `put` just
     /// increments one counter; a full index rebuild/repack/initial scan
     /// replaces one collection's contribution wholesale via
-    /// `LossyIndex::shard_counts`) rather than ever re-derived by
+    /// `LossyIndex::slot_counts`) rather than ever re-derived by
     /// scanning a shard file, which is what made `collections_referencing_shard`
     /// and a `collections`-style listing expensive before this existed.
     /// Reverse index of `shard_collections`: which shards a given collection currently
@@ -723,6 +1458,14 @@ pub struct PackfileStorage {
     /// across a whole run instead of only the most recent barrier (which
     /// `last_sync_timings` alone cannot answer).
     sync_totals: SyncTotals,
+    /// Rolling sync diagnostics retained for post-run inspection. This is
+    /// deliberately bounded and never participates in durability decisions.
+    sync_diagnostics: parking_lot::Mutex<SyncDiagnostics>,
+    /// Number and time spent publishing mutations to the optional journal.
+    publish_calls: AtomicU64,
+    publish_time_ns: AtomicU64,
+    pending_publish_since: parking_lot::Mutex<Option<std::time::Instant>>,
+    publish_generation: AtomicU64,
     /// Minimum wall-clock interval between full checkpoint rewrites needed
     /// because no usable delta base exists or a v3 append failed. Zero disables this half of the
     /// rewrite budget. See [`Self::set_checkpoint_rewrite_budget`].
@@ -749,6 +1492,10 @@ pub struct PackfileStorage {
     /// on a write-locked or per-call path, never per-record on the hot read
     /// path). See [`Self::set_stats_enabled`].
     stats_enabled: AtomicBool,
+    /// Opt-in wall-clock latency accounting for the public storage operations.
+    /// The timer is created only while `stats_enabled` is true so normal
+    /// deployments pay no `Instant` cost for this diagnostic.
+    operation_timings: OperationTimings,
     /// Whether [`Self::get_many_with_refresh`] may rescan a collection when
     /// the caller's in-memory snapshot misses. On by default. A single-writer
     /// store sets this `false`: its in-memory index is authoritative for every
@@ -816,6 +1563,20 @@ pub struct PackfileStorage {
     /// scatters over, even if it only touches sparse frames). Drives the
     /// scattered-read signal independent of candidate count.
     read_many_span_bytes: AtomicU64,
+    /// Merged read extents prefetched with `madvise(MADV_WILLNEED)` across
+    /// `get_many` batches. This is the physical plan the batch executed, as
+    /// opposed to the [`READ_RUN_GAP_BYTES`] logical shape in
+    /// [`Self::read_many_runs`].
+    read_plan_extents: AtomicU64,
+    /// Bytes covered by prefetched read extents (sum of extent lengths, not
+    /// physical disk bytes — `madvise` is a hint the kernel may partially or
+    /// fully ignore).
+    read_plan_prefetch_bytes: AtomicU64,
+    /// Planned extents that were not prefetched — offset beyond the current
+    /// mapping (typically a buffered-but-unflushed frame), missing mapping, or
+    /// a failed `madvise`. A persistently nonzero value means the plan is
+    /// silently degrading to no prefetch for those extents.
+    read_plan_skipped_extents: AtomicU64,
 
     // Always-on write-path counters (per-record `fetch_add` only on the
     // single-record `put`, whose hot cost is dominated by the write itself).
@@ -864,6 +1625,32 @@ pub struct PackfileStorage {
     /// cost, while a crash left a stale checkpoint is still always resolved by
     /// the fingerprint → rescan fallback.
     index_checkpoint_dirty: AtomicBool,
+    /// The shard→collection sidecar is known missing or invalid and must be
+    /// regenerated even though no index is dirty (see
+    /// `RoomScanOutput::sidecar_missing`). Distinct from
+    /// `shard_collections_stale`: that flag only says ordinary writes have
+    /// advanced the in-memory bookkeeping past the on-disk copy, which is
+    /// deferred to the next persistence anchor.
+    shard_collections_dirty: AtomicBool,
+    /// A completed sync barrier advanced the in-memory shard→collection
+    /// bookkeeping past the on-disk sidecar by deferring its write. Set only on
+    /// the delta-append and budget-deferred-checkpoint paths, never by the raw
+    /// mutation helpers: bookkeeping changed by a write that was never synced
+    /// already invalidates the checkpoint fast path, so the next open
+    /// full-scans and has no use for a sidecar. The sidecar is rebuildable
+    /// acceleration metadata, so this only schedules a flush at the next
+    /// anchor: a checkpoint rewrite, a repack, or shutdown.
+    shard_collections_stale: AtomicBool,
+    /// A missing sidecar was observed, but its physical byte metrics could not
+    /// be rebuilt. Keep retrying rather than publishing misleading zeros.
+    shard_collections_recovery_failed: AtomicBool,
+    /// A sidecar persist failure has already been logged; cleared on success so
+    /// a persistent failure logs once per streak, not once per sync.
+    shard_collections_failure_logged: AtomicBool,
+    /// Test-only: runs after the recovery scan and before its totals are
+    /// swapped in, so a test can hold recovery inside that window.
+    #[cfg(test)]
+    recovery_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Session state for the incremental index delta log: the base checkpoint
     /// fingerprint + generations the log continues, and the frames accumulated
     /// since the last persist. See [`DeltaLogState`].
@@ -876,6 +1663,11 @@ pub struct PackfileStorage {
     /// per-shard pack fsyncs and the index checkpoint can be deferred without
     /// risking acknowledged data (see [`Self::enable_journal`]).
     journal: parking_lot::Mutex<Option<Arc<JournalCoordinator>>>,
+    /// Pool tag this store publishes under on a shared journal, as a
+    /// [`crate::journal::pool_tag`] code (`0` = untagged/per-pool). Set by
+    /// [`Self::enable_shared_journal`]; read on the publish and replay hot
+    /// paths, so it is a plain atomic rather than behind the journal mutex.
+    journal_pool: std::sync::atomic::AtomicU8,
     /// Committed groups recovered when the journal was opened, retained for
     /// [`Self::replay_journal`] to re-apply after a reopen.
     journal_recovery: parking_lot::Mutex<Vec<crate::journal::CommittedGroup>>,
@@ -887,6 +1679,10 @@ pub struct PackfileStorage {
     /// unflushed journal groups that the durable fingerprint gate deliberately
     /// hides. See [`Self::enable_read_journal`].
     read_journal: parking_lot::Mutex<Option<ReadJournal>>,
+    /// Number of in-process transactions whose published groups are still
+    /// being materialized. While non-zero, ordinary reads consult the journal
+    /// overlay before the live index.
+    transaction_overlay_users: AtomicU64,
     /// Journal LSN covered by the durable index this handle actually loaded.
     ///
     /// Read once at open, when the index is built from the on-disk checkpoint
@@ -895,6 +1691,10 @@ pub struct PackfileStorage {
     /// not mean this handle's in-memory index contains those records. Advancing
     /// this pair requires loading the corresponding checkpoint, not a live
     /// packfile rescan. See [`Self::get_read_committed`].
+    // Only read back by the (feature-gated) read-committed overlay; a
+    // non-`multi-reader` build still writes it once at open so the two
+    // build configurations share one open path, but never reads it back.
+    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     read_covered_lsn: AtomicU64,
     /// Successful checkpoint-bound index reloads triggered by the
     /// read-committed overlay, because a writer's reclaim outran the coverage
@@ -907,213 +1707,6 @@ pub struct PackfileStorage {
     read_reload_failures: AtomicU64,
 }
 
-/// One committed value in the read-journal overlay: payload and its LSN.
-type ReadJournalValue = (bytes::Bytes, u64);
-/// Values for one collection, keyed by node ID.
-type ReadJournalCollection = HashMap<[u8; 16], ReadJournalValue>;
-/// Committed puts keyed `collection_id -> node_id`.
-type ReadJournalPuts = HashMap<[u8; 16], ReadJournalCollection>;
-
-/// Outcome of refreshing the overlay against the writer's segment.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReadRefresh {
-    /// The segment was scanned and applied; the overlay is current.
-    Applied,
-    /// The segment was reclaimed past the coverage this reader's index
-    /// incorporated. The checkpoint-bound index must be reloaded before the
-    /// overlay can be trusted again.
-    NeedsReload,
-}
-
-/// In-memory overlay of committed journal groups, built by scanning a
-/// writer's journal segment read-only. It is the read-committed source of
-/// truth for [`PackfileStorage::get_read_committed`]: entries at or below
-/// `observed_lsn` have a complete commit trailer, so they are committed even
-/// though the writer may not have fsynced or advanced the durable index yet.
-struct ReadJournal {
-    /// Segment file scanned for committed groups.
-    path: PathBuf,
-    /// The journal LSN covered by the durable index this reader actually
-    /// loaded, fixed when the overlay was enabled.
-    ///
-    /// This is the *only* coverage entries may be filtered or pruned against.
-    /// Reading a fresher `journal.lsn` from disk would prune a committed entry
-    /// the reader's stale in-memory index does not yet contain, dropping the
-    /// record from both places. It is deliberately not advanced by a live
-    /// packfile rescan: only loading the corresponding checkpoint may advance
-    /// the index/coverage pair.
-    covered: u64,
-    /// Raw file length at the last scan. Skips a rescan when unchanged, so an
-    /// unchanged partial tail is not re-probed on every read.
-    observed_len: u64,
-    /// Absolute offset after the last complete group consumed. A partial tail
-    /// is re-probed from here once more bytes land.
-    observed_valid_len: u64,
-    /// Highest applied LSN. Groups at or below this are already in the overlay.
-    observed_lsn: u64,
-    /// Committed puts as `(payload, lsn)`, keyed `collection_id -> node_id`.
-    puts: ReadJournalPuts,
-    /// Highest committed delete LSN per collection. This is a persistent
-    /// boundary: durable fallback stays suppressed for the collection until the
-    /// checkpoint covers the delete, because the durable index may still hold
-    /// pre-delete records. A later put does not clear it.
-    delete_lsn: HashMap<[u8; 16], u64>,
-}
-
-impl ReadJournal {
-    fn empty(path: PathBuf, covered: u64) -> Self {
-        Self {
-            path,
-            covered,
-            observed_len: 0,
-            observed_valid_len: 0,
-            observed_lsn: 0,
-            puts: HashMap::new(),
-            delete_lsn: HashMap::new(),
-        }
-    }
-
-    /// Drop all applied state so the next refresh rebuilds from the segment.
-    fn reset_overlay(&mut self) {
-        self.puts.clear();
-        self.delete_lsn.clear();
-        self.observed_lsn = 0;
-        self.observed_valid_len = 0;
-        // Zero the length too, so an equal-length segment after a reload still
-        // forces a full rescan instead of short-circuiting on `len == observed_len`.
-        self.observed_len = 0;
-    }
-
-    /// Discard overlay state the durable index this reader loaded now covers.
-    ///
-    /// Reclaim is best-effort, so a journal group can outlive the checkpoint
-    /// that covers it. Without this, an old journal put or delete could shadow
-    /// newer checkpointed state. The bound is [`Self::covered`] — the coverage
-    /// of the loaded index, not a detached disk read — so an entry is only
-    /// dropped once the fallback index is known to contain it.
-    fn prune_covered(&mut self, covered: u64) {
-        if covered == 0 {
-            return;
-        }
-        self.puts.retain(|_, entries| {
-            entries.retain(|_, (_, lsn)| *lsn > covered);
-            !entries.is_empty()
-        });
-        self.delete_lsn.retain(|_, lsn| *lsn > covered);
-    }
-
-    /// Whether a reset (reclaimed/rotated) segment now begins past the
-    /// coverage this reader's durable index incorporated.
-    ///
-    /// After a reset the overlay is rebuilt from the segment alone. If the
-    /// segment's base LSN is past `covered + 1`, the writer reclaimed groups
-    /// this reader's index never absorbed: those records are in neither the
-    /// overlay nor the index. This uses the header base LSN, not the first
-    /// group, so a fully reclaimed (header-only) segment — where the segment
-    /// has no groups at all — is still detected. A missing/short segment
-    /// reports base 0 and is not a gap.
-    fn reset_has_coverage_gap(scan: &crate::journal::Scan, covered: u64) -> bool {
-        scan.base_lsn > covered.saturating_add(1)
-    }
-
-    /// Apply every committed group above `observed_lsn` to the overlay.
-    ///
-    /// A missing segment is treated as empty only before this reader has seen
-    /// any journal bytes; if an observed segment disappears, the caller must
-    /// reload the checkpoint. A segment that shrank since the last scan was
-    /// reclaimed, so the overlay is rebuilt from scratch. Never repairs or
-    /// creates the file, matching a read-only worker's constraints.
-    ///
-    /// Returns [`ReadRefresh::NeedsReload`] when a reset reveals the writer
-    /// reclaimed past this reader's incorporated coverage; the caller must
-    /// reload the checkpoint-bound index and rebind `covered` before retrying.
-    fn refresh(&mut self) -> Result<ReadRefresh, StorageError> {
-        // Coverage is fixed to the index this reader loaded. Reading
-        // `journal.lsn` fresh would prune entries the reader's stale index has
-        // not incorporated yet, dropping records from both sources.
-        let covered = self.covered;
-        let len = match fs::metadata(&self.path) {
-            Ok(meta) => meta.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if self.observed_len != 0 || self.observed_lsn > covered {
-                    return Ok(ReadRefresh::NeedsReload);
-                }
-                0
-            }
-            Err(error) => return Err(StorageError::Io(error)),
-        };
-        if len != self.observed_len {
-            let mut reset = false;
-            if len < self.observed_len {
-                // The segment was reclaimed/rotated; re-derive from the start.
-                self.reset_overlay();
-                reset = true;
-            }
-            let full_scan = self.observed_valid_len == 0;
-            let scan = if full_scan {
-                Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
-            } else {
-                // Read only the tail past the last complete group. A failure
-                // here means the segment was replaced under us (or a rotation
-                // changed its base), so fall back to a full rescan.
-                if let Ok(scan) = Journal::scan_read_only_from(
-                    &self.path,
-                    self.observed_valid_len,
-                    self.observed_lsn.saturating_add(1),
-                ) {
-                    scan
-                } else {
-                    self.reset_overlay();
-                    reset = true;
-                    Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
-                }
-            };
-            // A full rescan has no continuity with the previous overlay, so it
-            // must be gap-checked too — not only an explicit shrink. Without
-            // this, a reload that rebinds `covered` below the segment base
-            // would silently serve a hole.
-            if (reset || full_scan) && Self::reset_has_coverage_gap(&scan, covered) {
-                return Ok(ReadRefresh::NeedsReload);
-            }
-            for group in &scan.groups {
-                for entry in &group.entries {
-                    if entry.lsn <= self.observed_lsn || entry.lsn <= covered {
-                        continue;
-                    }
-                    match &entry.mutation {
-                        JournalMutation::Put {
-                            collection_id,
-                            node_id,
-                            payload,
-                        } => {
-                            self.puts.entry(*collection_id).or_default().insert(
-                                *node_id,
-                                (bytes::Bytes::copy_from_slice(payload), entry.lsn),
-                            );
-                        }
-                        JournalMutation::DeleteCollection { collection_id } => {
-                            self.puts.remove(collection_id);
-                            self.delete_lsn
-                                .entry(*collection_id)
-                                .and_modify(|lsn| *lsn = (*lsn).max(entry.lsn))
-                                .or_insert(entry.lsn);
-                        }
-                    }
-                }
-                self.observed_lsn = self.observed_lsn.max(group.last_lsn);
-            }
-            // Resume from the last complete group, not the raw file length, so
-            // a partial tail is re-probed once its trailer lands.
-            self.observed_valid_len = scan.valid_len;
-            self.observed_len = len;
-        }
-        // The checkpoint can advance without the segment changing (reclaim is
-        // best-effort), so prune overlay state it now covers.
-        self.prune_covered(covered);
-        Ok(ReadRefresh::Applied)
-    }
-}
-
 /// Per-collection state for incremental repack.
 #[derive(Clone)]
 struct RepackIncrementalState {
@@ -1123,7 +1716,7 @@ struct RepackIncrementalState {
     // pack_id beside the cursor so an offset from the old incarnation is
     // never applied to the replacement file.
     scan_offsets: HashMap<u16, (u64, u64)>,
-    /// The deduplicated hash → (`shard_id`, offset) map from the last repack.
+    /// The deduplicated hash → (`slot`, offset) map from the last repack.
     /// The next repack merges newly-scanned entries into this map.
     live_map: HashMap<[u8; 16], (u16, u64)>,
     /// Cached edge lists for every node that survived the last repack.
@@ -1401,6 +1994,7 @@ impl PackfileStorage {
 
     /// Open a read-only observer with the read-committed journal overlay
     /// enabled, in one call.
+    #[cfg(feature = "multi-reader")]
     ///
     /// This is the intended constructor for an authoritative read-only worker
     /// handle. The durable read APIs ([`StorageEngine::get_many`],
@@ -1428,6 +2022,27 @@ impl PackfileStorage {
     ) -> Result<Self, StorageError> {
         let store = Self::open_read_only(base_dir)?;
         store.enable_read_journal(wal_path)?;
+        Ok(store)
+    }
+
+    /// Open a read-only worker on one pool of a **shared** WAL.
+    ///
+    /// Identical to [`Self::open_read_committed`] except the overlay applies
+    /// only frames tagged with `pool`, so a worker reading the state pool does
+    /// not observe event-DAG or edges mutations that share the same
+    /// segment. `wal_path` is the database root's shared `wal.bin`, not a
+    /// per-pool segment.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_read_committed`].
+    #[cfg(feature = "multi-reader")]
+    pub fn open_read_committed_shared(
+        base_dir: PathBuf,
+        wal_path: impl AsRef<Path>,
+        pool: crate::layout::ShardType,
+    ) -> Result<Self, StorageError> {
+        let store = Self::open_read_only(base_dir)?;
+        store.enable_read_journal_shared(wal_path, pool)?;
         Ok(store)
     }
 
@@ -1570,7 +2185,7 @@ impl PackfileStorage {
                 &open_shards,
                 &deleted_collections,
                 writable,
-                false,
+                ReloadMode::Strict,
                 index_config,
                 &mut timings,
             )
@@ -1601,7 +2216,7 @@ impl PackfileStorage {
         }
 
         let scan_started = std::time::Instant::now();
-        for (shard_id, shard_pack_id, path, _file_len) in open_shards {
+        for (slot, shard_pack_id, path, _file_len) in open_shards {
             // A read-only open must never touch the file at all — the
             // truncating recovery scan below is only safe when we're the
             // sole writer (guaranteed by the writer lock); a read-only
@@ -1631,7 +2246,7 @@ impl PackfileStorage {
                     std::io::Error::new(
                         error.kind(),
                         format!(
-                            "read-only scan failed for shard {shard_id:02x} ({}): {error}",
+                            "read-only scan failed for shard {slot:02x} ({}): {error}",
                             path.display()
                         ),
                     )
@@ -1642,7 +2257,7 @@ impl PackfileStorage {
                     collection_order.push(collection_id);
                 }
                 collection_entries.entry(collection_id).or_default().push((
-                    shard_id,
+                    slot,
                     hash,
                     offset,
                     shard_pack_id,
@@ -1685,6 +2300,13 @@ impl PackfileStorage {
             DeltaLogState::default(),
             read_covered,
         );
+        // A writer that had to rescan has no checkpoint describing this pack
+        // set. Mark it dirty so the next sync persists one; otherwise a store
+        // opened and synced without further writes (e.g. after an aborted
+        // import) would rescan every packfile on every open forever.
+        if writable {
+            store.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
         timings.total = started.elapsed();
         *store.last_open_timings.lock() = Some(timings);
         Ok(store)
@@ -1710,8 +2332,8 @@ impl PackfileStorage {
         // shards, but enough to keep a resumed collection's writes landing near
         // its existing data instead of restarting at whatever the pool's
         // active shard happens to be.
-        if let Some(&(last_shard_id, _, _, _)) = records.last() {
-            shards.set_collection_home(collection_id, last_shard_id);
+        if let Some(&(last_slot, _, _, _)) = records.last() {
+            shards.set_collection_home(collection_id, last_slot);
         }
         let index = LossyIndex::with_config(
             records
@@ -1720,11 +2342,24 @@ impl PackfileStorage {
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             index_config,
         );
-        for (shard_id, hash, offset, _pack_id) in records {
-            check_index_offset(*shard_id, hash, *offset)?;
-            let _ = index.insert(hash, *shard_id, *offset);
+        for (slot, hash, offset, _pack_id) in records {
+            check_index_offset(*slot, hash, *offset)?;
+            let _ = index.insert(hash, *slot, *offset);
         }
-        let counts = index.shard_counts();
+        for (slot, _hash, offset, pack_id) in records {
+            let shard = shards
+                .get_shard(*slot)
+                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?;
+            let bytes = ShardPool::record_disk_len_at(&shard, *offset)?;
+            let total = out
+                .collection_disk_bytes
+                .entry(*pack_id)
+                .or_default()
+                .entry(*collection_id)
+                .or_default();
+            *total = total.saturating_add(bytes);
+        }
+        let counts = index.slot_counts();
 
         // Build slot→pack_id lookup from the records for this collection.
         let slot_to_pack_id: HashMap<u16, u64> = records
@@ -1732,11 +2367,11 @@ impl PackfileStorage {
             .map(|(slot, _, _, pack_id)| (*slot, *pack_id))
             .collect();
 
-        for (&shard_id, &count) in &counts {
+        for (&slot, &count) in &counts {
             let pack_id = slot_to_pack_id
-                .get(&shard_id)
+                .get(&slot)
                 .copied()
-                .unwrap_or(u64::from(shard_id));
+                .unwrap_or(u64::from(slot));
             out.shard_collections
                 .entry(pack_id)
                 .or_default()
@@ -1760,7 +2395,11 @@ impl PackfileStorage {
     /// Assemble a fully constructed store from the per-collection state both
     /// the rescan path and the checkpoint fast path produce, so the two share
     /// one field-for-field constructor.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one field-for-field constructor shared by both open paths"
+    )]
     fn assemble(
         shards: ShardPool,
         scan_out: RoomScanOutput,
@@ -1799,6 +2438,7 @@ impl PackfileStorage {
                 collection_order,
                 shard_collections: scan_out.shard_collections,
                 collection_shards: scan_out.collection_shards,
+                collection_disk_bytes: scan_out.collection_disk_bytes,
             }),
             pinned: PinnedNodes::new(),
             base_dir,
@@ -1813,6 +2453,7 @@ impl PackfileStorage {
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
             index_config,
+            read_plan: RwLock::new(ReadPlanPolicy::default()),
             repack_count: AtomicU64::new(0),
             repack_kept_total: AtomicU64::new(0),
             repack_dropped_total: AtomicU64::new(0),
@@ -1820,22 +2461,36 @@ impl PackfileStorage {
             repack_incremental: RwLock::new(HashMap::new()),
             last_shard_collections_flush: RwLock::new(None),
             index_checkpoint_dirty: AtomicBool::new(false),
+            shard_collections_dirty: AtomicBool::new(scan_out.sidecar_missing),
+            shard_collections_stale: AtomicBool::new(false),
+            shard_collections_recovery_failed: AtomicBool::new(scan_out.sidecar_recovery_failed),
+            shard_collections_failure_logged: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_pause_hook: parking_lot::Mutex::new(None),
             journal: parking_lot::Mutex::new(None),
+            journal_pool: std::sync::atomic::AtomicU8::new(0),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
             read_journal: parking_lot::Mutex::new(None),
+            transaction_overlay_users: AtomicU64::new(0),
             read_covered_lsn,
             read_reloads: AtomicU64::new(0),
             read_reload_failures: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
+            sync_diagnostics: parking_lot::Mutex::new(SyncDiagnostics::default()),
+            publish_calls: AtomicU64::new(0),
+            publish_time_ns: AtomicU64::new(0),
+            pending_publish_since: parking_lot::Mutex::new(None),
+            publish_generation: AtomicU64::new(0),
             checkpoint_rewrite_min_interval_ns: AtomicU64::new(0),
             checkpoint_rewrite_max_bytes: AtomicU64::new(0),
             last_checkpoint_rewrite_at: parking_lot::Mutex::new(None),
             checkpoint_bytes_at_last_rewrite: AtomicU64::new(0),
             checkpoint_skips: AtomicU64::new(0),
             stats_enabled: AtomicBool::new(false),
+            operation_timings: OperationTimings::default(),
             refresh_on_miss: AtomicBool::new(true),
             open_count: AtomicU64::new(1),
             get_calls: AtomicU64::new(0),
@@ -1855,6 +2510,9 @@ impl PackfileStorage {
             candidate_frame_bytes: AtomicU64::new(0),
             read_many_runs: AtomicU64::new(0),
             read_many_span_bytes: AtomicU64::new(0),
+            read_plan_extents: AtomicU64::new(0),
+            read_plan_prefetch_bytes: AtomicU64::new(0),
+            read_plan_skipped_extents: AtomicU64::new(0),
             put_calls: AtomicU64::new(0),
             put_bytes: AtomicU64::new(0),
             put_many_calls: AtomicU64::new(0),
@@ -1909,16 +2567,22 @@ impl PackfileStorage {
         let path = Self::journal_lsn_path(&self.base_dir);
         let tmp = path.with_extension("lsn.tmp");
         fs::write(&tmp, lsn.to_le_bytes()).map_err(StorageError::Io)?;
-        fs::File::open(&tmp)
+        // Windows requires a write-capable handle for FlushFileBuffers,
+        // which is what `sync_all` uses. A read-only handle works on Unix
+        // but fails with ERROR_ACCESS_DENIED on Windows.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp)
             .and_then(|file| file.sync_all())
             .map_err(StorageError::Io)?;
         fs::rename(&tmp, &path).map_err(StorageError::Io)?;
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         Ok(())
     }
 
     /// The journal LSN the on-disk checkpoint covers (0 when none is recorded).
-    fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
+    pub fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
         fs::read(Self::journal_lsn_path(base_dir))
             .ok()
             .and_then(|bytes| bytes.get(..8).map(<[u8; 8]>::try_from))
@@ -2027,7 +2691,8 @@ impl PackfileStorage {
     /// checkpoint generation. A malformed or semantically inconsistent log
     /// makes this function return `None`, selecting the full rescan path.
     ///
-    /// `read_journal_reload` selects the read-committed overlay's reload mode
+    /// `reload_mode` selects the caller's stance (see [`ReloadMode`]).
+    /// `ReloadMode::JournalBound` is for the read-committed overlay's reload
     /// (see `reload_index_from_checkpoint`): the caller is a read-only worker
     /// advancing its index/coverage pair to a writer's checkpoint, not a
     /// session opening the store. In that mode the exact-pack fingerprint gate
@@ -2049,7 +2714,7 @@ impl PackfileStorage {
         open_shards: &[(u16, u64, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
         writable: bool,
-        read_journal_reload: bool,
+        reload_mode: ReloadMode,
         index_config: crate::index::IndexConfig,
         timings: &mut OpenTimings,
     ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
@@ -2098,7 +2763,8 @@ impl PackfileStorage {
         // delta replay (see this function's doc): the overlay supplies the
         // committed suffix, and requiring the live pack set to match would fail
         // the read closed while a writer is still appending.
-        let replay_needed = !read_journal_reload && local_fingerprint != checkpoint.fingerprint;
+        let replay_needed =
+            reload_mode == ReloadMode::Strict && local_fingerprint != checkpoint.fingerprint;
         if !replay_needed && writable {
             let _ = std::fs::remove_file(&delta_path);
         }
@@ -2159,6 +2825,11 @@ impl PackfileStorage {
                 }
             }
             timings.delta_replay = delta_started.elapsed();
+            // Reachable only after a log validated against both fingerprints,
+            // so a nonzero count means operations were actually replayed.
+            timings.delta_replay_operations = u64::try_from(replay_operations.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(replay_frames.len()).unwrap_or(u64::MAX));
         }
 
         // Group the (gated) frames by target collection once, so the
@@ -2282,7 +2953,7 @@ impl PackfileStorage {
             .map(|(slot, pack_id, _, _)| (*slot, *pack_id))
             .collect();
 
-        // Translate every shard_id this checkpoint's index entries (and any
+        // Translate every slot this checkpoint's index entries (and any
         // delta frame continuing it) encode — the writer's own local slot at
         // checkpoint-write time — to this reader's own local slot for the
         // same pack_id. Slot numbers are a process-local handle, not a
@@ -2292,13 +2963,13 @@ impl PackfileStorage {
         // `CHECKPOINT_VERSION`'s v6 doc comment). A checkpoint_slot with no
         // entry here (its pack_id isn't among this reader's currently-open
         // packs) is left unmapped; any index entry that actually needs it
-        // makes `remap_shard_ids` fail closed below, forcing a full rescan
+        // makes `remap_slots` fail closed below, forcing a full rescan
         // rather than serving an unresolvable slot.
         let pack_id_to_local_slot: HashMap<u64, u16> = open_shards
             .iter()
             .map(|(slot, pack_id, _, _)| (*pack_id, *slot))
             .collect();
-        let shard_id_remap: HashMap<u16, u16> = checkpoint
+        let slot_remap: HashMap<u16, u16> = checkpoint
             .pack_table
             .iter()
             .filter_map(|&(checkpoint_slot, pack_id)| {
@@ -2373,7 +3044,7 @@ impl PackfileStorage {
                 };
                 (index, loaded.generation)
             };
-            if !index.remap_shard_ids(&shard_id_remap) {
+            if !index.remap_slots(&slot_remap) {
                 return None;
             }
             current_len.insert(loaded.collection_id, u32::try_from(index.len()).ok()?);
@@ -2391,7 +3062,7 @@ impl PackfileStorage {
             if deleted_collections.contains(&collection_id) {
                 continue;
             }
-            if !index.remap_shard_ids(&shard_id_remap) {
+            if !index.remap_slots(&slot_remap) {
                 return None;
             }
             current_len.insert(collection_id, u32::try_from(index.len()).ok()?);
@@ -2421,6 +3092,31 @@ impl PackfileStorage {
             &all_deleted_collections,
         );
         timings.bookkeeping_source = bookkeeping_source;
+        if bookkeeping_source == BookkeepingSource::Sidecar {
+            if let Some(directory) = read_persisted_shard_collections(base_dir) {
+                for record in directory.records {
+                    let total = scan_out
+                        .collection_disk_bytes
+                        .entry(record.pack_id)
+                        .or_default()
+                        .entry(record.collection_id)
+                        .or_default();
+                    *total = total.saturating_add(record.disk_bytes);
+                }
+            }
+        } else if writable {
+            // No valid sidecar to seed the physical byte totals from. Rebuild
+            // them exactly (every appended frame, as `physical_layout`
+            // counts) rather than persisting zeros, and make the next sync
+            // rewrite the sidecar. This is a recovery path, so one pack scan
+            // is acceptable.
+            scan_out.sidecar_missing = true;
+            scan_out.sidecar_recovery_failed = true;
+            if let Ok(physical) = crate::packfile::layout::physical_layout(base_dir) {
+                scan_out.collection_disk_bytes = disk_bytes_from_physical(&physical);
+                scan_out.sidecar_recovery_failed = false;
+            }
+        }
 
         // Bookkeeping (home-shard seeding + shard directory) from the sidecar
         // where that passed its gates, otherwise a slot walk of the — possibly
@@ -2431,7 +3127,7 @@ impl PackfileStorage {
                 let mut out = HashMap::with_capacity(collection_order.len());
                 for collection_id in &collection_order {
                     if let Some(gen) = scan_out.collections.get(collection_id) {
-                        out.insert(*collection_id, gen.load().index.shard_counts());
+                        out.insert(*collection_id, gen.load().index.slot_counts());
                     }
                 }
                 out
@@ -2445,11 +3141,11 @@ impl PackfileStorage {
             if let Some(&home_shard) = counts.keys().max() {
                 shards.set_collection_home(collection_id, home_shard);
             }
-            for (&shard_id, &count) in counts {
+            for (&slot, &count) in counts {
                 let pack_id = slot_to_pack_id
-                    .get(&shard_id)
+                    .get(&slot)
                     .copied()
-                    .unwrap_or(u64::from(shard_id));
+                    .unwrap_or(u64::from(slot));
                 scan_out
                     .shard_collections
                     .entry(pack_id)
@@ -2517,32 +3213,18 @@ impl PackfileStorage {
         ids
     }
 
-    /// Collection IDs whose live index currently references at least one record
-    /// physically stored in `shard_id`.
-    ///
-    /// Shards are shared, so this is normally more than one collection; it's the
-    /// set `repack_shard` needs to touch before that shard can retire.
-    ///
-    /// Sweeps the shard's own file content (bounded by `MAX_SHARD_BYTES`,
-    /// not by how many unrelated collections happen to be loaded) rather than
-    /// scanning every collection's index to ask "does this touch shard N" — a
-    /// candidate set from the raw scan is then filtered against each
-    /// candidate collection's *current* live index, since the scan alone can't
-    /// tell a still-live reference from a collection that already repacked past
-    /// this shard (its old bytes just haven't been overwritten — they
-    /// never are, shards are append-only).
+    /// Collection IDs whose live indexes currently reference records in
+    /// `slot`. A collection repacked away from the slot is excluded even if
+    /// its old bytes remain in the append-only pack. Order is unspecified.
     ///
     /// # Errors
-    /// Returns `StorageError` if the shard's file can't be read, or if
-    /// `shard_id` doesn't correspond to a currently-open shard.
-    pub fn collections_referencing_shard(
-        &self,
-        shard_id: u16,
-    ) -> Result<Vec<[u8; 16]>, StorageError> {
-        let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
+    /// Returns [`StorageError::Io`] with `NotFound` if `slot` does not
+    /// correspond to an open shard.
+    pub fn collections_referencing_shard(&self, slot: u16) -> Result<Vec<[u8; 16]>, StorageError> {
+        let shard = self.shards.get_shard(slot).ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("no open shard with id {shard_id}"),
+                format!("no open shard with id {slot}"),
             ))
         })?;
         // O(1) against the incrementally-maintained shard→collection directory
@@ -2556,7 +3238,7 @@ impl PackfileStorage {
             .unwrap_or_default())
     }
 
-    /// Repack every collection that still references `shard_id`.
+    /// Repack every collection that still references `slot`.
     ///
     /// A shard only ever retires once *every* collection referencing it has
     /// repacked past its data there (see `retire_empty_shards`) — there's
@@ -2580,10 +3262,10 @@ impl PackfileStorage {
     /// collections in this call are not rolled back.
     pub fn repack_shard(
         &self,
-        shard_id: u16,
+        slot: u16,
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
-        let collections = self.collections_referencing_shard(shard_id)?;
+        let collections = self.collections_referencing_shard(slot)?;
         let mut results = Vec::with_capacity(collections.len());
         for collection_id in collections {
             let (kept, dropped) = self
@@ -2636,6 +3318,30 @@ impl PackfileStorage {
     pub fn set_repack_threshold_entries(&self, entries: u64) {
         self.repack_threshold_entries
             .store(entries, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the merged-read-plan policy for `get_many` (see
+    /// [`ReadPlanPolicy`]). Takes effect on the next batch.
+    pub fn set_read_plan_policy(&self, policy: ReadPlanPolicy) {
+        *self.read_plan.write() = policy;
+    }
+
+    /// The current merged-read-plan policy.
+    #[must_use]
+    pub fn read_plan_policy(&self) -> ReadPlanPolicy {
+        *self.read_plan.read()
+    }
+
+    /// Whether this storage attempts zstd compression on written records.
+    #[must_use]
+    pub fn is_compression_enabled(&self) -> bool {
+        self.shards.is_compression_enabled()
+    }
+
+    /// The checksum policy configured for this storage.
+    #[must_use]
+    pub fn checksum_policy(&self) -> packfile::ChecksumPolicy {
+        self.shards.checksum_policy()
     }
 
     /// Returns `true` if a collection's index has reached the configured repack
@@ -2691,7 +3397,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
     ) -> Result<Vec<ScannedShard>, StorageError> {
         let mut scanned: Vec<ScannedShard> = Vec::new();
-        for (shard_id, shard) in self.shards.all_shards() {
+        for (slot, shard) in self.shards.all_shards() {
             match packfile::scan_packfile(&shard.path) {
                 Ok(entries) => {
                     let collection_entries: Vec<([u8; 16], u64)> = entries
@@ -2700,7 +3406,7 @@ impl PackfileStorage {
                         .map(|(_, hash, offset)| (hash, offset))
                         .collect();
                     if !collection_entries.is_empty() {
-                        scanned.push((shard_id, collection_entries));
+                        scanned.push((slot, collection_entries));
                     }
                 }
                 Err(e) => {
@@ -2725,12 +3431,12 @@ impl PackfileStorage {
             .copied()
             .map(|collection_id| (collection_id, HashMap::new()))
             .collect();
-        for (shard_id, shard) in self.shards.all_shards() {
+        for (slot, shard) in self.shards.all_shards() {
             for (collection_id, hash, offset) in packfile::scan_packfile(&shard.path)? {
                 if wanted.contains(&collection_id) {
                     maps.entry(collection_id)
                         .or_default()
-                        .insert(hash, (shard_id, offset));
+                        .insert(hash, (slot, offset));
                 }
             }
         }
@@ -2748,14 +3454,14 @@ impl PackfileStorage {
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             index_config,
         );
-        for (hash, shard_id, offset) in offsets {
-            check_index_offset(*shard_id, hash, *offset)?;
-            let _ = index.insert(hash, *shard_id, *offset);
+        for (hash, slot, offset) in offsets {
+            check_index_offset(*slot, hash, *offset)?;
+            let _ = index.insert(hash, *slot, *offset);
         }
         Ok(index)
     }
 
-    /// Convert a slot-keyed `shard_counts` from `LossyIndex` to a pack_id-keyed
+    /// Convert a slot-keyed `slot_counts` from `LossyIndex` to a pack_id-keyed
     /// `HashMap<u64, u64>` for use with `replace_collection_shard_counts`.
     fn slot_counts_to_pack_id_counts(&self, counts: &HashMap<u16, u64>) -> HashMap<u64, u64> {
         let shards = self.shards.all_shards();
@@ -2824,14 +3530,14 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Records one new record landing in `shard_id` for `collection_id` — the
+    /// Records one new record landing in `slot` for `collection_id` — the
     /// cheap, O(1) path for a plain `put` that only appends, never moves
     /// or drops anything. Kept separate from
     /// [`Self::replace_collection_shard_counts`], which pays for a full
     /// per-shard recount and is reserved for the cases that actually
     /// change a collection's existing distribution (an index rebuild or a
     /// repack), so a normal write never regresses to O(collection size).
-    fn record_new_shard_collection(&self, pack_id: u64, collection_id: &[u8; 16]) {
+    fn record_new_shard_collection(&self, pack_id: u64, collection_id: &[u8; 16], disk_bytes: u64) {
         let mut tables = self.index_tables.write();
         let count = tables
             .shard_collections
@@ -2845,10 +3551,81 @@ impl PackfileStorage {
             .entry(*collection_id)
             .or_default()
             .insert(pack_id);
+        let bytes = tables
+            .collection_disk_bytes
+            .entry(pack_id)
+            .or_default()
+            .entry(*collection_id)
+            .or_default();
+        *bytes = bytes.saturating_add(disk_bytes);
+    }
+
+    fn record_put_many_shard_collections(
+        &self,
+        collection_id: &[u8; 16],
+        count_packs: &[u64],
+        byte_packs: &[(u64, u64)],
+    ) {
+        let mut tables = self.index_tables.write();
+        for &pack_id in count_packs {
+            let count = tables
+                .shard_collections
+                .entry(pack_id)
+                .or_default()
+                .entry(*collection_id)
+                .or_insert(0);
+            *count = count.saturating_add(1);
+            tables
+                .collection_shards
+                .entry(*collection_id)
+                .or_default()
+                .insert(pack_id);
+        }
+        for &(pack_id, disk_bytes) in byte_packs {
+            let bytes = tables
+                .collection_disk_bytes
+                .entry(pack_id)
+                .or_default()
+                .entry(*collection_id)
+                .or_default();
+            *bytes = bytes.saturating_add(disk_bytes);
+        }
+    }
+
+    fn record_disk_bytes(&self, pack_id: u64, collection_id: &[u8; 16], disk_bytes: u64) {
+        let mut tables = self.index_tables.write();
+        let bytes = tables
+            .collection_disk_bytes
+            .entry(pack_id)
+            .or_default()
+            .entry(*collection_id)
+            .or_default();
+        *bytes = bytes.saturating_add(disk_bytes);
+    }
+
+    fn replace_collection_disk_bytes(
+        &self,
+        collection_id: &[u8; 16],
+        bytes_by_pack: &HashMap<u64, u64>,
+    ) {
+        let mut tables = self.index_tables.write();
+        for collections in tables.collection_disk_bytes.values_mut() {
+            collections.remove(collection_id);
+        }
+        for (&pack_id, &disk_bytes) in bytes_by_pack {
+            tables
+                .collection_disk_bytes
+                .entry(pack_id)
+                .or_default()
+                .insert(*collection_id, disk_bytes);
+        }
+        tables
+            .collection_disk_bytes
+            .retain(|_, collections| !collections.is_empty());
     }
 
     /// Replaces `collection_id`'s entire contribution to `shard_collections` with
-    /// `counts` (typically `LossyIndex::shard_counts()` converted to `pack_id` keys)
+    /// `counts` (typically `LossyIndex::slot_counts()` converted to `pack_id` keys)
     /// — clears it out of any shard it no longer occupies and installs the fresh
     /// per-shard counts. Used wherever a collection's index is replaced wholesale
     /// rather than incrementally appended to, since only then can its distribution
@@ -2928,6 +3705,49 @@ impl PackfileStorage {
     /// # Errors
     /// Returns `StorageError` on write or rename failure.
     pub fn persist_shard_collections(&self) -> Result<(), StorageError> {
+        if self
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire)
+        {
+            // The open-time recovery scan failed, so the byte totals are not
+            // trustworthy. Retry it now; until it succeeds nothing is written,
+            // so zero-byte fallbacks are never published.
+            //
+            // The scan and the swap of the in-memory totals must not interleave
+            // with an append: a frame written after the scan would be missing
+            // from the totals while the persisted fingerprint already covers
+            // it, and nothing would ever correct that. So hold every
+            // collection's put mutex (the same sorted-lock pattern the
+            // checkpoint writer uses; no caller holds one when it persists)
+            // across the flush, the scan, and the swap. This only runs on the
+            // rare recovery path, so briefly stalling writers is acceptable.
+            // Take the creation lock first, then read the collection set: a
+            // collection created earlier is in the set, and none can appear
+            // while it is held. Sort so every mutex is acquired in one global
+            // order, whatever else locks several collections at once.
+            let create_guard = self.collection_creation.write();
+            let mut collection_ids: Vec<[u8; 16]> =
+                self.collections_read().keys().copied().collect();
+            collection_ids.sort_unstable();
+            collection_ids.dedup();
+            let lock_arcs: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+            let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
+            self.shards.flush_all().map_err(StorageError::Io)?;
+            let physical = crate::packfile::layout::physical_layout(&self.base_dir)
+                .map_err(StorageError::Io)?;
+            #[cfg(test)]
+            {
+                let hook = self.recovery_pause_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            self.index_tables.write().collection_disk_bytes = disk_bytes_from_physical(&physical);
+            drop(guards);
+            drop(create_guard);
+            self.shard_collections_recovery_failed
+                .store(false, Ordering::Release);
+        }
         let mut buf = Vec::new();
         buf.extend_from_slice(SHARD_ROOMS_MAGIC);
         buf.push(SHARD_ROOMS_VERSION);
@@ -2943,30 +3763,44 @@ impl PackfileStorage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
-        let tables = self.index_tables.read();
-        let collection_order: HashMap<[u8; 16], u64> = tables
-            .collection_order
-            .iter()
-            .enumerate()
-            .map(|(index, collection_id)| {
-                u64::try_from(index)
-                    .map(|index| (*collection_id, index))
-                    .map_err(|_| {
-                        StorageError::Io(std::io::Error::other("collection order exceeds u64"))
-                    })
-            })
-            .collect::<Result<_, _>>()?;
-        for (pack_id, collections) in &tables.shard_collections {
-            for (collection_id, count) in collections {
-                buf.extend_from_slice(&pack_id.to_le_bytes());
-                buf.extend_from_slice(collection_id);
-                buf.extend_from_slice(&count.to_le_bytes());
-                let order = collection_order
-                    .get(collection_id)
-                    .copied()
-                    .unwrap_or(u64::MAX);
-                buf.extend_from_slice(&order.to_le_bytes());
+        let records = {
+            let tables = self.index_tables.read();
+            let collection_order: HashMap<[u8; 16], u64> = tables
+                .collection_order
+                .iter()
+                .enumerate()
+                .map(|(index, collection_id)| {
+                    u64::try_from(index)
+                        .map(|index| (*collection_id, index))
+                        .map_err(|_| {
+                            StorageError::Io(std::io::Error::other("collection order exceeds u64"))
+                        })
+                })
+                .collect::<Result<_, _>>()?;
+            let mut records = Vec::new();
+            for (pack_id, collections) in &tables.shard_collections {
+                for (collection_id, count) in collections {
+                    let order = collection_order
+                        .get(collection_id)
+                        .copied()
+                        .unwrap_or(u64::MAX);
+                    let disk_bytes = tables
+                        .collection_disk_bytes
+                        .get(pack_id)
+                        .and_then(|collections| collections.get(collection_id))
+                        .copied()
+                        .unwrap_or(0);
+                    records.push((*pack_id, *collection_id, *count, order, disk_bytes));
+                }
             }
+            records
+        };
+        for (pack_id, collection_id, count, order, disk_bytes) in records {
+            buf.extend_from_slice(&pack_id.to_le_bytes());
+            buf.extend_from_slice(&collection_id);
+            buf.extend_from_slice(&count.to_le_bytes());
+            buf.extend_from_slice(&order.to_le_bytes());
+            buf.extend_from_slice(&disk_bytes.to_le_bytes());
         }
 
         let unique = SHARD_ROOMS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2993,7 +3827,18 @@ impl PackfileStorage {
         // fsync is issued, so "completed" stops short of claiming power-loss
         // durability for the directory entry itself).
         self.sidecar_writes.fetch_add(1, Ordering::Relaxed);
+        self.shard_collections_dirty.store(false, Ordering::Relaxed);
+        self.shard_collections_stale.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// True when a completed sync barrier deferred the `shard_collections.bin`
+    /// write to the next anchor (checkpoint rewrite, repack, or clean
+    /// shutdown). Writes that have not been synced are not reported here: they
+    /// invalidate the checkpoint fast path, so the next open full-scans and
+    /// never consults the sidecar.
+    pub fn is_shard_collections_stale(&self) -> bool {
+        self.shard_collections_stale.load(Ordering::Relaxed)
     }
 
     /// Best-effort wrapper around [`Self::persist_shard_collections`] — logs and
@@ -3002,8 +3847,19 @@ impl PackfileStorage {
     /// data, not something worth failing an otherwise-successful sync
     /// over.
     fn persist_shard_collections_best_effort(&self) {
-        if let Err(e) = self.persist_shard_collections() {
-            eprintln!("mtxdb: failed to persist shard→collection directory: {e}");
+        match self.persist_shard_collections() {
+            Ok(()) => self
+                .shard_collections_failure_logged
+                .store(false, Ordering::Relaxed),
+            Err(e) => {
+                // A persistent failure would otherwise log on every sync.
+                if !self
+                    .shard_collections_failure_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    eprintln!("mtxdb: failed to persist shard→collection directory: {e}");
+                }
+            }
         }
     }
 
@@ -3075,6 +3931,46 @@ impl PackfileStorage {
                 }
             }
         }
+    }
+
+    /// Snapshot every collection's live generation for a checkpoint, encoded as
+    /// `(collection_id, generation, room)`. Callers hold all collection put
+    /// mutexes, so the snapshot is a consistent point in the index.
+    fn checkpoint_snapshots(&self) -> Vec<([u8; 16], u64, Arc<RoomGeneration>)> {
+        let tables = self.index_tables.read();
+        tables
+            .collection_order
+            .iter()
+            .filter_map(|collection_id| {
+                tables.collections.get(collection_id).map(|g| {
+                    let generation = arc_swap::ArcSwapAny::load_full(g);
+                    (*collection_id, generation.generation, generation)
+                })
+            })
+            .collect()
+    }
+
+    /// The journal LSN this store's checkpoint covers: its own pool's committed
+    /// watermark on a shared segment (one group can interleave other pools'
+    /// frames), or the global committed LSN for a per-pool segment. `None` when
+    /// no journal is enabled.
+    ///
+    /// The value is floored by the durable coverage already recorded beside the
+    /// checkpoint. A pool whose frames have all been reclaimed has no committed
+    /// group left to derive a watermark from, so the fresh coordinator reports
+    /// zero for it; writing that zero would erase the durable coverage and make
+    /// the next replay start from a stale bound. Coverage only ever advances.
+    fn checkpoint_covered_lsn(&self) -> Option<u64> {
+        self.journal().map(|journal| {
+            #[cfg(feature = "multi-reader")]
+            let committed = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+                Some(pool) => journal.committed_lsn_for_pool(pool),
+                None => journal.committed_lsn(),
+            };
+            #[cfg(not(feature = "multi-reader"))]
+            let committed = journal.committed_lsn();
+            committed.max(Self::read_journal_lsn(&self.base_dir))
+        })
     }
 
     /// Persist the full per-collection index state to `index.checkpoint`, so
@@ -3191,7 +4087,7 @@ impl PackfileStorage {
             .collect();
         let fingerprint = crate::index::checkpoint::pack_fingerprint(&packs);
         // Every pack live right now, keyed by this writer's own local slot —
-        // lets a reader translate this checkpoint's shard_id-encoded index
+        // lets a reader translate this checkpoint's slot-encoded index
         // entries to its own local slot for the same pack_id, rather than
         // trusting the writer's raw slot number (see CHECKPOINT_VERSION's
         // doc comment on the v6 bump for why that's unsafe after a
@@ -3201,19 +4097,7 @@ impl PackfileStorage {
             .map(|(slot, shard)| (*slot, shard.pack_id))
             .collect();
 
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
 
         // Rotate the delta epoch while still locked: `old_base_fingerprint`
         // (D0's name, if any) is retired below only after `fingerprint`'s
@@ -3229,7 +4113,13 @@ impl PackfileStorage {
         // that LSN (the journal scan only knows the committed prefix). The
         // committed LSN is conservative -- the fsynced packs above may cover
         // more -- and replaying that suffix again is idempotent.
-        let wal_lsn = self.journal().map(|journal| journal.committed_lsn());
+        //
+        // On a shared segment the global committed LSN can include other pools'
+        // frames, which this checkpoint does not materialize. Record this
+        // pool's own committed watermark instead, so its coverage and the
+        // reclaim floor both describe only frames this index holds.
+        let journal_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
+        let wal_lsn = self.checkpoint_covered_lsn();
         drop(guards);
         // `create_guard` is deliberately NOT dropped here, unlike the
         // per-collection put mutexes above. An existing collection's
@@ -3269,7 +4159,7 @@ impl PackfileStorage {
         // this fsync commits either observes the rename (fingerprint gate
         // passes) or doesn't (falls back to the still-valid predecessor
         // checkpoint) — never a torn or partially-visible rename.
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         // The checkpoint naming `fingerprint` is now durably in place, so a
         // new collection publishing from here on lands after it — same
         // recovery story a reopen already has for any other post-checkpoint
@@ -3287,8 +4177,28 @@ impl PackfileStorage {
         if let Some(lsn) = wal_lsn {
             self.write_journal_lsn(lsn)?;
             if let Some(journal) = self.journal() {
-                if let Err(error) = journal.reclaim_through(lsn) {
-                    eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                match journal_pool {
+                    // A per-pool segment holds only this pool's frames, so this
+                    // checkpoint covers everything at or below `lsn` and the
+                    // segment can drop that prefix.
+                    None => {
+                        if let Err(error) = journal.reclaim_through(lsn) {
+                            eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                        }
+                    }
+                    // A shared segment also holds other pools' frames. Record
+                    // this pool's coverage and reclaim only up to the minimum
+                    // across every pool that has frames in the segment, so no
+                    // pool's frames are dropped before they are materialized.
+                    #[cfg(feature = "multi-reader")]
+                    Some(pool) => {
+                        journal.report_pool_coverage(pool, lsn);
+                        if let Err(error) = journal.reclaim_shared() {
+                            eprintln!("warning: shared journal reclaim failed: {error}");
+                        }
+                    }
+                    #[cfg(not(feature = "multi-reader"))]
+                    Some(_) => unreachable!("shared journal state requires multi-reader"),
                 }
             }
         }
@@ -3408,21 +4318,9 @@ impl PackfileStorage {
         let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
-        let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
+        let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
         drop(guards);
         drop(create_guard);
 
@@ -3447,7 +4345,7 @@ impl PackfileStorage {
             &pack_table,
         )
         .map_err(StorageError::Io)?;
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         self.retire_delta_epoch(old_base_fingerprint);
         let guards = lock_arcs.iter().map(|m| m.lock()).collect::<Vec<_>>();
         let has_unfinished_work = {
@@ -3476,19 +4374,7 @@ impl PackfileStorage {
         let _guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
         self.shards.flush_all().unwrap();
         let fingerprint = self.current_pack_fingerprint();
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
         (fingerprint, old_base_fingerprint)
     }
@@ -3506,21 +4392,9 @@ impl PackfileStorage {
         let guards: Vec<_> = mutexes.iter().map(|m| m.lock()).collect();
         self.shards.flush_all()?;
         let fingerprint = self.current_pack_fingerprint();
-        let snapshots: Vec<([u8; 16], u64, Arc<RoomGeneration>)> = {
-            let tables = self.index_tables.read();
-            tables
-                .collection_order
-                .iter()
-                .filter_map(|collection_id| {
-                    tables.collections.get(collection_id).map(|g| {
-                        let generation = arc_swap::ArcSwapAny::load_full(g);
-                        (*collection_id, generation.generation, generation)
-                    })
-                })
-                .collect()
-        };
+        let snapshots = self.checkpoint_snapshots();
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
-        let covered_lsn = self.journal().map_or(0, |journal| journal.committed_lsn());
+        let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
         drop(guards);
         let pack_table: Vec<(u16, u64)> = self
             .shards
@@ -3536,7 +4410,7 @@ impl PackfileStorage {
             &pack_table,
         )
         .map_err(StorageError::Io)?;
-        let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+        let _ = crate::shard::sync_directory(&self.base_dir);
         Ok((fingerprint, old_base_fingerprint))
     }
 
@@ -3556,7 +4430,7 @@ impl PackfileStorage {
             // one covers the unlink instead, so the retired epoch's file
             // doesn't linger past a crash — harmless either way (see the
             // doc comment above), but tidier.
-            let _ = fs::File::open(&self.base_dir).and_then(|dir| dir.sync_all());
+            let _ = crate::shard::sync_directory(&self.base_dir);
         }
     }
 
@@ -3900,6 +4774,22 @@ impl PackfileStorage {
         Some(shards)
     }
 
+    /// Current physical bytes per collection from the persisted directory.
+    /// Values include superseded frames and are `None` for stores whose
+    /// sidecar predates persisted physical metrics.
+    #[must_use]
+    pub fn collection_disk_bytes_from_disk(
+        base_dir: &std::path::Path,
+    ) -> Option<HashMap<[u8; 16], u64>> {
+        let records = read_persisted_shard_collections(base_dir)?.records;
+        let mut bytes = HashMap::new();
+        for record in records {
+            let total = bytes.entry(record.collection_id).or_insert(0_u64);
+            *total = total.saturating_add(record.disk_bytes);
+        }
+        Some(bytes)
+    }
+
     /// Current live-node count per shard from the persisted shard→collection
     /// directory, without opening packfiles or rebuilding collection indexes.
     ///
@@ -3957,8 +4847,8 @@ impl PackfileStorage {
     /// writes* just retired-and-recreated at the same path, turning a
     /// stale-but-valid offset into a read into unrelated, freshly-written
     /// bytes.
-    fn pin_shards(&self, shard_ids: impl Iterator<Item = u16>) -> HashMap<u16, Arc<Shard>> {
-        let unique: HashSet<u16> = shard_ids.collect();
+    fn pin_shards(&self, slots: impl Iterator<Item = u16>) -> HashMap<u16, Arc<Shard>> {
+        let unique: HashSet<u16> = slots.collect();
         unique
             .into_iter()
             .filter_map(|id| self.shards.get_shard(id).map(|shard| (id, shard)))
@@ -3979,25 +4869,26 @@ impl PackfileStorage {
     }
 
     /// Copy a record from an old (pinned) shard to the active shard.
-    /// Returns the new `(hash, shard_id, offset)` or None if `old_shard_id`
+    /// Returns the new `(hash, slot, offset)` or None if `old_slot`
     /// isn't in `pinned`.
     fn copy_record_to_shard(
         &self,
         collection_id: &[u8; 16],
         pinned: &HashMap<u16, Arc<Shard>>,
-        old_shard_id: u16,
+        old_slot: u16,
         old_offset: u64,
-    ) -> Result<Option<([u8; 16], u16, u64)>, StorageError> {
-        let Some(old_shard) = pinned.get(&old_shard_id) else {
+    ) -> Result<Option<RepackCopiedRecord>, StorageError> {
+        let Some(old_shard) = pinned.get(&old_slot) else {
             return Ok(None);
         };
         let record = self.read_at(old_shard, old_offset, true)?;
-        let (new_shard_id, new_offset) = self.shards.put_record(&Record {
+        let (new_slot, new_offset, disk_bytes) = self.shards.put_record_with_len(&Record {
             collection_id: *collection_id,
             hash: record.hash,
             data: record.data,
+            metadata: record.metadata,
         })?;
-        Ok(Some((record.hash, new_shard_id, new_offset)))
+        Ok(Some((record.hash, new_slot, new_offset, disk_bytes)))
     }
     fn swap_generation(
         &self,
@@ -4129,9 +5020,9 @@ impl PackfileStorage {
             total.saturating_mul(2).max(NEW_COLLECTION_INDEX_FLOOR),
             self.index_config,
         );
-        for (shard_id, entries) in scanned {
+        for (slot, entries) in scanned {
             for (hash, offset) in entries {
-                // `IndexSlot` can only represent offsets up to
+                // `IndexEntry` can only represent offsets up to
                 // `PACK_INDEX_OFFSET_LIMIT`. Offsets a legacy or externally
                 // created oversized shard can no longer fit are rejected
                 // rather than silently skipped: writes are already capped at
@@ -4139,8 +5030,8 @@ impl PackfileStorage {
                 // shard did not come from this engine, and silently indexing
                 // around it would make its data unreachable while reporting a
                 // successful rebuild.
-                check_index_offset(shard_id, &hash, offset)?;
-                let _ = index.insert(&hash, shard_id, offset);
+                check_index_offset(slot, &hash, offset)?;
+                let _ = index.insert(&hash, slot, offset);
             }
         }
         Ok(index)
@@ -4160,21 +5051,19 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         index: &LossyIndex,
     ) -> Result<Option<LossyIndex>, StorageError> {
-        index.grow_by_recovering_hashes(|shard_id, offset, slot_tag| {
-            let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
-                StorageError::Corrupt(format!(
-                    "checkpoint index refers to missing shard {shard_id}"
-                ))
+        index.grow_by_recovering_hashes(|slot, offset, slot_tag| {
+            let shard = self.shards.get_shard(slot).ok_or_else(|| {
+                StorageError::Corrupt(format!("checkpoint index refers to missing shard {slot}"))
             })?;
             let (found_collection, hash) = self.shards.record_identity_at(&shard, offset)?;
             if &found_collection != collection_id {
                 return Err(StorageError::Corrupt(format!(
-                    "checkpoint index offset {offset} in shard {shard_id} belongs to another collection"
+                    "checkpoint index offset {offset} in shard {slot} belongs to another collection"
                 )));
             }
             if index.tag_for_hash(&hash) != slot_tag {
                 return Err(StorageError::Corrupt(format!(
-                    "checkpoint index tag does not match frame at offset {offset} in shard {shard_id}"
+                    "checkpoint index tag does not match frame at offset {offset} in shard {slot}"
                 )));
             }
             Ok(hash)
@@ -4192,15 +5081,15 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         index: &LossyIndex,
         hash: &NodeId,
-        shard_id: u16,
+        slot: u16,
         offset: u64,
-    ) -> Result<Result<(u32, u64), InsertError>, StorageError> {
+    ) -> Result<Result<(u32, u64, bool), InsertError>, StorageError> {
         Ok(self
-            .insert_index_undoable(collection_id, index, hash, shard_id, offset)?
-            .map(|(bucket, slot, _undo)| (bucket, slot)))
+            .insert_index_undoable(collection_id, index, hash, slot, offset)?
+            .map(|(bucket, slot, undo)| (bucket, slot, undo.was_empty())))
     }
 
-    /// Like [`Self::insert_index`], but also returns the [`SlotUndo`]
+    /// Like [`Self::insert_index`], but also returns the [`EntryUndo`]
     /// needed to reverse this one write, for callers mutating a still-live
     /// (not cloned) index across a multi-record batch.
     fn insert_index_undoable(
@@ -4208,21 +5097,21 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         index: &LossyIndex,
         hash: &NodeId,
-        shard_id: u16,
+        slot: u16,
         offset: u64,
-    ) -> Result<Result<(u32, u64, SlotUndo), InsertError>, StorageError> {
+    ) -> Result<Result<(u32, u64, EntryUndo), InsertError>, StorageError> {
         loop {
-            match index.insert_undoable(hash, shard_id, offset) {
+            match index.insert_undoable(hash, slot, offset) {
                 Ok(written) => return Ok(Ok(written)),
                 Err(InsertError::TableFull) => return Ok(Err(InsertError::TableFull)),
                 Err(InsertError::NeedsIdentity {
                     bucket,
-                    shard_id,
+                    slot,
                     offset,
                 }) => {
-                    let shard = self.shards.get_shard(shard_id).ok_or_else(|| {
+                    let shard = self.shards.get_shard(slot).ok_or_else(|| {
                         StorageError::Corrupt(format!(
-                            "index refers to missing shard {shard_id} while resolving a tag collision"
+                            "index refers to missing shard {slot} while resolving a tag collision"
                         ))
                     })?;
                     let (found_collection, found_hash) =
@@ -4231,7 +5120,7 @@ impl PackfileStorage {
                         || !index.hydrate_slot_identity(bucket, &found_hash)
                     {
                         return Err(StorageError::Corrupt(format!(
-                            "index tag candidate at offset {offset} in shard {shard_id} is inconsistent"
+                            "index tag candidate at offset {offset} in shard {slot} is inconsistent"
                         )));
                     }
                 }
@@ -4286,8 +5175,8 @@ impl PackfileStorage {
         track: bool,
     ) -> Result<Option<NodeData>, StorageError> {
         let mut last_err: Option<StorageError> = None;
-        for &(shard_id, offset) in candidates {
-            let Some(shard) = pinned.get(&shard_id) else {
+        for &(slot, offset) in candidates {
+            let Some(shard) = pinned.get(&slot) else {
                 continue;
             };
 
@@ -4367,10 +5256,10 @@ impl PackfileStorage {
         }
 
         while let Some(hash) = queue.pop_front() {
-            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
+            let Some(&(slot, offset)) = hash_to_shard_offset.get(&hash) else {
                 continue;
             };
-            let Some(old_shard) = pinned.get(&shard_id) else {
+            let Some(old_shard) = pinned.get(&slot) else {
                 continue;
             };
             let record = pool.read_at(old_shard, offset, true)?;
@@ -4444,7 +5333,7 @@ impl PackfileStorage {
         // would miss even though it is still live. See `pin_shards`.
         let pinned = self.pin_shards(
             gen.index
-                .referenced_shard_ids()
+                .referenced_slot_ids()
                 .into_iter()
                 .enumerate()
                 .filter(|&(_, referenced)| referenced)
@@ -4524,8 +5413,8 @@ impl PackfileStorage {
         let mut all_hashes: Vec<[u8; 16]> = hash_to_shard_offset.keys().copied().collect();
         all_hashes.sort_unstable();
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
-        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
-            if let Some(shard) = pinned.get(&shard_id) {
+        for (hash, &(slot, offset)) in hash_to_shard_offset {
+            if let Some(shard) = pinned.get(&slot) {
                 let record = pool.read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
@@ -4561,7 +5450,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on I/O or corruption.
-    /// Builds this repack's deduped `hash → (shard_id, offset)` map,
+    /// Builds this repack's deduped `hash → (slot, offset)` map,
     /// incrementally where possible, and returns the previous
     /// [`RepackIncrementalState`] (moved out, not cloned) so the caller can
     /// reuse its `adjacency` cache when deciding which nodes need fresh disk
@@ -4598,7 +5487,7 @@ impl PackfileStorage {
             let shards = self.shards.all_shards();
             let current_pack_ids: HashMap<u16, u64> = shards
                 .iter()
-                .map(|(shard_id, shard)| (*shard_id, shard.pack_id))
+                .map(|(slot, shard)| (*slot, shard.pack_id))
                 .collect();
             // Slot IDs are recyclable.  A cursor (and every entry in the
             // carried live_map) is meaningful only for the pack incarnation
@@ -4607,13 +5496,13 @@ impl PackfileStorage {
             let pack_changed = prev
                 .scan_offsets
                 .iter()
-                .any(|(shard_id, (pack_id, _))| current_pack_ids.get(shard_id) != Some(pack_id));
+                .any(|(slot, (pack_id, _))| current_pack_ids.get(slot) != Some(pack_id));
             if pack_changed {
                 let scanned = self.scan_collection_records(collection_id)?;
                 let mut map = HashMap::new();
-                for (shard_id, entries) in scanned {
+                for (slot, entries) in scanned {
                     for (hash, offset) in entries {
-                        map.insert(hash, (shard_id, offset));
+                        map.insert(hash, (slot, offset));
                     }
                 }
                 return Ok((map, None));
@@ -4622,17 +5511,17 @@ impl PackfileStorage {
             // Scan only bytes appended since the last repack, merging into
             // the stolen live_map in-place — O(delta) work, not O(total).
             let mut map = prev.live_map.clone();
-            for (shard_id, shard) in shards {
+            for (slot, shard) in shards {
                 let start = prev
                     .scan_offsets
-                    .get(&shard_id)
+                    .get(&slot)
                     .filter(|(pack_id, _)| *pack_id == shard.pack_id)
                     .map_or(0, |(_, offset)| *offset);
                 let entries =
                     packfile::scan_packfile_from(&shard.path, start).map_err(StorageError::Io)?;
                 for (rid, hash, offset) in entries {
                     if rid == *collection_id {
-                        map.insert(hash, (shard_id, offset));
+                        map.insert(hash, (slot, offset));
                     }
                 }
             }
@@ -4641,9 +5530,9 @@ impl PackfileStorage {
             // First repack: full scan of every shard.
             let scanned = self.scan_collection_records(collection_id)?;
             let mut map = HashMap::new();
-            for (shard_id, entries) in &scanned {
+            for (slot, entries) in &scanned {
                 for (hash, offset) in entries {
-                    map.insert(*hash, (*shard_id, *offset));
+                    map.insert(*hash, (*slot, *offset));
                 }
             }
             Ok((map, None))
@@ -4708,10 +5597,10 @@ impl PackfileStorage {
             }
 
             // Slow path: new node, must read from disk.
-            let Some(&(shard_id, offset)) = hash_to_shard_offset.get(&hash) else {
+            let Some(&(slot, offset)) = hash_to_shard_offset.get(&hash) else {
                 continue;
             };
-            let Some(old_shard) = pinned.get(&shard_id) else {
+            let Some(old_shard) = pinned.get(&slot) else {
                 continue;
             };
             let record = pool.read_at(old_shard, offset, true)?;
@@ -4760,14 +5649,14 @@ impl PackfileStorage {
         let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> =
             HashMap::with_capacity(hash_to_shard_offset.len());
 
-        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
+        for (hash, &(slot, offset)) in hash_to_shard_offset {
             // Fast path: node was live last time, edge list is cached.
             if let Some(edges) = prev.adjacency.get(hash) {
                 adjacency.insert(*hash, edges.clone());
                 continue;
             }
             // Slow path: new node, must read from disk.
-            if let Some(shard) = pinned.get(&shard_id) {
+            if let Some(shard) = pinned.get(&slot) {
                 let record = pool.read_at(shard, offset, true)?;
                 let edges = extract_edges(hash, &record.data);
                 adjacency.insert(*hash, edges);
@@ -4796,12 +5685,12 @@ impl PackfileStorage {
         let surviving: HashSet<[u8; 16]> = new_offsets.iter().map(|&(h, _, _)| h).collect();
 
         let mut scan_offsets = HashMap::new();
-        for (shard_id, shard) in self.shards.all_shards() {
-            scan_offsets.insert(shard_id, (shard.pack_id, shard.file_len()));
+        for (slot, shard) in self.shards.all_shards() {
+            scan_offsets.insert(slot, (shard.pack_id, shard.file_len()));
         }
         let next_live_map: HashMap<[u8; 16], (u16, u64)> = new_offsets
             .iter()
-            .map(|&(hash, shard_id, offset)| (hash, (shard_id, offset)))
+            .map(|&(hash, slot, offset)| (hash, (slot, offset)))
             .collect();
         // Evict dropped nodes from the adjacency cache so they can't
         // re-enter the live set on a future incremental BFS pass.
@@ -4889,15 +5778,15 @@ impl PackfileStorage {
         let mut kept_bytes: u64 = 0;
         let mut dropped_bytes: u64 = 0;
         let mut shards_touched: HashSet<u16> = HashSet::new();
-        for (hash, &(shard_id, offset)) in hash_to_shard_offset {
-            if let Some(shard) = pinned.get(&shard_id) {
+        for (hash, &(slot, offset)) in hash_to_shard_offset {
+            if let Some(shard) = pinned.get(&slot) {
                 // Actual on-disk bytes, not the uncompressed upper bound —
                 // a repack preflight should report what will really be
                 // reclaimed/kept, which is smaller than plaintext size for
                 // any frame that compressed.
                 if let Ok(bytes) = Self::record_disk_len_at(shard, offset) {
                     if live_set.contains(hash) {
-                        shards_touched.insert(shard_id);
+                        shards_touched.insert(slot);
                         kept_bytes = kept_bytes.saturating_add(bytes);
                     } else {
                         dropped_bytes = dropped_bytes.saturating_add(bytes);
@@ -4972,18 +5861,18 @@ impl PackfileStorage {
         let mut collection_queue: Vec<[u8; 16]> = Vec::new();
 
         loop {
-            if let Some(shard_id) = shard_queue.pop() {
-                if shards.insert(shard_id) {
-                    for collection_id in self.collections_referencing_shard(shard_id)? {
+            if let Some(slot) = shard_queue.pop() {
+                if shards.insert(slot) {
+                    for collection_id in self.collections_referencing_shard(slot)? {
                         if collections.insert(collection_id) {
                             collection_queue.push(collection_id);
                         }
                     }
                 }
             } else if let Some(collection_id) = collection_queue.pop() {
-                for shard_id in self.collection_referenced_shards(&collection_id) {
-                    if !shards.contains(&shard_id) {
-                        shard_queue.push(shard_id);
+                for slot in self.collection_referenced_shards(&collection_id) {
+                    if !shards.contains(&slot) {
+                        shard_queue.push(slot);
                     }
                 }
             } else {
@@ -5006,7 +5895,7 @@ impl PackfileStorage {
             return Vec::new();
         };
         gen.index
-            .referenced_shard_ids()
+            .referenced_slot_ids()
             .iter()
             .enumerate()
             .filter_map(|(i, &referenced)| referenced.then(|| u16::try_from(i).ok()).flatten())
@@ -5033,12 +5922,12 @@ impl PackfileStorage {
             .read()
             .shard_collections
             .iter()
-            .map(|(&shard_id, collections)| {
+            .map(|(&slot, collections)| {
                 let count = collections
                     .values()
                     .copied()
                     .fold(0u64, u64::saturating_add);
-                (shard_id, count)
+                (slot, count)
             })
             .collect()
     }
@@ -5178,32 +6067,40 @@ impl PackfileStorage {
         // them.
         let source_shards: HashSet<u16> = hash_to_shard_offset
             .values()
-            .map(|&(shard_id, _)| shard_id)
+            .map(|&(slot, _)| slot)
             .collect();
         self.shards
             .prepare_collection_repack(collection_id, &source_shards)?;
 
         let mut new_offsets: Vec<([u8; 16], u16, u64)> = Vec::with_capacity(topo.len());
+        let mut new_disk_bytes = HashMap::new();
         for &local in &topo {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");
-            let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
+            let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            if let Some(entry) =
-                self.copy_record_to_shard(collection_id, &pinned, old_shard_id, old_offset)?
+            if let Some((hash, slot, offset, disk_bytes)) =
+                self.copy_record_to_shard(collection_id, &pinned, old_slot, old_offset)?
             {
-                new_offsets.push(entry);
+                let pack_id = self
+                    .shards
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |shard| shard.pack_id);
+                let total = new_disk_bytes.entry(pack_id).or_insert(0_u64);
+                *total = (*total).saturating_add(disk_bytes);
+                new_offsets.push((hash, slot, offset));
             }
         }
 
         let kept = new_offsets.len();
 
         let index = Self::build_index(&new_offsets, self.index_config)?;
+        self.replace_collection_disk_bytes(collection_id, &new_disk_bytes);
         self.replace_collection_shard_counts(
             collection_id,
-            &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+            &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
         );
         self.swap_generation(collection_id, index)?;
         self.retire_empty_shards(collection_id);
@@ -5253,6 +6150,7 @@ impl PackfileStorage {
         // `persist_index_checkpoint`) means the next sync retries it.
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
+        self.persist_shard_collections_best_effort();
 
         Ok((kept, dropped))
     }
@@ -5329,7 +6227,7 @@ impl PackfileStorage {
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
         output_progress: &mut impl FnMut(Option<[u8; 16]>, u16, u16, usize, bool),
         output_state: &mut (u16, usize),
-    ) -> Result<(RepackOffsets, usize), StorageError> {
+    ) -> Result<(RepackOffsets, usize, HashMap<u64, u64>), StorageError> {
         let roots = self.live_roots.read().get(collection_id).cloned();
         let (live_hashes, adjacency) = match roots {
             Some(roots) if !roots.is_empty() => Self::bfs_live_set(
@@ -5370,15 +6268,16 @@ impl PackfileStorage {
         }
 
         let mut new_offsets = Vec::with_capacity(topo.len());
+        let mut new_disk_bytes = HashMap::new();
         for &local in &topo {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");
-            let Some(&(old_shard_id, old_offset)) = hash_to_shard_offset.get(hash) else {
+            let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            if let Some(entry) =
-                self.copy_record_to_shard(collection_id, pinned, old_shard_id, old_offset)?
+            if let Some((hash, slot, offset, disk_bytes)) =
+                self.copy_record_to_shard(collection_id, pinned, old_slot, old_offset)?
             {
                 output_state.1 = output_state.1.saturating_add(1);
                 let current_active_shard = self.shards.active_shard().slot;
@@ -5389,11 +6288,17 @@ impl PackfileStorage {
                     collection_id,
                     output_state.1,
                 );
-                new_offsets.push(entry);
+                let pack_id = self
+                    .shards
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |shard| shard.pack_id);
+                let total = new_disk_bytes.entry(pack_id).or_insert(0_u64);
+                *total = (*total).saturating_add(disk_bytes);
+                new_offsets.push((hash, slot, offset));
             }
         }
 
-        Ok((new_offsets, dropped))
+        Ok((new_offsets, dropped, new_disk_bytes))
     }
 
     /// As [`Self::repack_collections_reachable`], with a callback whenever the
@@ -5439,7 +6344,7 @@ impl PackfileStorage {
         let maps = self.scan_collection_record_maps(&collection_ids)?;
         let source_shards: HashSet<u16> = maps
             .values()
-            .flat_map(|map| map.values().map(|&(shard_id, _)| shard_id))
+            .flat_map(|map| map.values().map(|&(slot, _)| slot))
             .collect();
         let pinned = self.pin_shards(source_shards.iter().copied());
 
@@ -5455,7 +6360,7 @@ impl PackfileStorage {
             let hash_to_shard_offset = maps.get(collection_id).ok_or_else(|| {
                 StorageError::Corrupt("repack batch scan lost requested collection".to_owned())
             })?;
-            let (new_offsets, dropped) = self.copy_repack_batch_collection(
+            let (new_offsets, dropped, new_disk_bytes) = self.copy_repack_batch_collection(
                 collection_id,
                 hash_to_shard_offset,
                 &pinned,
@@ -5465,9 +6370,10 @@ impl PackfileStorage {
             )?;
             let kept = new_offsets.len();
             let index = Self::build_index(&new_offsets, self.index_config)?;
+            self.replace_collection_disk_bytes(collection_id, &new_disk_bytes);
             self.replace_collection_shard_counts(
                 collection_id,
-                &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+                &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
             );
             self.swap_generation(collection_id, index)?;
             // The batch path does a full cold-start scan (scan_collection_record_maps),
@@ -5518,13 +6424,14 @@ impl PackfileStorage {
         // next sync a retry, not correctness.
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
+        self.persist_shard_collections_best_effort();
 
         Ok(results)
     }
 
     /// Fetches the ancestors of `frontier`, walking `extract_edges`
     /// backward and stopping expansion at (and excluding) anything in
-    /// `stop_at` — a bounded ancestor walk, e.g. for auth-chain or
+    /// `stop_at` — a bounded ancestor walk, e.g. for edges or
     /// prev-event traversal from a caller-supplied frontier back to
     /// caller-supplied already-known boundary nodes.
     ///
@@ -5660,7 +6567,7 @@ impl PackfileStorage {
         let mut referenced = [false; shard::MAX_SHARDS];
         for gen_swap in collections.values() {
             let gen = gen_swap.load();
-            let ids = gen.index.referenced_shard_ids();
+            let ids = gen.index.referenced_slot_ids();
             for (i, &has_refs) in ids.iter().enumerate() {
                 referenced[i] |= has_refs;
             }
@@ -5672,6 +6579,16 @@ impl PackfileStorage {
                 self.shards.retire_slot(id);
             }
         }
+        drop(collections);
+        let mut tables = self.index_tables.write();
+        let live_pack_ids: HashSet<u64> = tables
+            .collection_shards
+            .values()
+            .flat_map(|packs| packs.iter().copied())
+            .collect();
+        tables
+            .collection_disk_bytes
+            .retain(|pack_id, _| live_pack_ids.contains(pack_id));
     }
 }
 
@@ -5703,6 +6620,12 @@ impl PackfileStorage {
         if !self.refresh_on_miss.load(Ordering::Relaxed) {
             return self.get_many(collection_id, ids);
         }
+        let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get_many_with_refresh)
+        } else {
+            OperationTimer::disabled()
+        };
         let mut results = self.get_many(collection_id, ids)?;
         let mut missing: Vec<usize> = results
             .iter()
@@ -5759,222 +6682,6 @@ impl PackfileStorage {
         self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
         Ok(results)
     }
-
-    /// Reload the durable index from the current on-disk checkpoint and rebind
-    /// [`Self::read_covered_lsn`] to it.
-    ///
-    /// Returns `false` when no checkpoint matching the current packs is on
-    /// disk, so the caller can fail closed instead of serving a stale index.
-    /// Coverage is captured before the checkpoint is read, so the new bound can
-    /// never be newer than the index loaded below.
-    fn reload_index_from_checkpoint(&self) -> bool {
-        // A writer may have created new packs since this handle opened, and the
-        // checkpoint it wrote names that new pack set. Rediscover before
-        // building the fingerprint, or the reload can never match.
-        if self.shards.discover_shards().is_err() {
-            self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        // Rebuild the fingerprint from files that still exist. This worker's
-        // shard table can retain open handles to packs the writer retired and
-        // unlinked during repack; including their cached lengths makes every
-        // checkpoint fingerprint mismatch forever. New/grown live packs are
-        // included at their current lengths, and the checkpoint delta log
-        // validates the suffix from the checkpoint's original fingerprint.
-        let mut open_shards: Vec<(u16, u64, PathBuf, u64)> = Vec::new();
-        for (id, shard) in self.shards.all_shards() {
-            match fs::metadata(&shard.path) {
-                Ok(metadata) => {
-                    open_shards.push((id, shard.pack_id, shard.path.clone(), metadata.len()));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
-        }
-        let deleted_collections = self.deleted_collections.lock().clone();
-        let mut timings = OpenTimings::default();
-        let Some((scan_out, collection_order, _delta_state, checkpoint_covered)) =
-            Self::checkpoint_scan_out(
-                &self.base_dir,
-                self.cache_capacity,
-                &self.shards,
-                &open_shards,
-                &deleted_collections,
-                false,
-                true,
-                self.index_config,
-                &mut timings,
-            )
-        else {
-            self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
-        {
-            let mut tables = self.index_tables.write();
-            tables.collections = scan_out.collections;
-            tables.collection_order = collection_order;
-            tables.shard_collections = scan_out.shard_collections;
-            tables.collection_shards = scan_out.collection_shards;
-        }
-        // Bind coverage to the checkpoint actually loaded, not to a
-        // separately-read `journal.lsn` that a concurrent checkpoint may
-        // already have advanced past this index.
-        self.read_covered_lsn
-            .store(checkpoint_covered, Ordering::Release);
-        self.read_reloads.fetch_add(1, Ordering::Relaxed);
-        true
-    }
-
-    /// Refresh the read-committed overlay, reloading the checkpoint-bound index
-    /// when the writer reclaimed past this reader's incorporated coverage.
-    ///
-    /// A reclaim that outruns the reader's index is the one case the overlay
-    /// cannot resolve from the segment alone; reloading the checkpoint advances
-    /// the index/coverage pair together, after which the retry is consistent.
-    /// Without a usable checkpoint the read fails closed.
-    fn refresh_read_journal(&self) -> Result<(), StorageError> {
-        const RELOAD_ATTEMPTS: usize = 8;
-        const MAX_BACKOFF_MS: u64 = 64;
-        // Capture coverage once, before the first attempt. Comparing the final
-        // value against a per-iteration snapshot would only detect coverage that
-        // advanced on the *last* attempt, misreporting a moving checkpoint as a
-        // genuine gap. Reloads only ever advance `read_covered_lsn`, so a strict
-        // increase across the whole loop is exactly the retryable signal.
-        let coverage_before_attempts = self.read_covered_lsn.load(Ordering::Acquire);
-        for attempt in 0..RELOAD_ATTEMPTS {
-            let mut guard = self.read_journal.lock();
-            let Some(overlay) = guard.as_mut() else {
-                return Ok(());
-            };
-            if overlay.refresh()? == ReadRefresh::Applied {
-                return Ok(());
-            }
-            if !self.reload_index_from_checkpoint() {
-                drop(guard);
-                let delay_ms = 1_u64
-                    .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
-                    .unwrap_or(MAX_BACKOFF_MS)
-                    .min(MAX_BACKOFF_MS);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                continue;
-            }
-            overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
-            overlay.reset_overlay();
-            drop(guard);
-            if attempt.saturating_add(1) < RELOAD_ATTEMPTS {
-                let delay_ms = 1_u64
-                    .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
-                    .unwrap_or(MAX_BACKOFF_MS)
-                    .min(MAX_BACKOFF_MS);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-        }
-        if self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts {
-            Err(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "read-committed checkpoint coverage advanced during reload; retry the read",
-            )))
-        } else {
-            Err(StorageError::Corrupt(
-                "read-committed journal segment skips LSNs not covered by the loaded checkpoint"
-                    .to_owned(),
-            ))
-        }
-    }
-
-    /// Enable a read-only journal overlay for the read-committed API.
-    ///
-    /// `path` is a writer's journal segment. The overlay is built with
-    /// [`Journal::scan_read_only`], which never creates, repairs, or locks the
-    /// segment, so this is safe from a read-only worker process. The durable
-    /// read API ([`StorageEngine::get_many`], [`Self::get_many_with_refresh`])
-    /// is unchanged and continues to hide unflushed writes; only
-    /// [`Self::get_read_committed`] consults the overlay.
-    ///
-    /// # Errors
-    /// Returns [`StorageError`] if the segment is unreadable, a committed
-    /// group fails validation, or a coverage gap cannot be resolved by
-    /// reloading the checkpoint.
-    pub fn enable_read_journal(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
-        // Bind the overlay to the coverage of the index this handle loaded, not
-        // whatever `journal.lsn` says now: a concurrent checkpoint may already
-        // have advanced past this handle's in-memory index.
-        let covered = self.read_covered_lsn.load(Ordering::Acquire);
-        *self.read_journal.lock() = Some(ReadJournal::empty(path.as_ref().to_path_buf(), covered));
-        if let Err(error) = self.refresh_read_journal() {
-            *self.read_journal.lock() = None;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// Read records at read-committed visibility: the durable index plus any
-    /// committed-but-unflushed journal group.
-    ///
-    /// This is the cross-process freshness path for read-only workers, and it
-    /// is deliberately separate from the durable API. A key absent from the
-    /// durable index is filled from a complete journal group (commit trailer
-    /// present) even before the writer fsyncs or advances the index
-    /// checkpoint. A committed collection delete shadows durable records.
-    ///
-    /// Without [`Self::enable_read_journal`] this degrades to
-    /// [`Self::get_many_with_refresh`].
-    ///
-    /// # Errors
-    /// Returns [`StorageError`] if reading the durable index or scanning the
-    /// journal segment fails.
-    pub fn get_read_committed(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
-        let mut unresolved: Vec<usize> = Vec::new();
-
-        // Refresh outside the read lock: this may reload the checkpoint-bound
-        // index if the writer reclaimed past this reader's coverage.
-        self.refresh_read_journal()?;
-
-        {
-            let guard = self.read_journal.lock();
-            if let Some(overlay) = guard.as_ref() {
-                match overlay.puts.get(collection_id) {
-                    Some(committed) => {
-                        for (index, id) in ids.iter().enumerate() {
-                            match committed.get(id) {
-                                Some((payload, _)) => {
-                                    results[index] = Some(NodeData::new(payload.clone()));
-                                }
-                                None => unresolved.push(index),
-                            }
-                        }
-                    }
-                    None => unresolved.extend(0..ids.len()),
-                }
-                // A delete the checkpoint does not yet cover means the durable
-                // index may still hold pre-delete records, so falling back for
-                // missing keys would resurrect them. Return the overlay's view
-                // (post-delete puts only) until the delete is covered.
-                if overlay.delete_lsn.contains_key(collection_id) {
-                    return Ok(results);
-                }
-            } else {
-                unresolved.extend(0..ids.len());
-            }
-        }
-
-        if !unresolved.is_empty() {
-            let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();
-            let durable = self.get_many_with_refresh(collection_id, &durable_ids)?;
-            for (index, value) in unresolved.into_iter().zip(durable) {
-                results[index] = value;
-            }
-        }
-        Ok(results)
-    }
 }
 
 impl PackfileStorage {
@@ -5983,6 +6690,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
+        metadata: Option<FrameMetadata>,
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
@@ -5990,17 +6698,25 @@ impl PackfileStorage {
             collection_id: *collection_id,
             hash: *id,
             data: data.bytes.clone(),
+            metadata,
         };
-        let (shard_id, offset) = self.shards.put_record(&record)?;
+        let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
         self.publish_mutation(|| JournalMutation::Put {
             collection_id: *collection_id,
             node_id: *id,
             payload: data.bytes.to_vec(),
         })?;
+        let pack_id = self
+            .shards
+            .get_shard(slot)
+            .map_or(u64::from(slot), |shard| shard.pack_id);
+        progress
+            .pending_shard_collections
+            .push((pack_id, disk_bytes));
         if progress.index_needs_rebuild {
             return Ok(());
         }
-        self.index_put_many_entry(collection_id, id, old_gen, shard_id, offset, progress)
+        self.index_put_many_entry(collection_id, id, old_gen, slot, offset, progress)
     }
 
     fn index_put_many_entry(
@@ -6008,7 +6724,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         old_gen: Option<&RoomGeneration>,
-        shard_id: u16,
+        slot: u16,
         offset: u64,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
@@ -6020,14 +6736,14 @@ impl PackfileStorage {
                     .index
             }
         };
-        let insert_result =
-            self.insert_index_undoable(collection_id, live, id, shard_id, offset)?;
+        let insert_result = self.insert_index_undoable(collection_id, live, id, slot, offset)?;
         let inserted = if let Ok((bucket, slot, undo)) = insert_result {
+            let was_empty = undo.was_empty();
             progress.pending_deltas.push((bucket, slot));
             if progress.owned_index.is_none() {
                 progress.undo_log.push(undo);
             }
-            true
+            was_empty
         } else {
             let grow_started = std::time::Instant::now();
             let grown = if let Some(grown) = live.grow() {
@@ -6053,16 +6769,16 @@ impl PackfileStorage {
                 u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            let inserted = grown.insert(id, shard_id, offset).is_ok();
+            let inserted = grown.insert(id, slot, offset).is_ok();
             progress.owned_index = Some(grown);
             inserted
         };
         if inserted {
             let pack_id = self
                 .shards
-                .get_shard(shard_id)
-                .map_or(u64::from(shard_id), |shard| shard.pack_id);
-            progress.pending_shard_collections.push(pack_id);
+                .get_shard(slot)
+                .map_or(u64::from(slot), |shard| shard.pack_id);
+            progress.pending_shard_collection_counts.push(pack_id);
         }
         Ok(())
     }
@@ -6072,19 +6788,74 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
-    ) -> Result<(u16, u64), StorageError> {
+        metadata: Option<FrameMetadata>,
+    ) -> Result<(u16, u64, u64), StorageError> {
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
             data: data.bytes.clone(),
+            metadata,
         };
-        let location = self.shards.put_record(&record)?;
+        let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
         self.publish_mutation(|| JournalMutation::Put {
             collection_id: *collection_id,
             node_id: *id,
             payload: data.bytes.to_vec(),
         })?;
-        Ok(location)
+        Ok((slot, offset, disk_bytes))
+    }
+
+    /// Store a record after verifying that its bytes hash to `expected_digest`,
+    /// attaching versioned metadata (logical id, content digest, role) to the
+    /// frame so readers can recover it without decoding a caller-supplied
+    /// addressing scheme.
+    ///
+    /// This is the verify-on-write entry point for callers that already know
+    /// the content digest they expect (e.g. a Matrix event's canonical
+    /// content hash). The digest is recomputed over the exact bytes being
+    /// stored; a mismatch is rejected *before* anything is appended, so a
+    /// corrupt or mis-addressed write never becomes durable.
+    ///
+    /// `logical_id` is the full 256-bit logical identity (e.g. the digest of
+    /// the event id) stored in the metadata; it is independent of the
+    /// 16-byte `id` used as the index key, which survives redaction.
+    ///
+    /// The digest function is caller-selectable via `algorithm` so a template
+    /// or configuration can choose SHA-256 today and BLAKE3/SHA-512 later
+    /// without a format break; the chosen algorithm is recorded in the frame
+    /// metadata.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] when the digest of `data` under
+    /// `algorithm` does not equal `expected_digest`, and propagates any error
+    /// from the underlying put.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_verified(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        logical_id: &Digest32,
+        algorithm: DigestAlgorithm,
+        expected_digest: &Digest32,
+        role: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
+        let digest = crate::storage::content_digest(algorithm, &data.bytes);
+        if &digest != expected_digest {
+            return Err(StorageError::Corrupt(format!(
+                "content digest mismatch: expected {}, got {}",
+                hex32(expected_digest),
+                hex32(&digest)
+            )));
+        }
+        let metadata = FrameMetadata {
+            logical_id: Some(*logical_id),
+            content_digest: Some(digest),
+            digest_algorithm: algorithm,
+            role: role.map(<[u8]>::to_vec),
+            unknown: Vec::new(),
+        };
+        self.put_internal(collection_id, id, data, Some(metadata))
     }
 
     fn prepare_put_many_progress(
@@ -6121,13 +6892,13 @@ impl PackfileStorage {
             index_needs_rebuild: false,
             pending_deltas: Vec::with_capacity(entries_len),
             pending_shard_collections: Vec::with_capacity(entries_len),
+            pending_shard_collection_counts: Vec::with_capacity(entries_len),
             invalidate_delta: false,
             undo_log: Vec::new(),
         }
     }
 
     fn validate_put_many_inputs(
-        &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<bool, StorageError> {
@@ -6139,18 +6910,9 @@ impl PackfileStorage {
                 collection_id: *collection_id,
                 hash: *id,
                 data: data.bytes.clone(),
+                metadata: None,
             })?;
         }
-        self.put_many_calls.fetch_add(1, Ordering::Relaxed);
-        self.put_many_records
-            .fetch_add(entries.len() as u64, Ordering::Relaxed);
-        self.put_many_bytes.fetch_add(
-            entries
-                .iter()
-                .map(|(_, data)| data.bytes.len() as u64)
-                .sum::<u64>(),
-            Ordering::Relaxed,
-        );
         Ok(true)
     }
 
@@ -6159,13 +6921,23 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
+        metadata: Option<FrameMetadata>,
+    ) -> Result<(), StorageError> {
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+        self.put_internal_locked(collection_id, id, data, metadata)
+    }
+
+    fn put_internal_locked(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        metadata: Option<FrameMetadata>,
     ) -> Result<(), StorageError> {
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
             .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
-        let collection_arc = self.put_mutex(collection_id);
-        let _collection_guard = collection_arc.lock();
-
         // New-collection puts must not interleave their record flush with a
         // concurrent checkpoint's fingerprint→snapshot window (see
         // `persist_index_checkpoint`). Existing collections are already gated
@@ -6178,18 +6950,23 @@ impl PackfileStorage {
             None
         };
 
-        let (shard_id, offset) = self.append_put_record(collection_id, id, data)?;
+        let (slot, offset, disk_bytes) =
+            self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
-                if let Ok((bucket, slot)) =
-                    self.insert_index(collection_id, &gen.index, id, shard_id, offset)?
+                if let Ok((bucket, entry, inserted)) =
+                    self.insert_index(collection_id, &gen.index, id, slot, offset)?
                 {
-                    self.record_delta(collection_id, gen.generation, bucket, slot);
+                    self.record_delta(collection_id, gen.generation, bucket, entry);
                     let pack_id = self
                         .shards
-                        .get_shard(shard_id)
-                        .map_or(u64::from(shard_id), |shard| shard.pack_id);
-                    self.record_new_shard_collection(pack_id, collection_id);
+                        .get_shard(slot)
+                        .map_or(u64::from(slot), |shard| shard.pack_id);
+                    if inserted {
+                        self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+                    } else {
+                        self.record_disk_bytes(pack_id, collection_id, disk_bytes);
+                    }
 
                     let mut data_to_cache = data.clone();
                     for child in &mut data_to_cache.children {
@@ -6225,14 +7002,18 @@ impl PackfileStorage {
                 // index's own smaller hard floor.
                 None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
             };
-            let inserted = self.insert_index(collection_id, &index, id, shard_id, offset)?;
-            if let Ok((bucket, slot)) = inserted {
-                self.record_delta(collection_id, generation, bucket, slot);
+            let inserted = self.insert_index(collection_id, &index, id, slot, offset)?;
+            if let Ok((bucket, entry, is_new)) = inserted {
+                self.record_delta(collection_id, generation, bucket, entry);
                 let pack_id = self
                     .shards
-                    .get_shard(shard_id)
-                    .map_or(u64::from(shard_id), |s| s.pack_id);
-                self.record_new_shard_collection(pack_id, collection_id);
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |s| s.pack_id);
+                if is_new {
+                    self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+                } else {
+                    self.record_disk_bytes(pack_id, collection_id, disk_bytes);
+                }
             } else {
                 // The insert was rejected (table full). The collection's shape
                 // is about to change, so any delta frames would no longer be
@@ -6242,25 +7023,33 @@ impl PackfileStorage {
                     // The failed insert did not mutate the table, so retry it
                     // after the in-memory rehash. This is the normal capacity
                     // path and must not turn into a full-pack scan.
-                    let _ = grown.insert(id, shard_id, offset);
+                    let _ = grown.insert(id, slot, offset);
                     index = grown;
                 } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
                     // A checkpoint-backed index has locations but not homes.
                     // Recovering the hashes from those locations is bounded
                     // by this collection, unlike `rebuild_index`'s pack scan.
-                    let _ = grown.insert(id, shard_id, offset);
+                    let _ = grown.insert(id, slot, offset);
                     index = grown;
                 } else {
                     index = self.rebuild_index(collection_id)?;
-                    let _ = index.insert(id, shard_id, offset);
+                    let _ = index.insert(id, slot, offset);
                 }
                 // The rebuild re-derived the collection's entire live set from
                 // scratch, so its shard distribution needs a full
                 // recompute too, not just crediting this one record.
                 self.replace_collection_shard_counts(
                     collection_id,
-                    &self.slot_counts_to_pack_id_counts(&index.shard_counts()),
+                    &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
                 );
+                // The recompute above covers live-node counts only. This frame
+                // was appended either way, so its bytes still have to be added
+                // (the branches above account for it themselves).
+                let pack_id = self
+                    .shards
+                    .get_shard(slot)
+                    .map_or(u64::from(slot), |s| s.pack_id);
+                self.record_disk_bytes(pack_id, collection_id, disk_bytes);
             }
             let cache = match &old_gen {
                 Some(g) => g.cache.clone(),
@@ -6289,12 +7078,42 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
-        if !self.validate_put_many_inputs(collection_id, entries)? {
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+        let written = self.put_many_internal_locked(collection_id, entries, metadatas)?;
+        if written > 0 {
+            self.put_many_calls.fetch_add(1, Ordering::Relaxed);
+            self.put_many_records
+                .fetch_add(written as u64, Ordering::Relaxed);
+            self.put_many_bytes.fetch_add(
+                entries
+                    .iter()
+                    .map(|(_, data)| data.bytes.len() as u64)
+                    .sum::<u64>(),
+                Ordering::Relaxed,
+            );
+        }
+        Ok(written)
+    }
+
+    fn put_many_internal_locked(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
+    ) -> Result<usize, StorageError> {
+        if let Some(metadatas) = metadatas {
+            debug_assert_eq!(
+                metadatas.len(),
+                entries.len(),
+                "per-entry metadata must align with entries"
+            );
+        }
+        if !Self::validate_put_many_inputs(collection_id, entries)? {
             return Ok(0);
         }
-        let collection_arc = self.put_mutex(collection_id);
-        let collection_guard = collection_arc.lock();
 
         // Same comment as in `put`: a brand-new collection must be excluded
         // from a concurrent checkpoint's fingerprint→snapshot window.
@@ -6327,16 +7146,17 @@ impl PackfileStorage {
                     }
                 }
                 drop(create_guard);
-                drop(collection_guard);
                 return Err(self.persist_failed_batch_boundary($error));
             }};
         }
 
-        for (id, data) in entries {
+        for (index, (id, data)) in entries.iter().enumerate() {
+            let metadata = metadatas.and_then(|m| m.get(index)).cloned().flatten();
             if let Err(error) = self.append_put_many_entry(
                 collection_id,
                 id,
                 data,
+                metadata,
                 old_gen.as_deref().map(|generation| &**generation),
                 &mut progress,
             ) {
@@ -6352,7 +7172,7 @@ impl PackfileStorage {
             // rebuild_index automatically discovers all the records we just appended
             self.replace_collection_shard_counts(
                 collection_id,
-                &self.slot_counts_to_pack_id_counts(&rebuilt.shard_counts()),
+                &self.slot_counts_to_pack_id_counts(&rebuilt.slot_counts()),
             );
             progress.owned_index = Some(rebuilt);
         }
@@ -6366,9 +7186,11 @@ impl PackfileStorage {
                 self.record_delta(collection_id, progress.generation, bucket, slot);
             }
         }
-        for pack_id in progress.pending_shard_collections {
-            self.record_new_shard_collection(pack_id, collection_id);
-        }
+        self.record_put_many_shard_collections(
+            collection_id,
+            &progress.pending_shard_collection_counts,
+            &progress.pending_shard_collections,
+        );
 
         // Apply cache mutations only after all disk writes succeed, so a
         // failed batch does not leak partial state into the shared cache.
@@ -6405,8 +7227,206 @@ impl PackfileStorage {
 }
 
 impl StorageEngine for PackfileStorage {
+    fn collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
+        self.try_collection_exists(collection_id)
+    }
+
+    fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
+        self.try_collection_len(collection_id)
+    }
+
+    fn create_or_put_established(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        validate_established_batch_inputs(records)?;
+        if !metadata.verify_collection_id(collection_id) {
+            return Err(StorageError::Internal(
+                "collection metadata does not reproduce collection id".to_owned(),
+            ));
+        }
+        if metadata.collection_canonical_id.is_empty() {
+            return Err(StorageError::Internal(
+                "collection metadata has empty canonical id".to_owned(),
+            ));
+        }
+
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+
+        if let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
+            let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+                StorageError::Corrupt("malformed collection metadata record".to_owned())
+            })?;
+            if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
+                return Err(StorageError::Internal(
+                    "collection metadata mismatch: existing genesis record differs".to_owned(),
+                ));
+            }
+            let mut to_append = Vec::with_capacity(records.len());
+            for (id, data) in records {
+                if let Some(existing_rec) = self.get(collection_id, id)? {
+                    if existing_rec.bytes != data.bytes {
+                        return Err(StorageError::Collision(format!(
+                            "record collision on node {}",
+                            hex16(id)
+                        )));
+                    }
+                } else {
+                    to_append.push((*id, data.clone()));
+                }
+            }
+            if to_append.len() == 1 {
+                let (id, data) = &to_append[0];
+                return self.put_internal_locked(collection_id, id, data, None);
+            } else if !to_append.is_empty() {
+                self.put_many_internal_locked(collection_id, &to_append, None)?;
+            }
+        } else {
+            if self.collection_exists(collection_id) {
+                return Err(StorageError::Internal(
+                    "genesis metadata must be written before the collection's first record"
+                        .to_owned(),
+                ));
+            }
+            let mut batch = Vec::with_capacity(records.len().saturating_add(1));
+            batch.push((
+                COLLECTION_METADATA_RECORD_ID,
+                NodeData::new(metadata.encode().into()),
+            ));
+            batch.extend_from_slice(records);
+            self.put_many_internal_locked(collection_id, &batch, None)?;
+        }
+        Ok(())
+    }
+
+    fn put_many_established(
+        &self,
+        collection_id: &[u8; 16],
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        validate_established_batch_inputs(records)?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+
+        let Some(existing) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? else {
+            return Err(StorageError::NotFound(*collection_id));
+        };
+        let found = CollectionMetadata::decode(&existing.bytes).ok_or_else(|| {
+            StorageError::Corrupt("malformed collection metadata record".to_owned())
+        })?;
+        if !found.verify_collection_id(collection_id) {
+            return Err(StorageError::Corrupt(
+                "stored collection metadata does not reproduce collection id".to_owned(),
+            ));
+        }
+
+        let to_append =
+            collect_missing_established_records(records, |id| self.get(collection_id, id))?;
+        if !to_append.is_empty() {
+            let written = self.put_many_internal_locked(collection_id, &to_append, None)?;
+            if written > 0 {
+                self.put_many_calls.fetch_add(1, Ordering::Relaxed);
+                self.put_many_records
+                    .fetch_add(written as u64, Ordering::Relaxed);
+                self.put_many_bytes.fetch_add(
+                    to_append
+                        .iter()
+                        .map(|(_, data)| data.bytes.len() as u64)
+                        .sum::<u64>(),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn create_or_upsert_established_validated(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        node_id: &NodeId,
+        data: &NodeData,
+        validate: &mut dyn FnMut(Option<&NodeData>) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        validate_established_upsert_inputs(collection_id, metadata, node_id)?;
+
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
+
+        if let Some(existing_meta_rec) = self.get(collection_id, &COLLECTION_METADATA_RECORD_ID)? {
+            let found = CollectionMetadata::decode(&existing_meta_rec.bytes).ok_or_else(|| {
+                StorageError::Corrupt("malformed collection metadata record".to_owned())
+            })?;
+            if found != *metadata {
+                found.validate_identity_collision(metadata, collection_id)?;
+                return Err(StorageError::Internal(
+                    "collection metadata mismatch: existing genesis record differs".to_owned(),
+                ));
+            }
+
+            let existing = self.get(collection_id, node_id)?;
+            validate(existing.as_ref())?;
+
+            if let Some(existing) = existing {
+                if existing.bytes == data.bytes {
+                    return Ok(());
+                }
+            }
+
+            self.put_internal_locked(collection_id, node_id, data, None)?;
+        } else {
+            if self.collection_exists(collection_id) {
+                return Err(StorageError::Internal(
+                    "genesis metadata must be written before the collection's first record"
+                        .to_owned(),
+                ));
+            }
+
+            validate(None)?;
+
+            let batch = [
+                (
+                    COLLECTION_METADATA_RECORD_ID,
+                    NodeData::new(metadata.encode().into()),
+                ),
+                (*node_id, data.clone()),
+            ];
+            self.put_many_internal_locked(collection_id, &batch, None)?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_collection_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+    ) -> Result<(), StorageError> {
+        self.create_or_put_established(collection_id, metadata, &[])
+    }
+
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
         let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get)
+        } else {
+            OperationTimer::disabled()
+        };
+        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+            return Ok(self
+                .get_read_committed(collection_id, std::slice::from_ref(id))?
+                .into_iter()
+                .next()
+                .flatten());
+        }
         // A concurrent repack can swap the generation and retire the shard ids
         // its index pointed at. Pin the candidate shards and confirm the
         // generation did not change between the index lookup and the pin
@@ -6430,7 +7450,7 @@ impl StorageEngine for PackfileStorage {
             let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
             #[cfg(test)]
             Self::run_test_before_pin();
-            let pinned = self.pin_shards(candidates.iter().map(|&(shard_id, _)| shard_id));
+            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
             let still_current = match gen_guard.as_ref() {
                 Some(loaded) => {
                     let current = self.generation(collection_id);
@@ -6462,6 +7482,14 @@ impl StorageEngine for PackfileStorage {
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
         let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get_many)
+        } else {
+            OperationTimer::disabled()
+        };
+        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+            return self.get_read_committed(collection_id, ids);
+        }
         // As in `get`: pin the candidate shards and retry if a concurrent
         // repack swapped the generation (and so may have retired them) between
         // the index lookups and the pin.
@@ -6493,7 +7521,7 @@ impl StorageEngine for PackfileStorage {
             let pinned = self.pin_shards(
                 to_fetch
                     .iter()
-                    .flat_map(|(_, candidates)| candidates.iter().map(|&(shard_id, _)| shard_id)),
+                    .flat_map(|(_, candidates)| candidates.iter().map(|&(slot, _)| slot)),
             );
             let still_current = match gen_guard.as_ref() {
                 Some(loaded) => {
@@ -6508,26 +7536,39 @@ impl StorageEngine for PackfileStorage {
 
             to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
 
+            let policy = self.read_plan_policy();
+            let plan_wanted = policy.wants(usize::try_from(candidates_seen).unwrap_or(usize::MAX));
+
+            // Suppress readahead for a scattered batch when asked. This is
+            // independent of extent planning: it reads the same pages either
+            // way, it just stops the kernel from over-reading first.
+            if policy.random_advice && candidates_seen > 0 {
+                Self::advise_random(&pinned);
+            }
+
+            // One grouping of candidate offsets per shard feeds both the
+            // scatter counters and the merged read plan below.
+            let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+            if track || plan_wanted {
+                for (_, candidates) in &to_fetch {
+                    for (slot, offset) in candidates {
+                        per_shard.entry(*slot).or_default().push(*offset);
+                    }
+                }
+                for offsets in per_shard.values_mut() {
+                    offsets.sort_unstable();
+                }
+            }
+
             if track {
                 self.index_candidates
                     .fetch_add(candidates_seen, Ordering::Relaxed);
-                let touched: HashSet<u16> = to_fetch
-                    .iter()
-                    .flat_map(|(_, candidates)| candidates.iter().map(|(shard_id, _)| *shard_id))
-                    .collect();
                 self.get_many_shards_touched
-                    .fetch_add(touched.len() as u64, Ordering::Relaxed);
+                    .fetch_add(per_shard.len() as u64, Ordering::Relaxed);
 
-                let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
-                for (_, candidates) in &to_fetch {
-                    for (shard_id, offset) in candidates {
-                        per_shard.entry(*shard_id).or_default().push(*offset);
-                    }
-                }
                 let mut runs: u64 = 0;
                 let mut span: u64 = 0;
-                for offsets in per_shard.values_mut() {
-                    offsets.sort_unstable();
+                for offsets in per_shard.values() {
                     let first = *offsets.first().expect("offsets non-empty by construction");
                     let last = *offsets.last().expect("offsets non-empty by construction");
                     runs = runs.saturating_add(1);
@@ -6540,6 +7581,14 @@ impl StorageEngine for PackfileStorage {
                 }
                 self.read_many_runs.fetch_add(runs, Ordering::Relaxed);
                 self.read_many_span_bytes.fetch_add(span, Ordering::Relaxed);
+            }
+
+            // Meld nearby candidates into contiguous extents and hint the
+            // kernel to read each as one sequential run, before the
+            // per-candidate decode loop touches them one at a time.
+            if plan_wanted {
+                let extents = plan_read_extents(&per_shard, policy);
+                self.prefetch_extents(&extents, &pinned, track);
             }
 
             for (i, candidates) in &to_fetch {
@@ -6566,7 +7615,12 @@ impl StorageEngine for PackfileStorage {
         id: &NodeId,
         data: &NodeData,
     ) -> Result<(), StorageError> {
-        self.put_internal(collection_id, id, data)
+        let _latency = if self.stats_enabled.load(Ordering::Relaxed) {
+            OperationTimer::new(&self.operation_timings.put)
+        } else {
+            OperationTimer::disabled()
+        };
+        self.put_internal(collection_id, id, data, None)
     }
 
     fn put_many(
@@ -6574,7 +7628,12 @@ impl StorageEngine for PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError> {
-        self.put_many_internal(collection_id, entries)
+        let _latency = if self.stats_enabled.load(Ordering::Relaxed) {
+            OperationTimer::new(&self.operation_timings.put_many)
+        } else {
+            OperationTimer::disabled()
+        };
+        self.put_many_internal(collection_id, entries, None)
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -6606,12 +7665,19 @@ impl StorageEngine for PackfileStorage {
     fn sync(&self) -> Result<(), StorageError> {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
-        self.sync_durability(true, &mut timings)?;
-        self.persist_index_checkpoint_or_delta(&mut timings);
+        let pending_generation = self.mark_sync_pending_age(&mut timings);
+        let result = self
+            .sync_durability(true, &mut timings)
+            .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+        timings.failed = result.is_err();
+        self.finish_sync_pending_age(pending_generation);
         timings.total = started.elapsed();
-        self.count_sync_persistence(&timings);
+        self.record_sync_diagnostics(&timings);
+        if result.is_ok() {
+            self.count_sync_persistence(&timings);
+        }
         *self.last_sync_timings.lock() = Some(timings);
-        Ok(())
+        result
     }
 
     fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -6620,6 +7686,190 @@ impl StorageEngine for PackfileStorage {
 }
 
 impl PackfileStorage {
+    /// Check collection existence using the historical boolean API.
+    ///
+    /// Call [`Self::try_collection_exists`] when storage errors must be
+    /// distinguished from a missing collection.
+    #[must_use]
+    pub fn collection_exists(&self, collection_id: &[u8; 16]) -> bool {
+        self.try_collection_exists(collection_id).unwrap_or(false)
+    }
+
+    /// Check collection existence without hiding overlay/read failures.
+    ///
+    /// The trait's historical boolean API is retained for compatibility and
+    /// fails closed on errors. New callers that need to distinguish absence
+    /// from storage failure should use this method.
+    ///
+    /// # Errors
+    /// Returns a storage or journal-overlay error when the authoritative
+    /// read-committed lookup cannot be completed.
+    pub fn try_collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
+        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+            return self
+                .get_read_committed(
+                    collection_id,
+                    std::slice::from_ref(&COLLECTION_METADATA_RECORD_ID),
+                )
+                .map(|values| values.first().is_some_and(Option::is_some));
+        }
+        Ok(self.generation(collection_id).is_some())
+    }
+
+    /// Return collection length at read-committed visibility.
+    ///
+    /// Overlay puts replace durable values with the same node ID and add to
+    /// the durable count only for new IDs. A committed collection delete
+    /// hides the durable generation until replacement puts are applied.
+    ///
+    /// # Errors
+    /// Returns a storage or journal-overlay error when the authoritative
+    /// read-committed view cannot be refreshed.
+    pub fn try_collection_len(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<Option<usize>, StorageError> {
+        if self.transaction_overlay_users.load(Ordering::Acquire) == 0 {
+            return Ok(self
+                .generation(collection_id)
+                .map(|generation| generation.index.len()));
+        }
+
+        let overlay_guard = self.refresh_read_journal()?;
+        let Some(overlay) = overlay_guard.as_ref() else {
+            return Ok(self
+                .generation(collection_id)
+                .map(|generation| generation.index.len()));
+        };
+        let puts = overlay.puts.get(collection_id);
+        let deleted = overlay.delete_lsn.contains_key(collection_id);
+        let generation = self.generation(collection_id);
+        let durable_len = generation
+            .as_ref()
+            .map_or(0, |generation| generation.index.len());
+
+        if deleted {
+            return Ok(puts
+                .filter(|puts| !puts.is_empty())
+                .map(std::collections::HashMap::len));
+        }
+
+        let Some(puts) = puts else {
+            return Ok(generation.map(|_| durable_len));
+        };
+        let additions = puts
+            .keys()
+            .filter(|node_id| {
+                generation.as_ref().map_or(true, |generation| {
+                    generation.index.lookup_all(node_id).next().is_none()
+                })
+            })
+            .count();
+        let length = durable_len.saturating_add(additions);
+        Ok(if generation.is_some() || !puts.is_empty() {
+            Some(length)
+        } else {
+            None
+        })
+    }
+
+    /// Hint the kernel to read each planned extent as one sequential run.
+    ///
+    /// Reads go through the shard's mmap, so the physical coalescing is a
+    /// `madvise(MADV_WILLNEED)` over the merged range rather than a `pread`
+    /// into a buffer: the existing zero-copy decode path is unchanged, and the
+    /// kernel is free to queue the readahead asynchronously while resolution
+    /// proceeds. Best-effort: an extent that cannot be advised (missing
+    /// mapping, offset beyond the current mapping, or a failed `madvise`) is
+    /// counted in `read_plan_skipped_extents` rather than silently dropped.
+    #[cfg(unix)]
+    fn prefetch_extents(
+        &self,
+        extents: &[ReadExtent],
+        pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+    ) {
+        for extent in extents {
+            match Self::prefetch_extent(extent, pinned) {
+                Some(len) => {
+                    if track {
+                        self.read_plan_extents.fetch_add(1, Ordering::Relaxed);
+                        self.read_plan_prefetch_bytes
+                            .fetch_add(len, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    if track {
+                        self.read_plan_skipped_extents
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Advise every pinned shard mapping `MADV_RANDOM` before a scattered
+    /// batch read, so the kernel does not let readahead amplify each fault
+    /// into a large sequential block read. This is the no-plan alternative to
+    /// [`Self::prefetch_extents`]: it does not merge or prefetch anything, it
+    /// only stops readahead from over-reading beyond the pages actually
+    /// touched. A shard whose mapping is absent or whose `madvise` fails is
+    /// simply left alone — the read still works, just with default advice.
+    #[cfg(unix)]
+    fn advise_random(pinned: &HashMap<u16, Arc<Shard>>) {
+        for shard in pinned.values() {
+            if let Ok(guard) = shard.mmap() {
+                if let Some(mapping) = guard.as_ref() {
+                    let _ = mapping.advise(memmap2::Advice::Random);
+                }
+            }
+        }
+    }
+
+    /// Non-Unix builds have no `madvise`; readahead advice is a no-op.
+    #[cfg(not(unix))]
+    fn advise_random(_pinned: &HashMap<u16, Arc<Shard>>) {}
+
+    /// `madvise(MADV_WILLNEED)` one extent, returning its byte length on
+    /// success and `None` if it could not be advised.
+    ///
+    /// `advise_range` requires the offset and length to lie within the mapping;
+    /// clamp rather than error, since a virtual (buffered-but-unflushed) offset
+    /// is legitimately beyond the current mapping and simply cannot be
+    /// prefetched until the shard flushes.
+    #[cfg(unix)]
+    fn prefetch_extent(extent: &ReadExtent, pinned: &HashMap<u16, Arc<Shard>>) -> Option<u64> {
+        let shard = pinned.get(&extent.slot)?;
+        let guard = shard.mmap().ok()?;
+        let mapping = guard.as_ref()?;
+        let start = usize::try_from(extent.start).ok()?;
+        let end = usize::try_from(extent.end)
+            .unwrap_or(usize::MAX)
+            .min(mapping.len());
+        if start >= end {
+            return None;
+        }
+        let len = end.saturating_sub(start);
+        mapping
+            .advise_range(memmap2::Advice::WillNeed, start, len)
+            .ok()?;
+        Some(u64::try_from(len).unwrap_or(u64::MAX))
+    }
+
+    /// Non-Unix builds have no `madvise`; every planned extent is skipped.
+    #[cfg(not(unix))]
+    fn prefetch_extents(
+        &self,
+        extents: &[ReadExtent],
+        _pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+    ) {
+        if track {
+            self.read_plan_skipped_extents
+                .fetch_add(extents.len() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Persist the pre-batch generation after a batch failed after physical
     /// appends. The append-only frames remain as unreachable bytes, but the
     /// checkpoint's matching pack fingerprint makes that exclusion durable
@@ -6640,24 +7890,30 @@ impl PackfileStorage {
 
     /// Sync all open shards to disk (full pool, not just dirty).
     ///
-    /// Also persists the shard→collection directory as a side effect — an
-    /// explicit sync is a natural point to flush this observability data too.
-    /// The sidecar is written exactly once, pinned to the same pack
-    /// fingerprint the index checkpoint/delta advance to inside
-    /// `persist_index_checkpoint_or_delta`; see its owner comment for why the
-    /// write lives there rather than here.
+    /// A full checkpoint rewrite also persists the shard→collection directory
+    /// as a side effect — the rewrite is an anchor at which this observability
+    /// sidecar is re-pinned to the same pack fingerprint the checkpoint just
+    /// became. A delta-only barrier defers it; see
+    /// `persist_index_checkpoint_or_delta` for the deferral policy.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure.
     pub fn sync_all(&self) -> Result<(), StorageError> {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
-        self.sync_durability(false, &mut timings)?;
-        self.persist_index_checkpoint_or_delta(&mut timings);
+        let pending_generation = self.mark_sync_pending_age(&mut timings);
+        let result = self
+            .sync_durability(false, &mut timings)
+            .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+        timings.failed = result.is_err();
+        self.finish_sync_pending_age(pending_generation);
         timings.total = started.elapsed();
-        self.count_sync_persistence(&timings);
+        self.record_sync_diagnostics(&timings);
+        if result.is_ok() {
+            self.count_sync_persistence(&timings);
+        }
         *self.last_sync_timings.lock() = Some(timings);
-        Ok(())
+        result
     }
 
     /// Rewrite the on-disk index checkpoint now, bypassing the delta-append
@@ -6737,10 +7993,31 @@ impl PackfileStorage {
     /// Returns `StorageError` if the journal segment cannot be opened or its
     /// committed prefix cannot be validated.
     pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
+        self.reject_legacy_journal_in_shared_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
         *self.journal.lock() = Some(Arc::new(JournalCoordinator::new(journal, &scan)));
         Ok(())
+    }
+
+    /// Fail closed when a path-based per-pool journal would be attached to a
+    /// store that lives inside a database root.
+    ///
+    /// Every root, old or new, is driven by one root-level pool-tagged segment
+    /// through one coordinator. Letting a caller hand such a pool a private
+    /// per-pool `wal.bin` would split the durability fence and silently diverge
+    /// from the root's WAL. A standalone store outside any root keeps the
+    /// per-pool journal path.
+    fn reject_legacy_journal_in_shared_root(&self) -> Result<(), StorageError> {
+        match crate::layout::enclosing_root(&self.base_dir)? {
+            Some((root, _)) => Err(StorageError::Internal(format!(
+                "{} is inside database root {}; attach it to the root coordinator \
+                 with PackfileStorage::enable_shared_journal instead of a per-pool journal",
+                self.base_dir.display(),
+                root.display()
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Route durability through a journal whose group sequence is drawn from a
@@ -6754,16 +8031,61 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Same as [`Self::enable_journal`].
+    #[cfg(feature = "multi-reader")]
     pub fn enable_journal_with_sequence(
         &self,
         path: impl AsRef<std::path::Path>,
         sequence: Arc<AtomicU64>,
     ) -> Result<(), StorageError> {
+        self.reject_legacy_journal_in_shared_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
         *self.journal.lock() = Some(Arc::new(JournalCoordinator::with_shared_sequence(
             journal, &scan, sequence,
         )));
+        Ok(())
+    }
+
+    /// Attach this store to a shared, multi-pool journal coordinator.
+    ///
+    /// Every mutation this store publishes is tagged with `pool`, so recovery
+    /// routes it back to this pool. Because all pools share one coordinator
+    /// (and therefore one segment), any one pool's `sync`/`sync_all` fences
+    /// every pool's pending mutations in a single group and a single fsync —
+    /// instead of each pool paying its own WAL fsync.
+    ///
+    /// The coordinator must be built from a pool-tagged segment (see
+    /// [`Journal::open_shared`]) and the caller must hold the root writer lock
+    /// ([`crate::journal::SharedWalLock`]). This is opt-in; a store that never
+    /// calls it keeps the legacy per-pool journal path unchanged.
+    ///
+    /// The store's existing durable coverage (the `journal.lsn` written beside
+    /// its last checkpoint) is reported to the coordinator on attach. Without
+    /// it, a pool whose frames were reclaimed before a restart has no coverage
+    /// in the freshly recovered segment, and reclaim could advance past frames
+    /// this store has not materialized (or block on a pool that is in fact
+    /// already covered).
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if a journal is already enabled on this store.
+    #[cfg(feature = "multi-reader")]
+    pub fn enable_shared_journal(
+        &self,
+        journal: Arc<JournalCoordinator>,
+        pool: crate::layout::ShardType,
+    ) -> Result<(), StorageError> {
+        let mut slot = self.journal.lock();
+        if slot.is_some() {
+            return Err(StorageError::Internal(
+                "a journal is already enabled on this store".into(),
+            ));
+        }
+        self.journal_recovery
+            .lock()
+            .clone_from(&journal.recovered_groups());
+        self.journal_pool.store(pool_tag(pool), Ordering::Release);
+        journal.report_pool_coverage(pool, Self::read_journal_lsn(&self.base_dir));
+        *slot = Some(journal);
         Ok(())
     }
 
@@ -6790,9 +8112,15 @@ impl PackfileStorage {
         self.replaying.store(true, Ordering::SeqCst);
         let result = (|| -> Result<u64, StorageError> {
             let mut replayed = 0u64;
+            // On a shared journal, replay only this pool's frames; the other
+            // pools' mutations are replayed by their own stores.
+            let pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
             for group in &groups {
                 for entry in &group.entries {
                     if entry.lsn <= covered {
+                        continue;
+                    }
+                    if pool.is_some_and(|pool| entry.pool != Some(pool)) {
                         continue;
                     }
                     match &entry.mutation {
@@ -6827,6 +8155,126 @@ impl PackfileStorage {
         self.journal.lock().clone()
     }
 
+    /// Start a bounded background WAL group committer on this store's journal.
+    ///
+    /// Additive and opt-in: without it the store keeps the historical blocking
+    /// [`StorageEngine::sync`] behavior. The committer fsyncs the pending WAL
+    /// group at most once per [`GroupCommitConfig::interval`], coalescing every
+    /// mutation published in that window into one group, and flushes early once
+    /// [`GroupCommitConfig::max_pending`] records are outstanding. It commits
+    /// the journal only; packfile checkpointing and segment reclaim remain the
+    /// explicit `sync`/`sync_all` path. No-op when no journal is enabled.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committer thread cannot be spawned.
+    pub fn start_background_commit(&self, config: GroupCommitConfig) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .start_background_committer(config)
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop the background committer (if any), join it, and flush the final
+    /// pending WAL group so a quiet stream's last write is durable before this
+    /// returns. No-op when no journal is enabled.
+    ///
+    /// # Errors
+    /// Returns a storage error if the final flush fails.
+    pub fn stop_background_commit(&self) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .stop_background_committer()
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Register a non-blocking durability request through `target_lsn`,
+    /// returning `None` when no journal is enabled.
+    #[must_use]
+    pub fn request_durable(&self, target_lsn: u64) -> Option<DurabilityToken> {
+        self.journal()
+            .map(|journal| journal.request_durable(target_lsn))
+    }
+
+    /// Block until the group covering `token` is durable. No-op when no journal
+    /// is enabled. Pair with [`Self::request_durable`].
+    ///
+    /// # Errors
+    /// Returns a storage error if the target was never published, the journal
+    /// is poisoned, the background committer failed, or the commit fails.
+    pub fn wait_durable(&self, token: DurabilityToken) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .wait_durable(token)
+                .map(|_| ())
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Perform one bounded WAL group commit over everything published so far.
+    /// No-op when no journal is enabled.
+    ///
+    /// # Errors
+    /// Returns a storage error if appending or fsyncing the group fails.
+    pub fn flush_durable(&self) -> Result<(), StorageError> {
+        match self.journal() {
+            Some(journal) => journal
+                .flush_durable()
+                .map(|_| ())
+                .map_err(StorageError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Enable the in-process read overlay for a published transaction that is
+    /// still being materialized. The overlay is shared with the existing
+    /// read-committed implementation, but ordinary reads consult it only
+    /// while at least one transaction is in this state.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn activate_transaction_overlay(
+        &self,
+        wal_path: &Path,
+        pool: crate::layout::ShardType,
+    ) -> Result<(), StorageError> {
+        let previous = self
+            .transaction_overlay_users
+            .fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            if let Err(error) = self.enable_transaction_read_journal(wal_path, pool) {
+                self.transaction_overlay_users
+                    .fetch_sub(1, Ordering::AcqRel);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop consulting the in-process transaction overlay after all staged
+    /// mutations have been materialized or the transaction was abandoned
+    /// before journal publication.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn deactivate_transaction_overlay(&self) {
+        let mut users = self.transaction_overlay_users.load(Ordering::Acquire);
+        loop {
+            let next = users
+                .checked_sub(1)
+                .expect("transaction overlay deactivated too often");
+            match self.transaction_overlay_users.compare_exchange_weak(
+                users,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => users = current,
+            }
+        }
+    }
+
     /// Publish one mutation to the journal, if enabled. Returns the assigned
     /// LSN, or `None` when no journal is configured.
     ///
@@ -6836,7 +8284,12 @@ impl PackfileStorage {
         &self,
         mutation: impl FnOnce() -> JournalMutation,
     ) -> Result<Option<u64>, StorageError> {
+        let started = std::time::Instant::now();
+        if JOURNAL_SUPPRESSED.with(Cell::get) {
+            return Ok(None);
+        }
         let Some(journal) = self.journal() else {
+            self.record_published_mutation(started);
             return Ok(None);
         };
         // Replayed mutations are already durable in the journal; never
@@ -6844,12 +8297,74 @@ impl PackfileStorage {
         if self.replaying.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        // The live index is already updated synchronously on the write path,
-        // so the overlay callback has nothing to publish.
-        journal
-            .publish(mutation(), |_lsn| {})
+        // The live index is already updated synchronously on the write path.
+        // Append this autocommit mutation as its own complete, visible group;
+        // durability remains separate so the background committer can batch
+        // several such groups into one fsync. On a shared journal, tag the
+        // frame with this store's pool so recovery can route it.
+        #[cfg(feature = "multi-reader")]
+        let result = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+            Some(pool) => journal
+                .publish_group_tagged(pool, &[mutation()])
+                .map(|receipt| receipt.last_lsn),
+            None => journal
+                .publish_group(&[mutation()])
+                .map(|receipt| receipt.last_lsn),
+        }
+        .map(Some)
+        .map_err(StorageError::Io);
+        #[cfg(not(feature = "multi-reader"))]
+        let result = journal
+            .publish_group(&[mutation()])
+            .map(|receipt| receipt.last_lsn)
             .map(Some)
-            .map_err(StorageError::Io)
+            .map_err(StorageError::Io);
+        if result.is_ok() {
+            self.record_published_mutation(started);
+        }
+        result
+    }
+
+    /// Apply a mutation staged by a database transaction without publishing
+    /// it to the legacy per-write journal queue. The transaction coordinator
+    /// publishes the complete batch after every pool has applied successfully.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn apply_transaction_mutation(
+        &self,
+        mutation: &JournalMutation,
+    ) -> Result<(), StorageError> {
+        JOURNAL_SUPPRESSED.with(|suppressed| {
+            let previous = suppressed.replace(true);
+            let result = match mutation {
+                JournalMutation::Put {
+                    collection_id,
+                    node_id,
+                    payload,
+                } => self.put(
+                    collection_id,
+                    node_id,
+                    &NodeData::new(bytes::Bytes::from(payload.clone())),
+                ),
+                JournalMutation::DeleteCollection { collection_id } => {
+                    self.delete_collection(collection_id)
+                }
+            };
+            suppressed.set(previous);
+            result
+        })
+    }
+
+    fn record_published_mutation(&self, started: std::time::Instant) {
+        self.publish_calls.fetch_add(1, Ordering::Relaxed);
+        self.publish_time_ns.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let mut pending = self.pending_publish_since.lock();
+        if pending.is_none() {
+            *pending = Some(std::time::Instant::now());
+        }
+        self.publish_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Advance one barrier's durability boundary.
@@ -6865,14 +8380,27 @@ impl PackfileStorage {
         dirty_only: bool,
         timings: &mut SyncTimings,
     ) -> Result<(), StorageError> {
+        let dirty_lock_before = self.shards.dirty_lock_wait();
         if let Some(journal) = self.journal() {
             let flush_started = std::time::Instant::now();
             self.shards.flush_all()?;
             timings.pack_flush = flush_started.elapsed();
             let target = journal.capture_sync_target();
             let wal_started = std::time::Instant::now();
-            journal.sync_through(target).map_err(StorageError::Io)?;
+            let (_, journal_timings) = journal
+                .sync_through_timed(target)
+                .map_err(StorageError::Io)?;
             timings.wal = wal_started.elapsed();
+            timings.journal_lock_wait = journal_timings.journal_lock_wait;
+            timings.journal_pending_wait = journal_timings.journal_pending_wait;
+            timings.journal_append = journal_timings.journal_append;
+            timings.journal_fsync = journal_timings.journal_fsync;
+            timings.journal_sync_calls = 1;
+            timings.journal_bytes = journal_timings.journal_bytes;
+            timings.journal_records = journal_timings.journal_records;
+            timings.journal_waiters = u64::from(journal_timings.journal_waiter);
+            timings.journal_coalesced = u64::from(journal_timings.journal_coalesced);
+            timings.journal_in_flight = journal_timings.journal_in_flight;
         } else if dirty_only {
             self.shards.sync_dirty()?;
             if let Some((flush, fsync)) = self.shards.last_sync_split() {
@@ -6886,6 +8414,10 @@ impl PackfileStorage {
                 timings.pack_fsync = fsync;
             }
         }
+        timings.dirty_lock_wait = self
+            .shards
+            .dirty_lock_wait()
+            .saturating_sub(dirty_lock_before);
         Ok(())
     }
 
@@ -6902,6 +8434,53 @@ impl PackfileStorage {
             self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
         } else if !timings.delta_log.is_zero() {
             self.delta_appends.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_sync_diagnostics(&self, timings: &SyncTimings) {
+        let journal_path = self
+            .journal()
+            .map(|journal| journal.path().display().to_string());
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        self.sync_diagnostics.lock().record(SyncDiagnosticSample {
+            timestamp_ms,
+            process_id: std::process::id(),
+            journal_path,
+            total: timings.total,
+            failed: timings.failed,
+            pack_flush: timings.pack_flush,
+            pack_fsync: timings.pack_fsync,
+            sidecar: timings.sidecar,
+            delta_log: timings.delta_log,
+            checkpoint: timings.checkpoint,
+            dirty_lock_wait: timings.dirty_lock_wait,
+            pending_publish_age: timings.pending_publish_age,
+            wal: timings.wal,
+            journal_lock_wait: timings.journal_lock_wait,
+            journal_pending_wait: timings.journal_pending_wait,
+            journal_append: timings.journal_append,
+            journal_fsync: timings.journal_fsync,
+            journal_records: timings.journal_records,
+            journal_bytes: timings.journal_bytes,
+            journal_in_flight: timings.journal_in_flight,
+            journal_waiters: timings.journal_waiters,
+            journal_coalesced: timings.journal_coalesced,
+        });
+    }
+
+    fn mark_sync_pending_age(&self, timings: &mut SyncTimings) -> u64 {
+        let generation = self.publish_generation.load(Ordering::Acquire);
+        if let Some(since) = *self.pending_publish_since.lock() {
+            timings.pending_publish_age = since.elapsed();
+        }
+        generation
+    }
+
+    fn finish_sync_pending_age(&self, generation: u64) {
+        if self.publish_generation.load(Ordering::Acquire) == generation {
+            *self.pending_publish_since.lock() = None;
         }
     }
     /// `put_bytes + put_many_bytes` written since the last full checkpoint
@@ -6960,30 +8539,42 @@ impl PackfileStorage {
     /// a checkpoint; oversized v3 batches fall back from the append helper.
     fn delta_state_needs_full_rewrite(&self) -> bool {
         let state = self.delta_state.lock();
-        if state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty() {
-            return true;
-        }
-        false
+        state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty()
     }
 
     /// Persist the dirty index state for a sync barrier — a delta append when
     /// the log can be continued, otherwise a full checkpoint rewrite — and
     /// record which path ran in `timings`. No-op when nothing is dirty.
     ///
-    /// The shard→collection inspection sidecar is owned here, written exactly
-    /// once per dirty barrier whether the index persisted as a delta append or
-    /// a full rewrite: it must stay gated to the same pack set the checkpoint
-    /// just became, so the next open can rebuild per-shard counts from records
-    /// instead of walking every slot. A clean barrier writes nothing (the
-    /// sidecar can only have gone stale together with the index — the same
-    /// mutations that move a record into a shard also dirty the index). A
-    /// failure here leaves the previous directory stale; the fingerprint gate
-    /// then falls back to the slot walk until the next rewrite.
+    /// The shard→collection inspection sidecar is deferred away from the
+    /// per-event durable barrier: a delta append and a deferred checkpoint
+    /// rewrite only set `shard_collections_stale`, leaving the on-disk copy
+    /// (and its pack fingerprint) behind the live pack set. That is safe
+    /// because the sidecar is rebuildable acceleration metadata — the next open
+    /// fails its fingerprint gate and falls back to the slot walk — so the hot
+    /// barrier never pays its `sync_data` + rename. The sidecar is re-pinned
+    /// only at anchors: a successful full checkpoint rewrite (to the same pack
+    /// fingerprint the checkpoint just became), a repack, or shutdown (`Drop`).
+    /// A known missing/invalid sidecar (`shard_collections_dirty`) is still
+    /// regenerated even on an otherwise clean barrier, because that is a rare
+    /// recovery path rather than a steady-state write.
     fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         let _persist_guard = self.index_persist_lock.lock();
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
+            // Nothing to checkpoint, but a sidecar lost while the checkpoint
+            // survived still has to be regenerated. A sidecar that is merely
+            // stale from deferred writes is left for the next anchor.
+            if self.shard_collections_dirty.load(Ordering::Relaxed) {
+                let sidecar_started = std::time::Instant::now();
+                self.persist_shard_collections_best_effort();
+                timings.sidecar = sidecar_started.elapsed();
+            }
             return;
         }
+        // Only a full checkpoint rewrite re-pins the sidecar to the pack
+        // fingerprint the checkpoint just became. Every other dirty path
+        // records staleness instead and writes nothing.
+        let mut sidecar_anchor = false;
         if self.delta_state_needs_full_rewrite() {
             if self.should_defer_checkpoint_rewrite() {
                 // Write-neutral stopgap: the caller already synced the
@@ -6994,12 +8585,14 @@ impl PackfileStorage {
                 // `index_checkpoint_dirty` set so a later barrier past the
                 // budget still rewrites.
                 self.checkpoint_skips.fetch_add(1, Ordering::Relaxed);
+                self.shard_collections_stale.store(true, Ordering::Relaxed);
                 return;
             }
             let checkpoint_started = std::time::Instant::now();
             self.persist_index_checkpoint_best_effort();
             self.note_checkpoint_rewrite();
             timings.checkpoint = checkpoint_started.elapsed();
+            sidecar_anchor = true;
         } else {
             let delta_started = std::time::Instant::now();
             if let Err(error) = self.append_index_delta() {
@@ -7012,13 +8605,24 @@ impl PackfileStorage {
                 self.persist_index_checkpoint_best_effort();
                 self.note_checkpoint_rewrite();
                 timings.checkpoint = checkpoint_started.elapsed();
+                sidecar_anchor = true;
             } else {
                 timings.delta_log = delta_started.elapsed();
+                // A missing/invalid sidecar must still be regenerated, but a
+                // normal delta append defers it: the on-disk copy is merely
+                // stale and the next open rebuilds it from the slot walk.
+                if self.shard_collections_dirty.load(Ordering::Relaxed) {
+                    sidecar_anchor = true;
+                } else {
+                    self.shard_collections_stale.store(true, Ordering::Relaxed);
+                }
             }
         }
-        let sidecar_started = std::time::Instant::now();
-        self.persist_shard_collections_best_effort();
-        timings.sidecar = sidecar_started.elapsed();
+        if sidecar_anchor {
+            let sidecar_started = std::time::Instant::now();
+            self.persist_shard_collections_best_effort();
+            timings.sidecar = sidecar_started.elapsed();
+        }
     }
 
     /// Fingerprint of the current on-disk pack set, computed from each
@@ -7081,7 +8685,7 @@ impl PackfileStorage {
     /// ```
     /// use mtxdb::shard::AppendPolicy;
     /// use mtxdb::PackfileStorage;
-    /// # let dir = std::env::temp_dir().join("mtxdb-doc-with-append-policy");
+    /// # let dir = std::env::temp_dir().join(format!("mtxdb-doc-with-append-policy-{}", std::process::id()));
     /// let store = PackfileStorage::open(dir.clone())
     ///     .unwrap()
     ///     .with_append_policy(AppendPolicy::buffered());
@@ -7119,8 +8723,8 @@ impl PackfileStorage {
 
     /// Get IO/sync stats for a single shard by ID.
     #[must_use]
-    pub fn shard_stats_for(&self, shard_id: u16) -> Option<crate::shard::ShardStats> {
-        self.shards.stats(shard_id)
+    pub fn shard_stats_for(&self, slot: u16) -> Option<crate::shard::ShardStats> {
+        self.shards.stats(slot)
     }
 
     /// Total number of shards retired (garbage-collected after a repack)
@@ -7158,8 +8762,12 @@ impl PackfileStorage {
     /// batch, and sync counters are always on regardless.
     ///
     /// Changing the flag is safe at any point and affects only subsequent
-    /// reads; counters are monotone, so reads disabled by a false-to-true
-    /// transition are reflected as fewer `get_*` calls, not as zeros.
+    /// operations; logical read counters are monotone, so reads disabled by a
+    /// false-to-true transition are reflected as fewer `get_*` calls, not as
+    /// zeros.
+    /// When enabled, it also records wall-clock totals and fixed latency
+    /// buckets plus maxima for `get`, `get_many`, `get_many_with_refresh`,
+    /// `put`, and `put_many` in [`Self::stats`].
     pub fn set_stats_enabled(&self, enabled: bool) {
         self.stats_enabled.store(enabled, Ordering::Relaxed);
     }
@@ -7235,6 +8843,9 @@ impl PackfileStorage {
             candidate_frame_bytes: self.candidate_frame_bytes.load(Ordering::Relaxed),
             read_many_runs: self.read_many_runs.load(Ordering::Relaxed),
             read_many_span_bytes: self.read_many_span_bytes.load(Ordering::Relaxed),
+            read_plan_extents: self.read_plan_extents.load(Ordering::Relaxed),
+            read_plan_prefetch_bytes: self.read_plan_prefetch_bytes.load(Ordering::Relaxed),
+            read_plan_skipped_extents: self.read_plan_skipped_extents.load(Ordering::Relaxed),
             put_calls: self.put_calls.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             put_many_calls: self.put_many_calls.load(Ordering::Relaxed),
@@ -7255,9 +8866,28 @@ impl PackfileStorage {
             read_reload_failures: self.read_reload_failures.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
+            get_latency: self.operation_timings.get.snapshot(),
+            get_many_latency: self.operation_timings.get_many.snapshot(),
+            get_many_with_refresh_latency: self.operation_timings.get_many_with_refresh.snapshot(),
+            put_latency: self.operation_timings.put.snapshot(),
+            put_many_latency: self.operation_timings.put_many.snapshot(),
             last_open_timings: self.open_timings(),
             last_sync_timings: self.sync_timings(),
             sync_totals: self.sync_totals.snapshot(),
+            sync_diagnostics: self.sync_diagnostics.lock().snapshot(),
+            publish_calls: self.publish_calls.load(Ordering::Relaxed),
+            publish_time: std::time::Duration::from_nanos(
+                self.publish_time_ns.load(Ordering::Relaxed),
+            ),
+            background_commits: self
+                .journal()
+                .map_or(0, |journal| journal.background_commits()),
+            background_coalesced: self
+                .journal()
+                .map_or(0, |journal| journal.background_coalesced()),
+            durability: self
+                .journal()
+                .map_or_else(Default::default, |journal| journal.durability_stats()),
             repack: self.repack_stats(),
             cache,
             shards: self.shard_stats(),
@@ -7266,6 +8896,25 @@ impl PackfileStorage {
             max_index_probe_len,
             dirty_lock_wait: self.shards.dirty_lock_wait(),
         }
+    }
+
+    /// Atomically take the current sync diagnostics and reset only those
+    /// diagnostics for the next observation interval.
+    ///
+    /// Unlike [`Self::reset_stats`], this leaves all runtime counters and
+    /// cumulative sync totals untouched. The returned histograms, peak
+    /// in-flight count, interval maxima (`max_journal_lock_wait` and
+    /// `max_journal_fsync`), and worst-operation samples therefore describe
+    /// the interval ending at this call; the interval maxima reset to zero
+    /// alongside the histograms. Syncs racing with the call are recorded in
+    /// either the returned snapshot or the next interval, never partially in
+    /// both.
+    #[must_use]
+    pub fn take_sync_diagnostics(&self) -> SyncDiagnosticsSnapshot {
+        let mut diagnostics = self.sync_diagnostics.lock();
+        let snapshot = diagnostics.snapshot();
+        diagnostics.reset();
+        snapshot
     }
 
     /// Zero every runtime counter except `open_count` (counts stores
@@ -7297,6 +8946,9 @@ impl PackfileStorage {
             &self.candidate_frame_bytes,
             &self.read_many_runs,
             &self.read_many_span_bytes,
+            &self.read_plan_extents,
+            &self.read_plan_prefetch_bytes,
+            &self.read_plan_skipped_extents,
             &self.put_calls,
             &self.put_bytes,
             &self.put_many_calls,
@@ -7318,9 +8970,11 @@ impl PackfileStorage {
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        self.operation_timings.reset();
         *self.last_open_timings.lock() = None;
         *self.last_sync_timings.lock() = None;
         self.sync_totals.reset();
+        self.sync_diagnostics.lock().reset();
     }
 
     /// Number of times a specific collection has been repacked. 0 if it has
@@ -7422,6 +9076,16 @@ pub struct RuntimeStats {
     /// `get_many` batch (stats-gated; the logical byte-extent the batch
     /// scatters over, not physical disk bytes read).
     pub read_many_span_bytes: u64,
+    /// Merged read extents prefetched with `madvise(MADV_WILLNEED)` across
+    /// `get_many` batches (the executed physical plan, as opposed to the
+    /// [`Self::read_many_runs`] logical shape).
+    pub read_plan_extents: u64,
+    /// Bytes covered by prefetched read extents (sum of extent lengths; not
+    /// physical disk bytes, since `madvise` is a hint).
+    pub read_plan_prefetch_bytes: u64,
+    /// Planned extents not prefetched (offset beyond the current mapping,
+    /// missing mapping, or a failed `madvise`).
+    pub read_plan_skipped_extents: u64,
     /// Single-record `put` attempts.
     pub put_calls: u64,
     /// Bytes accepted across single-record `put` attempts.
@@ -7465,6 +9129,19 @@ pub struct RuntimeStats {
     pub sidecar_writes: u64,
     /// `sync`/`sync_all` calls.
     pub sync_calls: u64,
+    /// Opt-in wall-clock latency for single-record reads.
+    pub get_latency: OperationLatency,
+    /// Opt-in wall-clock latency for batched reads.
+    pub get_many_latency: OperationLatency,
+    /// Opt-in inclusive wall-clock latency for refresh-aware batched reads,
+    /// including any inner `get_many`, stale-index refresh, and retry work.
+    /// This overlaps [`Self::get_many_latency`] when refresh is enabled and
+    /// must not be added to it.
+    pub get_many_with_refresh_latency: OperationLatency,
+    /// Opt-in wall-clock latency for single-record writes.
+    pub put_latency: OperationLatency,
+    /// Opt-in wall-clock latency for batched writes.
+    pub put_many_latency: OperationLatency,
     /// Per-phase breakdown of the most recent open.
     pub last_open_timings: Option<OpenTimings>,
     /// Per-phase breakdown of the most recent sync.
@@ -7473,6 +9150,22 @@ pub struct RuntimeStats {
     /// `last_sync_timings`, and the only view that can answer a run-wide
     /// scatter-vs-rewrite split (the most-recent breakdown is one barrier).
     pub sync_totals: SyncTotalsSnapshot,
+    /// Bounded worst-operation samples and latency histograms for the current
+    /// process. Unlike cumulative totals, these preserve tail behavior.
+    pub sync_diagnostics: SyncDiagnosticsSnapshot,
+    /// Successful mutation publication calls and their cumulative time.
+    pub publish_calls: u64,
+    /// Cumulative time spent publishing mutations.
+    pub publish_time: std::time::Duration,
+    /// Background WAL group commits that appended and fsynced a group (see
+    /// [`PackfileStorage::start_background_commit`]). Zero without a journal
+    /// or when the committer was never started.
+    pub background_commits: u64,
+    /// Background commit attempts already covered by a durable group.
+    pub background_coalesced: u64,
+    /// Lifetime journal durability accounting (requests versus real fsyncs,
+    /// records per fsync, blocked-wait latency). Default without a journal.
+    pub durability: crate::journal::DurabilityStats,
     /// Cumulative repack activity (persisted across opens).
     pub repack: RepackStats,
     /// Aggregate decoded-node cache hit/miss across loaded collections.
@@ -7502,6 +9195,32 @@ pub struct RuntimeStats {
     pub dirty_lock_wait: std::time::Duration,
 }
 
+/// Flush a dirty/stale shard→collection sidecar on shutdown so a clean exit
+/// leaves the sidecar pinned to the last *durable* pack set.
+///
+/// This covers state that a completed `sync`/`sync_all` left deferred (a delta
+/// append or a budget-deferred checkpoint rewrite set `shard_collections_stale`)
+/// plus a sidecar lost at open (`shard_collections_dirty`). It deliberately
+/// does **not** flush bookkeeping changed by writes that were never synced:
+/// such a write grows a pack past the last checkpoint, so the next open cannot
+/// take the checkpoint fast path at all and full-scans instead — it never
+/// consults the sidecar. Writing one there would be unownable I/O, so the
+/// narrower contract is the correct one.
+///
+/// Best-effort and gated: a read-only handle never sets either flag, and any
+/// write error is swallowed by the best-effort wrapper. Even skipping the flush
+/// entirely is safe — the sidecar is rebuildable acceleration metadata — so
+/// correctness never depends on `Drop`.
+impl Drop for PackfileStorage {
+    fn drop(&mut self) {
+        if self.shard_collections_dirty.load(Ordering::Relaxed)
+            || self.shard_collections_stale.load(Ordering::Relaxed)
+        {
+            self.persist_shard_collections_best_effort();
+        }
+    }
+}
+
 impl Default for RuntimeStats {
     fn default() -> Self {
         Self {
@@ -7523,6 +9242,9 @@ impl Default for RuntimeStats {
             candidate_frame_bytes: 0,
             read_many_runs: 0,
             read_many_span_bytes: 0,
+            read_plan_extents: 0,
+            read_plan_prefetch_bytes: 0,
+            read_plan_skipped_extents: 0,
             put_calls: 0,
             put_bytes: 0,
             put_many_calls: 0,
@@ -7541,9 +9263,20 @@ impl Default for RuntimeStats {
             read_reload_failures: 0,
             sidecar_writes: 0,
             sync_calls: 0,
+            get_latency: OperationLatency::default(),
+            get_many_latency: OperationLatency::default(),
+            get_many_with_refresh_latency: OperationLatency::default(),
+            put_latency: OperationLatency::default(),
+            put_many_latency: OperationLatency::default(),
             last_open_timings: None,
             last_sync_timings: None,
             sync_totals: SyncTotalsSnapshot::default(),
+            sync_diagnostics: SyncDiagnosticsSnapshot::default(),
+            publish_calls: 0,
+            publish_time: std::time::Duration::ZERO,
+            background_commits: 0,
+            background_coalesced: 0,
+            durability: crate::journal::DurabilityStats::default(),
             repack: RepackStats::default(),
             cache: CacheStats::default(),
             shards: Vec::new(),
@@ -7606,12 +9339,14 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("mdb_test_pfs_{name}_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("mdb_test_pfs_{name}_{}_{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_sees_a_committed_but_unflushed_group() {
         let dir = test_dir("read_committed_unflushed");
@@ -7660,6 +9395,161 @@ mod tests {
         );
     }
 
+    /// Journal state for a writer-restart scenario: LSN 1 is durable and LSN 2
+    /// is visible but never reached the disk. Returns the segment length that
+    /// covers only LSN 1, so a test can cut the file back to what a crash would
+    /// have kept.
+    #[cfg(feature = "multi-reader")]
+    fn journal_with_a_visible_but_undurable_group(
+        wal: &std::path::Path,
+        collection: [u8; 16],
+        stable: [u8; 16],
+        reused: [u8; 16],
+    ) -> u64 {
+        let (mut journal, _) = Journal::open(wal).unwrap();
+        journal
+            .commit_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: stable,
+                payload: b"stable".to_vec(),
+            }])
+            .unwrap();
+        let durable_len = std::fs::metadata(wal).unwrap().len();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: reused,
+                payload: b"stale-".to_vec(),
+            }])
+            .unwrap();
+        durable_len
+    }
+
+    /// A writer that crashes loses its visible-but-undurable tail, and the
+    /// restarted writer reuses those LSNs. A live reader that already applied
+    /// the lost group must not keep serving it. The reissued group has the same
+    /// length, so the file is exactly as long as when the reader last scanned.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_overlay_drops_a_group_the_restarted_writer_discarded() {
+        let dir = test_dir("read_committed_writer_restart_same_len");
+        let wal = dir.join("wal.bin");
+        let collection = [0x42u8; 16];
+        let stable = [0x01u8; 16];
+        let reused = [0x02u8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x99u8; 16],
+            &[0x99u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let durable_len =
+            journal_with_a_visible_but_undurable_group(&wal, collection, stable, reused);
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        let before_restart = store.get_read_committed(&collection, &[reused]).unwrap();
+        assert_eq!(
+            before_restart[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"stale-"[..])
+        );
+
+        // The crash: LSN 2 never reached the disk. The restarted writer
+        // recovers LSN 1 and publishes a different LSN 2 of the same length.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(durable_len)
+            .unwrap();
+        let (mut journal, scan) = Journal::open(&wal).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: reused,
+                payload: b"fresh-".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let after = store.get_read_committed(&collection, &[reused]).unwrap();
+        assert_eq!(
+            after[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"fresh-"[..]),
+            "the reader must not keep the group the restarted writer discarded"
+        );
+    }
+
+    /// Same restart, but the reissued LSN 2 is followed by an LSN 3, so the file
+    /// has grown and the reader takes its incremental-scan path.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_overlay_drops_a_discarded_group_when_the_file_grew() {
+        let dir = test_dir("read_committed_writer_restart_grew");
+        let wal = dir.join("wal.bin");
+        let collection = [0x42u8; 16];
+        let stable = [0x01u8; 16];
+        let reused = [0x02u8; 16];
+        let later = [0x03u8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x99u8; 16],
+            &[0x99u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let durable_len =
+            journal_with_a_visible_but_undurable_group(&wal, collection, stable, reused);
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        let before_restart = store.get_read_committed(&collection, &[reused]).unwrap();
+        assert_eq!(
+            before_restart[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"stale-"[..])
+        );
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(durable_len)
+            .unwrap();
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        for (node, payload) in [(reused, &b"fresh-"[..]), (later, &b"after-"[..])] {
+            journal
+                .append_group(&[JournalMutation::Put {
+                    collection_id: collection,
+                    node_id: node,
+                    payload: payload.to_vec(),
+                }])
+                .unwrap();
+        }
+        drop(journal);
+
+        let after = store
+            .get_read_committed(&collection, &[reused, later])
+            .unwrap();
+        assert_eq!(
+            after[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"fresh-"[..]),
+            "the reissued LSN must replace the discarded group's content"
+        );
+        assert_eq!(
+            after[1].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"after-"[..])
+        );
+    }
+
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_shadows_durable_with_a_committed_delete() {
         let dir = test_dir("read_committed_delete");
@@ -7695,6 +9585,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_preserves_a_delete_boundary_across_recreate() {
         let dir = test_dir("read_committed_recreate");
@@ -7744,6 +9635,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_ignores_entries_the_checkpoint_covers() {
         let dir = test_dir("read_committed_covered");
@@ -7788,6 +9680,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_keeps_entries_a_newer_checkpoint_covers() {
         let dir = test_dir("read_committed_stale_index");
@@ -7842,6 +9735,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_fails_closed_when_reclaim_skips_its_covered_lsn() {
         let dir = test_dir("read_committed_reclaim_gap");
@@ -7892,6 +9786,108 @@ mod tests {
         );
     }
 
+    /// A genuine coverage gap that reloads cannot close — the checkpoint
+    /// exists and matches, but never covers the reclaimed LSNs — is a
+    /// persistent corruption, not a transient condition.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_gap_with_matching_checkpoint_is_corrupt() {
+        let dir = test_dir("read_committed_gap_corrupt");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Cu8; 16];
+        let node = [0x0fu8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x96u8; 16],
+            &[0x96u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"first".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal.reclaim_through(1).unwrap();
+        drop(journal);
+
+        let error = store
+            .get_read_committed(&collection, &[node])
+            .expect_err("the unrecoverable gap must fail");
+        assert!(
+            matches!(error, StorageError::Corrupt(_)),
+            "a matching checkpoint that never covers the gap is corrupt, got {error:?}"
+        );
+    }
+
+    /// The same gap, but with no usable checkpoint to reload: every reload
+    /// attempt fails, so the read is retryable once the writer publishes a
+    /// checkpoint instead of being reported as permanent corruption.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_gap_without_checkpoint_is_retryable() {
+        let dir = test_dir("read_committed_gap_retry");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Du8; 16];
+        let node = [0x0fu8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x97u8; 16],
+            &[0x97u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: node,
+                payload: b"first".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        // Remove the checkpoint the reader would reload, so the reload path
+        // fails closed but retryably.
+        fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal.reclaim_through(1).unwrap();
+        drop(journal);
+
+        let error = store
+            .get_read_committed(&collection, &[node])
+            .expect_err("the unrecoverable gap must fail");
+        assert!(
+            matches!(
+                error,
+                StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "a missing checkpoint must be reported as retryable, got {error:?}"
+        );
+    }
+
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
         let dir = test_dir("read_committed_reclaim_reload");
@@ -7977,6 +9973,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_reload_skips_the_exact_pack_gate() {
         let dir = test_dir("read_committed_reload_skip_gate");
@@ -8043,6 +10040,17 @@ mod tests {
             )
             .unwrap();
 
+        // The relaxation is scoped to the read-journal reload: a normal open
+        // runs `ReloadMode::Strict` and must still reject the checkpoint the
+        // eager append has outgrown, falling back to a full rescan rather than
+        // trusting a stale fingerprint.
+        let strict_reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        assert_eq!(
+            strict_reader.open_timings().unwrap().path,
+            OpenPath::FullScan,
+            "a strict open must not accept a checkpoint the live packs have outgrown"
+        );
+
         let read_committed = store
             .get_read_committed(&collection, &[first, second, third])
             .unwrap();
@@ -8062,6 +10070,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn repack_persists_checkpoint_so_read_journal_reload_survives_retirement() {
         // Repack moves a collection's records into a fresh destination shard
@@ -8133,6 +10142,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn repack_persisted_checkpoint_reload_resolves_record_by_post_repack_offset() {
         let dir = test_dir("repack_persists_checkpoint_read");
@@ -8166,22 +10176,30 @@ mod tests {
         );
     }
 
-    /// Delta frames carry the same raw, process-local `shard_id` that the
-    /// checkpoint does (`DeltaFrame.slot` is a packed `IndexSlot`, see
-    /// `index/format.rs`). The checkpoint path remaps those through its v6
-    /// pack table (`LossyIndex::remap_shard_ids`), but `replay_frames` stores
-    /// `frame.slot` verbatim, so a delta replayed onto a pool whose slots were
-    /// renumbered by a retirement can still point at the wrong shard.
+    /// Coverage for a post-repack delta epoch over *existing* pack identities:
+    /// a delta written after repack's fresh checkpoint must replay for a cold
+    /// reader and resolve through the checkpoint's v6 pack table, not the
+    /// reader's own shard numbering.
     ///
-    /// This test asks the narrow question that decides whether a delta-side
-    /// identity binding (a `SlotBinding` operation) is required: can a delta
-    /// log written before a retirement actually be replayed by a fresh reader
-    /// after it? The fingerprint gates are expected to reject such a log — the
-    /// epoch is named by the pre-retirement checkpoint fingerprint and its
-    /// `tail_fingerprint` names the pre-retirement pack set — in which case
-    /// replay never happens and this gap is latent rather than exploitable.
+    /// `repack_collection_reachable` persists a checkpoint (C1) naming the
+    /// post-retirement pack set, so the pre-retirement delta epoch is retired
+    /// with it. A later `sync_all` appends a fresh epoch continuing C1; this
+    /// test pins that a cold open *replays* that epoch (nonzero `delta_replay`,
+    /// not a checkpoint rewrite that already included `third`) and returns all
+    /// three records.
+    ///
+    /// `third` must be durably synced, not merely shard-flushed: only a sync
+    /// persists the index. An uncommitted record is invisible to checkpoint
+    /// replay and recoverable only by a fallback full scan — a different
+    /// property, and the one the previous version of this test accidentally
+    /// measured.
+    ///
+    /// Out of scope: a delta frame referencing a pack created *after* C1 (a
+    /// pack absent from C1's pack table), and any claim that a delta-side
+    /// `SlotBinding` is unnecessary.
+    #[cfg(feature = "multi-reader")]
     #[test]
-    fn delta_epoch_written_before_retirement_is_not_replayed_after() {
+    fn post_repack_delta_epoch_replays_for_a_cold_reader() {
         let dir = test_dir("delta_across_retirement");
         let wal = dir.join("wal.bin");
         let collection = [0x71u8; 16];
@@ -8202,7 +10220,7 @@ mod tests {
             .unwrap();
         writer.sync().unwrap();
 
-        // A post-checkpoint write leaves a delta epoch (D1) whose base is the
+        // A post-checkpoint write leaves a delta epoch whose base is the
         // current checkpoint and whose tail names the current pack set.
         writer
             .put(
@@ -8213,16 +10231,16 @@ mod tests {
             .unwrap();
         writer.sync_all().unwrap();
 
-        // Retire a shard without re-checkpointing: repack moves the collection's
-        // records into a fresh destination shard and unlinks the source. The
-        // writer's slot table now has a hole, so a fresh reader's
-        // `discover_shards` will not reproduce the writer's numbering.
+        // Repack moves the collection's records into a fresh destination shard
+        // and unlinks the source. The writer's slot table now has a hole, so a
+        // fresh reader's `discover_shards` will not reproduce the writer's
+        // numbering. Repack persists a checkpoint for the new layout.
         writer
             .repack_collection_reachable(&collection, |_hash, _data| Vec::new())
             .unwrap();
 
-        // A third record after the repack, flushed but never checkpointed,
-        // would be recoverable only through a delta replay.
+        // Commit `third` into the delta epoch continuing the post-repack
+        // checkpoint. A shard flush alone would not persist the index.
         writer
             .put(
                 &collection,
@@ -8230,24 +10248,48 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"third")),
             )
             .unwrap();
-        writer.shards.flush_all().unwrap();
+        writer.sync_all().unwrap();
         drop(writer);
 
         let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
         reader.enable_read_journal(&wal).unwrap();
-        reader.reload_index_from_checkpoint();
 
-        // Every record must either resolve correctly or not at all. A wrong
-        // shard would surface as a hash mismatch (verified in
-        // `resolve_from_pinned`), never as wrong bytes.
+        let timings = reader
+            .stats()
+            .last_open_timings
+            .expect("open must record timings");
+        // The post-repack checkpoint and its delta epoch must both validate, so
+        // the cold open takes the checkpoint fast path rather than a full scan.
+        assert_eq!(
+            timings.path,
+            OpenPath::Checkpoint,
+            "the post-repack checkpoint and the epoch continuing it must be usable"
+        );
+        // Prove the records below come from a gated delta replay, not from a
+        // checkpoint rewrite that already included `third`. This is a
+        // deterministic count, unlike the `delta_replay` duration.
+        assert!(
+            timings.delta_replay_operations > 0,
+            "cold open must have replayed the post-repack delta epoch: {timings:?}"
+        );
+        assert_eq!(
+            timings.full_scan,
+            Duration::ZERO,
+            "cold open must not have fallen back to a full scan"
+        );
+
+        // All three records must resolve to their exact bytes through the
+        // replayed delta — never to a wrong shard's bytes.
         for (id, expected) in [
             (first, &b"first"[..]),
             (second, &b"second"[..]),
             (third, &b"third"[..]),
         ] {
-            if let Some(data) = reader.get(&collection, &id).unwrap() {
-                assert_eq!(data.bytes.as_ref(), expected);
-            }
+            let data = reader
+                .get(&collection, &id)
+                .unwrap()
+                .expect("record must exist");
+            assert_eq!(data.bytes.as_ref(), expected);
         }
     }
 
@@ -8296,6 +10338,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn open_read_committed_serves_the_overlay_in_one_call() {
         let dir = test_dir("open_read_committed");
@@ -8389,8 +10432,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
-    fn reset_has_coverage_gap_flags_a_header_only_segment() {
+    fn reset_has_coverage_gap_is_a_pure_base_jump() {
         // A fully reclaimed segment carries no groups, only a moved base LSN.
         // Keying the gap check off the first group would miss it entirely.
         let header_only = crate::journal::Scan {
@@ -8398,15 +10442,35 @@ mod tests {
             valid_len: 0,
             truncated_tail: false,
             base_lsn: 3,
+            consumed_tail: Vec::new(),
         };
-        assert!(ReadJournal::reset_has_coverage_gap(&header_only, 1));
-        assert!(!ReadJournal::reset_has_coverage_gap(&header_only, 2));
+        let per_pool = |covered: u64| ReadJournal::empty(std::path::PathBuf::new(), covered, None);
+        let shared = |covered: u64| {
+            ReadJournal::empty(
+                std::path::PathBuf::new(),
+                covered,
+                Some(crate::layout::ShardType::State),
+            )
+        };
+        // The base jumped from covered + 1 = 2 to 3, so the reclaimed prefix may
+        // hold a frame this reader lacks. Both layouts must ask for a reload;
+        // whether the jump is a real gap for this pool is decided after the
+        // reload, not by inspecting the surviving groups. A previous check that
+        // looked for this pool's frames in those groups both missed reclaimed
+        // frames (silent staleness) and rejected valid frames when another pool
+        // opened the gap.
+        assert!(per_pool(1).reset_has_coverage_gap(&header_only));
+        assert!(shared(1).reset_has_coverage_gap(&header_only));
+        // covered + 1 reaches the base, so nothing at or below covered moved.
+        assert!(!per_pool(2).reset_has_coverage_gap(&header_only));
+        assert!(!shared(2).reset_has_coverage_gap(&header_only));
         assert!(
-            !ReadJournal::reset_has_coverage_gap(&crate::journal::Scan::empty(), 0),
+            !per_pool(0).reset_has_coverage_gap(&crate::journal::Scan::empty()),
             "a missing/short segment reports base 0 and is not a gap"
         );
     }
 
+    #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_picks_up_groups_appended_after_the_first_scan() {
         let dir = test_dir("read_committed_tail");
@@ -8461,7 +10525,7 @@ mod tests {
             .map(|i| {
                 let mut id = [0u8; 16];
                 id[0] = i;
-                id[8..12].copy_from_slice(&(u32::from(i) + 1).to_le_bytes());
+                id[8..12].copy_from_slice(&u32::from(i).saturating_add(1).to_le_bytes());
                 (id, NodeData::new(bytes::Bytes::from(format!("node {i}"))))
             })
             .collect()
@@ -8656,7 +10720,7 @@ mod tests {
                         &NodeData::new(bytes::Bytes::from_static(b"tamper target")),
                     )
                     .unwrap();
-                let (shard_id, offset) = store
+                let (slot, offset) = store
                     .generation(&TEST_COLLECTION)
                     .unwrap()
                     .index
@@ -8665,7 +10729,7 @@ mod tests {
                 // Tampering happens on-disk: commit the buffered frame so the
                 // tamper site computed from `offset` actually lands in the file.
                 store.sync_all().unwrap();
-                let path = store.shards.get_shard(shard_id).unwrap().path.clone();
+                let path = store.shards.get_shard(slot).unwrap().path.clone();
                 drop(store);
 
                 let mut bytes = fs::read(&path).unwrap();
@@ -10151,6 +12215,60 @@ mod tests {
             Duration::ZERO,
             "the barrier path must not fsync pack shards with a WAL"
         );
+        assert_eq!(timings.journal_sync_calls, 1);
+        assert!(timings.journal_records >= 1);
+        assert_eq!(
+            timings.journal_bytes, 0,
+            "the WAL group was appended during publication; sync only fsyncs it"
+        );
+        assert!(timings.journal_fsync > Duration::ZERO);
+        assert!(
+            timings.journal_lock_wait + timings.journal_append + timings.journal_fsync
+                <= timings.wal,
+            "reported journal phases cannot exceed the WAL phase"
+        );
+        let stats = store.stats();
+        assert_eq!(stats.publish_calls, 1);
+        assert_eq!(stats.sync_diagnostics.worst_syncs.len(), 1);
+        assert_eq!(stats.sync_diagnostics.peak_journal_in_flight, 1);
+        assert_eq!(
+            stats
+                .sync_diagnostics
+                .fsync_latency
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            stats
+                .sync_diagnostics
+                .lock_wait_latency
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        let interval = store.take_sync_diagnostics();
+        assert_eq!(interval.peak_journal_in_flight, 1);
+        assert!(interval.max_journal_fsync > Duration::ZERO);
+        assert_eq!(interval.max_journal_lock_wait, timings.journal_lock_wait);
+        assert_eq!(interval.worst_syncs.len(), 1);
+        assert_eq!(
+            interval.fsync_latency.buckets.iter().sum::<u64>(),
+            1,
+            "taking diagnostics must return the completed interval"
+        );
+        assert_eq!(
+            store.take_sync_diagnostics(),
+            SyncDiagnosticsSnapshot::default(),
+            "taking diagnostics must reset only the diagnostics interval"
+        );
+        assert_eq!(
+            store.stats().sync_totals.calls,
+            1,
+            "taking diagnostics must preserve cumulative sync totals"
+        );
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
         assert!(store.journal().expect("journal enabled").committed_lsn() >= 1);
     }
@@ -10192,6 +12310,64 @@ mod tests {
             "the post-checkpoint mutation must be replayed"
         );
         assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+
+    /// A single-pool journal may reclaim an older committed group while a
+    /// later group remains in the segment. Reopening that same store must
+    /// still replay the surviving suffix.
+    #[test]
+    fn single_pool_reclaim_then_replay_surviving_group() {
+        let dir = test_dir("single_pool_reclaim_replay");
+        let journal_path = dir.join("wal.bin");
+        let reclaimed_id = distinct_id(10);
+        let surviving_id = distinct_id(11);
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store.enable_journal(&journal_path).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(8),
+                    &NodeData::new(bytes::Bytes::from_static(b"checkpointed")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &reclaimed_id,
+                    &NodeData::new(bytes::Bytes::from_static(b"reclaimed")),
+                )
+                .unwrap();
+            let reclaimed_lsn = store.journal().unwrap().published_lsn();
+            store.sync_all().unwrap();
+
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &surviving_id,
+                    &NodeData::new(bytes::Bytes::from_static(b"surviving")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+            let journal = store.journal().unwrap();
+            let surviving_lsn = journal.published_lsn();
+            assert!(surviving_lsn > reclaimed_lsn);
+            journal.reclaim_through(reclaimed_lsn).unwrap();
+        }
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.enable_journal(&journal_path).unwrap();
+        assert_eq!(reopened.replay_journal().unwrap(), 1);
+        assert!(reopened
+            .get(&TEST_COLLECTION, &surviving_id)
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .get(&TEST_COLLECTION, &reclaimed_id)
+            .unwrap()
+            .is_some());
     }
 
     /// A checkpoint must bound journal replay by the LSN that is actually
@@ -10652,6 +12828,12 @@ mod tests {
         let snapshot = store.stats();
         assert_eq!(snapshot.get_calls, 2);
         assert_eq!(snapshot.get_misses, 1);
+        assert_eq!(snapshot.get_latency.calls, 2);
+        assert!(snapshot.get_latency.total > std::time::Duration::ZERO);
+        assert!(snapshot.get_latency.max > std::time::Duration::ZERO);
+        assert!(snapshot.get_latency.max >= snapshot.get_latency.total / 2);
+        assert!(snapshot.get_latency.max <= snapshot.get_latency.total);
+        assert_eq!(snapshot.get_latency.buckets.iter().sum::<u64>(), 2);
 
         // Batched writes against an already-materialized (non-mmap) index
         // mutate it in place and roll back via an undo log on failure,
@@ -10684,6 +12866,8 @@ mod tests {
         // already-owned, non-mmap index and takes the in-place fast path.
         assert_eq!(snapshot.put_many_clone_path_calls, 1);
         assert_eq!(snapshot.put_many_fast_path_calls, 7);
+        assert_eq!(snapshot.put_many_latency.calls, 8);
+        assert_eq!(snapshot.put_many_latency.buckets.iter().sum::<u64>(), 8);
         // 64 distinct records into a floor-sized 64-slot index must cross the
         // grow threshold at least once.
         assert!(snapshot.index_grow_count >= 1);
@@ -10704,6 +12888,9 @@ mod tests {
         assert_eq!(snapshot.put_many_calls, 0);
         assert_eq!(snapshot.get_calls, 0);
         assert_eq!(snapshot.get_misses, 0);
+        assert_eq!(snapshot.get_latency.calls, 0);
+        assert_eq!(snapshot.get_latency.max, std::time::Duration::ZERO);
+        assert_eq!(snapshot.put_many_latency.calls, 0);
 
         // Sync accounting: the first (structurally invalidated) sync rewrites
         // the checkpoint; a later clean batch sync appends the delta log.
@@ -10837,6 +13024,171 @@ mod tests {
         assert_eq!(
             single_after.read_many_span_bytes,
             single_before.read_many_span_bytes
+        );
+    }
+
+    #[test]
+    fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
+        let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+
+        // Meld runs across gaps within the threshold, split across larger ones.
+        per_shard.insert(3, vec![0, 50_000, 400_000, 450_000, 10_000_000]);
+        let extents = plan_read_extents(
+            &per_shard,
+            ReadPlanPolicy {
+                merge_gap_bytes: 100_000,
+                max_extent_bytes: 10_000_000,
+                min_batch_candidates: 1,
+                random_advice: false,
+            },
+        );
+        assert_eq!(
+            extents,
+            vec![
+                ReadExtent {
+                    slot: 3,
+                    start: 0,
+                    end: 50_000 + MAX_FRAME_DISK_LEN,
+                },
+                ReadExtent {
+                    slot: 3,
+                    start: 400_000,
+                    end: 450_000 + MAX_FRAME_DISK_LEN,
+                },
+                ReadExtent {
+                    slot: 3,
+                    start: 10_000_000,
+                    end: 10_000_000 + MAX_FRAME_DISK_LEN,
+                },
+            ]
+        );
+
+        // A generous gap threshold still splits once the run would exceed the
+        // cap: 0 and 100_000 fit under 200_000, but adding 150_000 would not.
+        per_shard.clear();
+        per_shard.insert(7, vec![0, 100_000, 150_000]);
+        let capped = plan_read_extents(
+            &per_shard,
+            ReadPlanPolicy {
+                merge_gap_bytes: 10_000_000,
+                max_extent_bytes: 200_000,
+                min_batch_candidates: 1,
+                random_advice: false,
+            },
+        );
+        assert_eq!(
+            capped,
+            vec![
+                ReadExtent {
+                    slot: 7,
+                    start: 0,
+                    end: 100_000 + MAX_FRAME_DISK_LEN,
+                },
+                ReadExtent {
+                    slot: 7,
+                    start: 150_000,
+                    end: 150_000 + MAX_FRAME_DISK_LEN,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plan_read_extents_orders_by_slot() {
+        let mut per_shard: HashMap<u16, Vec<u64>> = HashMap::new();
+        per_shard.insert(9, vec![0, 10]);
+        per_shard.insert(2, vec![0, 10]);
+        per_shard.insert(5, vec![0, 10]);
+        let extents = plan_read_extents(
+            &per_shard,
+            ReadPlanPolicy {
+                merge_gap_bytes: 100,
+                max_extent_bytes: 8 * 1024 * 1024,
+                min_batch_candidates: 1,
+                random_advice: false,
+            },
+        );
+        let slots: Vec<u16> = extents.iter().map(|extent| extent.slot).collect();
+        assert_eq!(slots, vec![2, 5, 9]);
+    }
+
+    #[test]
+    fn test_read_plan_policy_wants_gates_on_batch_size_and_cap() {
+        let policy = ReadPlanPolicy {
+            merge_gap_bytes: 0,
+            max_extent_bytes: 8 * 1024 * 1024,
+            min_batch_candidates: 16,
+            random_advice: false,
+        };
+        assert!(!policy.wants(15));
+        assert!(policy.wants(16));
+        assert!(!ReadPlanPolicy::disabled().wants(1_000_000));
+    }
+
+    #[test]
+    fn test_random_advice_preset_plans_nothing() {
+        // The random-advice preset suppresses readahead but builds no
+        // extents: it must never satisfy `wants`, whatever the batch size.
+        let policy = ReadPlanPolicy::random_advice();
+        assert!(policy.random_advice);
+        assert!(!policy.wants(1_000_000));
+        assert!(!ReadPlanPolicy::disabled().random_advice);
+        assert!(!ReadPlanPolicy::prefetch().random_advice);
+        assert!(ReadPlanPolicy::prefetch().wants(16));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_get_many_prefetch_plan_counters() {
+        let dir = test_dir("read_plan_counters");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        let entries: Vec<_> = (0..8u8)
+            .map(|value| {
+                let mut id = [0u8; 16];
+                id[0] = value;
+                id[9] = value.wrapping_mul(37).wrapping_add(11);
+                (id, NodeData::new(bytes::Bytes::from(vec![value; 16])))
+            })
+            .collect();
+        writer.put_many(&TEST_COLLECTION, &entries).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let reader = PackfileStorage::open_read_only(dir).unwrap();
+        reader.set_stats_enabled(true);
+        reader.set_read_plan_policy(ReadPlanPolicy {
+            merge_gap_bytes: 1024 * 1024,
+            max_extent_bytes: 8 * 1024 * 1024,
+            min_batch_candidates: 1,
+            random_advice: false,
+        });
+
+        let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
+        let before = reader.stats();
+        let results = reader.get_many(&TEST_COLLECTION, &ids).unwrap();
+        assert_eq!(
+            results.iter().filter(|value| value.is_some()).count(),
+            entries.len()
+        );
+        let after = reader.stats();
+        assert!(after.read_plan_extents > before.read_plan_extents);
+        assert!(after.read_plan_prefetch_bytes > before.read_plan_prefetch_bytes);
+        // Every candidate is committed to disk, so every planned extent is
+        // prefetchable and none is skipped.
+        assert_eq!(after.read_plan_skipped_extents, 0);
+
+        // A disabled policy prefetches nothing, even for the same batch.
+        reader.set_read_plan_policy(ReadPlanPolicy::disabled());
+        let disabled_before = reader.stats();
+        reader.get_many(&TEST_COLLECTION, &ids).unwrap();
+        let disabled_after = reader.stats();
+        assert_eq!(
+            disabled_after.read_plan_extents,
+            disabled_before.read_plan_extents
+        );
+        assert_eq!(
+            disabled_after.read_plan_prefetch_bytes,
+            disabled_before.read_plan_prefetch_bytes
         );
     }
 
@@ -11430,6 +13782,11 @@ mod tests {
         std::fs::write(dir.join("aabb_00.pack"), b"").unwrap();
         std::fs::write(dir.join("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_00.pack"), b"").unwrap();
         std::fs::write(dir.join("00000000000000000000000000000000_gg.pack"), b"").unwrap();
+        // A filename that isn't valid UTF-8 is only creatable on filesystems
+        // that accept arbitrary bytes (Linux/BSD). APFS on macOS rejects it
+        // with EILSEQ (os error 92), and Windows has no `std::os::unix`; the
+        // ASCII-only malformed names above still cover the skip path there.
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
@@ -11446,6 +13803,7 @@ mod tests {
                 collection_id: [0x01; 16],
                 hash: [0xAA; 16],
                 data: bytes::Bytes::from_static(b"hello"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -11772,7 +14130,7 @@ mod tests {
         const TEST_SHARDS: usize = 4;
 
         let dir = test_dir("repack_reclaims_slots");
-        let store = PackfileStorage::open(dir).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
 
         let mut root = [0u8; 16];
         root[0] = 0xFF;
@@ -11822,6 +14180,25 @@ mod tests {
         assert!(
             store.shards_retired() > 0,
             "retire_empty_shards should have retired at least one now-garbage-only shard"
+        );
+
+        // The collection occupied several packs, and repack retired the
+        // garbage-only source packs. The persisted byte total must follow the
+        // surviving physical layout rather than retaining bytes for retired
+        // packs.
+        store.sync_all().unwrap();
+        let physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let expected = physical
+            .collections
+            .get(&TEST_COLLECTION)
+            .expect("repacked collection remains on disk")
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "retired packs must not remain in collection byte accounting"
         );
 
         // Every shard except the current active one held nothing but
@@ -12208,7 +14585,760 @@ mod tests {
             from_disk, expected,
             "the persisted directory's per-collection totals must match the live index's own counts"
         );
+        let disk_bytes = PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .expect("v5 sidecar physical metrics");
+        assert!(disk_bytes.get(&TEST_COLLECTION).copied().unwrap_or(0) > 0);
+        assert!(disk_bytes.get(&OTHER_COLLECTION).copied().unwrap_or(0) > 0);
         assert!(PackfileStorage::collection_directory_persisted_at(&dir).is_some());
+    }
+
+    #[test]
+    fn put_many_overwrites_keep_one_live_node_and_count_every_frame() {
+        let dir = test_dir("put_many_overwrites_accounting");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let id = distinct_id(0);
+        let entries = vec![
+            (id, NodeData::new(bytes::Bytes::from_static(b"first"))),
+            (id, NodeData::new(bytes::Bytes::from_static(b"second"))),
+        ];
+        assert_eq!(store.put_many(&TEST_COLLECTION, &entries).unwrap(), 2);
+        store.sync_all().unwrap();
+
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)],
+            "an overwrite inside one batch must not inflate live-node counts"
+        );
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "batch accounting must include both appended frames"
+        );
+    }
+
+    #[test]
+    fn put_verified_and_empty_records_are_accounted_as_physical_frames() {
+        let dir = test_dir("verified_and_empty_accounting");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let verified_id = distinct_id(0);
+        let verified = bytes::Bytes::from_static(b"verified");
+        let digest = DigestAlgorithm::Sha256.digest(&verified);
+        store
+            .put_verified(
+                &TEST_COLLECTION,
+                &verified_id,
+                &NodeData::new(verified),
+                &digest,
+                DigestAlgorithm::Sha256,
+                &digest,
+                None,
+            )
+            .unwrap();
+        let empty_id = distinct_id(1);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &empty_id,
+                &NodeData::new(bytes::Bytes::new()),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 2)],
+            "empty records still occupy live index slots"
+        );
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "verified and empty records must use their encoded frame lengths"
+        );
+    }
+
+    #[test]
+    fn failed_sidecar_recovery_is_retried_and_never_publishes_zero_metrics() {
+        let dir = test_dir("sidecar_recovery_failure");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"data")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        let before = fs::read(&sidecar).unwrap();
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+
+        // Model an open whose recovery scan failed: byte totals unknown, flag set.
+        store.index_tables.write().collection_disk_bytes.clear();
+        store
+            .shard_collections_recovery_failed
+            .store(true, Ordering::Release);
+
+        // While the scan still fails (an unreadable pack), nothing is written.
+        let junk = dir.join("pack_00000000000000ff.pack");
+        fs::write(&junk, b"not a packfile").unwrap();
+        assert!(store.persist_shard_collections().is_err());
+        assert!(store
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire));
+        assert_eq!(fs::read(&sidecar).unwrap(), before, "no zero-byte sidecar");
+
+        // Once the scan can succeed, the next persist retries it and recovers.
+        fs::remove_file(&junk).unwrap();
+        store.persist_shard_collections().unwrap();
+        assert!(!store
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire));
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected)
+        );
+    }
+
+    /// Deterministic version of the recovery/append race: hold recovery between
+    /// its scan and the swap of its totals and force a writer into that window.
+    /// The writer must be blocked by the collection mutexes; without them its
+    /// frame would be appended after the scan and then be lost by the swap.
+    #[test]
+    fn a_writer_cannot_slip_into_the_recovery_scan_to_swap_window() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::time::Duration;
+
+        let wait = Duration::from_secs(10);
+        let dir = test_dir("sidecar_recovery_window");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.index_tables.write().collection_disk_bytes.clear();
+        store
+            .shard_collections_recovery_failed
+            .store(true, Ordering::Release);
+
+        let (scanned_tx, scanned_rx) = channel::<()>();
+        let (resume_tx, resume_rx) = channel::<()>();
+        let resume_rx = parking_lot::Mutex::new(resume_rx);
+        *store.recovery_pause_hook.lock() = Some(Arc::new(move || {
+            scanned_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }));
+
+        let recovery = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.persist_shard_collections().unwrap())
+        };
+        // Recovery has scanned and is paused, still holding its locks.
+        scanned_rx.recv_timeout(wait).unwrap();
+
+        let (started_tx, started_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let writer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                store
+                    .put(
+                        &TEST_COLLECTION,
+                        &distinct_id(1),
+                        &NodeData::new(bytes::Bytes::from_static(b"written during recovery")),
+                    )
+                    .unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        // Only start the clock once the writer is running, so the timeout
+        // measures lock blocking rather than thread scheduling.
+        started_rx.recv_timeout(wait).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Timeout),
+            "a writer must be blocked while recovery holds the collection locks"
+        );
+
+        resume_tx.send(()).unwrap();
+        recovery.join().unwrap();
+        done_rx
+            .recv_timeout(wait)
+            .expect("writer must finish once recovery ends");
+        writer.join().unwrap();
+
+        // `sync_all` defers the sidecar on a delta-only barrier; flush it
+        // explicitly so this checks the totals rather than the deferral.
+        store.sync_all().unwrap();
+        // The sidecar is rebuilt from the shards' in-memory lengths, while
+        // `physical_layout` reads the pack files. Force the writer's frame out
+        // of any staging buffer first so the two sources cannot disagree just
+        // because the frame was appended after the recovery thread's own
+        // `flush_all` — the very window this test drives.
+        store.shards.flush_all().unwrap();
+        store.persist_shard_collections().unwrap();
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "the frame written around recovery must be in the persisted totals"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A put whose insert triggers index growth takes a different code path;
+    /// it must still account for its frame's bytes.
+    #[test]
+    fn puts_and_batches_that_grow_the_index_are_byte_accounted() {
+        let dir = test_dir("growth_byte_accounting");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x43u8; 16];
+        for i in 0..200u8 {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![b'x'; 64])),
+                )
+                .unwrap();
+        }
+        let batch: Vec<_> = (0..200u8)
+            .map(|i| {
+                (
+                    distinct_id(i),
+                    NodeData::new(bytes::Bytes::from(vec![b'y'; 64])),
+                )
+            })
+            .collect();
+        assert_eq!(store.put_many(&collection, &batch).unwrap(), 200);
+
+        // A batch into an EXISTING small collection is what grows its index
+        // mid-batch (a fresh collection is pre-sized for the batch).
+        let grown_collection = [0x44u8; 16];
+        store
+            .put(
+                &grown_collection,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        let (_, _, capacity_before) = store.collection_index_info(&grown_collection).unwrap();
+        let batch: Vec<_> = (1..250u8)
+            .map(|i| {
+                (
+                    distinct_id(i),
+                    NodeData::new(bytes::Bytes::from(vec![b'z'; 64])),
+                )
+            })
+            .collect();
+        assert_eq!(store.put_many(&grown_collection, &batch).unwrap(), 249);
+        let (_, _, capacity_after) = store.collection_index_info(&grown_collection).unwrap();
+        assert!(
+            capacity_after > capacity_before,
+            "the batch must grow the index ({capacity_before} -> {capacity_after})"
+        );
+        store.sync_all().unwrap();
+
+        let physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let sidecar = PackfileStorage::collection_disk_bytes_from_disk(&dir).unwrap();
+        for id in [TEST_COLLECTION, collection, grown_collection] {
+            assert_eq!(
+                sidecar.get(&id),
+                Some(&physical.collections[&id].disk_bytes),
+                "collection {id:02x?}: growth must not drop a frame's bytes"
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Recovery must be atomic with appends: frames written while it runs may
+    /// not be left out of (or double counted in) the totals it publishes.
+    #[test]
+    fn sidecar_recovery_is_consistent_with_concurrent_appends() {
+        let dir = test_dir("sidecar_recovery_concurrent");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        store.index_tables.write().collection_disk_bytes.clear();
+        store
+            .shard_collections_recovery_failed
+            .store(true, Ordering::Release);
+
+        let writer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for i in 1..200u8 {
+                    store
+                        .put(
+                            &TEST_COLLECTION,
+                            &distinct_id(i),
+                            &NodeData::new(bytes::Bytes::from(vec![b'x'; 64])),
+                        )
+                        .unwrap();
+                }
+            })
+        };
+        // Recover while the writer is appending.
+        while store
+            .shard_collections_recovery_failed
+            .load(Ordering::Acquire)
+        {
+            let _ = store.persist_shard_collections();
+        }
+        writer.join().unwrap();
+        // `sync_all` now defers the sidecar on a delta-only barrier, so flush
+        // it explicitly before checking the totals recovery published.
+        store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
+
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "totals published by recovery must match the frames on disk"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A checkpoint that survives without its shard→collection sidecar must not
+    /// leave the sidecar missing (no write dirties the store to regenerate it)
+    /// nor persist zero byte totals for data that is already on disk.
+    #[test]
+    fn missing_sidecar_is_rewritten_with_exact_bytes_when_the_checkpoint_survives() {
+        let dir = test_dir("sidecar_missing_checkpoint_present");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            let id = distinct_id(0);
+            for payload in [&b"first"[..], &b"second!!"[..]] {
+                store
+                    .put(
+                        &TEST_COLLECTION,
+                        &id,
+                        &NodeData::new(bytes::Bytes::copy_from_slice(payload)),
+                    )
+                    .unwrap();
+            }
+            store.sync_all().unwrap();
+        }
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        fs::remove_file(&sidecar).unwrap();
+        assert!(PackfileStorage::index_checkpoint_path(&dir).exists());
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.sync_all().unwrap();
+        assert!(sidecar.exists(), "sync must regenerate the lost sidecar");
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)]
+        );
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "regenerated bytes must equal the physical layout, not zero"
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A delta-only sync must not rewrite the sidecar: it records staleness and
+    /// waits for an explicit flush. The first sync (no checkpoint base) is a
+    /// full rewrite, so it is still an anchor.
+    #[test]
+    fn delta_barrier_defers_sidecar_until_an_explicit_flush() {
+        let dir = test_dir("sidecar_deferred_delta_barrier");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"seed")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        assert_eq!(
+            store.stats().sidecar_writes,
+            1,
+            "the checkpoint anchor writes the sidecar"
+        );
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        let after_checkpoint = fs::read(&sidecar).unwrap();
+
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(1),
+                &NodeData::new(bytes::Bytes::from_static(b"more")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        assert_eq!(
+            store.stats().sidecar_writes,
+            1,
+            "a delta-only barrier must not rewrite the sidecar"
+        );
+        assert!(store.shard_collections_stale.load(Ordering::Relaxed));
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            after_checkpoint,
+            "the on-disk sidecar is left stale, not rewritten"
+        );
+
+        // An explicit flush is the checkpoint/repack/shutdown anchor.
+        store.persist_shard_collections().unwrap();
+        assert_eq!(store.stats().sidecar_writes, 2);
+        assert!(!store.shard_collections_stale.load(Ordering::Relaxed));
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 2)]
+        );
+
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sidecar left stale by a deferred delta barrier must not be trusted: a
+    /// concurrent read-only open falls back to the slot walk. Dropping the
+    /// writer flushes it, so a later open trusts it again.
+    #[test]
+    fn stale_sidecar_forces_slot_scan_and_drop_repins_it() {
+        let dir = test_dir("sidecar_stale_then_drop");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        for i in 0..3u8 {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        store.sync_all().unwrap(); // checkpoint anchor: sidecar written
+
+        for i in 3..6u8 {
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i])),
+                )
+                .unwrap();
+        }
+        store.sync_all().unwrap(); // delta barrier: sidecar deferred
+
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        assert_eq!(
+            reader.open_timings().unwrap().bookkeeping_source,
+            BookkeepingSource::SlotScan,
+            "a stale sidecar must not be trusted"
+        );
+        assert_eq!(
+            reader
+                .collection_summaries()
+                .into_iter()
+                .find(|(id, _, _, _)| *id == TEST_COLLECTION)
+                .unwrap()
+                .1,
+            6,
+            "the slot walk must still see every live record"
+        );
+        drop(reader);
+
+        // Dropping the writer flushes the deferred sidecar, re-pinned to the
+        // live pack set.
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.open_timings().unwrap().bookkeeping_source,
+            BookkeepingSource::Sidecar,
+            "Drop must have re-pinned the sidecar to the live packs"
+        );
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 6)]
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A torn (partially written) sidecar must be treated as absent: open
+    /// rebuilds from the slot walk, and the next clean barrier regenerates it
+    /// with exact byte totals.
+    #[test]
+    fn torn_sidecar_is_ignored_and_regenerated() {
+        let dir = test_dir("sidecar_torn");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(0),
+                    &NodeData::new(bytes::Bytes::from_static(b"x")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+        }
+        let sidecar = PackfileStorage::shard_collections_path(&dir);
+        let full = fs::read(&sidecar).unwrap();
+        assert!(full.len() > 20);
+        fs::write(&sidecar, &full[..full.len() / 2]).unwrap();
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.open_timings().unwrap().bookkeeping_source,
+            BookkeepingSource::SlotScan,
+            "a torn sidecar must not be trusted"
+        );
+        // The open observed a missing sidecar, so the clean barrier regenerates
+        // it without needing any write.
+        reopened.sync_all().unwrap();
+        assert!(reopened.stats().sidecar_writes >= 1);
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "regeneration must use exact byte totals, not zeros"
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The rate-limited flush must stay consistent while writers append.
+    #[test]
+    fn maybe_persist_shard_collections_is_consistent_under_concurrent_writes() {
+        let dir = test_dir("sidecar_maybe_persist_concurrent");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        let writer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for i in 0..500u32 {
+                    let mut id = [0u8; 16];
+                    id[..4].copy_from_slice(&i.to_le_bytes());
+                    id[9] = u8::try_from(i & 0xff).unwrap().wrapping_mul(37);
+                    store
+                        .put(
+                            &TEST_COLLECTION,
+                            &id,
+                            &NodeData::new(bytes::Bytes::from(vec![b'x'; 32])),
+                        )
+                        .unwrap();
+                }
+            })
+        };
+        while !writer.is_finished() {
+            store.persist_shard_collections().unwrap();
+        }
+        writer.join().unwrap();
+        store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
+
+        let expected = crate::packfile::layout::physical_layout(&dir)
+            .unwrap()
+            .collections[&TEST_COLLECTION]
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "totals flushed under concurrent writes must match the frames on disk"
+        );
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 500)]
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A write that is never synced is deliberately not flushed at shutdown:
+    /// it already advances a pack past the checkpoint, so the next open cannot
+    /// take the checkpoint fast path and never consults the sidecar. Correctness
+    /// must hold anyway, because the full rescan rebuilds everything.
+    #[test]
+    fn unsynced_write_then_drop_reopens_by_full_scan_with_correct_data() {
+        let dir = test_dir("sidecar_unsynced_drop");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(0),
+                    &NodeData::new(bytes::Bytes::from_static(b"synced")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+            // A later write with no sync must not mark the sidecar stale, and
+            // `Drop` must not need to flush it.
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &distinct_id(1),
+                    &NodeData::new(bytes::Bytes::from_static(b"unsynced")),
+                )
+                .unwrap();
+            assert!(!store.is_shard_collections_stale());
+        }
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.open_timings().unwrap().path,
+            OpenPath::FullScan,
+            "an unsynced write invalidates the checkpoint fast path"
+        );
+        assert_eq!(
+            reopened
+                .collection_summaries()
+                .into_iter()
+                .find(|(id, _, _, _)| *id == TEST_COLLECTION)
+                .unwrap()
+                .1,
+            2,
+            "the full rescan must still recover every record"
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_collection_disk_bytes_track_overwrite_reopen_and_repack() {
+        let dir = test_dir("collection_disk_bytes_semantics");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let id = distinct_id(0);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"second")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)],
+            "overwriting a key must not inflate the live-node count"
+        );
+        let physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let expected = physical
+            .collections
+            .get(&TEST_COLLECTION)
+            .expect("collection in physical layout")
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "sidecar bytes must include both the original and overwrite frames"
+        );
+
+        drop(store);
+        let checkpoint_reopened = PackfileStorage::open(dir.clone()).unwrap();
+        checkpoint_reopened.sync_all().unwrap();
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "checkpoint-backed reopen must preserve physical byte accounting"
+        );
+        drop(checkpoint_reopened);
+        fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+        fs::remove_file(PackfileStorage::shard_collections_path(&dir)).unwrap();
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.sync_all().unwrap();
+        assert_eq!(
+            PackfileStorage::collection_directory_from_disk(&dir),
+            vec![(TEST_COLLECTION, 1)],
+            "a full rescan must preserve the live-node count"
+        );
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&expected),
+            "reopen must preserve physical byte accounting"
+        );
+        reopened
+            .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+            .unwrap();
+        reopened.sync_all().unwrap();
+        let repacked_physical = crate::packfile::layout::physical_layout(&dir).unwrap();
+        let repacked_expected = repacked_physical
+            .collections
+            .get(&TEST_COLLECTION)
+            .expect("collection after repack")
+            .disk_bytes;
+        assert_eq!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir)
+                .unwrap()
+                .get(&TEST_COLLECTION),
+            Some(&repacked_expected),
+            "repack must update physical byte accounting"
+        );
     }
 
     #[test]
@@ -12313,7 +15443,10 @@ mod tests {
         );
 
         store.delete_collection(&TEST_COLLECTION).unwrap();
+        // A delta-only sync defers the sidecar, so flush it to exercise the
+        // persisted directory rather than the deferral.
         store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
 
         let directory = PackfileStorage::collection_directory_from_disk(&dir);
         assert_eq!(
@@ -12492,7 +15625,7 @@ mod tests {
                 &NodeData::new(bytes::Bytes::from_static(b"pin me")),
             )
             .unwrap();
-        let (shard_id, offset) = store
+        let (slot, offset) = store
             .generation(&TEST_COLLECTION)
             .unwrap()
             .index
@@ -12500,11 +15633,11 @@ mod tests {
             .expect("just-written record must be indexed");
 
         // Duplicate ids in the input must collapse to one pinned entry.
-        let pinned = store.pin_shards([shard_id, shard_id, shard_id].into_iter());
+        let pinned = store.pin_shards([slot, slot, slot].into_iter());
         assert_eq!(pinned.len(), 1);
 
         let record = store
-            .read_at(&pinned[&shard_id], offset, true)
+            .read_at(&pinned[&slot], offset, true)
             .expect("pinned shard must resolve the real on-disk record");
         assert_eq!(record.data.as_ref(), b"pin me");
     }
@@ -12577,5 +15710,1169 @@ mod tests {
             found, total,
             "lost writes during concurrent put+reachable-repack"
         );
+    }
+
+    /// Collect the metadata of every record in every pack file under `dir`.
+    fn all_record_metadata(dir: &std::path::Path) -> Vec<FrameMetadata> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "pack") {
+                let mut file = fs::File::open(&path).unwrap();
+                file.seek(SeekFrom::Start(packfile::HEADER_LEN as u64))
+                    .unwrap();
+                while let Some(record) = packfile::read_record_metadata(&mut file).unwrap() {
+                    if let Some(metadata) = record.metadata {
+                        found.push(metadata);
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// `put_verified` must reject a mismatched digest before writing anything,
+    /// and accept a matching digest while attaching the full logical id,
+    /// content digest, algorithm, and role to the on-disk frame.
+    #[test]
+    fn put_verified_checks_digest_and_attaches_metadata() {
+        let dir = test_dir("put_verified_metadata");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x31; 16];
+        let id = [0x32; 16];
+        let payload = b"canonical event bytes";
+        let data = NodeData::new(bytes::Bytes::from_static(payload));
+        let logical_id = [0x77; 32];
+        let digest = crate::storage::content_digest(DigestAlgorithm::Sha256, payload);
+
+        // A wrong expected digest is rejected and leaves no record behind.
+        let mut wrong = digest;
+        wrong[0] ^= 0xff;
+        let error = store
+            .put_verified(
+                &collection,
+                &id,
+                &data,
+                &logical_id,
+                DigestAlgorithm::Sha256,
+                &wrong,
+                Some(b"event"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Corrupt(_)), "got {error:?}");
+        assert!(store.get(&collection, &id).unwrap().is_none());
+        assert_eq!(all_record_metadata(&dir), Vec::new());
+
+        // The matching digest succeeds.
+        store
+            .put_verified(
+                &collection,
+                &id,
+                &data,
+                &logical_id,
+                DigestAlgorithm::Sha256,
+                &digest,
+                Some(b"event"),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(
+            store.get(&collection, &id).unwrap().map(|d| d.bytes),
+            Some(bytes::Bytes::from_static(payload))
+        );
+
+        let metadatas = all_record_metadata(&dir);
+        assert_eq!(metadatas.len(), 1);
+        let metadata = &metadatas[0];
+        assert_eq!(metadata.logical_id, Some(logical_id));
+        assert_eq!(metadata.content_digest, Some(digest));
+        assert_eq!(metadata.digest_algorithm, DigestAlgorithm::Sha256);
+        assert_eq!(metadata.role.as_deref(), Some(&b"event"[..]));
+
+        // Read path reconstructs metadata too (via `read_record_metadata`).
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.get(&collection, &id).unwrap().map(|d| d.bytes),
+            Some(bytes::Bytes::from_static(payload))
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A generic `put` (metadata `None`) must not grow frames or set the
+    /// metadata flag, so existing workloads see byte-identical records.
+    #[test]
+    fn plain_put_writes_no_metadata() {
+        let dir = test_dir("plain_put_no_metadata");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x41; 16];
+        let id = [0x42; 16];
+        store
+            .put(
+                &collection,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"plain")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(all_record_metadata(&dir), Vec::new());
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A writer that opens without a usable checkpoint (e.g. after an aborted
+    /// import that never synced) must persist one on its next sync even though
+    /// it wrote nothing itself; otherwise every later open rescans every pack.
+    #[test]
+    fn rescan_open_persists_a_checkpoint_on_the_next_sync() {
+        let dir = test_dir("rescan_open_checkpoint");
+        {
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(
+                    &TEST_COLLECTION,
+                    &[0x11u8; 16],
+                    &NodeData::new(bytes::Bytes::from_static(b"payload")),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+        }
+        let checkpoint = PackfileStorage::index_checkpoint_path(&dir);
+        fs::remove_file(&checkpoint).unwrap();
+
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        assert!(!checkpoint.exists(), "the rescan open alone writes none");
+        store.sync_all().unwrap();
+        assert!(
+            checkpoint.exists(),
+            "a sync after a rescan open must persist the checkpoint"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collection_len_counts_genesis_and_distinct_ids() {
+        let dir = test_dir("collection_len");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        crate::storage::assert_collection_len_counts_genesis_and_distinct_ids(&store);
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An empty batch must be a no-op across every backend: no collection is
+    /// created, so `collection_exists`/`collection_len` report absence. This
+    /// mirrors the in-memory-backend test of the same name; the two backends
+    /// previously disagreed (`InMemoryStorage` left an empty entry behind).
+    #[test]
+    fn empty_put_many_is_a_noop_and_does_not_create_the_collection() {
+        let dir = test_dir("empty_put_many_noop");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x7Du8; 16];
+        assert_eq!(store.put_many(&collection, &[]).unwrap(), 0);
+        assert!(!store.collection_exists(&collection));
+        assert_eq!(store.collection_len(&collection).unwrap(), None);
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Concurrent genesis establishment on a real packfile-backed store must
+    /// serialize on the collection `put_mutex`: without it, two writers can
+    /// both observe an absent metadata record and append conflicting genesis
+    /// frames. `InMemoryStorage`'s equivalent is trivially serialized by its
+    /// single map write lock; this exercises the locking path that is not.
+    ///
+    /// Scope: intra-process only. The `put_mutex` map is per-instance, so it
+    /// says nothing about writers in separate processes. Cross-process writers
+    /// are excluded by the shard pool's exclusive `.mtxdb.lock` writer lock
+    /// (`ShardPool::acquire_writer_lock`), which permits one writer process per
+    /// store; this test pins the thread-level race.
+    #[test]
+    fn ensure_collection_metadata_is_atomic_under_concurrency() {
+        use crate::template::{
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
+        };
+
+        let dir = test_dir("ensure_metadata_concurrent");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        let metadata = Arc::new(CollectionMetadata {
+            member_namespace: Some(*b"EVNT"),
+            collection_canonical_id: b"!room:matrix.org".to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Pointer {
+                    pointer: "/event_id".into(),
+                },
+                digest_algorithm: DigestAlgorithm::Sha256,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: None,
+            schema: None,
+        });
+        let collection =
+            derive_collection_id(metadata.member_namespace, &metadata.collection_canonical_id);
+
+        // Release every thread at once so the lookup/append windows overlap.
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let metadata = Arc::clone(&metadata);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .ensure_collection_metadata(&collection, &metadata)
+                        .expect("concurrent genesis establishment must be idempotent");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            store.get_collection_metadata(&collection).unwrap(),
+            Some((*metadata).clone())
+        );
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writers racing with *different* genesis metadata must not both win:
+    /// exactly one establishes the collection and every other writer sees the
+    /// mismatch. Without the collection's `put_mutex` held across the lookup
+    /// and append, several writers could each append their own genesis frame.
+    #[test]
+    fn ensure_collection_metadata_conflicting_writers_have_one_winner() {
+        use crate::template::{
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule,
+        };
+
+        let dir = test_dir("ensure_metadata_conflict");
+        let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+        let collection = derive_collection_id(Some(*b"EVNT"), b"!room:matrix.org");
+        let candidates: Vec<CollectionMetadata> = (0..8)
+            .map(|i| CollectionMetadata {
+                member_namespace: Some(*b"EVNT"),
+                collection_canonical_id: b"!room:matrix.org".to_vec(),
+                record_id_rule: RecordIdentityRule {
+                    policy: FrameIdPolicy::Pointer {
+                        pointer: "/event_id".into(),
+                    },
+                    digest_algorithm: DigestAlgorithm::Sha256,
+                },
+                payload: PayloadPolicy::Source,
+                extension: None,
+                role: Some(format!("role_{i}")),
+                schema: None,
+            })
+            .collect();
+
+        let barrier = Arc::new(std::sync::Barrier::new(candidates.len()));
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = candidates
+                .iter()
+                .map(|metadata| {
+                    let store = Arc::clone(&store);
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.ensure_collection_metadata(&collection, metadata)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one conflicting genesis writer may succeed: {results:?}"
+        );
+        for result in results.iter().filter(|r| r.is_err()) {
+            assert!(
+                matches!(result, Err(StorageError::Internal(msg)) if msg.contains("mismatch")),
+                "losers must report a metadata mismatch, got {result:?}"
+            );
+        }
+        let stored = store
+            .get_collection_metadata(&collection)
+            .unwrap()
+            .expect("the winner's genesis record is stored");
+        assert!(candidates.contains(&stored));
+        assert_eq!(store.collection_len(&collection).unwrap(), Some(1));
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Checkpoint-backed hash recovery must handle frames that carry metadata
+    /// (as `put_verified` writes do). `record_identity_at` previously rejected
+    /// `FLAG_METADATA` frames, so `grow_checkpoint_index` failed closed to a
+    /// full rescan instead of recovering their identity.
+    #[test]
+    fn checkpoint_growth_recovers_metadata_bearing_frames() {
+        let dir = test_dir("checkpoint_growth_metadata");
+        let collection = TEST_COLLECTION;
+        let id = [0x33u8; 16];
+        let payload = bytes::Bytes::from_static(b"metadata payload");
+        let digest = DigestAlgorithm::Sha256.digest(&payload);
+
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put_verified(
+                &collection,
+                &id,
+                &NodeData::new(payload),
+                &digest,
+                DigestAlgorithm::Sha256,
+                &digest,
+                None,
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        let checkpoint_index = reopened
+            .generation(&collection)
+            .expect("checkpoint collection exists");
+        assert!(checkpoint_index.index.is_mmap_backed());
+        let grown = reopened
+            .grow_checkpoint_index(&collection, &checkpoint_index.index)
+            .unwrap()
+            .expect("checkpoint index can grow");
+        assert!(
+            grown.lookup(&id).is_some(),
+            "a metadata-bearing frame's identity must be recoverable"
+        );
+        drop(checkpoint_index);
+        drop(reopened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two stores attached to one shared coordinator: a single pool's sync
+    /// commits both pools' published mutations in one durability barrier, and
+    /// a later reopen replays only each pool's own tagged frames.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_journal_fences_all_pools_and_routes_replay_by_pool() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_journal_root");
+        let dir_a = test_dir("shared_journal_a");
+        let dir_b = test_dir("shared_journal_b");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+
+        let a = PackfileStorage::open(dir_a.clone()).unwrap();
+        let b = PackfileStorage::open(dir_b.clone()).unwrap();
+        a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        b.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        a.put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::new(bytes::Bytes::from_static(b"state")),
+        )
+        .unwrap();
+        b.put(
+            &OTHER_COLLECTION,
+            &distinct_id(1),
+            &NodeData::new(bytes::Bytes::from_static(b"event")),
+        )
+        .unwrap();
+
+        // One durability barrier fences the other pool's published mutation
+        // too, without checkpointing either pool and triggering reclaim.
+        coordinator.sync().unwrap();
+        assert_eq!(
+            coordinator.committed_lsn(),
+            coordinator.published_lsn(),
+            "one barrier must commit every pool's published mutation"
+        );
+        // A fresh session over the shared segment: each autocommit write is
+        // its own complete group; one fsync covered both.
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        assert_eq!(scan.groups.len(), 2, "one group per autocommit write");
+        assert_eq!(scan.groups[0].entries.len(), 1);
+        assert_eq!(scan.groups[1].entries.len(), 1);
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+
+        let fresh_a = PackfileStorage::open(test_dir("shared_journal_fresh_a")).unwrap();
+        fresh_a
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .unwrap();
+        assert_eq!(
+            fresh_a.replay_journal().unwrap(),
+            1,
+            "the state store replays only its own pool's frame"
+        );
+        assert!(fresh_a
+            .get(&TEST_COLLECTION, &distinct_id(0))
+            .unwrap()
+            .is_some());
+        assert!(
+            fresh_a
+                .get(&OTHER_COLLECTION, &distinct_id(1))
+                .unwrap()
+                .is_none(),
+            "a pool must not replay another pool's frames"
+        );
+
+        let fresh_b = PackfileStorage::open(test_dir("shared_journal_fresh_b")).unwrap();
+        fresh_b
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::EventDag)
+            .unwrap();
+        assert_eq!(fresh_b.replay_journal().unwrap(), 1);
+        assert!(fresh_b
+            .get(&OTHER_COLLECTION, &distinct_id(1))
+            .unwrap()
+            .is_some());
+        assert!(fresh_b
+            .get(&TEST_COLLECTION, &distinct_id(0))
+            .unwrap()
+            .is_none());
+        drop(fresh_a);
+        drop(fresh_b);
+        drop(a);
+        drop(b);
+    }
+
+    /// A single-pool autocommit group can be reclaimed on its own once its
+    /// pool checkpoints: a reopen replays only the surviving frames, and LSNs
+    /// continue past the reclaimed prefix without being reused.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_reclaim_replay_root");
+        let wal = root.join("wal.bin");
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let a = PackfileStorage::open(test_dir("shared_reclaim_replay_a")).unwrap();
+        let b = PackfileStorage::open(test_dir("shared_reclaim_replay_b")).unwrap();
+        a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        b.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        // LSN 1 is State's; LSNs 2 and 3 are EventDag's. Each autocommit
+        // write is its own group.
+        a.put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::new(bytes::Bytes::from_static(b"state")),
+        )
+        .unwrap();
+        for id in [1u8, 2] {
+            b.put(
+                &OTHER_COLLECTION,
+                &distinct_id(id),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        }
+        coordinator.sync().unwrap();
+        assert_eq!(coordinator.committed_lsn(), 3);
+
+        // State checkpoints through its own frame; EventDag has not. Only the
+        // covered single-pool group may be reclaimed.
+        coordinator.report_pool_coverage(ShardType::State, 1);
+        assert!(coordinator.reclaim_shared().unwrap().is_some());
+        drop(a);
+        drop(b);
+        drop(coordinator);
+
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        assert_eq!(scan.base_lsn, 2, "the state group is reclaimed");
+        assert_eq!(scan.groups.len(), 2, "both uncovered event groups survive");
+        assert_eq!(scan.groups[0].first_lsn, 2);
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+
+        // The reclaimed state frame is gone from the journal by design: its
+        // pool's checkpoint owns it, so a state store has nothing to replay.
+        let fresh_a = PackfileStorage::open(test_dir("shared_reclaim_replay_fresh_a")).unwrap();
+        fresh_a
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .unwrap();
+        assert_eq!(fresh_a.replay_journal().unwrap(), 0);
+
+        // The event store replays exactly the frames that survived.
+        let fresh_b = PackfileStorage::open(test_dir("shared_reclaim_replay_fresh_b")).unwrap();
+        fresh_b
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::EventDag)
+            .unwrap();
+        assert_eq!(fresh_b.replay_journal().unwrap(), 2);
+        for id in [1u8, 2] {
+            assert!(fresh_b
+                .get(&OTHER_COLLECTION, &distinct_id(id))
+                .unwrap()
+                .is_some());
+        }
+
+        // Numbering continues past the reclaimed prefix: no LSN is reused.
+        fresh_b
+            .put(
+                &OTHER_COLLECTION,
+                &distinct_id(3),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        assert_eq!(recovered.published_lsn(), 4);
+        drop(fresh_a);
+        drop(fresh_b);
+    }
+
+    /// A shared segment may only be reclaimed up to the minimum durable
+    /// coverage across every pool that has frames in it.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_reclaim_waits_for_every_pool_then_truncates() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_reclaim_root");
+        let dir_a = test_dir("shared_reclaim_a");
+        let dir_b = test_dir("shared_reclaim_b");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+
+        let a = PackfileStorage::open(dir_a.clone()).unwrap();
+        let b = PackfileStorage::open(dir_b.clone()).unwrap();
+        a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        b.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        a.put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::new(bytes::Bytes::from_static(b"a")),
+        )
+        .unwrap();
+        b.put(
+            &OTHER_COLLECTION,
+            &distinct_id(1),
+            &NodeData::new(bytes::Bytes::from_static(b"b")),
+        )
+        .unwrap();
+
+        // Only A checkpoints; B still has an un-covered frame in the segment,
+        // so the shared prefix must not be reclaimed yet.
+        a.sync_all().unwrap();
+        assert_eq!(
+            Journal::scan_read_only(&wal).unwrap().groups.len(),
+            1,
+            "shared reclaim must wait for every pool's coverage"
+        );
+
+        // B checkpoints too; now the covered prefix can be dropped.
+        b.sync_all().unwrap();
+        let scan = Journal::scan_read_only(&wal).unwrap();
+        assert_eq!(scan.groups.len(), 0, "every pool covered: prefix reclaimed");
+        assert!(
+            scan.base_lsn > 1,
+            "the segment base advanced past the reclaimed group"
+        );
+    }
+
+    /// End-to-end: three interleaved pool groups, independent per-pool
+    /// checkpoints, shared reclaim, then a read-only reopen. The state reader's
+    /// index boundary is state's own watermark, so a base advanced by the
+    /// event-DAG pool must not be mistaken for a lost state frame.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_interleaved_checkpoints_reclaim_then_read_only_reopen() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_e2e_root");
+        let dir_state = test_dir("shared_e2e_state");
+        let dir_event = test_dir("shared_e2e_event");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+
+        let state = PackfileStorage::open(dir_state.clone()).unwrap();
+        let event = PackfileStorage::open(dir_event.clone()).unwrap();
+        state
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        event
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        // Interleaved commits: each sync checkpoints only its own pool.
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"state-1")),
+            )
+            .unwrap();
+        state.sync_all().unwrap();
+        event
+            .put(
+                &OTHER_COLLECTION,
+                &distinct_id(1),
+                &NodeData::new(bytes::Bytes::from_static(b"event-1")),
+            )
+            .unwrap();
+        event.sync_all().unwrap();
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(2),
+                &NodeData::new(bytes::Bytes::from_static(b"state-2")),
+            )
+            .unwrap();
+        state.sync_all().unwrap();
+        // Force a full rewrite so this test exercises reclaim deterministically
+        // (an ordinary sync may append a delta instead).
+        state.force_index_checkpoint().unwrap();
+
+        // The two pools have distinct watermarks. Each pool's group is
+        // reclaimed as soon as that pool has checkpointed it: state's later
+        // group does not wait on event-DAG, whose frames never reached it.
+        let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
+        let event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
+        assert!(state_lsn > event_lsn, "state committed a later group");
+        let scan = Journal::scan_read_only(&wal).unwrap();
+        assert!(
+            scan.groups.is_empty(),
+            "each pool's own group is reclaimed once that pool covers it"
+        );
+        assert_eq!(
+            scan.base_lsn,
+            state_lsn + 1,
+            "an idle pool must not pin a later group its frames never reached"
+        );
+
+        drop(state);
+        drop(event);
+
+        // Read-only reopen of the state pool: its checkpoint covered exactly
+        // its own watermark, so the reclaimed prefix is not a coverage gap and
+        // the durable records remain readable.
+        let reader = PackfileStorage::open_read_only(dir_state.clone()).unwrap();
+        reader
+            .enable_read_journal_shared(&wal, ShardType::State)
+            .unwrap();
+        let got = reader
+            .get_read_committed(&TEST_COLLECTION, &[distinct_id(0), distinct_id(2)])
+            .unwrap();
+        assert_eq!(
+            got[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"state-1"[..])
+        );
+        assert_eq!(
+            got[1].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"state-2"[..])
+        );
+    }
+
+    /// A shared reader whose own frame was committed by another pool's sync
+    /// (so its checkpoint has not advanced) must tolerate a base LSN gap opened
+    /// entirely by the other pools and read its own frame, instead of failing
+    /// closed on the reclaim.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_read_committed_accepts_another_pools_reclaimed_prefix() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_gap_root");
+        let dir_state = test_dir("shared_gap_state");
+        let dir_event = test_dir("shared_gap_event");
+        let wal = root.join("wal.bin");
+
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let state = PackfileStorage::open(dir_state.clone()).unwrap();
+        let event = PackfileStorage::open(dir_event.clone()).unwrap();
+        state
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        event
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .unwrap();
+
+        // State checkpoints one frame, then the reader opens bound to it.
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(0),
+                &NodeData::new(bytes::Bytes::from_static(b"state-1")),
+            )
+            .unwrap();
+        state.sync_all().unwrap();
+        state.force_index_checkpoint().unwrap();
+        let reader = PackfileStorage::open_read_only(dir_state.clone()).unwrap();
+        reader
+            .enable_read_journal_shared(&wal, ShardType::State)
+            .unwrap();
+
+        // Event-DAG reclaims its own later groups, advancing the segment base
+        // well past the reader's coverage without ever moving state's.
+        for id in 1..4u8 {
+            event
+                .put(
+                    &OTHER_COLLECTION,
+                    &distinct_id(id),
+                    &NodeData::new(bytes::Bytes::from_static(b"event")),
+                )
+                .unwrap();
+            event.sync_all().unwrap();
+            event.force_index_checkpoint().unwrap();
+        }
+
+        // State publishes a second frame; event's sync commits it, but state
+        // never checkpoints, so state's durable coverage stays at the first
+        // frame while the frame now sits above the advanced base.
+        state
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(9),
+                &NodeData::new(bytes::Bytes::from_static(b"state-2")),
+            )
+            .unwrap();
+        event.sync_all().unwrap();
+
+        let got = reader
+            .get_read_committed(&TEST_COLLECTION, &[distinct_id(9)])
+            .expect("a base gap made of other pools' frames must not fail closed");
+        assert_eq!(
+            got[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"state-2"[..])
+        );
+        assert_eq!(
+            reader
+                .get_read_committed(&TEST_COLLECTION, &[distinct_id(0)])
+                .unwrap()[0]
+                .as_ref()
+                .map(|data| data.bytes.as_ref()),
+            Some(&b"state-1"[..]),
+            "the reader's own checkpointed frame must remain readable"
+        );
+    }
+
+    /// A read-only worker on a shared WAL must observe only its own pool's
+    /// tagged frames, not the other pools' interleaved in the same segment.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_read_committed_filters_by_pool() {
+        use crate::journal::{Journal, JournalCoordinator};
+        use crate::layout::ShardType;
+
+        let root = test_dir("shared_read_committed_root");
+        let wal = root.join("wal.bin");
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        coordinator
+            .publish_group_tagged(
+                ShardType::State,
+                &[JournalMutation::Put {
+                    collection_id: TEST_COLLECTION,
+                    node_id: distinct_id(0),
+                    payload: b"state".to_vec(),
+                }],
+            )
+            .unwrap();
+        coordinator
+            .publish_group_tagged(
+                ShardType::EventDag,
+                &[JournalMutation::Put {
+                    collection_id: OTHER_COLLECTION,
+                    node_id: distinct_id(1),
+                    payload: b"event".to_vec(),
+                }],
+            )
+            .unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        // A read-only open needs at least one shard, so seed each reader's own
+        // pool directory with a durable record in an unrelated collection.
+        let seed_dir = |name: &str| {
+            let dir = test_dir(name);
+            {
+                let seed = PackfileStorage::open(dir.clone()).unwrap();
+                seed.put(
+                    &[0x77; 16],
+                    &distinct_id(9),
+                    &NodeData::new(bytes::Bytes::from_static(b"seed")),
+                )
+                .unwrap();
+                seed.sync_all().unwrap();
+            }
+            dir
+        };
+
+        let state_reader = PackfileStorage::open_read_committed_shared(
+            seed_dir("shared_read_committed_state"),
+            &wal,
+            ShardType::State,
+        )
+        .unwrap();
+        assert!(
+            state_reader
+                .get_read_committed(&TEST_COLLECTION, &[distinct_id(0)])
+                .unwrap()[0]
+                .is_some(),
+            "the state worker must see its own pool's frame"
+        );
+        assert!(
+            state_reader
+                .get_read_committed(&OTHER_COLLECTION, &[distinct_id(1)])
+                .unwrap()[0]
+                .is_none(),
+            "the state worker must not see the event-DAG pool's frame"
+        );
+
+        let event_reader = PackfileStorage::open_read_committed_shared(
+            seed_dir("shared_read_committed_event"),
+            &wal,
+            ShardType::EventDag,
+        )
+        .unwrap();
+        assert!(event_reader
+            .get_read_committed(&OTHER_COLLECTION, &[distinct_id(1)])
+            .unwrap()[0]
+            .is_some());
+        assert!(event_reader
+            .get_read_committed(&TEST_COLLECTION, &[distinct_id(0)])
+            .unwrap()[0]
+            .is_none());
+    }
+
+    /// The root shared-WAL lock is exclusive while held and reacquirable after
+    /// the holder drops it.
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn shared_wal_lock_is_exclusive() {
+        let root = test_dir("shared_wal_lock_exclusive");
+        // A shared-WAL lock is gated on a shared-layout database descriptor.
+        let _layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
+        let first = crate::journal::SharedWalLock::acquire(&root).unwrap();
+        let second = crate::journal::SharedWalLock::acquire(&root);
+        assert!(
+            matches!(second, Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a second writer must be refused while the root lock is held"
+        );
+        drop(first);
+        assert!(
+            crate::journal::SharedWalLock::acquire(&root).is_ok(),
+            "a released root lock must be reacquirable"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn packfile_storage_create_or_upsert_established_validated_contract() {
+        use crate::template::{
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
+        };
+
+        let dir = test_dir("create_or_upsert_contract");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+
+        let canonical_id = b"sys:packfile-upsert";
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
+
+        let valid_meta = CollectionMetadata {
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
+            collection_canonical_id: canonical_id.to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_auxiliary".to_owned()),
+            schema: None,
+        };
+
+        let node_id = [0x55; 16];
+        let data1 = NodeData::new(bytes::Bytes::from_static(b"val1"));
+
+        // 1. Validation failure on absent collection leaves collection absent
+        let err = store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data1,
+                &mut |_| Err(StorageError::Internal("pre-check failed".into())),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+        assert!(!store.collection_exists(&col_id));
+        assert!(store.get_collection_metadata(&col_id).unwrap().is_none());
+        assert!(store.get(&col_id, &node_id).unwrap().is_none());
+
+        // 2. Successful establishment commits metadata and record atomically
+        store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data1,
+                &mut |existing| {
+                    assert!(existing.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(store.collection_exists(&col_id));
+        assert_eq!(
+            store.get_collection_metadata(&col_id).unwrap().unwrap(),
+            valid_meta
+        );
+        assert_eq!(
+            store.get(&col_id, &node_id).unwrap().unwrap().bytes,
+            b"val1"[..]
+        );
+
+        // 3. Idempotent retry: same key + same payload -> Ok(())
+        let mut ran = false;
+        store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data1,
+                &mut |existing| {
+                    ran = true;
+                    assert_eq!(existing.unwrap().bytes, b"val1"[..]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(ran);
+
+        // 4. Same key replacement succeeds with new value
+        let data2 = NodeData::new(bytes::Bytes::from_static(b"val2_updated"));
+        store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data2,
+                &mut |existing| {
+                    assert_eq!(existing.unwrap().bytes, b"val1"[..]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.get(&col_id, &node_id).unwrap().unwrap().bytes,
+            b"val2_updated"[..]
+        );
+
+        // 5. Collision detected by validator aborts without mutating
+        let data3 = NodeData::new(bytes::Bytes::from_static(b"val3_conflict"));
+        let err = store
+            .create_or_upsert_established_validated(
+                &col_id,
+                &valid_meta,
+                &node_id,
+                &data3,
+                &mut |existing| {
+                    assert_eq!(existing.unwrap().bytes, b"val2_updated"[..]);
+                    Err(StorageError::Collision("logical key collision".into()))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Collision(_)));
+        assert_eq!(
+            store.get(&col_id, &node_id).unwrap().unwrap().bytes,
+            b"val2_updated"[..]
+        );
+
+        // 6. Persistence across reopen
+        drop(store);
+        let reopened = PackfileStorage::open(dir).unwrap();
+        assert_eq!(
+            reopened.get_collection_metadata(&col_id).unwrap().unwrap(),
+            valid_meta
+        );
+        assert_eq!(
+            reopened.get(&col_id, &node_id).unwrap().unwrap().bytes,
+            b"val2_updated"[..]
+        );
+
+        // 7. Corrupted stored metadata detection: stored canonical id does not reproduce collection id
+        let meta_colliding = CollectionMetadata {
+            collection_canonical_id: b"sys:packfile-other".to_vec(),
+            ..valid_meta.clone()
+        };
+        let target_col_id = derive_collection_id(
+            meta_colliding.member_namespace,
+            &meta_colliding.collection_canonical_id,
+        );
+        let sim_dir = test_dir("create_or_upsert_collision");
+        let sim_store = PackfileStorage::open(sim_dir).unwrap();
+        let seed = [(
+            COLLECTION_METADATA_RECORD_ID,
+            NodeData::new(valid_meta.encode().into()),
+        )];
+        sim_store
+            .put_many_internal_locked(&target_col_id, &seed, None)
+            .unwrap();
+
+        let err = sim_store
+            .create_or_upsert_established_validated(
+                &target_col_id,
+                &meta_colliding,
+                &node_id,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Internal(_)));
+
+        // 8. Unknown member namespace rejected on establishment
+        let meta_unknown = CollectionMetadata {
+            member_namespace: Some(*b"EDGE"),
+            ..valid_meta.clone()
+        };
+        let err_unknown = sim_store
+            .create_or_upsert_established_validated(
+                &target_col_id,
+                &meta_unknown,
+                &node_id,
+                &data1,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err_unknown, StorageError::Internal(_)));
+    }
+
+    #[test]
+    fn packfile_storage_create_or_upsert_concurrent_writers() {
+        use crate::template::{
+            derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy,
+            RecordIdentityRule, MEMBER_NAMESPACE_INTL,
+        };
+
+        let dir = test_dir("create_or_upsert_concurrency");
+        let store = Arc::new(PackfileStorage::open(dir).unwrap());
+
+        let canonical_id = b"sys:concurrent-upsert";
+        let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
+
+        let meta = CollectionMetadata {
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
+            collection_canonical_id: canonical_id.to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_auxiliary".to_owned()),
+            schema: None,
+        };
+
+        let node_id = [0x77; 16];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        // Two threads race to write distinct keys sharing the same physical node_id
+        let t1 = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let meta = meta.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let key_tag = b"key_alpha:";
+                let data = NodeData::new(bytes::Bytes::from_static(b"key_alpha:payload_alpha"));
+                store.create_or_upsert_established_validated(
+                    &col_id,
+                    &meta,
+                    &node_id,
+                    &data,
+                    &mut |existing| {
+                        if let Some(existing) = existing {
+                            if !existing.bytes.starts_with(key_tag) {
+                                return Err(StorageError::Collision("key mismatch".into()));
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+            })
+        };
+
+        let t2 = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let meta = meta.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let key_tag = b"key_beta:";
+                let data = NodeData::new(bytes::Bytes::from_static(b"key_beta:payload_beta"));
+                store.create_or_upsert_established_validated(
+                    &col_id,
+                    &meta,
+                    &node_id,
+                    &data,
+                    &mut |existing| {
+                        if let Some(existing) = existing {
+                            if !existing.bytes.starts_with(key_tag) {
+                                return Err(StorageError::Collision("key mismatch".into()));
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+            })
+        };
+
+        let res1 = t1.join().unwrap();
+        let res2 = t2.join().unwrap();
+
+        // Exactly one thread must win, and the other must get Collision
+        let (winner, _loser) = match (res1, res2) {
+            (Ok(()), Err(StorageError::Collision(_))) => ("alpha", "beta"),
+            (Err(StorageError::Collision(_)), Ok(())) => ("beta", "alpha"),
+            (r1, r2) => panic!("unexpected outcome: r1={r1:?}, r2={r2:?}"),
+        };
+
+        let final_data = store.get(&col_id, &node_id).unwrap().unwrap();
+        if winner == "alpha" {
+            assert!(final_data.bytes.starts_with(b"key_alpha:"));
+        } else {
+            assert!(final_data.bytes.starts_with(b"key_beta:"));
+        }
     }
 }

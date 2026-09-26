@@ -61,9 +61,18 @@ doc: ##H Build docs
 # Test & bench
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+# Optional Cargo profile for `make test` / `make cov`. Empty means Cargo's own
+# default; local `.env` may set it (e.g. dev-quick). The flag is only emitted
+# when the variable is non-empty — an unset `--profile` makes Cargo consume the
+# next argument (here `-p`) as its value and fail with a bogus subcommand.
+MTXDB_TEST_PROFILE ?=
+ifneq ($(strip $(MTXDB_TEST_PROFILE)),)
+MTXDB_TEST_PROFILE_FLAG := --profile $(MTXDB_TEST_PROFILE)
+endif
+
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(CARGO) test --workspace --lib --tests --timings
+	$(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
@@ -72,16 +81,17 @@ LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
 cov: ##H Run code coverage and generate HTML report
 	# TODO: include `src/bin/` in coverage
 	# Run coverage
-	$(CARGO) llvm-cov -p mtxdb --lib --tests \
+	$(CARGO) llvm-cov $(MTXDB_TEST_PROFILE_FLAG) \
+		-p mtxdb --lib --tests \
 		--html --output-dir .coverage \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Print per-file summary to the terminal (functions/lines only)
 	@echo ''
 	@echo '══════════════ COVERAGE SUMMARY ══════════════'
-	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report -p mtxdb \
+	LLVM_COV_FLAGS="${LLVM_COV_FLAGS}" $(CARGO) llvm-cov report $(MTXDB_TEST_PROFILE_FLAG) -p mtxdb \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*'
 	# Process report to codecov-compatible JSON
-	$(CARGO) llvm-cov report -p mtxdb \
+	$(CARGO) llvm-cov report $(MTXDB_TEST_PROFILE_FLAG) -p mtxdb \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*' \
 		--codecov --output-path .coverage/codecov.json
 	@echo DONE. You may open it with:
@@ -109,21 +119,21 @@ _bench/external:
 build: ##H Build all
 	$(CARGO) build --release --timings
 	$(CARGO) build --release --timings --manifest-path mtxdb-cli/Cargo.toml
-	$(CARGO) build --release --timings --manifest-path mtxdb-ffi/Cargo.toml
-	RUSTFLAGS= $(CARGO) build --release --timings --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1
+
+
+MTXDB_INSTALL_PROFILE ?= release
 
 .PHONY: install
 install:	##H Install CLI from source
-	$(CARGO) install --timings --locked --path mtxdb-cli
+	$(CARGO) install --profile $(MTXDB_INSTALL_PROFILE) --timings --locked --path mtxdb-cli
 
 
 .PHONY: clean
 clean: ##H Clean build artifacts
 	$(CARGO) clean
 	cd mtxdb-cli && $(CARGO) clean
-	cd mtxdb-ffi && $(CARGO) clean
-	cd mtxdb-wasm && $(CARGO) clean
 	cd benches && $(CARGO) clean
+	rm -rf .mypy_cache/ .ruff_cache/ __pycache__/
 	rm -rf .coverage/ lcov.info
 
 
@@ -131,7 +141,8 @@ clean: ##H Clean build artifacts
 # Execute command for reach submodule
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-PROJECT_CRATES ?= mtxdb-cli/ mtxdb-ffi/ mtxdb-wasm/ benches/
+PROJECT_CRATES ?= mtxdb-cli/
+# PROJECT_CRATES ?= mtxdb-cli/ benches/
 
 .PHONY: sub
 sub:	##H Run a command for each crate (set c)

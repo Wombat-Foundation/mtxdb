@@ -1,0 +1,62 @@
+---
+name: Native platforms
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_BACKTRACE: "1"
+
+jobs:
+  native:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    env:
+      # Workflow declares `stable`, but the committed rust-toolchain.toml pin
+      # (nightly-2026-08-20) outranks the installed default; RUSTUP_TOOLCHAIN
+      # wins over the file so these runners actually use stable.
+      RUSTUP_TOOLCHAIN: stable
+      # `.cargo/config.toml` enables the host-native `rustc-wrapper` on every
+      # platform, but Windows cannot execute its `.sh` (`%1 is not a valid
+      # Win32 application`, os error 193), and Cargo has no OS-conditional
+      # `rustc-wrapper`. An empty RUSTC_WRAPPER env overrides the config value,
+      # so Windows builds portable while macOS keeps the native/mold wrapper.
+      RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && '.cargo/cargo-wrapper.sh' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check workspace
+        run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --locked --workspace --all-features --lib --tests
+
+      - name: Run benchmarks
+        run: cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets

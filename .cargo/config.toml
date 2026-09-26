@@ -1,14 +1,15 @@
 [alias]
-test-ffi = "test --manifest-path mtxdb-ffi/Cargo.toml"
-# mtxdb-wasm is a cdylib with no test harness and no wasm test runner, so a
-# host `cargo test` only compiles a native harness and reports 0 tests. Check
-# it against the real target (what `make build` compiles) instead.
-test-wasm = "check --manifest-path mtxdb-wasm/Cargo.toml --target wasm32-wasip1"
-test-all = "!cargo test && cargo test-ffi && cargo test-wasm"
+# mtxdb-cli is a separate workspace (see mtxdb-cli/Cargo.toml); reach it with
+# --manifest-path, as `make build`/`make test` also do.
+test-cli = "test --manifest-path mtxdb-cli/Cargo.toml"
+test-all = "!cargo test && cargo test-cli"
 
 [build]
 # target-dir = "target"
-# rustc-wrapper = ".cargo/cargo-wrapper.sh"
+rustc-wrapper = ".cargo/cargo-wrapper.sh"
 
 [env]
+# Left commented: cargo-wrapper.sh already wraps sccache itself
+# (sandbox-aware — skips it under Codex, where the sandbox can't reach the
+# host daemon). Setting this too would double-wrap rustc through sccache.
 # RUSTC_WRAPPER = { value = "sccache", force = false }

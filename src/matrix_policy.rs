@@ -217,6 +217,59 @@ impl MatrixRoomVersion {
         }
     }
 
+    /// The oldest room version mtxdb will import.
+    ///
+    /// v1/v2 event IDs are server-assigned, so a logical id cannot be
+    /// re-derived from the payload and two distinct payloads may claim the
+    /// same id. v3 is content-addressed but encodes with standard
+    /// (non-URL-safe) base64, whose `/` and `+` break request paths and
+    /// reverse proxies. v4+ is content-addressed with URL-safe unpadded
+    /// base64, so the event id is always recomputable and collision-free.
+    pub const MIN_SUPPORTED: Self = Self::V4;
+
+    /// Whether this version meets [`Self::MIN_SUPPORTED`].
+    ///
+    /// Fail-open for future versions: only the three known-unsuitable
+    /// versions are rejected.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        !matches!(self, Self::V1 | Self::V2 | Self::V3)
+    }
+
+    /// RFC 6901 pointer to the field of a room's `m.room.create` event that
+    /// carries the collection's canonical (external) id.
+    ///
+    /// v12 derives the room id from the accepted create event's event id, so
+    /// the source is `/event_id`; every earlier version stores a server-
+    /// assigned `/room_id` on the create event itself.
+    #[must_use]
+    pub const fn collection_key_pointer(self) -> &'static str {
+        match self {
+            Self::V12 => "/event_id",
+            _ => "/room_id",
+        }
+    }
+
+    /// Normalize an establishment record's collection-key value into the form
+    /// ordinary events reference it.
+    ///
+    /// Pre-v12 the create event carries its server-assigned `room_id`, which
+    /// later events reference verbatim. Room version 12 derives the room id
+    /// from the create event's id by replacing the `$` event sigil with `!`
+    /// (MSC4291), so the raw `/event_id` value must be normalized before a
+    /// later batch of ordinary events — whose `room_id` is `!<hash>` —
+    /// derives the same collection identity.
+    #[must_use]
+    pub fn normalize_collection_identity(self, source: &str) -> String {
+        match self {
+            Self::V12 => match source.strip_prefix('$') {
+                Some(rest) => format!("!{rest}"),
+                None => source.to_owned(),
+            },
+            _ => source.to_owned(),
+        }
+    }
+
     /// Whether verification must use strict canonical-number validation.
     #[must_use]
     pub const fn requires_strict_canonical_numbers(self) -> bool {
@@ -266,9 +319,42 @@ pub struct RoomMetadata {
     pub additional_creators: Vec<String>,
 }
 
+/// Matrix storage profile defaults for a shared-WAL database.
+///
+/// Under the Matrix storage model:
+/// - `State`: HAMT nodes, roots, and state-group sidecars are dense hashes that
+///   do not benefit from zstd; compression is disabled to save CPU cycles on write and replay.
+/// - `EventDag`: Event JSON benefits significantly from zstd; compression is enabled.
+/// - `Edges`: Edge records retain standard defaults.
+#[cfg(feature = "multi-reader")]
+#[must_use]
+pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
+    crate::database::PoolPolicies {
+        state: crate::database::PoolPolicy {
+            compress: false,
+            checksum_policy: crate::packfile::ChecksumPolicy::Full,
+        },
+        event_dag: crate::database::PoolPolicy::default(),
+        edges: crate::database::PoolPolicy::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "multi-reader")]
+    fn matrix_pool_policies_skips_state_compression() {
+        let policies = matrix_pool_policies();
+        assert!(!policies.state.compress);
+        assert!(policies.event_dag.compress);
+        assert!(policies.edges.compress);
+        assert_eq!(
+            policies.state.checksum_policy,
+            crate::packfile::ChecksumPolicy::Full
+        );
+    }
 
     #[test]
     fn v1_v2_v3_identity_boundaries_are_explicit() {
@@ -328,5 +414,70 @@ mod tests {
                 ReferenceHashInputPolicy::V11Plus
             );
         }
+    }
+
+    /// The support floor is v4: v1/v2 are server-assigned and v3 uses
+    /// non-URL-safe base64. The base64url shift is exactly the v3/v4 boundary.
+    #[test]
+    fn support_floor_is_v4() {
+        assert_eq!(MatrixRoomVersion::MIN_SUPPORTED, MatrixRoomVersion::V4);
+        for version in [
+            MatrixRoomVersion::V1,
+            MatrixRoomVersion::V2,
+            MatrixRoomVersion::V3,
+        ] {
+            assert!(!version.is_supported());
+        }
+        for version in [
+            MatrixRoomVersion::V4,
+            MatrixRoomVersion::V11,
+            MatrixRoomVersion::V12,
+        ] {
+            assert!(version.is_supported());
+        }
+        assert_eq!(
+            MatrixRoomVersion::V3.reference_hash_encoding(),
+            ReferenceHashEncoding::StandardBase64NoPad
+        );
+        assert_eq!(
+            MatrixRoomVersion::V4.reference_hash_encoding(),
+            ReferenceHashEncoding::UrlSafeBase64NoPad
+        );
+    }
+
+    /// The collection key source switches exactly where the room-id policy
+    /// does: v12 reads the create event's `/event_id`, earlier versions read
+    /// its server-assigned `/room_id`.
+    #[test]
+    fn collection_key_source_switches_at_v12() {
+        for version in [MatrixRoomVersion::V4, MatrixRoomVersion::V11] {
+            assert_eq!(version.room_id_policy(), RoomIdPolicy::ServerAssigned);
+            assert_eq!(version.collection_key_pointer(), "/room_id");
+        }
+        assert_eq!(
+            MatrixRoomVersion::V12.room_id_policy(),
+            RoomIdPolicy::CreateEventId
+        );
+        assert_eq!(MatrixRoomVersion::V12.collection_key_pointer(), "/event_id");
+    }
+
+    /// A v12 create event id and the `room_id` ordinary events carry name the
+    /// same collection; the sigil swap is what makes the follow-up batch route.
+    #[test]
+    fn v12_normalizes_the_create_event_id_into_the_room_id_form() {
+        assert_eq!(
+            MatrixRoomVersion::V12.normalize_collection_identity("$DGMOhash"),
+            "!DGMOhash"
+        );
+        // A server-assigned room id is already the referenced form.
+        assert_eq!(
+            MatrixRoomVersion::V10.normalize_collection_identity("!room:server"),
+            "!room:server"
+        );
+        // Already-normalized or unexpected input is left untouched.
+        assert_eq!(
+            MatrixRoomVersion::V12.normalize_collection_identity("!already"),
+            "!already"
+        );
     }
 }

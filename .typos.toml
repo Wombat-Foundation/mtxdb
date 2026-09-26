@@ -3,4 +3,4 @@ mis = "mis"
 ede = "ede"
 
 [files]
-extend-exclude = []
+extend-exclude = ["mtxdb-cli/tests/fixtures/*.jsonl"]

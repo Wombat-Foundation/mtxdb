@@ -3,15 +3,24 @@
 mod cmd;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
-use mtxdb::ShardType;
+use mtxdb::{ReadPlanPolicy, ShardType};
 
+static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn debug_enabled() -> bool {
+    DEBUG_ENABLED.get().copied().unwrap_or(false)
+}
+
+#[derive(Clone)]
 pub(crate) struct Cli {
-    pub(crate) dir: Option<PathBuf>,
+    pub(crate) dirs: Vec<PathBuf>,
     pub(crate) shard_type: Option<ShardType>,
-    pub(crate) namespace: Option<String>,
+    pub(crate) coalesce: bool,
+    pub(crate) read_plan: ReadPlanPolicy,
     pub(crate) command: Commands,
 }
 
@@ -19,7 +28,7 @@ impl Cli {
     /// Return the single selected shard type, or bail if `-t all` was used.
     pub(crate) fn require_shard_type(&self) -> anyhow::Result<ShardType> {
         self.shard_type.context(
-            "this command requires a specific shard type (-t state, -t event-dag, or -t auth-chain)",
+            "this command requires a specific shard type (-t state, -t events, or -t edges)",
         )
     }
 
@@ -33,8 +42,47 @@ impl Cli {
                 .flatten(),
         )
     }
+
+    /// Return the single directory target or the default ".", bailing if multiple were specified.
+    pub(crate) fn require_single_dir(&self, cmd: &str) -> anyhow::Result<&std::path::Path> {
+        if self.dirs.len() > 1 {
+            anyhow::bail!(
+                "`mtxdb {cmd}` accepts only a single --dir target, but {} were provided",
+                self.dirs.len()
+            );
+        }
+        Ok(self.single_dir())
+    }
+
+    /// Return the first directory target or the default ".".
+    pub(crate) fn single_dir(&self) -> &std::path::Path {
+        self.dirs
+            .first()
+            .map_or_else(|| std::path::Path::new("."), PathBuf::as_path)
+    }
+
+    /// Return all target directories, defaulting to `["."]` if none were specified.
+    pub(crate) fn dirs_or_default(&self) -> Vec<PathBuf> {
+        if self.dirs.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            self.dirs.clone()
+        }
+    }
+
+    /// Create a clone targeting a single specific directory.
+    pub(crate) fn with_dir(&self, dir: PathBuf) -> Self {
+        Self {
+            dirs: vec![dir],
+            shard_type: self.shard_type,
+            coalesce: self.coalesce,
+            read_plan: self.read_plan,
+            command: self.command.clone(),
+        }
+    }
 }
 
+#[derive(Clone)]
 pub(crate) enum Commands {
     Put {
         collection: String,
@@ -45,10 +93,14 @@ pub(crate) enum Commands {
         collection: Option<String>,
         id: String,
         raw: bool,
+        verbose: bool,
+        header: bool,
+        decode: Option<String>,
     },
     Collections {
         all: bool,
         layout: bool,
+        canonical: bool,
         sort: Option<String>,
         limit: i64,
     },
@@ -60,12 +112,22 @@ pub(crate) enum Commands {
     Stats {
         json: bool,
     },
+    Meta {
+        target: String,
+        json: bool,
+        limit: i64,
+        offset: i64,
+        decode: Option<String>,
+    },
     Info {
-        collection: String,
+        collection: Option<String>,
+        stats: bool,
     },
     Scan {
         selector: String,
         verbose: bool,
+        header: bool,
+        decode: Option<String>,
         limit: i64,
         id: Option<String>,
         collection: Option<String>,
@@ -83,10 +145,12 @@ pub(crate) enum Commands {
     },
     Repack {
         collection: Option<String>,
-        shards: Vec<String>,
+        packs: Vec<String>,
         all: bool,
         root: Vec<String>,
         topo: bool,
+        out: Option<PathBuf>,
+        yes: bool,
     },
     Delete {
         collections: Vec<String>,
@@ -122,7 +186,7 @@ pub(crate) enum Commands {
 }
 
 fn build_cli() -> Command {
-    global_args(Command::new("mtxdb"))
+    global_args(Command::new("mtxdb").subcommand_precedence_over_arg(true))
         .version(concat!(
             env!("CARGO_PKG_VERSION"),
             " (",
@@ -145,8 +209,9 @@ fn build_cli() -> Command {
         )
         .about("CLI for the mtxdb content-addressed storage engine")
         .subcommand(sub_shards())
-        .subcommand(sub_stats())
         .subcommand(sub_collections())
+        .subcommand(sub_stats())
+        .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
         .subcommand(sub_import())
@@ -173,8 +238,18 @@ fn global_args(cmd: Command) -> Command {
             .long("dir")
             .env("MTXDB_DIR")
             .value_name("DIR")
+            .action(ArgAction::Append)
+            .num_args(1..)
             .global(true)
-            .help("Database root directory"),
+            .help("Database root directory (or multiple directories)"),
+    )
+    .arg(
+        Arg::new("coalesce")
+            .short('c')
+            .long("coalesce")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Aggregate supported read-only reports across multiple database roots (shards, collections, stats, get) or coalescing repack (--out)"),
     )
     .arg(
         Arg::new("shard_type")
@@ -182,24 +257,27 @@ fn global_args(cmd: Command) -> Command {
             .long("shard-type")
             .env("MTXDB_SHARD_TYPE")
             .value_name("TYPE")
-            .default_value("event-dag")
-            .value_parser(["state", "event-dag", "auth-chain", "all"])
+            .default_value("events")
+            .value_parser(["state", "event", "events", "event-dag", "edges", "all"])
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on (use 'all' to target every pool)"),
     )
     .arg(
-        Arg::new("namespace")
-            .short('n')
-            .long("namespace")
-            .env("MTXDB_NAMESPACE")
-            .value_name("NAMESPACE")
+        Arg::new("read_plan")
+            .long("read-plan")
+            .value_name("MODE")
+            .default_value("plain")
+            .value_parser(["plain", "prefetch"])
             .global(true)
-            .help(
-                "Homeserver namespace for deriving keys from `!room_id`/`$event_id` \
-                 (must match the namespace Synapse's embedded mirror wrote with, e.g. \
-                 its server_name); required when using those sigils",
-            ),
+            .help("Merged read prefetch for batch reads: 'plain' (default, independent reads) or 'prefetch' to meld nearby candidates into sequential extents"),
+    )
+    .arg(
+        Arg::new("debug")
+            .long("debug")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Enable additional diagnostic output"),
     )
 }
 
@@ -230,6 +308,51 @@ fn sub_stats() -> Command {
         )
 }
 
+fn sub_meta() -> Command {
+    Command::new("meta")
+        .about("Inspect on-disk metadata and durability artifacts (read-only)")
+        .arg(
+            Arg::new("target")
+                .value_name("TARGET")
+                .default_value("overview")
+                .value_parser([
+                    "overview",
+                    "db",
+                    "wal",
+                    "checkpoint",
+                    "delta",
+                    "sidecars",
+                    "packs",
+                    "locks",
+                    "raw",
+                ])
+                .help("Artifact group to inspect (default: overview)"),
+        )
+        .arg(limit_arg())
+        .arg(
+            Arg::new("offset")
+                .long("offset")
+                .default_value("0")
+                .value_parser(clap::value_parser!(i64))
+                .help("Number of decoded records to skip"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Emit diagnostic records as JSON"),
+        )
+        .arg(
+            Arg::new("decode")
+                .long("decode")
+                .value_name("FORMAT")
+                .num_args(0..=1)
+                .default_missing_value("auto")
+                .value_parser(["auto", "json", "raw"])
+                .help("Decode WAL payloads when possible (json or raw)"),
+        )
+}
+
 fn sub_collections() -> Command {
     Command::new("collections")
         .about("List logical collections in the selected shard pool")
@@ -241,8 +364,14 @@ fn sub_collections() -> Command {
                 .help("List collections in every independent pool"),
         )
         .arg(layout_arg())
+        .arg(
+            Arg::new("canonical")
+                .long("canonical")
+                .action(ArgAction::SetTrue)
+                .help("Show each collection's canonical ID"),
+        )
         .arg(limit_arg())
-        .arg(sort_arg("slot, collection, nodes, load, shards, index, disk, packs, avoidable, segments, fragmentation"))
+        .arg(sort_arg("collection, nodes, idx-load (alias: load), shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
 
 fn layout_arg() -> Arg {
@@ -271,11 +400,7 @@ fn sort_arg(help: &'static str) -> Arg {
 }
 
 fn sub_init() -> Command {
-    Command::new("init").about(
-        "Create a new mtxdb database root (db.meta + a directory per shard pool). \
-         The only command that creates a store -- every other command errors \
-         if it doesn't already exist.",
-    )
+    Command::new("init").about("Create a new mtxdb database root (db.meta + pools).")
 }
 
 fn sub_subprocess_writer() -> Command {
@@ -347,9 +472,9 @@ fn sub_scan() -> Command {
                 .required(true)
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A 32-hex-digit collection ID (`0x`-prefix optional), or a pack ID from \
-                     `mtxdb shards` (1-16 hex digits, `0x`-prefix required) — e.g. `mtxdb scan \
-                     0102030405060708090a0b0c0d0e0f10` or `mtxdb scan 0x1`",
+                    "A `0x`-prefixed collection ID (32 hex digits after `0x`), or a pack ID \
+                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits) — e.g. `mtxdb \
+                     scan 0x0102030405060708090a0b0c0d0e0f10` or `mtxdb scan 0x1`",
                 ),
         )
         .arg(
@@ -357,7 +482,21 @@ fn sub_scan() -> Command {
                 .short('v')
                 .long("verbose")
                 .action(ArgAction::SetTrue)
-                .help("Print each frame's JSON payload when available"),
+                .help("Print each frame's payload when available"),
+        )
+        .arg(
+            Arg::new("header")
+                .long("header")
+                .action(ArgAction::SetTrue)
+                .help("Print frame header details (offsets, sizes, flags, and metadata TLVs)"),
+        )
+        .arg(
+            Arg::new("decode")
+                .long("decode")
+                .value_name("FORMAT")
+                .num_args(0..=1)
+                .default_missing_value("auto")
+                .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
         )
         .arg(
             Arg::new("id")
@@ -392,13 +531,21 @@ fn sub_info() -> Command {
         .about("Show storage info for a collection or a pack")
         .arg(
             Arg::new("collection")
-                .required(true)
+                .required(false)
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A 32-hex-digit collection ID (`0x`-prefix optional), a collection's \
-                     slot index from `mtxdb collections`, or a pack ID from `mtxdb shards` \
-                     (1-16 hex digits, `0x`-prefix required) — e.g. `mtxdb info \
-                     0x0102030405060708090a0b0c0d0e0f10` or `mtxdb info 0x1`",
+                    "A `0x`-prefixed collection ID (32 hex digits after `0x`) or a pack ID \
+                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits). Omit it to \
+                     show database and pool metadata.",
+                ),
+        )
+        .arg(
+            Arg::new("stats")
+                .long("stats")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "For a collection, also scan every record for event statistics (room \
+                     state, members, DAG health, activity, senders). Slower on large rooms.",
                 ),
         )
 }
@@ -410,7 +557,7 @@ fn sub_import() -> Command {
             "Import Matrix federation events from a JSON document or JSONL event stream. A JSON \
              document must contain a `pdus` array, an `auth_chain` array, or both; a `.jsonl` \
              file contains one event per line. Each imported event needs an `event_id`. The \
-             namespace comes from `collection_id` unless --collection is supplied.",
+             collection identity comes from `collection_id` unless --collection is supplied.",
         )
         .arg(
             Arg::new("path")
@@ -423,7 +570,7 @@ fn sub_import() -> Command {
             Arg::new("collection")
                 .short('r')
                 .long("collection")
-                .help("Collection ID (hex, 32 chars). Auto-detected if omitted"),
+                .help("Collection ID (0x-prefixed, 32 hex digits). Auto-detected if omitted"),
         )
         .arg(
             Arg::new("template")
@@ -444,7 +591,7 @@ fn sub_export() -> Command {
             Arg::new("collection")
                 .required(true)
                 .value_name("COLLECTION")
-                .help("Collection ID (hex, 32 chars)"),
+                .help("Collection ID (0x-prefixed, 32 hex digits)"),
         )
 }
 
@@ -455,21 +602,21 @@ fn sub_repack() -> Command {
             Arg::new("collection")
                 .short('r')
                 .long("collection")
-                .conflicts_with("shard"),
+                .conflicts_with("pack"),
         )
         .arg(
-            Arg::new("shard")
-                .short('s')
-                .long("shard")
+            Arg::new("pack")
+                .short('p')
+                .long("pack")
                 .conflicts_with("collection")
                 .num_args(1..)
                 .value_name("PACK_ID")
-                .help("Repack collections referencing packs (repeat -s for multiple pack IDs)"),
+                .help("Repack collections referencing packs (repeat -p for multiple pack IDs)"),
         )
         .arg(
             Arg::new("all")
                 .long("all")
-                .conflicts_with_all(["collection", "shard"])
+                .conflicts_with_all(["collection", "pack"])
                 .action(ArgAction::SetTrue)
                 .help("Repack every collection in every active pack"),
         )
@@ -479,6 +626,19 @@ fn sub_repack() -> Command {
                 .long("topo")
                 .action(ArgAction::SetTrue)
                 .help("Repack in topological order (requires edge-capable data format)"),
+        )
+        .arg(
+            Arg::new("out")
+                .long("out")
+                .value_name("DIR")
+                .help("Destination directory for coalescing repack into a new canonical database"),
+        )
+        .arg(
+            Arg::new("yes")
+                .short('y')
+                .long("yes")
+                .action(ArgAction::SetTrue)
+                .help("Skip interactive confirmation"),
         )
 }
 
@@ -521,22 +681,53 @@ fn sub_get() -> Command {
             Arg::new("id")
                 .index(1)
                 .required_unless_present("id_option")
-                .help("Node ID (32 hex characters) or Matrix event ID"),
+                .help("Node ID (0x-prefixed, 32 hex digits) or Matrix event ID"),
         )
         .arg(
             Arg::new("id_option")
                 .short('i')
                 .long("id")
                 .conflicts_with("id")
-                .help("Node ID (32 hex characters) or Matrix event ID"),
+                .help("Node ID (0x-prefixed, 32 hex digits) or Matrix event ID"),
         )
         .arg(
             Arg::new("raw")
                 .long("raw")
                 .action(ArgAction::SetTrue)
-                .conflicts_with("text")
                 .help("Emit payload bytes verbatim instead of pretty-printing JSON"),
         )
+        .arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .action(ArgAction::SetTrue)
+                .help("Print record and Matrix event metadata to stderr"),
+        )
+        .arg(
+            Arg::new("header")
+                .long("header")
+                .action(ArgAction::SetTrue)
+                .help("Print frame header and collection metadata details to stderr"),
+        )
+        .arg(
+            Arg::new("decode")
+                .long("decode")
+                .value_name("FORMAT")
+                .num_args(0..=1)
+                .default_missing_value("auto")
+                .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
+        )
+}
+
+/// Map the `--read-plan` CLI mode to a store policy.
+///
+/// `clap`'s value parser restricts the argument to these modes, so the
+/// fallthrough is unreachable in practice.
+fn read_plan_from_mode(mode: &str) -> ReadPlanPolicy {
+    match mode {
+        "plain" => ReadPlanPolicy::disabled(),
+        "prefetch" => ReadPlanPolicy::prefetch(),
+        _ => unreachable!("clap validates read-plan mode"),
+    }
 }
 
 #[allow(
@@ -551,15 +742,26 @@ fn parse_cli() -> Cli {
         std::process::exit(0);
     }
 
-    let dir = matches.get_one::<String>("dir").map(PathBuf::from);
+    let dirs: Vec<PathBuf> = matches
+        .get_many::<String>("dir")
+        .map(|vals| vals.map(PathBuf::from).collect())
+        .unwrap_or_default();
+    let coalesce = matches.get_flag("coalesce");
+    let _ = DEBUG_ENABLED.set(matches.get_flag("debug"));
+    let read_plan = read_plan_from_mode(
+        matches
+            .get_one::<String>("read_plan")
+            .map(String::as_str)
+            .expect("clap supplies the default read-plan mode"),
+    );
     let shard_type = match matches
         .get_one::<String>("shard_type")
         .map(String::as_str)
         .expect("clap supplies the default shard type")
     {
         "state" => Some(ShardType::State),
-        "event-dag" => Some(ShardType::EventDag),
-        "auth-chain" => Some(ShardType::AuthChain),
+        "event" | "events" | "event-dag" => Some(ShardType::EventDag),
+        "edges" => Some(ShardType::Edges),
         "all" => None,
         _ => unreachable!("clap validates shard type"),
     };
@@ -578,10 +780,14 @@ fn parse_cli() -> Cli {
                 .expect("clap requires either positional ID or --id")
                 .clone(),
             raw: m.get_flag("raw"),
+            verbose: m.get_flag("verbose"),
+            header: m.get_flag("header"),
+            decode: m.get_one::<String>("decode").cloned(),
         },
         Some(("collections", m)) => Commands::Collections {
             all: m.get_flag("all"),
             layout: m.get_flag("layout"),
+            canonical: m.get_flag("canonical"),
             sort: m.get_one::<String>("sort").cloned(),
             limit: *m
                 .get_one::<i64>("limit")
@@ -595,12 +801,26 @@ fn parse_cli() -> Cli {
         Some(("stats", m)) => Commands::Stats {
             json: m.get_flag("json"),
         },
+        Some(("meta", m)) => Commands::Meta {
+            target: m.get_one::<String>("target").unwrap().clone(),
+            json: m.get_flag("json"),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+            offset: *m
+                .get_one::<i64>("offset")
+                .expect("clap supplies a default offset"),
+            decode: m.get_one::<String>("decode").cloned(),
+        },
         Some(("info", m)) => Commands::Info {
-            collection: m.get_one::<String>("collection").unwrap().clone(),
+            collection: m.get_one::<String>("collection").cloned(),
+            stats: m.get_flag("stats"),
         },
         Some(("scan", m)) => Commands::Scan {
             selector: m.get_one::<String>("selector").unwrap().clone(),
             verbose: m.get_flag("verbose"),
+            header: m.get_flag("header"),
+            decode: m.get_one::<String>("decode").cloned(),
             id: m.get_one::<String>("id").cloned(),
             collection: m.get_one::<String>("collection").cloned(),
             raw: m.get_flag("raw"),
@@ -624,8 +844,8 @@ fn parse_cli() -> Cli {
         },
         Some(("repack", m)) => Commands::Repack {
             collection: m.get_one::<String>("collection").cloned(),
-            shards: m
-                .get_many::<String>("shard")
+            packs: m
+                .get_many::<String>("pack")
                 .into_iter()
                 .flatten()
                 .cloned()
@@ -638,6 +858,8 @@ fn parse_cli() -> Cli {
                 .cloned()
                 .collect(),
             topo: m.get_flag("topo"),
+            out: m.get_one::<String>("out").map(PathBuf::from),
+            yes: m.get_flag("yes"),
         },
         Some(("delete", m)) => Commands::Delete {
             collections: m
@@ -675,41 +897,178 @@ fn parse_cli() -> Cli {
         }
     };
 
-    let namespace = matches.get_one::<String>("namespace").cloned();
-
     Cli {
-        dir,
+        dirs,
         shard_type,
-        namespace,
+        coalesce,
+        read_plan,
         command,
     }
 }
 
-fn main() -> anyhow::Result<()> {
+// `main` deliberately does not return `Result`: std's `Termination` prints the
+// error via `Debug`, and anyhow's `Debug` includes a backtrace whenever
+// `RUST_BACKTRACE` is set in the environment — for release builds too. A
+// missing database is an expected user error, so we render the chain with
+// `Display` instead and let the profile/env decide nothing.
+fn main() -> std::process::ExitCode {
     let cli = parse_cli();
     if let Commands::Completions { shell } = &cli.command {
-        let shell = match shell.as_str() {
-            "bash" => clap_complete::Shell::Bash,
-            "elvish" => clap_complete::Shell::Elvish,
-            "fish" => clap_complete::Shell::Fish,
-            "powershell" => clap_complete::Shell::PowerShell,
-            "zsh" => clap_complete::Shell::Zsh,
-            _ => unreachable!("Clap validates the shell name"),
-        };
-        // Rebuild without the hidden `completions` subcommand —
-        // `.hide(true)` only suppresses --help, not shell completions.
-        let base = build_cli();
-        let mut command = clap::Command::new("mtxdb");
-        for arg in base.get_arguments() {
-            command = command.arg(arg.clone());
-        }
-        for sub in base.get_subcommands() {
-            if sub.get_name() != "completions" {
-                command = command.subcommand(sub.clone());
+        #[cfg(feature = "completions")]
+        {
+            let shell = match shell.as_str() {
+                "bash" => clap_complete::Shell::Bash,
+                "elvish" => clap_complete::Shell::Elvish,
+                "fish" => clap_complete::Shell::Fish,
+                "powershell" => clap_complete::Shell::PowerShell,
+                "zsh" => clap_complete::Shell::Zsh,
+                _ => unreachable!("Clap validates the shell name"),
+            };
+            // Rebuild without the hidden `completions` subcommand —
+            // `.hide(true)` only suppresses --help, not shell completions.
+            let base = build_cli();
+            let mut command = clap::Command::new("mtxdb");
+            for arg in base.get_arguments() {
+                command = command.arg(arg.clone());
             }
+            for sub in base.get_subcommands() {
+                if sub.get_name() != "completions" {
+                    command = command.subcommand(sub.clone());
+                }
+            }
+            clap_complete::generate(shell, &mut command, "mtxdb", &mut std::io::stdout());
+            return std::process::ExitCode::SUCCESS;
         }
-        clap_complete::generate(shell, &mut command, "mtxdb", &mut std::io::stdout());
-        return Ok(());
+        #[cfg(not(feature = "completions"))]
+        {
+            let _ = shell;
+            eprintln!(
+                "Error: this build was compiled without shell-completion support \
+                 (enable the `completions` feature)"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
     }
-    cmd::run(&cli)
+    match cmd::run(&cli) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn test_dir_parsing() {
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2"])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2"])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2", "-a"])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+
+        let m = build_cli()
+            .try_get_matches_from([
+                "mtxdb",
+                "scan",
+                "0x0102030405060708090a0b0c0d0e0f10",
+                "-d",
+                "dir1",
+                "dir2",
+            ])
+            .unwrap();
+        let dirs: Vec<_> = m
+            .get_many::<String>("dir")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(dirs, vec!["dir1", "dir2"]);
+        assert_eq!(m.subcommand_name(), Some("scan"));
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2", "-c"])
+            .unwrap();
+        assert!(m.get_flag("coalesce"));
+
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "--coalesce", "shards", "-d", "dir1", "dir2"])
+            .unwrap();
+        assert!(m.get_flag("coalesce"));
+
+        let m = build_cli()
+            .try_get_matches_from([
+                "mtxdb", "repack", "-d", "dir1", "dir2", "-c", "--out", "target", "-y",
+            ])
+            .unwrap();
+        assert!(m.get_flag("coalesce"));
+        let sub = m.subcommand_matches("repack").unwrap();
+        assert_eq!(
+            sub.get_one::<String>("out").map(String::as_str),
+            Some("target")
+        );
+        assert!(sub.get_flag("yes"));
+    }
+
+    #[test]
+    fn test_read_plan_flag_parsing() {
+        // Default is plain.
+        let default = build_cli()
+            .try_get_matches_from(["mtxdb", "shards"])
+            .unwrap();
+        assert_eq!(
+            default.get_one::<String>("read_plan").map(String::as_str),
+            Some("plain")
+        );
+
+        // Explicit prefetch is accepted (before and after the subcommand).
+        for argv in [
+            ["mtxdb", "--read-plan", "prefetch", "shards"],
+            ["mtxdb", "shards", "--read-plan", "prefetch"],
+        ] {
+            let m = build_cli().try_get_matches_from(argv).unwrap();
+            assert_eq!(
+                m.get_one::<String>("read_plan").map(String::as_str),
+                Some("prefetch")
+            );
+        }
+
+        // An unknown mode is rejected by clap's value parser.
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "--read-plan", "ssd", "shards"])
+            .is_err());
+    }
+
+    #[test]
+    fn test_read_plan_mode_maps_to_policy() {
+        assert_eq!(read_plan_from_mode("plain"), ReadPlanPolicy::disabled());
+        assert_eq!(read_plan_from_mode("prefetch"), ReadPlanPolicy::prefetch());
+        assert_ne!(read_plan_from_mode("prefetch"), ReadPlanPolicy::disabled());
+    }
 }

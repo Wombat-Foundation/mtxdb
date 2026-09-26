@@ -19,3 +19,18 @@ key, payload-retention policy, relationships, and validation behaviour. The Matr
 reference policy is [`templates/matrix-event-v1.json`](templates/matrix-event-v1.json);
 see [`templates/README.md`](templates/README.md) for the generic format and why
 Matrix uses `event_id` as its logical identity.
+
+## On-disk diagnostics
+
+The CLI's read-only metadata inspector reports physical storage and durability
+state without acquiring writer locks:
+
+```text
+mtxdb meta [overview|db|wal|checkpoint|delta|sidecars|packs|locks|raw]
+```
+
+The default target is `overview`. Use `--limit` and `--offset` for pagination,
+`--decode` for supported payload decoding, and `--json` for structured output.
+Corrupt headers, truncated tails, stale checkpoints, orphaned delta epochs, and
+lock-marker anomalies are reported as diagnostics while inspection continues
+where possible.

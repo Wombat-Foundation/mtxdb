@@ -3,12 +3,22 @@
 //! Auxiliary indexes are logical stores, not additional packfile pools. They
 //! use the normal [`StorageEngine`] so callers do not create one directory or
 //! file per room, namespace, or index name.
+//!
+//! Identity note: auxiliary key digests and collection ids are intentionally
+//! BLAKE3 (via [`DigestAlgorithm::Blake3`] and [`derive_collection_id`]). These
+//! indexes are core-internal and unreleased, so there is no persisted SHA-256
+//! data to remain compatible with and no versioned dual-read or migration is
+//! required. Reverting these derivations to SHA-256 would be a regression, not
+//! a compatibility fix.
 
-use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
-use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
+use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
+use crate::template::{
+    derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+    MEMBER_NAMESPACE_INTL,
+};
 
-const STORE_DOMAIN: &[u8] = b"mtxdb:aux:v1:";
 const VALUE_MAGIC: &[u8; 4] = b"AUX1";
 const DIGEST_LEN: usize = 32;
 
@@ -18,23 +28,18 @@ pub type AuxiliaryKeyDigest = [u8; DIGEST_LEN];
 /// Derive the canonical full digest for an auxiliary-index key.
 #[must_use]
 pub fn auxiliary_key_digest(key: &[u8]) -> AuxiliaryKeyDigest {
-    Sha256::digest(key).into()
+    DigestAlgorithm::Blake3.digest(key)
 }
 
 /// Derive the logical collection identity for a named auxiliary index.
 ///
-/// The returned 16-byte value is the compatibility collection ID required by
-/// the current storage engine. It is not the canonical identity of a key;
-/// key identities remain the full 32-byte digests stored in each envelope.
+/// Auxiliary indexes are core-internal collections, so they use the shared
+/// [`derive_collection_id`] with the core-internal pool namespace rather than a
+/// private domain string. The returned 16-byte value is the routing id; key
+/// identities remain the full 32-byte digests stored in each envelope.
 #[must_use]
 pub fn auxiliary_collection_id(name: &str) -> [u8; 16] {
-    let mut hasher = Sha256::new();
-    hasher.update(STORE_DOMAIN);
-    hasher.update(name.as_bytes());
-    let digest = hasher.finalize();
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&digest[..16]);
-    id
+    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), name.as_bytes())
 }
 
 fn physical_id(digest: &AuxiliaryKeyDigest) -> NodeId {
@@ -46,6 +51,7 @@ fn physical_id(digest: &AuxiliaryKeyDigest) -> NodeId {
 /// A named logical auxiliary index backed by an existing storage engine.
 pub struct AuxiliaryIndex<'a, S: StorageEngine + ?Sized> {
     engine: &'a S,
+    name: String,
     collection_id: [u8; 16],
 }
 
@@ -55,8 +61,41 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     pub fn open(engine: &'a S, name: &str) -> Self {
         Self {
             engine,
+            name: name.to_owned(),
             collection_id: auxiliary_collection_id(name),
         }
+    }
+
+    /// Return this index's canonical name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return this index's collection metadata.
+    #[must_use]
+    pub fn metadata(&self) -> CollectionMetadata {
+        CollectionMetadata {
+            member_namespace: Some(MEMBER_NAMESPACE_INTL),
+            collection_canonical_id: self.name.as_bytes().to_vec(),
+            record_id_rule: RecordIdentityRule {
+                policy: FrameIdPolicy::Key,
+                digest_algorithm: DigestAlgorithm::Blake3,
+            },
+            payload: PayloadPolicy::Source,
+            extension: None,
+            role: Some("system_auxiliary".to_owned()),
+            schema: None,
+        }
+    }
+
+    /// Ensure that collection metadata is established for this auxiliary index.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Internal`] if existing metadata conflicts, or propagates backend error.
+    pub fn ensure_metadata(&self) -> Result<(), StorageError> {
+        self.engine
+            .create_or_put_established(&self.collection_id, &self.metadata(), &[])
     }
 
     /// Return this index's compatibility collection ID.
@@ -76,24 +115,40 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         let digest = auxiliary_key_digest(key);
         let node_id = physical_id(&digest);
-        let Some(data) = self.engine.get(&self.collection_id, &node_id)? else {
-            return Ok(None);
-        };
-        if data.bytes.is_empty() {
-            return Ok(None);
-        }
-        decode_value(&digest, &data.bytes).map(Some)
+        let data = self.engine.get(&self.collection_id, &node_id)?;
+        decode_stored_value(&digest, data.as_ref())
     }
 
-    /// Insert or replace a value by its logical key.
+    /// Read several logical keys with one backend lookup.
     ///
-    /// A collision in the current 16-byte physical compatibility ID is
-    /// rejected instead of silently overwriting the existing key. Full
-    /// 32-byte identity is retained in the versioned value envelope.
+    /// The returned values are in the same order as `keys`. Missing keys are
+    /// represented by `None`; stored envelopes are validated just like
+    /// [`Self::get`].
     ///
     /// # Errors
-    /// Returns [`StorageError::Corrupt`] if the physical compatibility ID is
-    /// occupied by another key, or propagates a backend error.
+    /// Returns a storage or auxiliary-envelope error.
+    pub fn get_many(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+        let digests: Vec<AuxiliaryKeyDigest> =
+            keys.iter().map(|key| auxiliary_key_digest(key)).collect();
+        let ids: Vec<NodeId> = digests.iter().map(physical_id).collect();
+        let existing = self.engine.get_many(&self.collection_id, &ids)?;
+        existing
+            .iter()
+            .zip(digests.iter())
+            .map(|(data, digest)| decode_stored_value(digest, data.as_ref()))
+            .collect()
+    }
+
+    /// Insert or update a value by its logical key.
+    ///
+    /// Atomically establishes the collection metadata on the first write
+    /// and appends the key-value envelope. Retains idempotency (same key and value succeeds),
+    /// permits same-key replacement with updated values, and rejects truncated-ID collisions
+    /// (distinct key with the same 16-byte physical node ID) with [`StorageError::Collision`].
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Collision`] on physical ID key collisions,
+    /// [`StorageError::Corrupt`] on corrupted existing records, or propagates backend error.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let digest = auxiliary_key_digest(key);
@@ -103,15 +158,98 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
                 decode_value(&digest, &existing.bytes)?;
             }
         }
-        let mut encoded = Vec::with_capacity(VALUE_MAGIC.len() + DIGEST_LEN + value.len());
+        let capacity = VALUE_MAGIC
+            .len()
+            .checked_add(DIGEST_LEN)
+            .and_then(|length| length.checked_add(value.len()))
+            .ok_or_else(|| StorageError::Corrupt("auxiliary value length overflow".to_owned()))?;
+        let mut encoded = Vec::with_capacity(capacity);
         encoded.extend_from_slice(VALUE_MAGIC);
         encoded.extend_from_slice(&digest);
         encoded.extend_from_slice(value);
-        self.engine.put(
+        let data = NodeData::new(bytes::Bytes::from(encoded));
+
+        let mut validate = |existing: Option<&NodeData>| -> Result<(), StorageError> {
+            if let Some(existing) = existing {
+                if !existing.bytes.is_empty() {
+                    decode_value(&digest, &existing.bytes)?;
+                }
+            }
+            Ok(())
+        };
+
+        self.engine.create_or_upsert_established_validated(
             &self.collection_id,
+            &self.metadata(),
             &node_id,
-            &NodeData::new(bytes::Bytes::from(encoded)),
+            &data,
+            &mut validate,
         )
+    }
+
+    /// Insert or replace several values with one read and one write batch.
+    ///
+    /// Existing records are still checked for full-digest collisions, but
+    /// callers avoid one storage round trip per auxiliary entry.
+    ///
+    /// Writes are last-writer-wins per record and are not serialized against
+    /// other writers: if two `put_many` calls race on the same key, the value
+    /// from the batch the backing store commits last is retained. Callers must
+    /// not rely on any ordering between concurrent writers.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] for malformed existing envelopes or
+    /// digest collisions, and propagates storage errors.
+    pub fn put_many(&self, entries: &[(&[u8], &[u8])]) -> Result<usize, StorageError> {
+        let mut physical: Vec<(NodeId, NodeData)> = Vec::with_capacity(entries.len());
+        let mut seen: HashMap<NodeId, AuxiliaryKeyDigest> = HashMap::with_capacity(entries.len());
+        for (key, value) in entries {
+            let digest = auxiliary_key_digest(key);
+            let node_id = physical_id(&digest);
+            if let Some(previous) = seen.insert(node_id, digest) {
+                if previous != digest {
+                    return Err(StorageError::Corrupt(
+                        "auxiliary-index key digest collision".to_owned(),
+                    ));
+                }
+            }
+            let capacity = VALUE_MAGIC
+                .len()
+                .checked_add(DIGEST_LEN)
+                .and_then(|length| length.checked_add(value.len()))
+                .ok_or_else(|| {
+                    StorageError::Corrupt("auxiliary value length overflow".to_owned())
+                })?;
+            let mut encoded = Vec::with_capacity(capacity);
+            encoded.extend_from_slice(VALUE_MAGIC);
+            encoded.extend_from_slice(&digest);
+            encoded.extend_from_slice(value);
+            physical.push((node_id, NodeData::new(bytes::Bytes::from(encoded))));
+        }
+
+        let ids: Vec<NodeId> = physical.iter().map(|(id, _)| *id).collect();
+        let existing = self.engine.get_many(&self.collection_id, &ids)?;
+        for ((_, data), existing) in physical.iter().zip(existing) {
+            if let Some(existing) = existing {
+                // The full digest is retained in the envelope. Validate it
+                // before allowing the batch to replace the record.
+                let digest_start = VALUE_MAGIC.len();
+                let digest_end = digest_start.checked_add(DIGEST_LEN).ok_or_else(|| {
+                    StorageError::Corrupt("auxiliary digest length overflow".to_owned())
+                })?;
+                let digest: AuxiliaryKeyDigest = data
+                    .bytes
+                    .get(digest_start..digest_end)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        StorageError::Corrupt(
+                            "new auxiliary value has an incomplete digest envelope".to_owned(),
+                        )
+                    })?;
+                decode_value(&digest, &existing.bytes)?;
+            }
+        }
+        self.engine.put_many(&self.collection_id, &physical)
     }
 }
 
@@ -132,17 +270,31 @@ fn decode_value(
         ));
     }
     if encoded[digest_start..value_start] != expected_digest[..] {
-        return Err(StorageError::Corrupt(
+        return Err(StorageError::Collision(
             "auxiliary-index key digest collision".to_owned(),
         ));
     }
     Ok(encoded[value_start..].to_vec())
 }
 
+fn decode_stored_value(
+    digest: &AuxiliaryKeyDigest,
+    data: Option<&NodeData>,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let Some(data) = data else {
+        return Ok(None);
+    };
+    if data.bytes.is_empty() {
+        return Ok(None);
+    }
+    decode_value(digest, &data.bytes).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::InMemoryStorage;
+    use crate::storage::{InMemoryStorage, StorageEngine};
+    use crate::template::MEMBER_NAMESPACE_INTL;
 
     #[test]
     fn named_indexes_share_storage_but_have_distinct_collections() {
@@ -153,6 +305,36 @@ mod tests {
         first.put(b"key", b"value").unwrap();
         assert_eq!(first.get(b"key").unwrap(), Some(b"value".to_vec()));
         assert_eq!(second.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn get_many_preserves_order_and_distinguishes_missing_and_empty_values() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "batch");
+        index.put(b"first", b"one").unwrap();
+        index.put(b"empty", b"").unwrap();
+
+        let values = index.get_many(&[b"empty", b"missing", b"first"]).unwrap();
+        assert_eq!(values[0], Some(Vec::new()));
+        assert_eq!(values[1], None);
+        assert_eq!(values[2], Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn get_many_rejects_a_corrupt_envelope() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "corrupt");
+        let digest = auxiliary_key_digest(b"bad");
+        let node_id = physical_id(&digest);
+        engine
+            .put(
+                &index.collection_id(),
+                &node_id,
+                &NodeData::new(VALUE_MAGIC.to_vec().into()),
+            )
+            .unwrap();
+
+        assert!(index.get_many(&[b"bad"]).is_err());
     }
 
     #[test]
@@ -184,5 +366,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index.get(b"key").unwrap(), Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn auxiliary_index_establishes_metadata_on_put() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "sys:matrix-state-groups");
+        index.put(b"event_1", b"state_group_1").unwrap();
+        let meta = engine
+            .get_collection_metadata(&index.collection_id())
+            .unwrap()
+            .expect("metadata must be established on put");
+        assert_eq!(meta.collection_canonical_id, b"sys:matrix-state-groups");
+        assert_eq!(meta.member_namespace, Some(MEMBER_NAMESPACE_INTL));
+        assert_eq!(meta.role.as_deref(), Some("system_auxiliary"));
+        assert_eq!(meta.record_id_rule.policy, FrameIdPolicy::Key);
+        assert!(meta.verify_collection_id(&index.collection_id()));
+
+        // Idempotent retry succeeds
+        index.put(b"event_1", b"state_group_1").unwrap();
+        assert_eq!(
+            index.get(b"event_1").unwrap(),
+            Some(b"state_group_1".to_vec())
+        );
+
+        // Same-key replacement succeeds and updates value
+        index.put(b"event_1", b"different_group").unwrap();
+        assert_eq!(
+            index.get(b"event_1").unwrap(),
+            Some(b"different_group".to_vec())
+        );
+    }
+
+    #[test]
+    fn auxiliary_index_rejects_truncated_id_collision_without_corrupting() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "sys:test-collisions");
+        index.put(b"key_1", b"val_1").unwrap();
+        assert_eq!(index.get(b"key_1").unwrap(), Some(b"val_1".to_vec()));
+
+        let digest1 = auxiliary_key_digest(b"key_1");
+        let node_id1 = physical_id(&digest1);
+
+        // Fabricate a colliding key that has a different full digest but targets the same node_id
+        let mut colliding_digest = digest1;
+        colliding_digest[31] ^= 0xFF; // Different 32-byte digest, same first 16 bytes!
+        assert_eq!(&colliding_digest[..16], &node_id1[..]);
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(VALUE_MAGIC);
+        encoded.extend_from_slice(&colliding_digest);
+        encoded.extend_from_slice(b"colliding_val");
+        let colliding_data = NodeData::new(bytes::Bytes::from(encoded));
+
+        let mut validate = |existing: Option<&NodeData>| -> Result<(), StorageError> {
+            if let Some(existing) = existing {
+                if !existing.bytes.is_empty() {
+                    decode_value(&colliding_digest, &existing.bytes)?;
+                }
+            }
+            Ok(())
+        };
+
+        let err = engine
+            .create_or_upsert_established_validated(
+                &index.collection_id(),
+                &index.metadata(),
+                &node_id1,
+                &colliding_data,
+                &mut validate,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, StorageError::Collision(_)));
+
+        // Original key remains intact and uncorrupted:
+        assert_eq!(index.get(b"key_1").unwrap(), Some(b"val_1".to_vec()));
     }
 }

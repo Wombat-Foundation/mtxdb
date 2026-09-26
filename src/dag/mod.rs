@@ -210,6 +210,35 @@ impl ActiveRoomFrontier {
         node_idx as usize
     }
 
+    /// Rebind edges to known events that were inserted after their child.
+    ///
+    /// `insert_event` normally produces resident edges when parents arrive
+    /// first. A caller may also ingest events in arbitrary order; in that
+    /// case a known parent initially looks like a disk edge. Once the complete
+    /// batch has been inserted, convert those edges while leaving genuinely
+    /// non-resident parents as disk edges. Callers that ingest arbitrary-order
+    /// batches must call this explicitly; keeping `insert_event` incremental
+    /// avoids rescanning all prior edges after every insertion.
+    pub fn rebind_resident_edges(&mut self) {
+        let resident_by_local: HashMap<LocalId, u32> = self
+            .resident
+            .iter()
+            .filter_map(|(&short_id, &slot)| {
+                self.id_remap
+                    .get(&short_id)
+                    .copied()
+                    .map(|local_id| (local_id, slot))
+            })
+            .collect();
+        for edge in &mut self.edges {
+            if !edge.is_resident() {
+                if let Some(&slot) = resident_by_local.get(&edge.local_id()) {
+                    *edge = GraphEdge::resident(slot);
+                }
+            }
+        }
+    }
+
     /// Get the `prev_edges` for a node by its arena index.
     ///
     /// # Panics
@@ -308,6 +337,24 @@ mod tests {
         let prev = frontier.prev_edges(idx_a);
         assert_eq!(prev.len(), 1);
         assert!(!prev[0].is_resident());
+    }
+
+    #[test]
+    fn test_rebind_resident_edges_after_out_of_order_insert() {
+        let mut frontier = ActiveRoomFrontier::new();
+        let child = frontier.insert_event(101, &[100, 999], &[]);
+        let parent = frontier.insert_event(100, &[], &[]);
+
+        // Deliberately pins the pre-rebind state (a tripwire, not a bug): if a
+        // future fix makes the late parent resident on insert, this fails and
+        // the explicit post-batch rebind below can be removed.
+        assert!(!frontier.prev_edges(child)[0].is_resident());
+        frontier.rebind_resident_edges();
+
+        let prev = frontier.prev_edges(child);
+        assert!(prev[0].is_resident());
+        assert_eq!(prev[0].arena_index(), parent);
+        assert!(!prev[1].is_resident());
     }
 
     #[test]

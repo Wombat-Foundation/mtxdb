@@ -1,3 +1,4 @@
+use fs2::FileExt as _;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Seek, Write};
@@ -13,8 +14,101 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::packfile::{self, Record};
 
+// Linux `sync_file_range(2)`, declared directly rather than adding a `libc`
+// dependency for a single probe call.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i32;
+}
+
+/// Diagnostic information recovered from a lock marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockHolderInfo {
+    /// PID recorded by the writer.
+    pub pid: u32,
+    /// Whether the recorded process identity is currently alive.
+    pub running: bool,
+    /// Whether the marker includes a Linux process starttime.
+    pub has_starttime: bool,
+}
+
+/// Probe: start writeback for a just-flushed range before the next flush, to
+/// test whether keeping the dirty frontier ahead of the writer shrinks the
+/// `folio_wait_bit` stall. Enabled by `MTXDB_SYNC_FILE_RANGE=1`. A pure hint:
+/// failure is ignored, since the bytes are already in the page cache.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn kick_writeback(file: &File, offset: u64, len: u64) {
+    use std::os::unix::io::AsRawFd;
+    const SYNC_FILE_RANGE_WRITE: u32 = 2;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("MTXDB_SYNC_FILE_RANGE").is_ok_and(|v| v != "0")) {
+        return;
+    }
+    // SAFETY: `file` holds a valid fd for the duration of the call, and the
+    // syscall only advances writeback for the given range — it cannot affect
+    // correctness.
+    let _ = unsafe {
+        sync_file_range(
+            file.as_raw_fd(),
+            i64::try_from(offset).unwrap_or(i64::MAX),
+            i64::try_from(len).unwrap_or(i64::MAX),
+            SYNC_FILE_RANGE_WRITE,
+        )
+    };
+}
+
+/// Flush a directory's entries to stable storage.
+///
+/// Unix can fsync a directory descriptor directly. Windows has no std API for
+/// it, and only lets you open a directory handle at all with
+/// `FILE_FLAG_BACKUP_SEMANTICS`; `sync_all` then maps to `FlushFileBuffers`,
+/// which persists the directory's entries — the same approach `SQLite`'s Win32
+/// VFS uses. `custom_flags` is safe, so this needs no FFI or new dependency.
+pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory sync is unsupported on this platform",
+        ))
+    }
+}
+
 /// Maximum number of shards in the pool.
+///
+/// This is a runtime policy cap, not a format limit: the shard slot is a
+/// `u16` that can represent 65,536 values, and nothing about the on-disk
+/// encoding forbids more than this count. The cap deliberately bounds one
+/// process's live shard objects — their pack-file descriptors, their
+/// (lazily created) mappings, and their buffered append memory — under a
+/// no-eviction lifecycle: once live, a shard is retired only when a repack
+/// reclaims it, never by closing and reopening its file.
+///
+/// It is also not a complete resource limit on its own. A process's usable
+/// shard count is bounded by its file-descriptor and VMA budgets, which are
+/// separate and often tighter (see [`ShardPool`]); a single
+/// `MAX_SHARDS`-sized pool can still reach `EMFILE` or exhaust
+/// `vm.max_map_count` first.
 pub const MAX_SHARDS: usize = 4096;
+
+const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 
 /// Maximum number of shards as `u16`. Primary constant for shard IDs
 /// and modular arithmetic.
@@ -22,12 +116,12 @@ pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 
 /// Maximum shard size before rotation: `2^32 - 2` bytes (~4 GiB), the
 /// largest value for which every offset a shard can ever produce still
-/// fits `IndexSlot`'s 32-bit offset field (which reserves its all-zero
+/// fits `IndexEntry`'s 32-bit offset field (which reserves its all-zero
 /// encoding as the empty-slot sentinel, capping the max representable
-/// offset at `2^32 - 2` — see `index::IndexSlot`). Do not round this up
+/// offset at `2^32 - 2` — see `index::IndexEntry`). Do not round this up
 /// to a clean `4 * 1024 * 1024 * 1024`: that's one byte over the ceiling and
-/// lets a shard produce an offset `IndexSlot::new` panics on.
-pub const MAX_SHARD_BYTES: u64 = crate::index::IndexSlot::MAX_OFFSET;
+/// lets a shard produce an offset `IndexEntry::new` panics on.
+pub const MAX_SHARD_BYTES: u64 = crate::index::IndexEntry::MAX_OFFSET;
 
 /// Default in-memory threshold before a shard's buffered frames are written
 /// to disk as one positioned write. Keeps bulk writes from paying a
@@ -37,6 +131,12 @@ pub const MAX_SHARD_BYTES: u64 = crate::index::IndexSlot::MAX_OFFSET;
 /// persistence once at commit). The default [`AppendPolicy`] is
 /// [`AppendPolicy::Eager`], so this threshold only applies to pools opened
 /// with [`AppendPolicy::Buffered`].
+///
+/// The buffer is per shard, so the pool's buffered-memory commitment is this
+/// threshold times the number of shards holding unflushed data. That product
+/// is a worst-case upper bound, not a standing footprint: only a shard whose
+/// buffer is currently near full contributes this much, and `MAX_SHARDS`
+/// bounds how many can do so at once.
 pub(crate) const PENDING_FLUSH_BYTES: usize = 1 << 20;
 
 /// When a shard's appended frames are written to its underlying pack file.
@@ -272,7 +372,7 @@ fn persist_store_meta(base_dir: &Path) {
         return; // never true for a real semver string; just don't write garbage
     };
     let mut buf = Vec::with_capacity(6usize.saturating_add(version.len()));
-    buf.extend_from_slice(b"SMeta");
+    buf.extend_from_slice(b"MTXS");
     buf.push(STORE_META_VERSION);
     buf.push(version_len);
     buf.extend_from_slice(version);
@@ -299,11 +399,12 @@ fn persist_store_meta(base_dir: &Path) {
 #[must_use]
 pub fn store_created_by_version(base_dir: &Path) -> Option<String> {
     let data = fs::read(base_dir.join(STORE_META_FILENAME)).ok()?;
-    if data.len() < 7 || &data[0..5] != b"SMeta" || data[5] != STORE_META_VERSION {
+    if data.len() < 6 || &data[0..4] != b"MTXS" || data[4] != STORE_META_VERSION {
         return None;
     }
-    let version_len = usize::from(data[6]);
-    let version_bytes = data.get(7..7 + version_len)?;
+    let version_len = usize::from(data[5]);
+    let version_end = 6usize.checked_add(version_len)?;
+    let version_bytes = data.get(6..version_end)?;
     String::from_utf8(version_bytes.to_vec()).ok()
 }
 
@@ -424,28 +525,39 @@ impl Drop for Shard {
     }
 }
 
-/// Holds the writer's exclusive claim on a `base_dir` (see
-/// `ShardPool::acquire_writer_lock`). Removing the marker file on drop is
-/// what makes a clean shutdown release the lock instantly, same as real
-/// `flock` releasing on fd close — a crash instead leaves it for the next
-/// opener's staleness check (`lock_holder_is_dead`) to reclaim.
-#[cfg(not(target_arch = "wasm32"))]
-struct WriterLock {
-    path: PathBuf,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for WriterLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+/// Holds the writer's exclusive claim on a pool or database-root lock path.
+/// On Unix, the open file descriptor owns a kernel advisory lock for this
+/// value's lifetime. The marker contents are diagnostic only.
+pub(crate) struct WriterLock {
+    _file: File,
 }
 
 /// Pool of global shard files shared across all collections.
 ///
-/// Only `MAX_SHARDS` files are open at any time, capping file descriptor
-/// usage regardless of collection count. The active write shard rotates when it
-/// exceeds `MAX_SHARD_BYTES`.
+/// At most `MAX_SHARDS` shard files are live at any time, which bounds the
+/// pool's own resource use regardless of collection count. That bound is a
+/// policy cap over live shard *objects*, not a promise about how many the
+/// process can actually hold; the real ceilings are the surrounding system
+/// budgets:
+///
+/// - File descriptors are per-process (`RLIMIT_NOFILE`): each live shard
+///   holds a persistent file descriptor, plus transient ones during rotation
+///   or recovery, so a process reaches `EMFILE` once
+///   `(limit - baseline - headroom) / fds_per_live_shard` shards are live.
+///   Under multiple readers on one host these descriptors also aggregate
+///   against the system-wide `fs.file-max` pool (`ENFILE`).
+/// - Mappings consume virtual address space and VMAs against the *per-process*
+///   `vm.max_map_count`. A mapping is created lazily, and because mappings are
+///   reference-counted a remap can leave more than one live while previously
+///   returned ranges still reference an older mapping — so an active shard
+///   accounts for one or more VMAs, not exactly one. VMA counts do not
+///   aggregate across processes.
+///
+/// Neither budget is fixed here: `fds_per_live_shard` and the per-shard VMA
+/// count both vary with workload and implementation, so the formulas stay
+/// symbolic rather than being reduced to constants.
+///
+/// The active write shard rotates when it exceeds `MAX_SHARD_BYTES`.
 pub struct ShardPool {
     /// Fixed-size array of shard slots. `None` means unused.
     shards: RwLock<Vec<Option<Arc<Shard>>>>,
@@ -457,7 +569,7 @@ pub struct ShardPool {
     /// Per-pool rotation threshold, in bytes. Defaults to `MAX_SHARD_BYTES`
     /// but may be set lower (e.g. by a benchmark that wants many small
     /// packs to exercise repack/locality behavior) — never higher, since
-    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexSlot`'s 32-bit
+    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexEntry`'s 32-bit
     /// offset field.
     max_shard_bytes: u64,
     /// Per-pool seed mixed into index bucket/tag derivation. Generated once
@@ -546,8 +658,6 @@ pub struct ShardPool {
     /// its lifetime matters — so `#[allow(dead_code)]` here is correct,
     /// not a lint dodge: the field genuinely has no read access by
     /// design, the same way a `MutexGuard` binding is never "used" either.
-    /// `None` on wasm32, where there's no cross-process model to guard.
-    #[cfg(not(target_arch = "wasm32"))]
     #[allow(dead_code)]
     writer_lock: Option<WriterLock>,
 }
@@ -924,9 +1034,9 @@ impl ShardPool {
         let store_meta_write_time = t_store_meta.elapsed();
 
         if bucket_seed == 0 {
-            let mut seed_bytes = [0u8; 8];
-            getrandom::fill(&mut seed_bytes).map_err(io::Error::other)?;
-            bucket_seed = u64::from_ne_bytes(seed_bytes);
+            use std::collections::hash_map::RandomState;
+            use std::hash::{BuildHasher, Hasher};
+            bucket_seed = RandomState::new().build_hasher().finish();
         }
 
         let t_pool_meta_persist = Instant::now();
@@ -944,8 +1054,7 @@ impl ShardPool {
         shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
         next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
 
-        let dir = File::open(base_dir)?;
-        dir.sync_all()?;
+        sync_directory(base_dir)?;
         let initial_pack_create_time = t_initial_pack.elapsed();
 
         Ok((
@@ -1001,7 +1110,7 @@ impl ShardPool {
         checksum_policy: packfile::ChecksumPolicy,
         stats_persisted_at: Option<u64>,
         mut timings: ShardOpenTimings,
-        #[cfg(not(target_arch = "wasm32"))] writer_lock: Option<WriterLock>,
+        writer_lock: Option<WriterLock>,
     ) -> Self {
         let metadata_subphases_sum = timings
             .pool_meta_restore
@@ -1042,7 +1151,6 @@ impl ShardPool {
             compress,
             checksum_policy,
             append_policy: AppendPolicy::Eager,
-            #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         }
     }
@@ -1068,14 +1176,10 @@ impl ShardPool {
         }
 
         let writer_lock_started = Instant::now();
-        #[cfg(not(target_arch = "wasm32"))]
         let writer_lock = writable
             .then(|| Self::acquire_writer_lock(&base_dir))
             .transpose()?;
-        #[cfg(not(target_arch = "wasm32"))]
         let writer_lock_time = writer_lock_started.elapsed();
-        #[cfg(target_arch = "wasm32")]
-        let writer_lock_time = Duration::ZERO;
 
         let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
         let mut next_slot: u16 = 0;
@@ -1167,7 +1271,6 @@ impl ShardPool {
                 total,
                 ..Default::default()
             },
-            #[cfg(not(target_arch = "wasm32"))]
             writer_lock,
         ))
     }
@@ -1184,6 +1287,12 @@ impl ShardPool {
         self.bucket_seed
     }
 
+    /// Whether this pool attempts zstd compression on written records.
+    #[must_use]
+    pub fn is_compression_enabled(&self) -> bool {
+        self.compress
+    }
+
     /// Claim the writer lock on `base_dir`: atomically create a
     /// `.mtxdb.lock` marker file, which fails with `AlreadyExists` if
     /// another writer already holds it. Pure `std::fs` — no OS-level
@@ -1197,27 +1306,54 @@ impl ShardPool {
     /// removed and retried once rather than wrongly blocking forever. The
     /// starttime is what makes this safe across PID reuse (see
     /// `lock_holder_is_dead`) — a bare PID is not enough on its own.
-    #[cfg(not(target_arch = "wasm32"))]
     fn acquire_writer_lock(base_dir: &Path) -> io::Result<WriterLock> {
-        let lock_path = base_dir.join(".mtxdb.lock");
-        match Self::try_create_lock_file(&lock_path) {
-            Ok(()) => Ok(WriterLock { path: lock_path }),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if Self::lock_holder_is_dead(&lock_path) {
-                    let _ = fs::remove_file(&lock_path);
-                    Self::try_create_lock_file(&lock_path)?;
-                    return Ok(WriterLock { path: lock_path });
-                }
-                Err(io::Error::new(
+        Self::acquire_lock_path(&base_dir.join(".mtxdb.lock"))
+    }
+
+    /// Acquire the same `{pid, starttime}`-guarded exclusive lock at an
+    /// arbitrary path. Shared by the per-pool writer lock (`.mtxdb.lock`) and
+    /// the database-root shared-WAL lock (`.mtxdb.wal.lock`); see
+    /// `acquire_writer_lock`'s doc for the staleness contract.
+    pub(crate) fn acquire_lock_path(lock_path: &Path) -> io::Result<WriterLock> {
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+
+        file.try_lock_exclusive().map_err(|error| {
+            // fs2 exposes Windows ERROR_LOCK_VIOLATION directly, while std
+            // does not map that Windows error to WouldBlock. Preserve the
+            // platform-independent lock contract.
+            let lock_contended = error.kind() == io::ErrorKind::WouldBlock
+                || (cfg!(target_os = "windows")
+                    && error.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION));
+            if lock_contended {
+                io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
-                        "{} is already locked by another writer process",
-                        base_dir.display()
+                        "{} is already locked by another writer",
+                        lock_path.display()
                     ),
-                ))
+                )
+            } else {
+                error
             }
-            Err(e) => Err(e),
-        }
+        })?;
+
+        file.set_len(0)?;
+        #[cfg(target_os = "linux")]
+        let marker = Self::proc_start_time("self").map_or_else(
+            || format!("{}\n", std::process::id()),
+            |start| format!("{} {start}\n", std::process::id()),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let marker = format!("{}\n", std::process::id());
+        file.write_all(marker.as_bytes())?;
+        file.sync_all()?;
+
+        Ok(WriterLock { _file: file })
     }
 
     /// Atomically create the lock file and write our `{pid, starttime}`
@@ -1228,22 +1364,6 @@ impl ShardPool {
     /// alive") on a torn write from a crash mid-write — there's no
     /// correctness reason to pay an fsync on every lock acquisition to
     /// protect against that.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn try_create_lock_file(lock_path: &Path) -> io::Result<()> {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)?;
-        let pid = std::process::id();
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(start_time) = Self::proc_start_time("self") {
-                return write!(file, "{pid} {start_time}");
-            }
-        }
-        write!(file, "{pid}")
-    }
-
     /// Reads field 22 (`starttime`, clock ticks since boot) out of
     /// `/proc/<pid_or_self>/stat`. Parses from the *last* `)` rather than
     /// splitting on whitespace from the start: the second field (`comm`,
@@ -1289,8 +1409,8 @@ impl ShardPool {
     /// an older binary (bare PID, no starttime) has nothing to compare
     /// against and fails closed exactly as before, same as any other
     /// unparsable content.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn lock_holder_is_dead(lock_path: &Path) -> bool {
+    #[must_use]
+    pub fn lock_holder_is_dead(lock_path: &Path) -> bool {
         #[cfg(target_os = "linux")]
         {
             let Ok(contents) = fs::read_to_string(lock_path) else {
@@ -1323,6 +1443,32 @@ impl ShardPool {
             let _ = lock_path;
             false
         }
+    }
+
+    /// Read the PID recorded in a lock marker and classify its holder.
+    ///
+    /// Returns `None` for a missing or unparsable marker. The liveness result
+    /// is advisory and never acquires, removes, or modifies the lock.
+    #[must_use]
+    pub fn lock_holder_status(lock_path: &Path) -> Option<(u32, bool)> {
+        let info = Self::lock_holder_info(lock_path)?;
+        Some((info.pid, info.running))
+    }
+
+    /// Read the lock marker with confidence information for diagnostics.
+    #[must_use]
+    pub fn lock_holder_info(lock_path: &Path) -> Option<LockHolderInfo> {
+        let contents = fs::read_to_string(lock_path).ok()?;
+        let pid = contents.split_whitespace().next()?.parse().ok()?;
+        Some(LockHolderInfo {
+            pid,
+            running: !Self::lock_holder_is_dead(lock_path),
+            has_starttime: contents
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some(),
+        })
     }
 
     /// Discovers new pack files on disk and adds them to the pool.
@@ -1428,8 +1574,8 @@ impl ShardPool {
         bucket_seed: u64,
         sync_dir: bool,
     ) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(22);
-        buf.extend_from_slice(b"PMeta");
+        let mut buf = Vec::with_capacity(21);
+        buf.extend_from_slice(b"MTXP");
         buf.push(POOL_META_VERSION);
         buf.extend_from_slice(&next.to_le_bytes());
         buf.extend_from_slice(&bucket_seed.to_le_bytes());
@@ -1446,8 +1592,7 @@ impl ShardPool {
                 // Fsync the containing directory so the rename is durable
                 // across power loss — without this, a crash could leave the
                 // old pool.meta (or no file) in place, allowing pack_id reuse.
-                let dir = File::open(base_dir)?;
-                dir.sync_all()?;
+                sync_directory(base_dir)?;
             }
             Ok(())
         })();
@@ -1470,32 +1615,32 @@ impl ShardPool {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if data.len() < 22 {
+        if data.len() < 21 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "pool.meta is truncated ({} bytes, expected >= 22)",
+                    "pool.meta is truncated ({} bytes, expected >= 21)",
                     data.len()
                 ),
             ));
         }
-        if &data[0..5] != b"PMeta" {
+        if &data[0..4] != b"MTXP" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pool.meta has invalid magic",
             ));
         }
-        if data[5] != POOL_META_VERSION {
+        if data[4] != POOL_META_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
                     "pool.meta has unsupported version {} (expected {})",
-                    data[5], POOL_META_VERSION
+                    data[4], POOL_META_VERSION
                 ),
             ));
         }
-        let next_pack_id = u64::from_le_bytes(data[6..14].try_into().unwrap());
-        let bucket_seed = u64::from_le_bytes(data[14..22].try_into().unwrap());
+        let next_pack_id = u64::from_le_bytes(data[5..13].try_into().unwrap());
+        let bucket_seed = u64::from_le_bytes(data[13..21].try_into().unwrap());
         Ok(Some(PoolMeta {
             next_pack_id,
             bucket_seed,
@@ -1749,6 +1894,16 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on write, flush, or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
+        self.put_record_with_len(record)
+            .map(|(slot, offset, _)| (slot, offset))
+    }
+
+    /// Append a record and return its exact encoded frame size as well as its
+    /// location. The extra size is used by incremental physical accounting.
+    ///
+    /// # Errors
+    /// Returns an I/O or encoding error if the record cannot be appended.
+    pub fn put_record_with_len(&self, record: &Record) -> io::Result<(u16, u64, u64)> {
         let mut shard = self.shard_for_collection(&record.collection_id);
         loop {
             if shard.is_poisoned() {
@@ -1876,7 +2031,8 @@ impl ShardPool {
                 }
                 return Err(e);
             }
-            return Ok((shard.slot, virtual_end));
+            let disk_bytes = u64::try_from(frame_len).unwrap_or(u64::MAX);
+            return Ok((shard.slot, virtual_end, disk_bytes));
         }
     }
 
@@ -1973,6 +2129,12 @@ impl ShardPool {
             // next flush attempt instead of silently discarding already
             // "successful" puts whose offsets the index has already
             // handed out.
+            // On Windows this is a seek followed by write_all rather than an
+            // append write. It is safe because append_lock serializes every
+            // flush and no other path moves the shared file pointer. The
+            // committed file_len is initialized from file metadata on reopen
+            // and advanced only after a successful flush, so this cannot
+            // overwrite data or leave a gap at the on-disk EOF frontier.
             let file = shard.file.try_clone()?;
             #[cfg(unix)]
             file.write_all_at(&pending_guard, committed)?;
@@ -1982,6 +2144,8 @@ impl ShardPool {
                 file.seek(io::SeekFrom::Start(committed))?;
                 file.write_all(&pending_guard)?;
             }
+            #[cfg(target_os = "linux")]
+            kick_writeback(&file, committed, pending_guard.len() as u64);
             let new_len = pending_guard.len() as u64;
             let file_len = committed.checked_add(new_len).ok_or_else(|| {
                 io::Error::new(
@@ -2094,7 +2258,9 @@ impl ShardPool {
                 return Err(StorageError::Corrupt("truncated frame body or CRC".into()));
             }
 
-            return Ok(u64::from(frame_len) + 8);
+            return u64::from(frame_len)
+                .checked_add(8)
+                .ok_or_else(|| StorageError::Corrupt("record length overflow".into()));
         }
         unreachable!("record_disk_len_at remap-retry is bounded to two iterations")
     }
@@ -2209,7 +2375,12 @@ impl ShardPool {
                 return Err(StorageError::Corrupt("truncated record metadata".into()));
             }
             let flags = mem[prefix_end];
-            if flags & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED) != 0 {
+            if flags
+                & !(packfile::FLAG_COMPRESSED
+                    | packfile::FLAG_CRC_DISABLED
+                    | packfile::FLAG_METADATA)
+                != 0
+            {
                 return Err(StorageError::Corrupt(format!(
                     "unsupported record flags: {flags:#04x}"
                 )));
@@ -2307,15 +2478,8 @@ impl ShardPool {
                 &mem[prefix_end..crc_pos],
                 mem[crc_pos..frame_end].try_into().unwrap(),
                 verify,
-                MmapRange {
-                    mmap: Arc::clone(&mapping),
-                    // `frame_len >= FRAME_FIXED_LEN` was checked above, so
-                    // the fixed 37-byte metadata prefix fits in the frame.
-                    start: prefix_end
-                        .checked_add(37)
-                        .expect("validated frame metadata prefix fits in usize"),
-                    end: crc_pos,
-                },
+                Arc::clone(&mapping),
+                prefix_end,
             );
         }
         unreachable!("read_at remap-retry is bounded to two iterations")
@@ -2325,17 +2489,25 @@ impl ShardPool {
     /// When `verify` is false — or the frame carries
     /// [`packfile::FLAG_CRC_DISABLED`] — the checksum is skipped, not
     /// compared; structural validation (lengths, flags, node bytes) still runs.
+    ///
+    /// `frame_base` is the absolute mmap offset of `payload[0]` (the flags
+    /// byte), used to build the zero-copy `MmapRange` for the node bytes after
+    /// any metadata block has been located.
     fn decode_record_frame(
         frame_len: [u8; 4],
         payload: &[u8],
         checksum: [u8; 4],
         verify: bool,
-        node_bytes_owner: MmapRange,
+        mmap: Arc<Mmap>,
+        frame_base: usize,
     ) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
         let flags = payload[0];
-        if flags & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED) != 0 {
+        if flags
+            & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED | packfile::FLAG_METADATA)
+            != 0
+        {
             return Err(StorageError::Corrupt(format!(
                 "unsupported record flags: {flags:#04x}"
             )));
@@ -2359,13 +2531,42 @@ impl ShardPool {
         collection_id.copy_from_slice(&payload[5..21]);
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&payload[21..37]);
-        let data =
-            Self::decode_node_bytes(flags, uncompressed_len, &payload[37..], node_bytes_owner)?;
+
+        let rest = &payload[37..];
+        let (metadata, node_offset, node_bytes) = if flags & packfile::FLAG_METADATA != 0 {
+            let (metadata, consumed) = packfile::FrameMetadata::decode(rest)
+                .map_err(|e| StorageError::Corrupt(format!("frame metadata: {e}")))?;
+            let node_bytes = rest.get(consumed..).ok_or_else(|| {
+                StorageError::Corrupt("frame metadata consumes past payload".into())
+            })?;
+            let node_offset = 37usize
+                .checked_add(consumed)
+                .ok_or_else(|| StorageError::Corrupt("frame node offset overflow".into()))?;
+            (Some(metadata), node_offset, node_bytes)
+        } else {
+            (None, 37, rest)
+        };
+
+        let data = Self::decode_node_bytes(
+            flags,
+            uncompressed_len,
+            node_bytes,
+            MmapRange {
+                mmap,
+                start: frame_base
+                    .checked_add(node_offset)
+                    .ok_or_else(|| StorageError::Corrupt("frame node offset overflow".into()))?,
+                end: frame_base
+                    .checked_add(payload.len())
+                    .ok_or_else(|| StorageError::Corrupt("frame end overflow".into()))?,
+            },
+        )?;
 
         Ok(Record {
             collection_id,
             hash,
             data,
+            metadata,
         })
     }
 
@@ -2394,15 +2595,18 @@ impl ShardPool {
                 packfile::MAX_DATA_LEN
             )));
         }
-        let decompressed = zstd::bulk::decompress(node_bytes, expected_len)
-            .map_err(|e| StorageError::Corrupt(format!("zstd decompress failed: {e}")))?;
-        if decompressed.len() != expected_len {
-            return Err(StorageError::Corrupt(format!(
-                "decompressed length {} != framed uncompressed_len {uncompressed_len}",
-                decompressed.len()
-            )));
+        #[cfg(feature = "zstd")]
+        {
+            let decompressed = packfile::zstd_decompress(node_bytes, expected_len)
+                .map_err(|e| StorageError::Corrupt(e.to_string()))?;
+            Ok(bytes::Bytes::from(decompressed))
         }
-        Ok(bytes::Bytes::from(decompressed))
+        #[cfg(not(feature = "zstd"))]
+        {
+            Err(StorageError::Corrupt(
+                "compressed node but this build was compiled without the `zstd` feature".into(),
+            ))
+        }
     }
 
     /// Remap a shard to its current on-disk length.
@@ -2708,6 +2912,33 @@ impl ShardPool {
     /// Commits any buffered frames first, so the fsync covers everything a
     /// caller believes it has put.
     ///
+    /// # Cross-process visibility
+    ///
+    /// This makes the dirty shard bytes durable, but it is not the
+    /// transaction-level durability or publication barrier: it does not commit
+    /// the journal/LSN boundary and does not advance the LSN a reader in
+    /// another process observes, so nothing about another process's view
+    /// follows from it returning `Ok`.
+    ///
+    /// * With a [journal](crate::journal) enabled, the transaction-level
+    ///   durability barrier is
+    ///   [`JournalCoordinator::sync_through`](crate::journal::JournalCoordinator::sync_through)
+    ///   (reached via the packfile storage sync path), and shard fsyncs are
+    ///   acceleration recovered from the journal on reopen. A separate process
+    ///   observes committed data through the read-committed overlay
+    ///   (`PackfileStorage::open_read_committed` / `get_read_committed`, the
+    ///   `multi-reader` feature), whose boundary is the journal's committed
+    ///   LSN. That boundary can advance *before* this call, and a
+    ///   visible-but-uncommitted group is not crash-durable.
+    /// * Without a journal, a peer sees shard bytes only after an explicit
+    ///   [`StorageEngine::refresh_collection`](crate::storage::StorageEngine::refresh_collection)
+    ///   re-scan; the engine has no ambient cross-process invalidation. A
+    ///   successful `sync_dirty` then guarantees those bytes survive a crash,
+    ///   not that a peer has picked them up.
+    ///
+    /// Same-process readers go through the live index; cross-process readers
+    /// go through the journal overlay (or an explicit rescan).
+    ///
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_dirty(&self) -> io::Result<()> {
@@ -2845,7 +3076,8 @@ mod tests {
         use std::sync::atomic::AtomicU64;
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("mdb_test_shard_{name}_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("mdb_test_shard_{name}_{}_{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -2860,6 +3092,7 @@ mod tests {
             collection_id,
             hash,
             data: bytes::Bytes::copy_from_slice(data),
+            metadata: None,
         }
     }
 
@@ -3705,6 +3938,7 @@ mod tests {
                 collection_id: [0x22; 16],
                 hash: [0x33; 16],
                 data: bytes::Bytes::from_static(b"pre-cutover data"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -3836,7 +4070,7 @@ mod tests {
             // Place fake orphaned .tmp files
             fs::write(
                 dir.join("pool.meta.tmp.1234"),
-                b"PMeta\x01\x01\x00\x00\x00\x00\x00\x00\x00",
+                b"MTXP\x01\x01\x00\x00\x00\x00\x00\x00\x00",
             )
             .unwrap();
             fs::write(dir.join("pack_0000000000000000.tmp.1234.0"), b"PACK\x02...").unwrap();
@@ -3982,6 +4216,7 @@ mod tests {
                 collection_id: [0x01; 16],
                 hash: [0xAA; 16],
                 data: bytes::Bytes::from_static(b"live data"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -3996,6 +4231,7 @@ mod tests {
                 collection_id: [0xFF; 16],
                 hash: [0xBB; 16],
                 data: bytes::Bytes::from_static(b"stale leftover"),
+                metadata: None,
             },
         )
         .unwrap();
@@ -4132,6 +4368,7 @@ mod tests {
                     },
                     hash: [0xAA; 16],
                     data: bytes::Bytes::from_static(b"payload"),
+                    metadata: None,
                 },
             )
             .unwrap();
@@ -4167,14 +4404,14 @@ mod tests {
     }
 
     /// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
-    /// `IndexSlot` stores as `offset + 1`, so the maximum valid offset must
+    /// `IndexEntry` stores as `offset + 1`, so the maximum valid offset must
     /// never reach the empty-slot sentinel boundary.
     #[test]
     fn max_shard_bytes_fits_index_slot() {
         // The largest offset a shard can ever present must survive
-        // IndexSlot::new without panicking.
+        // IndexEntry::new without panicking.
         let max_offset = MAX_SHARD_BYTES - 1;
-        let slot = crate::index::IndexSlot::new(0, 0, max_offset);
+        let slot = crate::index::IndexEntry::new(0, 0, max_offset);
         assert_eq!(slot.offset(), max_offset);
     }
 

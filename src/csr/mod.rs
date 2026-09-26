@@ -79,7 +79,8 @@ impl Csr {
     #[must_use]
     pub fn neighbors(&self, local_id: u32) -> &[u32] {
         let start = self.offsets[local_id as usize] as usize;
-        let end = self.offsets[local_id as usize + 1] as usize;
+        let next = (local_id as usize).saturating_add(1);
+        let end = self.offsets[next] as usize;
         &self.targets[start..end]
     }
 

@@ -6,7 +6,7 @@ rust-version = "1.81"
 publish = false
 
 # Deliberately outside the root [workspace]'s `members` — same reasoning as
-# mtxdb-ffi/mtxdb-wasm (see the root Cargo.toml's [workspace] comment): a
+# mtxdb-cli (see the root Cargo.toml's [workspace] comment): a
 # standalone `[workspace]` table here stops Cargo's upward search, so this
 # crate is its own workspace root. That means `cargo build/check/clippy
 # --workspace --all-targets --all-features` from the repo root never touches
@@ -21,13 +21,20 @@ publish = false
 # amalgamation from source on every build, on top of libsqlite3-sys's own
 # bindgen run. Linking the system libsqlite3 (found via pkg-config) skips that
 # compile step; it costs requiring sqlite3 dev headers to be installed where
-# benches are run.
+# benches are run. Windows has neither a system libsqlite3 nor pkg-config, so
+# it overrides this with the `bundled` feature below.
 bytes = "1.5"
 crc32fast = "1.4"
 fjall = "2.11.2"
 libmdbx = "0.6"
-mtxdb = { path = ".." }
+mtxdb = { path = "..", features = ["multi-reader"] }
 rusqlite = "0.32"
+
+[target.'cfg(windows)'.dependencies]
+# No system SQLite and no pkg-config on Windows, so build and link the bundled
+# amalgamation instead (MSVC is available on the CI runner). Linux/macOS keep
+# the system library via the non-bundled dependency above.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # LINTS — mirrors the root workspace's [workspace.lints]; this crate no
 # longer shares that table since it's its own workspace root.
@@ -87,6 +94,12 @@ harness = false
 [[bench]]
 name = "scan"
 path = "scan.rs"
+harness = false
+
+# Cold-cache off-vs-hdd comparison for get_many's merged read plan.
+[[bench]]
+name = "read_plan"
+path = "read_plan.rs"
 harness = false
 
 [[bench]]

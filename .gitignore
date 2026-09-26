@@ -3,6 +3,10 @@ target/
 .coverage/
 lcov.info
 
+# IDEs
+.idea/
+.vscode/
+
 # test / in-repo db
 /pools
 

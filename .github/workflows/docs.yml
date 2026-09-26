@@ -15,11 +15,16 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_BACKTRACE: "1"
 
 jobs:
   docs:
     if: github.ref_name == 'master' || github.ref_name == 'dev'
     runs-on: ubuntu-latest
+    env:
+      # Override the committed rust-toolchain.toml pin (nightly-2026-08-20) so
+      # rustdoc matches the stable toolchain installed below.
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

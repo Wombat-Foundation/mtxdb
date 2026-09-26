@@ -41,11 +41,11 @@ use super::format::{
 };
 
 /// Magic identifying the persisted-index checkpoint format.
-pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXIDX01";
+pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// Current wire version (see [`CheckpointHeader::version`]).
 ///
 /// Bumped to 6: the header carries a pack table (`slot -> pack_id`
-/// bindings for every pack live at checkpoint-write time). `shard_id` in a
+/// bindings for every pack live at checkpoint-write time). `slot` in a
 /// checkpoint's raw index slots (and in `DeltaFrame.slot`) is the writer's
 /// local, process-scoped `ShardPool` slot, not a stable identity — a fresh
 /// reader's `discover_shards` reassigns slots by first-free-in-`pack_id`-order,
@@ -125,7 +125,7 @@ pub struct LoadedCheckpoint {
     /// this checkpoint.
     pub mmap: Arc<Mmap>,
     /// `(writer's local shard slot, pack_id)` for every pack live at
-    /// checkpoint-write time. Every `shard_id` embedded in this checkpoint's
+    /// checkpoint-write time. Every `slot` embedded in this checkpoint's
     /// raw index slots (and in any delta frame that continues it) refers to
     /// one of these slots — translate through this table to a reader's own
     /// local slot rather than trusting the slot number directly. See the
@@ -467,6 +467,12 @@ pub fn read_checkpoint_with_policy(
         .slots_bytes
         .checked_add(header.homes_bytes)
         .and_then(|v| v.checked_add(header.tails_bytes))?;
+    // Slots are unique u16 values, so a valid pack table cannot exceed 65,536
+    // entries; reject before `pack_table` and its dedupe sets reserve capacity
+    // from `pack_table_count`.
+    if header.pack_table_count > u32::from(u16::MAX).saturating_add(1) {
+        return None;
+    }
     if header.pack_table_bytes
         != u64::from(header.pack_table_count).checked_mul(PACK_TABLE_ENTRY_LEN as u64)?
     {
@@ -926,7 +932,8 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_missing_file() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_missing");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_ckpt_fp_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -939,7 +946,7 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_truncated() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_trunc");
+        let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_trunc_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -953,7 +960,8 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_invalid_magic() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_badmagic");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_ckpt_fp_badmagic_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -969,7 +977,7 @@ mod tests {
 
     #[test]
     fn read_pack_fingerprint_valid_roundtrip() {
-        let dir = std::env::temp_dir().join("mtxdb_ckpt_fp_valid");
+        let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_valid_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -997,7 +1005,8 @@ mod tests {
 
     #[test]
     fn read_durable_fingerprint_no_checkpoint() {
-        let dir = std::env::temp_dir().join("mtxdb_durable_no_ckpt");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_durable_no_ckpt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -1009,7 +1018,8 @@ mod tests {
 
     #[test]
     fn read_durable_fingerprint_checkpoint_only() {
-        let dir = std::env::temp_dir().join("mtxdb_durable_ckpt_only");
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_durable_ckpt_only_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
