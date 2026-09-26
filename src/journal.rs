@@ -2634,11 +2634,13 @@ impl Journal {
             file.set_len(scan.valid_len)?;
         }
         file.seek(SeekFrom::Start(scan.valid_len))?;
-        if !scan.groups.is_empty() {
+        if scan.truncated_tail || !scan.groups.is_empty() {
             // What recovery keeps may exist only in the page cache (a process
             // crash leaves it there), yet the coordinator will report it
             // committed. Make it durable now, and record that in the hint, so a
-            // later sync never claims bytes that were not fsynced.
+            // later sync never claims bytes that were not fsynced. The same
+            // fsync makes a truncation durable, including one that dropped
+            // every group, so a dropped tail cannot reappear.
             file.sync_all()?;
             if let Some(last) = scan.groups.last() {
                 write_durable_hint(
@@ -3372,10 +3374,11 @@ fn read_durable_len(path: &Path, base_sequence: u64, base_lsn: u64, file_len: u6
     durable_len
 }
 
-/// Record that `durable_len` bytes of the segment are durable, in place and
-/// without truncating (truncate-and-rewrite would make some filesystems flush
-/// the hint), through a positioned write so no handle's cursor moves. Best
-/// effort: a failed write leaves the previous, lower mark, which is safe.
+/// Record that `durable_len` bytes of the segment are durable. Write a complete
+/// fixed-size replacement and atomically rename it over the old hint, so
+/// readers see either a checksum-valid old mark or a checksum-valid new one;
+/// a crash may still lose the rename, which safely falls back to truncation.
+/// Best effort: a failed write leaves the previous, lower mark, which is safe.
 fn write_durable_hint(
     path: &Path,
     base_sequence: u64,
@@ -3384,24 +3387,24 @@ fn write_durable_hint(
     through_lsn: u64,
 ) {
     let hint = encode_durable_hint(base_sequence, base_lsn, synced_bytes, through_lsn);
-    let Ok(file) = OpenOptions::new()
+    let path = durable_hint_path(path);
+    let temp_path = path.with_extension("durable.tmp");
+    let Ok(mut file) = OpenOptions::new()
         .create(true)
-        .truncate(false)
         .write(true)
-        .open(durable_hint_path(path))
+        .truncate(true)
+        .open(&temp_path)
     else {
         return;
     };
-    #[cfg(unix)]
-    let result = std::os::unix::fs::FileExt::write_all_at(&file, &hint, 0);
-    #[cfg(not(unix))]
-    let result = {
-        let mut handle = &file;
-        handle
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| handle.write_all(&hint))
-    };
-    result.ok();
+    if file.write_all(&hint).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return;
+    }
+    drop(file);
+    if fs::rename(&temp_path, &path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
 }
 
 fn scan_bytes(
