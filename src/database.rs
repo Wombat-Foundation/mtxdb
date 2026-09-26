@@ -177,8 +177,14 @@ impl DatabaseTransaction<'_> {
         collection_id: &[u8; 16],
         node_ids: &[NodeId],
     ) -> Result<Vec<Option<crate::storage::NodeData>>, StorageError> {
-        let _lifecycle = self.lifecycle.lock();
-        let staged = self.stage.lookup_many(pool, collection_id, node_ids);
+        // Resolve against the stage under the lifecycle lock, which is what
+        // keeps that answer consistent with a concurrent commit or abort. The
+        // live read below is only for records the stage says nothing about, so
+        // it needs no lock and must not hold up a commit behind a large read.
+        let staged = {
+            let _lifecycle = self.lifecycle.lock();
+            self.stage.lookup_many(pool, collection_id, node_ids)
+        };
         let mut results = Vec::with_capacity(node_ids.len());
         let mut live_slots = Vec::new();
         let mut live_ids = Vec::new();
@@ -1612,7 +1618,7 @@ mod tests {
             meta.push(1);
             meta.extend_from_slice(&[0u8; 8]);
             meta[4 + 1] = layout_code; // reserved[0] is the WAL-layout byte
-            meta.extend_from_slice(b"state\nevent\nedges\n");
+            meta.extend_from_slice(b"mtpl-state\nmtpl-event\nmtpl-edges\n");
             std::fs::write(root.join("db.meta"), meta).unwrap();
             // A checkpoint watermark recorded before the shared segment existed.
             std::fs::write(
@@ -1666,7 +1672,7 @@ mod tests {
                 let mut bytes = Vec::from(b"MTXD".as_slice());
                 bytes.push(1);
                 bytes.extend_from_slice(&[0u8; 8]);
-                bytes.extend_from_slice(b"state\nevent\nedges\n");
+                bytes.extend_from_slice(b"mtpl-state\nmtpl-event\nmtpl-edges\n");
                 bytes
             },
         )

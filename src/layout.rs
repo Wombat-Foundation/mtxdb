@@ -25,7 +25,18 @@ use std::path::{Path, PathBuf};
 const DB_META_MAGIC: &[u8; 4] = b"MTXD";
 const DB_META_VERSION: u8 = 1;
 const DB_META_RESERVED_LEN: usize = 8;
-const DB_META_POOL_LIST: &[u8] = b"state\nevent\nedges\n";
+/// The pool list a descriptor must carry, built from the pool directory names
+/// so it can never drift from them. A root whose descriptor lists other names
+/// (an older layout) is rejected by [`validate_db_meta`] instead of being
+/// opened with its data orphaned in directories nothing reads.
+fn db_meta_pool_list() -> Vec<u8> {
+    let mut list = Vec::new();
+    for shard_type in ShardType::ALL {
+        list.extend_from_slice(shard_type.as_str().as_bytes());
+        list.push(b'\n');
+    }
+    list
+}
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
@@ -68,12 +79,13 @@ impl WalLayout {
 
 /// Build the on-disk descriptor bytes for a database root.
 fn db_meta_bytes(wal_layout: WalLayout) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(DB_META_HEADER_LEN.saturating_add(DB_META_POOL_LIST.len()));
+    let pool_list = db_meta_pool_list();
+    let mut buf = Vec::with_capacity(DB_META_HEADER_LEN.saturating_add(pool_list.len()));
     buf.extend_from_slice(DB_META_MAGIC);
     buf.push(DB_META_VERSION);
     buf.extend_from_slice(&[0u8; DB_META_RESERVED_LEN]);
     buf[DB_META_WAL_LAYOUT_OFFSET] = wal_layout.code();
-    buf.extend_from_slice(DB_META_POOL_LIST);
+    buf.extend_from_slice(&pool_list);
     buf
 }
 
@@ -101,7 +113,7 @@ fn validate_db_meta(contents: &[u8]) -> bool {
     if WalLayout::from_code(contents[DB_META_WAL_LAYOUT_OFFSET]).is_none() {
         return false;
     }
-    contents[DB_META_HEADER_LEN..] == *DB_META_POOL_LIST
+    contents[DB_META_HEADER_LEN..] == db_meta_pool_list()[..]
 }
 
 /// Read the WAL layout a database root declares, or `None` when the root has
@@ -410,6 +422,29 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mtxdb-layout-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    /// A root written before the pool directories were renamed lists the old
+    /// names. It must be rejected loudly, not opened with its data orphaned in
+    /// `pools/state` etc. beside freshly created, empty `pools/mtpl-*`.
+    #[test]
+    fn a_descriptor_listing_the_old_pool_names_is_rejected() {
+        let root = test_dir("old_pool_names");
+        let layout = DatabaseLayout::open(root.clone()).unwrap();
+        drop(layout);
+        let meta_path = root.join(DB_META_FILENAME);
+        let mut contents = fs::read(&meta_path).unwrap();
+        let header_len = contents.len() - super::db_meta_pool_list().len();
+        contents.truncate(header_len);
+        contents.extend_from_slice(b"state\nevent\nedges\n");
+        fs::write(&meta_path, contents).unwrap();
+
+        assert_eq!(
+            super::read_wal_layout(&root).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(DatabaseLayout::open(root.clone()).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
