@@ -975,6 +975,16 @@ pub struct DeltaLogV3 {
     pub coverage_prefix_ops: usize,
 }
 
+/// The writer appends its one coverage claim as the last operation of a batch.
+fn coverage_claim_is_well_placed(operations: &[DeltaOperation]) -> bool {
+    let claims = operations
+        .iter()
+        .filter(|operation| matches!(operation, DeltaOperation::Coverage { .. }))
+        .count();
+    claims == 0
+        || (claims == 1 && matches!(operations.last(), Some(DeltaOperation::Coverage { .. })))
+}
+
 /// Read and structurally validate a v3 delta log.
 ///
 /// Unlike v2 the frame region is variable-length, so after the fixed batch
@@ -1065,12 +1075,15 @@ pub fn read_delta_log_v3(path: &Path) -> Option<DeltaLogV3> {
         if batch_crc(frames, batch_tail_fingerprint) != stored_crc {
             break;
         }
-        for operation in &batch_operations {
-            if let DeltaOperation::Coverage { covered_lsn } = operation {
-                // Coverage only moves forward; a lower claim in a later batch
-                // (it should not happen) cannot lower what was proven earlier.
-                coverage = Some(coverage.map_or(*covered_lsn, |old: u64| old.max(*covered_lsn)));
-            }
+        // A claim anywhere but last, or a second one, is not something a writer
+        // produces: the batch is treated as damaged and claims nothing.
+        if !coverage_claim_is_well_placed(&batch_operations) {
+            break;
+        }
+        if let Some(DeltaOperation::Coverage { covered_lsn }) = batch_operations.last() {
+            // Coverage only moves forward; a lower claim in a later batch
+            // (it should not happen) cannot lower what was proven earlier.
+            coverage = Some(coverage.map_or(*covered_lsn, |old: u64| old.max(*covered_lsn)));
         }
         operations.append(&mut batch_operations);
         if matches!(operations.last(), Some(DeltaOperation::Coverage { .. })) {
@@ -1933,6 +1946,50 @@ mod tests {
             Some(40)
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A batch whose claim is not its last operation, or that holds two, was
+    /// not written by this writer; it is dropped along with everything after it.
+    #[test]
+    fn a_misplaced_or_repeated_coverage_claim_is_rejected() {
+        let incremental = DeltaOperation::Incremental(DeltaFrame {
+            collection_id: [2; 16],
+            bucket: 1,
+            generation: 1,
+            slot: 5,
+        });
+        let bad_batches: [Vec<DeltaOperation>; 2] = [
+            vec![
+                DeltaOperation::Coverage { covered_lsn: 50 },
+                incremental.clone(),
+            ],
+            vec![
+                DeltaOperation::Coverage { covered_lsn: 50 },
+                DeltaOperation::Coverage { covered_lsn: 60 },
+            ],
+        ];
+        for (index, bad) in bad_batches.iter().enumerate() {
+            let dir = coverage_log_dir(&format!("misplaced-{index}"));
+            let path = dir.join(INDEX_DELTA_FILE);
+            append_v3_batch_with_durability(
+                &path,
+                true,
+                0xABC,
+                &[
+                    incremental.clone(),
+                    DeltaOperation::Coverage { covered_lsn: 7 },
+                ],
+                0x111,
+                true,
+            )
+            .unwrap();
+            append_v3_batch_with_durability(&path, false, 0xABC, bad, 0x222, true).unwrap();
+            let log = read_delta_log_v3(&path).unwrap();
+            assert_eq!(log.coverage, Some(7), "case {index}");
+            assert_eq!(log.coverage_prefix_ops, 2, "case {index}");
+            assert_eq!(log.operations.len(), 2, "case {index}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// A torn batch, or one whose bytes were damaged, claims nothing: coverage

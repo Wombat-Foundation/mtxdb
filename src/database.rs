@@ -1860,6 +1860,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Measurement, not policy: with a pool that never reports, count what the
+    /// emergency zone costs. Every sync there may force a checkpoint; this
+    /// records how many did, whether any reclaimed anything, and how much
+    /// headroom the commits had left.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn emergency_zone_cost_with_a_pool_that_never_reports() {
+        let (db, root) = small_segment_database("emergency_cost");
+        db.coordinator().set_blocker_remediation(|_| {});
+        let pools = [ShardType::State, ShardType::EventDag];
+        let coordinator = db.coordinator();
+        let cap = coordinator.segment_cap();
+        let emergency = cap - cap / 4;
+        let mut next = 0u64;
+        let mut syncs = 0usize;
+        let mut checkpoints = 0usize;
+        let mut no_progress = 0usize;
+        let mut slowest = std::time::Duration::ZERO;
+        let mut min_headroom = u64::MAX;
+        let mut rounds = 0usize;
+        loop {
+            if commit_batch(&db, &pools, &mut next, 1).is_err() {
+                break;
+            }
+            let before = coordinator.segment_len();
+            if before >= emergency {
+                let cover_before = db.pool(ShardType::EventDag).durable_coverage();
+                let started = std::time::Instant::now();
+                db.pool(ShardType::EventDag).sync_all().unwrap();
+                slowest = slowest.max(started.elapsed());
+                syncs += 1;
+                let timings = db.pool(ShardType::EventDag).sync_timings().unwrap();
+                let forced = !timings.checkpoint.is_zero()
+                    || db.pool(ShardType::EventDag).durable_coverage() > cover_before;
+                if forced {
+                    checkpoints += 1;
+                    if coordinator.segment_len() >= before {
+                        no_progress += 1;
+                    }
+                }
+                min_headroom = min_headroom.min(cap.saturating_sub(coordinator.segment_len()));
+            } else {
+                db.pool(ShardType::EventDag).sync_all().unwrap();
+            }
+            rounds += 1;
+            assert!(rounds < 400, "the segment never filled");
+        }
+        eprintln!(
+            "emergency zone: cap={cap} emergency={emergency} syncs={syncs} \
+             checkpoints={checkpoints} no_progress={no_progress} slowest={slowest:?} \
+             min_headroom={min_headroom}"
+        );
+        // Nothing can reclaim while `State` is silent, so a forced step may
+        // only repeat after the segment has grown by an eighth of the trigger.
+        let growth = coordinator.reclaim_trigger_len() / 8;
+        let bound = usize::try_from((cap - emergency) / growth).unwrap() + 2;
+        assert!(
+            syncs > bound,
+            "the zone must be crossed by more syncs than the bound"
+        );
+        assert!(
+            checkpoints <= bound,
+            "{checkpoints} forced steps in {syncs} syncs; at most {bound}"
+        );
+        assert!(min_headroom > 0, "a commit had no room left");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The same lag, but the database can make the silent pool checkpoint. Once
     /// the segment reaches the emergency zone it does, reclaim succeeds, and no
     /// commit ever fails.

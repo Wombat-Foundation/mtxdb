@@ -1730,9 +1730,10 @@ impl JournalCoordinator {
         }
         // The directory did not match the file: decide from a scan of it.
         let scan = Journal::scan_read_only(&self.path)?;
+        let marks = marks_from_scan(&scan);
         let boundary = {
             let coverage = self.coverage.lock();
-            boundary_through(&marks_from_scan(&scan), &coverage.covered)
+            boundary_through(&marks, &coverage.covered)
         };
         match boundary {
             Some(covered_lsn) => self.reclaim_through(covered_lsn).map(Some),
@@ -2350,7 +2351,8 @@ impl JournalCoordinator {
     /// back would only repeat a checkpoint that cannot help, so it waits until
     /// the segment has grown by an eighth of the trigger or some pool's
     /// coverage advanced. A pool that is holding it back always checkpoints:
-    /// that is what un-stalls it. Nobody waits in the emergency zone.
+    /// that is what un-stalls it. The emergency zone does not lift the wait:
+    /// measured, it only repeated checkpoints that reclaimed nothing.
     #[must_use]
     pub fn should_force_reclaim_checkpoint(&self, pool: Option<ShardType>) -> bool {
         let len = self.segment_len();
@@ -2367,8 +2369,7 @@ impl JournalCoordinator {
         let Some(stall) = *self.reclaim_stall.lock() else {
             return true;
         };
-        len >= self.emergency_len()
-            || self.coverage_epoch.load(Ordering::Acquire) != stall.coverage_epoch
+        self.coverage_epoch.load(Ordering::Acquire) != stall.coverage_epoch
             || len >= stall.at_len.saturating_add(self.reclaim_retry_growth())
             || pool.is_some_and(|pool| self.reclaim_blockers().contains(&pool))
     }
@@ -7173,7 +7174,20 @@ mod tests {
         let (mut reference, reference_path) = shared_journal_with_groups("dir_reference", 6);
         // Keep the last group ending at the file length (so the directory is
         // trusted) but point an earlier group's end into the middle of a group.
+        let true_end = broken.groups[1].end_offset;
+        assert!(
+            directory_of_file(&broken_path)
+                .iter()
+                .any(|mark| mark.end_offset == true_end),
+            "groups[1] must end on a real group boundary before it is corrupted"
+        );
         broken.groups[1].end_offset += 1;
+        assert!(
+            !directory_of_file(&broken_path)
+                .iter()
+                .any(|mark| mark.end_offset == broken.groups[1].end_offset),
+            "the corrupted end must not be a real group boundary"
+        );
         assert!(broken.directory_matches_file());
         let actual = broken.reclaim_through(5).unwrap();
         let expected = reference.reclaim_through_scan(5).unwrap();
