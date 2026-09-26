@@ -870,6 +870,26 @@ pub struct Scan {
     /// there are no groups to compare but the base still moved past what the
     /// reader's index incorporated.
     pub base_lsn: u64,
+    /// The last bytes (up to [`CONSUMED_TAIL_LEN`]) of the complete groups this
+    /// scan consumed, never reaching into the file header. A read-only overlay
+    /// remembers them, appended to what it already remembered, so it later
+    /// compares the disk against the bytes it actually built from instead of
+    /// against a separate read that could race a rewrite.
+    pub(crate) consumed_tail: Vec<u8>,
+}
+
+/// How many bytes ending at the last consumed group a read-only overlay
+/// remembers to notice that the consumed prefix was rewritten.
+pub(crate) const CONSUMED_TAIL_LEN: usize = 1024;
+
+/// How long the remembered window is for a segment whose last complete group
+/// ends at `valid_len`: the last [`CONSUMED_TAIL_LEN`] bytes, but never
+/// reaching into the file header.
+#[must_use]
+pub(crate) fn consumed_tail_len(valid_len: u64) -> usize {
+    let header_len = u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX);
+    let available = valid_len.saturating_sub(header_len);
+    usize::try_from(available).map_or(CONSUMED_TAIL_LEN, |len| len.min(CONSUMED_TAIL_LEN))
 }
 
 impl Scan {
@@ -882,6 +902,7 @@ impl Scan {
             valid_len: 0,
             truncated_tail: false,
             base_lsn: 0,
+            consumed_tail: Vec::new(),
         }
     }
 }
@@ -2299,12 +2320,68 @@ impl Journal {
                 valid_len: start.min(len),
                 truncated_tail: false,
                 base_lsn,
+                consumed_tail: Vec::new(),
             });
         }
         file.seek(SeekFrom::Start(start))?;
         let mut tail = Vec::new();
         file.read_to_end(&mut tail)?;
         scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, version)
+    }
+
+    /// Read up to `max_len` bytes of the segment ending at `end_offset` from an
+    /// already-open `file` into `window`, never reaching back into the file
+    /// header. Returns `false` when the file is shorter than `end_offset` or
+    /// has no group bytes before it, leaving `window` unspecified.
+    ///
+    /// A read-only overlay keeps this window from the end of the last group it
+    /// consumed and compares it on later refreshes: file length alone cannot
+    /// show that the bytes already consumed are still the same ones. The
+    /// window is compared byte for byte instead of relying on the group
+    /// trailer, because the trailer is not a content fingerprint: the group
+    /// checksum covers `header || records` and every record already ends with
+    /// its own CRC32, so for groups of the same shape it comes out identical
+    /// whatever the payload. The window includes the last record's own CRC,
+    /// which does depend on the record's full content.
+    ///
+    /// Reads through the caller's descriptor with a positioned read, so the
+    /// refresh path pays one syscall and reuses `window`'s allocation instead
+    /// of opening the file each time. The caller must notice a replaced file
+    /// itself (its descriptor keeps the old inode). Never repairs or creates
+    /// the file.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the read fails.
+    pub(crate) fn read_tail_ending_at(
+        file: &File,
+        end_offset: u64,
+        max_len: u64,
+        window: &mut Vec<u8>,
+    ) -> io::Result<bool> {
+        let header_len = u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX);
+        if end_offset <= header_len {
+            return Ok(false);
+        }
+        let start = end_offset.saturating_sub(max_len).max(header_len);
+        let window_len = usize::try_from(end_offset.saturating_sub(start))
+            .map_err(|_| invalid_data("tail window exceeds the address space"))?;
+        window.clear();
+        window.resize(window_len, 0);
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_exact_at(file, window, start);
+        #[cfg(not(unix))]
+        let read = {
+            let mut handle = file;
+            handle
+                .seek(SeekFrom::Start(start))
+                .and_then(|_| handle.read_exact(window))
+        };
+        match read {
+            Ok(()) => Ok(true),
+            // The file is shorter than the window's end: the consumed prefix is gone.
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Open a journal and recover its committed groups.
@@ -3127,11 +3204,13 @@ fn scan_groups_from(
             .ok_or_else(|| invalid_data("journal LSN overflow"))?;
     }
 
+    let consumed_tail = bytes[cursor.saturating_sub(CONSUMED_TAIL_LEN)..cursor].to_vec();
     Ok(Scan {
         groups,
         valid_len,
         truncated_tail,
         base_lsn: segment_base_lsn,
+        consumed_tail,
     })
 }
 
@@ -4215,6 +4294,118 @@ mod tests {
             drop(recovered);
             fs::remove_file(copy).unwrap();
         }
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A crash can persist a later page while an earlier one never reached the
+    /// disk, leaving a hole with intact groups after it. That is
+    /// indistinguishable from bit rot in acknowledged data, so the journal
+    /// fails closed: the read-only scan and recovery both refuse the segment
+    /// with `InvalidData` and neither repairs it, instead of silently dropping
+    /// the later groups. A hole with nothing valid after it is an ordinary torn
+    /// tail and is covered elsewhere. The image is built by zeroing the middle
+    /// group of a finished file; it says nothing about which pages a real crash
+    /// would leave behind.
+    #[test]
+    fn a_hole_before_a_later_intact_group_fails_closed() {
+        let coordinator = open_arc("hole_before_later_group");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
+        coordinator.publish_group(&[put(1, 3, b"last")]).unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let hole_start = super::FILE_HEADER_LEN as u64 + first.bytes_written;
+        let hole_len = usize::try_from(middle.bytes_written).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(hole_start)).unwrap();
+            file.write_all(&vec![0; hole_len]).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+
+        let scan_error = Journal::scan_read_only(&path).unwrap_err();
+        assert_eq!(scan_error.kind(), std::io::ErrorKind::InvalidData);
+        let open_error = Journal::open(&path)
+            .err()
+            .expect("recovery must refuse a hole");
+        assert_eq!(open_error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "neither the scan nor a failed recovery may modify the segment"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A scan reports the last bytes of the groups it consumed, never reaching
+    /// into the file header, whether it read the whole segment or only a tail.
+    #[test]
+    fn a_scan_reports_the_bytes_it_consumed() {
+        let path = temp_path("consumed_tail");
+        let _ = fs::remove_file(&path);
+        let (mut journal, _) = Journal::open(&path).unwrap();
+        journal.append_group(&[put(1, 1, b"small")]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        let scan = Journal::scan_read_only(&path).unwrap();
+        assert!(bytes.len() < super::FILE_HEADER_LEN + super::CONSUMED_TAIL_LEN);
+        assert_eq!(
+            scan.consumed_tail,
+            &bytes[super::FILE_HEADER_LEN..],
+            "a short segment reports everything after the header"
+        );
+        assert_eq!(
+            scan.consumed_tail.len(),
+            super::consumed_tail_len(scan.valid_len)
+        );
+
+        for node in 2..12u8 {
+            journal.append_group(&[put(1, node, &[node; 300])]).unwrap();
+        }
+        let bytes = fs::read(&path).unwrap();
+        let full = Journal::scan_read_only(&path).unwrap();
+        let valid = usize::try_from(full.valid_len).unwrap();
+        assert_eq!(
+            full.consumed_tail,
+            &bytes[valid - super::CONSUMED_TAIL_LEN..valid]
+        );
+
+        // An incremental scan reports only what it consumed from its start, so
+        // the window is the last `CONSUMED_TAIL_LEN` bytes of `start..valid`,
+        // or all of it when that range is shorter. The ten 300-byte groups
+        // above give a range longer than the window.
+        let start = scan.valid_len;
+        let tail = Journal::scan_read_only_from(&path, start, scan.groups[0].last_lsn + 1).unwrap();
+        let start = usize::try_from(start).unwrap();
+        let expected_start = valid.saturating_sub(super::CONSUMED_TAIL_LEN).max(start);
+        assert_eq!(
+            tail.consumed_tail,
+            &bytes[expected_start..valid],
+            "incremental scans report the exact consumed suffix"
+        );
+
+        // A small incremental scan consumes fewer bytes than the window, so it
+        // reports exactly those bytes and nothing from before its start.
+        let before_small = full.valid_len;
+        journal.append_group(&[put(1, 99, b"tiny")]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let small = Journal::scan_read_only_from(
+            &path,
+            before_small,
+            full.groups.last().unwrap().last_lsn + 1,
+        )
+        .unwrap();
+        let from = usize::try_from(before_small).unwrap();
+        let end = usize::try_from(small.valid_len).unwrap();
+        assert!(end - from < super::CONSUMED_TAIL_LEN);
+        assert_eq!(
+            small.consumed_tail,
+            &bytes[from..end],
+            "a scan shorter than the window reports exactly the bytes it consumed"
+        );
         fs::remove_file(path).unwrap();
     }
 

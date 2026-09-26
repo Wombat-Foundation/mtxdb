@@ -9395,6 +9395,160 @@ mod tests {
         );
     }
 
+    /// Journal state for a writer-restart scenario: LSN 1 is durable and LSN 2
+    /// is visible but never reached the disk. Returns the segment length that
+    /// covers only LSN 1, so a test can cut the file back to what a crash would
+    /// have kept.
+    #[cfg(feature = "multi-reader")]
+    fn journal_with_a_visible_but_undurable_group(
+        wal: &std::path::Path,
+        collection: [u8; 16],
+        stable: [u8; 16],
+        reused: [u8; 16],
+    ) -> u64 {
+        let (mut journal, _) = Journal::open(wal).unwrap();
+        journal
+            .commit_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: stable,
+                payload: b"stable".to_vec(),
+            }])
+            .unwrap();
+        let durable_len = std::fs::metadata(wal).unwrap().len();
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: reused,
+                payload: b"stale-".to_vec(),
+            }])
+            .unwrap();
+        durable_len
+    }
+
+    /// A writer that crashes loses its visible-but-undurable tail, and the
+    /// restarted writer reuses those LSNs. A live reader that already applied
+    /// the lost group must not keep serving it. The reissued group has the same
+    /// length, so the file is exactly as long as when the reader last scanned.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_overlay_drops_a_group_the_restarted_writer_discarded() {
+        let dir = test_dir("read_committed_writer_restart_same_len");
+        let wal = dir.join("wal.bin");
+        let collection = [0x42u8; 16];
+        let stable = [0x01u8; 16];
+        let reused = [0x02u8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x99u8; 16],
+            &[0x99u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let durable_len =
+            journal_with_a_visible_but_undurable_group(&wal, collection, stable, reused);
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        let before_restart = store.get_read_committed(&collection, &[reused]).unwrap();
+        assert_eq!(
+            before_restart[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"stale-"[..])
+        );
+
+        // The crash: LSN 2 never reached the disk. The restarted writer
+        // recovers LSN 1 and publishes a different LSN 2 of the same length.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(durable_len)
+            .unwrap();
+        let (mut journal, scan) = Journal::open(&wal).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        journal
+            .append_group(&[JournalMutation::Put {
+                collection_id: collection,
+                node_id: reused,
+                payload: b"fresh-".to_vec(),
+            }])
+            .unwrap();
+        drop(journal);
+
+        let after = store.get_read_committed(&collection, &[reused]).unwrap();
+        assert_eq!(
+            after[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"fresh-"[..]),
+            "the reader must not keep the group the restarted writer discarded"
+        );
+    }
+
+    /// Same restart, but the reissued LSN 2 is followed by an LSN 3, so the file
+    /// has grown and the reader takes its incremental-scan path.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_overlay_drops_a_discarded_group_when_the_file_grew() {
+        let dir = test_dir("read_committed_writer_restart_grew");
+        let wal = dir.join("wal.bin");
+        let collection = [0x42u8; 16];
+        let stable = [0x01u8; 16];
+        let reused = [0x02u8; 16];
+        let later = [0x03u8; 16];
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x99u8; 16],
+            &[0x99u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let durable_len =
+            journal_with_a_visible_but_undurable_group(&wal, collection, stable, reused);
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+        let before_restart = store.get_read_committed(&collection, &[reused]).unwrap();
+        assert_eq!(
+            before_restart[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"stale-"[..])
+        );
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(durable_len)
+            .unwrap();
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        for (node, payload) in [(reused, &b"fresh-"[..]), (later, &b"after-"[..])] {
+            journal
+                .append_group(&[JournalMutation::Put {
+                    collection_id: collection,
+                    node_id: node,
+                    payload: payload.to_vec(),
+                }])
+                .unwrap();
+        }
+        drop(journal);
+
+        let after = store
+            .get_read_committed(&collection, &[reused, later])
+            .unwrap();
+        assert_eq!(
+            after[0].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"fresh-"[..]),
+            "the reissued LSN must replace the discarded group's content"
+        );
+        assert_eq!(
+            after[1].as_ref().map(|data| data.bytes.as_ref()),
+            Some(&b"after-"[..])
+        );
+    }
+
     #[cfg(feature = "multi-reader")]
     #[test]
     fn read_committed_overlay_shadows_durable_with_a_committed_delete() {
@@ -10288,6 +10442,7 @@ mod tests {
             valid_len: 0,
             truncated_tail: false,
             base_lsn: 3,
+            consumed_tail: Vec::new(),
         };
         let per_pool = |covered: u64| ReadJournal::empty(std::path::PathBuf::new(), covered, None);
         let shared = |covered: u64| {

@@ -6,7 +6,7 @@
 //! single-process embedded deployment never calls any of this.
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -14,6 +14,76 @@ use crate::journal::{Journal, Mutation as JournalMutation};
 use crate::storage::{NodeData, NodeId, StorageError};
 
 use super::{OpenTimings, PackfileStorage, ReloadMode};
+
+/// How many bytes ending at the last consumed group the overlay remembers to
+/// notice that the consumed prefix was rewritten.
+const TAIL_WINDOW: u64 = crate::journal::CONSUMED_TAIL_LEN as u64;
+
+/// A file's identity and change stamp: device, inode, length and change time.
+/// Equal stamps on a quiet file mean nothing wrote to it in between, so the
+/// consumed bytes need no re-read. The change time (ctime) is used because,
+/// unlike the modification time, no caller can set it backwards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    ctime_secs: i64,
+    ctime_nanos: i64,
+}
+
+impl FileStamp {
+    /// Whether two stamps name the same file, ignoring length and time.
+    fn same_file(self, other: Self) -> bool {
+        self.dev == other.dev && self.ino == other.ino
+    }
+
+    /// Whether the last change is older than [`QUIET_AFTER`], so any later
+    /// write is guaranteed a different change time whatever the filesystem's
+    /// timestamp granularity. A change inside that window could share a tick
+    /// with a later write, so the stamp is not trusted yet.
+    ///
+    /// This reads the wall clock. A backwards step makes the age negative and
+    /// the stamp counts as not quiet, which is the safe direction. A forward
+    /// step could make a just-changed file look quiet; that would also need a
+    /// same-tick rewrite to go unnoticed, so it is accepted rather than guarded.
+    fn is_quiet(self) -> bool {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return false;
+        };
+        let Ok(secs) = u64::try_from(self.ctime_secs) else {
+            return false;
+        };
+        let changed = std::time::Duration::new(secs, u32::try_from(self.ctime_nanos).unwrap_or(0));
+        now.checked_sub(changed)
+            .is_some_and(|age| age > QUIET_AFTER)
+    }
+}
+
+/// How long a file must have been unchanged before an equal [`FileStamp`] is
+/// trusted to mean it was not rewritten in between.
+const QUIET_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The stamp of `meta`, when the platform exposes a reliable file identity.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn file_stamp(meta: &fs::Metadata) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileStamp {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+        ctime_secs: meta.ctime(),
+        ctime_nanos: meta.ctime_nsec(),
+    })
+}
+
+/// Without inode numbers and change times, the overlay compares the tail bytes
+/// on every refresh instead of trusting a synthetic identity.
+#[cfg(not(unix))]
+fn file_stamp(_meta: &fs::Metadata) -> Option<FileStamp> {
+    None
+}
 
 /// One committed value in the read-journal overlay: payload and its LSN.
 type ReadJournalValue = (bytes::Bytes, u64);
@@ -63,6 +133,43 @@ pub(super) struct ReadJournal {
     observed_valid_len: u64,
     /// Highest applied LSN. Groups at or below this are already in the overlay.
     observed_lsn: u64,
+    /// The last bytes consumed (up to [`TAIL_WINDOW`], ending at
+    /// `observed_valid_len`), or `None` before any group was applied.
+    ///
+    /// File length cannot show that the bytes already consumed are still the
+    /// ones on disk: after a writer restart that discarded a visible-but-
+    /// undurable group and reissued its LSN, or after a reclaim followed by
+    /// enough appends, the file can be the same length (or longer) while its
+    /// content differs. Comparing this window against the bytes now ending at
+    /// `observed_valid_len` catches that. It covers the most recently consumed
+    /// records only: a rewrite that leaves the whole window byte-identical is
+    /// not detected. The group trailer is not used because it is not a content
+    /// fingerprint (see [`Journal::read_tail_ending_at`]).
+    observed_tail: Option<Vec<u8>>,
+    /// Descriptor the tail window is read through, opened when the window was
+    /// recorded, so a refresh pays one positioned read instead of an open.
+    tail_file: Option<File>,
+    /// Stamp of the file when the tail window was recorded. The descriptor
+    /// keeps pointing at an old inode after the writer renames a replacement
+    /// into place (reclaim), so a path whose device or inode differs means the
+    /// segment was replaced and the overlay must be rebuilt. An equal stamp on
+    /// a file that was already quiet when recorded (`tail_quiet`) proves the
+    /// consumed bytes were not rewritten, so the window is not re-read.
+    tail_stamp: Option<FileStamp>,
+    /// Whether the file was quiet, per [`FileStamp::is_quiet`], when
+    /// `tail_stamp` was taken.
+    tail_quiet: bool,
+    /// Test-only count of window reads, to show the fingerprint skips them.
+    #[cfg(test)]
+    pub(super) tail_reads: u64,
+    /// Test-only count of descriptor opens used to record the tail.
+    #[cfg(test)]
+    pub(super) tail_opens: u64,
+    /// Test-only count of overlay rebuilds forced by a changed tail.
+    #[cfg(test)]
+    pub(super) tail_resets: u64,
+    /// Scratch buffer the window is read into, reused across refreshes.
+    tail_scratch: Vec<u8>,
     /// Committed puts as `(payload, lsn)`, keyed `collection_id -> node_id`.
     pub(super) puts: ReadJournalPuts,
     /// Highest committed delete LSN per collection. This is a persistent
@@ -85,6 +192,17 @@ impl ReadJournal {
             observed_len: 0,
             observed_valid_len: 0,
             observed_lsn: 0,
+            observed_tail: None,
+            tail_file: None,
+            tail_stamp: None,
+            tail_quiet: false,
+            #[cfg(test)]
+            tail_reads: 0,
+            #[cfg(test)]
+            tail_opens: 0,
+            #[cfg(test)]
+            tail_resets: 0,
+            tail_scratch: Vec::new(),
             puts: HashMap::new(),
             delete_lsn: HashMap::new(),
         }
@@ -96,6 +214,10 @@ impl ReadJournal {
         self.delete_lsn.clear();
         self.observed_lsn = 0;
         self.observed_valid_len = 0;
+        self.observed_tail = None;
+        self.tail_file = None;
+        self.tail_stamp = None;
+        self.tail_quiet = false;
         // Zero the length too, so an equal-length segment after a reload still
         // forces a full rescan instead of short-circuiting on `len == observed_len`.
         self.observed_len = 0;
@@ -133,6 +255,141 @@ impl ReadJournal {
         scan.base_lsn > self.covered.saturating_add(1)
     }
 
+    /// Whether the bytes that ended the consumed prefix are no longer the ones
+    /// ending at `observed_valid_len` on disk. `stamp` is the segment path's
+    /// stamp right now. A replaced file, or missing or unreadable bytes, count
+    /// as changed: the consumed prefix is gone.
+    fn observed_tail_changed(&mut self, stamp: Option<FileStamp>) -> bool {
+        let Some(expected) = &self.observed_tail else {
+            // Groups were applied but their tail could not be recorded (or the
+            // recording was discarded), so nothing protects the overlay from a
+            // rewritten prefix: rebuild it and try recording again.
+            return self.observed_lsn > 0;
+        };
+        let mut unchanged_stamp = None;
+        match (stamp, self.tail_stamp) {
+            (Some(now), Some(then)) => {
+                if !now.same_file(then) {
+                    return true;
+                }
+                // Nothing wrote to a file that was already quiet when the
+                // window was recorded, so the consumed bytes are unchanged.
+                if self.tail_quiet && now == then {
+                    return false;
+                }
+                if now == then {
+                    unchanged_stamp = Some(now);
+                }
+            }
+            (None, None) => {}
+            _ => return true,
+        }
+        let Some(file) = &self.tail_file else {
+            return true;
+        };
+        #[cfg(test)]
+        {
+            self.tail_reads = self.tail_reads.saturating_add(1);
+        }
+        match Journal::read_tail_ending_at(
+            file,
+            self.observed_valid_len,
+            TAIL_WINDOW,
+            &mut self.tail_scratch,
+        ) {
+            Ok(true) if &self.tail_scratch != expected => true,
+            Ok(true) => {
+                // The window matches and the stamp is unchanged. If the file
+                // has by now been quiet longer than the timestamp granularity,
+                // any later write is guaranteed a different change time, so
+                // later refreshes can trust the stamp and skip this read. This
+                // is what lets a file that was still warm when recorded reach
+                // the fast path.
+                if unchanged_stamp.is_some_and(FileStamp::is_quiet) {
+                    self.tail_quiet = true;
+                }
+                false
+            }
+            Ok(false) | Err(_) => true,
+        }
+    }
+
+    /// Remember the bytes that end the consumed prefix, and keep a descriptor
+    /// for later refreshes to compare them through.
+    ///
+    /// The window is built from the bytes the scan actually consumed
+    /// (`consumed`), appended to the window already remembered, never from a
+    /// separate read of the file: a rewrite that lands after the scan can then
+    /// never be folded into what is remembered, and a later comparison is
+    /// always against what the overlay was built from. `scanned` is the
+    /// segment path's stamp taken before the scan; a write after that stat
+    /// changes the stamp, so the next refresh compares the window instead of
+    /// trusting it.
+    ///
+    /// While the segment is still the same file the held descriptor is reused,
+    /// so a refresh that only appended opens nothing. A new descriptor is
+    /// opened only after a reset or a replaced file, and if it refers to a
+    /// different file than `scanned` the segment was replaced mid-refresh and
+    /// the recording is discarded. On any failure nothing is remembered, which
+    /// [`Self::observed_tail_changed`] treats as untrusted, so the next refresh
+    /// rescans from the start instead of trusting the prefix.
+    fn record_observed_tail(&mut self, scanned: Option<FileStamp>, consumed: &[u8]) {
+        let mut window = self.observed_tail.take().unwrap_or_default();
+        let reusable = match (scanned, self.tail_stamp) {
+            (Some(now), Some(then)) => now.same_file(then),
+            _ => false,
+        };
+        let held = if reusable {
+            self.tail_file.take()
+        } else {
+            None
+        };
+        self.tail_file = None;
+        self.tail_stamp = None;
+        self.tail_quiet = false;
+        if self.observed_valid_len == 0 {
+            return;
+        }
+        window.extend_from_slice(consumed);
+        if window.len() > crate::journal::CONSUMED_TAIL_LEN {
+            let excess = window
+                .len()
+                .saturating_sub(crate::journal::CONSUMED_TAIL_LEN);
+            window.drain(..excess);
+        }
+        // The remembered bytes must be exactly the window a later comparison
+        // reads. If they are not (nothing consumed to build them from), leave
+        // the overlay untrusted so it rebuilds.
+        let expected_len = crate::journal::consumed_tail_len(self.observed_valid_len);
+        // A segment with no group bytes yet (header only) has no window to
+        // protect and none to compare, so nothing is recorded.
+        if expected_len == 0 || window.len() != expected_len {
+            return;
+        }
+        let file = if let Some(file) = held {
+            file
+        } else {
+            #[cfg(test)]
+            {
+                self.tail_opens = self.tail_opens.saturating_add(1);
+            }
+            let Ok(file) = File::open(&self.path) else {
+                return;
+            };
+            let opened = file.metadata().ok().and_then(|meta| file_stamp(&meta));
+            if let (Some(scanned), Some(opened)) = (scanned, opened) {
+                if !scanned.same_file(opened) {
+                    return;
+                }
+            }
+            file
+        };
+        self.observed_tail = Some(window);
+        self.tail_file = Some(file);
+        self.tail_quiet = scanned.is_some_and(FileStamp::is_quiet);
+        self.tail_stamp = scanned;
+    }
+
     /// Apply every committed group above `observed_lsn` to the overlay.
     ///
     /// A missing segment is treated as empty only before this reader has seen
@@ -155,16 +412,26 @@ impl ReadJournal {
         // `journal.lsn` fresh would prune entries the reader's stale index has
         // not incorporated yet, dropping records from both sources.
         let covered = self.covered;
-        let len = match fs::metadata(&self.path) {
-            Ok(meta) => meta.len(),
+        let (len, stamp) = match fs::metadata(&self.path) {
+            Ok(meta) => (meta.len(), file_stamp(&meta)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if self.observed_len != 0 || self.observed_lsn > covered {
                     return Ok(ReadRefresh::NeedsReload);
                 }
-                0
+                (0, None)
             }
             Err(error) => return Err(StorageError::Io(error)),
         };
+        // Length alone cannot show that the consumed prefix is unchanged, so
+        // check the bytes that ended it first. On a change, drop everything and
+        // rebuild: a full rescan is gap-checked like any other reset below.
+        if self.observed_tail_changed(stamp) {
+            #[cfg(test)]
+            {
+                self.tail_resets = self.tail_resets.saturating_add(1);
+            }
+            self.reset_overlay();
+        }
         if len != self.observed_len {
             let mut reset = false;
             if len < self.observed_len {
@@ -238,6 +505,7 @@ impl ReadJournal {
             // a partial tail is re-probed once its trailer lands.
             self.observed_valid_len = scan.valid_len;
             self.observed_len = len;
+            self.record_observed_tail(stamp, &scan.consumed_tail);
         }
         // The checkpoint can advance without the segment changing (reclaim is
         // best-effort), so prune overlay state it now covers.
@@ -523,5 +791,307 @@ impl PackfileStorage {
             }
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    const COLLECTION: [u8; 16] = [0x42; 16];
+    const REUSED: [u8; 16] = [0x02; 16];
+
+    fn put(node: [u8; 16], payload: &[u8]) -> JournalMutation {
+        JournalMutation::Put {
+            collection_id: COLLECTION,
+            node_id: node,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn temp_wal(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_read_journal_{label}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("wal.bin")
+    }
+
+    /// LSN 1 and LSN 2 (`stale-`), returning the length that keeps only LSN 1.
+    fn write_two_groups(wal: &std::path::Path) -> u64 {
+        let (mut journal, _) = Journal::open(wal).unwrap();
+        journal.append_group(&[put([0x01; 16], b"stable")]).unwrap();
+        let first_len = fs::metadata(wal).unwrap().len();
+        journal.append_group(&[put(REUSED, b"stale-")]).unwrap();
+        first_len
+    }
+
+    /// A restart that drops LSN 2 and reissues it with the same length.
+    fn restart_with_reissued_lsn(wal: &std::path::Path, keep_len: u64) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(wal)
+            .unwrap()
+            .set_len(keep_len)
+            .unwrap();
+        let (mut journal, _) = Journal::open(wal).unwrap();
+        journal.append_group(&[put(REUSED, b"fresh-")]).unwrap();
+    }
+
+    fn value(overlay: &ReadJournal) -> Option<Vec<u8>> {
+        overlay
+            .puts
+            .get(&COLLECTION)
+            .and_then(|nodes| nodes.get(&REUSED))
+            .map(|(bytes, _)| bytes.to_vec())
+    }
+
+    /// A file that has been quiet longer than the timestamp granularity is
+    /// trusted on an unchanged fingerprint: repeated refreshes read nothing.
+    #[test]
+    fn an_unchanged_quiet_file_is_not_re_read() {
+        let wal = temp_wal("quiet_skip");
+        write_two_groups(&wal);
+        std::thread::sleep(QUIET_AFTER + Duration::from_millis(60));
+
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        assert!(matches!(overlay.refresh(true), Ok(ReadRefresh::Applied)));
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+        for _ in 0..50 {
+            assert!(matches!(overlay.refresh(true), Ok(ReadRefresh::Applied)));
+        }
+        assert_eq!(
+            overlay.tail_reads, 0,
+            "an unchanged quiet file needs no read"
+        );
+        assert_eq!(overlay.tail_resets, 0);
+    }
+
+    /// Appending to the same segment reuses the held descriptor when the
+    /// overlay records each new consumed tail; only the initial recording
+    /// opens the WAL.
+    #[test]
+    fn same_file_appends_reuse_the_tail_descriptor() {
+        let wal = temp_wal("reuse_tail_descriptor");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        assert_eq!(overlay.tail_opens, 1);
+
+        for (node, payload) in [([0x03; 16], &b"third"[..]), ([0x04; 16], &b"fourth"[..])] {
+            let (mut journal, _) = Journal::open(&wal).unwrap();
+            journal.append_group(&[put(node, payload)]).unwrap();
+            drop(journal);
+            overlay.refresh(true).unwrap();
+        }
+
+        assert_eq!(
+            overlay.tail_opens, 1,
+            "same-file appends must reuse the WAL"
+        );
+    }
+
+    /// A same-length rewrite of a quiet file changes its change time, so the
+    /// fingerprint no longer matches, the window is compared, and the overlay
+    /// is rebuilt. The file's length and inode are exactly what they were.
+    #[test]
+    fn a_same_length_rewrite_of_a_quiet_file_is_detected() {
+        let wal = temp_wal("quiet_rewrite");
+        let keep_len = write_two_groups(&wal);
+        std::thread::sleep(QUIET_AFTER + Duration::from_millis(60));
+
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+        let len_before = fs::metadata(&wal).unwrap().len();
+
+        restart_with_reissued_lsn(&wal, keep_len);
+        assert_eq!(fs::metadata(&wal).unwrap().len(), len_before);
+        overlay.refresh(true).unwrap();
+        assert_eq!(value(&overlay), Some(b"fresh-".to_vec()));
+        assert_eq!(overlay.tail_resets, 1);
+    }
+
+    /// Reclaim renames a replacement over the segment. Even a byte-identical
+    /// replacement is a different file, and is caught by its inode before any
+    /// bytes are compared.
+    #[test]
+    fn a_renamed_in_replacement_is_detected_by_identity_alone() {
+        let wal = temp_wal("rename_replace");
+        write_two_groups(&wal);
+        std::thread::sleep(QUIET_AFTER + Duration::from_millis(60));
+
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        let reads_before = overlay.tail_reads;
+
+        let copy = wal.with_extension("copy");
+        fs::copy(&wal, &copy).unwrap();
+        fs::rename(&copy, &wal).unwrap();
+
+        overlay.refresh(true).unwrap();
+        assert_eq!(
+            overlay.tail_resets, 1,
+            "a replaced file must rebuild the overlay"
+        );
+        assert_eq!(
+            overlay.tail_reads, reads_before,
+            "the replacement is caught before any window is read"
+        );
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+    }
+
+    /// The real path: a stamp recorded right after a write is warm and not
+    /// trusted, then promoted after one verifying read once the file has gone
+    /// quiet. If the machine is so slow that the file was already quiet at the
+    /// first refresh, there is no warm state to observe and the test returns.
+    #[test]
+    fn a_freshly_recorded_stamp_is_verified_then_promoted_once_quiet() {
+        let wal = temp_wal("fresh_then_quiet");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        if overlay.tail_quiet {
+            eprintln!(
+                "skipped: the file was already quiet at the first refresh, so there \
+                 is no warm stamp to observe on this machine"
+            );
+            return;
+        }
+        std::thread::sleep(QUIET_AFTER + Duration::from_millis(60));
+        for _ in 0..20 {
+            overlay.refresh(true).unwrap();
+        }
+        assert_eq!(overlay.tail_reads, 1, "one verifying read, then trusted");
+        assert!(overlay.tail_quiet);
+        assert_eq!(overlay.tail_resets, 0);
+    }
+
+    /// State-model test, not a real recording: the stamp is flipped to
+    /// untrusted by hand after a genuine quiet period, to check the promotion
+    /// rule in isolation from timing. The real path is covered by
+    /// `a_freshly_recorded_stamp_is_verified_then_promoted_once_quiet`.
+    #[test]
+    fn a_warm_fingerprint_is_verified_then_promoted_once_quiet() {
+        let wal = temp_wal("warm_then_quiet");
+        write_two_groups(&wal);
+        std::thread::sleep(QUIET_AFTER + Duration::from_millis(60));
+
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        // Model a stamp recorded while the file was still warm.
+        overlay.tail_quiet = false;
+        for _ in 0..20 {
+            overlay.refresh(true).unwrap();
+        }
+        assert_eq!(overlay.tail_reads, 1, "one verifying read, then trusted");
+        assert!(overlay.tail_quiet);
+        assert_eq!(overlay.tail_resets, 0);
+    }
+
+    /// A stamp that is not yet trusted must keep validating the tail: a
+    /// same-length rewrite is caught even though length and inode match.
+    #[test]
+    fn an_untrusted_fingerprint_still_validates_the_tail() {
+        let wal = temp_wal("untrusted_rewrite");
+        let keep_len = write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        overlay.tail_quiet = false;
+
+        restart_with_reissued_lsn(&wal, keep_len);
+        overlay.refresh(true).unwrap();
+        assert_eq!(value(&overlay), Some(b"fresh-".to_vec()));
+        assert_eq!(overlay.tail_resets, 1);
+    }
+
+    /// State-model test: a stamp recorded earlier but unavailable now cannot
+    /// be compared, so it fails closed and rebuilds. Only platforms that
+    /// report inode numbers and change times record a stamp at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_stamp_that_cannot_be_compared_fails_closed() {
+        let wal = temp_wal("stamp_mismatch");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        assert!(
+            overlay.tail_stamp.is_some(),
+            "a unix platform must record a stamp"
+        );
+        overlay.tail_stamp = None;
+        overlay.refresh(true).unwrap();
+        assert_eq!(overlay.tail_resets, 1);
+    }
+
+    /// The remembered window is composed from consumed bytes across refreshes
+    /// (the previous window plus what each scan consumed). The previous window
+    /// ends exactly at the scan's start offset, `observed_valid_len`, and the
+    /// scan's bytes begin there, so the two are contiguous. The composed window
+    /// must always equal the window a later comparison reads from disk,
+    /// including once the file outgrows the window, which is where the join and
+    /// the trim in `record_observed_tail` matter.
+    #[test]
+    fn the_composed_window_matches_the_disk_after_every_refresh() {
+        let wal = temp_wal("composed_window");
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        let file = File::open(&wal).unwrap();
+        for round in 0..12u8 {
+            journal
+                .append_group(&[put([round; 16], &[round; 300])])
+                .unwrap();
+            overlay.refresh(true).unwrap();
+            let mut on_disk = Vec::new();
+            assert!(Journal::read_tail_ending_at(
+                &file,
+                overlay.observed_valid_len,
+                TAIL_WINDOW,
+                &mut on_disk
+            )
+            .unwrap());
+            assert_eq!(
+                overlay.observed_tail.as_deref(),
+                Some(on_disk.as_slice()),
+                "round {round}: the remembered window must equal the disk"
+            );
+        }
+        assert_eq!(overlay.tail_resets, 0);
+    }
+
+    /// If groups were applied but their tail could not be recorded, nothing
+    /// protects the overlay, so the next refresh must rebuild it and try again
+    /// instead of trusting the prefix.
+    #[test]
+    fn an_unrecorded_tail_forces_a_rebuild() {
+        let wal = temp_wal("unrecorded_tail");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        assert!(overlay.observed_tail.is_some());
+
+        overlay.observed_tail = None;
+        overlay.refresh(true).unwrap();
+        assert_eq!(overlay.tail_resets, 1);
+        assert!(
+            overlay.observed_tail.is_some(),
+            "the rebuild records the tail again"
+        );
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+    }
+
+    /// An empty segment has no consumed bytes to protect; refreshing it must
+    /// not rebuild forever.
+    #[test]
+    fn an_empty_segment_does_not_rebuild_on_every_refresh() {
+        let wal = temp_wal("empty_segment");
+        drop(Journal::open(&wal).unwrap());
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        for _ in 0..5 {
+            overlay.refresh(true).unwrap();
+        }
+        assert_eq!(overlay.tail_resets, 0);
     }
 }
