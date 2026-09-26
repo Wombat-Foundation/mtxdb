@@ -8244,7 +8244,7 @@ impl PackfileStorage {
             .transaction_overlay_users
             .fetch_add(1, Ordering::AcqRel);
         if previous == 0 {
-            if let Err(error) = self.enable_read_journal_shared(wal_path, pool) {
+            if let Err(error) = self.enable_transaction_read_journal(wal_path, pool) {
                 self.transaction_overlay_users
                     .fetch_sub(1, Ordering::AcqRel);
                 return Err(error);

@@ -740,6 +740,55 @@ impl PackfileStorage {
         self.enable_read_journal_inner(path, Some(pool))
     }
 
+    /// Enable the in-process overlay a writer's own pool uses while a published
+    /// transaction is being materialized.
+    ///
+    /// This is not the reader's setup. A read-only worker has an index loaded
+    /// from a checkpoint, so a reclaimed journal prefix past that checkpoint is
+    /// a gap it must reload to fill. A writer's live index already holds every
+    /// mutation it has applied, so a reclaimed prefix can never hide data from
+    /// it, and there is nothing to reload: its `read_covered_lsn` is never set
+    /// and a reload from the checkpoint cannot succeed against its own open
+    /// packs. Running the reader's gap check here made every commit fail with a
+    /// retry-forever `WouldBlock` once a checkpoint had reclaimed the shared
+    /// WAL past LSN 1.
+    ///
+    /// The overlay is bound to the pool's checkpoint coverage (`journal.lsn`):
+    /// frames at or below it are in the durable index, and frames above it are
+    /// served from the journal until the transaction is fully materialized.
+    /// It is built directly and refreshed once with `accept_reclaimed_prefix`
+    /// set, rather than going through `enable_read_journal_inner`, whose
+    /// refresh-then-reload path is the reader's and cannot succeed here.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the segment is unreadable or a committed
+    /// group fails validation.
+    #[cfg(feature = "multi-reader")]
+    pub(super) fn enable_transaction_read_journal(
+        &self,
+        path: &std::path::Path,
+        pool: crate::layout::ShardType,
+    ) -> Result<(), StorageError> {
+        let covered = Self::read_journal_lsn(&self.base_dir);
+        let mut overlay = ReadJournal::empty(path.to_path_buf(), covered, Some(pool));
+        // The writer's index already holds everything it applied, so accept a
+        // reclaimed prefix instead of treating it as a gap. A fresh overlay has
+        // observed nothing and accepts the prefix, so the only outcome besides
+        // an error is `Applied`; anything else is a broken assumption and is
+        // surfaced instead of installing an overlay that was never built.
+        match overlay.refresh(true)? {
+            ReadRefresh::Applied => {}
+            ReadRefresh::NeedsReload => {
+                return Err(StorageError::Internal(
+                    "the writer's transaction overlay unexpectedly needed a checkpoint reload"
+                        .to_owned(),
+                ));
+            }
+        }
+        *self.read_journal.lock() = Some(overlay);
+        Ok(())
+    }
+
     fn enable_read_journal_inner(
         &self,
         path: impl AsRef<std::path::Path>,

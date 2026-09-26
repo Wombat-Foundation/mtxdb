@@ -6,6 +6,8 @@
 //! target LSN and releases it only after a durable group covers that target.
 
 use std::collections::HashMap;
+#[cfg(feature = "multi-reader")]
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -175,6 +177,19 @@ struct TxnStageData {
     receipt: Option<CommitReceipt>,
 }
 
+/// What a transaction's staged mutations say about one record.
+#[cfg(feature = "multi-reader")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StagedLookup {
+    /// The newest staged mutation for the record is a put of this payload.
+    Put(Vec<u8>),
+    /// A staged collection delete hides the record, and nothing newer puts it
+    /// back.
+    Deleted,
+    /// Nothing staged names the record; the live store decides.
+    Absent,
+}
+
 /// Transaction-local mutation buffer used by
 /// [`crate::database::DatabaseTransaction`].
 ///
@@ -192,6 +207,8 @@ struct TxnStageData {
 pub struct TxnStage {
     state: std::sync::atomic::AtomicU8,
     data: Mutex<TxnStageData>,
+    #[cfg(test)]
+    lookup_many_calls: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "multi-reader")]
@@ -221,6 +238,8 @@ impl TxnStage {
                 appended: [false; 3],
                 receipt: None,
             }),
+            #[cfg(test)]
+            lookup_many_calls: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -234,6 +253,89 @@ impl TxnStage {
             Self::JOURNAL_PUBLISHED => TxnStageState::JournalPublished,
             _ => TxnStageState::Active,
         }
+    }
+
+    /// Look one record up in the mutations staged for `pool`. See
+    /// [`Self::lookup_many`], which this calls.
+    #[must_use]
+    pub fn lookup(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+    ) -> StagedLookup {
+        self.lookup_many(pool, collection_id, std::slice::from_ref(node_id))
+            .pop()
+            .unwrap_or(StagedLookup::Absent)
+    }
+
+    /// Look several records up in the mutations staged for `pool`, in the order
+    /// of `node_ids`, taking the stage lock once and scanning the staged
+    /// mutations once however many records are asked for.
+    ///
+    /// This is what lets a transaction read its own uncommitted writes. The
+    /// staged mutations are in append order, so the newest one that names a
+    /// record wins. A staged `DeleteCollection` for the record's collection
+    /// hides everything older, both earlier staged puts and whatever the live
+    /// pool holds, while a put staged after it is newer and is seen. Only an
+    /// active stage answers: once the stage is discarded, or publication has
+    /// begun, every record is `Absent` and the caller reads the live store,
+    /// which by then serves the group through the transaction overlay.
+    ///
+    /// The single pass keeps the newest put position for each wanted record
+    /// and the position of the last delete for the collection, so the cost is
+    /// the staged mutations plus the records asked for, not their product.
+    /// Payloads are cloned only for records that resolve to a put.
+    #[must_use]
+    pub fn lookup_many(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[[u8; 16]],
+    ) -> Vec<StagedLookup> {
+        #[cfg(test)]
+        self.lookup_many_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE || node_ids.is_empty() {
+            return vec![StagedLookup::Absent; node_ids.len()];
+        }
+        let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
+        let mut newest_put: HashMap<[u8; 16], (usize, &Vec<u8>)> = HashMap::new();
+        let mut last_delete: Option<usize> = None;
+        for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
+            match mutation {
+                Mutation::Put {
+                    collection_id: staged_collection,
+                    node_id,
+                    payload,
+                } if staged_collection == collection_id && wanted.contains(node_id) => {
+                    newest_put.insert(*node_id, (position, payload));
+                }
+                Mutation::DeleteCollection {
+                    collection_id: staged_collection,
+                } if staged_collection == collection_id => last_delete = Some(position),
+                _ => {}
+            }
+        }
+        node_ids
+            .iter()
+            .map(|node_id| match (newest_put.get(node_id), last_delete) {
+                // A put older than the delete is hidden by it.
+                (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
+                (Some((_, payload)), _) => StagedLookup::Put((*payload).clone()),
+                (None, Some(_)) => StagedLookup::Deleted,
+                (None, None) => StagedLookup::Absent,
+            })
+            .collect()
+    }
+
+    /// Number of batch lookup passes, for complexity tests only.
+    #[cfg(test)]
+    #[must_use]
+    pub fn lookup_many_calls(&self) -> u64 {
+        self.lookup_many_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Discard an active attempt. Safe to call more than once.

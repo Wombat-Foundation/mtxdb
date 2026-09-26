@@ -22,11 +22,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::journal::{
-    CommitReceipt, Journal, JournalCoordinator, SharedWalLock, TxnStage, TxnStageState,
+    CommitReceipt, Journal, JournalCoordinator, SharedWalLock, StagedLookup, TxnStage,
+    TxnStageState,
 };
 use crate::layout::{DatabaseLayout, ShardType};
 use crate::packfile::storage::PackfileStorage;
-use crate::storage::StorageError;
+use crate::storage::{NodeId, StorageEngine, StorageError};
 
 /// Write and verification policy for a single storage pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,9 +107,29 @@ impl Drop for TransactionOverlayGuard {
     }
 }
 
-/// Storage transaction whose mutations remain invisible until commit.
+/// How a transaction reaches its database: borrowed for the common in-process
+/// case, or owned so the transaction can outlive the caller's borrow (held
+/// across an FFI boundary or moved between threads).
+enum DatabaseRef<'a> {
+    Borrowed(&'a SharedDatabase),
+    Owned(Arc<SharedDatabase>),
+}
+
+impl std::ops::Deref for DatabaseRef<'_> {
+    type Target = SharedDatabase;
+
+    fn deref(&self) -> &SharedDatabase {
+        match self {
+            Self::Borrowed(database) => database,
+            Self::Owned(database) => database,
+        }
+    }
+}
+
+/// Storage transaction whose mutations remain invisible to other readers until
+/// commit. The transaction itself reads its own writes through [`Self::get`].
 pub struct DatabaseTransaction<'a> {
-    database: &'a SharedDatabase,
+    database: DatabaseRef<'a>,
     stage: Arc<TxnStage>,
     lifecycle: parking_lot::Mutex<()>,
 }
@@ -139,6 +160,51 @@ impl DatabaseTransaction<'_> {
     pub fn delete_collection(&self, pool: ShardType, collection_id: [u8; 16]) -> io::Result<()> {
         let _lifecycle = self.lifecycle.lock();
         self.stage.stage_delete_collection(pool, collection_id)
+    }
+
+    /// Read records through this transaction: its own staged writes first,
+    /// then the live pool. Results are in the order of `node_ids`.
+    ///
+    /// The newest staged mutation for a record wins. A staged collection delete
+    /// hides that collection's records, both staged and live, until a later
+    /// staged put writes one back. Nothing here is visible to other readers.
+    ///
+    /// # Errors
+    /// Returns an error if the live pool cannot be read.
+    pub fn get(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[NodeId],
+    ) -> Result<Vec<Option<crate::storage::NodeData>>, StorageError> {
+        let _lifecycle = self.lifecycle.lock();
+        let staged = self.stage.lookup_many(pool, collection_id, node_ids);
+        let mut results = Vec::with_capacity(node_ids.len());
+        let mut live_slots = Vec::new();
+        let mut live_ids = Vec::new();
+        for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
+            match lookup {
+                StagedLookup::Put(payload) => results.push(Some(crate::storage::NodeData::new(
+                    bytes::Bytes::from(payload),
+                ))),
+                StagedLookup::Deleted => results.push(None),
+                StagedLookup::Absent => {
+                    results.push(None);
+                    live_slots.push(slot);
+                    live_ids.push(*node_id);
+                }
+            }
+        }
+        if !live_ids.is_empty() {
+            let live = self
+                .database
+                .pool(pool)
+                .get_many(collection_id, &live_ids)?;
+            for (slot, value) in live_slots.into_iter().zip(live) {
+                results[slot] = value;
+            }
+        }
+        Ok(results)
     }
 
     /// Commit the staged mutations. Pack/index application is performed once;
@@ -335,7 +401,21 @@ impl SharedDatabase {
     #[must_use]
     pub fn begin_transaction(&self) -> DatabaseTransaction<'_> {
         DatabaseTransaction {
-            database: self,
+            database: DatabaseRef::Borrowed(self),
+            stage: Arc::new(TxnStage::new()),
+            lifecycle: parking_lot::Mutex::new(()),
+        }
+    }
+
+    /// Begin a transaction that owns a handle to this database, so it is not
+    /// tied to a borrow and can be held across an FFI boundary or moved to
+    /// another thread. It runs the same commit sequence as
+    /// [`Self::begin_transaction`]: overlay activation, journal publication,
+    /// recovery registration and materialization.
+    #[must_use]
+    pub fn begin_owned_transaction(self: &Arc<Self>) -> DatabaseTransaction<'static> {
+        DatabaseTransaction {
+            database: DatabaseRef::Owned(Arc::clone(self)),
             stage: Arc::new(TxnStage::new()),
             lifecycle: parking_lot::Mutex::new(()),
         }
@@ -587,6 +667,397 @@ mod tests {
             .stage
             .mark_mutation_applied(ShardType::State, 0)
             .unwrap();
+    }
+
+    fn payload_of(value: Option<&NodeData>) -> Option<Vec<u8>> {
+        value.map(|data| data.bytes.to_vec())
+    }
+
+    fn data(bytes: &'static [u8]) -> NodeData {
+        NodeData::new(bytes::Bytes::from_static(bytes))
+    }
+
+    fn live_get(
+        database: &SharedDatabase,
+        pool: ShardType,
+        collection: [u8; 16],
+        id: NodeId,
+    ) -> Option<Vec<u8>> {
+        payload_of(database.pool(pool).get(&collection, &id).unwrap().as_ref())
+    }
+
+    fn own_get(
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        collection: [u8; 16],
+        id: NodeId,
+    ) -> Option<Vec<u8>> {
+        let values = transaction.get(pool, &collection, &[id]).unwrap();
+        payload_of(values[0].as_ref())
+    }
+
+    /// A transaction reads its own staged writes, while the live pool stays
+    /// untouched until commit. After commit the live pool sees the write.
+    #[test]
+    fn a_transaction_reads_its_own_writes_and_others_do_not() {
+        let root = test_root("transaction_reads_own_writes");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [7u8; 16];
+        let transaction = database.begin_transaction();
+        transaction
+            .put(ShardType::State, collection, node(1), &data(b"staged"))
+            .unwrap();
+
+        assert_eq!(
+            own_get(&transaction, ShardType::State, collection, node(1)),
+            Some(b"staged".to_vec())
+        );
+        assert_eq!(
+            live_get(&database, ShardType::State, collection, node(1)),
+            None,
+            "no other reader may see an uncommitted write"
+        );
+        transaction.commit().unwrap();
+        assert_eq!(
+            live_get(&database, ShardType::State, collection, node(1)),
+            Some(b"staged".to_vec()),
+            "commit makes the write visible to everyone"
+        );
+        assert_eq!(
+            own_get(&transaction, ShardType::State, collection, node(1)),
+            Some(b"staged".to_vec()),
+            "the committed transaction still reads it, now from the live pool"
+        );
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The newest staged write wins, reads fall back to live data for records
+    /// the transaction has not touched, and results keep the request order.
+    #[test]
+    fn transaction_reads_prefer_the_newest_write_then_the_live_pool() {
+        let root = test_root("transaction_reads_layering");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [7u8; 16];
+        database
+            .pool(ShardType::State)
+            .put(&collection, &node(1), &data(b"live-1"))
+            .unwrap();
+        database
+            .pool(ShardType::State)
+            .put(&collection, &node(2), &data(b"live-2"))
+            .unwrap();
+
+        let transaction = database.begin_transaction();
+        transaction
+            .put(ShardType::State, collection, node(1), &data(b"first"))
+            .unwrap();
+        transaction
+            .put(ShardType::State, collection, node(1), &data(b"second"))
+            .unwrap();
+        let got = transaction
+            .get(ShardType::State, &collection, &[node(2), node(1), node(9)])
+            .unwrap();
+        assert_eq!(payload_of(got[0].as_ref()), Some(b"live-2".to_vec()));
+        assert_eq!(payload_of(got[1].as_ref()), Some(b"second".to_vec()));
+        assert_eq!(payload_of(got[2].as_ref()), None);
+        assert_eq!(
+            live_get(&database, ShardType::State, collection, node(1)),
+            Some(b"live-1".to_vec()),
+            "live data is untouched until commit"
+        );
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A staged collection delete hides the collection's live records and the
+    /// transaction's own earlier puts; a put staged after it is newer and is
+    /// seen. Other collections are unaffected, and the live pool keeps
+    /// everything until commit.
+    #[test]
+    fn a_staged_collection_delete_hides_older_data_but_not_newer_puts() {
+        let root = test_root("transaction_reads_delete");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let doomed = [7u8; 16];
+        let other = [8u8; 16];
+        for collection in [doomed, other] {
+            database
+                .pool(ShardType::State)
+                .put(&collection, &node(1), &data(b"live"))
+                .unwrap();
+        }
+
+        let transaction = database.begin_transaction();
+        transaction
+            .put(ShardType::State, doomed, node(2), &data(b"before-delete"))
+            .unwrap();
+        transaction
+            .delete_collection(ShardType::State, doomed)
+            .unwrap();
+        transaction
+            .put(ShardType::State, doomed, node(3), &data(b"after-delete"))
+            .unwrap();
+
+        let got = transaction
+            .get(ShardType::State, &doomed, &[node(1), node(2), node(3)])
+            .unwrap();
+        assert_eq!(payload_of(got[0].as_ref()), None, "live record hidden");
+        assert_eq!(payload_of(got[1].as_ref()), None, "earlier put hidden");
+        assert_eq!(
+            payload_of(got[2].as_ref()),
+            Some(b"after-delete".to_vec()),
+            "a later put is visible"
+        );
+        assert_eq!(
+            own_get(&transaction, ShardType::State, other, node(1)),
+            Some(b"live".to_vec()),
+            "other collections are unaffected"
+        );
+        assert_eq!(
+            live_get(&database, ShardType::State, doomed, node(1)),
+            Some(b"live".to_vec()),
+            "the delete is not applied to the live pool before commit"
+        );
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An aborted transaction leaves nothing behind: its staged writes are gone
+    /// for the transaction and never reached the live pool.
+    #[test]
+    fn an_aborted_transaction_leaves_no_trace() {
+        let root = test_root("transaction_reads_abort");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [7u8; 16];
+        let transaction = database.begin_transaction();
+        transaction
+            .put(ShardType::State, collection, node(1), &data(b"rolled-back"))
+            .unwrap();
+        assert_eq!(
+            own_get(&transaction, ShardType::State, collection, node(1)),
+            Some(b"rolled-back".to_vec())
+        );
+        transaction.abort().unwrap();
+        assert_eq!(
+            own_get(&transaction, ShardType::State, collection, node(1)),
+            None,
+            "an aborted transaction no longer serves its staged writes"
+        );
+        assert_eq!(
+            live_get(&database, ShardType::State, collection, node(1)),
+            None
+        );
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two open transactions do not see each other's staged writes.
+    #[test]
+    fn open_transactions_are_isolated_from_each_other() {
+        let root = test_root("transaction_isolation");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [7u8; 16];
+        let first = database.begin_transaction();
+        let second = database.begin_transaction();
+        first
+            .put(ShardType::State, collection, node(1), &data(b"first"))
+            .unwrap();
+        second
+            .put(ShardType::State, collection, node(2), &data(b"second"))
+            .unwrap();
+
+        assert_eq!(
+            own_get(&first, ShardType::State, collection, node(1)),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(own_get(&first, ShardType::State, collection, node(2)), None);
+        assert_eq!(
+            own_get(&second, ShardType::State, collection, node(2)),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(
+            own_get(&second, ShardType::State, collection, node(1)),
+            None
+        );
+        drop(first);
+        drop(second);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// While a commit is part-way (journal published, only some mutations
+    /// applied to the pools, as after a failed post-commit callback that will be
+    /// retried) the stage no longer answers, but the transaction must still read
+    /// its own writes. The live store serves the whole group through the
+    /// transaction overlay, including the mutation not yet applied.
+    #[test]
+    fn a_transaction_still_reads_its_writes_while_its_commit_is_part_way() {
+        let root = test_root("transaction_reads_mid_commit");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let state_collection = [0x61; 16];
+        let event_collection = [0x62; 16];
+        let transaction = database.begin_transaction();
+        let mut overlay = None;
+        prepare_partial_materialization(
+            &database,
+            &transaction,
+            &mut overlay,
+            state_collection,
+            event_collection,
+        );
+
+        assert_eq!(
+            own_get(&transaction, ShardType::State, state_collection, node(1)),
+            Some(b"state".to_vec()),
+            "an applied mutation is read from the pool"
+        );
+        assert_eq!(
+            own_get(&transaction, ShardType::EventDag, event_collection, node(2)),
+            Some(b"event".to_vec()),
+            "a published but not yet applied mutation is read through the overlay"
+        );
+        drop(overlay);
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A large batch of reads against a large stage preserves request order
+    /// and resolves every id. This is a correctness test for the batch
+    /// layering; the single-pass complexity is implemented by `lookup_many`.
+    #[test]
+    fn a_large_batch_read_preserves_order_and_values() {
+        const RECORDS: u16 = 4000;
+        let root = test_root("transaction_reads_large_batch");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [7u8; 16];
+        let id_of = |index: u16| -> NodeId {
+            let mut id = [0u8; 16];
+            id[..2].copy_from_slice(&index.to_le_bytes());
+            id
+        };
+        let transaction = database.begin_transaction();
+        for index in 0..RECORDS {
+            transaction
+                .put(
+                    ShardType::State,
+                    collection,
+                    id_of(index),
+                    &NodeData::new(bytes::Bytes::from(index.to_le_bytes().to_vec())),
+                )
+                .unwrap();
+        }
+        let ids: Vec<NodeId> = (0..RECORDS).map(id_of).collect();
+        let values = transaction
+            .get(ShardType::State, &collection, &ids)
+            .unwrap();
+        assert_eq!(
+            transaction.stage.lookup_many_calls(),
+            1,
+            "the batch is resolved by one staged scan"
+        );
+        assert_eq!(values.len(), usize::from(RECORDS));
+        for (index, value) in values.iter().enumerate() {
+            let expected = u16::try_from(index).unwrap().to_le_bytes().to_vec();
+            assert_eq!(payload_of(value.as_ref()), Some(expected));
+        }
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An owned transaction is not tied to a borrow: it can move to another
+    /// thread and still runs the whole commit sequence, so the data reaches the
+    /// live pool.
+    #[test]
+    fn an_owned_transaction_moves_across_threads_and_commits() {
+        let root = test_root("owned_transaction");
+        let database = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+        let collection = [7u8; 16];
+        let transaction = database.begin_owned_transaction();
+        transaction
+            .put(ShardType::State, collection, node(1), &data(b"owned"))
+            .unwrap();
+
+        let handle = std::thread::spawn(move || {
+            assert_eq!(
+                own_get(&transaction, ShardType::State, collection, node(1)),
+                Some(b"owned".to_vec())
+            );
+            transaction.commit().unwrap();
+        });
+        handle.join().unwrap();
+        assert_eq!(
+            live_get(&database, ShardType::State, collection, node(1)),
+            Some(b"owned".to_vec())
+        );
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Staged records are scoped to their pool: the same collection and id in
+    /// another pool is a different record.
+    #[test]
+    fn staged_reads_are_scoped_to_their_pool() {
+        let root = test_root("transaction_reads_pool_scope");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [7u8; 16];
+        let transaction = database.begin_transaction();
+        transaction
+            .put(ShardType::State, collection, node(1), &data(b"state"))
+            .unwrap();
+        assert_eq!(
+            own_get(&transaction, ShardType::EventDag, collection, node(1)),
+            None
+        );
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression: once a checkpoint had reclaimed the shared WAL, every
+    /// transaction commit failed with a `WouldBlock` that no retry cleared and
+    /// the staged data was never applied. The overlay setup ran a reader's gap
+    /// check against a writer that never sets its own read coverage. A plain
+    /// pool sync is enough to reclaim, so this is the ordinary case.
+    #[test]
+    fn a_transaction_commits_after_a_checkpoint_has_reclaimed_the_wal() {
+        let root = test_root("commit_after_checkpoint");
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [7u8; 16];
+        database
+            .pool(ShardType::State)
+            .put(&[0x99; 16], &node(1), &data(b"seed"))
+            .unwrap();
+        database.pool(ShardType::State).sync().unwrap();
+        let wal =
+            crate::journal::Journal::scan_read_only(database.layout().shared_wal_path()).unwrap();
+        assert!(
+            wal.base_lsn > 1,
+            "the sync must have reclaimed the WAL past LSN 1 for this to test anything"
+        );
+
+        let transaction = database.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                collection,
+                node(1),
+                &data(b"after-checkpoint"),
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            live_get(&database, ShardType::State, collection, node(1)),
+            Some(b"after-checkpoint".to_vec())
+        );
+        drop(transaction);
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn node(id: u8) -> NodeId {
@@ -873,6 +1344,16 @@ mod tests {
                 .bytes
                 .as_ref(),
             b"event"
+        );
+        let during_materialization = transaction
+            .get(ShardType::EventDag, &event_collection, &[event_node])
+            .unwrap();
+        assert_eq!(
+            during_materialization[0]
+                .as_ref()
+                .map(|data| data.bytes.as_ref()),
+            Some(b"event".as_ref()),
+            "a retrying transaction must keep read-your-writes through its overlay"
         );
 
         assert!(transaction.abort().is_err());

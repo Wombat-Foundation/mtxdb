@@ -25,6 +25,7 @@ const NODE: [u8; 16] = [0x33; 16];
 const PAYLOAD: &[u8] = b"committed by the writer process";
 const READER_ENV: &str = "MTXDB_SHARED_READER_ROOT";
 const STALE_READER_ENV: &str = "MTXDB_SHARED_STALE_READER_ROOT";
+const TRANSACTION_READER_ENV: &str = "MTXDB_SHARED_TRANSACTION_READER_ROOT";
 const READER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The reader-process entry point. Runs only when re-executed with
@@ -91,6 +92,39 @@ fn stale_reader_process_baselines_then_rereads_after_publish() {
         .is_some_and(|data| data.bytes.as_ref() == PAYLOAD);
     let outcome: &[u8] = if saw_it { b"ok" } else { b"miss" };
     std::fs::write(&result, outcome).expect("write reader result");
+}
+
+/// Read before, during, and after a transaction. The staged-window read is
+/// the cross-process rollback-invisibility check.
+#[test]
+fn transaction_reader_process_reads_before_during_and_after_commit() {
+    let Ok(root) = std::env::var(TRANSACTION_READER_ENV) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let pool_dir = root.join("pools").join(ShardType::State.as_str());
+    let wal_path = root.join("wal.bin");
+    let reader = PackfileStorage::open_read_committed_shared(pool_dir, wal_path, ShardType::State)
+        .expect("reader process must open the shared WAL read-only");
+    let sees = |label: &str| {
+        let values = reader
+            .get_read_committed(&COLLECTION, &[NODE])
+            .unwrap_or_else(|error| panic!("{label} lookup failed: {error}"));
+        values[0]
+            .as_ref()
+            .is_some_and(|data| data.bytes.as_ref() == PAYLOAD)
+    };
+    assert!(!sees("baseline"));
+    std::fs::write(root.join("transaction-baseline.done"), b"1").unwrap();
+    wait_for(&root.join("transaction-staged.done"), READER_TIMEOUT);
+    let staged = sees("staged");
+    let staged_result: &[u8] = if staged { b"visible" } else { b"absent" };
+    std::fs::write(root.join("transaction-staged.result"), staged_result).unwrap();
+    std::fs::write(root.join("transaction-staged-read.done"), b"1").unwrap();
+    wait_for(&root.join("transaction-committed.done"), READER_TIMEOUT);
+    let committed = sees("committed");
+    let committed_result: &[u8] = if committed { b"visible" } else { b"absent" };
+    std::fs::write(root.join("transaction-committed.result"), committed_result).unwrap();
 }
 
 /// A test temp root that removes itself on drop, including when an assertion
@@ -262,4 +296,51 @@ fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
         .map(|shard| db.pool(*shard).stats().sync_totals.calls)
         .sum();
     assert_eq!(fsyncs, 0, "the published record must not have been fsynced");
+}
+
+#[test]
+fn a_reader_process_sees_a_transaction_only_after_commit() {
+    let root = TempRoot::new("transaction-visibility");
+    let db = SharedDatabase::open(root.path().to_path_buf()).unwrap();
+    let mut reader = spawn_reader_entry(
+        "transaction_reader_process_reads_before_during_and_after_commit",
+        TRANSACTION_READER_ENV,
+        root.path(),
+    );
+    wait_for(
+        &root.path().join("transaction-baseline.done"),
+        READER_TIMEOUT,
+    );
+
+    let transaction = db.begin_transaction();
+    transaction
+        .put(
+            ShardType::State,
+            COLLECTION,
+            NODE,
+            &NodeData::new(bytes::Bytes::from_static(PAYLOAD)),
+        )
+        .unwrap();
+    std::fs::write(root.path().join("transaction-staged.done"), b"1").unwrap();
+    wait_for(
+        &root.path().join("transaction-staged-read.done"),
+        READER_TIMEOUT,
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("transaction-staged.result")).unwrap(),
+        b"absent"
+    );
+    transaction.commit().unwrap();
+    std::fs::write(root.path().join("transaction-committed.done"), b"1").unwrap();
+
+    assert!(reader
+        .wait_bounded(
+            "transaction_reader_process_reads_before_during_and_after_commit",
+            READER_TIMEOUT,
+        )
+        .success());
+    assert_eq!(
+        std::fs::read(root.path().join("transaction-committed.result")).unwrap(),
+        b"visible"
+    );
 }
