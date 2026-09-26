@@ -1063,8 +1063,7 @@ mod tests {
 
     /// An identity that disappears between recording and refresh (a stamp was
     /// recorded, none is available now) means the file is not known to be the
-    /// one the overlay was built from, so the overlay is rebuilt. The reverse
-    /// flip is handled by the same arm.
+    /// one the overlay was built from, so the overlay is rebuilt.
     #[test]
     #[cfg(unix)]
     fn a_stamp_that_vanishes_between_refreshes_forces_a_rebuild() {
@@ -1082,6 +1081,29 @@ mod tests {
             "the rebuild records without an identity"
         );
         assert!(overlay.tail_file.is_none());
+    }
+
+    /// The reverse flip: a segment recorded without an identity that reports
+    /// one on a later refresh is not known to be the file the overlay was built
+    /// from, so it is rebuilt and recorded with the identity.
+    #[test]
+    #[cfg(unix)]
+    fn an_identity_that_appears_between_refreshes_forces_a_rebuild() {
+        let wal = temp_wal("identity_appears");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.force_no_identity = true;
+        overlay.refresh(true).unwrap();
+        assert!(overlay.tail_stamp.is_none());
+        overlay.force_no_identity = false;
+        overlay.refresh(true).unwrap();
+        assert_eq!(overlay.tail_resets, 1);
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+        assert!(
+            overlay.tail_stamp.is_some(),
+            "the rebuild records the identity now available"
+        );
+        assert!(overlay.tail_file.is_some());
     }
 
     /// Without a file identity an unchanged segment is not rebuilt: the window
