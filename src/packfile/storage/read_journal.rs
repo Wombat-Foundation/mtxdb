@@ -173,6 +173,10 @@ pub(super) struct ReadJournal {
     /// Test-only count of window reads, to show the fingerprint skips them.
     #[cfg(test)]
     pub(super) tail_reads: u64,
+    /// Test-only total of segment bytes scanned across refreshes, to show a
+    /// retained overlay scans only what was appended.
+    #[cfg(test)]
+    pub(super) scanned_bytes: u64,
     /// Test-only switch that makes every stamp absent, as on a platform without
     /// inode numbers, to exercise the no-identity path on unix.
     #[cfg(test)]
@@ -216,6 +220,8 @@ impl ReadJournal {
             tail_quiet: false,
             #[cfg(test)]
             tail_reads: 0,
+            #[cfg(test)]
+            scanned_bytes: 0,
             #[cfg(test)]
             force_no_identity: false,
             #[cfg(test)]
@@ -484,6 +490,8 @@ impl ReadJournal {
                 reset = true;
             }
             let full_scan = self.observed_valid_len == 0;
+            #[cfg(test)]
+            let scan_from = self.observed_valid_len;
             let scan = if full_scan {
                 Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
             } else {
@@ -547,6 +555,12 @@ impl ReadJournal {
             }
             // Resume from the last complete group, not the raw file length, so
             // a partial tail is re-probed once its trailer lands.
+            #[cfg(test)]
+            {
+                self.scanned_bytes = self
+                    .scanned_bytes
+                    .saturating_add(scan.valid_len.saturating_sub(scan_from));
+            }
             self.observed_valid_len = scan.valid_len;
             self.observed_len = len;
             self.record_observed_tail(stamp, &scan.consumed_tail);
@@ -807,7 +821,15 @@ impl PackfileStorage {
         // observed nothing and accepts the prefix, so the only outcome besides
         // an error is `Applied`; anything else is a broken assumption and is
         // surfaced instead of installing an overlay that was never built.
-        match overlay.refresh(true)? {
+        #[cfg(test)]
+        let scanned_before = overlay.scanned_bytes;
+        let refreshed = overlay.refresh(true)?;
+        #[cfg(test)]
+        self.transaction_overlay_scanned.fetch_add(
+            overlay.scanned_bytes.saturating_sub(scanned_before),
+            Ordering::Relaxed,
+        );
+        match refreshed {
             ReadRefresh::Applied => {}
             ReadRefresh::NeedsReload => {
                 return Err(StorageError::Internal(

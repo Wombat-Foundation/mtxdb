@@ -1357,6 +1357,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Commit cost must not grow with the unreclaimed WAL: a lone commit
+    /// scans only the group it appended, however long the segment already is.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn lone_commits_scan_only_the_appended_suffix() {
+        let root = test_root("overlay_scan_bounded");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x75; 16];
+        let pool = db.pool(ShardType::EventDag);
+        let commit = |seq: u16| {
+            let before = pool.transaction_overlay_scanned_bytes();
+            let txn = db.begin_transaction();
+            for record in 0..4u8 {
+                let mut id = [0u8; 16];
+                id[..2].copy_from_slice(&seq.to_le_bytes());
+                id[15] = record;
+                txn.put(ShardType::EventDag, collection, id, &data(b"payload"))
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+            pool.transaction_overlay_scanned_bytes() - before
+        };
+        for seq in 0..50 {
+            commit(seq);
+        }
+        let early = commit(50);
+        for seq in 51..500 {
+            commit(seq);
+        }
+        let late = commit(500);
+        assert!(early > 0, "a commit must scan its own group");
+        assert!(
+            late <= early.saturating_mul(2),
+            "commit scanned {late} bytes after 500 commits but {early} after 50: \
+             the overlay is rescanning the WAL"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn transaction_commit_applies_and_publishes_once() {
         let root = test_root("transaction_commit");

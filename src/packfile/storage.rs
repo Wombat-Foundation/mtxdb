@@ -1646,6 +1646,10 @@ pub struct PackfileStorage {
     /// being materialized. While non-zero, ordinary reads consult the journal
     /// overlay before the live index.
     transaction_overlay_users: AtomicU64,
+    /// Test-only total of segment bytes the transaction overlay has scanned,
+    /// across activations, whether the overlay was retained or rebuilt.
+    #[cfg(all(test, feature = "multi-reader"))]
+    transaction_overlay_scanned: AtomicU64,
     /// Journal LSN covered by the durable index this handle actually loaded.
     ///
     /// Read once at open, when the index is built from the on-disk checkpoint
@@ -2436,6 +2440,8 @@ impl PackfileStorage {
             replaying: AtomicBool::new(false),
             read_journal: parking_lot::Mutex::new(None),
             transaction_overlay_users: AtomicU64::new(0),
+            #[cfg(all(test, feature = "multi-reader"))]
+            transaction_overlay_scanned: AtomicU64::new(0),
             read_covered_lsn,
             read_reloads: AtomicU64::new(0),
             read_reload_failures: AtomicU64::new(0),
@@ -8214,6 +8220,12 @@ impl PackfileStorage {
             }
         }
         Ok(())
+    }
+
+    /// Total segment bytes the retained transaction overlay has scanned.
+    #[cfg(all(test, feature = "multi-reader"))]
+    pub(crate) fn transaction_overlay_scanned_bytes(&self) -> u64 {
+        self.transaction_overlay_scanned.load(Ordering::Relaxed)
     }
 
     /// Stop consulting the in-process transaction overlay after all staged
