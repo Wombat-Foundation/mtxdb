@@ -106,3 +106,9 @@ harness = false
 name = "compare_external"
 path = "compare_external.rs"
 harness = false
+
+# Plain-autocommit vs staged-transaction writes through the shared WAL.
+[[bench]]
+name = "txn_commit"
+path = "txn_commit.rs"
+harness = false
