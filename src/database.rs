@@ -16,7 +16,9 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::journal::{
     CommitReceipt, Journal, JournalCoordinator, SharedWalLock, StagedLookup, TxnStage,
@@ -82,8 +84,67 @@ pub struct SharedDatabase {
     /// workers. The stage's applied-bit check and mutation application must be
     /// one critical section.
     recovery_lifecycle: parking_lot::Mutex<()>,
+    commit_phases: CommitPhases,
     /// Held for the lifetime of the handle: one writer per database root.
     _lock: SharedWalLock,
+}
+
+/// Total time and call count for one commit phase.
+#[derive(Default)]
+struct PhaseTimer {
+    nanos: AtomicU64,
+    calls: AtomicU64,
+}
+
+impl PhaseTimer {
+    fn add(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PhaseTiming {
+        PhaseTiming {
+            total: Duration::from_nanos(self.nanos.load(Ordering::Relaxed)),
+            calls: self.calls.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CommitPhases {
+    overlay: PhaseTimer,
+    publish: PhaseTimer,
+    register_wait: PhaseTimer,
+    materialize_wait: PhaseTimer,
+    materialize: PhaseTimer,
+}
+
+/// Accumulated time and call count of one commit phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseTiming {
+    /// Summed wall time across all calls.
+    pub total: Duration,
+    /// Number of times the phase ran.
+    pub calls: u64,
+}
+
+/// Where transaction commits have spent their time since the database opened.
+///
+/// `*_wait` phases are time blocked acquiring the recovery lifecycle lock, so
+/// a large value there is contention between commits, not work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitPhaseStats {
+    /// Activating the read overlay on every pool.
+    pub overlay: PhaseTiming,
+    /// Appending the journal group (includes waiting for the journal lock).
+    pub publish: PhaseTiming,
+    /// Waiting for the recovery lifecycle lock before registering the stage.
+    pub register_wait: PhaseTiming,
+    /// Waiting for the recovery lifecycle lock before materializing.
+    pub materialize_wait: PhaseTiming,
+    /// Applying the staged writes to the pools.
+    pub materialize: PhaseTiming,
 }
 
 struct RecoveryItem {
@@ -225,8 +286,13 @@ impl DatabaseTransaction<'_> {
                     .map_err(StorageError::Io)?;
                 return Ok(());
             }
+            let started = Instant::now();
             let mut overlay = Some(self.database.activate_transaction_overlay()?);
-            if let Err(error) = self.database.publish_transaction(&self.stage) {
+            self.database.commit_phases.overlay.add(started.elapsed());
+            let started = Instant::now();
+            let published = self.database.publish_transaction(&self.stage);
+            self.database.commit_phases.publish.add(started.elapsed());
+            if let Err(error) = published {
                 drop(overlay.take());
                 return Err(StorageError::Io(error));
             }
@@ -245,7 +311,12 @@ impl DatabaseTransaction<'_> {
             };
             // Keep recovery from removing a duplicate queue entry between
             // registration and transferring ownership of this overlay.
+            let started = Instant::now();
             let _recovery_lifecycle = self.database.recovery_lifecycle.lock();
+            self.database
+                .commit_phases
+                .register_wait
+                .add(started.elapsed());
             self.database.register_new_recovery_stage(
                 Arc::clone(&self.stage),
                 receipt,
@@ -264,7 +335,12 @@ impl DatabaseTransaction<'_> {
             // Take this lock before checking the recovery queue. A recovery
             // worker may otherwise finish and remove this stage between the
             // membership check and lock acquisition.
+            let started = Instant::now();
             let _recovery_lifecycle = self.database.recovery_lifecycle.lock();
+            self.database
+                .commit_phases
+                .materialize_wait
+                .add(started.elapsed());
             match self.stage.state() {
                 TxnStageState::JournalPublished => {
                     self.stage
@@ -277,7 +353,13 @@ impl DatabaseTransaction<'_> {
                 }
                 _ => return Ok(()),
             }
-            self.database.materialize_transaction(&self.stage)?;
+            let started = Instant::now();
+            let materialized = self.database.materialize_transaction(&self.stage);
+            self.database
+                .commit_phases
+                .materialize
+                .add(started.elapsed());
+            materialized?;
             self.stage.mark_published().map_err(StorageError::Io)?;
             self.database.finish_recovery_stage(&self.stage)?;
         }
@@ -360,6 +442,7 @@ impl SharedDatabase {
             pools,
             recovery_queue: parking_lot::Mutex::new(Vec::new()),
             recovery_lifecycle: parking_lot::Mutex::new(()),
+            commit_phases: CommitPhases::default(),
             _lock: lock,
         })
     }
@@ -421,6 +504,19 @@ impl SharedDatabase {
             database: DatabaseRef::Owned(Arc::clone(self)),
             stage: Arc::new(TxnStage::new()),
             lifecycle: parking_lot::Mutex::new(()),
+        }
+    }
+
+    /// Where transaction commits have spent their time so far.
+    #[must_use]
+    pub fn commit_phase_stats(&self) -> CommitPhaseStats {
+        let phases = &self.commit_phases;
+        CommitPhaseStats {
+            overlay: phases.overlay.snapshot(),
+            publish: phases.publish.snapshot(),
+            register_wait: phases.register_wait.snapshot(),
+            materialize_wait: phases.materialize_wait.snapshot(),
+            materialize: phases.materialize.snapshot(),
         }
     }
 

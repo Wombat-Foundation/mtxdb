@@ -112,3 +112,9 @@ harness = false
 name = "txn_commit"
 path = "txn_commit.rs"
 harness = false
+
+# Concurrent transaction commits with the background committer running.
+[[bench]]
+name = "txn_contention"
+path = "txn_contention.rs"
+harness = false

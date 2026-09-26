@@ -56,7 +56,9 @@ pub use auxiliary::{
 };
 pub use cache::NodeCache;
 #[cfg(feature = "multi-reader")]
-pub use database::{DatabaseTransaction, PoolPolicies, PoolPolicy, SharedDatabase};
+pub use database::{
+    CommitPhaseStats, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy, SharedDatabase,
+};
 pub use index::LossyIndex;
 #[cfg(feature = "multi-reader")]
 pub use journal::SharedWalLock;
