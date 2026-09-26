@@ -531,7 +531,7 @@ impl SharedDatabase {
     /// journal for no reader.
     fn activate_transaction_overlay(
         &self,
-        touched: [bool; 3],
+        touched: [bool; ShardType::ALL.len()],
     ) -> Result<TransactionOverlayGuard, StorageError> {
         let wal_path = self.layout.shared_wal_path();
         let mut held: Vec<Arc<PackfileStorage>> = Vec::with_capacity(touched.len());
@@ -1542,6 +1542,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Small enough that a few hundred KiB of commits cross it.
+    #[cfg(feature = "multi-reader")]
+    const TEST_RECLAIM_TRIGGER_LEN: u64 = 256 << 10;
+
     /// Write committed transactions that stage into each of the `active` pools
     /// and sync every round, idle pools first while the segment is still
     /// large. Returns the largest WAL seen after a round's syncs (past round
@@ -1550,7 +1554,7 @@ mod tests {
     /// checkpoint once the segment is large. The segment can only be reclaimed
     /// once all the active pools have reported coverage.
     #[cfg(feature = "multi-reader")]
-    fn run_bounded_wal_rounds(name: &str, active: &[ShardType]) -> u64 {
+    fn run_bounded_wal_rounds(name: &str, active: &[ShardType], defer_rewrites: bool) -> u64 {
         use crate::PackfileStorage;
         assert!(!active.is_empty(), "at least one pool must be active");
         for (index, pool) in active.iter().enumerate() {
@@ -1561,6 +1565,16 @@ mod tests {
         }
         let root = test_root(name);
         let db = SharedDatabase::open(root.clone()).unwrap();
+        db.coordinator()
+            .set_reclaim_trigger_len(TEST_RECLAIM_TRIGGER_LEN);
+        if defer_rewrites {
+            // A budget that would defer every structural rewrite for an hour must
+            // not hold back the checkpoint the size trigger forces.
+            for pool in ShardType::ALL {
+                db.pool(pool)
+                    .set_checkpoint_rewrite_budget(std::time::Duration::from_secs(3600), 0);
+            }
+        }
         let collection = [0x7a; 16];
         let wal = db.layout().shared_wal_path();
         let mut order: Vec<ShardType> = ShardType::ALL
@@ -1628,15 +1642,19 @@ mod tests {
         largest_after_sync
     }
 
-    /// The WAL must stay below the reclaim trigger after every sync.
+    /// The WAL must stay below the reclaim trigger after each round's syncs.
     #[cfg(feature = "multi-reader")]
     fn assert_wal_bounded(name: &str, active: &[ShardType]) {
-        let largest = run_bounded_wal_rounds(name, active);
+        assert_wal_bounded_with(name, active, false);
+    }
+
+    #[cfg(feature = "multi-reader")]
+    fn assert_wal_bounded_with(name: &str, active: &[ShardType], defer_rewrites: bool) {
+        let largest = run_bounded_wal_rounds(name, active, defer_rewrites);
         assert!(
-            largest < crate::journal::RECLAIM_TRIGGER_LEN,
+            largest < TEST_RECLAIM_TRIGGER_LEN,
             "{active:?}: the WAL stayed at {largest} bytes after a round's syncs; it must be \
-             reclaimed once past {} bytes",
-            crate::journal::RECLAIM_TRIGGER_LEN
+             reclaimed once past {TEST_RECLAIM_TRIGGER_LEN} bytes"
         );
     }
 
@@ -1670,6 +1688,15 @@ mod tests {
     #[test]
     fn repeated_syncs_keep_the_shared_wal_bounded_with_two_pools_active() {
         assert_wal_bounded("wal_bounded_two", &[ShardType::State, ShardType::EventDag]);
+    }
+
+    /// A configured checkpoint-rewrite deferral budget must not postpone the
+    /// checkpoint the size trigger forces: the segment would fill and commits
+    /// would fail.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_deferral_budget_does_not_hold_back_the_forced_reclaim() {
+        assert_wal_bounded_with("wal_bounded_deferred", &[ShardType::EventDag], true);
     }
 
     /// A transaction that stages writes for one pool must not activate (and so

@@ -8559,7 +8559,7 @@ impl PackfileStorage {
         let Some(journal) = self.journal() else {
             return false;
         };
-        if journal.segment_len() <= crate::journal::RECLAIM_TRIGGER_LEN {
+        if journal.segment_len() <= journal.reclaim_trigger_len() {
             return false;
         }
         #[cfg(feature = "multi-reader")]
@@ -8613,7 +8613,10 @@ impl PackfileStorage {
         // records staleness instead and writes nothing.
         let mut sidecar_anchor = false;
         if journal_needs_reclaim || self.delta_state_needs_full_rewrite() {
-            if self.should_defer_checkpoint_rewrite() {
+            // A deferral budget postpones acceleration rewrites; it must not
+            // postpone the one that lets the journal be reclaimed, or the segment
+            // fills and commits fail.
+            if !journal_needs_reclaim && self.should_defer_checkpoint_rewrite() {
                 // Write-neutral stopgap: the caller already synced the
                 // packfiles, so skipping the acceleration rewrite costs only
                 // the next open a rescan — the stale on-disk checkpoint no

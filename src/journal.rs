@@ -137,13 +137,13 @@ const MAX_SEGMENT_LEN: u64 = (256 << 20) + FILE_HEADER_LEN as u64;
 
 /// Segment size above which a sync forces a full index checkpoint, because only
 /// a full checkpoint records journal coverage and lets the segment be
-/// reclaimed. A quarter of [`MAX_SEGMENT_LEN`] leaves room for writes that land
-/// while the checkpoint runs, so a busy writer never reaches the hard limit.
-#[cfg(not(test))]
-pub(crate) const RECLAIM_TRIGGER_LEN: u64 = 64 << 20;
-/// Small under `cfg(test)` so a test can cross it with a few hundred KiB.
-#[cfg(test)]
-pub(crate) const RECLAIM_TRIGGER_LEN: u64 = 256 << 10;
+/// reclaimed. A quarter of [`MAX_SEGMENT_LEN`] leaves headroom for writes that
+/// land while the checkpoint runs. It is a margin, not a guarantee: a writer
+/// that appends more than the remaining space during one checkpoint still fills
+/// the segment.
+/// A coordinator starts with this and can be given another with
+/// [`JournalCoordinator::set_reclaim_trigger_len`].
+pub(crate) const RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN / 4;
 
 /// A durable mutation represented in a journal group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -392,7 +392,7 @@ impl TxnStage {
     /// Which pools (in [`ShardType::ALL`] order) have at least one staged
     /// mutation.
     #[cfg(feature = "multi-reader")]
-    pub(crate) fn touched_pools(&self) -> [bool; 3] {
+    pub(crate) fn touched_pools(&self) -> [bool; ShardType::ALL.len()] {
         let data = self.data.lock();
         std::array::from_fn(|index| data.pools.get(index).is_some_and(|pool| !pool.is_empty()))
     }
@@ -1006,6 +1006,12 @@ enum SharedBoundary {
     Through(u64),
 }
 
+// Pool bits are `1 << index`, so they must stay below the unattributed bit.
+const _: () = assert!(
+    ShardType::ALL.len() < 7,
+    "GroupMark::pools has one bit per pool below UNATTRIBUTED_POOL_BIT"
+);
+
 /// The bit standing for `pool` in [`GroupMark::pools`].
 fn pool_bit(pool: Option<ShardType>) -> u8 {
     pool.and_then(|pool| ShardType::ALL.into_iter().position(|known| known == pool))
@@ -1041,6 +1047,32 @@ fn marks_from_scan(scan: &Scan) -> Vec<GroupMark> {
                 .fold(0, |mask, entry| mask | pool_bit(entry.pool)),
         })
         .collect()
+}
+
+/// The last group of the longest prefix of `groups` that a shared segment may
+/// drop: every pool with a frame in each group has reported coverage through the
+/// group's `last_lsn`, and the group holds no untagged frame (which no pool's
+/// coverage can account for). `None` when even the first group is still needed.
+///
+/// The one place this rule lives: the directory and the scan fallback both call
+/// it, so they cannot disagree.
+#[cfg(feature = "multi-reader")]
+fn boundary_through(groups: &[GroupMark], covered: &HashMap<ShardType, u64>) -> Option<u64> {
+    let mut boundary = None;
+    'groups: for group in groups {
+        for (index, pool) in ShardType::ALL.into_iter().enumerate() {
+            if group.pools & (1_u8 << index) != 0
+                && !covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn)
+            {
+                break 'groups;
+            }
+        }
+        if group.pools & UNATTRIBUTED_POOL_BIT != 0 {
+            break 'groups;
+        }
+        boundary = Some(group.last_lsn);
+    }
+    boundary
 }
 
 /// Result of validating a journal file.
@@ -1286,6 +1318,9 @@ pub struct JournalCoordinator {
     /// committed-but-unflushed group.
     visible_lsn: AtomicU64,
     committed_lsn: AtomicU64,
+    /// Segment length above which a sync forces a reclaiming checkpoint; see
+    /// [`RECLAIM_TRIGGER_LEN`].
+    reclaim_trigger_len: AtomicU64,
     /// Optional shared, cross-pool group-sequence allocator. When present,
     /// each committed group draws its sequence from here instead of the
     /// segment's own counter, so groups across several pool segments share one
@@ -1437,6 +1472,7 @@ impl JournalCoordinator {
             published_lsn: AtomicU64::new(committed_lsn),
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
+            reclaim_trigger_len: AtomicU64::new(RECLAIM_TRIGGER_LEN),
             sequence: None,
             #[cfg(feature = "multi-reader")]
             coverage: Mutex::new(coverage),
@@ -1577,24 +1613,7 @@ impl JournalCoordinator {
         let scan = Journal::scan_read_only(&self.path)?;
         let boundary = {
             let coverage = self.coverage.lock();
-            let mut boundary = None;
-            'groups: for group in &scan.groups {
-                for entry in &group.entries {
-                    match entry.pool {
-                        Some(pool)
-                            if coverage
-                                .covered
-                                .get(&pool)
-                                .is_some_and(|lsn| *lsn >= group.last_lsn) => {}
-                        // Either the contributing pool has not reported coverage
-                        // through this group, or a frame carries no pool tag and
-                        // so cannot be attributed. Stop before dropping it.
-                        _ => break 'groups,
-                    }
-                }
-                boundary = Some(group.last_lsn);
-            }
-            boundary
+            boundary_through(&marks_from_scan(&scan), &coverage.covered)
         };
         match boundary {
             Some(covered_lsn) => self.reclaim_through(covered_lsn).map(Some),
@@ -2045,6 +2064,22 @@ impl JournalCoordinator {
     #[must_use]
     pub fn segment_len(&self) -> u64 {
         self.journal.lock().file_len
+    }
+
+    /// Segment length above which a sync forces a reclaiming checkpoint.
+    #[must_use]
+    pub fn reclaim_trigger_len(&self) -> u64 {
+        self.reclaim_trigger_len.load(Ordering::Relaxed)
+    }
+
+    /// Set the segment length above which a sync forces a reclaiming
+    /// checkpoint. Tests use a small value to cross it without writing tens of
+    /// MiB. It is not available outside tests: a value of zero would force a
+    /// checkpoint on every sync and one above the segment cap would switch the
+    /// forced reclaim off.
+    #[cfg(all(test, feature = "multi-reader"))]
+    pub(crate) fn set_reclaim_trigger_len(&self, len: u64) {
+        self.reclaim_trigger_len.store(len, Ordering::Relaxed);
     }
 
     /// Highest LSN any caller has requested through [`Self::request_durable`].
@@ -3136,23 +3171,8 @@ impl Journal {
         if !self.directory_matches_file() {
             return SharedBoundary::Untrusted;
         }
-        let mut boundary = None;
-        'groups: for group in &self.groups {
-            for (index, pool) in ShardType::ALL.into_iter().enumerate() {
-                if group.pools & (1_u8 << index) != 0
-                    && !covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn)
-                {
-                    break 'groups;
-                }
-            }
-            // A frame with no pool tag cannot be attributed to any pool's
-            // coverage, so it is never dropped.
-            if group.pools & UNATTRIBUTED_POOL_BIT != 0 {
-                break 'groups;
-            }
-            boundary = Some(group.last_lsn);
-        }
-        boundary.map_or(SharedBoundary::NothingCovered, SharedBoundary::Through)
+        boundary_through(&self.groups, covered)
+            .map_or(SharedBoundary::NothingCovered, SharedBoundary::Through)
     }
 
     /// Reclaim using the group directory: pick the cut from it and read only
@@ -3186,7 +3206,7 @@ impl Journal {
             // scan would have: it must hold exactly the groups the directory
             // says, each valid. Anything else means the directory is stale, and
             // the scan path decides instead.
-            let checked = scan_groups_from(
+            let Ok(checked) = scan_groups_from(
                 &suffix,
                 cut_offset,
                 first.sequence,
@@ -3194,7 +3214,9 @@ impl Journal {
                 new_base_lsn,
                 self.version,
                 || u64::MAX,
-            )?;
+            ) else {
+                return self.reclaim_through_scan(covered_lsn);
+            };
             if checked.groups.len() != retained.len()
                 || checked.valid_len != self.file_len
                 || checked.truncated_tail
@@ -6726,5 +6748,58 @@ mod tests {
             }
         }
         fs::remove_file(&path).unwrap();
+    }
+    /// A frame with no pool tag cannot be attributed to any pool's coverage, so
+    /// the boundary must stop before its group even when every tagged pool has
+    /// reported past it.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn an_untagged_frame_stops_the_boundary() {
+        use super::{boundary_through, GroupMark, UNATTRIBUTED_POOL_BIT};
+        use crate::layout::ShardType;
+        use std::collections::HashMap;
+        let mark = |last_lsn: u64, pools: u8| GroupMark {
+            sequence: last_lsn,
+            first_lsn: last_lsn,
+            last_lsn,
+            end_offset: last_lsn * 100,
+            pools,
+        };
+        let state = 1_u8;
+        let groups = [
+            mark(1, state),
+            mark(2, state | UNATTRIBUTED_POOL_BIT),
+            mark(3, state),
+        ];
+        let covered = HashMap::from([(ShardType::State, 99_u64)]);
+        assert_eq!(boundary_through(&groups, &covered), Some(1));
+        assert_eq!(boundary_through(&groups[1..], &covered), None);
+        assert_eq!(boundary_through(&groups[2..], &covered), Some(3));
+        // A tagged pool that has not reported blocks its group.
+        assert_eq!(boundary_through(&groups[..1], &HashMap::new()), None);
+    }
+
+    /// A directory whose offsets make the retained suffix start mid-group must
+    /// not fail the reclaim: the suffix check errors, and the scan path decides.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_misaligned_directory_falls_back_to_the_scan_instead_of_failing() {
+        let (mut broken, broken_path) = shared_journal_with_groups("dir_misaligned", 6);
+        let (mut reference, reference_path) = shared_journal_with_groups("dir_reference", 6);
+        // Keep the last group ending at the file length (so the directory is
+        // trusted) but point an earlier group's end into the middle of a group.
+        broken.groups[1].end_offset += 1;
+        assert!(broken.directory_matches_file());
+        let actual = broken.reclaim_through(5).unwrap();
+        let expected = reference.reclaim_through_scan(5).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            fs::read(&broken_path).unwrap(),
+            fs::read(&reference_path).unwrap()
+        );
+        assert!(broken.directory_matches_file());
+        assert_eq!(broken.groups, directory_of_file(&broken_path));
+        fs::remove_file(&broken_path).unwrap();
+        fs::remove_file(&reference_path).unwrap();
     }
 }

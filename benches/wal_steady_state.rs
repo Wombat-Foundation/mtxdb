@@ -23,7 +23,8 @@ use mtxdb::storage::{NodeData, NodeId};
 use mtxdb::SharedDatabase;
 
 const COLLECTION: [u8; 16] = [7; 16];
-/// Matches the non-test `RECLAIM_TRIGGER_LEN` in `journal.rs`.
+/// A quarter of the 256 MiB segment cap, the default `RECLAIM_TRIGGER_LEN` in
+/// `journal.rs` (which adds the 12 KiB header to the cap before dividing).
 const TRIGGER_BYTES: u64 = 64 << 20;
 
 fn env_u64(key: &str, default: u64) -> u64 {
