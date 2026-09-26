@@ -1249,6 +1249,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The overlay is reused across lone transactions to avoid rescanning the
+    /// WAL. A stale entry from an earlier transaction must never shadow a value
+    /// written directly to the pool afterwards.
+    #[test]
+    fn reused_overlay_does_not_shadow_a_later_direct_write() {
+        let root = test_root("overlay_reuse_shadow");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x71; 16];
+        let first = db.begin_transaction();
+        first
+            .put(ShardType::EventDag, collection, node(1), &data(b"old"))
+            .unwrap();
+        first.commit().unwrap();
+        db.pool(ShardType::EventDag)
+            .put(&collection, &node(1), &data(b"new"))
+            .unwrap();
+        let second = db.begin_transaction();
+        second
+            .put(ShardType::EventDag, collection, node(2), &data(b"other"))
+            .unwrap();
+        second.commit().unwrap();
+        assert_eq!(
+            live_get(&db, ShardType::EventDag, collection, node(1)),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            live_get(&db, ShardType::EventDag, collection, node(2)),
+            Some(b"other".to_vec())
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn transaction_commit_applies_and_publishes_once() {
         let root = test_root("transaction_commit");

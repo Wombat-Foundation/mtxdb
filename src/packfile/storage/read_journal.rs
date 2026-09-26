@@ -777,7 +777,24 @@ impl PackfileStorage {
         pool: crate::layout::ShardType,
     ) -> Result<(), StorageError> {
         let covered = Self::read_journal_lsn(&self.base_dir);
-        let mut overlay = ReadJournal::empty(path.to_path_buf(), covered, Some(pool));
+        // Keep the previous overlay's scan position and tail fingerprint, and
+        // drop only its entries. Every earlier transaction is fully
+        // materialized (no user held the overlay), so those entries are in the
+        // writer's index and would only shadow newer direct writes; but the
+        // position lets this refresh scan just the groups appended since, not
+        // the whole segment from the checkpoint. A reclaimed or replaced
+        // segment fails the length and fingerprint checks and rebuilds.
+        let mut overlay = match self.read_journal.lock().take() {
+            Some(mut previous)
+                if previous.pool == Some(pool) && previous.path.as_path() == path =>
+            {
+                previous.puts.clear();
+                previous.delete_lsn.clear();
+                previous.covered = covered;
+                previous
+            }
+            _ => ReadJournal::empty(path.to_path_buf(), covered, Some(pool)),
+        };
         // The writer's index already holds everything it applied, so accept a
         // reclaimed prefix instead of treating it as a gap. A fresh overlay has
         // observed nothing and accepts the prefix, so the only outcome besides
