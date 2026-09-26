@@ -65,10 +65,14 @@ impl FileStamp {
 const QUIET_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The stamp of `meta`, when the platform exposes a reliable file identity.
+/// Inode 0 is not a real identity (some filesystems report it for every file),
+/// so it yields no stamp.
 #[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
 fn file_stamp(meta: &fs::Metadata) -> Option<FileStamp> {
     use std::os::unix::fs::MetadataExt;
+    if meta.ino() == 0 {
+        return None;
+    }
     Some(FileStamp {
         dev: meta.dev(),
         ino: meta.ino(),
@@ -162,6 +166,10 @@ pub(super) struct ReadJournal {
     /// Test-only count of window reads, to show the fingerprint skips them.
     #[cfg(test)]
     pub(super) tail_reads: u64,
+    /// Test-only switch that makes every stamp absent, as on a platform without
+    /// inode numbers, to exercise the no-identity path on unix.
+    #[cfg(test)]
+    pub(super) force_no_identity: bool,
     /// Test-only count of descriptor opens used to record the tail.
     #[cfg(test)]
     pub(super) tail_opens: u64,
@@ -198,6 +206,8 @@ impl ReadJournal {
             tail_quiet: false,
             #[cfg(test)]
             tail_reads: 0,
+            #[cfg(test)]
+            force_no_identity: false,
             #[cfg(test)]
             tail_opens: 0,
             #[cfg(test)]
@@ -267,7 +277,12 @@ impl ReadJournal {
             return self.observed_lsn > 0;
         };
         let mut unchanged_stamp = None;
-        match (stamp, self.tail_stamp) {
+        // With a real identity the descriptor held since recording still names
+        // the file the overlay was built from. Without one (a platform that
+        // reports no inode numbers) a replaced file cannot be told apart by
+        // inode, so the path is opened afresh and what is there now is compared.
+        let fresh;
+        let file = match (stamp, self.tail_stamp) {
             (Some(now), Some(then)) => {
                 if !now.same_file(then) {
                     return true;
@@ -280,12 +295,21 @@ impl ReadJournal {
                 if now == then {
                     unchanged_stamp = Some(now);
                 }
+                let Some(held) = &self.tail_file else {
+                    return true;
+                };
+                held
             }
-            (None, None) => {}
+            (None, None) => {
+                let Ok(opened) = File::open(&self.path) else {
+                    return true;
+                };
+                fresh = opened;
+                &fresh
+            }
+            // An identity that appeared or vanished since recording means the
+            // file is not the one the overlay was built from.
             _ => return true,
-        }
-        let Some(file) = &self.tail_file else {
-            return true;
         };
         #[cfg(test)]
         {
@@ -335,6 +359,10 @@ impl ReadJournal {
     /// rescans from the start instead of trusting the prefix.
     fn record_observed_tail(&mut self, scanned: Option<FileStamp>, consumed: &[u8]) {
         let mut window = self.observed_tail.take().unwrap_or_default();
+        // A stamp exists only where the platform reports a reliable file
+        // identity, so a `Some` pair means the held descriptor can be trusted
+        // to name the same file. With no identity there is no descriptor to
+        // reuse and none is ever held.
         let reusable = match (scanned, self.tail_stamp) {
             (Some(now), Some(then)) => now.same_file(then),
             _ => false,
@@ -366,8 +394,12 @@ impl ReadJournal {
         if expected_len == 0 || window.len() != expected_len {
             return;
         }
-        let file = if let Some(file) = held {
-            file
+        // Without an identity no descriptor is kept: later comparisons open the
+        // path afresh (see `observed_tail_changed`).
+        let file = if scanned.is_none() {
+            None
+        } else if let Some(file) = held {
+            Some(file)
         } else {
             #[cfg(test)]
             {
@@ -382,10 +414,10 @@ impl ReadJournal {
                     return;
                 }
             }
-            file
+            Some(file)
         };
         self.observed_tail = Some(window);
-        self.tail_file = Some(file);
+        self.tail_file = file;
         self.tail_quiet = scanned.is_some_and(FileStamp::is_quiet);
         self.tail_stamp = scanned;
     }
@@ -422,6 +454,8 @@ impl ReadJournal {
             }
             Err(error) => return Err(StorageError::Io(error)),
         };
+        #[cfg(test)]
+        let stamp = if self.force_no_identity { None } else { stamp };
         // Length alone cannot show that the consumed prefix is unchanged, so
         // check the bytes that ended it first. On a change, drop everything and
         // rebuild: a full rescan is gap-checked like any other reset below.
@@ -967,6 +1001,131 @@ mod tests {
         assert_eq!(overlay.tail_reads, 1, "one verifying read, then trusted");
         assert!(overlay.tail_quiet);
         assert_eq!(overlay.tail_resets, 0);
+    }
+
+    /// On a platform without inode numbers a replaced file cannot be told apart
+    /// by identity, and the persistent descriptor would keep naming the old
+    /// file. The overlay must then compare what is at the path now: a
+    /// same-length replacement on a new inode with different content is caught,
+    /// and no descriptor is held. `force_no_identity` stands in for such a
+    /// platform on unix.
+    #[test]
+    fn without_a_file_identity_a_replacement_is_caught_by_content() {
+        let wal = temp_wal("no_identity_replace");
+        let keep_len = write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.force_no_identity = true;
+        overlay.refresh(true).unwrap();
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+        assert!(overlay.tail_stamp.is_none(), "no stamp without an identity");
+        assert!(overlay.tail_file.is_none(), "no descriptor may be held");
+        assert_eq!(
+            overlay.tail_opens, 0,
+            "recording must not open a descriptor"
+        );
+        assert_eq!(
+            overlay.tail_opens, 0,
+            "no-identity recording opens no handle"
+        );
+
+        // Build the same-length replacement beside the segment and rename it
+        // over the original, so the path now names a different inode.
+        let replacement = wal.with_extension("replacement");
+        fs::copy(&wal, &replacement).unwrap();
+        restart_with_reissued_lsn(&replacement, keep_len);
+        fs::rename(&replacement, &wal).unwrap();
+
+        overlay.refresh(true).unwrap();
+        assert_eq!(value(&overlay), Some(b"fresh-".to_vec()));
+        assert_eq!(overlay.tail_resets, 1);
+        assert_eq!(
+            overlay.tail_opens, 0,
+            "no-identity refreshes do not retain opens"
+        );
+    }
+
+    /// Without a file identity an in-place same-length rewrite (same inode,
+    /// new content) is caught by the same fresh-handle comparison.
+    #[test]
+    fn without_a_file_identity_an_in_place_rewrite_is_caught_by_content() {
+        let wal = temp_wal("no_identity_rewrite");
+        let keep_len = write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.force_no_identity = true;
+        overlay.refresh(true).unwrap();
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+        let len_before = fs::metadata(&wal).unwrap().len();
+
+        restart_with_reissued_lsn(&wal, keep_len);
+        assert_eq!(fs::metadata(&wal).unwrap().len(), len_before);
+        overlay.refresh(true).unwrap();
+        assert_eq!(value(&overlay), Some(b"fresh-".to_vec()));
+        assert_eq!(overlay.tail_resets, 1);
+        assert_eq!(overlay.tail_opens, 0);
+    }
+
+    /// An identity that disappears between recording and refresh (a stamp was
+    /// recorded, none is available now) means the file is not known to be the
+    /// one the overlay was built from, so the overlay is rebuilt. The reverse
+    /// flip is handled by the same arm.
+    #[test]
+    fn a_stamp_that_vanishes_between_refreshes_forces_a_rebuild() {
+        let wal = temp_wal("identity_flip");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        if overlay.tail_stamp.is_none() {
+            eprintln!("skipped: this platform records no file identity");
+            return;
+        }
+        overlay.force_no_identity = true;
+        overlay.refresh(true).unwrap();
+        assert_eq!(overlay.tail_resets, 1);
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+        assert!(
+            overlay.tail_stamp.is_none(),
+            "the rebuild records without an identity"
+        );
+    }
+
+    /// Without a file identity an unchanged segment is not rebuilt: the window
+    /// is compared through a fresh handle each refresh and matches.
+    #[test]
+    fn without_a_file_identity_an_unchanged_segment_is_not_rebuilt() {
+        let wal = temp_wal("no_identity_unchanged");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.force_no_identity = true;
+        overlay.refresh(true).unwrap();
+        for _ in 0..10 {
+            overlay.refresh(true).unwrap();
+        }
+        assert_eq!(overlay.tail_resets, 0);
+        assert_eq!(overlay.tail_opens, 0, "no descriptor is ever kept");
+        assert_eq!(overlay.tail_reads, 10, "one comparison per refresh");
+        assert_eq!(
+            overlay.tail_opens, 0,
+            "no-identity refreshes do not retain opens"
+        );
+        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+    }
+
+    /// Losing a previously available identity must force a comparison rather
+    /// than trusting the descriptor recorded while identity was available.
+    #[test]
+    #[cfg(unix)]
+    fn identity_disappearing_forces_a_tail_rebuild() {
+        let wal = temp_wal("identity_disappears");
+        write_two_groups(&wal);
+        let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
+        overlay.refresh(true).unwrap();
+        assert!(overlay.tail_stamp.is_some());
+
+        overlay.force_no_identity = true;
+        overlay.refresh(true).unwrap();
+        assert_eq!(overlay.tail_resets, 1);
+        assert!(overlay.tail_stamp.is_none());
+        assert!(overlay.tail_file.is_none());
     }
 
     /// State-model test, not a real recording: the stamp is flipped to
