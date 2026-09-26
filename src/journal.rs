@@ -5738,7 +5738,10 @@ mod tests {
             "stop must flush the final pending group"
         );
         assert!(!coordinator.has_background_committer());
-        assert!(coordinator.background_commits() >= 1);
+        wait_until(
+            || coordinator.background_commits() >= 1,
+            "background commit to be counted after stop",
+        );
         fs::remove_file(coordinator.path()).unwrap();
     }
 
