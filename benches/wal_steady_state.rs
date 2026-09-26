@@ -14,7 +14,9 @@
 //!
 //! Env knobs: `MTXDB_WS_ROUNDS` (default 120), `MTXDB_WS_COMMITS` (per round,
 //! default 200), `MTXDB_WS_BATCH` (records per commit, default 20),
-//! `MTXDB_WS_PAYLOAD` (default 256), `MTXDB_BENCH_ROOT`.
+//! `MTXDB_WS_PAYLOAD` (default 256), `MTXDB_WS_PACK_BUDGET_MB` (unsynced pack
+//! MiB at which a sync also fsyncs the packs; default the library's, 0 disables),
+//! `MTXDB_BENCH_ROOT`.
 
 use std::time::{Duration, Instant};
 
@@ -57,6 +59,15 @@ fn main() {
     let _ = std::fs::remove_dir_all(&root);
 
     let db = SharedDatabase::open(root.clone()).expect("open shared database");
+    let pack_budget = std::env::var("MTXDB_WS_PACK_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb << 20);
+    if let Some(bytes) = pack_budget {
+        for pool in ShardType::ALL {
+            db.pool(pool).set_pack_fsync_budget(bytes);
+        }
+    }
     let wal = db.layout().shared_wal_path();
     let wal_len = || std::fs::metadata(&wal).expect("stat wal").len();
     let data = NodeData::from_slice(&vec![0x5a; payload]);
@@ -64,7 +75,10 @@ fn main() {
     let mut next = 0u64;
     let mut delta_syncs = Vec::new();
     let mut peak = 0u64;
-    println!("rounds={rounds} commits/round={commits} batch={batch} payload={payload}");
+    println!(
+        "rounds={rounds} commits/round={commits} batch={batch} payload={payload} pack_budget={}",
+        pack_budget.map_or_else(|| "default".to_owned(), |bytes| format!("{} MiB", bytes >> 20))
+    );
     for round in 0..rounds {
         for _ in 0..commits {
             let txn = db.begin_transaction();

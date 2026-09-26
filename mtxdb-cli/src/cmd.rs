@@ -4667,13 +4667,14 @@ fn meta_deltas(root: &Path, report: &mut MetaReport, limit: usize, offset: usize
             }
             if let Some(log) = mtxdb::index::delta::read_delta_log_v3(&path) {
                 report.line(format!(
-                "delta {} epoch={fingerprint:#x}: v3 operations={} base={:#x} tail={:#x} committed_len={} torn_tail={}",
+                "delta {} epoch={fingerprint:#x}: v3 operations={} base={:#x} tail={:#x} committed_len={} torn_tail={} coverage={}",
                 path.display(),
                 log.operations.len(),
                 log.base_fingerprint,
                 log.tail_fingerprint,
                 log.file_len,
-                log.torn_tail
+                log.torn_tail,
+                log.coverage.map_or_else(|| "none".to_owned(), |lsn| lsn.to_string())
             ));
                 if log.torn_tail {
                     report.finding(
@@ -4746,6 +4747,9 @@ fn format_delta_operation(operation: &mtxdb::index::delta::DeltaOperation) -> St
             hex::encode(collection_id),
             generation
         ),
+        DeltaOperation::Coverage { covered_lsn } => {
+            format!("kind=coverage covered_lsn={covered_lsn}")
+        }
     }
 }
 

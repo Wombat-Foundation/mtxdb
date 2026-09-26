@@ -1288,6 +1288,17 @@ struct DeltaLogState {
     /// Wire version of the active on-disk epoch. A v2 epoch is read for
     /// compatibility but is rebased to v3 before any further writes.
     log_version: u8,
+    /// The `pack_id`s of the packs the checkpoint of this epoch recorded in its
+    /// pack table. Every slot a delta operation of this epoch names resolves
+    /// through that table, so only while every live pack is in it can a reader
+    /// apply the log; a pack created since forces a full checkpoint instead of a
+    /// delta coverage batch.
+    base_pack_ids: HashSet<u64>,
+    /// Bytes of the on-disk log an fsync has covered. Ordinary delta batches are
+    /// not fsynced (the log is rebuildable acceleration), so without this a
+    /// coverage batch, which must be durable, would pay for every batch written
+    /// since the epoch began in one fsync.
+    log_synced_bytes: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1303,6 +1314,20 @@ struct V3PendingBatch {
     order_updates: Vec<([u8; 16], u64)>,
     next_order_key: u64,
 }
+
+/// Written-but-unsynced pack bytes at which a sync with a journal enabled also
+/// fsyncs the dirty packs. With a journal, a sync only has to fsync the WAL, so
+/// pack data would otherwise pile up unsynced until the next checkpoint and be
+/// flushed all at once there, under the collection locks. Fsyncing it in slices
+/// as it accumulates keeps that burst small. Zero disables it.
+pub const DEFAULT_PACK_FSYNC_BUDGET_BYTES: u64 = 8 << 20;
+
+/// Unsynced delta-log bytes at which an ordinary delta batch also fsyncs the
+/// log. A coverage batch must be durable, and its fsync covers everything
+/// written to the log before it, so leaving the backlog to it would make the
+/// batch that lets the journal be reclaimed pay for the whole epoch at once.
+/// Zero disables it.
+pub const DEFAULT_DELTA_FSYNC_BUDGET_BYTES: u64 = 1 << 20;
 
 /// A content-addressed packfile storage engine backed by a global shard pool.
 ///
@@ -1438,6 +1463,12 @@ pub struct PackfileStorage {
     /// because no usable delta base exists or a v3 append failed. Zero disables this half of the
     /// rewrite budget. See [`Self::set_checkpoint_rewrite_budget`].
     checkpoint_rewrite_min_interval_ns: AtomicU64,
+    /// Written-but-unsynced pack bytes at which a journal-mode sync also fsyncs
+    /// the dirty packs (0 disables). See [`Self::set_pack_fsync_budget`].
+    pack_fsync_budget_bytes: AtomicU64,
+    /// Unsynced delta-log bytes at which a delta batch also fsyncs the log
+    /// (0 disables). See [`DEFAULT_DELTA_FSYNC_BUDGET_BYTES`].
+    delta_fsync_budget_bytes: AtomicU64,
     /// Maximum `put_bytes + put_many_bytes` accumulated since the last full
     /// checkpoint rewrite before one is forced even inside the time interval.
     /// Zero disables this half of the budget.
@@ -1679,6 +1710,12 @@ pub struct PackfileStorage {
     // build configurations share one open path, but never reads it back.
     #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     read_covered_lsn: AtomicU64,
+    /// The journal LSN this pool's packs are known to durably cover, so a reopen
+    /// need not replay at or below it. Read from disk once at open
+    /// ([`Self::read_journal_lsn`]) and advanced by whatever makes more of the
+    /// journal safe to drop: a checkpoint's `journal.lsn` write, or a coverage
+    /// batch appended to the delta log. It only ever moves forward.
+    durable_coverage: AtomicU64,
     /// Successful checkpoint-bound index reloads triggered by the
     /// read-committed overlay, because a writer's reclaim outran the coverage
     /// this handle's index incorporated. A WAL-cell failure on the reload path
@@ -2184,6 +2221,7 @@ impl PackfileStorage {
                 cache_capacity,
                 delta_state,
                 checkpoint_covered,
+                read_covered,
             );
             timings.total = started.elapsed();
             *store.last_open_timings.lock() = Some(timings);
@@ -2281,6 +2319,7 @@ impl PackfileStorage {
             // can continue anything the checkpoint recorded; force the next
             // dirty sync into a full checkpoint rewrite that re-bases the log.
             DeltaLogState::default(),
+            read_covered,
             read_covered,
         );
         // A writer that had to rescan has no checkpoint describing this pack
@@ -2393,6 +2432,7 @@ impl PackfileStorage {
         cache_capacity: usize,
         delta_state: DeltaLogState,
         read_covered: u64,
+        durable_coverage: u64,
     ) -> Self {
         let index_config = crate::index::IndexConfig {
             seed: shards.bucket_seed(),
@@ -2463,6 +2503,7 @@ impl PackfileStorage {
             #[cfg(all(test, feature = "multi-reader"))]
             transaction_overlay_scanned: AtomicU64::new(0),
             read_covered_lsn,
+            durable_coverage: AtomicU64::new(durable_coverage),
             read_reloads: AtomicU64::new(0),
             read_reload_failures: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
@@ -2474,6 +2515,8 @@ impl PackfileStorage {
             pending_publish_since: parking_lot::Mutex::new(None),
             publish_generation: AtomicU64::new(0),
             checkpoint_rewrite_min_interval_ns: AtomicU64::new(0),
+            pack_fsync_budget_bytes: AtomicU64::new(DEFAULT_PACK_FSYNC_BUDGET_BYTES),
+            delta_fsync_budget_bytes: AtomicU64::new(DEFAULT_DELTA_FSYNC_BUDGET_BYTES),
             checkpoint_rewrite_max_bytes: AtomicU64::new(0),
             last_checkpoint_rewrite_at: parking_lot::Mutex::new(None),
             checkpoint_bytes_at_last_rewrite: AtomicU64::new(0),
@@ -2567,16 +2610,61 @@ impl PackfileStorage {
             .map_err(StorageError::Io)?;
         fs::rename(&tmp, &path).map_err(StorageError::Io)?;
         let _ = crate::shard::sync_directory(&self.base_dir);
+        self.durable_coverage.fetch_max(lsn, Ordering::AcqRel);
         Ok(())
     }
 
-    /// The journal LSN the on-disk checkpoint covers (0 when none is recorded).
+    /// The journal LSN this pool's durable state covers (0 when none is
+    /// recorded): the newest of the `journal.lsn` a checkpoint wrote, the
+    /// coverage the checkpoint's own header records, and what a committed batch
+    /// of the delta log that continues the current checkpoint claims.
+    ///
+    /// A missing, torn or corrupt record of either kind claims nothing, so the
+    /// result can only be lower than the truth, which makes recovery replay
+    /// more, never less. It reads the disk (and scans the delta log), so a
+    /// writer uses [`Self::durable_coverage`] instead.
     pub fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
-        fs::read(Self::journal_lsn_path(base_dir))
+        let recorded = fs::read(Self::journal_lsn_path(base_dir))
             .ok()
             .and_then(|bytes| bytes.get(..8).map(<[u8; 8]>::try_from))
             .and_then(Result::ok)
-            .map_or(0, u64::from_le_bytes)
+            .map_or(0, u64::from_le_bytes);
+        recorded.max(Self::checkpoint_and_delta_coverage(base_dir))
+    }
+
+    /// The coverage the checkpoint on disk records, or that a committed batch
+    /// of the delta log continuing it claims, whichever is newer; 0 when there
+    /// is neither. The log only counts if it names that checkpoint's
+    /// fingerprint; a stale epoch left by a crash is inert.
+    ///
+    /// Reading the checkpoint's own record matters: a new checkpoint retires
+    /// the delta epoch that held the newest claim, and `journal.lsn` is written
+    /// only after the checkpoint is durable, so for a moment the checkpoint's
+    /// header is the only place that coverage is written down.
+    fn checkpoint_and_delta_coverage(base_dir: &std::path::Path) -> u64 {
+        let Ok(Some(summary)) = crate::index::checkpoint::read_checkpoint_summary(
+            &Self::index_checkpoint_path(base_dir),
+        ) else {
+            return 0;
+        };
+        let from_log = match delta::read_delta_tail_fingerprint(&Self::delta_path(
+            base_dir,
+            summary.fingerprint,
+        )) {
+            Ok(Some(tail)) if tail.base_fingerprint == summary.fingerprint => {
+                tail.coverage.unwrap_or(0)
+            }
+            _ => 0,
+        };
+        summary.covered_lsn.max(from_log)
+    }
+
+    /// The journal LSN this pool's packs are known to durably cover, held in
+    /// memory. What [`Self::read_journal_lsn`] said at open, moved forward by
+    /// every checkpoint and coverage batch this handle wrote since.
+    #[must_use]
+    pub fn durable_coverage(&self) -> u64 {
+        self.durable_coverage.load(Ordering::Acquire)
     }
 
     /// Remove every on-disk delta-log epoch file except `keep` (pass `None`
@@ -2771,6 +2859,11 @@ impl PackfileStorage {
         // to the rescan — never a partial replay.
         let mut replay_frames: Vec<DeltaFrame> = Vec::new();
         let mut replay_operations = Vec::new();
+        // The journal coverage the applied part of the delta log claims. A
+        // coverage batch lets the journal be reclaimed past the checkpoint's own
+        // coverage, so the index built here is only complete up to the claim if
+        // the operations the claim describes were applied.
+        let mut log_coverage: Option<u64> = None;
         // A checkpoint with no surviving delta log is a valid base for the
         // current v3 writer. Only an actual v2 log needs a one-time rebase.
         let mut replay_log_version = 3;
@@ -2787,6 +2880,7 @@ impl PackfileStorage {
                     return None;
                 }
                 log_bytes_on_disk = log.file_len;
+                log_coverage = log.coverage;
                 replay_operations = log.operations;
                 replay_log_version = 3;
             } else {
@@ -2819,6 +2913,27 @@ impl PackfileStorage {
             timings.delta_replay_operations = u64::try_from(replay_operations.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(u64::try_from(replay_frames.len()).unwrap_or(u64::MAX));
+        } else if reload_mode == ReloadMode::JournalBound {
+            // A read-journal reload skips the exact-pack gate (the writer keeps
+            // appending), but it must still see the index changes a coverage
+            // batch describes, or a reclaim past the checkpoint's coverage would
+            // leave records that are in neither the index nor the journal. Take
+            // the delta operations up to the last coverage claim. Every one of
+            // them was written after the packs they name were durable, and the
+            // writer only appends coverage while every live pack is in this
+            // checkpoint's pack table, so their slots translate below; if one
+            // does not, the load fails closed like any other bad slot.
+            let delta_started = std::time::Instant::now();
+            if let Some(mut log) = delta::read_delta_log_v3(&delta_path) {
+                if log.base_fingerprint == checkpoint.fingerprint && log.coverage_prefix_ops > 0 {
+                    log.operations.truncate(log.coverage_prefix_ops);
+                    log_coverage = log.coverage;
+                    replay_operations = log.operations;
+                    timings.delta_replay_operations =
+                        u64::try_from(replay_operations.len()).unwrap_or(u64::MAX);
+                }
+            }
+            timings.delta_replay = delta_started.elapsed();
         }
 
         // Group the (gated) frames by target collection once, so the
@@ -2934,6 +3049,9 @@ impl PackfileStorage {
                     snapshot_indexes.remove(&collection_id);
                     v3_tombstones.insert(collection_id);
                 }
+                // A coverage claim changes no index state; it is read
+                // separately (see `durable_coverage_from_disk`).
+                DeltaOperation::Coverage { .. } => {}
             }
         }
 
@@ -3160,10 +3278,21 @@ impl PackfileStorage {
                 .map_or(0, |last| last.saturating_add(1)),
             base_order: live_order,
             log_bytes: log_bytes_on_disk,
+            // What was on disk at open is treated as durable; only what this
+            // session appends is owed an fsync.
+            log_synced_bytes: log_bytes_on_disk,
             log_version: replay_log_version,
+            base_pack_ids: checkpoint
+                .pack_table
+                .iter()
+                .map(|&(_, pack_id)| pack_id)
+                .collect(),
             ..DeltaLogState::default()
         };
 
+        // The index holds the checkpoint plus the operations of the log that were
+        // applied, so it covers whatever those describe as well.
+        let covered_lsn = covered_lsn.max(log_coverage.unwrap_or(0));
         Some((scan_out, collection_order, delta_state, covered_lsn))
     }
 
@@ -3958,7 +4087,7 @@ impl PackfileStorage {
             };
             #[cfg(not(feature = "multi-reader"))]
             let committed = journal.committed_lsn();
-            committed.max(Self::read_journal_lsn(&self.base_dir))
+            committed.max(self.durable_coverage())
         })
     }
 
@@ -3990,6 +4119,14 @@ impl PackfileStorage {
     fn persist_index_checkpoint(&self) -> Result<(), StorageError> {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        // With a journal, this checkpoint must make the packs durable before it
+        // records coverage, and it does so below with every collection locked,
+        // which stalls every writer for as long as the fsync takes. Do the bulk
+        // of that here first, with no lock held: the fsync under the locks then
+        // only covers what was written since.
+        if self.journal().is_some() {
+            self.shards.sync_dirty()?;
         }
         // Epoch-handoff protocol: hold every collection's put_mutex only
         // across the snapshot + epoch rotation below (same sorted-lock
@@ -4093,6 +4230,8 @@ impl PackfileStorage {
         // checkpoint (C1) is durable; every collection's writers already
         // target the new epoch (D1) by the time the locks drop next.
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        self.delta_state.lock().base_pack_ids =
+            pack_table.iter().map(|&(_, pack_id)| pack_id).collect();
         // Every collection's put mutex is held here, so no `put` is mid-flight
         // and every mutation published so far has completed its index update.
         // The recorded LSN must be *committed*, not merely published: a
@@ -4107,7 +4246,6 @@ impl PackfileStorage {
         // frames, which this checkpoint does not materialize. Record this
         // pool's own committed watermark instead, so its coverage and the
         // reclaim floor both describe only frames this index holds.
-        let journal_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
         let wal_lsn = self.checkpoint_covered_lsn();
         drop(guards);
         // `create_guard` is deliberately NOT dropped here, unlike the
@@ -4165,31 +4303,7 @@ impl PackfileStorage {
         // correctness (the checkpoint is already durable).
         if let Some(lsn) = wal_lsn {
             self.write_journal_lsn(lsn)?;
-            if let Some(journal) = self.journal() {
-                match journal_pool {
-                    // A per-pool segment holds only this pool's frames, so this
-                    // checkpoint covers everything at or below `lsn` and the
-                    // segment can drop that prefix.
-                    None => {
-                        if let Err(error) = journal.reclaim_through(lsn) {
-                            eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
-                        }
-                    }
-                    // A shared segment also holds other pools' frames. Record
-                    // this pool's coverage and reclaim only up to the minimum
-                    // across every pool that has frames in the segment, so no
-                    // pool's frames are dropped before they are materialized.
-                    #[cfg(feature = "multi-reader")]
-                    Some(pool) => {
-                        journal.report_pool_coverage(pool, lsn);
-                        if let Err(error) = journal.reclaim_shared() {
-                            eprintln!("warning: shared journal reclaim failed: {error}");
-                        }
-                    }
-                    #[cfg(not(feature = "multi-reader"))]
-                    Some(_) => unreachable!("shared journal state requires multi-reader"),
-                }
-            }
+            self.report_coverage_and_reclaim(lsn);
         }
         self.retire_delta_epoch(old_base_fingerprint);
         // The unlocked serialize/write window above let concurrent puts land
@@ -4274,6 +4388,7 @@ impl PackfileStorage {
         state.next_order_key = u64::try_from(snapshots.len()).unwrap_or(u64::MAX);
         state.pending.clear();
         state.log_bytes = 0;
+        state.log_synced_bytes = 0;
         state.log_version = 3;
         old_base_fingerprint
     }
@@ -4428,7 +4543,7 @@ impl PackfileStorage {
     /// continued; otherwise a fresh header pins `base_fingerprint` (the
     /// checkpoint the frames extend) for the reopen replay gate.
     fn append_index_delta(&self) -> Result<(), StorageError> {
-        self.append_index_delta_v3()
+        self.append_index_delta_v3(false).map(|_| ())
     }
 
     fn build_v3_pending_batch(
@@ -4516,6 +4631,7 @@ impl PackfileStorage {
         base_fingerprint: u64,
         operations: &[DeltaOperation],
         tail_fingerprint: u64,
+        durable: bool,
     ) -> Result<(), StorageError> {
         let path = Self::delta_path(&self.base_dir, base_fingerprint);
         let on_disk_len = fs::metadata(&path)
@@ -4558,24 +4674,57 @@ impl PackfileStorage {
                 "v3 delta log cap reached",
             )));
         }
-        let bytes_written = delta::append_v3_batch(
+        let bytes_written = delta::append_v3_batch_with_durability(
             &path,
             write_header,
             base_fingerprint,
             operations,
             tail_fingerprint,
+            durable,
         )
         .map_err(StorageError::Io)?;
         state.log_bytes = state
             .log_bytes
             .saturating_add(u64::try_from(bytes_written).unwrap_or(u64::MAX));
+        if durable {
+            state.log_synced_bytes = state.log_bytes;
+        } else {
+            // Pay for the log's durability in slices as it grows. Best effort:
+            // the log is acceleration, and a coverage batch fsyncs it again.
+            let budget = self.delta_fsync_budget_bytes.load(Ordering::Relaxed);
+            if budget != 0 && state.log_bytes.saturating_sub(state.log_synced_bytes) >= budget {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.sync_data())
+                {
+                    Ok(()) => state.log_synced_bytes = state.log_bytes,
+                    Err(error) => eprintln!("mtxdb: delta log fsync failed: {error}"),
+                }
+            }
+        }
         Ok(())
     }
 
     /// Append v3 operations. Collection locks pin every live index
     /// and the collection-creation lock prevents an unrepresented collection
     /// from appearing between pack flush and snapshot capture.
-    fn append_index_delta_v3(&self) -> Result<(), StorageError> {
+    ///
+    /// With `with_coverage` the batch also carries a claim that the packs
+    /// durably cover this pool's journal frames through the returned LSN, so
+    /// the journal can be reclaimed without a full checkpoint. The ordering that
+    /// makes the claim true: with every collection locked (so no put is
+    /// mid-flight and everything published for this pool has been applied) the
+    /// LSN is captured and every pack is fsynced, and only then is the batch,
+    /// claim last, appended and fsynced. A crash before the batch is durable
+    /// leaves no claim; a torn batch fails its CRC and claims nothing.
+    fn append_index_delta_v3(&self, with_coverage: bool) -> Result<Option<u64>, StorageError> {
+        if with_coverage {
+            // Make the bulk of the pack bytes durable before any lock is taken;
+            // the fsync under the locks below then only covers what was written
+            // since.
+            self.shards.sync_dirty()?;
+        }
         let create_guard = self.collection_creation.write();
         let mut ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         {
@@ -4591,6 +4740,16 @@ impl PackfileStorage {
         // before these locks were acquired. Flush again while the snapshot set
         // is stable so the tail fingerprint covers every serialized slot.
         self.shards.flush_all()?;
+        let covered = if with_coverage {
+            let covered = self.checkpoint_covered_lsn();
+            // Everything up to `covered` is applied and flushed; make it durable
+            // before claiming it. `sync_all`, not `sync_dirty`: a claim must not
+            // rest on a dirty bit some other syncer cleared.
+            self.shards.sync_all()?;
+            covered
+        } else {
+            None
+        };
         let tail_fingerprint = self.current_pack_fingerprint();
 
         // Copy the small state-machine metadata, then release its mutex while
@@ -4608,7 +4767,7 @@ impl PackfileStorage {
                 "v3 delta append without a clean v3 checkpoint base",
             )));
         }
-        if snapshot_state.pending.is_empty() {
+        if snapshot_state.pending.is_empty() && covered.is_none() {
             return Err(StorageError::Io(std::io::Error::other(
                 "v3 delta append with no pending operations",
             )));
@@ -4616,7 +4775,7 @@ impl PackfileStorage {
 
         let batch = self.build_v3_pending_batch(&snapshot_state)?;
         let V3PendingBatch {
-            operations,
+            mut operations,
             generation_updates,
             order_updates,
             next_order_key,
@@ -4632,7 +4791,18 @@ impl PackfileStorage {
                 "v3 delta state changed while snapshot batch was prepared",
             )));
         }
-        self.write_v3_delta_batch(&mut state, base_fingerprint, &operations, tail_fingerprint)?;
+        // The claim is the batch's last operation, so a reader that applies the
+        // operations up to it holds exactly the index the claim describes.
+        if let Some(covered_lsn) = covered {
+            operations.push(DeltaOperation::Coverage { covered_lsn });
+        }
+        self.write_v3_delta_batch(
+            &mut state,
+            base_fingerprint,
+            &operations,
+            tail_fingerprint,
+            covered.is_some(),
+        )?;
         for (collection_id, generation) in generation_updates {
             if generation == 0 {
                 state.base_generations.remove(&collection_id);
@@ -4650,7 +4820,12 @@ impl PackfileStorage {
         drop(state);
         drop(guards);
         drop(create_guard);
-        Ok(())
+        if let Some(covered_lsn) = covered {
+            // The batch is durable, so the claim is too.
+            self.durable_coverage
+                .fetch_max(covered_lsn, Ordering::AcqRel);
+        }
+        Ok(covered)
     }
 
     /// Best-effort wrapper around [`Self::persist_index_checkpoint`] — logs
@@ -7666,6 +7841,9 @@ impl StorageEngine for PackfileStorage {
             self.count_sync_persistence(&timings);
         }
         *self.last_sync_timings.lock() = Some(timings);
+        if result.is_ok() {
+            self.remediate_lagging_pools();
+        }
         result
     }
 
@@ -7902,6 +8080,9 @@ impl PackfileStorage {
             self.count_sync_persistence(&timings);
         }
         *self.last_sync_timings.lock() = Some(timings);
+        if result.is_ok() {
+            self.remediate_lagging_pools();
+        }
         result
     }
 
@@ -7965,6 +8146,24 @@ impl PackfileStorage {
         );
         self.checkpoint_rewrite_max_bytes
             .store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// Set how many written-but-unsynced pack bytes make a journal-mode sync also
+    /// fsync the dirty packs; zero disables it and leaves pack fsyncs to the
+    /// checkpoint. This only schedules fsyncs earlier: coverage still comes from
+    /// the checkpoint's own fsync of every shard, so it never claims pack data
+    /// the packs have not made durable.
+    pub fn set_pack_fsync_budget(&self, bytes: u64) {
+        self.pack_fsync_budget_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Set how many unsynced delta-log bytes make a delta batch also fsync the
+    /// log; zero disables it. Like the pack budget it only schedules an fsync
+    /// earlier, so a later coverage batch, which is always fsynced, pays for
+    /// less.
+    pub fn set_delta_fsync_budget(&self, bytes: u64) {
+        self.delta_fsync_budget_bytes
+            .store(bytes, Ordering::Relaxed);
     }
 
     /// Route durability through a write-ahead journal at `path`.
@@ -8073,7 +8272,7 @@ impl PackfileStorage {
             .lock()
             .clone_from(&journal.recovered_groups());
         self.journal_pool.store(pool_tag(pool), Ordering::Release);
-        journal.report_pool_coverage(pool, Self::read_journal_lsn(&self.base_dir));
+        journal.report_pool_coverage(pool, self.durable_coverage());
         *slot = Some(journal);
         Ok(())
     }
@@ -8096,7 +8295,7 @@ impl PackfileStorage {
         if self.journal().is_none() {
             return Ok(0);
         }
-        let covered = Self::read_journal_lsn(&self.base_dir);
+        let covered = self.durable_coverage();
         let groups = self.journal_recovery.lock().clone();
         self.replaying.store(true, Ordering::SeqCst);
         let result = (|| -> Result<u64, StorageError> {
@@ -8412,6 +8611,16 @@ impl PackfileStorage {
             timings.journal_waiters = u64::from(journal_timings.journal_waiter);
             timings.journal_coalesced = u64::from(journal_timings.journal_coalesced);
             timings.journal_in_flight = journal_timings.journal_in_flight;
+            // The WAL is durable, so the packs are only owed for the checkpoint.
+            // Pay that in slices, outside every collection lock, once enough has
+            // accumulated, instead of all at once at the checkpoint.
+            let budget = self.pack_fsync_budget_bytes.load(Ordering::Relaxed);
+            if budget != 0 && self.shards.unsynced_bytes() >= budget {
+                self.shards.sync_dirty()?;
+                if let Some((_, fsync)) = self.shards.last_sync_split() {
+                    timings.pack_fsync = fsync;
+                }
+            }
         } else if dirty_only {
             self.shards.sync_dirty()?;
             if let Some((flush, fsync)) = self.shards.last_sync_split() {
@@ -8550,6 +8759,50 @@ impl PackfileStorage {
         state.base_fingerprint.is_none() || state.log_version != 3 || state.pending.is_empty()
     }
 
+    /// Tell the journal this pool's packs durably cover its frames through
+    /// `lsn`, and reclaim what that lets go of. Best-effort: a failed
+    /// compaction costs disk, never correctness (the coverage is already
+    /// durable).
+    fn report_coverage_and_reclaim(&self, lsn: u64) {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+            // A per-pool segment holds only this pool's frames, so this
+            // coverage means the segment can drop everything at or below `lsn`.
+            None => {
+                if let Err(error) = journal.reclaim_through(lsn) {
+                    eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                }
+            }
+            // A shared segment also holds other pools' frames. Record this
+            // pool's coverage and reclaim only what every contributing pool has
+            // covered, so no pool's frames are dropped before they are durable
+            // in its packs.
+            #[cfg(feature = "multi-reader")]
+            Some(pool) => {
+                journal.report_pool_coverage(pool, lsn);
+                if let Err(error) = journal.reclaim_shared() {
+                    eprintln!("warning: shared journal reclaim failed: {error}");
+                }
+            }
+            #[cfg(not(feature = "multi-reader"))]
+            Some(_) => unreachable!("shared journal state requires multi-reader"),
+        }
+    }
+
+    /// After a sync (no lock held): if a shared-WAL reclaim is stalled in the
+    /// emergency zone, make the pools holding it back checkpoint. Which pools,
+    /// and how, is decided by the coordinator and whoever owns the pools.
+    fn remediate_lagging_pools(&self) {
+        #[cfg(feature = "multi-reader")]
+        if let Some(journal) = self.journal() {
+            journal.remediate_blockers(pool_from_tag(self.journal_pool.load(Ordering::Acquire)));
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        let _ = self;
+    }
+
     /// Whether this sync must take a full checkpoint so the journal can be
     /// reclaimed: the segment is large, and this pool has journal frames its
     /// last checkpoint does not yet cover. A pool with nothing new to cover
@@ -8559,14 +8812,39 @@ impl PackfileStorage {
         let Some(journal) = self.journal() else {
             return false;
         };
-        if journal.segment_len() <= journal.reclaim_trigger_len() {
+        #[cfg(feature = "multi-reader")]
+        let this_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
+        #[cfg(not(feature = "multi-reader"))]
+        let this_pool = None;
+        if !journal.should_force_reclaim_checkpoint(this_pool) {
             return false;
         }
         #[cfg(feature = "multi-reader")]
         if let Some(pool) = pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
-            return journal.committed_lsn_for_pool(pool) > Self::read_journal_lsn(&self.base_dir);
+            return journal.committed_lsn_for_pool(pool) > self.durable_coverage();
         }
         true
+    }
+
+    /// Whether a delta log continues the checkpoint this session is based on, so
+    /// a batch can be appended to it (pending operations or not).
+    fn delta_base_is_usable(&self) -> bool {
+        let state = self.delta_state.lock();
+        state.base_fingerprint.is_some() && state.log_version == 3
+    }
+
+    /// Whether every live pack is one the base checkpoint's pack table names,
+    /// so every slot a delta operation of this epoch carries resolves through
+    /// that table for any reader. A pack created since forces a full
+    /// checkpoint, which records the new table.
+    fn packs_match_checkpoint_table(&self) -> bool {
+        let state = self.delta_state.lock();
+        !state.base_pack_ids.is_empty()
+            && self
+                .shards
+                .all_shards()
+                .iter()
+                .all(|(_, shard)| state.base_pack_ids.contains(&shard.pack_id))
     }
 
     /// Persist the dirty index state for a sync barrier — a delta append when
@@ -8612,7 +8890,37 @@ impl PackfileStorage {
         // fingerprint the checkpoint just became. Every other dirty path
         // records staleness instead and writes nothing.
         let mut sidecar_anchor = false;
-        if journal_needs_reclaim || self.delta_state_needs_full_rewrite() {
+        // When the journal must be reclaimed and a delta log can continue the
+        // checkpoint, record the coverage in a delta batch instead of rewriting
+        // the whole index: the packs are made durable, then the batch carrying
+        // the claim is, and only then is the journal reclaimed.
+        let mut coverage_batch_written = false;
+        if journal_needs_reclaim
+            && self.delta_base_is_usable()
+            && self.packs_match_checkpoint_table()
+        {
+            let delta_started = std::time::Instant::now();
+            match self.append_index_delta_v3(true) {
+                Ok(Some(covered)) => {
+                    timings.delta_log = delta_started.elapsed();
+                    self.report_coverage_and_reclaim(covered);
+                    coverage_batch_written = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("mtxdb: delta coverage batch failed, rewriting checkpoint: {error}");
+                }
+            }
+        }
+        if coverage_batch_written {
+            // Like any delta append: the sidecar is merely stale, unless it is
+            // known missing.
+            if self.shard_collections_dirty.load(Ordering::Relaxed) {
+                sidecar_anchor = true;
+            } else {
+                self.shard_collections_stale.store(true, Ordering::Relaxed);
+            }
+        } else if journal_needs_reclaim || self.delta_state_needs_full_rewrite() {
             // A deferral budget postpones acceleration rewrites; it must not
             // postpone the one that lets the journal be reclaimed, or the segment
             // fills and commits fail.
@@ -16910,5 +17218,435 @@ mod tests {
         } else {
             assert!(final_data.bytes.starts_with(b"key_beta:"));
         }
+    }
+    /// With a journal a sync only has to fsync the WAL, so pack data would pile
+    /// up until the checkpoint. Once enough is unsynced a sync also fsyncs the
+    /// packs, in slices; the budget can be turned off.
+    #[test]
+    fn a_journal_sync_fsyncs_packs_once_a_budget_of_them_is_unsynced() {
+        for (budget, expect_fsync) in [(0_u64, false), (1024, true)] {
+            let dir = test_dir(&format!("pack_budget_{budget}"));
+            let wal = dir.join("budget.wal");
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store.enable_journal(&wal).unwrap();
+            let collection = [0x11u8; 16];
+            // The first sync is the store's first checkpoint, which fsyncs every
+            // pack whatever the budget; take it before measuring the delta path.
+            store
+                .put(
+                    &collection,
+                    &[0xFE; 16],
+                    &NodeData::new(bytes::Bytes::from_static(b"base")),
+                )
+                .unwrap();
+            store.sync().unwrap();
+            store.set_pack_fsync_budget(budget);
+            for index in 0..64u8 {
+                store
+                    .put(
+                        &collection,
+                        &[index; 16],
+                        &NodeData::new(bytes::Bytes::from(vec![index; 200])),
+                    )
+                    .unwrap();
+            }
+            store.sync().unwrap();
+            let timings = store.sync_timings().unwrap();
+            assert_eq!(
+                store.shards.unsynced_bytes() == 0,
+                expect_fsync,
+                "budget {budget}: packs synced or not"
+            );
+            assert_eq!(
+                !timings.pack_fsync.is_zero(),
+                expect_fsync,
+                "budget {budget}"
+            );
+            drop(store);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A checkpoint records journal coverage, so it must leave every pack byte
+    /// durable, whatever the incremental budget did before it.
+    #[test]
+    fn a_checkpoint_leaves_no_pack_bytes_unsynced_whatever_the_budget() {
+        for budget in [0_u64, 1 << 30] {
+            let dir = test_dir(&format!("checkpoint_syncs_packs_{budget}"));
+            let wal = dir.join("checkpoint.wal");
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store.enable_journal(&wal).unwrap();
+            store.set_pack_fsync_budget(budget);
+            let collection = [0x12u8; 16];
+            for index in 0..32u8 {
+                store
+                    .put(
+                        &collection,
+                        &[index; 16],
+                        &NodeData::new(bytes::Bytes::from(vec![index; 300])),
+                    )
+                    .unwrap();
+            }
+            store.force_index_checkpoint().unwrap();
+            assert_eq!(store.shards.unsynced_bytes(), 0, "budget {budget}");
+            drop(store);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+    /// After the writer reclaims its journal on the strength of a delta coverage
+    /// batch (no new checkpoint), a reader that attaches sees every record that
+    /// is now only covered there: the reader loads the checkpoint, applies the
+    /// delta operations the coverage claim describes, and binds its coverage to
+    /// the claim, so nothing falls into the gap the reclaim left.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_reader_sees_records_covered_only_by_a_delta_coverage_batch() {
+        let dir = test_dir("reader_delta_coverage");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Au8; 16];
+        let key = |index: u8| [index; 16];
+
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        // Force the coverage step on every sync.
+        writer.journal().unwrap().set_reclaim_trigger_len(1);
+        writer
+            .put(
+                &collection,
+                &key(1),
+                &NodeData::new(bytes::Bytes::from_static(b"one")),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let checkpoint = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+
+        for index in 2..=6u8 {
+            writer
+                .put(
+                    &collection,
+                    &key(index),
+                    &NodeData::new(bytes::Bytes::from(vec![index; 8])),
+                )
+                .unwrap();
+            writer.sync().unwrap();
+            let timings = writer.sync_timings().unwrap();
+            assert!(
+                timings.checkpoint.is_zero(),
+                "sync {index} rewrote the checkpoint"
+            );
+            assert!(
+                !timings.delta_log.is_zero(),
+                "sync {index} wrote no coverage batch"
+            );
+        }
+        assert!(
+            writer.durable_coverage() > checkpoint.covered_lsn,
+            "coverage must have advanced past the checkpoint's"
+        );
+        let base_lsn = Journal::scan_read_only(&wal).unwrap().base_lsn;
+        assert!(
+            base_lsn > checkpoint.covered_lsn.saturating_add(1),
+            "the journal was reclaimed past the checkpoint's coverage"
+        );
+
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        reader.enable_read_journal(&wal).unwrap();
+        let ids: Vec<NodeId> = (1..=6u8).map(key).collect();
+        let values = reader.get_read_committed(&collection, &ids).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            assert!(
+                value.is_some(),
+                "record {} is invisible to the reader",
+                index + 1
+            );
+        }
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// A reader that attached before the writer advanced coverage by delta
+    /// batch must reload correctly when the reclaim moves the journal past its
+    /// index: the reload applies the delta operations up to the last coverage
+    /// claim, records after it still come from the overlay, and a record the
+    /// writer overwrote in a covered batch is served at its newest value.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_reader_attached_earlier_reloads_through_the_delta_coverage_prefix() {
+        let dir = test_dir("reader_delta_coverage_reload");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4Cu8; 16];
+        let key = |index: u8| [index; 16];
+        let value = |bytes: &'static [u8]| NodeData::new(bytes::Bytes::from_static(bytes));
+
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer.journal().unwrap().set_reclaim_trigger_len(1);
+        writer.put(&collection, &key(1), &value(b"one")).unwrap();
+        writer.sync().unwrap();
+
+        // The reader attaches now: its index is the first checkpoint.
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        reader.enable_read_journal(&wal).unwrap();
+        assert_eq!(reader.read_covered_lsn.load(Ordering::Acquire), 1);
+
+        // Coverage moves ahead by delta batches, overwriting key 1 on the way.
+        writer.put(&collection, &key(2), &value(b"two")).unwrap();
+        writer.put(&collection, &key(1), &value(b"one-v2")).unwrap();
+        writer.sync().unwrap();
+        writer.put(&collection, &key(3), &value(b"three")).unwrap();
+        writer.sync().unwrap();
+        assert!(writer.sync_timings().unwrap().checkpoint.is_zero());
+        // A record after the last coverage batch, journalled and synced only in
+        // the WAL: no coverage step is possible without new uncovered frames, so
+        // stop the writer from taking one for it.
+        writer.journal().unwrap().set_reclaim_trigger_len(u64::MAX);
+        writer.put(&collection, &key(4), &value(b"four")).unwrap();
+        writer.sync().unwrap();
+        assert!(writer.sync_timings().unwrap().delta_log.as_nanos() > 0);
+
+        let ids: Vec<NodeId> = (1..=4u8).map(key).collect();
+        let values = reader.get_read_committed(&collection, &ids).unwrap();
+        let payloads: Vec<Option<&[u8]>> = values
+            .iter()
+            .map(|value| value.as_ref().map(|data| data.bytes.as_ref()))
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![
+                Some(&b"one-v2"[..]),
+                Some(&b"two"[..]),
+                Some(&b"three"[..]),
+                Some(&b"four"[..]),
+            ]
+        );
+        assert!(
+            reader.stats().read_reloads >= 1,
+            "the reclaim must have forced a reload"
+        );
+        assert!(
+            reader.read_covered_lsn.load(Ordering::Acquire) > 1,
+            "the reload must have bound coverage to the delta claim"
+        );
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// A writer with a journal that syncs under the size trigger: every sync
+    /// past the first is a delta coverage step. Returns the store and the keys.
+    #[cfg(feature = "multi-reader")]
+    fn writer_with_coverage_steps(
+        dir: &std::path::Path,
+        wal: &std::path::Path,
+        records: u8,
+    ) -> PackfileStorage {
+        let writer = PackfileStorage::open(dir.to_path_buf()).unwrap();
+        writer.enable_journal(wal).unwrap();
+        writer.journal().unwrap().set_reclaim_trigger_len(1);
+        for index in 1..=records {
+            writer
+                .put(
+                    &[0x4Du8; 16],
+                    &[index; 16],
+                    &NodeData::new(bytes::Bytes::from(vec![index; 16])),
+                )
+                .unwrap();
+            writer.sync().unwrap();
+        }
+        writer
+    }
+
+    /// Reopen a store with a journal and check every record is served.
+    #[cfg(feature = "multi-reader")]
+    fn reopen_and_read_all(
+        dir: &std::path::Path,
+        wal: &std::path::Path,
+        records: u8,
+    ) -> PackfileStorage {
+        let reopened = PackfileStorage::open(dir.to_path_buf()).unwrap();
+        reopened.enable_journal(wal).unwrap();
+        reopened.replay_journal().unwrap();
+        for index in 1..=records {
+            let value = reopened.get(&[0x4Du8; 16], &[index; 16]).unwrap();
+            assert_eq!(
+                value.map(|data| data.bytes.to_vec()),
+                Some(vec![index; 16]),
+                "record {index} lost across the reopen"
+            );
+        }
+        reopened
+    }
+
+    /// Crash after coverage steps and a reclaim that went past the checkpoint:
+    /// the reopened writer takes its coverage from the delta claim, replays only
+    /// what is uncovered, and loses nothing.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_writer_recovers_from_a_reclaim_licensed_by_a_delta_coverage_batch() {
+        let dir = test_dir("recover_delta_coverage");
+        let wal = dir.join("wal.bin");
+        let writer = writer_with_coverage_steps(&dir, &wal, 6);
+        let checkpoint_coverage = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap()
+        .covered_lsn;
+        let claimed = writer.durable_coverage();
+        assert!(
+            claimed > checkpoint_coverage,
+            "the delta path must have advanced coverage"
+        );
+        assert!(
+            Journal::scan_read_only(&wal).unwrap().base_lsn > checkpoint_coverage.saturating_add(1),
+            "the journal must have been reclaimed past the checkpoint"
+        );
+        drop(writer); // no clean shutdown work is relied on: everything below is on disk
+
+        assert_eq!(
+            PackfileStorage::read_journal_lsn(&dir),
+            claimed,
+            "the disk must say what the writer claimed"
+        );
+        let reopened = reopen_and_read_all(&dir, &wal, 6);
+        assert_eq!(reopened.durable_coverage(), claimed);
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A coverage batch that is torn, or whose bytes are damaged, claims
+    /// nothing. The journal was reclaimed on the strength of it and cannot help,
+    /// but the packs it described are durable, so the reopen rebuilds the index
+    /// from them and every record is still there.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_torn_or_damaged_coverage_batch_loses_no_records() {
+        let dir = test_dir("torn_delta_coverage");
+        let wal = dir.join("wal.bin");
+        let writer = writer_with_coverage_steps(&dir, &wal, 6);
+        let checkpoint = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+        drop(writer);
+        let delta_path = PackfileStorage::delta_path(&dir, checkpoint.fingerprint);
+        let intact = fs::read(&delta_path).unwrap();
+        assert!(
+            delta::read_delta_log_v3(&delta_path)
+                .unwrap()
+                .coverage
+                .is_some(),
+            "the log must carry a coverage claim to lose"
+        );
+
+        // Cut the log inside its last batch, and separately flip a bit in it.
+        let cut = intact.len() - 3;
+        let mut damaged = intact.clone();
+        let last = damaged.len() - 20;
+        damaged[last] ^= 0x40;
+        for (label, bytes) in [("torn", intact[..cut].to_vec()), ("bit flip", damaged)] {
+            fs::write(&delta_path, &bytes).unwrap();
+            let claimed = PackfileStorage::read_journal_lsn(&dir);
+            let last_claim = delta::read_delta_log_v3(&delta_path)
+                .and_then(|log| log.coverage)
+                .unwrap_or(0);
+            assert!(
+                claimed == checkpoint.covered_lsn.max(last_claim),
+                "{label}: coverage must come only from what still validates"
+            );
+            let reopened = reopen_and_read_all(&dir, &wal, 6);
+            drop(reopened);
+            // A reopen must not have kept the damaged log going.
+            fs::write(&delta_path, &intact).unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Without a coverage step (the journal is not over its trigger) nothing is
+    /// claimed beyond the checkpoint, the journal keeps its groups, and a crash
+    /// replays them: the behaviour before coverage batches existed.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_sync_under_the_trigger_claims_no_coverage() {
+        let dir = test_dir("no_coverage_under_trigger");
+        let wal = dir.join("wal.bin");
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer
+            .put(
+                &[0x4Du8; 16],
+                &[1; 16],
+                &NodeData::new(bytes::Bytes::from(vec![1; 16])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let after_checkpoint = writer.durable_coverage();
+        for index in 2..=4u8 {
+            writer
+                .put(
+                    &[0x4Du8; 16],
+                    &[index; 16],
+                    &NodeData::new(bytes::Bytes::from(vec![index; 16])),
+                )
+                .unwrap();
+            writer.sync().unwrap();
+            let timings = writer.sync_timings().unwrap();
+            assert!(timings.checkpoint.is_zero());
+            assert!(!timings.delta_log.is_zero(), "an ordinary delta batch");
+        }
+        assert_eq!(writer.durable_coverage(), after_checkpoint);
+        let groups = Journal::scan_read_only(&wal).unwrap().groups.len();
+        assert!(
+            groups >= 3,
+            "the journal keeps the uncovered groups ({groups})"
+        );
+        drop(writer);
+        drop(reopen_and_read_all(&dir, &wal, 4));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The coverage step is only taken while every live pack is in the base
+    /// checkpoint's pack table, since a reader translates the delta operations'
+    /// slots through it. A pack created since forces a full checkpoint, which
+    /// records the new table and starts a new epoch.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_pack_missing_from_the_checkpoint_table_forces_a_full_checkpoint() {
+        let dir = test_dir("coverage_pack_gate");
+        let wal = dir.join("wal.bin");
+        let writer = writer_with_coverage_steps(&dir, &wal, 3);
+        // With the table intact the step is a delta batch.
+        writer
+            .put(
+                &[0x4Du8; 16],
+                &[9; 16],
+                &NodeData::new(bytes::Bytes::from(vec![9; 16])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        assert!(writer.sync_timings().unwrap().checkpoint.is_zero());
+        assert!(writer.packs_match_checkpoint_table());
+        // Forget the table, as if a pack had been created since the checkpoint.
+        writer.delta_state.lock().base_pack_ids.clear();
+        assert!(!writer.packs_match_checkpoint_table());
+        writer
+            .put(
+                &[0x4Du8; 16],
+                &[10; 16],
+                &NodeData::new(bytes::Bytes::from(vec![10; 16])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let timings = writer.sync_timings().unwrap();
+        assert!(
+            !timings.checkpoint.is_zero(),
+            "a full checkpoint re-bases the epoch"
+        );
+        assert!(
+            writer.packs_match_checkpoint_table(),
+            "and records the new table"
+        );
+        drop(writer);
+        drop(reopen_and_read_all(&dir, &wal, 3));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

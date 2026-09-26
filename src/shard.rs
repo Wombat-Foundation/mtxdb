@@ -246,6 +246,13 @@ pub struct Shard {
     bytes_written: AtomicU64,
     /// Number of times this shard's file has been fsynced.
     sync_count: AtomicU64,
+    /// Length of this shard's file that an fsync has made durable: the value
+    /// of `file_len` read just before the last successful fsync, or the opened
+    /// length for bytes that predate this process. Everything at or below it
+    /// survives a crash; `file_len - synced_len` is what a sync still owes. It
+    /// only schedules fsyncs (see [`Shard::unsynced_bytes`]); no durability claim
+    /// is derived from it, and a checkpoint still fsyncs every shard.
+    synced_len: AtomicU64,
     /// Set when a failed flush could not be rolled back (the tail-truncating
     /// `set_len` itself failed), leaving torn, undeclared bytes past
     /// `file_len` on disk. Once set, every further append/flush on this
@@ -458,6 +465,7 @@ impl Shard {
             write_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             sync_count: AtomicU64::new(0),
+            synced_len: AtomicU64::new(file_len),
             poisoned: AtomicBool::new(false),
         }
     }
@@ -483,6 +491,35 @@ impl Shard {
     #[must_use]
     pub fn file_len(&self) -> u64 {
         self.file_len.load(Ordering::Acquire)
+    }
+
+    /// Bytes of this shard's file that an fsync has made durable; see the field
+    /// doc for what this may and may not be used for.
+    #[must_use]
+    pub fn synced_len(&self) -> u64 {
+        self.synced_len.load(Ordering::Acquire)
+    }
+
+    /// Bytes written to this shard's file (and so flushed to the page cache)
+    /// that no fsync has covered yet.
+    #[must_use]
+    pub fn unsynced_bytes(&self) -> u64 {
+        self.file_len().saturating_sub(self.synced_len())
+    }
+
+    /// fsync the file, then advance the durable watermark to the length read
+    /// *before* the fsync started: every byte at or below it was written before
+    /// the fsync began, so the fsync covers it, while bytes appended during the
+    /// fsync stay owed to the next one.
+    fn fsync_advancing_watermark(&self, data_only: bool) -> io::Result<()> {
+        let covered = self.file_len();
+        if data_only {
+            self.file.sync_data()?;
+        } else {
+            self.file.sync_all()?;
+        }
+        self.synced_len.fetch_max(covered, Ordering::AcqRel);
+        Ok(())
     }
 
     /// Restore counters from a persisted snapshot. Only called at startup,
@@ -2853,7 +2890,7 @@ impl ShardPool {
             if self.take_dirty(id) {
                 had_dirty = true;
             }
-            if let Err(error) = shard.file.sync_all() {
+            if let Err(error) = shard.fsync_advancing_watermark(false) {
                 self.restore_dirty(id);
                 return Err(error);
             }
@@ -2870,6 +2907,17 @@ impl ShardPool {
             self.persist_stats_best_effort();
         }
         Ok(())
+    }
+
+    /// Bytes written to shards that no fsync has covered yet, summed over the
+    /// pool. Includes bytes only in the page cache; excludes frames still
+    /// buffered in memory (a flush moves them here).
+    #[must_use]
+    pub fn unsynced_bytes(&self) -> u64 {
+        self.all_shards()
+            .iter()
+            .map(|(_, shard)| shard.unsynced_bytes())
+            .sum()
     }
 
     /// (flush, fsync) wall-clock split of the last sync — `sync_all` or the
@@ -2965,7 +3013,7 @@ impl ShardPool {
             // crash; the mode/timestamp metadata `sync_all` would also write
             // is not needed. The full-barrier `sync_all` above keeps
             // `sync_all`.
-            if let Err(error) = shard.file.sync_data() {
+            if let Err(error) = shard.fsync_advancing_watermark(true) {
                 self.restore_dirty(id);
                 return Err(error);
             }
@@ -4446,5 +4494,52 @@ mod tests {
             pool.dirty.lock().is_empty(),
             "sync_dirty should clear dirty after fsync"
         );
+    }
+    /// The durable watermark follows fsyncs: bytes written are owed until a sync
+    /// covers them, `sync_dirty` and `sync_all` both pay them off, and the
+    /// watermark never runs ahead of the file.
+    #[test]
+    fn synced_len_tracks_what_an_fsync_has_covered() {
+        let dir = test_dir("synced_len");
+        let pool = ShardPool::open(dir).unwrap();
+        assert_eq!(pool.unsynced_bytes(), 0);
+
+        let record = test_record(0x01, 0xAA, b"first payload");
+        let (slot, offset) = pool.put_record(&record).unwrap();
+        let shard = pool.get_shard(slot).unwrap();
+        // Force the buffered frame onto the file so it counts as written.
+        pool.read_at(&shard, offset, true).unwrap();
+        assert!(shard.file_len() > shard.synced_len());
+        assert_eq!(pool.unsynced_bytes(), shard.unsynced_bytes());
+        assert!(pool.unsynced_bytes() > 0);
+
+        pool.sync_dirty().unwrap();
+        assert_eq!(shard.synced_len(), shard.file_len());
+        assert_eq!(pool.unsynced_bytes(), 0);
+
+        // More data is owed again, and `sync_all` pays it off too.
+        let (slot, offset) = pool
+            .put_record(&test_record(0x02, 0xBB, b"second payload"))
+            .unwrap();
+        let shard = pool.get_shard(slot).unwrap();
+        pool.read_at(&shard, offset, true).unwrap();
+        assert!(pool.unsynced_bytes() > 0);
+        pool.sync_all().unwrap();
+        assert_eq!(pool.unsynced_bytes(), 0);
+        assert!(shard.synced_len() <= shard.file_len());
+    }
+
+    /// Bytes that predate this process are not counted as owed.
+    #[test]
+    fn bytes_present_at_open_are_not_counted_as_unsynced() {
+        let dir = test_dir("synced_len_reopen");
+        {
+            let pool = ShardPool::open(dir.clone()).unwrap();
+            pool.put_record(&test_record(0x01, 0xAA, b"before"))
+                .unwrap();
+            pool.sync_all().unwrap();
+        }
+        let reopened = ShardPool::open(dir).unwrap();
+        assert_eq!(reopened.unsynced_bytes(), 0);
     }
 }

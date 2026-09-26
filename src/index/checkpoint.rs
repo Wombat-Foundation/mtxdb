@@ -595,6 +595,31 @@ pub fn read_checkpoint_with_policy(
 pub fn read_pack_fingerprint(
     path: &Path,
 ) -> Result<Option<u64>, crate::index::delta::DeltaFingerprintError> {
+    Ok(read_checkpoint_summary(path)?.map(|summary| summary.fingerprint))
+}
+
+/// What a checkpoint's header says, without reading its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointSummary {
+    /// The pack fingerprint the checkpoint was written against.
+    pub fingerprint: u64,
+    /// The journal LSN its index covers, or zero when written without a journal.
+    pub covered_lsn: u64,
+}
+
+/// Lightweight read of a checkpoint's header: its `pack_fingerprint` and the
+/// journal `covered_lsn` it records.
+///
+/// Same contract as [`read_pack_fingerprint`]: `Ok(None)` for a missing file,
+/// `Err` for a truncated one or one with an invalid magic or version.
+///
+/// # Errors
+///
+/// Returns a [`crate::index::delta::DeltaFingerprintError`] when an existing
+/// checkpoint cannot be read or validated.
+pub fn read_checkpoint_summary(
+    path: &Path,
+) -> Result<Option<CheckpointSummary>, crate::index::delta::DeltaFingerprintError> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -613,7 +638,10 @@ pub fn read_pack_fingerprint(
             "invalid checkpoint magic/version",
         ));
     }
-    Ok(Some(header.pack_fingerprint))
+    Ok(Some(CheckpointSummary {
+        fingerprint: header.pack_fingerprint,
+        covered_lsn: header.covered_lsn,
+    }))
 }
 
 /// Result of reading the durable fingerprint.

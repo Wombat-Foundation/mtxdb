@@ -1031,6 +1031,70 @@ struct GroupMark {
     pools: u8,
 }
 
+/// A pool's reclaim coverage on a shared segment is stuck: the segment is over
+/// the reclaim trigger and a reclaim could not shrink it. Remembered so forced
+/// checkpoints back off until something can change the outcome.
+#[cfg(feature = "multi-reader")]
+#[derive(Clone, Copy, Debug)]
+struct ReclaimStall {
+    /// Segment length when the reclaim failed to shrink it.
+    at_len: u64,
+    /// `coverage_epoch` at that moment; a later value means a pool advanced its
+    /// coverage, so a reclaim may now succeed.
+    coverage_epoch: u64,
+}
+
+/// Something that makes a named pool checkpoint so it reports coverage, given
+/// to a coordinator by whatever owns the pools.
+#[cfg(feature = "multi-reader")]
+type BlockerRemediation = Arc<dyn Fn(ShardType) + Send + Sync>;
+
+#[cfg(feature = "multi-reader")]
+thread_local! {
+    /// Set while this thread is checkpointing lagging pools, so their syncs do
+    /// not start another round.
+    static REMEDIATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What the in-memory group directory currently holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupDirectoryStats {
+    /// Complete groups in the segment, one directory entry each.
+    pub groups: u64,
+    /// Bytes the directory has allocated for them.
+    pub bytes: u64,
+}
+
+/// The smallest group the format allows: a header, one mutation frame and a
+/// trailer.
+const MIN_GROUP_LEN: u64 = (GROUP_HEADER_LEN + MIN_FRAME_LEN + GROUP_TRAILER_LEN) as u64;
+
+/// Groups in a segment of the largest size made only of the smallest groups.
+const WORST_CASE_DIRECTORY_GROUPS: u64 = MAX_SEGMENT_LEN / MIN_GROUP_LEN;
+
+/// Bytes the directory needs at [`WORST_CASE_DIRECTORY_GROUPS`].
+const WORST_CASE_DIRECTORY_BYTES: u64 =
+    WORST_CASE_DIRECTORY_GROUPS * std::mem::size_of::<GroupMark>() as u64;
+
+impl GroupDirectoryStats {
+    /// The most entries a segment can ever hold, and so the most memory the
+    /// directory can use for it: each group needs at least a header, one
+    /// mutation frame and a trailer. It is only approached by a workload of
+    /// single-record groups that keeps a nearly full segment unreclaimed, which
+    /// the size trigger is there to prevent; the directory needs no cap of its
+    /// own beyond it.
+    #[must_use]
+    pub const fn worst_case_groups() -> u64 {
+        WORST_CASE_DIRECTORY_GROUPS
+    }
+
+    /// Bytes the directory uses at [`Self::worst_case_groups`].
+    #[must_use]
+    pub const fn worst_case_bytes() -> u64 {
+        WORST_CASE_DIRECTORY_BYTES
+    }
+}
+
 /// The directory entries for the groups a scan returned.
 fn marks_from_scan(scan: &Scan) -> Vec<GroupMark> {
     scan.groups
@@ -1160,6 +1224,8 @@ pub struct Journal {
     next_sequence: u64,
     next_lsn: u64,
     poisoned: bool,
+    /// Largest the segment may grow. Always [`MAX_SEGMENT_LEN`] outside tests.
+    segment_cap: u64,
     /// In-memory directory of the complete groups in the segment, in order.
     ///
     /// It is a cache of what a scan of the file would find, built when the
@@ -1321,6 +1387,22 @@ pub struct JournalCoordinator {
     /// Segment length above which a sync forces a reclaiming checkpoint; see
     /// [`RECLAIM_TRIGGER_LEN`].
     reclaim_trigger_len: AtomicU64,
+    /// Set while a reclaim over the trigger cannot shrink the segment.
+    #[cfg(feature = "multi-reader")]
+    reclaim_stall: Mutex<Option<ReclaimStall>>,
+    /// Advances whenever any pool's reported coverage does.
+    #[cfg(feature = "multi-reader")]
+    coverage_epoch: AtomicU64,
+    /// Times a reclaim over the trigger has been found unable to shrink the
+    /// segment.
+    #[cfg(feature = "multi-reader")]
+    reclaim_stalls: AtomicU64,
+    /// Checkpoints the pools that hold a stalled reclaim back.
+    #[cfg(feature = "multi-reader")]
+    blocker_remediation: Mutex<Option<BlockerRemediation>>,
+    /// `(segment length, coverage epoch)` at the last remediation attempt.
+    #[cfg(feature = "multi-reader")]
+    last_remediation: Mutex<Option<(u64, u64)>>,
     /// Optional shared, cross-pool group-sequence allocator. When present,
     /// each committed group draws its sequence from here instead of the
     /// segment's own counter, so groups across several pool segments share one
@@ -1340,6 +1422,9 @@ pub struct JournalCoordinator {
     /// coverage the checkpoint lacks and let reclaim drop another pool's
     /// uncovered frames. See [`Self::committed_lsn_for_pool`].
     pool_committed: Mutex<HashMap<ShardType, u64>>,
+    /// First LSNs of transaction groups that are published but whose writes are
+    /// not yet all in the packs. See [`Self::publish_groups`].
+    unmaterialized: Mutex<std::collections::BTreeSet<u64>>,
     /// Appended-but-not-yet-committed groups, with the highest LSN each carried
     /// per pool. Appending a transaction group makes it visible before it is
     /// fsynced; when a later durable commit passes it,
@@ -1473,10 +1558,21 @@ impl JournalCoordinator {
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             reclaim_trigger_len: AtomicU64::new(RECLAIM_TRIGGER_LEN),
+            #[cfg(feature = "multi-reader")]
+            reclaim_stall: Mutex::new(None),
+            #[cfg(feature = "multi-reader")]
+            coverage_epoch: AtomicU64::new(0),
+            #[cfg(feature = "multi-reader")]
+            reclaim_stalls: AtomicU64::new(0),
+            #[cfg(feature = "multi-reader")]
+            blocker_remediation: Mutex::new(None),
+            #[cfg(feature = "multi-reader")]
+            last_remediation: Mutex::new(None),
             sequence: None,
             #[cfg(feature = "multi-reader")]
             coverage: Mutex::new(coverage),
             pool_committed: Mutex::new(pool_committed),
+            unmaterialized: Mutex::new(std::collections::BTreeSet::new()),
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
@@ -1525,11 +1621,14 @@ impl JournalCoordinator {
     pub fn report_pool_coverage(&self, pool: ShardType, lsn: u64) {
         let mut coverage = self.coverage.lock();
         let entry = coverage.covered.entry(pool).or_insert(0);
-        *entry = (*entry).max(lsn);
+        if lsn > *entry {
+            *entry = lsn;
+            self.coverage_epoch.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Highest committed group `last_lsn` that carried at least one frame for
-    /// `pool`, or 0 when no committed group has yet.
+    /// `pool` and is fully in the packs, or 0 when there is none.
     ///
     /// A pool checkpoint must record this, not [`Self::committed_lsn`]. One
     /// shared group can interleave several pools' frames, so the global
@@ -1539,7 +1638,20 @@ impl JournalCoordinator {
     #[must_use]
     #[cfg(feature = "multi-reader")]
     pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
-        self.pool_committed.lock().get(&pool).copied().unwrap_or(0)
+        let committed = self.pool_committed.lock().get(&pool).copied().unwrap_or(0);
+        // A published transaction whose writes are not all in the packs yet
+        // holds coverage below its first frame.
+        match self.unmaterialized.lock().first() {
+            Some(first_lsn) => committed.min(first_lsn.saturating_sub(1)),
+            None => committed,
+        }
+    }
+
+    /// Record that the transaction group whose first frame is `first_lsn` has
+    /// been fully written to the packs, so coverage may pass it.
+    #[cfg(feature = "multi-reader")]
+    pub fn transaction_materialized(&self, first_lsn: u64) {
+        self.unmaterialized.lock().remove(&first_lsn);
     }
 
     /// Record a durable commit and advance the generation that re-arms the
@@ -1603,9 +1715,16 @@ impl JournalCoordinator {
             };
             match boundary {
                 SharedBoundary::Through(covered_lsn) => {
-                    return journal.reclaim_through(covered_lsn).map(Some);
+                    let reclaimed = journal.reclaim_through(covered_lsn).map(Some);
+                    let coverage = self.coverage.lock();
+                    self.record_reclaim_outcome(&journal, &coverage.covered);
+                    return reclaimed;
                 }
-                SharedBoundary::NothingCovered => return Ok(None),
+                SharedBoundary::NothingCovered => {
+                    let coverage = self.coverage.lock();
+                    self.record_reclaim_outcome(&journal, &coverage.covered);
+                    return Ok(None);
+                }
                 SharedBoundary::Untrusted => {}
             }
         }
@@ -1619,6 +1738,130 @@ impl JournalCoordinator {
             Some(covered_lsn) => self.reclaim_through(covered_lsn).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// The pools whose missing coverage holds reclaim back right now, oldest
+    /// needed group first. Empty when nothing is blocked or it cannot be told.
+    #[cfg(feature = "multi-reader")]
+    #[must_use]
+    pub fn reclaim_blockers(&self) -> Vec<ShardType> {
+        let journal = self.journal.lock();
+        let coverage = self.coverage.lock();
+        journal.blocking_pools(&coverage.covered)
+    }
+
+    /// Whether the last reclaim left the segment over the trigger.
+    #[cfg(feature = "multi-reader")]
+    #[must_use]
+    pub fn is_reclaim_stalled(&self) -> bool {
+        self.reclaim_stall.lock().is_some()
+    }
+
+    /// Times a reclaim has been found unable to shrink a segment over the
+    /// trigger (each stall counts once, until a reclaim clears it).
+    #[cfg(feature = "multi-reader")]
+    #[must_use]
+    pub fn reclaim_stalls(&self) -> u64 {
+        self.reclaim_stalls.load(Ordering::Relaxed)
+    }
+
+    /// Give the coordinator a way to make one named pool checkpoint (and so
+    /// report coverage). It is used only in the emergency zone, to un-stall a
+    /// reclaim held back by a pool nobody is syncing.
+    #[cfg(feature = "multi-reader")]
+    pub fn set_blocker_remediation(&self, remediate: impl Fn(ShardType) + Send + Sync + 'static) {
+        *self.blocker_remediation.lock() = Some(Arc::new(remediate));
+    }
+
+    /// Note how a reclaim ended, with the journal and sync locks held. A
+    /// segment still over the trigger means the reclaim is stalled: remember
+    /// it, and say so once, naming the pools it is waiting on.
+    #[cfg(feature = "multi-reader")]
+    fn record_reclaim_outcome(&self, journal: &Journal, covered: &HashMap<ShardType, u64>) {
+        let len = journal.file_len;
+        if len <= self.reclaim_trigger_len() {
+            *self.reclaim_stall.lock() = None;
+            *self.last_remediation.lock() = None;
+            return;
+        }
+        let epoch = self.coverage_epoch.load(Ordering::Acquire);
+        let mut stall = self.reclaim_stall.lock();
+        let previous = *stall;
+        *stall = Some(ReclaimStall {
+            at_len: len,
+            coverage_epoch: epoch,
+        });
+        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
+        let was_emergency = previous.is_some_and(|old| {
+            old.at_len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4)
+        });
+        if previous.is_none() {
+            self.reclaim_stalls.fetch_add(1, Ordering::Relaxed);
+        }
+        if previous.is_none() || (emergency && !was_emergency) {
+            eprintln!(
+                "warning: shared WAL reclaim is stalled at {len} of {} bytes (trigger {}); \
+                 waiting on pools {:?} to report coverage",
+                journal.segment_cap,
+                self.reclaim_trigger_len(),
+                journal.blocking_pools(covered)
+            );
+        }
+    }
+
+    /// If a stalled reclaim has reached the emergency zone, make the pools
+    /// holding it back checkpoint, except `caller`, which is mid-sync. Runs
+    /// with no journal or persistence lock held, at most once per further
+    /// eighth of the trigger of growth unless coverage moved, and never from
+    /// inside another remediation.
+    #[cfg(feature = "multi-reader")]
+    pub fn remediate_blockers(&self, caller: Option<ShardType>) {
+        if REMEDIATING.with(std::cell::Cell::get) {
+            return;
+        }
+        let len = self.segment_len();
+        if len < self.emergency_len() || !self.is_reclaim_stalled() {
+            return;
+        }
+        let epoch = self.coverage_epoch.load(Ordering::Acquire);
+        {
+            let mut last = self.last_remediation.lock();
+            if let Some((last_len, last_epoch)) = *last {
+                if last_epoch == epoch && len < last_len.saturating_add(self.reclaim_retry_growth())
+                {
+                    return;
+                }
+            }
+            *last = Some((len, epoch));
+        }
+        let Some(remediate) = self.blocker_remediation.lock().clone() else {
+            return;
+        };
+        REMEDIATING.with(|flag| flag.set(true));
+        for pool in self.reclaim_blockers() {
+            if Some(pool) != caller {
+                remediate(pool);
+            }
+        }
+        REMEDIATING.with(|flag| flag.set(false));
+    }
+
+    /// The error for a commit refused because the segment is full, naming the
+    /// pools reclaim is waiting on when that is known.
+    fn explain_full_segment(&self, error: io::Error, journal: &Journal) -> io::Error {
+        #[cfg(feature = "multi-reader")]
+        if error.kind() == io::ErrorKind::WouldBlock {
+            let blockers = journal.blocking_pools(&self.coverage.lock().covered);
+            if !blockers.is_empty() {
+                return io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("{error}; reclaim is waiting on pools {blockers:?} to report coverage"),
+                );
+            }
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        let _ = (self, journal);
+        error
     }
 
     /// Build a coordinator whose groups draw their sequence from a shared,
@@ -1898,9 +2141,10 @@ impl JournalCoordinator {
     /// exhausted, or the append fails. A partial append poisons the
     /// underlying journal; publication is rejected until reopen/recovery.
     pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(None, mutations)])?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
-        })
+        self.publish_groups(&[(None, mutations)], false)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
+            })
     }
 
     /// Like [`Self::publish_group`], tagging every mutation with `pool`.
@@ -1915,7 +2159,7 @@ impl JournalCoordinator {
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(Some(pool), mutations)])?
+        self.publish_groups(&[(Some(pool), mutations)], false)?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -1940,7 +2184,7 @@ impl JournalCoordinator {
             .iter()
             .map(|(pool, mutations)| (Some(*pool), *mutations))
             .collect::<Vec<_>>();
-        self.publish_groups(&staged)?.ok_or_else(|| {
+        self.publish_groups(&staged, true)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cannot publish an empty transaction group",
@@ -1950,9 +2194,18 @@ impl JournalCoordinator {
 
     /// Single publication path. Holds `publication` for the whole append so
     /// LSN assignment, the append and the visibility advance are one step.
+    ///
+    /// A transaction group (`transaction` set) is published before its writes
+    /// are materialized into the packs. Until [`Self::transaction_materialized`]
+    /// says otherwise, no pool may claim coverage at or past its first frame:
+    /// the packs do not hold those frames yet, so a claim (and the reclaim it
+    /// would license) could lose an acknowledged commit to a crash. It is
+    /// registered here, under the journal lock, so no sync can promote a
+    /// watermark past the group before the group is on the floor list.
     fn publish_groups(
         &self,
         staged: &[(Option<ShardType>, &[Mutation])],
+        transaction: bool,
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
         if self.poisoned.load(Ordering::Acquire) {
@@ -1985,9 +2238,12 @@ impl JournalCoordinator {
                 if journal.poisoned {
                     self.poisoned.store(true, Ordering::Release);
                 }
-                return Err(error);
+                return Err(self.explain_full_segment(error, &journal));
             }
         };
+        if transaction {
+            self.unmaterialized.lock().insert(receipt.first_lsn);
+        }
         debug_assert_eq!(
             receipt.first_lsn, expected_first_lsn,
             "appended group must start at the journal tail"
@@ -2066,6 +2322,71 @@ impl JournalCoordinator {
         self.journal.lock().file_len
     }
 
+    /// Largest the segment may grow before commits are refused.
+    #[must_use]
+    pub fn segment_cap(&self) -> u64 {
+        self.journal.lock().segment_cap
+    }
+
+    /// The segment length past which a stalled reclaim is treated as an
+    /// emergency: three quarters of the cap.
+    #[cfg(feature = "multi-reader")]
+    fn emergency_len(&self) -> u64 {
+        let cap = self.segment_cap();
+        cap.saturating_sub(cap / 4)
+    }
+
+    /// How much a stalled segment must grow before the next forced checkpoint
+    /// is worth trying: an eighth of the trigger.
+    #[cfg(feature = "multi-reader")]
+    fn reclaim_retry_growth(&self) -> u64 {
+        self.reclaim_trigger_len() / 8
+    }
+
+    /// Whether a sync of `pool` should force a reclaiming checkpoint now.
+    ///
+    /// True once the segment is over the trigger, except while a reclaim is
+    /// known to be stalled. Then a pool that is not itself holding the reclaim
+    /// back would only repeat a checkpoint that cannot help, so it waits until
+    /// the segment has grown by an eighth of the trigger or some pool's
+    /// coverage advanced. A pool that is holding it back always checkpoints:
+    /// that is what un-stalls it. Nobody waits in the emergency zone.
+    #[must_use]
+    pub fn should_force_reclaim_checkpoint(&self, pool: Option<ShardType>) -> bool {
+        let len = self.segment_len();
+        if len <= self.reclaim_trigger_len() {
+            return false;
+        }
+        self.stall_permits_forcing(len, pool)
+    }
+
+    /// Whether a stalled reclaim (if there is one) still lets `pool`'s sync
+    /// force a checkpoint at segment length `len`.
+    #[cfg(feature = "multi-reader")]
+    fn stall_permits_forcing(&self, len: u64, pool: Option<ShardType>) -> bool {
+        let Some(stall) = *self.reclaim_stall.lock() else {
+            return true;
+        };
+        len >= self.emergency_len()
+            || self.coverage_epoch.load(Ordering::Acquire) != stall.coverage_epoch
+            || len >= stall.at_len.saturating_add(self.reclaim_retry_growth())
+            || pool.is_some_and(|pool| self.reclaim_blockers().contains(&pool))
+    }
+
+    /// Per-pool journals have no other pool to wait on, so nothing stalls.
+    #[cfg(not(feature = "multi-reader"))]
+    fn stall_permits_forcing(&self, _len: u64, _pool: Option<ShardType>) -> bool {
+        let _ = self;
+        true
+    }
+
+    /// What the journal's in-memory group directory holds: its entry count and
+    /// allocated bytes.
+    #[must_use]
+    pub fn group_directory_stats(&self) -> GroupDirectoryStats {
+        self.journal.lock().directory_stats()
+    }
+
     /// Segment length above which a sync forces a reclaiming checkpoint.
     #[must_use]
     pub fn reclaim_trigger_len(&self) -> u64 {
@@ -2080,6 +2401,14 @@ impl JournalCoordinator {
     #[cfg(all(test, feature = "multi-reader"))]
     pub(crate) fn set_reclaim_trigger_len(&self, len: u64) {
         self.reclaim_trigger_len.store(len, Ordering::Relaxed);
+    }
+
+    /// Shrink the segment cap, and the trigger with it (a quarter of the cap),
+    /// so a test can reach the hard limit with a few hundred KiB.
+    #[cfg(all(test, feature = "multi-reader"))]
+    pub(crate) fn set_segment_cap(&self, cap: u64) {
+        self.journal.lock().segment_cap = cap;
+        self.set_reclaim_trigger_len(cap / 4);
     }
 
     /// Highest LSN any caller has requested through [`Self::request_durable`].
@@ -2804,6 +3133,7 @@ impl Journal {
             next_sequence,
             next_lsn,
             poisoned: false,
+            segment_cap: MAX_SEGMENT_LEN,
             groups: marks_from_scan(&scan),
         };
         if !scan.groups.is_empty() {
@@ -2961,7 +3291,7 @@ impl Journal {
                 .saturating_add(trailer.len()),
         )
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group too large"))?;
-        if self.file_len.saturating_add(group_size) > MAX_SEGMENT_LEN {
+        if self.file_len.saturating_add(group_size) > self.segment_cap {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "journal segment is full; drain/rotate before accepting more writes",
@@ -3151,6 +3481,48 @@ impl Journal {
         });
     }
 
+    /// The pools that hold reclaim back: those with a frame in the oldest group
+    /// still needed that have not reported coverage through it. Empty when the
+    /// directory cannot be trusted, or the oldest needed group holds a frame no
+    /// pool can be asked to cover (an untagged one).
+    #[cfg(feature = "multi-reader")]
+    fn blocking_pools(&self, covered: &HashMap<ShardType, u64>) -> Vec<ShardType> {
+        if !self.directory_matches_file() {
+            return Vec::new();
+        }
+        for group in &self.groups {
+            let blockers: Vec<ShardType> = ShardType::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(index, pool)| {
+                    group.pools & (1_u8 << index) != 0
+                        && !covered.get(pool).is_some_and(|lsn| *lsn >= group.last_lsn)
+                })
+                .map(|(_, pool)| pool)
+                .collect();
+            if !blockers.is_empty() {
+                return blockers;
+            }
+            if group.pools & UNATTRIBUTED_POOL_BIT != 0 {
+                return Vec::new();
+            }
+        }
+        Vec::new()
+    }
+
+    /// What the group directory currently holds.
+    fn directory_stats(&self) -> GroupDirectoryStats {
+        GroupDirectoryStats {
+            groups: u64::try_from(self.groups.len()).unwrap_or(u64::MAX),
+            bytes: u64::try_from(
+                self.groups
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<GroupMark>()),
+            )
+            .unwrap_or(u64::MAX),
+        }
+    }
+
     /// Whether the in-memory group directory describes the file exactly: its
     /// last group ends where the file ends.
     fn directory_matches_file(&self) -> bool {
@@ -3197,17 +3569,21 @@ impl Journal {
             });
         let mut rebuilt = file_header_bytes(self.version, new_base_sequence, new_base_lsn);
         if let Some(first) = retained.first() {
-            let suffix = read_range(
+            // Read the suffix straight into the buffer that becomes the new
+            // segment, after its header, so it is allocated once.
+            let header_len = rebuilt.len();
+            read_range_into(
                 &self.path,
                 cut_offset,
                 self.file_len.saturating_sub(cut_offset),
+                &mut rebuilt,
             )?;
             // The suffix is copied byte for byte, so check it the way the full
             // scan would have: it must hold exactly the groups the directory
             // says, each valid. Anything else means the directory is stale, and
             // the scan path decides instead.
             let Ok(checked) = scan_groups_from(
-                &suffix,
+                rebuilt.get(header_len..).unwrap_or_default(),
                 cut_offset,
                 first.sequence,
                 first.first_lsn,
@@ -3223,7 +3599,6 @@ impl Journal {
             {
                 return self.reclaim_through_scan(covered_lsn);
             }
-            rebuilt.extend_from_slice(&suffix);
         }
         let reclaimed_bytes = self
             .file_len
@@ -3365,13 +3740,18 @@ impl Journal {
     }
 }
 
-/// Read `len` bytes of the file at `path` starting at `start`.
-fn read_range(path: &Path, start: u64, len: u64) -> io::Result<Vec<u8>> {
+/// Append `len` bytes of the file at `path`, starting at `start`, to `out`.
+fn read_range_into(path: &Path, start: u64, len: u64, out: &mut Vec<u8>) -> io::Result<()> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
-    let mut buffer = vec![0_u8; usize::try_from(len).map_err(|_| invalid_data("range too large"))?];
-    file.read_exact(&mut buffer)?;
-    Ok(buffer)
+    let len = usize::try_from(len).map_err(|_| invalid_data("range too large"))?;
+    let filled = out.len();
+    out.resize(filled.saturating_add(len), 0);
+    if let Err(error) = file.read_exact(out.get_mut(filled..).unwrap_or_default()) {
+        out.truncate(filled);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn file_header_bytes(version: JournalVersion, base_sequence: u64, base_lsn: u64) -> Vec<u8> {
@@ -4193,14 +4573,19 @@ mod tests {
         );
         assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > state_only);
 
-        // A group carrying both pools advances both to the group's own end.
-        coordinator
+        // A group carrying both pools advances both to the group's own end, once
+        // its writes are in the packs. Until then a transaction group holds the
+        // watermarks below its first frame: the packs do not have it yet.
+        let receipt = coordinator
             .publish_tagged_groups(&[
                 (ShardType::State, &[put(3, 3, b"s2")]),
                 (ShardType::EventDag, &[put(4, 4, b"e2")]),
             ])
             .unwrap();
         coordinator.sync().unwrap();
+        assert!(coordinator.committed_lsn_for_pool(ShardType::State) < receipt.first_lsn);
+        assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) < receipt.first_lsn);
+        coordinator.transaction_materialized(receipt.first_lsn);
         let shared = coordinator.committed_lsn();
         assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), shared);
         assert_eq!(
@@ -6801,5 +7186,26 @@ mod tests {
         assert_eq!(broken.groups, directory_of_file(&broken_path));
         fs::remove_file(&broken_path).unwrap();
         fs::remove_file(&reference_path).unwrap();
+    }
+    /// The directory's accounting follows appends and reclaims, and its worst
+    /// case is what the format allows.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn group_directory_accounting_follows_appends_and_reclaims() {
+        use super::{GroupDirectoryStats, GroupMark};
+        let (journal, path) = shared_journal_with_groups("dir_accounting", 9);
+        let stats = journal.directory_stats();
+        assert_eq!(stats.groups, 9);
+        assert!(stats.bytes >= 9 * std::mem::size_of::<GroupMark>() as u64);
+        drop(journal);
+        let (mut journal, _) = Journal::open_shared(&path).unwrap();
+        assert_eq!(journal.directory_stats().groups, 9);
+        journal.reclaim_through(10).unwrap();
+        assert_eq!(journal.directory_stats().groups, 4);
+        // A segment full of the smallest possible groups: a bounded, modest
+        // number of entries.
+        assert!(GroupDirectoryStats::worst_case_groups() > 0);
+        assert!(GroupDirectoryStats::worst_case_bytes() < (1 << 30));
+        fs::remove_file(&path).unwrap();
     }
 }

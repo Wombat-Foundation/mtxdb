@@ -441,6 +441,21 @@ impl SharedDatabase {
             StorageError::Internal("a shared database must open exactly three pools".into())
         })?;
 
+        // This process owns every pool, so it can make a lagging one checkpoint
+        // when its silence has stalled WAL reclaim into the emergency zone. The
+        // coordinator holds only weak references, so it does not keep the pools
+        // alive.
+        let weak_pools: Vec<std::sync::Weak<PackfileStorage>> =
+            pools.iter().map(Arc::downgrade).collect();
+        coordinator.set_blocker_remediation(move |pool| {
+            let storage = weak_pools
+                .get(shard_index(pool))
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(Err(error)) = storage.map(|storage| storage.force_index_checkpoint()) {
+                eprintln!("warning: checkpointing {pool:?} to unblock WAL reclaim failed: {error}");
+            }
+        });
+
         Ok(Self {
             layout,
             coordinator,
@@ -607,6 +622,9 @@ impl SharedDatabase {
             .position(|candidate| std::ptr::eq(candidate.stage.as_ref(), stage))
         {
             let item = queue.swap_remove(index);
+            // Its writes are all in the packs now, so pool coverage may pass it.
+            self.coordinator
+                .transaction_materialized(item.receipt.first_lsn);
             drop(item.overlay);
             Ok(())
         } else {
@@ -1586,7 +1604,7 @@ mod tests {
             PackfileStorage::read_journal_lsn(&db.layout().pool_dir(pool).unwrap())
         };
         let mut idle_lsn: Vec<Option<u64>> = vec![None; ShardType::ALL.len()];
-        let mut active_checkpointed = vec![false; ShardType::ALL.len()];
+        let mut active_advanced = vec![false; ShardType::ALL.len()];
         let mut next = 0u64;
         let mut largest_after_sync = 0u64;
         for round in 0..8 {
@@ -1604,22 +1622,29 @@ mod tests {
                 txn.commit().unwrap();
             }
             for pool in &order {
+                let before = db.pool(*pool).durable_coverage();
                 db.pool(*pool).sync_all().unwrap();
-                let checkpointed = !db.pool(*pool).sync_timings().unwrap().checkpoint.is_zero();
+                let advanced = db.pool(*pool).durable_coverage() > before;
                 let index = ShardType::ALL
                     .iter()
                     .position(|known| known == pool)
                     .unwrap();
                 if active.contains(pool) {
-                    active_checkpointed[index] |= round > 0 && checkpointed;
+                    // Whether it took a full checkpoint or a delta coverage batch,
+                    // the size trigger must make it advance its coverage.
+                    active_advanced[index] |= round > 0 && advanced;
                 } else if round == 0 {
                     idle_lsn[index] = Some(lsn_of(*pool));
                 } else {
-                    assert!(!checkpointed, "round {round}: idle {pool:?} checkpointed");
+                    let timings = db.pool(*pool).sync_timings().unwrap();
+                    assert!(
+                        !advanced && timings.checkpoint.is_zero() && timings.delta_log.is_zero(),
+                        "round {round}: idle {pool:?} did index or coverage work"
+                    );
                     assert_eq!(
                         Some(lsn_of(*pool)),
                         idle_lsn[index],
-                        "round {round}: idle {pool:?} moved its journal.lsn"
+                        "round {round}: idle {pool:?} moved its coverage"
                     );
                 }
             }
@@ -1633,8 +1658,8 @@ mod tests {
                 .position(|known| known == pool)
                 .unwrap();
             assert!(
-                active_checkpointed[index],
-                "{pool:?} never took the size-triggered checkpoint"
+                active_advanced[index],
+                "{pool:?} never advanced its coverage under the size trigger"
             );
         }
         drop(db);
@@ -1726,6 +1751,274 @@ mod tests {
             .put(ShardType::Edges, collection, node(3), &data(b"edge"))
             .unwrap();
         assert_eq!(mixed.stage.touched_pools(), [true, false, true]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Commit `count` transactions, each staging 20 records into every pool in
+    /// `pools`. Stops at the first error.
+    #[cfg(feature = "multi-reader")]
+    fn commit_batch(
+        db: &SharedDatabase,
+        pools: &[ShardType],
+        next: &mut u64,
+        count: usize,
+    ) -> Result<(), crate::storage::StorageError> {
+        use crate::storage::StorageError;
+        let collection = [0x7c; 16];
+        for _ in 0..count {
+            let txn = db.begin_transaction();
+            for _ in 0..20 {
+                let mut id = [0u8; 16];
+                id[..8].copy_from_slice(&next.to_le_bytes());
+                *next = next.saturating_add(1);
+                for pool in pools {
+                    txn.put(*pool, collection, id, &NodeData::from_slice(&[0x5a; 256]))
+                        .map_err(StorageError::Io)?;
+                }
+            }
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
+    /// A small database whose segment cap is 1 MiB, so its trigger is 256 KiB
+    /// and its emergency line 768 KiB.
+    #[cfg(feature = "multi-reader")]
+    fn small_segment_database(name: &str) -> (SharedDatabase, PathBuf) {
+        let root = test_root(name);
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        db.coordinator().set_segment_cap(1 << 20);
+        (db, root)
+    }
+
+    /// `State` and `EventDag` both have committed frames, but only `EventDag` is ever
+    /// synced. With nothing to remediate the lag, reclaim stalls: it must be
+    /// reported with the pool named, `EventDag` must stop repeating a checkpoint
+    /// that cannot help, and a commit that finally hits the hard limit must say
+    /// which pool it is waiting on instead of failing silently.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
+        let (db, root) = small_segment_database("lagging_no_remediation");
+        db.coordinator().set_blocker_remediation(|_| {});
+        let pools = [ShardType::State, ShardType::EventDag];
+        let coordinator = db.coordinator();
+        let emergency = coordinator.segment_cap() - coordinator.segment_cap() / 4;
+        let trigger = coordinator.reclaim_trigger_len();
+        let mut next = 0u64;
+        // Syncs and checkpoints taken while the segment is stalled but short of
+        // the emergency line, where the back-off applies.
+        let mut backed_off_syncs = 0usize;
+        let mut backed_off_checkpoints = 0usize;
+        let mut rounds = 0usize;
+        let failure = loop {
+            // About 10 KiB per round: well under the retry growth (32 KiB).
+            if let Err(error) = commit_batch(&db, &pools, &mut next, 1) {
+                break error;
+            }
+            let in_back_off_zone =
+                coordinator.is_reclaim_stalled() && coordinator.segment_len() < emergency;
+            db.pool(ShardType::EventDag).sync_all().unwrap();
+            if in_back_off_zone {
+                backed_off_syncs += 1;
+                if !db
+                    .pool(ShardType::EventDag)
+                    .sync_timings()
+                    .unwrap()
+                    .checkpoint
+                    .is_zero()
+                {
+                    backed_off_checkpoints += 1;
+                }
+            }
+            rounds += 1;
+            assert!(rounds < 400, "the segment never filled");
+        };
+        let message = failure.to_string();
+        assert!(message.contains("segment is full"), "{message}");
+        assert!(
+            message.contains("waiting on pools") && message.contains("State"),
+            "the error must name the lagging pool: {message}"
+        );
+        assert!(coordinator.is_reclaim_stalled());
+        assert_eq!(coordinator.reclaim_stalls(), 1, "one stall, reported once");
+        assert_eq!(coordinator.reclaim_blockers(), vec![ShardType::State]);
+        // The segment may only retry after growing by an eighth of the trigger,
+        // so the zone allows at most (emergency - trigger) / (trigger / 8)
+        // retries however many syncs happen in it.
+        let bound = usize::try_from((emergency - trigger) / (trigger / 8)).unwrap() + 2;
+        assert!(
+            backed_off_checkpoints <= bound,
+            "{backed_off_checkpoints} forced checkpoints in the back-off zone; at most {bound}"
+        );
+        assert!(
+            backed_off_checkpoints * 2 < backed_off_syncs,
+            "EventDag checkpointed {backed_off_checkpoints} times in {backed_off_syncs} syncs"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The same lag, but the database can make the silent pool checkpoint. Once
+    /// the segment reaches the emergency zone it does, reclaim succeeds, and no
+    /// commit ever fails.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_lagging_pool_is_checkpointed_for_the_caller_before_the_segment_fills() {
+        use crate::PackfileStorage;
+        let (db, root) = small_segment_database("lagging_remediated");
+        let pools = [ShardType::State, ShardType::EventDag];
+        let state_lsn =
+            || PackfileStorage::read_journal_lsn(&db.layout().pool_dir(ShardType::State).unwrap());
+        let mut next = 0u64;
+        for round in 0..120 {
+            commit_batch(&db, &pools, &mut next, 2)
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            db.pool(ShardType::EventDag).sync_all().unwrap();
+            assert!(
+                db.coordinator().segment_len() < db.coordinator().segment_cap(),
+                "round {round}: the segment reached its cap"
+            );
+        }
+        assert!(
+            db.coordinator().reclaim_stalls() >= 1,
+            "a stall must have been seen"
+        );
+        assert!(state_lsn() > 0, "State was never made to checkpoint");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A burst of commits between syncs can outrun the headroom the trigger
+    /// leaves: the segment fills, commits are refused with a clear error, and
+    /// one sync reclaims enough that commits work again with nothing lost.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_commit_burst_that_fills_the_segment_is_refused_then_recovers_after_a_sync() {
+        let (db, root) = small_segment_database("burst_fills_segment");
+        let pools = [ShardType::EventDag];
+        let mut next = 0u64;
+        let mut committed = 0u64;
+        let error = loop {
+            match commit_batch(&db, &pools, &mut next, 1) {
+                Ok(()) => committed = committed.saturating_add(1),
+                Err(error) => break error,
+            }
+            assert!(committed < 1000, "the segment never filled");
+        };
+        let message = error.to_string();
+        assert!(message.contains("segment is full"), "{message}");
+        assert!(db.coordinator().segment_len() > db.coordinator().reclaim_trigger_len());
+        // No sync ran during the burst, so it went straight past the trigger.
+        db.pool(ShardType::EventDag).sync_all().unwrap();
+        assert!(db.coordinator().segment_len() < db.coordinator().reclaim_trigger_len());
+        commit_batch(&db, &pools, &mut next, 1).unwrap();
+        // Every commit that succeeded before the refusal is still readable.
+        let collection = [0x7c; 16];
+        let mut first = [0u8; 16];
+        first[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(db
+            .pool(ShardType::EventDag)
+            .get_read_committed(&collection, &[first])
+            .unwrap()[0]
+            .is_some());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A transaction group is published to the WAL before its writes are
+    /// materialized into the packs. A checkpoint in that window must not record
+    /// coverage of frames the packs do not hold yet, or the WAL could be
+    /// reclaimed past them and a crash would lose an acknowledged commit.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_checkpoint_does_not_claim_an_unmaterialized_transaction() {
+        use crate::PackfileStorage;
+        let root = test_root("checkpoint_unmaterialized");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let transaction = db.begin_transaction();
+        transaction
+            .put(ShardType::State, [0x91; 16], node(1), &data(b"state"))
+            .unwrap();
+        let mut overlay = Some(activate_for(&db, &transaction.stage));
+        db.publish_transaction(&transaction.stage).unwrap();
+        transaction.stage.begin_materialization().unwrap();
+        let receipt = transaction.stage.published_receipt().unwrap();
+        db.register_new_recovery_stage(Arc::clone(&transaction.stage), receipt, &mut overlay)
+            .unwrap();
+        // The group is published but nothing has been written to the State pack.
+        for pool in ShardType::ALL {
+            db.pool(pool).sync_all().unwrap();
+        }
+        let covered =
+            PackfileStorage::read_journal_lsn(&db.layout().pool_dir(ShardType::State).unwrap());
+        assert!(
+            covered < receipt.first_lsn,
+            "State claims coverage through {covered} but its frame at LSN {} is not in any pack",
+            receipt.first_lsn
+        );
+        // The consequence a claim would have: the WAL group, the only copy of an
+        // acknowledged commit, being reclaimed.
+        let kept = crate::journal::Journal::scan_read_only(db.layout().shared_wal_path())
+            .unwrap()
+            .groups
+            .len();
+        assert_eq!(
+            kept, 1,
+            "the WAL must keep the group until its writes are in the packs"
+        );
+        drop((transaction, overlay));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two pools carry frames and each advances its coverage by a delta batch,
+    /// never a full checkpoint. The shared segment is reclaimed only once both
+    /// have reported: after the first pool's step the second still holds it,
+    /// and after the second's the reclaimed segment holds no covered group.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn shared_reclaim_waits_for_every_pools_delta_coverage_batch() {
+        let (db, root) = small_segment_database("shared_delta_coverage");
+        let pools = [ShardType::State, ShardType::EventDag];
+        let coordinator = db.coordinator();
+        let mut next = 0u64;
+        // A first sync of each pool takes its initial full checkpoint.
+        commit_batch(&db, &pools, &mut next, 1).unwrap();
+        for pool in pools {
+            db.pool(pool).sync_all().unwrap();
+        }
+        // Grow the segment past the trigger with both pools' frames.
+        while coordinator.segment_len() <= coordinator.reclaim_trigger_len() {
+            commit_batch(&db, &pools, &mut next, 1).unwrap();
+        }
+        let before = coordinator.segment_len();
+        db.pool(ShardType::EventDag).sync_all().unwrap();
+        let timings = db.pool(ShardType::EventDag).sync_timings().unwrap();
+        assert!(
+            timings.checkpoint.is_zero(),
+            "EventDag must advance by a delta batch"
+        );
+        assert!(!timings.delta_log.is_zero());
+        assert_eq!(
+            coordinator.segment_len(),
+            before,
+            "State has not reported, so nothing may be reclaimed"
+        );
+        assert_eq!(coordinator.reclaim_blockers(), vec![ShardType::State]);
+
+        db.pool(ShardType::State).sync_all().unwrap();
+        let timings = db.pool(ShardType::State).sync_timings().unwrap();
+        assert!(
+            timings.checkpoint.is_zero(),
+            "State must advance by a delta batch"
+        );
+        assert!(
+            coordinator.segment_len() < before,
+            "both pools have reported, so the segment shrinks"
+        );
+        assert!(coordinator.reclaim_blockers().is_empty());
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

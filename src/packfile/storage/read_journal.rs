@@ -837,7 +837,7 @@ impl PackfileStorage {
         path: &std::path::Path,
         pool: crate::layout::ShardType,
     ) -> Result<(), StorageError> {
-        let covered = Self::read_journal_lsn(&self.base_dir);
+        let covered = self.durable_coverage();
         // Keep the previous overlay's scan position and tail fingerprint, and
         // drop only its entries. Every earlier transaction is fully
         // materialized (no user held the overlay), so those entries are in the

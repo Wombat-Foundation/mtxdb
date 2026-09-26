@@ -123,10 +123,12 @@ const TRAILER_CRC_OFFSET: usize = 4;
 const V3_INCREMENTAL: u8 = 0x01;
 const V3_COLLECTION_SNAPSHOT: u8 = 0x02;
 const V3_COLLECTION_TOMBSTONE: u8 = 0x03;
+const V3_COVERAGE: u8 = 0x04;
 const V3_FRAME_HEADER_LEN: usize = 1 + 4;
 const V3_FRAME_TRAILER_LEN: usize = 4;
 const V3_SNAPSHOT_FIXED_LEN: usize = 16 + 8 + 8 + 4;
 const V3_TOMBSTONE_LEN: usize = 16 + 8;
+const V3_COVERAGE_LEN: usize = 8;
 
 /// One v3 operation in a count-framed delta batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +155,18 @@ pub enum DeltaOperation {
         collection_id: [u8; 16],
         /// Generation observed by the deletion operation.
         generation: u64,
+    },
+    /// The pool's packs durably hold every journal frame of this pool at or
+    /// below `covered_lsn`, and the index operations that precede this one in
+    /// the log describe them.
+    ///
+    /// Always the last operation of its batch, and only ever written after the
+    /// packs were fsynced, so a batch that carries it and validates (framing
+    /// and CRC) is a durable coverage claim. A batch that is torn, or fails its
+    /// CRC, claims nothing.
+    Coverage {
+        /// Highest journal LSN of this pool the packs durably cover.
+        covered_lsn: u64,
     },
 }
 
@@ -190,6 +204,9 @@ pub fn encode_v3_frame(operation: &DeltaOperation) -> io::Result<Vec<u8>> {
             payload.extend_from_slice(collection_id);
             payload.extend_from_slice(&generation.to_le_bytes());
             (V3_COLLECTION_TOMBSTONE, payload)
+        }
+        DeltaOperation::Coverage { covered_lsn } => {
+            (V3_COVERAGE, covered_lsn.to_le_bytes().to_vec())
         }
     };
     let payload_len = u32::try_from(payload.len())
@@ -254,6 +271,14 @@ pub fn decode_v3_frame(bytes: &[u8]) -> Option<(DeltaOperation, usize)> {
             DeltaOperation::CollectionTombstone {
                 collection_id: payload.get(..16)?.try_into().ok()?,
                 generation: u64::from_le_bytes(payload.get(16..24)?.try_into().ok()?),
+            }
+        }
+        V3_COVERAGE => {
+            if payload.len() != V3_COVERAGE_LEN {
+                return None;
+            }
+            DeltaOperation::Coverage {
+                covered_lsn: u64::from_le_bytes(payload.try_into().ok()?),
             }
         }
         _ => return None,
@@ -335,6 +360,8 @@ pub struct DeltaTailFingerprint {
     /// `true` means the file ended mid-batch (expected if writer crashed);
     /// `false` means we read to EOF cleanly after a complete batch.
     pub torn_tail: bool,
+    /// The newest journal coverage any committed batch claims (v3 logs only).
+    pub coverage: Option<u64>,
 }
 
 /// Failure while inspecting a delta log's durable fingerprint.
@@ -412,6 +439,7 @@ fn read_v3_tail_fingerprint(
     let mut pos = u64::try_from(DELTA_LOG_HEADER_LEN)
         .map_err(|_| invalid(path, "log header length overflows u64"))?;
     let mut last_tail = None;
+    let mut coverage: Option<u64> = None;
 
     while pos < len {
         let batch_header_end = pos
@@ -437,7 +465,7 @@ fn read_v3_tail_fingerprint(
                 .try_into()
                 .map_err(|_| invalid(path, "invalid v3 operation count"))?,
         );
-        let Some((cursor, mut batch_crc)) =
+        let Some((cursor, mut batch_crc, batch_coverage)) =
             scan_v3_frames(file, path, len, batch_header_end, operation_count)?
         else {
             break;
@@ -463,6 +491,10 @@ fn read_v3_tail_fingerprint(
             break;
         }
         last_tail = Some(tail_fingerprint);
+        // Only a batch that passed its CRC can claim coverage.
+        if let Some(claimed) = batch_coverage {
+            coverage = Some(coverage.map_or(claimed, |old: u64| old.max(claimed)));
+        }
         pos = trailer_end;
     }
 
@@ -473,6 +505,7 @@ fn read_v3_tail_fingerprint(
         base_fingerprint,
         tail_fingerprint,
         torn_tail: pos < len,
+        coverage,
     })
 }
 
@@ -482,15 +515,21 @@ fn scan_v3_frames(
     file_len: u64,
     mut cursor: u64,
     operation_count: u32,
-) -> Result<Option<(u64, crc32fast::Hasher)>, DeltaFingerprintError> {
+) -> Result<Option<(u64, crc32fast::Hasher, Option<u64>)>, DeltaFingerprintError> {
     let mut batch_crc = crc32fast::Hasher::new();
+    let mut coverage: Option<u64> = None;
     for _ in 0..operation_count {
-        let Some(next) = scan_v3_frame(file, path, file_len, cursor, &mut batch_crc)? else {
+        let Some((next, frame_coverage)) =
+            scan_v3_frame(file, path, file_len, cursor, &mut batch_crc)?
+        else {
             return Ok(None);
         };
         cursor = next;
+        if let Some(claimed) = frame_coverage {
+            coverage = Some(coverage.map_or(claimed, |old: u64| old.max(claimed)));
+        }
     }
-    Ok(Some((cursor, batch_crc)))
+    Ok(Some((cursor, batch_crc, coverage)))
 }
 
 fn scan_v3_frame(
@@ -499,7 +538,7 @@ fn scan_v3_frame(
     file_len: u64,
     cursor: u64,
     batch_crc: &mut crc32fast::Hasher,
-) -> Result<Option<u64>, DeltaFingerprintError> {
+) -> Result<Option<(u64, Option<u64>)>, DeltaFingerprintError> {
     let header_len = u64::try_from(V3_FRAME_HEADER_LEN)
         .map_err(|_| invalid(path, "v3 frame header length overflows u64"))?;
     let Some(header_end) = cursor
@@ -539,8 +578,11 @@ fn scan_v3_frame(
         {
             0
         }
+        V3_COVERAGE if payload_len == u64::try_from(V3_COVERAGE_LEN).unwrap_or(u64::MAX) => 0,
         _ => return Ok(None),
     };
+    let is_coverage = header[0] == V3_COVERAGE;
+    let mut coverage_bytes = [0u8; V3_COVERAGE_LEN];
     let mut frame_crc = crc32fast::Hasher::new();
     frame_crc.update(&header);
     batch_crc.update(&header);
@@ -570,6 +612,10 @@ fn scan_v3_frame(
         let chunk_size = usize::try_from(remaining.min(chunk.len() as u64)).unwrap_or(chunk.len());
         file.read_exact(&mut chunk[..chunk_size])
             .map_err(|error| io_error(path, "read v3 frame payload", error))?;
+        if is_coverage {
+            // A coverage payload is exactly eight bytes, read in one chunk.
+            coverage_bytes.copy_from_slice(&chunk[..V3_COVERAGE_LEN]);
+        }
         frame_crc.update(&chunk[..chunk_size]);
         batch_crc.update(&chunk[..chunk_size]);
         remaining = remaining.saturating_sub(u64::try_from(chunk_size).unwrap_or(u64::MAX));
@@ -581,7 +627,8 @@ fn scan_v3_frame(
         return Ok(None);
     }
     batch_crc.update(&stored_crc);
-    Ok(Some(checksum_end))
+    let coverage = is_coverage.then(|| u64::from_le_bytes(coverage_bytes));
+    Ok(Some((checksum_end, coverage)))
 }
 
 /// Lightweight forward scan of the delta log's last committed
@@ -682,6 +729,7 @@ pub fn read_delta_tail_fingerprint(
         if &batch_hdr[..4] != DELTA_BATCH_MAGIC {
             return match tail_fingerprint {
                 Some(tail_fingerprint) => Ok(Some(DeltaTailFingerprint {
+                    coverage: None,
                     base_fingerprint: base_fp,
                     tail_fingerprint,
                     torn_tail: pos < len,
@@ -755,6 +803,7 @@ pub fn read_delta_tail_fingerprint(
     let torn_tail = pos < len;
     match tail_fingerprint {
         Some(tail_fingerprint) => Ok(Some(DeltaTailFingerprint {
+            coverage: None,
             base_fingerprint: base_fp,
             tail_fingerprint,
             torn_tail,
@@ -783,6 +832,7 @@ pub fn v3_batch_len(operations: &[DeltaOperation]) -> Option<usize> {
                 V3_SNAPSHOT_FIXED_LEN.checked_add(index_blob.len())?
             }
             DeltaOperation::CollectionTombstone { .. } => V3_TOMBSTONE_LEN,
+            DeltaOperation::Coverage { .. } => V3_COVERAGE_LEN,
         };
         u32::try_from(payload_len).ok()?;
         let frame_len = V3_FRAME_HEADER_LEN
@@ -917,6 +967,12 @@ pub struct DeltaLogV3 {
     pub torn_tail: bool,
     /// Every committed operation in file order (torn trailing batches absent).
     pub operations: Vec<DeltaOperation>,
+    /// The newest journal coverage a committed batch claims, if any did.
+    pub coverage: Option<u64>,
+    /// How many of `operations` come up to and including the last coverage
+    /// operation: the prefix whose index changes are exactly what that coverage
+    /// describes. Zero when no batch carries coverage.
+    pub coverage_prefix_ops: usize,
 }
 
 /// Read and structurally validate a v3 delta log.
@@ -949,6 +1005,8 @@ pub fn read_delta_log_v3(path: &Path) -> Option<DeltaLogV3> {
 
     let mut operations: Vec<DeltaOperation> = Vec::new();
     let mut tail_fingerprint: Option<u64> = None;
+    let mut coverage: Option<u64> = None;
+    let mut coverage_prefix_ops = 0usize;
     let mut offset = DELTA_LOG_HEADER_LEN;
     while offset < buf.len() {
         let Some(header_end) = offset.checked_add(DELTA_BATCH_HEADER_LEN) else {
@@ -1007,7 +1065,17 @@ pub fn read_delta_log_v3(path: &Path) -> Option<DeltaLogV3> {
         if batch_crc(frames, batch_tail_fingerprint) != stored_crc {
             break;
         }
+        for operation in &batch_operations {
+            if let DeltaOperation::Coverage { covered_lsn } = operation {
+                // Coverage only moves forward; a lower claim in a later batch
+                // (it should not happen) cannot lower what was proven earlier.
+                coverage = Some(coverage.map_or(*covered_lsn, |old: u64| old.max(*covered_lsn)));
+            }
+        }
         operations.append(&mut batch_operations);
+        if matches!(operations.last(), Some(DeltaOperation::Coverage { .. })) {
+            coverage_prefix_ops = operations.len();
+        }
         tail_fingerprint = Some(batch_tail_fingerprint);
         offset = trailer_end;
     }
@@ -1018,6 +1086,8 @@ pub fn read_delta_log_v3(path: &Path) -> Option<DeltaLogV3> {
         file_len: u64::try_from(offset).unwrap_or(u64::MAX),
         torn_tail,
         operations,
+        coverage,
+        coverage_prefix_ops,
     })
 }
 
@@ -1089,6 +1159,32 @@ pub fn append_v3_batch(
     operations: &[DeltaOperation],
     tail_fingerprint: u64,
 ) -> std::io::Result<usize> {
+    append_v3_batch_with_durability(
+        path,
+        write_header,
+        base_fingerprint,
+        operations,
+        tail_fingerprint,
+        false,
+    )
+}
+
+/// [`append_v3_batch`] that, when `durable`, fsyncs the appended bytes before
+/// returning (and the directory too when the file was just created), so the
+/// batch survives a crash. A batch that carries a coverage claim must be
+/// appended this way: the journal may be reclaimed on the strength of it.
+///
+/// # Errors
+/// Returns an error if the operation count exceeds `u32`, a frame fails to
+/// encode, or a write or fsync fails.
+pub fn append_v3_batch_with_durability(
+    path: &Path,
+    write_header: bool,
+    base_fingerprint: u64,
+    operations: &[DeltaOperation],
+    tail_fingerprint: u64,
+    durable: bool,
+) -> std::io::Result<usize> {
     let operation_count = u32::try_from(operations.len())
         .map_err(|_| std::io::Error::other("delta batch exceeds u32 operation count"))?;
     let mut appended = 0usize;
@@ -1115,6 +1211,14 @@ pub fn append_v3_batch(
         batch_crc(&frames_bytes, tail_fingerprint),
     ))?;
     appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
+    if durable {
+        file.sync_data()?;
+        if write_header {
+            if let Some(parent) = path.parent() {
+                crate::shard::sync_directory(parent)?;
+            }
+        }
+    }
     Ok(appended)
 }
 
@@ -1719,6 +1823,189 @@ mod tests {
         assert!(!decoded.torn_tail);
         assert_eq!(decoded.file_len, fs::metadata(&path).unwrap().len());
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    fn coverage_log_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_delta_cov_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Coverage is an ordinary v3 frame: it round-trips, is sized exactly, and
+    /// its payload must be exactly one LSN.
+    #[test]
+    fn v3_coverage_frame_round_trips() {
+        let coverage = DeltaOperation::Coverage {
+            covered_lsn: 0xDEAD_BEEF,
+        };
+        let encoded = encode_v3_frame(&coverage).unwrap();
+        assert_eq!(
+            encoded.len(),
+            V3_FRAME_HEADER_LEN + V3_COVERAGE_LEN + V3_FRAME_TRAILER_LEN
+        );
+        assert_eq!(
+            decode_v3_frame(&encoded),
+            Some((coverage.clone(), encoded.len()))
+        );
+        assert_eq!(
+            v3_batch_len(&[coverage]).unwrap(),
+            DELTA_BATCH_HEADER_LEN + encoded.len() + DELTA_LOG_TRAILER_LEN
+        );
+        // A coverage frame with the wrong payload width is rejected.
+        let mut frame = vec![V3_COVERAGE];
+        frame.extend_from_slice(&4_u32.to_le_bytes());
+        frame.extend_from_slice(&[1, 2, 3, 4]);
+        frame.extend_from_slice(&crc32fast::hash(&frame).to_le_bytes());
+        assert!(decode_v3_frame(&frame).is_none());
+    }
+
+    /// Both readers report the newest coverage a committed batch claims, and
+    /// the full reader also says which operations that coverage describes.
+    #[test]
+    fn readers_report_the_newest_committed_coverage() {
+        let dir = coverage_log_dir("readers");
+        let path = dir.join(INDEX_DELTA_FILE);
+        let incremental = |bucket: u32| {
+            DeltaOperation::Incremental(DeltaFrame {
+                collection_id: [1; 16],
+                bucket,
+                generation: 1,
+                slot: 5,
+            })
+        };
+        // batch 1: two ops, no coverage
+        append_v3_batch(&path, true, 0xABC, &[incremental(1), incremental(2)], 0x111).unwrap();
+        let log = read_delta_log_v3(&path).unwrap();
+        assert_eq!(log.coverage, None);
+        assert_eq!(log.coverage_prefix_ops, 0);
+        assert_eq!(
+            read_delta_tail_fingerprint(&path)
+                .unwrap()
+                .unwrap()
+                .coverage,
+            None
+        );
+        // batch 2: an op, then coverage
+        append_v3_batch_with_durability(
+            &path,
+            false,
+            0xABC,
+            &[incremental(3), DeltaOperation::Coverage { covered_lsn: 40 }],
+            0x222,
+            true,
+        )
+        .unwrap();
+        // batch 3: more ops with no coverage: a later claim is not implied
+        append_v3_batch(&path, false, 0xABC, &[incremental(4)], 0x333).unwrap();
+        let log = read_delta_log_v3(&path).unwrap();
+        assert_eq!(log.coverage, Some(40));
+        assert_eq!(
+            log.coverage_prefix_ops, 4,
+            "two + one + the coverage op itself"
+        );
+        assert_eq!(log.operations.len(), 5);
+        assert_eq!(
+            read_delta_tail_fingerprint(&path)
+                .unwrap()
+                .unwrap()
+                .coverage,
+            Some(40)
+        );
+        // batch 4: a lower claim never lowers the coverage
+        append_v3_batch(
+            &path,
+            false,
+            0xABC,
+            &[DeltaOperation::Coverage { covered_lsn: 10 }],
+            0x444,
+        )
+        .unwrap();
+        let log = read_delta_log_v3(&path).unwrap();
+        assert_eq!(log.coverage, Some(40));
+        assert_eq!(log.coverage_prefix_ops, 6);
+        assert_eq!(
+            read_delta_tail_fingerprint(&path)
+                .unwrap()
+                .unwrap()
+                .coverage,
+            Some(40)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A torn batch, or one whose bytes were damaged, claims nothing: coverage
+    /// is whatever the last intact batch proved. This is the conservative
+    /// outcome, since a lower coverage only makes recovery replay more.
+    #[test]
+    fn a_torn_or_damaged_coverage_batch_claims_nothing() {
+        let dir = coverage_log_dir("torn");
+        let path = dir.join(INDEX_DELTA_FILE);
+        let incremental = DeltaOperation::Incremental(DeltaFrame {
+            collection_id: [2; 16],
+            bucket: 1,
+            generation: 1,
+            slot: 5,
+        });
+        append_v3_batch_with_durability(
+            &path,
+            true,
+            0xABC,
+            &[
+                incremental.clone(),
+                DeltaOperation::Coverage { covered_lsn: 7 },
+            ],
+            0x111,
+            true,
+        )
+        .unwrap();
+        let intact_len = fs::metadata(&path).unwrap().len();
+        append_v3_batch_with_durability(
+            &path,
+            false,
+            0xABC,
+            &[incremental, DeltaOperation::Coverage { covered_lsn: 99 }],
+            0x222,
+            true,
+        )
+        .unwrap();
+        let full = fs::read(&path).unwrap();
+        let intact_len = usize::try_from(intact_len).unwrap();
+
+        // Every prefix that stops inside the second batch loses its claim.
+        for cut in (intact_len + 1)..full.len() {
+            fs::write(&path, &full[..cut]).unwrap();
+            let log = read_delta_log_v3(&path).unwrap();
+            assert_eq!(log.coverage, Some(7), "cut at {cut}");
+            assert!(log.torn_tail, "cut at {cut}");
+            assert_eq!(
+                read_delta_tail_fingerprint(&path)
+                    .unwrap()
+                    .unwrap()
+                    .coverage,
+                Some(7),
+                "light reader, cut at {cut}"
+            );
+        }
+        // A single flipped bit anywhere in the second batch does the same.
+        for offset in intact_len..full.len() {
+            let mut damaged = full.clone();
+            damaged[offset] ^= 0x01;
+            fs::write(&path, &damaged).unwrap();
+            let claimed = read_delta_log_v3(&path).unwrap().coverage;
+            assert_eq!(claimed, Some(7), "bit flip at {offset}");
+            let light = read_delta_tail_fingerprint(&path)
+                .ok()
+                .flatten()
+                .and_then(|log| log.coverage);
+            assert_eq!(light, Some(7), "light reader, bit flip at {offset}");
+        }
+        // A log whose first batch is damaged claims nothing at all.
+        let mut damaged = full.clone();
+        damaged[DELTA_LOG_HEADER_LEN + DELTA_BATCH_HEADER_LEN + 3] ^= 0xFF;
+        fs::write(&path, &damaged).unwrap();
+        assert!(read_delta_log_v3(&path).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
