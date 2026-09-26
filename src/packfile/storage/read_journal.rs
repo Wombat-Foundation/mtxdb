@@ -946,15 +946,23 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
-        let mut unresolved: Vec<usize> = Vec::new();
-
         // Refresh outside the read lock: this may reload the checkpoint-bound
         // index if the writer reclaimed past this reader's coverage. The
         // returned guard keeps the applied overlay locked for the lookup below,
         // so another reader cannot reset it in between.
         let guard = self.refresh_read_journal()?;
 
+        // No overlay is installed (a writer with no transaction in flight):
+        // the live index is the whole answer, so skip the per-id bookkeeping
+        // below.
+        if guard.is_none() {
+            drop(guard);
+            let _fallback = FallbackReadGuard::enter();
+            return self.get_many_with_refresh(collection_id, ids);
+        }
+
+        let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
+        let mut unresolved: Vec<usize> = Vec::new();
         {
             if let Some(overlay) = guard.as_ref() {
                 match overlay.puts.get(collection_id) {

@@ -1520,6 +1520,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `sync_all` after the first checkpoint only appends index deltas, which do
+    /// not record journal coverage, so the shared WAL was never reclaimed again
+    /// and grew until commits failed with "journal segment is full". A large
+    /// segment must force a full checkpoint so the WAL stays bounded.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn repeated_syncs_keep_the_shared_wal_bounded() {
+        let root = test_root("wal_bounded");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x7a; 16];
+        let wal = db.layout().shared_wal_path();
+        let mut next = 0u64;
+        let mut largest_after_sync = 0u64;
+        for round in 0..8 {
+            for _ in 0..60 {
+                let txn = db.begin_transaction();
+                for _ in 0..20 {
+                    let mut id = [0u8; 16];
+                    id[..8].copy_from_slice(&next.to_le_bytes());
+                    next += 1;
+                    txn.put(
+                        ShardType::EventDag,
+                        collection,
+                        id,
+                        &NodeData::from_slice(&[0x5a; 256]),
+                    )
+                    .unwrap();
+                }
+                txn.commit().unwrap();
+            }
+            for pool in ShardType::ALL {
+                db.pool(pool).sync_all().unwrap();
+            }
+            if round > 0 {
+                largest_after_sync = largest_after_sync.max(std::fs::metadata(&wal).unwrap().len());
+            }
+        }
+        assert!(
+            largest_after_sync < crate::journal::RECLAIM_TRIGGER_LEN,
+            "the WAL stayed at {largest_after_sync} bytes after syncs; it must be reclaimed \
+             once past {} bytes",
+            crate::journal::RECLAIM_TRIGGER_LEN
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn transaction_commit_applies_and_publishes_once() {
         let root = test_root("transaction_commit");

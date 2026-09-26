@@ -8568,6 +8568,17 @@ impl PackfileStorage {
     /// recovery path rather than a steady-state write.
     fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         let _persist_guard = self.index_persist_lock.lock();
+        // A delta append does not advance the journal coverage, so on its own it
+        // never lets the segment shrink and the journal would fill to its hard
+        // limit. Once the segment is large, take the full checkpoint (which
+        // records coverage and reclaims), even if this pool's index is clean:
+        // a shared segment is only reclaimed once every pool has reported.
+        let journal_needs_reclaim = self
+            .journal()
+            .is_some_and(|journal| journal.segment_len() > crate::journal::RECLAIM_TRIGGER_LEN);
+        if journal_needs_reclaim {
+            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             // Nothing to checkpoint, but a sidecar lost while the checkpoint
             // survived still has to be regenerated. A sidecar that is merely
@@ -8583,7 +8594,7 @@ impl PackfileStorage {
         // fingerprint the checkpoint just became. Every other dirty path
         // records staleness instead and writes nothing.
         let mut sidecar_anchor = false;
-        if self.delta_state_needs_full_rewrite() {
+        if journal_needs_reclaim || self.delta_state_needs_full_rewrite() {
             if self.should_defer_checkpoint_rewrite() {
                 // Write-neutral stopgap: the caller already synced the
                 // packfiles, so skipping the acceleration rewrite costs only

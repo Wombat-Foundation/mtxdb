@@ -135,6 +135,16 @@ const MIN_FRAME_LEN: usize = FRAME_FIXED_LEN + FRAME_TRAILER_LEN;
 const MAX_GROUP_LEN: u64 = 256 << 20;
 const MAX_SEGMENT_LEN: u64 = (256 << 20) + FILE_HEADER_LEN as u64;
 
+/// Segment size above which a sync forces a full index checkpoint, because only
+/// a full checkpoint records journal coverage and lets the segment be
+/// reclaimed. A quarter of [`MAX_SEGMENT_LEN`] leaves room for writes that land
+/// while the checkpoint runs, so a busy writer never reaches the hard limit.
+#[cfg(not(test))]
+pub(crate) const RECLAIM_TRIGGER_LEN: u64 = 64 << 20;
+/// Small under `cfg(test)` so a test can cross it with a few hundred KiB.
+#[cfg(test)]
+pub(crate) const RECLAIM_TRIGGER_LEN: u64 = 256 << 10;
+
 /// A durable mutation represented in a journal group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation {
@@ -1931,6 +1941,12 @@ impl JournalCoordinator {
         // the old boundary.
         self.wake_durable_waiters();
         DurabilityToken { lsn: target_lsn }
+    }
+
+    /// Current length of the journal segment file, including its header.
+    #[must_use]
+    pub fn segment_len(&self) -> u64 {
+        self.journal.lock().file_len
     }
 
     /// Highest LSN any caller has requested through [`Self::request_durable`].
