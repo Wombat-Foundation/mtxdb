@@ -4087,6 +4087,11 @@ impl PackfileStorage {
             };
             #[cfg(not(feature = "multi-reader"))]
             let committed = journal.committed_lsn();
+            // `max` cannot inflate the claim past the materialization floor:
+            // LSNs are assigned in increasing order at publish, so a group
+            // published after `durable_coverage` was proven starts above it, and
+            // the floor `committed` is clamped to (`first_lsn - 1`) is never
+            // below it. The `max` only keeps the value from moving backwards.
             committed.max(self.durable_coverage())
         })
     }

@@ -518,6 +518,8 @@ fn scan_v3_frames(
 ) -> Result<Option<(u64, crc32fast::Hasher, Option<u64>)>, DeltaFingerprintError> {
     let mut batch_crc = crc32fast::Hasher::new();
     let mut coverage: Option<u64> = None;
+    let mut claims = 0usize;
+    let mut last_was_claim = false;
     for _ in 0..operation_count {
         let Some((next, frame_coverage)) =
             scan_v3_frame(file, path, file_len, cursor, &mut batch_crc)?
@@ -525,9 +527,15 @@ fn scan_v3_frames(
             return Ok(None);
         };
         cursor = next;
+        last_was_claim = frame_coverage.is_some();
         if let Some(claimed) = frame_coverage {
-            coverage = Some(coverage.map_or(claimed, |old: u64| old.max(claimed)));
+            claims = claims.saturating_add(1);
+            coverage = Some(claimed);
         }
+    }
+    // The same shape rule `read_delta_log_v3` applies: one claim, and last.
+    if claims > 1 || (claims == 1 && !last_was_claim) {
+        return Ok(None);
     }
     Ok(Some((cursor, batch_crc, coverage)))
 }
@@ -1988,6 +1996,44 @@ mod tests {
             assert_eq!(log.coverage, Some(7), "case {index}");
             assert_eq!(log.coverage_prefix_ops, 2, "case {index}");
             assert_eq!(log.operations.len(), 2, "case {index}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The two readers make the same durability decision from the same bytes,
+    /// including for batches whose claim is misplaced or repeated.
+    #[test]
+    fn the_tail_scanner_and_the_full_reader_agree_on_coverage() {
+        let incremental = DeltaOperation::Incremental(DeltaFrame {
+            collection_id: [2; 16],
+            bucket: 1,
+            generation: 1,
+            slot: 5,
+        });
+        let claim = |covered_lsn| DeltaOperation::Coverage { covered_lsn };
+        let cases: [Vec<DeltaOperation>; 4] = [
+            vec![incremental.clone(), claim(50)],
+            vec![claim(50), incremental.clone()],
+            vec![claim(50), claim(60)],
+            vec![incremental.clone()],
+        ];
+        for (index, batch) in cases.iter().enumerate() {
+            let dir = coverage_log_dir(&format!("agree-{index}"));
+            let path = dir.join(INDEX_DELTA_FILE);
+            append_v3_batch_with_durability(
+                &path,
+                true,
+                0xABC,
+                &[incremental.clone(), claim(7)],
+                0x111,
+                true,
+            )
+            .unwrap();
+            append_v3_batch_with_durability(&path, false, 0xABC, batch, 0x222, true).unwrap();
+            let full = read_delta_log_v3(&path).unwrap();
+            let tail = read_delta_tail_fingerprint(&path).unwrap().unwrap();
+            assert_eq!(full.coverage, tail.coverage, "case {index}");
+            assert_eq!(full.tail_fingerprint, tail.tail_fingerprint, "case {index}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }
