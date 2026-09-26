@@ -1282,6 +1282,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A retained overlay is cleared with its delete boundary, so an earlier
+    /// transaction's collection delete must neither resurrect old records nor
+    /// hide records written after it.
+    #[test]
+    fn reused_overlay_keeps_a_collection_delete_from_resurrecting_records() {
+        let root = test_root("overlay_reuse_delete");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x72; 16];
+        let put = |id: u8, value: &'static [u8]| {
+            let txn = db.begin_transaction();
+            txn.put(ShardType::EventDag, collection, node(id), &data(value))
+                .unwrap();
+            txn.commit().unwrap();
+        };
+        put(1, b"before");
+        let delete = db.begin_transaction();
+        delete
+            .delete_collection(ShardType::EventDag, collection)
+            .unwrap();
+        delete.commit().unwrap();
+        put(2, b"after");
+        assert_eq!(
+            live_get(&db, ShardType::EventDag, collection, node(1)),
+            None
+        );
+        assert_eq!(
+            live_get(&db, ShardType::EventDag, collection, node(2)),
+            Some(b"after".to_vec())
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Lone transactions alternate between two pools while a checkpoint
+    /// reclaims the WAL in between. The retained overlays must rebuild past the
+    /// replaced segment and keep applying only their own pool's frames.
+    #[test]
+    fn reused_overlay_survives_reclaim_with_interleaved_pools() {
+        let root = test_root("overlay_reuse_reclaim");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let state = [0x73; 16];
+        let events = [0x74; 16];
+        let commit_pair = |round: u8| {
+            for (pool, collection) in [(ShardType::State, state), (ShardType::EventDag, events)] {
+                let txn = db.begin_transaction();
+                txn.put(pool, collection, node(round), &data(b"value"))
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+        };
+        for round in 1..=3 {
+            commit_pair(round);
+        }
+        db.pool(ShardType::State).sync_all().unwrap();
+        db.pool(ShardType::EventDag).sync_all().unwrap();
+        for round in 4..=6 {
+            commit_pair(round);
+        }
+        for round in 1..=6 {
+            assert_eq!(
+                live_get(&db, ShardType::State, state, node(round)),
+                Some(b"value".to_vec())
+            );
+            assert_eq!(
+                live_get(&db, ShardType::EventDag, events, node(round)),
+                Some(b"value".to_vec())
+            );
+            // Each pool holds only its own collection.
+            assert_eq!(live_get(&db, ShardType::State, events, node(round)), None);
+            assert_eq!(live_get(&db, ShardType::EventDag, state, node(round)), None);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn transaction_commit_applies_and_publishes_once() {
         let root = test_root("transaction_commit");

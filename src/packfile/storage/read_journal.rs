@@ -763,6 +763,13 @@ impl PackfileStorage {
     /// The overlay is bound to the pool's checkpoint coverage (`journal.lsn`):
     /// frames at or below it are in the durable index, and frames above it are
     /// served from the journal until the transaction is fully materialized.
+    /// Normal commits scan only the suffix appended since the previous
+    /// activation, because the previous overlay's position is kept; a full
+    /// scan from the segment start happens only for the first activation, after
+    /// a reclaim or replacement, or on recovery. Only `SharedDatabase`, the
+    /// segment's single writer, reaches this path; read-only workers use
+    /// [`Self::enable_read_journal`].
+    ///
     /// It is built directly and refreshed once with `accept_reclaimed_prefix`
     /// set, rather than going through `enable_read_journal_inner`, whose
     /// refresh-then-reload path is the reader's and cannot succeed here.
