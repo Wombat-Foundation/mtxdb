@@ -79,15 +79,25 @@ const FH_VERSION: std::ops::Range<usize> = 8..12;
 const FH_BASE_SEQUENCE: std::ops::Range<usize> = 12..20;
 const FH_BASE_LSN: std::ops::Range<usize> = 20..28;
 const FH_BASE_CRC: std::ops::Range<usize> = 28..32;
-/// Embedded durability mark: length and LSN covered by its own CRC. These
-/// bytes are deliberately outside the immutable header CRC, because the mark
-/// is updated after the data fsync and need not be fsynced itself.
-const FH_DURABLE_LEN: std::ops::Range<usize> = 32..40;
-const FH_DURABLE_LSN: std::ops::Range<usize> = 40..48;
-const FH_DURABLE_CRC: std::ops::Range<usize> = 48..52;
 /// Header bytes covered by the immutable base CRC.
 const FH_BASE_CRC_COVERED: std::ops::Range<usize> = 0..FH_BASE_CRC.start;
-const FILE_HEADER_LEN: usize = FH_DURABLE_CRC.end;
+
+/// Size of the unit a torn write can damage. 4096 covers advanced-format disks,
+/// whose physical sector, and so atomic write unit, is 4 KiB: with 512-byte
+/// spacing both slots and the base header could share one such unit and a
+/// single torn write could reach all three. It costs 12 KiB per segment.
+const MARK_SECTOR_LEN: usize = 4096;
+/// The durability mark lives in two alternating slots, each alone in its own
+/// [`MARK_SECTOR_LEN`] unit after the one that holds the immutable base header. A torn write
+/// of one slot can therefore damage only that slot: never the other slot, and
+/// never the base header, which nothing rewrites after the file is created.
+/// Each slot is `generation(8) | durable_len(8) | durable_lsn(8) | crc(4)`; an
+/// all-zero slot has never been written and claims nothing.
+const MARK_SLOT_OFFSETS: [usize; 2] = [MARK_SECTOR_LEN, 2 * MARK_SECTOR_LEN];
+const MARK_SLOT_LEN: usize = 28;
+/// Where journal groups begin: after the base header's sector and both mark
+/// sectors. Everything that needs "the end of the header" uses this.
+const FILE_HEADER_LEN: usize = 3 * MARK_SECTOR_LEN;
 
 // Group header field byte ranges (`GROUP_HEADER_LEN` is the sum of the fields).
 const GH_MAGIC: std::ops::Range<usize> = 0..4;
@@ -958,10 +968,8 @@ struct SyncCapture {
     path: PathBuf,
     /// Length of the segment when the handle was cloned. Everything appended
     /// before that point is covered by the fsync, so this is what the
-    /// durability hint may claim once the fsync returns.
+    /// durability mark may claim once the fsync returns.
     file_len: u64,
-    /// The segment's format version, which decides whether it keeps an embedded mark.
-    version: JournalVersion,
 }
 
 /// Result of validating a journal file.
@@ -1035,10 +1043,12 @@ pub struct Journal {
     /// Current on-disk length tracked after open, append, and reclaim. Keeping
     /// this in memory avoids an fstat on every group publication.
     file_len: u64,
-    /// Base sequence and LSN from the file header, which key the durability
-    /// hint to this incarnation of the segment.
+    /// Base sequence and LSN from the file header.
     base_sequence: u64,
     base_lsn: u64,
+    /// Generation of the newest durability mark written to this segment; the
+    /// next mark uses the next generation, in the other slot.
+    mark_generation: u64,
     /// On-disk format version of this segment.
     version: JournalVersion,
     next_sequence: u64,
@@ -1668,7 +1678,6 @@ impl JournalCoordinator {
             sequence: journal.next_sequence.saturating_sub(1),
             path: journal.path.clone(),
             file_len: journal.file_len,
-            version: journal.version,
         })
     }
 
@@ -1721,15 +1730,9 @@ impl JournalCoordinator {
         // The fsync has returned, so every byte up to the captured length is
         // durable. Record that, after the fact and without an fsync of its own,
         // so recovery can tell a crash tail above it from corruption below it.
-        {
-            let mut journal = self.journal.lock();
-            write_durable_mark(
-                &mut journal.file,
-                capture.version,
-                capture.file_len,
-                capture.through_lsn,
-            );
-        }
+        self.journal
+            .lock()
+            .write_mark(capture.file_len, capture.through_lsn);
         // The groups were appended at publication, so this fsync wrote no
         // bytes: the receipt reports the durable range this call advanced.
         CommitReceipt {
@@ -2627,9 +2630,6 @@ impl Journal {
             // fsync makes a truncation durable, including one that dropped
             // every group, so a dropped tail cannot reappear.
             file.sync_all()?;
-            if let Some(last) = scan.groups.last() {
-                write_durable_mark(&mut file, version, scan.valid_len, last.last_lsn);
-            }
         }
         let next_sequence = scan
             .groups
@@ -2640,20 +2640,28 @@ impl Journal {
             .last()
             .map_or(base_lsn, |group| group.last_lsn.saturating_add(1));
 
-        Ok((
-            Self {
-                path,
-                file,
-                file_len: scan.valid_len,
-                base_sequence,
-                base_lsn,
-                version,
-                next_sequence,
-                next_lsn,
-                poisoned: false,
-            },
-            scan,
-        ))
+        let mark_generation = if version.is_pool_tagged() {
+            newest_mark(&bytes).map_or(0, |slot| slot.generation)
+        } else {
+            0
+        };
+        let mut journal = Self {
+            path,
+            file,
+            file_len: scan.valid_len,
+            base_sequence,
+            base_lsn,
+            mark_generation,
+            version,
+            next_sequence,
+            next_lsn,
+            poisoned: false,
+        };
+        if let Some(last) = scan.groups.last() {
+            // Recovery fsynced what it kept above, so record that in the mark.
+            journal.write_mark(scan.valid_len, last.last_lsn);
+        }
+        Ok((journal, scan))
     }
 
     /// Append a non-empty group and its commit trailer, without fsyncing.
@@ -2868,14 +2876,45 @@ impl Journal {
             return Err(error);
         }
         // The fsync returned, so everything appended so far is durable: record
-        // that in the embedded durability mark, after the fact.
-        write_durable_mark(
-            &mut self.file,
-            self.version,
-            self.file_len,
-            self.next_lsn.saturating_sub(1),
-        );
+        // that in the durability mark, after the fact.
+        self.write_mark(self.file_len, self.next_lsn.saturating_sub(1));
         Ok(())
+    }
+
+    /// Record, in the slot not holding the newest mark, that `durable_len`
+    /// bytes through `through_lsn` are durable. Call it only after an fsync
+    /// that covered them, so the mark can only under-claim.
+    ///
+    /// Only pool-tagged segments keep a mark. The slot is written with a
+    /// positioned write, so it never moves the append cursor. A failed write
+    /// is ignored: the previous mark stays in the other slot, or recovery sees
+    /// no mark and truncates conservatively.
+    fn write_mark(&mut self, durable_len: u64, through_lsn: u64) {
+        if !self.version.is_pool_tagged() {
+            return;
+        }
+        let generation = self.mark_generation.saturating_add(1);
+        let bytes = encode_mark_slot(MarkSlot {
+            generation,
+            durable_len,
+            durable_lsn: through_lsn,
+        });
+        let slot = usize::try_from(generation % 2).unwrap_or(0);
+        let offset = u64::try_from(MARK_SLOT_OFFSETS[slot]).unwrap_or(u64::MAX);
+        #[cfg(unix)]
+        let written = std::os::unix::fs::FileExt::write_all_at(&self.file, &bytes, offset);
+        // Elsewhere a positioned write moves the shared cursor, so restore it
+        // to the end of the segment, where appends continue. Appends take the
+        // journal lock too, so nothing writes in between.
+        #[cfg(not(unix))]
+        let written = self
+            .file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| self.file.write_all(&bytes))
+            .and_then(|()| self.file.seek(SeekFrom::Start(self.file_len)).map(drop));
+        if written.is_ok() {
+            self.mark_generation = generation;
+        }
     }
 
     /// Append a non-empty group and durably sync it.
@@ -2964,6 +3003,22 @@ impl Journal {
         for group in &retained {
             encode_group(group, self.version, &mut rebuilt)?;
         }
+        // The rebuilt file is fsynced before it replaces the segment, so all of
+        // it is durable. Put its mark inside it, first generation, so the mark
+        // is durable with the data and the old segment's marks, which described
+        // offsets that no longer exist, are simply gone.
+        let rebuilt_mark = self.version.is_pool_tagged().then(|| MarkSlot {
+            generation: 1,
+            durable_len: u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
+            durable_lsn: retained
+                .last()
+                .map_or(new_base_lsn.saturating_sub(1), |group| group.last_lsn),
+        });
+        if let Some(mark) = rebuilt_mark {
+            let offset = MARK_SLOT_OFFSETS[1];
+            let end = offset.saturating_add(MARK_SLOT_LEN);
+            rebuilt[offset..end].copy_from_slice(&encode_mark_slot(mark));
+        }
 
         let temp_path = self.path.with_extension("rotate");
         let write_result = (|| -> io::Result<()> {
@@ -2996,17 +3051,7 @@ impl Journal {
         self.file_len = u64::try_from(rebuilt.len()).unwrap_or(u64::MAX);
         self.base_sequence = new_base_sequence;
         self.base_lsn = new_base_lsn;
-        // The rebuilt file was fsynced before the rename, so all of it is
-        // durable. Re-key the hint to the new base: the old one described
-        // offsets that no longer exist and is ignored from here on.
-        write_durable_mark(
-            &mut self.file,
-            self.version,
-            self.file_len,
-            retained
-                .last()
-                .map_or(new_base_lsn.saturating_sub(1), |group| group.last_lsn),
-        );
+        self.mark_generation = u64::from(rebuilt_mark.is_some());
         if let Err(error) = sync_parent_dir(&self.path) {
             self.poisoned = true;
             return Err(error);
@@ -3069,61 +3114,65 @@ fn validate_file_header(bytes: &[u8]) -> io::Result<(JournalVersion, u64, u64)> 
     ))
 }
 
-/// Read the embedded durability mark. Invalid or absent marks are treated as
-/// unknown, never as proof that a suffix is durable.
+/// One durability-mark slot: which generation it is, and what it claims.
+#[derive(Clone, Copy)]
+struct MarkSlot {
+    generation: u64,
+    durable_len: u64,
+    durable_lsn: u64,
+}
+
+fn encode_mark_slot(slot: MarkSlot) -> [u8; MARK_SLOT_LEN] {
+    let mut bytes = [0_u8; MARK_SLOT_LEN];
+    bytes[..8].copy_from_slice(&slot.generation.to_le_bytes());
+    bytes[8..16].copy_from_slice(&slot.durable_len.to_le_bytes());
+    bytes[16..24].copy_from_slice(&slot.durable_lsn.to_le_bytes());
+    let mut crc = Hasher::new();
+    crc.update(&bytes[..24]);
+    bytes[24..28].copy_from_slice(&crc.finalize().to_le_bytes());
+    bytes
+}
+
+/// Decode one slot: `None` if it is unwritten (all zero) or fails its checksum.
+fn decode_mark_slot(bytes: &[u8]) -> Option<MarkSlot> {
+    let bytes = bytes.get(..MARK_SLOT_LEN)?;
+    let mut crc = Hasher::new();
+    crc.update(&bytes[..24]);
+    if u32::from_le_bytes(bytes[24..28].try_into().ok()?) != crc.finalize() {
+        return None;
+    }
+    let slot = MarkSlot {
+        generation: u64::from_le_bytes(bytes[..8].try_into().ok()?),
+        durable_len: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+        durable_lsn: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
+    };
+    // Generation zero is never written, so a checksum-valid slot claiming it
+    // is not a mark.
+    (slot.generation != 0).then_some(slot)
+}
+
+/// The newest valid mark in a segment's header region, or `None` when neither
+/// slot holds one: unwritten, torn, or corrupt. `None` means "durability
+/// unknown", which only ever widens what recovery is willing to truncate.
+fn newest_mark(bytes: &[u8]) -> Option<MarkSlot> {
+    MARK_SLOT_OFFSETS
+        .iter()
+        .filter_map(|&offset| bytes.get(offset..).and_then(decode_mark_slot))
+        .max_by_key(|slot| slot.generation)
+}
+
+/// How many leading bytes of the segment are known durable. Per-pool segments
+/// keep no mark and count every byte durable, so an invalid group fails closed.
+/// A missing or unreadable mark, or one claiming more than the file holds,
+/// yields `0`.
 fn read_durable_len_from_header(bytes: &[u8], version: JournalVersion, file_len: u64) -> u64 {
     if !version.is_pool_tagged() {
         return u64::MAX;
     }
-    let Some(header) = bytes.get(..FILE_HEADER_LEN) else {
-        return 0;
-    };
-    let mut crc = Hasher::new();
-    crc.update(&header[FH_DURABLE_LEN.start..FH_DURABLE_CRC.start]);
-    if u32::from_le_bytes(header[FH_DURABLE_CRC].try_into().expect("fixed slice")) != crc.finalize()
-    {
-        return 0;
-    }
-    let durable_len = u64::from_le_bytes(header[FH_DURABLE_LEN].try_into().expect("fixed slice"));
-    let _through_lsn = u64::from_le_bytes(header[FH_DURABLE_LSN].try_into().expect("fixed slice"));
-    if durable_len > file_len {
-        0
-    } else {
-        durable_len
-    }
-}
-
-/// Update the embedded mark after the covered data has been fsynced. A failed
-/// mark write is intentionally ignored: recovery then sees an unknown mark
-/// and truncates crash-explainable damage conservatively.
-fn write_durable_mark(
-    file: &mut File,
-    version: JournalVersion,
-    durable_len: u64,
-    through_lsn: u64,
-) {
-    if !version.is_pool_tagged() {
-        return;
-    }
-    let mut mark = [0_u8; FH_DURABLE_CRC.end - FH_DURABLE_LEN.start];
-    mark[..8].copy_from_slice(&durable_len.to_le_bytes());
-    mark[8..16].copy_from_slice(&through_lsn.to_le_bytes());
-    let mut crc = Hasher::new();
-    crc.update(&mark[..16]);
-    mark[16..20].copy_from_slice(&crc.finalize().to_le_bytes());
-    let position = file.stream_position().ok();
-    if file
-        .seek(SeekFrom::Start(
-            u64::try_from(FH_DURABLE_LEN.start).unwrap_or(u64::MAX),
-        ))
-        .is_ok()
-        && file.write_all(&mark).is_ok()
-    {
-        let _ = file.flush();
-    }
-    if let Some(position) = position {
-        let _ = file.seek(SeekFrom::Start(position));
-    }
+    newest_mark(bytes)
+        .map(|slot| slot.durable_len)
+        .filter(|&durable_len| durable_len <= file_len)
+        .unwrap_or(0)
 }
 
 fn encode_group_header(
@@ -4846,6 +4895,383 @@ mod tests {
         let (_journal, scan) = Journal::open_shared(&path).unwrap();
         assert_eq!(scan.groups.len(), 1);
         assert!(durable_mark(&path) > super::FILE_HEADER_LEN as u64);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A torn newest slot leaves the previous valid slot usable. The immutable
+    /// base header is separate: corrupting it still fails header validation
+    /// rather than being interpreted as a durability-mark failure.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_torn_newest_mark_falls_back_without_trusting_the_tail() {
+        let coordinator = open_shared_arc("embedded_mark_slots");
+        let path = coordinator.path();
+        let first = publish(&coordinator, 1, b"first");
+        coordinator.sync().unwrap();
+        let second = publish(&coordinator, 2, b"second");
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let mut bytes = fs::read(&path).unwrap();
+        // Generation two occupies slot zero; damage its CRC/data while the
+        // generation-one slot remains intact.
+        bytes[super::MARK_SLOT_OFFSETS[0]] ^= 0x80;
+        fs::write(&path, &bytes).unwrap();
+        punch_hole(
+            &path,
+            super::FILE_HEADER_LEN as u64 + first.bytes_written,
+            second.bytes_written,
+        );
+        let (_journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1, "the older mark bounds recovery");
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Overwrite `bytes` at `offset`, standing in for a torn or garbled write.
+    #[cfg(feature = "multi-reader")]
+    fn overwrite(path: &Path, offset: usize, bytes: &[u8]) {
+        use std::io::{Seek, SeekFrom};
+        let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(u64::try_from(offset).unwrap()))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    /// Both mark slots as currently decoded from the file's header region.
+    #[cfg(feature = "multi-reader")]
+    fn mark_slots(path: &Path) -> [Option<(u64, u64, u64)>; 2] {
+        let bytes = fs::read(path).unwrap();
+        super::MARK_SLOT_OFFSETS.map(|offset| {
+            super::decode_mark_slot(&bytes[offset..])
+                .map(|slot| (slot.generation, slot.durable_len, slot.durable_lsn))
+        })
+    }
+
+    /// Groups begin after the base header's sector and both mark sectors, and
+    /// each region sits in a sector of its own, so a torn write to one cannot
+    /// reach another.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn groups_start_after_a_reserved_sector_aligned_mark_region() {
+        assert_eq!(super::FILE_HEADER_LEN % super::MARK_SECTOR_LEN, 0);
+        const { assert!(super::FH_BASE_CRC.end <= super::MARK_SECTOR_LEN) };
+        for offset in super::MARK_SLOT_OFFSETS {
+            assert_eq!(offset % super::MARK_SECTOR_LEN, 0, "slot starts a sector");
+            assert!(offset >= super::MARK_SECTOR_LEN, "not in the header sector");
+            assert!(offset + super::MARK_SLOT_LEN <= offset + super::MARK_SECTOR_LEN);
+            assert!(offset + super::MARK_SECTOR_LEN <= super::FILE_HEADER_LEN);
+        }
+        assert_ne!(super::MARK_SLOT_OFFSETS[0], super::MARK_SLOT_OFFSETS[1]);
+
+        let coordinator = open_shared_arc("mark_region_layout");
+        let path = coordinator.path().clone();
+        let first = publish(&coordinator, 1, b"first");
+        drop(coordinator);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            super::FILE_HEADER_LEN as u64 + first.bytes_written,
+            "the first group starts right after the reserved region"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A fresh segment has written no mark: both slots are unwritten and claim
+    /// nothing.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn an_unwritten_mark_region_claims_nothing() {
+        let coordinator = open_shared_arc("mark_unwritten");
+        let path = coordinator.path().clone();
+        publish(&coordinator, 1, b"first");
+        drop(coordinator);
+        assert_eq!(mark_slots(&path), [None, None]);
+        assert_eq!(durable_mark(&path), 0);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Marks alternate between the two slots by generation, so a write always
+    /// goes to the slot that does not hold the newest mark.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn marks_alternate_between_the_two_slots() {
+        let coordinator = open_shared_arc("mark_alternate");
+        let path = coordinator.path().clone();
+        let mut file_sizes = Vec::new();
+        for node in 1..=3u8 {
+            publish(&coordinator, node, b"x");
+            coordinator.sync().unwrap();
+            file_sizes.push(fs::metadata(&path).unwrap().len());
+        }
+        drop(coordinator);
+
+        let [slot0, slot1] = mark_slots(&path);
+        let (generation0, len0, _) = slot0.expect("slot 0 holds a mark");
+        let (generation1, len1, _) = slot1.expect("slot 1 holds a mark");
+        // Generations 1 and 3 land in slot 1, generation 2 in slot 0, and the
+        // third overwrote the first: the two slots hold the two newest.
+        assert_eq!((generation0, len0), (2, file_sizes[1]));
+        assert_eq!((generation1, len1), (3, file_sizes[2]));
+        assert_eq!(
+            durable_mark(&path),
+            file_sizes[2],
+            "recovery takes the newest"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Fault injection: the newest slot is torn, so recovery falls back to the
+    /// older slot's mark instead of losing the mark altogether.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_torn_newest_slot_falls_back_to_the_older_one() {
+        let coordinator = open_shared_arc("mark_torn_newest");
+        let path = coordinator.path().clone();
+        publish(&coordinator, 1, b"first");
+        coordinator.sync().unwrap();
+        let first_len = fs::metadata(&path).unwrap().len();
+        publish(&coordinator, 2, b"second");
+        coordinator.sync().unwrap();
+        drop(coordinator);
+        assert_eq!(mark_slots(&path)[0].unwrap().0, 2, "generation 2 is newest");
+
+        // Tear generation 2, in slot 0: half of it never reached the disk.
+        overwrite(&path, super::MARK_SLOT_OFFSETS[0] + 12, &[0xAB; 16]);
+        let [torn, older] = mark_slots(&path);
+        assert!(torn.is_none(), "the torn slot fails its checksum");
+        assert_eq!(older.unwrap().0, 1);
+        assert_eq!(durable_mark(&path), first_len);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Fault injection: both slots are invalid. Durability is then unknown,
+    /// not proven, so recovery treats damage as an unacknowledged tail and
+    /// truncates instead of refusing to open.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn two_invalid_slots_mean_unknown_durability() {
+        let coordinator = open_shared_arc("mark_both_invalid");
+        let path = coordinator.path().clone();
+        let first = publish(&coordinator, 1, b"first");
+        let middle = publish(&coordinator, 2, b"middle");
+        publish(&coordinator, 3, b"last");
+        coordinator.sync().unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+        // Garble every slot (both are nonzero, so neither reads as unwritten).
+        for offset in super::MARK_SLOT_OFFSETS {
+            overwrite(&path, offset, &[0xCD; super::MARK_SLOT_LEN]);
+        }
+        assert_eq!(mark_slots(&path), [None, None]);
+        assert_eq!(durable_mark(&path), 0);
+
+        // A hole that would be corruption under a valid mark is now a tail.
+        let hole_start = super::FILE_HEADER_LEN as u64 + first.bytes_written;
+        punch_hole(&path, hole_start, middle.bytes_written);
+        let (_journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), hole_start);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The base header and the mark slots are checked independently: garbling
+    /// every mark leaves the base header valid and the segment openable, while
+    /// garbling the base header is detected even with valid marks.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn base_header_and_mark_slots_are_corrupted_independently() {
+        let coordinator = open_shared_arc("mark_vs_base");
+        let path = coordinator.path().clone();
+        publish(&coordinator, 1, b"first");
+        coordinator.sync().unwrap();
+        drop(coordinator);
+        let pristine = fs::read(&path).unwrap();
+
+        // Mark sectors garbled: the base header is untouched and still valid.
+        for offset in super::MARK_SLOT_OFFSETS {
+            overwrite(&path, offset, &vec![0xEE; super::MARK_SECTOR_LEN]);
+        }
+        assert!(super::validate_file_header(&fs::read(&path).unwrap()).is_ok());
+        let (_journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups.len(), 1, "the data is still there");
+
+        // Base header garbled, marks restored: detected on its own.
+        fs::write(&path, &pristine).unwrap();
+        overwrite(&path, super::FH_BASE_SEQUENCE.start, &[0x77; 4]);
+        assert_eq!(
+            Journal::open_shared(&path)
+                .err()
+                .expect("must refuse")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            Journal::scan_read_only(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Fault injection for the reason the slots have sectors of their own: a
+    /// mark write torn across its whole sector leaves the base header and the
+    /// first group readable.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_torn_mark_sector_cannot_reach_the_base_header() {
+        let coordinator = open_shared_arc("mark_sector_torn");
+        let path = coordinator.path().clone();
+        publish(&coordinator, 1, b"first");
+        coordinator.sync().unwrap();
+        let before = fs::read(&path).unwrap();
+        drop(coordinator);
+        overwrite(
+            &path,
+            super::MARK_SLOT_OFFSETS[1],
+            &vec![0x00; super::MARK_SECTOR_LEN],
+        );
+        let after = fs::read(&path).unwrap();
+        assert_eq!(
+            after[..super::MARK_SECTOR_LEN],
+            before[..super::MARK_SECTOR_LEN],
+            "the base header's sector is untouched"
+        );
+        assert!(super::validate_file_header(&after).is_ok());
+        assert_eq!(Journal::scan_read_only(&path).unwrap().groups.len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The mark is written with a positioned write, so it never moves the
+    /// append cursor: groups published after a sync land at the end, not at
+    /// the mark's offset.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_mark_write_leaves_the_append_cursor_alone() {
+        let coordinator = open_shared_arc("mark_cursor");
+        let path = coordinator.path().clone();
+        let mut total = super::FILE_HEADER_LEN as u64;
+        for node in 1..=4u8 {
+            total += publish(&coordinator, node, b"data").bytes_written;
+            coordinator.sync().unwrap();
+        }
+        drop(coordinator);
+        assert_eq!(fs::metadata(&path).unwrap().len(), total);
+        let (_journal, scan) = Journal::open_shared(&path).unwrap();
+        assert_eq!(scan.groups.len(), 4, "no group was overwritten by a mark");
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Reclaim puts a first-generation mark into the rebuilt file before that
+    /// file is fsynced, so the mark is durable with the data and covers all of
+    /// it; the old segment's marks are gone. A hole in what it retained is
+    /// corruption and still fails closed.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn reclaim_writes_a_first_generation_mark_with_the_rebuilt_data() {
+        let coordinator = open_shared_arc("mark_reclaim");
+        let path = coordinator.path().clone();
+        let first = publish(&coordinator, 1, b"first");
+        let second = publish(&coordinator, 2, b"second");
+        publish(&coordinator, 3, b"third");
+        coordinator.sync().unwrap();
+        coordinator.reclaim_through(first.last_lsn).unwrap();
+        drop(coordinator);
+
+        let len = fs::metadata(&path).unwrap().len();
+        let [slot0, slot1] = mark_slots(&path);
+        assert_eq!(slot0, None);
+        assert_eq!(
+            slot1.map(|(generation, durable_len, _)| (generation, durable_len)),
+            Some((1, len))
+        );
+
+        punch_hole(&path, super::FILE_HEADER_LEN as u64, second.bytes_written);
+        assert_eq!(
+            Journal::open_shared(&path)
+                .err()
+                .expect("must refuse")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Only damage a crash can explain is truncated, and only above the mark. A
+    /// group whose header checksum verifies but whose LSN skips ahead cannot be
+    /// produced by a crash on an append-only file, so it stays fatal even above
+    /// the mark: dropping it would hide a writer bug.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
+        let coordinator = open_shared_arc("mark_fatal_class");
+        let path = coordinator.path().clone();
+        let first = publish(&coordinator, 1, b"first");
+        coordinator.sync().unwrap();
+        drop(coordinator);
+
+        let bad_lsn = first.last_lsn + 5;
+        let group = super::CommittedGroup {
+            sequence: first.sequence + 1,
+            first_lsn: bad_lsn,
+            last_lsn: bad_lsn,
+            entries: vec![super::JournalEntry {
+                lsn: bad_lsn,
+                offset: 0,
+                frame_len: 0,
+                pool: Some(crate::layout::ShardType::State),
+                mutation: put(1, 2, b"skipped"),
+            }],
+        };
+        let mut bytes = Vec::new();
+        super::encode_group(&group, super::JournalVersion::V5PoolTagged, &mut bytes).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > durable_mark(&path));
+        assert_eq!(
+            Journal::open_shared(&path)
+                .err()
+                .expect("must refuse")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A per-pool segment keeps no mark, so its mark region stays unwritten and
+    /// it fails closed on any hole, as it always did.
+    #[test]
+    fn a_per_pool_segment_keeps_no_mark_and_fails_closed() {
+        let coordinator = open_arc("per_pool_no_mark");
+        let path = coordinator.path().clone();
+        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+        let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
+        coordinator.publish_group(&[put(1, 3, b"last")]).unwrap();
+        coordinator.sync().unwrap();
+        drop(coordinator);
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            bytes[super::MARK_SECTOR_LEN..super::FILE_HEADER_LEN]
+                .iter()
+                .all(|&byte| byte == 0),
+            "a per-pool segment must not write a mark"
+        );
+
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(
+                super::FILE_HEADER_LEN as u64 + first.bytes_written,
+            ))
+            .unwrap();
+            file.write_all(&vec![0; usize::try_from(middle.bytes_written).unwrap()])
+                .unwrap();
+        }
+        assert_eq!(
+            Journal::open(&path).err().expect("must refuse").kind(),
+            std::io::ErrorKind::InvalidData
+        );
         fs::remove_file(path).unwrap();
     }
 
