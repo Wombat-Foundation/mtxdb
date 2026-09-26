@@ -63,7 +63,7 @@ pub use journal::SharedWalLock;
 pub use journal::{DurabilityStats, DurabilityToken, DurableWaitLatency, GroupCommitConfig};
 #[cfg(feature = "multi-reader")]
 pub use journal::{StagedLookup, TxnStage, TxnStageState};
-pub use layout::{enclosing_root, read_wal_layout, DatabaseLayout, ShardType, WalLayout};
+pub use layout::{enclosing_root, is_database_root, DatabaseLayout, ShardType};
 #[cfg(feature = "multi-reader")]
 pub use matrix_policy::matrix_pool_policies;
 pub use matrix_policy::{
@@ -78,7 +78,6 @@ pub use shard::{LockHolderInfo, ShardPool};
 pub use storage::{
     content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,
 };
-#[allow(deprecated)]
 pub use template::{
     derive_collection_id, derive_group_full_id, derive_group_member_collection_id,
     derive_group_member_full_id, derive_member_collection_id_from_group,
@@ -89,5 +88,4 @@ pub use template::{
     COLLECTION_TEMPLATE_FORMAT_V1, MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT,
     MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT, NAMESPACE_BIAS_AUTH,
     NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT,
-    POOL_DST_AUTH, POOL_DST_EVNT, POOL_DST_INTERNAL, POOL_DST_PREV, POOL_DST_STAT,
 };

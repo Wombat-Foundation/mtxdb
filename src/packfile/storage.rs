@@ -7956,7 +7956,7 @@ impl PackfileStorage {
     /// Returns `StorageError` if the journal segment cannot be opened or its
     /// committed prefix cannot be validated.
     pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
-        self.reject_legacy_journal_in_shared_root()?;
+        self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
         *self.journal.lock() = Some(Arc::new(JournalCoordinator::new(journal, &scan)));
@@ -7966,14 +7966,14 @@ impl PackfileStorage {
     /// Fail closed when a path-based per-pool journal would be attached to a
     /// store that lives inside a database root.
     ///
-    /// Every root, old or new, is driven by one root-level pool-tagged segment
-    /// through one coordinator. Letting a caller hand such a pool a private
-    /// per-pool `wal.bin` would split the durability fence and silently diverge
-    /// from the root's WAL. A standalone store outside any root keeps the
-    /// per-pool journal path.
-    fn reject_legacy_journal_in_shared_root(&self) -> Result<(), StorageError> {
+    /// Every root is driven by one root-level pool-tagged segment through one
+    /// coordinator. Letting a caller hand such a pool a private per-pool
+    /// `wal.bin` would split the durability fence and silently diverge from the
+    /// root's WAL. A standalone store outside any root keeps the per-pool
+    /// journal path.
+    fn reject_per_pool_journal_in_root(&self) -> Result<(), StorageError> {
         match crate::layout::enclosing_root(&self.base_dir)? {
-            Some((root, _)) => Err(StorageError::Internal(format!(
+            Some(root) => Err(StorageError::Internal(format!(
                 "{} is inside database root {}; attach it to the root coordinator \
                  with PackfileStorage::enable_shared_journal instead of a per-pool journal",
                 self.base_dir.display(),
@@ -8000,7 +8000,7 @@ impl PackfileStorage {
         path: impl AsRef<std::path::Path>,
         sequence: Arc<AtomicU64>,
     ) -> Result<(), StorageError> {
-        self.reject_legacy_journal_in_shared_root()?;
+        self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
         *self.journal.lock() = Some(Arc::new(JournalCoordinator::with_shared_sequence(

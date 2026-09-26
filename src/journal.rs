@@ -31,46 +31,45 @@ const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JournalVersion {
     /// Per-pool segment. Mutation frames are untagged and the flag byte must be
-    /// zero. Bumped to 2 when the header gained the base sequence/LSN a rotated
-    /// segment needs to keep numbering global across a rewrite.
-    V2,
+    /// zero. Version 4 adds the embedded durability-mark header fields.
+    V4,
     /// Shared multi-pool segment. Every mutation frame carries a mandatory pool
     /// tag in the flag byte, so one physical WAL can carry the state,
     /// event-DAG, and edges pools and recovery can route each frame back
     /// to its pool.
-    V3PoolTagged,
+    V5PoolTagged,
 }
 
 impl JournalVersion {
     /// Version a freshly created per-pool segment uses.
     const fn per_pool() -> Self {
-        Self::V2
+        Self::V4
     }
 
     /// Version a freshly created shared (multi-pool) segment uses.
     #[cfg(feature = "multi-reader")]
     const fn shared() -> Self {
-        Self::V3PoolTagged
+        Self::V5PoolTagged
     }
 
     const fn as_u32(self) -> u32 {
         match self {
-            Self::V2 => 2,
-            Self::V3PoolTagged => 3,
+            Self::V4 => 4,
+            Self::V5PoolTagged => 5,
         }
     }
 
     fn from_u32(value: u32) -> io::Result<Self> {
         match value {
-            2 => Ok(Self::V2),
-            3 => Ok(Self::V3PoolTagged),
+            4 => Ok(Self::V4),
+            5 => Ok(Self::V5PoolTagged),
             _ => Err(invalid_data("unsupported journal version")),
         }
     }
 
     /// Whether every mutation frame in this segment must carry a pool tag.
     const fn is_pool_tagged(self) -> bool {
-        matches!(self, Self::V3PoolTagged)
+        matches!(self, Self::V5PoolTagged)
     }
 }
 
@@ -79,10 +78,16 @@ const FH_MAGIC: std::ops::Range<usize> = 0..8;
 const FH_VERSION: std::ops::Range<usize> = 8..12;
 const FH_BASE_SEQUENCE: std::ops::Range<usize> = 12..20;
 const FH_BASE_LSN: std::ops::Range<usize> = 20..28;
-const FH_CRC: std::ops::Range<usize> = 28..32;
-/// Header bytes covered by the trailing CRC (everything before it).
-const FH_CRC_COVERED: std::ops::Range<usize> = 0..FH_CRC.start;
-const FILE_HEADER_LEN: usize = FH_CRC.end;
+const FH_BASE_CRC: std::ops::Range<usize> = 28..32;
+/// Embedded durability mark: length and LSN covered by its own CRC. These
+/// bytes are deliberately outside the immutable header CRC, because the mark
+/// is updated after the data fsync and need not be fsynced itself.
+const FH_DURABLE_LEN: std::ops::Range<usize> = 32..40;
+const FH_DURABLE_LSN: std::ops::Range<usize> = 40..48;
+const FH_DURABLE_CRC: std::ops::Range<usize> = 48..52;
+/// Header bytes covered by the immutable base CRC.
+const FH_BASE_CRC_COVERED: std::ops::Range<usize> = 0..FH_BASE_CRC.start;
+const FILE_HEADER_LEN: usize = FH_DURABLE_CRC.end;
 
 // Group header field byte ranges (`GROUP_HEADER_LEN` is the sum of the fields).
 const GH_MAGIC: std::ops::Range<usize> = 0..4;
@@ -949,16 +954,13 @@ struct SyncCapture {
     through_lsn: u64,
     /// Sequence of the newest appended group, for the receipt.
     sequence: u64,
-    /// Segment path, for slow-fsync reporting and the durability hint.
+    /// Segment path, for slow-fsync reporting.
     path: PathBuf,
     /// Length of the segment when the handle was cloned. Everything appended
     /// before that point is covered by the fsync, so this is what the
     /// durability hint may claim once the fsync returns.
     file_len: u64,
-    /// The segment's base sequence and LSN, which key the durability hint.
-    base_sequence: u64,
-    base_lsn: u64,
-    /// The segment's format version, which decides whether it keeps a hint.
+    /// The segment's format version, which decides whether it keeps an embedded mark.
     version: JournalVersion,
 }
 
@@ -1666,8 +1668,6 @@ impl JournalCoordinator {
             sequence: journal.next_sequence.saturating_sub(1),
             path: journal.path.clone(),
             file_len: journal.file_len,
-            base_sequence: journal.base_sequence,
-            base_lsn: journal.base_lsn,
             version: journal.version,
         })
     }
@@ -1721,14 +1721,15 @@ impl JournalCoordinator {
         // The fsync has returned, so every byte up to the captured length is
         // durable. Record that, after the fact and without an fsync of its own,
         // so recovery can tell a crash tail above it from corruption below it.
-        write_durable_hint(
-            &capture.path,
-            capture.version,
-            capture.base_sequence,
-            capture.base_lsn,
-            capture.file_len,
-            capture.through_lsn,
-        );
+        {
+            let mut journal = self.journal.lock();
+            write_durable_mark(
+                &mut journal.file,
+                capture.version,
+                capture.file_len,
+                capture.through_lsn,
+            );
+        }
         // The groups were appended at publication, so this fsync wrote no
         // bytes: the receipt reports the durable range this call advanced.
         CommitReceipt {
@@ -2404,7 +2405,7 @@ impl Journal {
         let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
         let file_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         scan_bytes(&bytes, base_sequence, base_lsn, version, || {
-            read_durable_len(path, version, base_sequence, base_lsn, file_len)
+            read_durable_len_from_header(&bytes, version, file_len)
         })
     }
 
@@ -2441,7 +2442,7 @@ impl Journal {
         file.seek(SeekFrom::Start(0))?;
         let mut header = vec![0; FILE_HEADER_LEN];
         file.read_exact(&mut header)?;
-        let (version, base_sequence, base_lsn) = validate_file_header(&header)?;
+        let (version, _base_sequence, base_lsn) = validate_file_header(&header)?;
         if start >= len {
             return Ok(Scan {
                 groups: Vec::new(),
@@ -2455,7 +2456,7 @@ impl Journal {
         let mut tail = Vec::new();
         file.read_to_end(&mut tail)?;
         scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, version, || {
-            read_durable_len(path, version, base_sequence, base_lsn, len)
+            read_durable_len_from_header(&header, version, len)
         })
     }
 
@@ -2531,7 +2532,7 @@ impl Journal {
     }
 
     /// Open a shared (multi-pool) journal segment, or create one if the file is
-    /// absent. The segment is created as `JournalVersion::V3PoolTagged`, so
+    /// absent. The segment is created as `JournalVersion::V5PoolTagged`, so
     /// every mutation frame appended through it must carry a pool tag.
     ///
     /// # Errors
@@ -2612,7 +2613,7 @@ impl Journal {
         }
         let file_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let scan = scan_bytes(&bytes, base_sequence, base_lsn, version, || {
-            read_durable_len(&path, version, base_sequence, base_lsn, file_len)
+            read_durable_len_from_header(&bytes, version, file_len)
         })?;
         if scan.truncated_tail {
             file.set_len(scan.valid_len)?;
@@ -2627,14 +2628,7 @@ impl Journal {
             // every group, so a dropped tail cannot reappear.
             file.sync_all()?;
             if let Some(last) = scan.groups.last() {
-                write_durable_hint(
-                    &path,
-                    version,
-                    base_sequence,
-                    base_lsn,
-                    scan.valid_len,
-                    last.last_lsn,
-                );
+                write_durable_mark(&mut file, version, scan.valid_len, last.last_lsn);
             }
         }
         let next_sequence = scan
@@ -2874,12 +2868,10 @@ impl Journal {
             return Err(error);
         }
         // The fsync returned, so everything appended so far is durable: record
-        // that in the durability hint (see `HINT_MAGIC`), after the fact.
-        write_durable_hint(
-            &self.path,
+        // that in the embedded durability mark, after the fact.
+        write_durable_mark(
+            &mut self.file,
             self.version,
-            self.base_sequence,
-            self.base_lsn,
             self.file_len,
             self.next_lsn.saturating_sub(1),
         );
@@ -3007,11 +2999,9 @@ impl Journal {
         // The rebuilt file was fsynced before the rename, so all of it is
         // durable. Re-key the hint to the new base: the old one described
         // offsets that no longer exist and is ignored from here on.
-        write_durable_hint(
-            &self.path,
+        write_durable_mark(
+            &mut self.file,
             self.version,
-            new_base_sequence,
-            new_base_lsn,
             self.file_len,
             retained
                 .last()
@@ -3040,8 +3030,8 @@ fn file_header_bytes(version: JournalVersion, base_sequence: u64, base_lsn: u64)
     header[FH_BASE_SEQUENCE].copy_from_slice(&base_sequence.to_le_bytes());
     header[FH_BASE_LSN].copy_from_slice(&base_lsn.to_le_bytes());
     let mut crc = Hasher::new();
-    crc.update(&header[FH_CRC_COVERED]);
-    header[FH_CRC].copy_from_slice(&crc.finalize().to_le_bytes());
+    crc.update(&header[FH_BASE_CRC_COVERED]);
+    header[FH_BASE_CRC].copy_from_slice(&crc.finalize().to_le_bytes());
     header
 }
 
@@ -3068,8 +3058,8 @@ fn validate_file_header(bytes: &[u8]) -> io::Result<(JournalVersion, u64, u64)> 
         header[FH_VERSION].try_into().expect("fixed slice"),
     ))?;
     let mut crc = Hasher::new();
-    crc.update(&header[FH_CRC_COVERED]);
-    if u32::from_le_bytes(header[FH_CRC].try_into().expect("fixed slice")) != crc.finalize() {
+    crc.update(&header[FH_BASE_CRC_COVERED]);
+    if u32::from_le_bytes(header[FH_BASE_CRC].try_into().expect("fixed slice")) != crc.finalize() {
         return Err(invalid_data("journal header checksum mismatch"));
     }
     Ok((
@@ -3077,6 +3067,63 @@ fn validate_file_header(bytes: &[u8]) -> io::Result<(JournalVersion, u64, u64)> 
         u64::from_le_bytes(header[FH_BASE_SEQUENCE].try_into().expect("fixed slice")),
         u64::from_le_bytes(header[FH_BASE_LSN].try_into().expect("fixed slice")),
     ))
+}
+
+/// Read the embedded durability mark. Invalid or absent marks are treated as
+/// unknown, never as proof that a suffix is durable.
+fn read_durable_len_from_header(bytes: &[u8], version: JournalVersion, file_len: u64) -> u64 {
+    if !version.is_pool_tagged() {
+        return u64::MAX;
+    }
+    let Some(header) = bytes.get(..FILE_HEADER_LEN) else {
+        return 0;
+    };
+    let mut crc = Hasher::new();
+    crc.update(&header[FH_DURABLE_LEN.start..FH_DURABLE_CRC.start]);
+    if u32::from_le_bytes(header[FH_DURABLE_CRC].try_into().expect("fixed slice")) != crc.finalize()
+    {
+        return 0;
+    }
+    let durable_len = u64::from_le_bytes(header[FH_DURABLE_LEN].try_into().expect("fixed slice"));
+    let _through_lsn = u64::from_le_bytes(header[FH_DURABLE_LSN].try_into().expect("fixed slice"));
+    if durable_len > file_len {
+        0
+    } else {
+        durable_len
+    }
+}
+
+/// Update the embedded mark after the covered data has been fsynced. A failed
+/// mark write is intentionally ignored: recovery then sees an unknown mark
+/// and truncates crash-explainable damage conservatively.
+fn write_durable_mark(
+    file: &mut File,
+    version: JournalVersion,
+    durable_len: u64,
+    through_lsn: u64,
+) {
+    if !version.is_pool_tagged() {
+        return;
+    }
+    let mut mark = [0_u8; FH_DURABLE_CRC.end - FH_DURABLE_LEN.start];
+    mark[..8].copy_from_slice(&durable_len.to_le_bytes());
+    mark[8..16].copy_from_slice(&through_lsn.to_le_bytes());
+    let mut crc = Hasher::new();
+    crc.update(&mark[..16]);
+    mark[16..20].copy_from_slice(&crc.finalize().to_le_bytes());
+    let position = file.stream_position().ok();
+    if file
+        .seek(SeekFrom::Start(
+            u64::try_from(FH_DURABLE_LEN.start).unwrap_or(u64::MAX),
+        ))
+        .is_ok()
+        && file.write_all(&mark).is_ok()
+    {
+        let _ = file.flush();
+    }
+    if let Some(position) = position {
+        let _ = file.seek(SeekFrom::Start(position));
+    }
 }
 
 fn encode_group_header(
@@ -3281,141 +3328,6 @@ fn verify_group_payload<'a>(
     Ok(payload)
 }
 
-/// Sidecar that records how many bytes of the shared WAL a completed fsync made
-/// durable, so recovery can tell a crash artifact from corruption.
-///
-/// There is one per database, beside the shared `wal.bin` at the root, and none
-/// in any pool's directory: pools hold packs and shards, and the fewer hot
-/// write-ahead files there are the better. A per-pool segment therefore keeps
-/// no mark and fails closed on any invalid group, as it always did.
-///
-/// An ordinary power loss can persist a later page of an append-only file while
-/// an earlier, never-fsynced page is missing, leaving a hole before groups that
-/// were never acknowledged. Without a durability mark that is indistinguishable
-/// from rot in acknowledged data, and failing closed would make the journal
-/// unopenable after an ordinary crash. With the mark, the region above it is
-/// known to be unacknowledged and is truncated, while the same damage below it
-/// is real corruption and still fails closed.
-///
-/// The hint is written *after* the fsync it describes returns, so it can only
-/// ever claim bytes that are already durable, and it needs no fsync of its own:
-/// if it is lost or torn the mark falls back to zero and recovery truncates at
-/// the first invalid group, as other write-ahead logs do. It is overwritten in
-/// place at a fixed 44 bytes (never truncated) and protected by its own CRC.
-///
-/// It is keyed by the segment's base sequence and base LSN, so a hint left over
-/// from before a reclaim rewrote the segment (moving every offset) is ignored.
-///
-/// **Limit:** the mark lags the true durable point, so damage inside the most
-/// recent, not-yet-marked sync interval looks like a crash tail and is
-/// truncated. That is the cost of not fsyncing the hint, and it replaces a
-/// journal that cannot be opened after an ordinary power loss.
-const HINT_MAGIC: &[u8; 4] = b"MDHT";
-const HINT_LEN: usize = 44;
-
-/// Path of the durability hint next to the segment at `path`.
-fn durable_hint_path(path: &Path) -> PathBuf {
-    path.with_extension("durable")
-}
-
-fn encode_durable_hint(
-    base_sequence: u64,
-    base_lsn: u64,
-    synced_bytes: u64,
-    through_lsn: u64,
-) -> [u8; HINT_LEN] {
-    let mut hint = [0_u8; HINT_LEN];
-    hint[..4].copy_from_slice(HINT_MAGIC);
-    hint[4..12].copy_from_slice(&base_sequence.to_le_bytes());
-    hint[12..20].copy_from_slice(&base_lsn.to_le_bytes());
-    hint[20..28].copy_from_slice(&synced_bytes.to_le_bytes());
-    hint[28..36].copy_from_slice(&through_lsn.to_le_bytes());
-    let mut crc = Hasher::new();
-    crc.update(&hint[..36]);
-    hint[36..40].copy_from_slice(&crc.finalize().to_le_bytes());
-    // Bytes 40..44 stay zero: reserved.
-    hint
-}
-
-/// The number of leading bytes of the segment known to be durable, or `0` when
-/// nothing is known. A missing, torn, foreign or stale hint yields `0`, and so
-/// does one that claims more than the file holds; every one of those can only
-/// widen what recovery is willing to truncate, never cause a false failure.
-fn read_durable_len(
-    path: &Path,
-    version: JournalVersion,
-    base_sequence: u64,
-    base_lsn: u64,
-    file_len: u64,
-) -> u64 {
-    if !version.is_pool_tagged() {
-        // A per-pool segment has no mark: it keeps no sidecar, so every byte is
-        // treated as durable and any invalid group fails closed.
-        return u64::MAX;
-    }
-    let Ok(hint) = fs::read(durable_hint_path(path)) else {
-        return 0;
-    };
-    if hint.len() != HINT_LEN || &hint[..4] != HINT_MAGIC {
-        return 0;
-    }
-    let mut crc = Hasher::new();
-    crc.update(&hint[..36]);
-    if u32::from_le_bytes(hint[36..40].try_into().expect("fixed slice")) != crc.finalize() {
-        return 0;
-    }
-    let field = |range: std::ops::Range<usize>| {
-        u64::from_le_bytes(hint[range].try_into().expect("fixed slice"))
-    };
-    if field(4..12) != base_sequence || field(12..20) != base_lsn {
-        return 0;
-    }
-    let durable_len = field(20..28);
-    if durable_len > file_len {
-        return 0;
-    }
-    durable_len
-}
-
-/// Record that `durable_len` bytes of the segment are durable. Write a complete
-/// fixed-size replacement and atomically rename it over the old hint, so
-/// readers see either a checksum-valid old mark or a checksum-valid new one;
-/// a crash may still lose the rename, which safely falls back to truncation.
-/// Best effort: a failed write leaves the previous, lower mark, which is safe.
-fn write_durable_hint(
-    path: &Path,
-    version: JournalVersion,
-    base_sequence: u64,
-    base_lsn: u64,
-    synced_bytes: u64,
-    through_lsn: u64,
-) {
-    if !version.is_pool_tagged() {
-        // Only the shared WAL keeps a mark: one file per database, never a
-        // sidecar in each pool's directory.
-        return;
-    }
-    let hint = encode_durable_hint(base_sequence, base_lsn, synced_bytes, through_lsn);
-    let path = durable_hint_path(path);
-    let temp_path = path.with_extension("durable.tmp");
-    let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&temp_path)
-    else {
-        return;
-    };
-    if file.write_all(&hint).is_err() {
-        let _ = fs::remove_file(&temp_path);
-        return;
-    }
-    drop(file);
-    if fs::rename(&temp_path, &path).is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-}
-
 fn scan_bytes(
     bytes: &[u8],
     base_sequence: u64,
@@ -3535,7 +3447,7 @@ fn scan_one_group(
 /// the first group's `first_lsn` exactly, since LSNs stay contiguous within a
 /// segment. `Scan::valid_len` is absolute in the file, not relative to `bytes`.
 ///
-/// `durable_len` yields the durability mark (see [`HINT_MAGIC`]): how many
+/// `durable_len` yields the embedded durability mark: how many
 /// leading bytes of the file a completed fsync covered. It is called at most
 /// once, and only when a group fails validation in a way a crash can explain. A group that fails validation
 /// in a way a crash can explain ([`GroupFault::Crash`]) at or above it was never
@@ -3749,11 +3661,8 @@ impl SharedWalLock {
     /// if the lock file cannot be created.
     pub fn acquire(db_root: impl AsRef<Path>) -> io::Result<Self> {
         let db_root = db_root.as_ref();
-        // Require a database root. A root that predates the shared layout
-        // (marker `PerPool`) is accepted: it is driven through a fresh
-        // root-level shared segment like any other, and its old per-pool WALs
-        // are ignored.
-        if crate::layout::read_wal_layout(db_root)?.is_none() {
+        // Require a database root.
+        if !crate::layout::is_database_root(db_root)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -3773,13 +3682,8 @@ impl SharedWalLock {
 #[cfg(test)]
 mod tests {
     use super::{
-        durable_hint_path, BackgroundFailure, BackgroundState, GroupCommitConfig, Journal,
-        JournalCoordinator, Mutation,
-    };
-    #[cfg(feature = "multi-reader")]
-    use super::{
-        encode_durable_hint, encode_group, read_durable_len, write_durable_hint, CommittedGroup,
-        JournalEntry, JournalVersion, HINT_LEN,
+        BackgroundFailure, BackgroundState, GroupCommitConfig, Journal, JournalCoordinator,
+        Mutation,
     };
     #[cfg(feature = "multi-reader")]
     use super::{TxnStage, TxnStageState};
@@ -4831,27 +4735,18 @@ mod tests {
             .unwrap();
     }
 
-    /// The durable mark a shared segment's hint currently claims.
+    /// The embedded mark a shared segment currently claims.
     #[cfg(feature = "multi-reader")]
     fn durable_mark(path: &Path) -> u64 {
         let bytes = fs::read(path).unwrap();
-        let (version, base_sequence, base_lsn) = super::validate_file_header(&bytes).unwrap();
-        read_durable_len(
-            path,
-            version,
-            base_sequence,
-            base_lsn,
-            u64::try_from(bytes.len()).unwrap(),
-        )
+        let (version, _base_sequence, _base_lsn) = super::validate_file_header(&bytes).unwrap();
+        super::read_durable_len_from_header(&bytes, version, u64::try_from(bytes.len()).unwrap())
     }
 
     #[cfg(feature = "multi-reader")]
-    /// Open a shared (pool-tagged) coordinator: the only kind of segment that
-    /// keeps a durability mark.
     fn open_shared_arc(label: &str) -> Arc<JournalCoordinator> {
         let path = temp_path(label);
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(durable_hint_path(&path));
         let (journal, scan) = Journal::open_shared(&path).unwrap();
         Arc::new(JournalCoordinator::new(journal, &scan))
     }
@@ -4863,102 +4758,62 @@ mod tests {
             .unwrap()
     }
 
-    /// A completed sync records, after its fsync, how much of the segment is
-    /// durable: everything appended when its handle was captured.
+    /// The embedded mark advances only after the data fsync succeeds.
     #[cfg(feature = "multi-reader")]
     #[test]
-    fn a_sync_records_the_durable_mark_after_its_fsync() {
-        let coordinator = open_shared_arc("hint_after_sync");
-        let path = coordinator.path().clone();
-        assert_eq!(durable_mark(&path), 0, "nothing is durable before a sync");
+    fn a_sync_records_the_embedded_durable_mark_after_its_fsync() {
+        let coordinator = open_shared_arc("embedded_mark_after_sync");
+        let path = coordinator.path();
+        assert_eq!(durable_mark(&path), 0);
         let first = publish(&coordinator, 1, b"first");
-        assert_eq!(durable_mark(&path), 0, "publishing is not durability");
+        assert_eq!(durable_mark(&path), 0);
         coordinator.sync().unwrap();
         assert_eq!(
             durable_mark(&path),
             super::FILE_HEADER_LEN as u64 + first.bytes_written
         );
-        let hint = fs::read(durable_hint_path(&path)).unwrap();
-        assert_eq!(hint.len(), HINT_LEN);
-        assert_eq!(
-            u64::from_le_bytes(hint[28..36].try_into().unwrap()),
-            first.last_lsn,
-            "the hint records the LSN the fsync covered"
-        );
-        fs::remove_file(durable_hint_path(&path)).unwrap();
         fs::remove_file(path).unwrap();
     }
 
-    /// The hint may only claim bytes an fsync has made durable, so a failed
-    /// fsync must leave it where it was.
     #[cfg(feature = "multi-reader")]
     #[test]
-    fn a_failed_fsync_does_not_advance_the_durable_mark() {
-        let coordinator = open_shared_arc("hint_failed_fsync");
-        let path = coordinator.path().clone();
-        let first = publish(&coordinator, 1, b"first");
+    fn a_failed_fsync_does_not_advance_the_embedded_mark() {
+        let coordinator = open_shared_arc("embedded_mark_failed_fsync");
+        let path = coordinator.path();
+        publish(&coordinator, 1, b"first");
         coordinator.sync().unwrap();
         let mark = durable_mark(&path);
-        assert_eq!(mark, super::FILE_HEADER_LEN as u64 + first.bytes_written);
-
         publish(&coordinator, 2, b"second");
         *coordinator.fsync_hook.lock() = Some(Arc::new(|| Err(std::io::Error::other("injected"))));
         assert!(coordinator.sync().is_err());
-        assert_eq!(
-            durable_mark(&path),
-            mark,
-            "an fsync that failed claims nothing"
-        );
-        *coordinator.fsync_hook.lock() = None;
-        fs::remove_file(durable_hint_path(&path)).unwrap();
+        assert_eq!(durable_mark(&path), mark);
         fs::remove_file(path).unwrap();
     }
 
-    /// The point of the mark: a crash can leave a hole with later groups intact
-    /// above the last fsync, and that was never acknowledged, so recovery
-    /// truncates it and carries on instead of refusing to open. The hole here
-    /// starts exactly at the mark, the boundary case.
     #[cfg(feature = "multi-reader")]
     #[test]
-    fn a_hole_above_the_durable_mark_is_truncated_and_recovery_continues() {
-        let coordinator = open_shared_arc("hole_above_mark");
-        let path = coordinator.path().clone();
+    fn a_hole_above_the_embedded_mark_is_truncated() {
+        let coordinator = open_shared_arc("embedded_hole_above_mark");
+        let path = coordinator.path();
         let first = publish(&coordinator, 1, b"first");
         coordinator.sync().unwrap();
         let middle = publish(&coordinator, 2, b"middle");
         publish(&coordinator, 3, b"last");
         drop(coordinator);
         let hole_start = super::FILE_HEADER_LEN as u64 + first.bytes_written;
-        assert_eq!(durable_mark(&path), hole_start);
         punch_hole(&path, hole_start, middle.bytes_written);
-        let before = fs::read(&path).unwrap();
-
-        // A read-only scan stops at the hole without repairing anything.
-        let scan = Journal::scan_read_only(&path).unwrap();
-        assert_eq!(scan.groups.len(), 1);
-        assert!(scan.truncated_tail);
-        assert_eq!(scan.valid_len, hole_start);
-        assert_eq!(fs::read(&path).unwrap(), before, "a scan must not repair");
-
-        // Recovery drops the hole and the later group, then numbers on.
         let (journal, scan) = Journal::open_shared(&path).unwrap();
         assert_eq!(scan.groups.len(), 1);
         assert_eq!(fs::metadata(&path).unwrap().len(), hole_start);
-        let recovered = JournalCoordinator::new(journal, &scan);
-        let next = publish(&recovered, 9, b"again");
-        assert_eq!(next.first_lsn, first.last_lsn + 1);
-        drop(recovered);
-        fs::remove_file(durable_hint_path(&path)).unwrap();
+        drop(journal);
         fs::remove_file(path).unwrap();
     }
 
-    /// The same damage below the mark is acknowledged data gone bad, and still
-    /// fails closed, for the scan and for recovery, without repairing.
     #[cfg(feature = "multi-reader")]
     #[test]
-    fn a_hole_below_the_durable_mark_still_fails_closed() {
-        let coordinator = open_shared_arc("hole_below_mark");
-        let path = coordinator.path().clone();
+    fn a_hole_below_the_embedded_mark_still_fails_closed() {
+        let coordinator = open_shared_arc("embedded_hole_below_mark");
+        let path = coordinator.path();
         let first = publish(&coordinator, 1, b"first");
         let middle = publish(&coordinator, 2, b"middle");
         publish(&coordinator, 3, b"last");
@@ -4969,254 +4824,28 @@ mod tests {
             super::FILE_HEADER_LEN as u64 + first.bytes_written,
             middle.bytes_written,
         );
-        let before = fs::read(&path).unwrap();
-        assert_eq!(
-            Journal::scan_read_only(&path).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            Journal::open_shared(&path)
-                .err()
-                .expect("must refuse")
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(fs::read(&path).unwrap(), before, "nothing may be repaired");
-        fs::remove_file(durable_hint_path(&path)).unwrap();
+        let error = Journal::open_shared(&path).err().expect("must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         fs::remove_file(path).unwrap();
     }
 
-    /// With no usable hint nothing is known to be durable, so recovery falls back
-    /// to what other write-ahead logs do: the first invalid group ends the log.
-    /// A missing, torn, foreign or over-long hint can therefore only widen what
-    /// is truncated, never turn a crash into a failure.
     #[cfg(feature = "multi-reader")]
     #[test]
-    fn without_a_usable_hint_the_first_invalid_group_ends_recovery() {
-        let bad_hints: [(&str, Option<Vec<u8>>); 4] = [
-            ("missing", None),
-            ("torn", Some(vec![0xAB; 17])),
-            (
-                "corrupt",
-                Some({
-                    let mut hint = encode_durable_hint(1, 1, 10, 1).to_vec();
-                    hint[22] ^= 0xFF;
-                    hint
-                }),
-            ),
-            (
-                "beyond the file",
-                Some(encode_durable_hint(1, 1, u64::MAX / 2, 99).to_vec()),
-            ),
-        ];
-        for (label, hint) in bad_hints {
-            let coordinator =
-                open_shared_arc(&format!("hint_unusable_{}", label.replace(' ', "_")));
-            let path = coordinator.path().clone();
-            let first = publish(&coordinator, 1, b"first");
-            let middle = publish(&coordinator, 2, b"middle");
-            publish(&coordinator, 3, b"last");
-            coordinator.sync().unwrap();
-            drop(coordinator);
-            match hint {
-                Some(bytes) => fs::write(durable_hint_path(&path), bytes).unwrap(),
-                None => fs::remove_file(durable_hint_path(&path)).unwrap(),
-            }
-            let hole_start = super::FILE_HEADER_LEN as u64 + first.bytes_written;
-            punch_hole(&path, hole_start, middle.bytes_written);
-
-            let (_journal, scan) =
-                Journal::open_shared(&path).unwrap_or_else(|error| panic!("{label} hint: {error}"));
-            assert_eq!(scan.groups.len(), 1, "{label} hint");
-            assert_eq!(
-                fs::metadata(&path).unwrap().len(),
-                hole_start,
-                "{label} hint"
-            );
-            let _ = fs::remove_file(durable_hint_path(&path));
-            fs::remove_file(path).unwrap();
-        }
-    }
-
-    /// A hint left over from before a reclaim moved every offset describes a
-    /// different segment and is ignored; reclaim writes a fresh one for the
-    /// rebuilt file, so a hole in retained, durable data still fails closed.
-    #[cfg(feature = "multi-reader")]
-    #[test]
-    fn reclaim_rekeys_the_durable_mark_to_the_rebuilt_segment() {
-        let coordinator = open_shared_arc("hint_reclaim");
-        let path = coordinator.path().clone();
-        let first = publish(&coordinator, 1, b"first");
-        let second = publish(&coordinator, 2, b"second");
-        let third = publish(&coordinator, 3, b"third");
-        coordinator.sync().unwrap();
-        let old_hint = fs::read(durable_hint_path(&path)).unwrap();
-
-        coordinator.reclaim_through(first.last_lsn).unwrap();
-        let len = fs::metadata(&path).unwrap().len();
-        assert_eq!(
-            read_durable_len(
-                &path,
-                JournalVersion::V3PoolTagged,
-                second.sequence,
-                second.first_lsn,
-                len
-            ),
-            len,
-            "the rebuilt segment is entirely durable"
-        );
-        assert_eq!(
-            read_durable_len(&path, JournalVersion::V3PoolTagged, 1, 1, len),
-            0,
-            "the old base no longer matches"
-        );
-        // Restoring the pre-reclaim hint must not be believed either.
-        fs::write(durable_hint_path(&path), old_hint).unwrap();
-        assert_eq!(
-            read_durable_len(
-                &path,
-                JournalVersion::V3PoolTagged,
-                second.sequence,
-                second.first_lsn,
-                len
-            ),
-            0
-        );
-        write_durable_hint(
-            &path,
-            JournalVersion::V3PoolTagged,
-            second.sequence,
-            second.first_lsn,
-            len,
-            third.last_lsn,
-        );
-        drop(coordinator);
-
-        punch_hole(&path, super::FILE_HEADER_LEN as u64, second.bytes_written);
-        assert_eq!(
-            Journal::open_shared(&path)
-                .err()
-                .expect("must refuse")
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        fs::remove_file(durable_hint_path(&path)).unwrap();
-        fs::remove_file(path).unwrap();
-    }
-
-    /// Only damage a crash can explain is truncated, and only above the mark.
-    /// A group whose header checksum verifies but whose LSN skips ahead cannot
-    /// be produced by a crash on an append-only file, so it stays fatal even
-    /// above the mark: dropping it would hide a writer bug.
-    #[cfg(feature = "multi-reader")]
-    #[test]
-    fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
-        let coordinator = open_shared_arc("hint_fatal_class");
-        let path = coordinator.path().clone();
-        let first = publish(&coordinator, 1, b"first");
-        coordinator.sync().unwrap();
-        drop(coordinator);
-
-        let bad_lsn = first.last_lsn + 5;
-        let group = CommittedGroup {
-            sequence: first.sequence + 1,
-            first_lsn: bad_lsn,
-            last_lsn: bad_lsn,
-            entries: vec![JournalEntry {
-                lsn: bad_lsn,
-                offset: 0,
-                frame_len: 0,
-                pool: Some(crate::layout::ShardType::State),
-                mutation: put(1, 2, b"skipped"),
-            }],
-        };
-        let mut bytes = Vec::new();
-        encode_group(&group, JournalVersion::V3PoolTagged, &mut bytes).unwrap();
-        {
-            use std::io::Write;
-            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            file.write_all(&bytes).unwrap();
-        }
-        assert!(
-            fs::metadata(&path).unwrap().len() > durable_mark(&path),
-            "the bad group lies above the durable mark"
-        );
-        assert_eq!(
-            Journal::open_shared(&path)
-                .err()
-                .expect("must refuse")
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        fs::remove_file(durable_hint_path(&path)).unwrap();
-        fs::remove_file(path).unwrap();
-    }
-
-    /// Recovery can keep groups that exist only in the page cache (a process
-    /// crash leaves them there) while the coordinator reports them committed.
-    /// Opening must make them durable, and record that, so a later sync never
-    /// claims bytes that were not fsynced.
-    #[cfg(feature = "multi-reader")]
-    #[test]
-    fn recovery_makes_what_it_keeps_durable_and_marks_it() {
-        let path = temp_path("hint_recovery_marks");
+    fn recovery_marks_groups_it_keeps() {
+        let path = temp_path("embedded_recovery_mark");
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(durable_hint_path(&path));
         let (mut journal, _) = Journal::open_shared(&path).unwrap();
-        let receipt = journal
+        journal
             .append_group_for_current_mode(
                 &[(Some(crate::layout::ShardType::State), put(1, 1, b"cached"))],
                 None,
             )
             .unwrap();
         drop(journal);
-        assert_eq!(
-            durable_mark(&path),
-            0,
-            "appended, never synced, so unmarked"
-        );
-
+        assert_eq!(durable_mark(&path), 0);
         let (_journal, scan) = Journal::open_shared(&path).unwrap();
         assert_eq!(scan.groups.len(), 1);
-        assert_eq!(
-            durable_mark(&path),
-            super::FILE_HEADER_LEN as u64 + receipt.bytes_written,
-            "recovery fsynced what it kept and recorded it"
-        );
-        fs::remove_file(durable_hint_path(&path)).unwrap();
-        fs::remove_file(path).unwrap();
-    }
-
-    /// A per-pool segment keeps no sidecar (no hot file in a pool's directory)
-    /// and no mark, so it fails closed on any hole, as it did before the mark.
-    #[test]
-    fn a_per_pool_segment_keeps_no_sidecar_and_fails_closed() {
-        let coordinator = open_arc("per_pool_no_hint");
-        let path = coordinator.path().clone();
-        let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
-        let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
-        coordinator.publish_group(&[put(1, 3, b"last")]).unwrap();
-        coordinator.sync().unwrap();
-        drop(coordinator);
-        assert!(
-            !durable_hint_path(&path).exists(),
-            "a per-pool segment must not create a sidecar"
-        );
-
-        {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-            file.seek(SeekFrom::Start(
-                super::FILE_HEADER_LEN as u64 + first.bytes_written,
-            ))
-            .unwrap();
-            file.write_all(&vec![0; usize::try_from(middle.bytes_written).unwrap()])
-                .unwrap();
-        }
-        assert_eq!(
-            Journal::open(&path).err().expect("must refuse").kind(),
-            std::io::ErrorKind::InvalidData
-        );
+        assert!(durable_mark(&path) > super::FILE_HEADER_LEN as u64);
         fs::remove_file(path).unwrap();
     }
 

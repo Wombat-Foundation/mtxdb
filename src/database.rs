@@ -7,13 +7,10 @@
 //! coordinator, and replays recovered groups. It holds the root lock for its
 //! whole lifetime, so exactly one writer process owns the database.
 //!
-//! A legacy per-pool root (one whose `db.meta` predates the WAL-layout field,
-//! or was written as [`WalLayout::PerPool`]) is *not* rejected: it is opened
-//! onto a fresh root-level shared segment, and its old `pools/*/wal.bin`
-//! files are assumed already checkpointed and are ignored. The fresh segment's
-//! LSN space is seeded above every per-pool `journal.lsn` so the legacy
-//! coverage values stay meaningful; see `shared_wal_seed_lsn`. Callers that
-//! need to drive a single pool directly can still use
+//! If the root's WAL is missing, the fresh segment's LSN space is seeded above
+//! every pool's `journal.lsn` so a pool's recorded coverage stays meaningful
+//! and numbering can never restart beneath it; see `shared_wal_seed_lsn`.
+//! Callers that need to drive a single pool directly can still use
 //! [`crate::journal::SharedWalLock`] with
 //! [`PackfileStorage::enable_shared_journal`](crate::PackfileStorage::enable_shared_journal).
 
@@ -583,13 +580,13 @@ impl SharedDatabase {
 /// The base LSN a fresh shared WAL for `layout` must start above: one past the
 /// highest per-pool `journal.lsn` recorded beside a pool's last checkpoint.
 ///
-/// A root driven through per-pool journals stores each pool's durable coverage
-/// in that pool's own (now-retired) LSN space. The shared segment that replaces
-/// them must begin above every one of those watermarks, so each legacy coverage
-/// value stays meaningful in the single shared space: a restarted shared writer
-/// can neither replay past a pool's legacy coverage nor reclaim beneath a fresh
-/// frame that only looks covered because numbering restarted. Returns `1` for a
-/// root with no recorded coverage (a brand-new database).
+/// If the root's WAL is missing while a pool has recorded checkpoint coverage,
+/// the segment that replaces it must begin above every one of those
+/// watermarks, so each pool's coverage stays meaningful in the single shared
+/// LSN space: a restarted writer can neither replay past a pool's coverage nor
+/// reclaim beneath a fresh frame that only looks covered because numbering
+/// restarted. Returns `1` for a root with no recorded coverage (a brand-new
+/// database).
 ///
 /// This is the seed `Journal::open_shared_with_base` consumes; it is kept
 /// internal so a caller cannot create a shared segment with an arbitrary base
@@ -1091,7 +1088,6 @@ mod tests {
                 "every pool must share the one coordinator"
             );
         }
-        assert_eq!(db.layout().wal_layout(), crate::layout::WalLayout::Shared);
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1604,46 +1600,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// If the root's WAL is missing while a pool has recorded checkpoint
+    /// coverage, the fresh segment must start above that coverage, so a pool's
+    /// recorded LSN stays meaningful in the one shared LSN space and numbering
+    /// can never restart beneath it.
     #[test]
-    fn a_legacy_pool_coverage_seeds_the_shared_wal_above_it() {
-        // The layout marker is informational (see `DatabaseLayout::open`): both
-        // a PerPool-marked legacy root and a Shared-marked root whose sidecars
-        // predate the shared segment must seed the fresh WAL above the highest
-        // per-pool watermark, so legacy coverage values stay meaningful in the
-        // one shared LSN space.
-        for (name, layout_code) in [("legacy_seed_perpool", 0u8), ("legacy_seed_shared", 1u8)] {
-            let root = test_root(name);
-            std::fs::create_dir_all(root.join("pools/mtpl-state")).unwrap();
-            let mut meta = Vec::from(b"MTXD".as_slice());
-            meta.push(1);
-            meta.extend_from_slice(&[0u8; 8]);
-            meta[4 + 1] = layout_code; // reserved[0] is the WAL-layout byte
-            meta.extend_from_slice(b"mtpl-state\nmtpl-event\nmtpl-edges\n");
-            std::fs::write(root.join("db.meta"), meta).unwrap();
-            // A checkpoint watermark recorded before the shared segment existed.
-            std::fs::write(
-                root.join("pools/mtpl-state/journal.lsn"),
-                7u64.to_le_bytes(),
-            )
-            .unwrap();
+    fn a_missing_wal_is_seeded_above_the_pools_recorded_coverage() {
+        let root = test_root("seed_missing_wal");
+        drop(crate::layout::DatabaseLayout::open(root.clone()).unwrap());
+        std::fs::write(
+            root.join("pools/mtpl-state/journal.lsn"),
+            7u64.to_le_bytes(),
+        )
+        .unwrap();
+        assert!(!root.join("wal.bin").exists());
 
-            let db = SharedDatabase::open(root.clone()).unwrap();
-            let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
-            assert!(
-                scan.base_lsn > 7,
-                "{name}: the fresh shared WAL must start above the recorded coverage"
-            );
-            db.pool(ShardType::State)
-                .put(&[0x55u8; 16], &node(3), &NodeData::from_slice(b"live"))
-                .unwrap();
-            db.pool(ShardType::State).sync_all().unwrap();
-            assert!(
-                db.coordinator().committed_lsn_for_pool(ShardType::State) > 7,
-                "{name}: a new shared frame must be numbered above the watermark"
-            );
-            drop(db);
-            let _ = std::fs::remove_dir_all(&root);
-        }
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
+        assert!(
+            scan.base_lsn > 7,
+            "the fresh shared WAL must start above the recorded coverage"
+        );
+        db.pool(ShardType::State)
+            .put(&[0x55u8; 16], &node(3), &NodeData::from_slice(b"live"))
+            .unwrap();
+        db.pool(ShardType::State).sync_all().unwrap();
+        assert!(
+            db.coordinator().committed_lsn_for_pool(ShardType::State) > 7,
+            "a new shared frame must be numbered above the watermark"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1658,44 +1645,6 @@ mod tests {
         drop(first);
         // Releasing the first handle frees the root for a new writer.
         SharedDatabase::open(root.clone()).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_legacy_root_opens_onto_a_fresh_root_wal() {
-        let root = test_root("legacy_open");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("db.meta"),
-            // `WalLayout::PerPool` marker: reserved WAL-layout byte 0.
-            {
-                let mut bytes = Vec::from(b"MTXD".as_slice());
-                bytes.push(1);
-                bytes.extend_from_slice(&[0u8; 8]);
-                bytes.extend_from_slice(b"mtpl-state\nmtpl-event\nmtpl-edges\n");
-                bytes
-            },
-        )
-        .unwrap();
-        // A stale per-pool WAL that must be ignored, not replayed.
-        let stale_pool = root.join("pools/mtpl-state");
-        std::fs::create_dir_all(&stale_pool).unwrap();
-        std::fs::write(stale_pool.join("wal.bin"), b"not a real segment").unwrap();
-
-        let db = SharedDatabase::open(root.clone()).unwrap();
-        assert_eq!(db.layout().wal_layout(), crate::layout::WalLayout::PerPool);
-        assert!(root.join("wal.bin").is_file(), "a root WAL is created");
-        db.pool(ShardType::State)
-            .put(&[0x22u8; 16], &node(2), &NodeData::from_slice(b"live"))
-            .unwrap();
-        db.pool(ShardType::State).sync_all().unwrap();
-        let got = db
-            .pool(ShardType::State)
-            .get(&[0x22u8; 16], &node(2))
-            .unwrap()
-            .expect("a write on the fresh shared WAL must be readable");
-        assert_eq!(&got.bytes[..], b"live");
-        drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
 

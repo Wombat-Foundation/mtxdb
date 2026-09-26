@@ -169,22 +169,6 @@ pub const MEMBER_NAMESPACE_STAT: [u8; 4] = *b"STAT";
 /// Member namespace for internal system collections (`b"INTL"`).
 pub const MEMBER_NAMESPACE_INTL: [u8; 4] = *b"INTL";
 
-/// Deprecated compatibility alias for `MEMBER_NAMESPACE_EVNT`.
-#[deprecated(note = "use MEMBER_NAMESPACE_EVNT")]
-pub const POOL_DST_EVNT: [u8; 4] = MEMBER_NAMESPACE_EVNT;
-/// Deprecated compatibility alias for `MEMBER_NAMESPACE_PREV`.
-#[deprecated(note = "use MEMBER_NAMESPACE_PREV")]
-pub const POOL_DST_PREV: [u8; 4] = MEMBER_NAMESPACE_PREV;
-/// Deprecated compatibility alias for `MEMBER_NAMESPACE_AUTH`.
-#[deprecated(note = "use MEMBER_NAMESPACE_AUTH")]
-pub const POOL_DST_AUTH: [u8; 4] = MEMBER_NAMESPACE_AUTH;
-/// Deprecated compatibility alias for `MEMBER_NAMESPACE_STAT`.
-#[deprecated(note = "use MEMBER_NAMESPACE_STAT")]
-pub const POOL_DST_STAT: [u8; 4] = MEMBER_NAMESPACE_STAT;
-/// Deprecated compatibility alias for `MEMBER_NAMESPACE_INTL`.
-#[deprecated(note = "use MEMBER_NAMESPACE_INTL")]
-pub const POOL_DST_INTERNAL: [u8; 4] = MEMBER_NAMESPACE_INTL;
-
 /// Fixed 32-byte namespace bias constant for `b"EVNT"`.
 ///
 /// Computed as `BLAKE3-256("mtxdb/namespace/v1/EVNT")`.
@@ -441,13 +425,6 @@ pub struct CollectionMetadata {
 }
 
 impl CollectionMetadata {
-    /// Deprecated compatibility alias for `member_namespace`.
-    #[deprecated(note = "use member_namespace")]
-    #[must_use]
-    pub fn pool_dst(&self) -> Option<[u8; 4]> {
-        self.member_namespace
-    }
-
     /// The collection's group canonical ID.
     #[must_use]
     pub fn group_canonical_id(&self) -> &[u8] {
@@ -881,14 +858,7 @@ pub struct CollectionKeyRule {
     pub display_id_pointer: String,
 }
 
-impl CollectionKeyRule {
-    /// Deprecated compatibility alias for `member_namespace`.
-    #[deprecated(note = "use member_namespace")]
-    #[must_use]
-    pub fn pool_dst(&self) -> Option<[u8; 4]> {
-        self.member_namespace
-    }
-}
+impl CollectionKeyRule {}
 
 /// The template's establishment (genesis) rule: which source record defines a
 /// collection.

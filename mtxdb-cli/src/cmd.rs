@@ -4212,23 +4212,12 @@ fn meta_db(root: &Path, report: &mut MetaReport) {
             return;
         }
     };
-    let layout = match mtxdb::layout::read_wal_layout(root) {
-        Ok(Some(layout)) => match layout {
-            mtxdb::WalLayout::Shared => "shared",
-            mtxdb::WalLayout::PerPool => "per-pool",
-        },
-        Ok(None) => "unknown",
-        Err(error) => {
-            report.finding("WARN", &path, error);
-            "invalid"
-        }
-    };
     let pools = bytes.get(13..).map_or_else(
         || "<truncated>".to_owned(),
         |bytes| String::from_utf8_lossy(bytes).replace('\n', ", "),
     );
     report.line(format!(
-        "db.meta: {} bytes ({}, wal_layout={layout}, pools={pools})",
+        "db.meta: {} bytes ({}, pools={pools})",
         bytes.len(),
         metadata_magic(&bytes),
     ));
@@ -4857,10 +4846,7 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
     let root = cli.single_dir();
     let db_meta = root.join(mtxdb::layout::DB_META_FILENAME);
-    let wal = match layout.wal_layout() {
-        mtxdb::layout::WalLayout::Shared => "shared",
-        mtxdb::layout::WalLayout::PerPool => "per-pool",
-    };
+    let wal = "shared";
 
     println!("database: {}", root.display());
     println!("  db.meta:      {}", metadata_file_summary(&db_meta));
