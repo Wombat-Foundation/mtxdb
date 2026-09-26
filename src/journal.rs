@@ -82,8 +82,8 @@ const FH_BASE_CRC: std::ops::Range<usize> = 28..32;
 /// Header bytes covered by the immutable base CRC.
 const FH_BASE_CRC_COVERED: std::ops::Range<usize> = 0..FH_BASE_CRC.start;
 
-/// Size of the unit a torn write can damage. 4096 covers advanced-format disks,
-/// whose physical sector, and so atomic write unit, is 4 KiB: with 512-byte
+/// Size of the unit a torn write can damage. 4096 matches common 4 KiB
+/// physical sectors (advanced-format disks), which is the usual atomic write unit, though no filesystem or device guarantees it: with 512-byte
 /// spacing both slots and the base header could share one such unit and a
 /// single torn write could reach all three. It costs 12 KiB per segment.
 const MARK_SECTOR_LEN: usize = 4096;
@@ -91,10 +91,10 @@ const MARK_SECTOR_LEN: usize = 4096;
 /// [`MARK_SECTOR_LEN`] unit after the one that holds the immutable base header. A torn write
 /// of one slot can therefore damage only that slot: never the other slot, and
 /// never the base header, which nothing rewrites after the file is created.
-/// Each slot is `generation(8) | durable_len(8) | durable_lsn(8) | crc(4)`; an
+/// Each slot is `generation(8) | durable_len(8) | crc(4)`; an
 /// all-zero slot has never been written and claims nothing.
 const MARK_SLOT_OFFSETS: [usize; 2] = [MARK_SECTOR_LEN, 2 * MARK_SECTOR_LEN];
-const MARK_SLOT_LEN: usize = 28;
+const MARK_SLOT_LEN: usize = 20;
 /// Where journal groups begin: after the base header's sector and both mark
 /// sectors. Everything that needs "the end of the header" uses this.
 const FILE_HEADER_LEN: usize = 3 * MARK_SECTOR_LEN;
@@ -1730,9 +1730,7 @@ impl JournalCoordinator {
         // The fsync has returned, so every byte up to the captured length is
         // durable. Record that, after the fact and without an fsync of its own,
         // so recovery can tell a crash tail above it from corruption below it.
-        self.journal
-            .lock()
-            .write_mark(capture.file_len, capture.through_lsn);
+        self.journal.lock().write_mark(capture.file_len);
         // The groups were appended at publication, so this fsync wrote no
         // bytes: the receipt reports the durable range this call advanced.
         CommitReceipt {
@@ -2657,9 +2655,9 @@ impl Journal {
             next_lsn,
             poisoned: false,
         };
-        if let Some(last) = scan.groups.last() {
+        if !scan.groups.is_empty() {
             // Recovery fsynced what it kept above, so record that in the mark.
-            journal.write_mark(scan.valid_len, last.last_lsn);
+            journal.write_mark(scan.valid_len);
         }
         Ok((journal, scan))
     }
@@ -2877,19 +2875,19 @@ impl Journal {
         }
         // The fsync returned, so everything appended so far is durable: record
         // that in the durability mark, after the fact.
-        self.write_mark(self.file_len, self.next_lsn.saturating_sub(1));
+        self.write_mark(self.file_len);
         Ok(())
     }
 
     /// Record, in the slot not holding the newest mark, that `durable_len`
-    /// bytes through `through_lsn` are durable. Call it only after an fsync
+    /// bytes are durable. Call it only after an fsync
     /// that covered them, so the mark can only under-claim.
     ///
     /// Only pool-tagged segments keep a mark. The slot is written with a
     /// positioned write, so it never moves the append cursor. A failed write
     /// is ignored: the previous mark stays in the other slot, or recovery sees
     /// no mark and truncates conservatively.
-    fn write_mark(&mut self, durable_len: u64, through_lsn: u64) {
+    fn write_mark(&mut self, durable_len: u64) {
         if !self.version.is_pool_tagged() {
             return;
         }
@@ -2897,7 +2895,6 @@ impl Journal {
         let bytes = encode_mark_slot(MarkSlot {
             generation,
             durable_len,
-            durable_lsn: through_lsn,
         });
         let slot = usize::try_from(generation % 2).unwrap_or(0);
         let offset = u64::try_from(MARK_SLOT_OFFSETS[slot]).unwrap_or(u64::MAX);
@@ -3010,9 +3007,6 @@ impl Journal {
         let rebuilt_mark = self.version.is_pool_tagged().then(|| MarkSlot {
             generation: 1,
             durable_len: u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
-            durable_lsn: retained
-                .last()
-                .map_or(new_base_lsn.saturating_sub(1), |group| group.last_lsn),
         });
         if let Some(mark) = rebuilt_mark {
             let offset = MARK_SLOT_OFFSETS[1];
@@ -3119,17 +3113,15 @@ fn validate_file_header(bytes: &[u8]) -> io::Result<(JournalVersion, u64, u64)> 
 struct MarkSlot {
     generation: u64,
     durable_len: u64,
-    durable_lsn: u64,
 }
 
 fn encode_mark_slot(slot: MarkSlot) -> [u8; MARK_SLOT_LEN] {
     let mut bytes = [0_u8; MARK_SLOT_LEN];
     bytes[..8].copy_from_slice(&slot.generation.to_le_bytes());
     bytes[8..16].copy_from_slice(&slot.durable_len.to_le_bytes());
-    bytes[16..24].copy_from_slice(&slot.durable_lsn.to_le_bytes());
     let mut crc = Hasher::new();
-    crc.update(&bytes[..24]);
-    bytes[24..28].copy_from_slice(&crc.finalize().to_le_bytes());
+    crc.update(&bytes[..16]);
+    bytes[16..20].copy_from_slice(&crc.finalize().to_le_bytes());
     bytes
 }
 
@@ -3137,14 +3129,13 @@ fn encode_mark_slot(slot: MarkSlot) -> [u8; MARK_SLOT_LEN] {
 fn decode_mark_slot(bytes: &[u8]) -> Option<MarkSlot> {
     let bytes = bytes.get(..MARK_SLOT_LEN)?;
     let mut crc = Hasher::new();
-    crc.update(&bytes[..24]);
-    if u32::from_le_bytes(bytes[24..28].try_into().ok()?) != crc.finalize() {
+    crc.update(&bytes[..16]);
+    if u32::from_le_bytes(bytes[16..20].try_into().ok()?) != crc.finalize() {
         return None;
     }
     let slot = MarkSlot {
         generation: u64::from_le_bytes(bytes[..8].try_into().ok()?),
         durable_len: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
-        durable_lsn: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
     };
     // Generation zero is never written, so a checksum-valid slot claiming it
     // is not a mark.
@@ -4939,11 +4930,11 @@ mod tests {
 
     /// Both mark slots as currently decoded from the file's header region.
     #[cfg(feature = "multi-reader")]
-    fn mark_slots(path: &Path) -> [Option<(u64, u64, u64)>; 2] {
+    fn mark_slots(path: &Path) -> [Option<(u64, u64)>; 2] {
         let bytes = fs::read(path).unwrap();
         super::MARK_SLOT_OFFSETS.map(|offset| {
             super::decode_mark_slot(&bytes[offset..])
-                .map(|slot| (slot.generation, slot.durable_len, slot.durable_lsn))
+                .map(|slot| (slot.generation, slot.durable_len))
         })
     }
 
@@ -5005,8 +4996,8 @@ mod tests {
         drop(coordinator);
 
         let [slot0, slot1] = mark_slots(&path);
-        let (generation0, len0, _) = slot0.expect("slot 0 holds a mark");
-        let (generation1, len1, _) = slot1.expect("slot 1 holds a mark");
+        let (generation0, len0) = slot0.expect("slot 0 holds a mark");
+        let (generation1, len1) = slot1.expect("slot 1 holds a mark");
         // Generations 1 and 3 land in slot 1, generation 2 in slot 0, and the
         // third overwrote the first: the two slots hold the two newest.
         assert_eq!((generation0, len0), (2, file_sizes[1]));
@@ -5111,7 +5102,8 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    /// Fault injection for the reason the slots have sectors of their own: a
+    /// Writes the damage directly, modelling the post-crash disk image rather
+    /// than proving power-loss behavior. The reason the slots have sectors of their own: a
     /// mark write torn across its whole sector leaves the base header and the
     /// first group readable.
     #[cfg(feature = "multi-reader")]
@@ -5178,10 +5170,7 @@ mod tests {
         let len = fs::metadata(&path).unwrap().len();
         let [slot0, slot1] = mark_slots(&path);
         assert_eq!(slot0, None);
-        assert_eq!(
-            slot1.map(|(generation, durable_len, _)| (generation, durable_len)),
-            Some((1, len))
-        );
+        assert_eq!(slot1, Some((1, len)));
 
         punch_hole(&path, super::FILE_HEADER_LEN as u64, second.bytes_written);
         assert_eq!(
