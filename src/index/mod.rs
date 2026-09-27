@@ -245,6 +245,19 @@ impl EntryStorage {
     }
 }
 
+impl LossyIndex {
+    /// A copy of an identity side table, or an all-zero (unhydrated) one of
+    /// `capacity` entries if the source has none.
+    fn identity_table(table: &Mutex<Vec<u64>>, capacity: u32) -> Vec<u64> {
+        let table = table.lock();
+        if table.len() == capacity as usize {
+            table.clone()
+        } else {
+            vec![0; capacity as usize]
+        }
+    }
+}
+
 impl Clone for LossyIndex {
     fn clone(&self) -> Self {
         Self {
@@ -253,20 +266,15 @@ impl Clone for LossyIndex {
             shift: self.shift,
             config: self.config,
             slots: EntryStorage::Owned(self.slots.materialize(self.capacity as usize)),
-            // Checkpoint-backed indexes deliberately omit source hashes. On
-            // their first write, clone their slots into owned storage but
-            // keep an empty home table; `can_grow` remains false, so a later
-            // capacity boundary correctly falls back to a pack rebuild.
-            homes: Mutex::new(if self.is_mmap_backed() {
-                vec![0; self.capacity as usize]
-            } else {
-                self.homes.lock().clone()
-            }),
-            tails: Mutex::new(if self.is_mmap_backed() {
-                vec![0; self.capacity as usize]
-            } else {
-                self.tails.lock().clone()
-            }),
+            // Keep whatever identity tables the source holds. A mapping loaded
+            // with its persisted `homes`/`tails` carries hydrated identities, and
+            // dropping them here made every entry lose its identity on the first
+            // write after a reopen (the next checkpoint then persisted zeros). A
+            // mapping loaded without tables has none, so it gets zeroed ones.
+            // `can_grow` is untouched: a checkpoint-backed index still falls
+            // back to a pack rebuild at a capacity boundary.
+            homes: Mutex::new(Self::identity_table(&self.homes, self.capacity)),
+            tails: Mutex::new(Self::identity_table(&self.tails, self.capacity)),
             can_grow: self.can_grow,
             len: AtomicU32::new(self.len.load(Ordering::Acquire)),
             max_probe_len: AtomicU32::new(self.max_probe_len.load(Ordering::Relaxed)),
@@ -1349,6 +1357,201 @@ mod tests {
         let mut h = [0u8; 16];
         h[0] = byte;
         h
+    }
+
+    /// Deterministic 16-byte hashes (splitmix64), so tag collisions occur
+    /// among a few thousand of them.
+    fn spread_hash(seq: u64) -> [u8; 16] {
+        let mut state = seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut hash = [0u8; 16];
+        hash[..8].copy_from_slice(&next().to_be_bytes());
+        hash[8..].copy_from_slice(&next().to_be_bytes());
+        hash
+    }
+
+    /// Every occupied bucket carries a hydrated identity (the tail's known
+    /// marker) and a home from which the entry is reachable by linear probing
+    /// without crossing an empty slot: what a rehash from `homes`/`tails`
+    /// needs to be able to trust.
+    fn identities_complete(index: &LossyIndex) -> bool {
+        let homes = index.homes.lock();
+        let tails = index.tails.lock();
+        (0..index.capacity as usize).all(|bucket| {
+            if IndexEntry(index.entry_at(bucket)).is_empty() {
+                return true;
+            }
+            if tails[bucket] >> 63 == 0 {
+                return false;
+            }
+            let mut probe = index.bucket_for_home(homes[bucket]);
+            while probe != bucket {
+                if IndexEntry(index.entry_at(probe)).is_empty() {
+                    return false;
+                }
+                probe = probe.wrapping_add(1) & index.mask as usize;
+            }
+            true
+        })
+    }
+
+    fn candidates(index: &LossyIndex, hash: &[u8; 16]) -> Vec<(u16, u64)> {
+        let mut found: Vec<(u16, u64)> = index.lookup_all(hash).collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// Whether a checkpoint-loaded index could grow from its persisted `homes`
+    /// and `tails`. Loaders disable growth (`can_grow == false`) on purpose, so
+    /// this decides the question without changing that: build a live index,
+    /// persist and load it, and check (a) a fully hydrated load has complete
+    /// identities, and growing it with the existing rehash gives the same keys,
+    /// locators, length, per-pack counts and collision candidates; (b) a load
+    /// whose identity side tables lost entries is detected as incomplete, does
+    /// not grow, and the pack-based growth (`grow_by_recovering_hashes`) gives the
+    /// same result.
+    #[test]
+    fn a_hydrated_checkpoint_loaded_index_can_grow_from_its_identity_tables() {
+        let config = IndexConfig {
+            seed: 0x5EED_1234_ABCD_0042,
+            ..IndexConfig::default()
+        };
+        let live = LossyIndex::with_config(4096, config);
+        let mut locators: HashMap<(u16, u64), [u8; 16]> = HashMap::new();
+        let mut expected: Vec<([u8; 16], (u16, u64))> = Vec::new();
+        for seq in 0..3000u64 {
+            let hash = spread_hash(seq);
+            let locator = (u16::try_from(seq % 8).unwrap(), seq * 64);
+            live.insert(&hash, locator.0, locator.1).unwrap();
+            locators.insert(locator, hash);
+            expected.push((hash, locator));
+        }
+        let collisions = expected
+            .iter()
+            .filter(|(hash, _)| live.lookup_all(hash).count() > 1)
+            .count();
+        assert!(
+            (0..3000u64).any(|seq| {
+                let tag = live.tag_for_hash(&spread_hash(seq));
+                (seq + 1..3000).any(|other| live.tag_for_hash(&spread_hash(other)) == tag)
+            }),
+            "the workload must contain tag collisions to exercise them"
+        );
+        let _ = collisions;
+
+        // (a) fully hydrated checkpoint load.
+        let blob = live.serialize();
+        let mut loaded = LossyIndex::deserialize_with_config(&blob, config).unwrap();
+        assert!(!loaded.can_grow, "loaders disable growth today");
+        assert!(loaded.grow().is_none(), "and so refuse to grow");
+        assert!(
+            identities_complete(&loaded),
+            "v6 blobs persist full identities"
+        );
+        loaded.can_grow = true; // what a hydrated-only gate would set
+        let grown = loaded
+            .grow()
+            .expect("a hydrated load grows from its side tables");
+        assert_eq!(grown.capacity(), live.capacity() * 2);
+        assert_eq!(grown.len(), live.len());
+        assert_eq!(grown.slot_counts(), live.slot_counts());
+        for (hash, locator) in &expected {
+            assert_eq!(grown.lookup(hash), Some(*locator));
+            assert_eq!(candidates(&grown, hash), candidates(&live, hash));
+        }
+        assert!(
+            identities_complete(&grown),
+            "growth keeps identities complete"
+        );
+
+        // (b) identity side tables that lost entries.
+        let slots_region = 8 + live.capacity() as usize * 8;
+        let tails_region = slots_region + live.capacity() as usize * 8;
+        let mut damaged = blob.clone();
+        let mut zeroed = 0;
+        for bucket in 0..live.capacity() as usize {
+            if !IndexEntry(live.entry_at(bucket)).is_empty() && zeroed < 10 {
+                let at = tails_region + bucket * 8;
+                damaged[at..at + 8].fill(0);
+                zeroed += 1;
+            }
+        }
+        let partial = LossyIndex::deserialize_with_config(&damaged, config).unwrap();
+        assert!(
+            !identities_complete(&partial),
+            "zeroed tails must be detected, not trusted"
+        );
+        assert!(partial.grow().is_none(), "and it must not grow from them");
+        let recovered = partial
+            .grow_by_recovering_hashes(|slot, offset, _tag| {
+                locators.get(&(slot, offset)).copied().ok_or(())
+            })
+            .unwrap()
+            .expect("pack-based growth still works");
+        assert_eq!(recovered.len(), live.len());
+        assert_eq!(recovered.slot_counts(), live.slot_counts());
+        for (hash, locator) in &expected {
+            assert_eq!(recovered.lookup(hash), Some(*locator));
+        }
+
+        // A blob with no identity tables at all (pre-v4) is incomplete too.
+        let bare = LossyIndex::deserialize_with_config(&blob[..slots_region], config).unwrap();
+        assert!(!identities_complete(&bare));
+    }
+
+    /// The write path after a checkpoint reopen: the index is loaded over the
+    /// mapping (with its persisted identity tables), then cloned into owned
+    /// storage on the first write. If that clone drops the tables, every entry
+    /// loses its identity and the *next* checkpoint persists zeros, so a
+    /// hydrated-only growth gate would fail after any reopen.
+    #[test]
+    fn a_clone_of_a_checkpoint_mapped_index_keeps_its_identity_tables() {
+        let config = IndexConfig {
+            seed: 0x5EED_1234_ABCD_0042,
+            ..IndexConfig::default()
+        };
+        let live = LossyIndex::with_config(1024, config);
+        for seq in 0..600u64 {
+            live.insert(&spread_hash(seq), u16::try_from(seq % 4).unwrap(), seq * 64)
+                .unwrap();
+        }
+        assert!(identities_complete(&live));
+        let path = std::env::temp_dir().join(format!(
+            "mtxdb-index-identity-{}-{}.bin",
+            std::process::id(),
+            live.capacity()
+        ));
+        std::fs::write(&path, live.serialize()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = Arc::new(crate::packfile::map_pack(&file).unwrap());
+        let capacity = live.capacity() as usize;
+        let mapped = LossyIndex::from_mmap_slots_with_homes_tails(
+            mmap,
+            8,
+            8 + capacity * 8,
+            8 + capacity * 16,
+            live.capacity(),
+            u32::try_from(live.len()).unwrap(),
+            config,
+        );
+        assert!(mapped.is_mmap_backed());
+        assert!(
+            identities_complete(&mapped),
+            "the mapped load holds the persisted identities"
+        );
+        let owned = mapped.clone();
+        let complete_after_clone = identities_complete(&owned);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            complete_after_clone,
+            "cloning a mapped index into owned storage dropped its identity tables"
+        );
     }
 
     #[test]
