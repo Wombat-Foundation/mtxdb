@@ -928,6 +928,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A checkpoint written by the immediately preceding version (v7: 36-byte
+    /// pack-table entries carrying the 32-byte `PackId`) must be rejected, not
+    /// misread as v8's 20-byte entries. The version gate is what forces the
+    /// caller's full-rescan fallback instead of serving a garbled index.
+    #[test]
+    fn previous_version_checkpoint_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_prevver_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+
+        let blobs = [([1u8; 16], index_with_entries(1, 40).serialize())];
+        write_checkpoint(
+            &path,
+            pack_fingerprint(&[(pid(1), 10)]),
+            0,
+            0,
+            &blobs
+                .iter()
+                .map(|(id, b)| (*id, 0, b.as_slice()))
+                .collect::<Vec<_>>(),
+            &[(0, pid(1))],
+        )
+        .unwrap();
+        assert!(
+            read_checkpoint(&path).is_some(),
+            "sanity: current version reads"
+        );
+
+        // Rewrite the version field to the previous version.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&(CHECKPOINT_VERSION - 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            read_checkpoint(&path).is_none(),
+            "a v{} checkpoint must be rejected by the v{} reader",
+            CHECKPOINT_VERSION - 1,
+            CHECKPOINT_VERSION
+        );
+        // The lightweight header reader must agree, so `open` sees the same
+        // rejection and falls back to a full scan rather than trusting it.
+        assert!(read_checkpoint_summary(&path).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn content_crc32_catches_value_preserving_slot_corruption() {
         // The pre-CRC occupancy walk only ever compared a *count* of

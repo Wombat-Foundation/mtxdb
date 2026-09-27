@@ -3097,6 +3097,11 @@ mod tests {
     fn pack_id_for(n: u64) -> packfile::PackId {
         let mut bytes = [0u8; packfile::PACK_ID_LEN];
         bytes[..8].copy_from_slice(&n.to_be_bytes());
+        // Stamp an explicit nonzero marker in the trailing byte so even
+        // `n == 0` yields a valid identity (the all-zero address is reserved).
+        // The leading 8 bytes still encode `n`, so the 16-hex filename prefix
+        // is unchanged.
+        bytes[packfile::PACK_ID_LEN - 1] = 0xA5;
         packfile::PackId(bytes)
     }
 
@@ -3684,6 +3689,32 @@ mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
         assert!(!leftover_tmp, "a persist_stats tmp file was left behind");
+    }
+
+    /// A stats snapshot at the immediately preceding version (v5: 56-byte
+    /// records keyed by the 32-byte `PackId`) must be ignored rather than
+    /// misparsed as v6's 40-byte records. The snapshot is a rebuildable
+    /// observability cache, so rejection just means "not restored".
+    #[test]
+    fn previous_version_stats_snapshot_is_not_restored() {
+        let dir = test_dir("stats_prev_version");
+        // Hand-write a v5-format file: magic, version 5, timestamp, then one
+        // 56-byte record (32-byte pack id + three u64 counters). No shard is
+        // needed: the version gate rejects the whole file before any record is
+        // matched, which is exactly the behavior under test.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(STATS_MAGIC);
+        buf.push(STATS_VERSION - 1);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32 + 8 * 3]);
+        fs::write(ShardPool::stats_path(&dir), &buf).unwrap();
+
+        let empty_shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
+        assert!(
+            ShardPool::restore_persisted_stats(&dir, &empty_shards).is_none(),
+            "a v{} stats snapshot must not be restored by the v{STATS_VERSION} reader",
+            STATS_VERSION - 1
+        );
     }
 
     /// Core invariant of the writer lock: at most one writer per

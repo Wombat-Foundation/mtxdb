@@ -12805,6 +12805,33 @@ mod tests {
         );
     }
 
+    /// The shard→collection sidecar at the immediately preceding version (v6:
+    /// 72-byte records keyed by the 32-byte `PackId`) must be rejected rather
+    /// than misparsed as v7's 56-byte records. The sidecar is a rebuildable
+    /// acceleration, so rejection just routes the caller to the full walk.
+    #[test]
+    fn previous_version_shard_collections_sidecar_is_rejected() {
+        let dir = test_dir("shard_collections_prev_version");
+        // Header: magic(4) + version(1) + fingerprint(8) + persisted_at(8),
+        // then one 72-byte v6 record (32-byte pack id + 16-byte collection id
+        // + three u64 fields). The body length is a multiple of the *old*
+        // record size but not necessarily the new one, and the version gate
+        // must reject it before any body parse.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(SHARD_ROOMS_MAGIC);
+        buf.push(SHARD_ROOMS_VERSION - 1);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32 + 16 + 8 + 8 + 8]);
+        std::fs::write(PackfileStorage::shard_collections_path(&dir), &buf).unwrap();
+
+        assert!(
+            read_persisted_shard_collections(&dir).is_none(),
+            "a v{} shard-collections sidecar must be rejected by the v{SHARD_ROOMS_VERSION} reader",
+            SHARD_ROOMS_VERSION - 1
+        );
+    }
+
     #[test]
     fn test_walk_ancestors_pins_shards_against_a_mid_walk_repack() {
         // The walk freezes one generation, but a concurrent repack can still
@@ -15579,7 +15606,9 @@ mod tests {
             std::fs::write(path, b"").unwrap();
         }
 
-        let pack_id = PackId([0u8; crate::packfile::PACK_ID_LEN]);
+        let mut valid_bytes = [0u8; crate::packfile::PACK_ID_LEN];
+        valid_bytes[crate::packfile::PACK_ID_LEN - 1] = 1;
+        let pack_id = PackId(valid_bytes);
         let valid_path = dir.join(pack_id.filename());
         let mut buf = Vec::new();
         packfile::write_header(&mut buf, &pack_id).unwrap();

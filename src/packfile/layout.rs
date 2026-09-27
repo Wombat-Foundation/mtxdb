@@ -171,6 +171,10 @@ mod tests {
     fn pack_id_for(n: u64) -> PackId {
         let mut bytes = [0u8; crate::packfile::PACK_ID_LEN];
         bytes[..8].copy_from_slice(&n.to_be_bytes());
+        // Explicit nonzero marker in the trailing byte so `n == 0` is still a
+        // valid identity (the all-zero address is reserved); the filename
+        // prefix is unchanged.
+        bytes[crate::packfile::PACK_ID_LEN - 1] = 0xA5;
         PackId(bytes)
     }
 

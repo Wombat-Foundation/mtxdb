@@ -3873,12 +3873,78 @@ enum InfoTarget {
     Collection,
 }
 
+fn pack_id_exists(cli: &Cli, target_id: &PackId) -> bool {
+    let Ok(dirs) = valid_database_dirs(cli) else {
+        return false;
+    };
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+    for db_dir in dirs {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir) else {
+            continue;
+        };
+        for &shard_type in &shard_types {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            if let Ok(files) = glob_pack_files(&dir) {
+                if files.iter().any(|(id, _, _)| id == target_id) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
+    let Ok(dirs) = valid_database_dirs(cli) else {
+        return false;
+    };
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+    for db_dir in dirs {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir) else {
+            continue;
+        };
+        for &shard_type in &shard_types {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            let has = if let Some(summaries) =
+                PackfileStorage::collection_summaries_from_disk(&dir)
+            {
+                summaries.iter().any(|(id, _, _, _)| id == target_id)
+            } else if let Ok(store) = PackfileStorage::open_read_only(dir) {
+                store.collection_index_info(target_id).is_some()
+            } else {
+                false
+            };
+            if has {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Classify an `info` selector by the digits after its canonical lowercase
-/// `0x` prefix: 1-16 name a pack, exactly 32 name a collection, and any other
-/// count is an error. A selector without a `0x` prefix is handed to the
-/// collection parser (which accepts only a canonical sigil such as `!room`);
-/// an uppercase `0X` prefix is rejected rather than guessed at.
-fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
+/// `0x` prefix: 1-16 name a pack prefix, exactly 32 can name either a full pack
+/// address or a collection, and any other count is an error. A selector without
+/// a `0x` prefix is handed to the collection parser (which accepts only a canonical
+/// sigil such as `!room`); an uppercase `0X` prefix is rejected rather than guessed at.
+///
+/// For an ambiguous 32-hex selector, the database is checked:
+/// - If only an existing pack matches, it resolves as [`InfoTarget::Pack`].
+/// - If only a collection exists (or neither exists yet), it resolves as [`InfoTarget::Collection`].
+/// - If both a live pack and a collection match the same ID, an error requires an explicit selector.
+fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
     let Some(hex) = selector.strip_prefix("0x") else {
         if selector.starts_with("0X") {
             bail!("invalid ID `{selector}`: the prefix must be lowercase `0x`");
@@ -3886,13 +3952,34 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
         return Ok(InfoTarget::Collection);
     };
     match hex.len() {
-        1..=16 | 64 => Ok(InfoTarget::Pack),
-        32 => Ok(InfoTarget::Collection),
+        1..=16 => Ok(InfoTarget::Pack),
+        32 => {
+            let pack_id = parse_pack_id_selector(selector).ok().and_then(|sel| match sel {
+                PackSelector::Exact(id) => Some(id),
+                PackSelector::Prefix(_) => None,
+            });
+            let collection_id = parse_collection_id(selector).ok();
+
+            let pack_matches = pack_id.is_some_and(|id| pack_id_exists(cli, &id));
+            let collection_matches = collection_id.is_some_and(|id| collection_id_exists(cli, &id));
+
+            if pack_matches && collection_matches {
+                bail!(
+                    "ambiguous 32-hex selector `{selector}` matches both a live pack and a collection; \
+                     use a pack prefix (e.g. 0x{}) to inspect the pack",
+                    &hex[..mtxdb::packfile::PACK_FILENAME_PREFIX_HEX.min(hex.len())]
+                );
+            }
+            if pack_matches {
+                Ok(InfoTarget::Pack)
+            } else {
+                Ok(InfoTarget::Collection)
+            }
+        }
         found => {
             bail!(
-                "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection), \
-                 1-16 (a pack filename prefix), or 64 (a full pack address), found {found} \
-                 characters{}",
+                "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection or full pack address) \
+                 or 1-16 (a pack filename prefix), found {found} characters{}",
                 if hex.starts_with("0x") {
                     " (the `0x` prefix is doubled)"
                 } else {
@@ -3906,7 +3993,7 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
 #[allow(clippy::too_many_lines)]
 fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let deep = matches!(cli.command, Commands::Info { stats: true, .. });
-    let target = classify_info_selector(selector)?;
+    let target = classify_info_selector(cli, selector)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -4976,7 +5063,7 @@ fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
 
 fn cmd_info_single(cli: &Cli, selector: &str) -> anyhow::Result<()> {
     let deep = matches!(cli.command, Commands::Info { stats: true, .. });
-    match classify_info_selector(selector)? {
+    match classify_info_selector(cli, selector)? {
         InfoTarget::Pack => cmd_info_pack(cli, selector),
         InfoTarget::Collection => cmd_info_collection(cli, selector, deep),
     }
@@ -6156,7 +6243,7 @@ fn cmd_scan_coalesced(
     sort: Option<&str>,
     reverse: bool,
 ) -> anyhow::Result<()> {
-    let target = classify_info_selector(selector)?;
+    let target = classify_info_selector(cli, selector)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -6328,7 +6415,7 @@ fn cmd_scan_single(
     };
     // `info` and `scan` share `classify_info_selector`, so the same selector
     // works for both and a malformed one gets the same explanation.
-    let looks_like_pack_id = classify_info_selector(selector)? == InfoTarget::Pack;
+    let looks_like_pack_id = classify_info_selector(cli, selector)? == InfoTarget::Pack;
     if !looks_like_pack_id {
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
@@ -11091,35 +11178,111 @@ mod tests {
 
     #[test]
     fn info_selector_boundary_between_pack_and_collection() {
+        let cli = Cli {
+            dirs: Vec::new(),
+            shard_type: None,
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Info {
+                collection: None,
+                stats: false,
+            },
+        };
         let digits = |n: usize| format!("0x{}", "a".repeat(n));
         assert_eq!(
-            super::classify_info_selector("7").unwrap(),
+            super::classify_info_selector(&cli, "7").unwrap(),
             super::InfoTarget::Collection
         );
         assert_eq!(
-            super::classify_info_selector(&digits(1)).unwrap(),
+            super::classify_info_selector(&cli, &digits(1)).unwrap(),
             super::InfoTarget::Pack
         );
         assert_eq!(
-            super::classify_info_selector(&digits(16)).unwrap(),
+            super::classify_info_selector(&cli, &digits(16)).unwrap(),
             super::InfoTarget::Pack
         );
-        let upper = super::classify_info_selector("0X1").unwrap_err();
+        let upper = super::classify_info_selector(&cli, "0X1").unwrap_err();
         assert!(upper.to_string().contains("lowercase"), "{upper}");
         assert_eq!(
-            super::classify_info_selector(&digits(32)).unwrap(),
+            super::classify_info_selector(&cli, &digits(32)).unwrap(),
             super::InfoTarget::Collection
         );
-        for n in [0, 17, 31, 33] {
+        for n in [0, 17, 31, 33, 64] {
             assert!(
-                super::classify_info_selector(&digits(n)).is_err(),
+                super::classify_info_selector(&cli, &digits(n)).is_err(),
                 "{n} digits after 0x must be rejected"
             );
         }
     }
 
     #[test]
+    fn info_selector_32_hex_disambiguation() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let pool = layout.pool_dir(ShardType::State).unwrap();
+        let store = mtxdb::PackfileStorage::open(pool.clone()).unwrap();
+
+        // 1. Write a record to create a pack and collection
+        let collection_a = [0x42u8; 16];
+        let data = mtxdb::NodeData::new(bytes::Bytes::from_static(b"data1"));
+        store.put(&collection_a, &[0x01; 16], &data).unwrap();
+        store.sync_all().unwrap();
+
+        let files = glob_pack_files(&pool).unwrap();
+        let pack_id = files[0].0;
+        let pack_hex = format!("0x{}", pack_id.as_hex());
+        let col_hex = format_id(&collection_a);
+
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: Some(ShardType::State),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Info {
+                collection: None,
+                stats: false,
+            },
+        };
+
+        // Pack hex resolves to Pack
+        assert_eq!(
+            super::classify_info_selector(&cli, &pack_hex).unwrap(),
+            super::InfoTarget::Pack
+        );
+
+        // Collection hex resolves to Collection
+        assert_eq!(
+            super::classify_info_selector(&cli, &col_hex).unwrap(),
+            super::InfoTarget::Collection
+        );
+
+        // If a collection with the EXACT same ID as pack_id is created, it becomes ambiguous:
+        let collision_data = mtxdb::NodeData::new(bytes::Bytes::from_static(b"collision"));
+        store.put(pack_id.as_bytes(), &[0x02; 16], &collision_data).unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        let ambiguous_err = super::classify_info_selector(&cli, &pack_hex).unwrap_err();
+        assert!(
+            ambiguous_err.to_string().contains("ambiguous 32-hex selector"),
+            "{ambiguous_err}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn only_the_canonical_lowercase_prefix_is_accepted() {
+        let cli = Cli {
+            dirs: Vec::new(),
+            shard_type: None,
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Info {
+                collection: None,
+                stats: false,
+            },
+        };
         // A short 0x-prefixed prefix is a filename-prefix selector.
         let short = super::parse_pack_id_selector("0x1f").unwrap();
         assert!(short.matches(&PackId([0x1f; mtxdb::packfile::PACK_ID_LEN])));
@@ -11134,11 +11297,11 @@ mod tests {
         assert!(super::parse_pack_id_selector("0X1f").is_err());
         assert!(super::parse_collection_id(&upper).is_err());
         assert!(super::parse_node_id(&upper).is_err());
-        assert!(super::classify_info_selector(&upper).is_err());
+        assert!(super::classify_info_selector(&cli, &upper).is_err());
         // Every selector `info` routes to a pack must parse as one.
         for selector in ["0x1", "0xffffffffffffffff"] {
             assert_eq!(
-                super::classify_info_selector(selector).unwrap(),
+                super::classify_info_selector(&cli, selector).unwrap(),
                 super::InfoTarget::Pack
             );
             assert!(

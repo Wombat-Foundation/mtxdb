@@ -55,45 +55,52 @@ pub const PACK_FILENAME_PREFIX_HEX: usize = 16;
 pub struct PackId(pub [u8; PACK_ID_LEN]);
 
 impl PackId {
-    /// Generate a fresh random address from OS entropy.
+    /// Generate a fresh random address from the operating system's CSPRNG.
     ///
-    /// Uses `std`'s `RandomState` (OS-seeded) mixed with the process's
-    /// monotonic clock and an atomic counter, then hashed through BLAKE3 and
-    /// truncated to 128 bits. There is no security adversary selecting pack
-    /// identities here;
-    /// the requirement is collision-freedom across pools/hosts, which this
-    /// satisfies without adding a `getrandom` dependency.
+    /// Fills the full [`PACK_ID_LEN`] bytes from `getrandom` (the OS entropy
+    /// source: `getrandom(2)`/`/dev/urandom`, `BCryptGenRandom`, etc.). The
+    /// identity is externally visible and portable across pools and hosts, so
+    /// it must carry real entropy rather than a hash of a weaker seed: this
+    /// yields the full 128-bit collision bound the identity is documented to
+    /// have (birthday bound ≈ 2^64 packs).
+    ///
+    /// # Panics
+    /// Panics if the OS entropy source is unavailable. This cannot be handled
+    /// meaningfully at the call site: every caller (pack creation, extract,
+    /// import) needs a globally unique identity, and silently falling back to
+    /// a weaker source would reintroduce the collision risk this method exists
+    /// to avoid. OS entropy is available on every supported platform.
     #[must_use]
     pub fn random() -> Self {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        let mut hasher = blake3::Hasher::new();
-        // Two independently-seeded RandomState draws (each OS-seeded) plus a
-        // process-local counter make accidental repetition effectively
-        // impossible even across rapid creation bursts.
-        let seed_a = RandomState::new().build_hasher().finish();
-        let seed_b = RandomState::new().build_hasher().finish();
-        hasher.update(&seed_a.to_le_bytes());
-        hasher.update(&seed_b.to_le_bytes());
-        hasher.update(&counter.to_le_bytes());
-        if let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            hasher.update(&elapsed.as_nanos().to_le_bytes());
+        // The all-zero address is the reserved empty sentinel, so a draw that
+        // lands on it (probability 2^-128) is discarded rather than returned:
+        // `random` guarantees a nonzero identity by contract.
+        loop {
+            let mut bytes = [0u8; PACK_ID_LEN];
+            getrandom::fill(&mut bytes).expect("OS entropy source is available");
+            let id = Self(bytes);
+            if !id.is_zero() {
+                return id;
+            }
         }
-        let digest = *hasher.finalize().as_bytes();
-        let mut bytes = [0u8; PACK_ID_LEN];
-        bytes.copy_from_slice(&digest[..PACK_ID_LEN]);
-        Self(bytes)
     }
 
     /// The raw 16 address bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; PACK_ID_LEN] {
         &self.0
+    }
+
+    /// Whether this is the all-zero address, which is reserved as the
+    /// "no pack"/empty sentinel and is never a valid pack identity.
+    ///
+    /// [`PackId::random`] never produces it; the zero value only appears as a
+    /// placeholder in tombstone records and empty table slots. Trust
+    /// boundaries (header reads, hex parsing, pack creation/import) reject it
+    /// so a stray zero can never be adopted as a real pack's identity.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|&byte| byte == 0)
     }
 
     /// The full 32 lowercase hex digits of the address.
@@ -140,7 +147,7 @@ impl PackId {
 
     /// Parse an address from a filename stem (the part before `.pack`). Accepts
     /// the compact `pack_<16hex>` form, the underscore-joined
-    /// `pack_<16hex>[_<16hex>...]` form, and the full `pack_<64hex>` collision
+    /// `pack_<16hex>[_<16hex>...]` form, and the full `pack_<32hex>` collision
     /// form, and requires at least [`PACK_FILENAME_PREFIX_HEX`] lowercase hex
     /// digits.
     ///
@@ -149,7 +156,10 @@ impl PackId {
     ///
     /// # Errors
     /// Returns `None` if the stem is not `pack_` followed by groups of exactly
-    /// 16 lowercase hex digits (underscore-separated).
+    /// 16 lowercase hex digits (underscore-separated), or if it is the full
+    /// all-zero address (reserved, never a valid identity). A *truncated*
+    /// all-zero prefix is still accepted: it can legitimately belong to a
+    /// nonzero 128-bit address whose leading bits happen to be zero.
     #[must_use]
     pub fn parse_filename_prefix(stem: &str) -> Option<(Vec<u8>, usize)> {
         let rest = stem.strip_prefix("pack_")?;
@@ -182,6 +192,9 @@ impl PackId {
             let lo = hex_value(chunk[1])?;
             bytes[index] = (hi << 4) | lo;
         }
+        if bytes.len() == PACK_ID_LEN && bytes.iter().all(|&byte| byte == 0) {
+            return None;
+        }
         Some((bytes, digits.len()))
     }
 
@@ -190,7 +203,8 @@ impl PackId {
     /// selectors).
     ///
     /// # Errors
-    /// Returns `None` for the wrong length or any non-lowercase-hex character.
+    /// Returns `None` for the wrong length, any non-lowercase-hex character,
+    /// or the all-zero address (reserved, never a valid identity).
     #[must_use]
     pub fn from_hex(hex: &str) -> Option<Self> {
         if hex.len() != PACK_ID_LEN * 2 {
@@ -202,7 +216,11 @@ impl PackId {
             let lo = hex_value(chunk[1])?;
             bytes[index] = (hi << 4) | lo;
         }
-        Some(Self(bytes))
+        let id = Self(bytes);
+        if id.is_zero() {
+            return None;
+        }
+        Some(id)
     }
 
     /// Whether this address's lowercase hex begins with the given lowercase
@@ -1373,14 +1391,21 @@ fn read_record_metadata_skip_payload_with_end(
 /// creation, and never mutated again (see [`VERSION`]'s doc for why).
 ///
 /// # Errors
-/// Returns `io::Error` on write failure, or if the system clock is
-/// before the Unix epoch (treated as a hard error rather than silently
-/// recording a wrong creation time).
+/// Returns `io::Error` on write failure, if the system clock is before the
+/// Unix epoch (treated as a hard error rather than silently recording a wrong
+/// creation time), or if `pack_id` is the reserved all-zero address — refused
+/// so a creation or import path can never persist it as a real identity.
 ///
 /// # Panics
 /// Never in practice: the only internal conversion (`HEADER_LEN` as
 /// `u32`) is a compile-time constant well within range.
 pub fn write_header(writer: &mut impl Write, pack_id: &PackId) -> io::Result<()> {
+    if pack_id.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write the reserved all-zero pack id to a header",
+        ));
+    }
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -1540,11 +1565,20 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     let mut cursor: usize = 9;
     let mut pack_id = [0u8; PACK_ID_LEN];
     pack_id.copy_from_slice(&buf[cursor..cursor.saturating_add(PACK_ID_LEN)]);
+    let pack_id = PackId(pack_id);
+    // The all-zero address is the empty sentinel and never a real identity.
+    // Checked after the CRC so the rejection is based on authenticated bytes.
+    if pack_id.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shard header carries the reserved all-zero pack id",
+        ));
+    }
     cursor = cursor.saturating_add(PACK_ID_LEN);
     let created_at = u64::from_le_bytes(buf[cursor..cursor.saturating_add(8)].try_into().unwrap());
 
     Ok(Some(ShardHeader {
-        pack_id: PackId(pack_id),
+        pack_id,
         created_at,
     }))
 }
@@ -1554,7 +1588,7 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 /// `pack_id` is the caller's expectation for this file — derived from its
 /// filename. On creation it is written into the new header; on opening an
 /// existing file it is cross-checked against what the header actually says
-/// (they must match exactly on the full 256-bit id), so a shard file
+/// (they must match exactly on the full 128-bit id), so a shard file
 /// that's been copied or renamed inconsistently with its own recorded identity
 /// is caught here rather than silently trusted.
 ///
@@ -2173,6 +2207,12 @@ mod tests {
     fn test_pack_id(n: u64) -> PackId {
         let mut bytes = [0u8; PACK_ID_LEN];
         bytes[..8].copy_from_slice(&n.to_be_bytes());
+        // Keep the leading 8 bytes as `n` so the 16-hex filename prefix is
+        // stable, but stamp an explicit nonzero marker in the trailing byte so
+        // even `test_pack_id(0)` is a valid (non-reserved) identity rather than
+        // the all-zero sentinel. Tests that specifically need the zero sentinel
+        // construct `PackId([0; PACK_ID_LEN])` directly.
+        bytes[PACK_ID_LEN - 1] = 0xA5;
         PackId(bytes)
     }
 
@@ -2613,6 +2653,55 @@ mod tests {
     }
 
     #[test]
+    fn zero_pack_id_is_rejected_by_hex_parse() {
+        // The all-zero address is reserved and never a valid identity.
+        assert!(PackId::from_hex(&"0".repeat(PACK_ID_LEN * 2)).is_none());
+        // A nonzero address of the same length still parses.
+        assert!(PackId::from_hex(&"a".repeat(PACK_ID_LEN * 2)).is_some());
+    }
+
+    #[test]
+    fn zero_pack_id_is_rejected_by_write_header() {
+        let mut buf = Vec::new();
+        let err = write_header(&mut buf, &PackId([0u8; PACK_ID_LEN])).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(buf.is_empty(), "no header bytes may be emitted");
+    }
+
+    #[test]
+    fn zero_pack_id_is_rejected_by_read_header() {
+        // Hand-build a header whose pack id field is all zeros but whose CRC
+        // is otherwise valid, so the rejection is specifically about identity,
+        // not a CRC failure.
+        let mut buf = [0u8; HEADER_LEN];
+        buf[0..4].copy_from_slice(&MAGIC);
+        buf[4] = VERSION;
+        let header_len = u32::try_from(HEADER_LEN).expect("HEADER_LEN fits u32");
+        buf[5..9].copy_from_slice(&header_len.to_le_bytes());
+        // pack id bytes 9..(9 + PACK_ID_LEN) stay zero.
+        let crc = crc32fast::hash(&buf[..CRC_COVERED_LEN]);
+        buf[CRC_COVERED_LEN..CRC_COVERED_LEN + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let err = read_header(&mut Cursor::new(&buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn full_all_zero_filename_is_rejected_but_truncated_prefix_is_accepted() {
+        // The full 32-hex all-zero address is reserved.
+        assert!(
+            PackId::parse_filename_prefix(&format!("pack_{}", "0".repeat(PACK_ID_LEN * 2)))
+                .is_none()
+        );
+        // A truncated all-zero prefix is still a legal lookup key: it can
+        // belong to a nonzero address whose leading bits are zero.
+        let (bytes, digits) =
+            PackId::parse_filename_prefix("pack_0000000000000000").expect("truncated prefix ok");
+        assert_eq!(digits, PACK_FILENAME_PREFIX_HEX);
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn test_header_invalid_magic() {
         let mut buf = vec![0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(b"BADC");
@@ -2639,6 +2728,28 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let err = read_header(&mut cursor).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_pack_id_zero_rejected() {
+        let zero = PackId([0u8; PACK_ID_LEN]);
+        assert!(zero.is_zero());
+        assert!(PackId::from_hex(&"0".repeat(PACK_ID_LEN * 2)).is_none());
+        assert!(!PackId::random().is_zero());
+
+        // Header write and read reject zero
+        let mut buf = Vec::new();
+        assert!(write_header(&mut buf, &zero).is_err());
+
+        // parse_filename_prefix rejects full 32-hex all-zero but accepts 16-hex all-zero prefix
+        assert!(
+            PackId::parse_filename_prefix(&format!("pack_{}", "0".repeat(PACK_ID_LEN * 2)))
+                .is_none()
+        );
+        let (bytes, digits) = PackId::parse_filename_prefix("pack_0000000000000000")
+            .expect("16-hex zero is a valid prefix of a nonzero id");
+        assert_eq!(digits, 16);
+        assert_eq!(bytes, vec![0u8; 8]);
     }
 
     #[test]
