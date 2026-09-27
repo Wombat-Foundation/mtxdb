@@ -58,12 +58,17 @@ fn millis(duration: Duration) -> f64 {
 fn print_phases(timings: &mtxdb::packfile::storage::SyncTimings) {
     println!(
         "  phases: pack_flush {:.0} ms, pack_fsync {:.0} ms, delta_log {:.0} ms, \
-         checkpoint {:.0} ms, reclaim {:.0} ms, wal {:.0} ms, journal_fsync {:.0} ms",
+         checkpoint {:.0} ms, reclaim {:.0} ms (boundary {:.0}, copy {:.0}, fsync {:.0}), \
+         remediation {:.0} ms, wal {:.0} ms, journal_fsync {:.0} ms",
         millis(timings.pack_flush),
         millis(timings.pack_fsync),
         millis(timings.delta_log),
         millis(timings.checkpoint),
         millis(timings.reclaim),
+        millis(timings.reclaim_boundary),
+        millis(timings.reclaim_copy),
+        millis(timings.reclaim_fsync),
+        millis(timings.remediation),
         millis(timings.wal),
         millis(timings.journal_fsync),
     );

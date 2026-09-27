@@ -1539,6 +1539,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Remediation of a pool whose checkpoint tail is already running starts no
+    /// second tail (it would rotate the epoch again and race the first tail on
+    /// the same checkpoint file); remediation of the other pool starts its own
+    /// and leaves the held pool's coverage alone. Every record survives.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn remediating_a_pool_with_a_tail_running_starts_no_second_tail() {
+        let root = test_root("shared_wal_remediation_with_tail");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x5C; 16];
+        let state = db.pool(ShardType::State);
+        let events = db.pool(ShardType::EventDag);
+        state.set_background_checkpoint(true);
+        events.set_background_checkpoint(true);
+        let commit = |seq: u8| {
+            let txn = db.begin_transaction();
+            for pool in [ShardType::State, ShardType::EventDag] {
+                txn.put(pool, collection, node(seq), &data(b"payload"))
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        commit(1);
+        let release = state.hold_next_checkpoint_tail(false);
+        state.sync().unwrap();
+        assert!(state.checkpoint_in_flight());
+        assert_eq!(state.stats().checkpoint_tails_started, 1);
+        let state_before = state.durable_coverage();
+
+        commit(2);
+        state.force_index_checkpoint_detached().unwrap();
+        assert_eq!(
+            state.stats().checkpoint_tails_started,
+            1,
+            "remediating a pool whose tail is running must not start another"
+        );
+        events.force_index_checkpoint_detached().unwrap();
+        assert_eq!(events.stats().checkpoint_tails_started, 1);
+        events.wait_for_checkpoint();
+        assert!(events.durable_coverage() > 0);
+        assert_eq!(
+            state.durable_coverage(),
+            state_before,
+            "the other pool's remediation leaves the held pool's coverage alone"
+        );
+
+        drop(release);
+        state.wait_for_checkpoint();
+        assert!(state.durable_coverage() > state_before);
+        drop(db);
+        let reopened = SharedDatabase::open(root.clone()).unwrap();
+        for pool in [ShardType::State, ShardType::EventDag] {
+            for seq in [1, 2] {
+                assert!(
+                    live_get(&reopened, pool, collection, node(seq)).is_some(),
+                    "{pool:?} record {seq} must survive"
+                );
+            }
+        }
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// While a transaction holds the overlay it is on the read path, so its
     /// staged group is visible before materialization; once the last user
     /// releases it, the overlay leaves the read path, and writer reads stop

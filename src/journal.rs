@@ -1209,6 +1209,26 @@ pub struct Reclaim {
     pub retained_groups: u64,
     /// Bytes removed from the segment.
     pub reclaimed_bytes: u64,
+    /// Time deciding the reclaim boundary (directory lookup, or a scan when the
+    /// directory could not be trusted).
+    pub boundary: std::time::Duration,
+    /// Time reading and re-encoding the retained suffix into the rebuilt
+    /// segment.
+    pub copy: std::time::Duration,
+    /// Time writing, fsyncing and renaming the rebuilt segment into place.
+    pub fsync: std::time::Duration,
+}
+
+impl Default for Reclaim {
+    fn default() -> Self {
+        Self {
+            retained_groups: 0,
+            reclaimed_bytes: 0,
+            boundary: std::time::Duration::ZERO,
+            copy: std::time::Duration::ZERO,
+            fsync: std::time::Duration::ZERO,
+        }
+    }
 }
 
 /// A single-writer journal file. [`Self::append_group`] writes a complete
@@ -3586,8 +3606,10 @@ impl Journal {
             return Ok(Reclaim {
                 retained_groups: u64::try_from(self.groups.len()).unwrap_or(u64::MAX),
                 reclaimed_bytes: 0,
+                ..Default::default()
             });
         };
+        let copy_started = std::time::Instant::now();
         let header_len = FILE_HEADER_LEN as u64;
         let cut_offset = last_dropped.end_offset;
         let retained = self.groups.get(cut..).unwrap_or_default();
@@ -3641,11 +3663,17 @@ impl Journal {
                 ..*group
             })
             .collect::<Vec<_>>();
+        let copy = copy_started.elapsed();
+        let fsync_started = std::time::Instant::now();
         self.install_rebuilt(rebuilt, new_base_sequence, new_base_lsn)?;
+        let fsync = fsync_started.elapsed();
         self.groups = survivors;
         Ok(Reclaim {
             retained_groups,
             reclaimed_bytes,
+            copy,
+            fsync,
+            ..Default::default()
         })
     }
 
@@ -3653,12 +3681,14 @@ impl Journal {
     /// directory cannot be trusted, and it rebuilds the directory from what it
     /// finds.
     fn reclaim_through_scan(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
+        let scan_started = std::time::Instant::now();
         let bytes = fs::read(&self.path)?;
         let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
         // Reclaim rewrites the segment from its own live file, so any invalid
         // group there is corruption, not a crash tail: treat every byte as
         // durable and let it fail.
         let scan = scan_bytes(&bytes, base_sequence, base_lsn, version, || u64::MAX)?;
+        let boundary = scan_started.elapsed();
         let retained = scan
             .groups
             .iter()
@@ -3669,9 +3699,12 @@ impl Journal {
             return Ok(Reclaim {
                 retained_groups: u64::try_from(retained.len()).unwrap_or(u64::MAX),
                 reclaimed_bytes: 0,
+                boundary,
+                ..Default::default()
             });
         }
 
+        let copy_started = std::time::Instant::now();
         let (new_base_sequence, new_base_lsn) = retained
             .first()
             .map_or((self.next_sequence, self.next_lsn), |group| {
@@ -3692,14 +3725,20 @@ impl Journal {
                     .fold(0, |mask, entry| mask | pool_bit(entry.pool)),
             });
         }
+        let copy = copy_started.elapsed();
         let retained_groups = u64::try_from(retained.len()).unwrap_or(u64::MAX);
         let reclaimed_bytes =
             u64::try_from(bytes.len().saturating_sub(rebuilt.len())).unwrap_or(u64::MAX);
+        let fsync_started = std::time::Instant::now();
         self.install_rebuilt(rebuilt, new_base_sequence, new_base_lsn)?;
+        let fsync = fsync_started.elapsed();
         self.groups = survivors;
         Ok(Reclaim {
             retained_groups,
             reclaimed_bytes,
+            boundary,
+            copy,
+            fsync,
         })
     }
 
@@ -7056,7 +7095,11 @@ mod tests {
                 shared_journal_with_groups(&format!("reclaim_scan_{covered}"), 9);
             let expected = by_scan.reclaim_through_scan(covered).unwrap();
             let actual = by_directory.reclaim_through(covered).unwrap();
-            assert_eq!(actual, expected, "covered {covered}");
+            assert_eq!(
+                (actual.retained_groups, actual.reclaimed_bytes),
+                (expected.retained_groups, expected.reclaimed_bytes),
+                "covered {covered}"
+            );
             assert_eq!(
                 fs::read(&dir_path).unwrap(),
                 fs::read(&scan_path).unwrap(),
@@ -7084,7 +7127,14 @@ mod tests {
             let next_covered = by_directory.next_lsn.saturating_sub(2);
             let again_expected = by_scan.reclaim_through_scan(next_covered).unwrap();
             let again_actual = by_directory.reclaim_through(next_covered).unwrap();
-            assert_eq!(again_actual, again_expected, "covered {covered}: second");
+            assert_eq!(
+                (again_actual.retained_groups, again_actual.reclaimed_bytes),
+                (
+                    again_expected.retained_groups,
+                    again_expected.reclaimed_bytes
+                ),
+                "covered {covered}: second"
+            );
             assert_eq!(
                 fs::read(&dir_path).unwrap(),
                 fs::read(&scan_path).unwrap(),
@@ -7220,7 +7270,10 @@ mod tests {
         assert!(broken.directory_matches_file());
         let actual = broken.reclaim_through(5).unwrap();
         let expected = reference.reclaim_through_scan(5).unwrap();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            (actual.retained_groups, actual.reclaimed_bytes),
+            (expected.retained_groups, expected.reclaimed_bytes)
+        );
         assert_eq!(
             fs::read(&broken_path).unwrap(),
             fs::read(&reference_path).unwrap()

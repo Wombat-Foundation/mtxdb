@@ -319,6 +319,21 @@ pub struct SyncTimings {
     /// [`CheckpointBreakdown`]). This is the shared-segment rewrite and fsync
     /// that shrinks the journal once every pool has reported.
     pub reclaim: std::time::Duration,
+    /// Breakdown of [`Self::reclaim`]: deciding the shared-reclaim boundary
+    /// (directory lookup, or a scan when the directory could not be trusted).
+    pub reclaim_boundary: std::time::Duration,
+    /// Breakdown of [`Self::reclaim`]: reading and re-encoding the retained
+    /// suffix into the rebuilt segment.
+    pub reclaim_copy: std::time::Duration,
+    /// Breakdown of [`Self::reclaim`]: writing, fsyncing and renaming the
+    /// rebuilt segment into place. The likely disk cost.
+    pub reclaim_fsync: std::time::Duration,
+    /// Time spent in `remediate_lagging_pools`: in the non-background path this
+    /// force-checkpoints a pool holding the shared WAL back, and the caller
+    /// waits for it. Kept separate from [`Self::reclaim`] so a phase breakdown
+    /// can tell a coverage-step reclaim from a remediation checkpoint (whose
+    /// own journal wait would otherwise be miscounted as reclaim).
+    pub remediation: std::time::Duration,
     /// Committing the pending write-ahead journal group (one sequential
     /// fsync). Zero when no journal is configured.
     pub wal: std::time::Duration,
@@ -354,6 +369,10 @@ impl Default for SyncTimings {
             delta_log: std::time::Duration::ZERO,
             checkpoint: std::time::Duration::ZERO,
             reclaim: std::time::Duration::ZERO,
+            reclaim_boundary: std::time::Duration::ZERO,
+            reclaim_copy: std::time::Duration::ZERO,
+            reclaim_fsync: std::time::Duration::ZERO,
+            remediation: std::time::Duration::ZERO,
             wal: std::time::Duration::ZERO,
             journal_lock_wait: std::time::Duration::ZERO,
             journal_fsync: std::time::Duration::ZERO,
@@ -365,6 +384,19 @@ impl Default for SyncTimings {
             dirty_lock_wait: std::time::Duration::ZERO,
             pending_publish_age: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl SyncTimings {
+    /// Copy a coverage-step reclaim's phase breakdown into this barrier's
+    /// timings, so the `reclaim` total can be split into boundary, copy and
+    /// fsync. A no-op when no reclaim ran.
+    fn record_reclaim_phases(&mut self, reclaim: Option<&crate::journal::Reclaim>) {
+        if let Some(reclaim) = reclaim {
+            self.reclaim_boundary = reclaim.boundary;
+            self.reclaim_copy = reclaim.copy;
+            self.reclaim_fsync = reclaim.fsync;
         }
     }
 }
@@ -8438,17 +8470,14 @@ impl StorageEngine for PackfileStorage {
             .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
+        // Remediation runs after the journal barrier and is part of what the
+        // caller waited for: a sync that unblocks a stalled shared WAL pays the
+        // capture (or, without background checkpoints, the whole checkpoint).
         if result.is_ok() {
+            let remediation_started = std::time::Instant::now();
             self.remediate_lagging_pools();
+            timings.remediation = remediation_started.elapsed();
         }
-        // Remediation (a synchronous blocker checkpoint in the non-background
-        // path) runs after the journal barrier and is part of what the caller
-        // waited for, so fold it into both the reclaim phase and the total: a
-        // sync that unblocks a stalled shared WAL pays that checkpoint here,
-        // and leaving it out made the phases not add up to the wall time.
-        timings.reclaim = timings
-            .reclaim
-            .saturating_add(started.elapsed().saturating_sub(timings.total));
         timings.total = started.elapsed();
         self.record_sync_diagnostics(&timings);
         if result.is_ok() {
@@ -8686,13 +8715,10 @@ impl PackfileStorage {
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
         if result.is_ok() {
+            let remediation_started = std::time::Instant::now();
             self.remediate_lagging_pools();
+            timings.remediation = remediation_started.elapsed();
         }
-        // See `sync`: fold synchronous remediation into the reclaim phase and
-        // the total so the phase breakdown accounts for the wall time.
-        timings.reclaim = timings
-            .reclaim
-            .saturating_add(started.elapsed().saturating_sub(timings.total));
         timings.total = started.elapsed();
         self.record_sync_diagnostics(&timings);
         if result.is_ok() {
@@ -8759,8 +8785,18 @@ impl PackfileStorage {
         if !self.background_checkpoint.load(Ordering::Relaxed) {
             return self.force_index_checkpoint();
         }
-        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
+        // Serialize with this pool's own syncs, and never start a second tail:
+        // it would rotate the epoch again and race the first on the checkpoint
+        // file. A tail already running is what remediation wanted; its coverage
+        // lands when its image is durable, and a sync near the WAL cap waits for
+        // it. Only mark the index dirty when a checkpoint really starts, or the
+        // next sync would rewrite an image nothing needs.
+        let _persist_guard = self.index_persist_lock.lock();
+        if !self.finish_checkpoint_worker(false) {
+            return Ok(());
+        }
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.start_checkpoint_worker()
     }
 
@@ -9401,11 +9437,9 @@ impl PackfileStorage {
     /// `lsn`, and reclaim what that lets go of. Best-effort: a failed
     /// compaction costs disk, never correctness (the coverage is already
     /// durable).
-    fn report_coverage_and_reclaim(&self, lsn: u64) {
-        let Some(journal) = self.journal() else {
-            return;
-        };
-        report_coverage_and_reclaim_via(&journal, self.journal_pool.load(Ordering::Acquire), lsn);
+    fn report_coverage_and_reclaim(&self, lsn: u64) -> Option<crate::journal::Reclaim> {
+        let journal = self.journal()?;
+        report_coverage_and_reclaim_via(&journal, self.journal_pool.load(Ordering::Acquire), lsn)
     }
 
     /// After a sync (no lock held): if a shared-WAL reclaim is stalled in the
@@ -9565,8 +9599,9 @@ impl PackfileStorage {
                 Ok(Some(covered)) => {
                     timings.delta_log = delta_started.elapsed();
                     let reclaim_started = std::time::Instant::now();
-                    self.report_coverage_and_reclaim(covered);
+                    let reclaim = self.report_coverage_and_reclaim(covered);
                     timings.reclaim = reclaim_started.elapsed();
+                    timings.record_reclaim_phases(reclaim.as_ref());
                     coverage_batch_written = true;
                 }
                 Ok(None) => {}
@@ -10293,22 +10328,34 @@ fn retire_delta_epoch_file(base_dir: &Path, old_base_fingerprint: Option<u64>) {
 
 /// Tell the journal a pool's packs durably cover its frames through `lsn`, and
 /// reclaim what that lets go of. `tag` is the pool's journal tag.
-fn report_coverage_and_reclaim_via(journal: &JournalCoordinator, tag: u8, lsn: u64) {
+/// Report this pool's durable coverage and reclaim the journal, returning the
+/// reclaim's phase breakdown when one ran (for the sync-path timings).
+fn report_coverage_and_reclaim_via(
+    journal: &JournalCoordinator,
+    tag: u8,
+    lsn: u64,
+) -> Option<crate::journal::Reclaim> {
     match pool_from_tag(tag) {
         // A per-pool segment holds only this pool's frames, so this coverage
         // means the segment can drop everything at or below `lsn`.
-        None => {
-            if let Err(error) = journal.reclaim_through(lsn) {
+        None => match journal.reclaim_through(lsn) {
+            Ok(reclaim) => Some(reclaim),
+            Err(error) => {
                 eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                None
             }
-        }
+        },
         // A shared segment also holds other pools' frames. Record this pool's
         // coverage and reclaim only what every contributing pool has covered.
         #[cfg(feature = "multi-reader")]
         Some(pool) => {
             journal.report_pool_coverage(pool, lsn);
-            if let Err(error) = journal.reclaim_shared() {
-                eprintln!("warning: shared journal reclaim failed: {error}");
+            match journal.reclaim_shared() {
+                Ok(reclaim) => reclaim,
+                Err(error) => {
+                    eprintln!("warning: shared journal reclaim failed: {error}");
+                    None
+                }
             }
         }
         #[cfg(not(feature = "multi-reader"))]
@@ -10393,7 +10440,7 @@ impl CheckpointTail {
             write_journal_lsn_file(&self.base_dir, &self.durable_coverage, lsn)?;
             done.journal_lsn = lsn_started.elapsed();
             let reclaim_started = std::time::Instant::now();
-            report_coverage_and_reclaim_via(journal, self.pool_tag, lsn);
+            let _ = report_coverage_and_reclaim_via(journal, self.pool_tag, lsn);
             done.reclaim = reclaim_started.elapsed();
         }
         let retire_started = std::time::Instant::now();
