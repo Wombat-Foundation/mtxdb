@@ -4087,11 +4087,15 @@ impl PackfileStorage {
             };
             #[cfg(not(feature = "multi-reader"))]
             let committed = journal.committed_lsn();
-            // `max` cannot inflate the claim past the materialization floor:
-            // LSNs are assigned in increasing order at publish, so a group
-            // published after `durable_coverage` was proven starts above it, and
-            // the floor `committed` is clamped to (`first_lsn - 1`) is never
-            // below it. The `max` only keeps the value from moving backwards.
+            // The shared-WAL coverage batch and the full checkpoint both run
+            // `sync_all` after capturing this and before recording it, so a
+            // frame at or below `committed` that has been applied is covered.
+            // `a_power_cut_image_never_loses_a_record_a_claim_covered` checks
+            // it for autocommit writes and shared-WAL transactions, on records
+            // made durable by a full sync of both pools (an inflated claim
+            // fails it). A pool synced alone while another stays silent, and
+            // per-pool coordinators, are not exercised. `max` only keeps the
+            // value from moving backwards.
             committed.max(self.durable_coverage())
         })
     }
@@ -4467,6 +4471,23 @@ impl PackfileStorage {
         drop(guards);
         self.persist_shard_collections_best_effort();
         Ok(())
+    }
+
+    /// Test-only: turn a copy of this pool's directory into the disk a power
+    /// cut would leave, by cutting every pack back to the length an fsync has
+    /// covered. Bytes written but not yet fsynced are what a crash may lose;
+    /// bytes still buffered in memory are not in the copy at all.
+    #[cfg(all(test, feature = "multi-reader"))]
+    pub(crate) fn test_cut_packs_to_synced(&self, image_dir: &Path) {
+        for (_, shard) in self.shards.all_shards() {
+            let name = shard.path.file_name().expect("a pack has a file name");
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(image_dir.join(name))
+                .expect("the image holds every pack");
+            file.set_len(shard.synced_len().min(shard.file_len()))
+                .expect("cut the pack");
+        }
     }
 
     /// Test-only: perform exactly the locked prefix of

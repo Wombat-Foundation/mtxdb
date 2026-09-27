@@ -1929,6 +1929,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Copy `source` to `dest`, then cut every pool's packs in the copy back to
+    /// what an fsync had covered when the copy was taken.
+    #[cfg(feature = "multi-reader")]
+    fn crash_image(db: &SharedDatabase, source: &std::path::Path, dest: &std::path::Path) {
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(dest);
+        copy_tree(source, dest);
+        for pool in ShardType::ALL {
+            let live = db.layout().pool_dir(pool).unwrap();
+            let relative = live.strip_prefix(source).unwrap();
+            db.pool(pool).test_cut_packs_to_synced(&dest.join(relative));
+        }
+    }
+
+    /// Discriminating check for `checkpoint_covered_lsn`: after any mix of
+    /// writes and syncs, the disk a power cut would leave (packs cut to their
+    /// fsynced length, WAL as it is) must still hold every record that was
+    /// acknowledged and made durable by a full sync of its pool.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
+        let root = test_root("cut_image_source");
+        let image = test_root("cut_image_copy");
+        let collection = [0x6e; 16];
+        let pools = [ShardType::State, ShardType::EventDag];
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        db.coordinator().set_reclaim_trigger_len(1);
+        let mut durable: Vec<(ShardType, [u8; 16])> = Vec::new();
+        let mut pending: Vec<(ShardType, [u8; 16])> = Vec::new();
+        let mut next = 0u64;
+        for round in 0..40u32 {
+            let mut fresh = Vec::new();
+            for pool in pools {
+                let mut node = [0u8; 16];
+                node[..8].copy_from_slice(&next.to_le_bytes());
+                next += 1;
+                db.pool(pool)
+                    .put(&collection, &node, &NodeData::from_slice(&[0x11; 64]))
+                    .unwrap();
+                fresh.push((pool, node));
+            }
+            let txn = db.begin_transaction();
+            for pool in pools {
+                let mut node = [0u8; 16];
+                node[..8].copy_from_slice(&next.to_le_bytes());
+                next += 1;
+                txn.put(pool, collection, node, &NodeData::from_slice(&[0x22; 64]))
+                    .unwrap();
+                fresh.push((pool, node));
+            }
+            txn.commit().unwrap();
+            pending.extend(fresh);
+            match round % 4 {
+                0 => db.pool(ShardType::EventDag).sync().unwrap(),
+                1 => db.pool(ShardType::State).sync().unwrap(),
+                2 => {
+                    db.pool(ShardType::State).sync_all().unwrap();
+                    db.pool(ShardType::EventDag).sync_all().unwrap();
+                    durable.append(&mut pending);
+                }
+                _ => {}
+            }
+            crash_image(&db, &root, &image);
+            let recovered = SharedDatabase::open(image.clone()).unwrap();
+            for (pool, node) in &durable {
+                assert!(
+                    recovered
+                        .pool(*pool)
+                        .get(&collection, node)
+                        .unwrap()
+                        .is_some(),
+                    "round {round}: a durably synced record in {pool:?} is gone from the power-cut image"
+                );
+            }
+            drop(recovered);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
     /// The same lag, but the database can make the silent pool checkpoint. Once
     /// the segment reaches the emergency zone it does, reclaim succeeds, and no
     /// commit ever fails.
