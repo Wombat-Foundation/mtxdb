@@ -685,20 +685,20 @@ fn sub_packs_dump() -> Command {
              unique addresses, so if the same id is present in more than one selected pool \
              it is still rejected as ambiguous unless -t selects one.",
         )
-                .arg(
-                    Arg::new("pack")
-                        .short('p')
-                        .long("pack")
-                        .required(true)
-                        .value_name("PACK_ID")
-                        .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
-                )
-                .arg(
-                    Arg::new("collection")
-                        .short('r')
-                        .long("collection")
-                        .value_name("COLLECTION")
-                        .help("Only dump frames for this collection (0x-prefixed id or !room:server)"),
+        .arg(
+            Arg::new("pack")
+                .short('p')
+                .long("pack")
+                .required(true)
+                .value_name("PACK_ID")
+                .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
+        )
+        .arg(
+            Arg::new("collection")
+                .short('r')
+                .long("collection")
+                .value_name("COLLECTION")
+                .help("Only dump frames for this collection (0x-prefixed id or !room:server)"),
         )
         .arg(
             Arg::new("out")
