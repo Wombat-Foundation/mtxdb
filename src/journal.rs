@@ -2353,10 +2353,16 @@ impl JournalCoordinator {
 
     /// The segment length past which a stalled reclaim is treated as an
     /// emergency: three quarters of the cap.
-    #[cfg(feature = "multi-reader")]
     fn emergency_len(&self) -> u64 {
         let cap = self.segment_cap();
         cap.saturating_sub(cap / 4)
+    }
+
+    /// Whether the segment has reached the emergency zone, where a checkpoint
+    /// tail still in flight must be waited for rather than let run on.
+    #[must_use]
+    pub fn in_emergency_zone(&self) -> bool {
+        self.segment_len() >= self.emergency_len()
     }
 
     /// How much a stalled segment must grow before the next forced checkpoint

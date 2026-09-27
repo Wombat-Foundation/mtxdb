@@ -1844,7 +1844,21 @@ pub struct PackfileStorage {
     /// ([`Self::read_journal_lsn`]) and advanced by whatever makes more of the
     /// journal safe to drop: a checkpoint's `journal.lsn` write, or a coverage
     /// batch appended to the delta log. It only ever moves forward.
-    durable_coverage: AtomicU64,
+    ///
+    /// Shared (`Arc`) because a checkpoint tail on its own thread advances it
+    /// after the image is durable and cannot borrow the store; the cost is one
+    /// small allocation per pool.
+    durable_coverage: Arc<AtomicU64>,
+    /// The checkpoint tail running on its own thread, if one is (see
+    /// [`CheckpointTail`]). At most one at a time; joined before a synchronous
+    /// checkpoint, at close, and when the WAL nears its cap.
+    checkpoint_worker: parking_lot::Mutex<Option<CheckpointWorker>>,
+    /// Whether a sync that needs a full checkpoint hands its tail to a worker
+    /// thread instead of running it inline.
+    background_checkpoint: AtomicBool,
+    /// Test-only: a hold and a failure the next checkpoint tail takes with it.
+    #[cfg(test)]
+    checkpoint_tail_hook: parking_lot::Mutex<Option<TailHook>>,
     /// Successful checkpoint-bound index reloads triggered by the
     /// read-committed overlay, because a writer's reclaim outran the coverage
     /// this handle's index incorporated. A WAL-cell failure on the reload path
@@ -2633,7 +2647,11 @@ impl PackfileStorage {
             #[cfg(all(test, feature = "multi-reader"))]
             transaction_overlay_scanned: AtomicU64::new(0),
             read_covered_lsn,
-            durable_coverage: AtomicU64::new(durable_coverage),
+            durable_coverage: Arc::new(AtomicU64::new(durable_coverage)),
+            checkpoint_worker: parking_lot::Mutex::new(None),
+            background_checkpoint: AtomicBool::new(false),
+            #[cfg(test)]
+            checkpoint_tail_hook: parking_lot::Mutex::new(None),
             read_reloads: AtomicU64::new(0),
             read_reload_failures: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
@@ -2725,26 +2743,6 @@ impl PackfileStorage {
     /// bound [`Self::replay_journal`] to the post-checkpoint suffix.
     fn journal_lsn_path(base_dir: &std::path::Path) -> PathBuf {
         base_dir.join("journal.lsn")
-    }
-
-    /// Durably record the journal LSN the just-written checkpoint covers.
-    fn write_journal_lsn(&self, lsn: u64) -> Result<(), StorageError> {
-        let path = Self::journal_lsn_path(&self.base_dir);
-        let tmp = path.with_extension("lsn.tmp");
-        fs::write(&tmp, lsn.to_le_bytes()).map_err(StorageError::Io)?;
-        // Windows requires a write-capable handle for FlushFileBuffers,
-        // which is what `sync_all` uses. A read-only handle works on Unix
-        // but fails with ERROR_ACCESS_DENIED on Windows.
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&tmp)
-            .and_then(|file| file.sync_all())
-            .map_err(StorageError::Io)?;
-        fs::rename(&tmp, &path).map_err(StorageError::Io)?;
-        let _ = crate::shard::sync_directory(&self.base_dir);
-        self.durable_coverage.fetch_max(lsn, Ordering::AcqRel);
-        Ok(())
     }
 
     /// The journal LSN this pool's durable state covers (0 when none is
@@ -4455,11 +4453,38 @@ impl PackfileStorage {
     /// left unpersisted (see the lock re-acquisition below), so a transient
     /// failure or a racing write defers rather than drops the update.
     fn persist_index_checkpoint(&self) -> Result<(), StorageError> {
-        if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
+        // A synchronous checkpoint never overlaps a worker's.
+        self.finish_checkpoint_worker(true);
+        let Some(captured) = self.capture_checkpoint()? else {
             return Ok(());
+        };
+        let CapturedCheckpoint {
+            tail,
+            breakdown,
+            started,
+        } = captured;
+        match tail.run() {
+            Ok(done) => {
+                self.record_checkpoint(breakdown, &done, started);
+                Ok(())
+            }
+            Err(error) => {
+                self.abandon_checkpoint();
+                Err(error)
+            }
         }
+    }
+
+    /// The part of a checkpoint that needs the locks: everything up to the
+    /// point where the image bytes and the delta-epoch rotation are captured.
+    /// After it returns the returned tail owns everything it needs, so it can
+    /// run on any thread. `None` when nothing is dirty.
+    fn capture_checkpoint(&self) -> Result<Option<CapturedCheckpoint>, StorageError> {
         let started = std::time::Instant::now();
         let mut breakdown = CheckpointBreakdown::default();
+        if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         // With a journal, this checkpoint must make the packs durable before it
         // records coverage, and it does so below with every collection locked,
         // which stalls every writer for as long as the fsync takes. Do the bulk
@@ -4570,6 +4595,7 @@ impl PackfileStorage {
             .collect();
 
         let snapshots = self.checkpoint_snapshots();
+        let serialize_started = std::time::Instant::now();
 
         // Rotate the delta epoch while still locked: `old_base_fingerprint`
         // (D0's name, if any) is retired below only after `fingerprint`'s
@@ -4596,107 +4622,48 @@ impl PackfileStorage {
         // pool's own committed watermark instead, so its coverage and the
         // reclaim floor both describe only frames this index holds.
         let wal_lsn = self.checkpoint_covered_lsn();
+        // The image is captured here, under the locks, as bytes: the tail never
+        // reads the live table. Pending frames were cleared by the rotation and
+        // no put is mid-flight, so clearing the flag now loses nothing; a put
+        // after the locks drop sets it again, and a failed tail sets it back.
+        let blobs = Self::serialize_snapshots(&snapshots);
+        breakdown.serialize = serialize_started.elapsed();
+        self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         drop(guards);
-        breakdown.snapshot = snapshot_started.elapsed();
-        // `create_guard` is deliberately NOT dropped here, unlike the
-        // per-collection put mutexes above. An existing collection's
-        // concurrent put after this point is safe to let through: its frame
-        // lands after `fingerprint` and is recovered via the new delta epoch
-        // (D1) on reopen — see `rotate_delta_epoch`. A *newly discovered*
-        // collection (via `put`/`put_many` creating one, or `refresh_collection`
-        // publishing one from external writes) has no such fallback: it
-        // doesn't go through delta tracking, so if it publishes into
-        // `self.collections` during the unlocked serialize+write+rename
-        // below, its data can already be covered by `fingerprint` (the
-        // packs it lives in were flushed above) while being absent from
-        // `entries`/`blobs` (snapshotted just above, before it existed) —
-        // a crash after the rename makes reopen trust a checkpoint that
-        // silently omits it. Keep new-collection publication excluded until
-        // the checkpoint is durably renamed.
-
-        let write_started = std::time::Instant::now();
-        breakdown.serialize = Self::write_checkpoint_snapshot(
-            &Self::index_checkpoint_path(&self.base_dir),
-            fingerprint,
-            wal_lsn.unwrap_or(0),
-            base_delta_seq,
-            &snapshots,
-            &pack_table,
-        )
-        .map_err(StorageError::Io)?;
-        breakdown.write = write_started.elapsed().saturating_sub(breakdown.serialize);
-        breakdown.checkpoint_bytes =
-            fs::metadata(Self::index_checkpoint_path(&self.base_dir)).map_or(0, |meta| meta.len());
-        let directory_started = std::time::Instant::now();
-        // `write_checkpoint` fsyncs the new checkpoint's own bytes before
-        // renaming it into place, but the rename itself — the directory
-        // entry now pointing at the new inode — is only durable once the
-        // directory's own metadata is synced. Do that explicitly here rather
-        // than relying on `retire_delta_epoch`'s fsync (below) to cover it
-        // incidentally: that one only runs, and only after this rename, when
-        // there was a prior epoch to retire (`old_base_fingerprint.is_some()`
-        // and its `remove_file` succeeds) — a first-ever checkpoint, or a
-        // failed unlink, would otherwise leave the rename's durability
-        // resting on a later, unrelated sync happening to occur. Best-effort:
-        // a failure here is still safe, since a reopen after a crash before
-        // this fsync commits either observes the rename (fingerprint gate
-        // passes) or doesn't (falls back to the still-valid predecessor
-        // checkpoint) — never a torn or partially-visible rename.
-        let _ = crate::shard::sync_directory(&self.base_dir);
-        breakdown.directory_sync = directory_started.elapsed();
-        // The checkpoint naming `fingerprint` is now durably in place, so a
-        // new collection publishing from here on lands after it — same
-        // recovery story a reopen already has for any other post-checkpoint
-        // write (full rescan on fingerprint mismatch, or a fresh delta
-        // epoch). Safe to let new-collection publication through now.
+        breakdown.snapshot = snapshot_started
+            .elapsed()
+            .saturating_sub(breakdown.serialize);
+        // A collection published after this point lands after `fingerprint`
+        // (its frames change a pack length), so a reopen that trusts C1 either
+        // finds its frames in the new epoch or fails the tail-fingerprint gate
+        // and rescans; it can never be silently omitted, because the image was
+        // captured above with publication excluded. The creation lock can
+        // therefore drop with the put mutexes instead of riding out the tail.
         drop(create_guard);
-        // The checkpoint naming `fingerprint` is durable; record the journal
-        // LSN it covers so a reopen replays only mutations after it. Because
-        // the journal branch above fsynced every shard before this point,
-        // everything through `lsn` is now durable in the packfiles: the same
-        // coverage lets the segment drop its pre-checkpoint groups, so the
-        // journal holds only the post-checkpoint suffix instead of growing
-        // without bound. Best-effort — a failed compaction costs disk, never
-        // correctness (the checkpoint is already durable).
-        if let Some(lsn) = wal_lsn {
-            let lsn_started = std::time::Instant::now();
-            self.write_journal_lsn(lsn)?;
-            breakdown.journal_lsn = lsn_started.elapsed();
-            let reclaim_started = std::time::Instant::now();
-            self.report_coverage_and_reclaim(lsn);
-            breakdown.reclaim = reclaim_started.elapsed();
-        }
-        let retire_started = std::time::Instant::now();
-        self.retire_delta_epoch(old_base_fingerprint);
-        breakdown.retire = retire_started.elapsed();
-        // The unlocked serialize/write window above let concurrent puts land
-        // after the rotation. C1 was snapshotted before them, so such a put
-        // is durable only as a pending delta frame — if any frames, or a new
-        // invalidation, are still unapplied the dirty flag must survive so
-        // the next sync appends them to D1 instead of stranding them in
-        // memory. Briefly re-acquire every put_mutex (no I/O under them) so
-        // this decision can't interleave with a put's own frame-push +
-        // dirty-set (see `put_many`; the frame goes in before the flag).
-        // Re-lock the *extended* set (`lock_arcs` includes anything published
-        // during the initial scan), so a put to a collection that entered the
-        // locked window late is still pinned for this check.
-        let guards = lock_arcs.iter().map(|arc| arc.lock()).collect::<Vec<_>>();
-        let has_unfinished_work = {
-            let state = self.delta_state.lock();
-            !state.pending.is_empty()
+        let tail = CheckpointTail {
+            base_dir: self.base_dir.clone(),
+            fingerprint,
+            covered_lsn: wal_lsn,
+            base_delta_seq,
+            blobs,
+            pack_table,
+            old_base_fingerprint,
+            journal: self.journal(),
+            pool_tag: self.journal_pool.load(Ordering::Acquire),
+            durable_coverage: Arc::clone(&self.durable_coverage),
+            #[cfg(test)]
+            hook: self.checkpoint_tail_hook.lock().take(),
         };
-        if !has_unfinished_work {
-            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
-        }
-        drop(guards);
-        breakdown.total = started.elapsed();
-        *self.last_checkpoint_breakdown.lock() = Some(breakdown);
-        Ok(())
+        Ok(Some(CapturedCheckpoint {
+            tail,
+            breakdown,
+            started,
+        }))
     }
 
-    /// Serialize one immutable generation snapshot and write its checkpoint.
-    /// Shared by the production writer and test mirrors so they use identical
-    /// collection, generation, and coverage encoding.
+    /// Serialize snapshots and write their checkpoint, for the test mirrors of
+    /// the production capture and [`CheckpointTail::run`].
+    #[cfg(test)]
     fn write_checkpoint_snapshot(
         path: &Path,
         fingerprint: u64,
@@ -4726,6 +4693,158 @@ impl PackfileStorage {
             pack_table,
         )?;
         Ok(serialized)
+    }
+
+    /// Serialize every snapshot's index into an owned checkpoint blob.
+    fn serialize_snapshots(
+        snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
+    ) -> Vec<([u8; 16], u64, Vec<u8>)> {
+        snapshots
+            .iter()
+            .map(|(collection_id, generation, room)| {
+                (*collection_id, *generation, room.index.serialize())
+            })
+            .collect()
+    }
+
+    /// Fold a finished tail into the capture's breakdown and publish it.
+    fn record_checkpoint(
+        &self,
+        mut breakdown: CheckpointBreakdown,
+        done: &CheckpointBreakdown,
+        started: std::time::Instant,
+    ) {
+        breakdown.write = done.write;
+        breakdown.directory_sync = done.directory_sync;
+        breakdown.journal_lsn = done.journal_lsn;
+        breakdown.reclaim = done.reclaim;
+        breakdown.retire = done.retire;
+        breakdown.checkpoint_bytes = done.checkpoint_bytes;
+        breakdown.total = started.elapsed();
+        *self.last_checkpoint_breakdown.lock() = Some(breakdown);
+    }
+
+    /// A checkpoint whose tail failed did not become durable: the old
+    /// checkpoint and its log still pair, but the epoch this session rotated onto
+    /// names an image that does not exist. Forget it so the next sync rewrites
+    /// the checkpoint rather than appending to an orphaned log.
+    fn abandon_checkpoint(&self) {
+        self.delta_state.lock().base_fingerprint = None;
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Collect the background checkpoint tail. Returns whether none is left
+    /// running. With `wait` it blocks until the tail ends; without, it only
+    /// collects one that already has. A failed or panicked tail is reported and
+    /// abandoned, and the old checkpoint and log stay valid.
+    fn finish_checkpoint_worker(&self, wait: bool) -> bool {
+        let mut slot = self.checkpoint_worker.lock();
+        let Some(worker) = slot.take() else {
+            return true;
+        };
+        if !wait && !worker.handle.is_finished() {
+            *slot = Some(worker);
+            return false;
+        }
+        drop(slot);
+        match worker.handle.join() {
+            Ok(Ok(done)) => self.record_checkpoint(worker.breakdown, &done, worker.started),
+            Ok(Err(error)) => {
+                eprintln!("mtxdb: background checkpoint failed: {error}");
+                self.abandon_checkpoint();
+            }
+            Err(_) => {
+                eprintln!("mtxdb: background checkpoint panicked");
+                self.abandon_checkpoint();
+            }
+        }
+        true
+    }
+
+    /// Collect a finished checkpoint tail before a sync decides what to do.
+    /// Returns `true` when none is still running.
+    ///
+    /// A tail still running holds the WAL: no coverage may be claimed and
+    /// nothing reclaimed until its image is durable, and a second checkpoint
+    /// must not start. It is waited for only when the WAL nears its cap or the
+    /// delta log its rotation point (reclaim is never suppressed indefinitely).
+    /// Otherwise this sync's operations go to the new epoch's log and the sync
+    /// is done, which is why `false` means the caller returns.
+    fn settle_checkpoint_worker(&self) -> bool {
+        let must_wait = self
+            .journal()
+            .is_some_and(|journal| journal.in_emergency_zone())
+            || self.delta_state.lock().log_bytes >= self.delta_log_rotate_bytes();
+        if self.finish_checkpoint_worker(must_wait) {
+            return true;
+        }
+        if self.index_checkpoint_dirty.load(Ordering::Relaxed)
+            && !self.delta_state.lock().pending.is_empty()
+        {
+            match self.append_index_delta() {
+                Ok(()) => self.shard_collections_stale.store(true, Ordering::Relaxed),
+                Err(error) => {
+                    eprintln!("mtxdb: delta append during a checkpoint failed: {error}");
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether a checkpoint tail is running on its worker thread.
+    #[must_use]
+    pub fn checkpoint_in_flight(&self) -> bool {
+        self.checkpoint_worker.lock().is_some()
+    }
+
+    /// Block until any background checkpoint has finished.
+    pub fn wait_for_checkpoint(&self) {
+        self.finish_checkpoint_worker(true);
+    }
+
+    /// Let a sync that needs a full checkpoint hand its tail (write, fsync,
+    /// install, coverage, reclaim, retire) to a worker thread. Off by default.
+    pub fn set_background_checkpoint(&self, enabled: bool) {
+        self.background_checkpoint.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Full checkpoint for a sync: capture under the locks, then run the tail on
+    /// a worker when enabled, inline otherwise. Logs and swallows a failure like
+    /// [`Self::persist_index_checkpoint_best_effort`].
+    fn persist_index_checkpoint_for_sync(&self) {
+        if !self.background_checkpoint.load(Ordering::Relaxed) {
+            self.persist_index_checkpoint_best_effort();
+            return;
+        }
+        let captured = match self.capture_checkpoint() {
+            Ok(Some(captured)) => captured,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("mtxdb: failed to persist index checkpoint: {error}");
+                return;
+            }
+        };
+        let CapturedCheckpoint {
+            tail,
+            breakdown,
+            started,
+        } = captured;
+        let spawned = std::thread::Builder::new()
+            .name("mtxdb-checkpoint".into())
+            .spawn(move || tail.run());
+        match spawned {
+            Ok(handle) => {
+                *self.checkpoint_worker.lock() = Some(CheckpointWorker {
+                    handle,
+                    breakdown,
+                    started,
+                });
+            }
+            Err(error) => {
+                eprintln!("mtxdb: could not start the checkpoint worker: {error}");
+                self.abandon_checkpoint();
+            }
+        }
     }
 
     /// Switch the live delta-log state onto a fresh epoch named for
@@ -4912,19 +5031,9 @@ impl PackfileStorage {
     /// had no prior epoch. Best-effort: a failure here leaves the retired
     /// epoch's file on disk, which is always safe (see `delta_path`) — it
     /// simply names a fingerprint no future checkpoint will ever carry again.
+    #[cfg(test)]
     fn retire_delta_epoch(&self, old_base_fingerprint: Option<u64>) {
-        let Some(old_base_fingerprint) = old_base_fingerprint else {
-            return;
-        };
-        let path = Self::delta_path(&self.base_dir, old_base_fingerprint);
-        if fs::remove_file(&path).is_ok() {
-            // The checkpoint rename's own durability is already covered by
-            // the caller's fsync right after `write_checkpoint` returns; this
-            // one covers the unlink instead, so the retired epoch's file
-            // doesn't linger past a crash — harmless either way (see the
-            // doc comment above), but tidier.
-            let _ = crate::shard::sync_directory(&self.base_dir);
-        }
+        retire_delta_epoch_file(&self.base_dir, old_base_fingerprint);
     }
 
     /// Append the pending delta operations and clear the dirty flag. The
@@ -9236,28 +9345,7 @@ impl PackfileStorage {
         let Some(journal) = self.journal() else {
             return;
         };
-        match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
-            // A per-pool segment holds only this pool's frames, so this
-            // coverage means the segment can drop everything at or below `lsn`.
-            None => {
-                if let Err(error) = journal.reclaim_through(lsn) {
-                    eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
-                }
-            }
-            // A shared segment also holds other pools' frames. Record this
-            // pool's coverage and reclaim only what every contributing pool has
-            // covered, so no pool's frames are dropped before they are durable
-            // in its packs.
-            #[cfg(feature = "multi-reader")]
-            Some(pool) => {
-                journal.report_pool_coverage(pool, lsn);
-                if let Err(error) = journal.reclaim_shared() {
-                    eprintln!("warning: shared journal reclaim failed: {error}");
-                }
-            }
-            #[cfg(not(feature = "multi-reader"))]
-            Some(_) => unreachable!("shared journal state requires multi-reader"),
-        }
+        report_coverage_and_reclaim_via(&journal, self.journal_pool.load(Ordering::Acquire), lsn);
     }
 
     /// After a sync (no lock held): if a shared-WAL reclaim is stalled in the
@@ -9365,6 +9453,9 @@ impl PackfileStorage {
     /// recovery path rather than a steady-state write.
     fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         let _persist_guard = self.index_persist_lock.lock();
+        if !self.settle_checkpoint_worker() {
+            return;
+        }
         // A delta append does not advance the journal coverage, so on its own it
         // never lets the segment shrink and the journal would fill to its hard
         // limit. Once the segment is large, a pool with journal frames its
@@ -9455,7 +9546,7 @@ impl PackfileStorage {
                 return;
             }
             let checkpoint_started = std::time::Instant::now();
-            self.persist_index_checkpoint_best_effort();
+            self.persist_index_checkpoint_for_sync();
             self.note_checkpoint_rewrite();
             timings.checkpoint = checkpoint_started.elapsed();
             sidecar_anchor = true;
@@ -9472,7 +9563,7 @@ impl PackfileStorage {
                     eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
                 }
                 let checkpoint_started = std::time::Instant::now();
-                self.persist_index_checkpoint_best_effort();
+                self.persist_index_checkpoint_for_sync();
                 self.note_checkpoint_rewrite();
                 timings.checkpoint = checkpoint_started.elapsed();
                 sidecar_anchor = true;
@@ -10087,8 +10178,174 @@ pub struct RuntimeStats {
 /// write error is swallowed by the best-effort wrapper. Even skipping the flush
 /// entirely is safe — the sidecar is rebuildable acceleration metadata — so
 /// correctness never depends on `Drop`.
+/// [`PackfileStorage::write_journal_lsn`] on owned handles, for the tail.
+fn write_journal_lsn_file(
+    base_dir: &Path,
+    durable_coverage: &AtomicU64,
+    lsn: u64,
+) -> Result<(), StorageError> {
+    let path = PackfileStorage::journal_lsn_path(base_dir);
+    let tmp = path.with_extension("lsn.tmp");
+    fs::write(&tmp, lsn.to_le_bytes()).map_err(StorageError::Io)?;
+    // Windows requires a write-capable handle for FlushFileBuffers,
+    // which is what `sync_all` uses. A read-only handle works on Unix
+    // but fails with ERROR_ACCESS_DENIED on Windows.
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&tmp)
+        .and_then(|file| file.sync_all())
+        .map_err(StorageError::Io)?;
+    fs::rename(&tmp, &path).map_err(StorageError::Io)?;
+    let _ = crate::shard::sync_directory(base_dir);
+    durable_coverage.fetch_max(lsn, Ordering::AcqRel);
+    Ok(())
+}
+
+/// Remove the superseded delta-log epoch once the checkpoint that makes it safe
+/// to discard is durably renamed. Best-effort: a leftover file names a
+/// fingerprint no future checkpoint carries, so it is inert.
+fn retire_delta_epoch_file(base_dir: &Path, old_base_fingerprint: Option<u64>) {
+    let Some(old_base_fingerprint) = old_base_fingerprint else {
+        return;
+    };
+    let path = PackfileStorage::delta_path(base_dir, old_base_fingerprint);
+    if fs::remove_file(&path).is_ok() {
+        // The checkpoint rename's own durability is already covered by the
+        // directory fsync after `write_checkpoint`; this one covers the unlink,
+        // so the retired file does not linger past a crash.
+        let _ = crate::shard::sync_directory(base_dir);
+    }
+}
+
+/// Tell the journal a pool's packs durably cover its frames through `lsn`, and
+/// reclaim what that lets go of. `tag` is the pool's journal tag.
+fn report_coverage_and_reclaim_via(journal: &JournalCoordinator, tag: u8, lsn: u64) {
+    match pool_from_tag(tag) {
+        // A per-pool segment holds only this pool's frames, so this coverage
+        // means the segment can drop everything at or below `lsn`.
+        None => {
+            if let Err(error) = journal.reclaim_through(lsn) {
+                eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+            }
+        }
+        // A shared segment also holds other pools' frames. Record this pool's
+        // coverage and reclaim only what every contributing pool has covered.
+        #[cfg(feature = "multi-reader")]
+        Some(pool) => {
+            journal.report_pool_coverage(pool, lsn);
+            if let Err(error) = journal.reclaim_shared() {
+                eprintln!("warning: shared journal reclaim failed: {error}");
+            }
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        Some(_) => unreachable!("shared journal state requires multi-reader"),
+    }
+}
+
+/// Everything a checkpoint needs after the handoff, owned so it can run on any
+/// thread. Built under the locks by [`PackfileStorage::capture_checkpoint`]:
+/// the image is the captured bytes, never the live table, and the delta epoch
+/// has already been rotated. Running it writes and fsyncs the image, installs
+/// it, records the coverage it carries, reclaims the WAL and retires the old
+/// epoch, in that order; the WAL is not touched until the image is durable.
+struct CheckpointTail {
+    base_dir: PathBuf,
+    fingerprint: u64,
+    covered_lsn: Option<u64>,
+    base_delta_seq: u64,
+    blobs: Vec<([u8; 16], u64, Vec<u8>)>,
+    pack_table: Vec<(u16, u64)>,
+    old_base_fingerprint: Option<u64>,
+    journal: Option<Arc<JournalCoordinator>>,
+    pool_tag: u8,
+    durable_coverage: Arc<AtomicU64>,
+    #[cfg(test)]
+    hook: Option<TailHook>,
+}
+
+/// Test-only control over a checkpoint tail: it waits for `gate` to be
+/// released (or dropped), then fails if `fail` is set.
+#[cfg(test)]
+struct TailHook {
+    gate: std::sync::mpsc::Receiver<()>,
+    fail: bool,
+}
+
+impl CheckpointTail {
+    /// Run the tail; the returned breakdown holds only the phases it ran.
+    fn run(self) -> Result<CheckpointBreakdown, StorageError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            let _ = hook.gate.recv();
+            if hook.fail {
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected checkpoint tail failure",
+                )));
+            }
+        }
+        let mut done = CheckpointBreakdown::default();
+        let path = PackfileStorage::index_checkpoint_path(&self.base_dir);
+        let write_started = std::time::Instant::now();
+        let blobs: Vec<([u8; 16], u64, &[u8])> = self
+            .blobs
+            .iter()
+            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
+            .collect();
+        crate::index::checkpoint::write_checkpoint(
+            &path,
+            self.fingerprint,
+            self.covered_lsn.unwrap_or(0),
+            self.base_delta_seq,
+            &blobs,
+            &self.pack_table,
+        )
+        .map_err(StorageError::Io)?;
+        done.write = write_started.elapsed();
+        done.checkpoint_bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
+        // The rename is only durable once the directory is synced. Best-effort:
+        // a crash before it either observes the rename or falls back to the
+        // still-valid predecessor checkpoint, never a torn one.
+        let directory_started = std::time::Instant::now();
+        let _ = crate::shard::sync_directory(&self.base_dir);
+        done.directory_sync = directory_started.elapsed();
+        // The image is durable; record the LSN it covers so a reopen replays only
+        // what follows, and let the journal drop what the packs now cover. The
+        // pack fsync happened before the handoff, so everything through the LSN
+        // is durable in the packs. A failed compaction costs disk, not
+        // correctness.
+        if let (Some(journal), Some(lsn)) = (&self.journal, self.covered_lsn) {
+            let lsn_started = std::time::Instant::now();
+            write_journal_lsn_file(&self.base_dir, &self.durable_coverage, lsn)?;
+            done.journal_lsn = lsn_started.elapsed();
+            let reclaim_started = std::time::Instant::now();
+            report_coverage_and_reclaim_via(journal, self.pool_tag, lsn);
+            done.reclaim = reclaim_started.elapsed();
+        }
+        let retire_started = std::time::Instant::now();
+        retire_delta_epoch_file(&self.base_dir, self.old_base_fingerprint);
+        done.retire = retire_started.elapsed();
+        Ok(done)
+    }
+}
+
+/// A checkpoint captured under the locks, ready for its tail.
+struct CapturedCheckpoint {
+    tail: CheckpointTail,
+    breakdown: CheckpointBreakdown,
+    started: std::time::Instant,
+}
+
+/// A tail running on its own thread, with the capture's phase timings.
+struct CheckpointWorker {
+    handle: std::thread::JoinHandle<Result<CheckpointBreakdown, StorageError>>,
+    breakdown: CheckpointBreakdown,
+    started: std::time::Instant,
+}
+
 impl Drop for PackfileStorage {
     fn drop(&mut self) {
+        self.finish_checkpoint_worker(true);
         if self.shard_collections_dirty.load(Ordering::Relaxed)
             || self.shard_collections_stale.load(Ordering::Relaxed)
         {
@@ -10601,7 +10858,7 @@ mod tests {
         // handle's in-memory index still holds only V0. Pruning against that
         // detached coverage would drop V1 from the overlay and resurrect the
         // stale V0 from the index.
-        store.write_journal_lsn(1).unwrap();
+        write_journal_lsn_file(&store.base_dir, &store.durable_coverage, 1).unwrap();
         assert_eq!(
             store.get_read_committed(&collection, &[node]).unwrap()[0]
                 .as_ref()
@@ -13390,6 +13647,211 @@ mod tests {
             covered < published,
             "recording the published LSN would let a reopen skip a reused LSN"
         );
+    }
+
+    /// Hold the next background checkpoint tail until the returned sender is
+    /// used or dropped; with `fail` the tail then errors instead of installing.
+    fn hold_next_checkpoint_tail(
+        store: &PackfileStorage,
+        fail: bool,
+    ) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        *store.checkpoint_tail_hook.lock() = Some(TailHook { gate, fail });
+        release
+    }
+
+    fn put_bytes(store: &PackfileStorage, byte: u8) {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(byte),
+                &NodeData::new(bytes::Bytes::from(vec![byte; 8])),
+            )
+            .unwrap();
+    }
+
+    fn assert_all_present(store: &PackfileStorage, bytes: &[u8]) {
+        for &byte in bytes {
+            assert!(
+                store
+                    .get(&TEST_COLLECTION, &distinct_id(byte))
+                    .unwrap()
+                    .is_some(),
+                "record {byte} must be readable"
+            );
+        }
+    }
+
+    /// Copy every file of `from` into a fresh directory `name`, the disk a crash
+    /// at this instant would leave (files here are all fsynced or rebuildable).
+    fn copy_store_dir(from: &Path, name: &str) -> PathBuf {
+        let to = test_dir(name);
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+        to
+    }
+
+    /// The first sync of a store that opened without a checkpoint takes the full
+    /// path. While its tail is held the WAL is neither covered nor reclaimed, a
+    /// second sync starts no second checkpoint, everything synced in the window
+    /// survives a crash at that instant, and releasing the tail installs the
+    /// image and advances coverage.
+    #[test]
+    fn a_background_checkpoint_holds_the_wal_until_its_image_is_durable() {
+        let dir = test_dir("bg_checkpoint_holds_wal");
+        let journal_path = dir.join("wal.bin");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(&journal_path).unwrap();
+        store.set_background_checkpoint(true);
+        let covered_before = store.durable_coverage();
+        put_bytes(&store, 1);
+        let release = hold_next_checkpoint_tail(&store, false);
+        store.sync().unwrap();
+        assert!(store.checkpoint_in_flight(), "the tail runs on a worker");
+        assert_eq!(store.durable_coverage(), covered_before);
+
+        put_bytes(&store, 2);
+        store.sync().unwrap();
+        assert!(store.checkpoint_in_flight(), "one worker, not two");
+        assert_eq!(
+            store.durable_coverage(),
+            covered_before,
+            "no coverage before the image is durable"
+        );
+
+        // A crash now finds no new image, the old (absent) one, and the WAL.
+        let crashed = copy_store_dir(&dir, "bg_checkpoint_holds_wal_crash");
+        let after_crash = PackfileStorage::open(crashed.clone()).unwrap();
+        after_crash.enable_journal(crashed.join("wal.bin")).unwrap();
+        after_crash.replay_journal().unwrap();
+        assert_all_present(&after_crash, &[1, 2]);
+        drop(after_crash);
+
+        drop(release);
+        store.wait_for_checkpoint();
+        assert!(!store.checkpoint_in_flight());
+        assert!(
+            store.durable_coverage() > covered_before,
+            "the installed image advances coverage"
+        );
+        assert!(store.checkpoint_breakdown().is_some());
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.enable_journal(&journal_path).unwrap();
+        reopened.replay_journal().unwrap();
+        assert_all_present(&reopened, &[1, 2]);
+    }
+
+    /// A collection created after the handoff, while the tail is held, is in
+    /// neither the captured image nor a log the image names. It must survive a
+    /// crash before the tail finishes and a reopen after it: the creation lock
+    /// is released at the handoff on the strength of this.
+    #[test]
+    fn a_collection_created_during_a_background_checkpoint_is_not_lost() {
+        let dir = test_dir("bg_checkpoint_new_collection");
+        let journal_path = dir.join("wal.bin");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(&journal_path).unwrap();
+        store.set_background_checkpoint(true);
+        put_bytes(&store, 1);
+        let release = hold_next_checkpoint_tail(&store, false);
+        store.sync().unwrap();
+        assert!(store.checkpoint_in_flight());
+        store
+            .put(
+                &SECOND_COLLECTION,
+                &distinct_id(9),
+                &NodeData::new(bytes::Bytes::from_static(b"late")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        let crashed = copy_store_dir(&dir, "bg_checkpoint_new_collection_crash");
+        let after_crash = PackfileStorage::open(crashed.clone()).unwrap();
+        after_crash.enable_journal(crashed.join("wal.bin")).unwrap();
+        after_crash.replay_journal().unwrap();
+        assert!(after_crash
+            .get(&SECOND_COLLECTION, &distinct_id(9))
+            .unwrap()
+            .is_some());
+        drop(after_crash);
+        drop(release);
+        store.wait_for_checkpoint();
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.enable_journal(&journal_path).unwrap();
+        reopened.replay_journal().unwrap();
+        assert_all_present(&reopened, &[1]);
+        assert!(reopened
+            .get(&SECOND_COLLECTION, &distinct_id(9))
+            .unwrap()
+            .is_some());
+    }
+
+    /// A failed tail leaves the old state valid, reports, and the next sync
+    /// rewrites the checkpoint instead of appending to the orphaned epoch.
+    #[test]
+    fn a_failed_background_checkpoint_keeps_the_wal_and_is_retried() {
+        let dir = test_dir("bg_checkpoint_fails");
+        let journal_path = dir.join("wal.bin");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(&journal_path).unwrap();
+        store.set_background_checkpoint(true);
+        put_bytes(&store, 1);
+        let release = hold_next_checkpoint_tail(&store, true);
+        store.sync().unwrap();
+        assert!(store.checkpoint_in_flight());
+        drop(release);
+        store.wait_for_checkpoint();
+        assert!(!store.checkpoint_in_flight());
+        assert_eq!(store.durable_coverage(), 0, "a failed tail claims nothing");
+        assert!(
+            store.delta_state.lock().base_fingerprint.is_none(),
+            "the orphaned epoch is forgotten"
+        );
+        put_bytes(&store, 2);
+        store.sync().unwrap();
+        store.wait_for_checkpoint();
+        assert!(store.durable_coverage() > 0, "the retry installed an image");
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        reopened.enable_journal(&journal_path).unwrap();
+        reopened.replay_journal().unwrap();
+        assert_all_present(&reopened, &[1, 2]);
+    }
+
+    #[cfg(feature = "multi-reader")]
+    /// Near the WAL cap a sync waits for the tail instead of letting it run on
+    /// with reclaim suppressed.
+    #[test]
+    fn a_sync_in_the_wal_emergency_zone_waits_for_the_tail() {
+        let dir = test_dir("bg_checkpoint_emergency");
+        let journal_path = dir.join("wal.bin");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(&journal_path).unwrap();
+        store.set_background_checkpoint(true);
+        put_bytes(&store, 1);
+        let release = hold_next_checkpoint_tail(&store, false);
+        store.sync().unwrap();
+        assert!(store.checkpoint_in_flight());
+        let journal = store.journal().expect("journal enabled");
+        journal.set_segment_cap(journal.segment_len() + journal.segment_len() / 4);
+        assert!(journal.in_emergency_zone());
+        put_bytes(&store, 2);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(release);
+        });
+        store.sync().unwrap();
+        releaser.join().unwrap();
+        assert!(
+            !store.checkpoint_in_flight(),
+            "the sync had to wait for the tail"
+        );
+        assert!(store.durable_coverage() > 0);
     }
 
     #[test]

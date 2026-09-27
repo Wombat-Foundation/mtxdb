@@ -23,7 +23,9 @@
 //! default 100), `MTXDB_WL_BATCH` (records per commit, default 20),
 //! `MTXDB_WL_PAYLOAD` (default 256), `MTXDB_WL_ROUNDS` (default 400; a run that
 //! is never refused writes about 190 MiB of packs per 163 rounds),
-//! `MTXDB_WL_REMEDIATE`, `MTXDB_WL_SYNC_STATE=1` (also sync `State`, so nothing
+//! `MTXDB_WL_REMEDIATE`, `MTXDB_WL_BG=1` (checkpoint tails on worker threads:
+//! the sync time is then the foreground cost, and the breakdown's total the
+//! background duration), `MTXDB_WL_SYNC_STATE=1` (also sync `State`, so nothing
 //! lags: a control run), `MTXDB_WL_SLOW_MS` (also print any sync slower than
 //! this, default 400), `MTXDB_BENCH_ROOT`.
 
@@ -105,6 +107,20 @@ fn print_checkpoint_breakdowns(db: &SharedDatabase, before: &[u64]) {
     }
 }
 
+fn print_header(
+    coordinator: &mtxdb::journal::JournalCoordinator,
+    remediate: bool,
+    background: bool,
+) {
+    let cap = coordinator.segment_cap();
+    println!(
+        "cap={} MiB trigger={} MiB emergency={} MiB remediation={remediate} background={background}",
+        cap >> 20,
+        coordinator.reclaim_trigger_len() >> 20,
+        cap.saturating_sub(cap / 4) >> 20
+    );
+}
+
 fn main() {
     let commits = env_u64("MTXDB_WL_COMMITS", 100);
     let batch = env_u64("MTXDB_WL_BATCH", 20);
@@ -113,6 +129,7 @@ fn main() {
     let sync_state = env_u64("MTXDB_WL_SYNC_STATE", 0) != 0;
     let slow_ms = f64::from(u32::try_from(env_u64("MTXDB_WL_SLOW_MS", 400)).unwrap_or(u32::MAX));
     let remediate = env_u64("MTXDB_WL_REMEDIATE", 1) != 0;
+    let background = env_u64("MTXDB_WL_BG", 0) != 0;
 
     let base = std::env::var_os("MTXDB_BENCH_ROOT")
         .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
@@ -125,16 +142,14 @@ fn main() {
     if !remediate {
         coordinator.set_blocker_remediation(|_| {});
     }
+    for pool in [ShardType::State, ShardType::EventDag] {
+        db.pool(pool).set_background_checkpoint(background);
+    }
     let cap = coordinator.segment_cap();
     let emergency = cap.saturating_sub(cap / 4);
     let data = NodeData::from_slice(&vec![0x5a; payload]);
-    println!(
-        "cap={} MiB trigger={} MiB emergency={} MiB remediation={remediate} \
-         commits/round={commits} batch={batch} payload={payload}",
-        cap >> 20,
-        coordinator.reclaim_trigger_len() >> 20,
-        emergency >> 20
-    );
+    print_header(coordinator, remediate, background);
+    println!("commits/round={commits} batch={batch} payload={payload}");
 
     let mut next = 0u64;
     let mut zone_syncs = 0u64;
