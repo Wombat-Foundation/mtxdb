@@ -201,9 +201,9 @@ pub struct LossyIndex {
     /// packed tag this makes overwrite equality exact without putting
     /// full hashes in the checkpoint.
     tails: Mutex<Vec<u64>>,
-    /// `deserialize` restores slots without their source hashes. Such an
-    /// index remains readable, but must be rebuilt from packfiles if it ever
-    /// needs to grow.
+    /// An index with incomplete identity tables remains readable, but must be
+    /// rebuilt from packfiles if it ever needs to grow. Hydrated checkpoint
+    /// indexes are growable without that pack scan.
     can_grow: bool,
     /// Number of occupied slots.
     len: AtomicU32,
@@ -246,6 +246,49 @@ impl EntryStorage {
 }
 
 impl LossyIndex {
+    /// Whether the persisted identity tables are sufficient to rehash every
+    /// occupied slot without consulting the packs. The probe-chain check is
+    /// intentional: a corrupted home value could otherwise make `grow()` lose
+    /// an entry while still looking superficially hydrated.
+    fn identity_tables_complete(
+        capacity: u32,
+        shift: u32,
+        slots: &EntryStorage,
+        homes: &[u64],
+        tails: &[u64],
+    ) -> bool {
+        let cap = capacity as usize;
+        if homes.len() != cap || tails.len() != cap {
+            return false;
+        }
+        let mask = usize::try_from(capacity.wrapping_sub(1)).unwrap_or(usize::MAX);
+        (0..cap).all(|bucket| {
+            if IndexEntry(slots.get(bucket)).is_empty() {
+                return true;
+            }
+            if tails[bucket] >> 63 == 0 {
+                return false;
+            }
+            let mut probe =
+                usize::try_from((homes[bucket] >> shift) & u64::from(capacity.wrapping_sub(1)))
+                    .unwrap_or(usize::MAX);
+            while probe != bucket {
+                if IndexEntry(slots.get(probe)).is_empty() {
+                    return false;
+                }
+                probe = probe.wrapping_add(1) & mask;
+            }
+            true
+        })
+    }
+
+    /// [`Self::identity_tables_complete`] over this index's current tables.
+    fn identities_now_complete(&self) -> bool {
+        let homes = self.homes.lock();
+        let tails = self.tails.lock();
+        Self::identity_tables_complete(self.capacity, self.shift, &self.slots, &homes, &tails)
+    }
+
     /// A copy of an identity side table, or an all-zero (unhydrated) one of
     /// `capacity` entries if the source has none.
     fn identity_table(table: &Mutex<Vec<u64>>, capacity: u32) -> Vec<u64> {
@@ -271,8 +314,9 @@ impl Clone for LossyIndex {
             // dropping them here made every entry lose its identity on the first
             // write after a reopen (the next checkpoint then persisted zeros). A
             // mapping loaded without tables has none, so it gets zeroed ones.
-            // `can_grow` is untouched: a checkpoint-backed index still falls
-            // back to a pack rebuild at a capacity boundary.
+            // Preserve the source's completeness gate: a hydrated checkpoint
+            // remains growable after materialization, while an incomplete one
+            // still falls back to a pack rebuild at a capacity boundary.
             homes: Mutex::new(Self::identity_table(&self.homes, self.capacity)),
             tails: Mutex::new(Self::identity_table(&self.tails, self.capacity)),
             can_grow: self.can_grow,
@@ -656,12 +700,16 @@ impl LossyIndex {
 
     /// Double this live index's capacity without reading packfiles.
     ///
-    /// Returns `false` for an index deserialized from the compact on-disk
-    /// representation, whose original hashes are unavailable for rehashing.
-    /// Callers should retain their existing packfile rebuild fallback in that
-    /// case.
+    /// Returns `false` when the identity side tables are incomplete or the
+    /// index cannot grow further. Complete checkpoint identities can rehash
+    /// without reading packfiles; older/incomplete checkpoints retain the
+    /// packfile rebuild fallback.
     pub fn grow(&self) -> Option<Self> {
-        if !self.can_grow || self.capacity > u32::MAX / 2 {
+        // The gate is checked when growth is used, not only when the index was
+        // loaded: delta replay stores slot values straight into the table without
+        // identities, so a table that was complete at load can be incomplete by
+        // the time it has to grow.
+        if !self.can_grow || self.capacity > u32::MAX / 2 || !self.identities_now_complete() {
             return None;
         }
         let grown = Self::with_config((self.capacity as usize).saturating_mul(2), self.config);
@@ -1083,15 +1131,17 @@ impl LossyIndex {
             vec![0; capacity_usize]
         };
 
+        let slots = EntryStorage::Owned(slots);
+        let can_grow = Self::identity_tables_complete(capacity, shift, &slots, &homes, &tails);
         Ok(Self {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift,
             config,
-            slots: EntryStorage::Owned(slots),
+            slots,
             homes: Mutex::new(homes),
             tails: Mutex::new(tails),
-            can_grow: false,
+            can_grow,
             len: AtomicU32::new(len),
             max_probe_len: AtomicU32::new(0),
         })
@@ -1167,18 +1217,26 @@ impl LossyIndex {
                 buf[t_off..t_off.wrapping_add(8)].try_into().unwrap(),
             ));
         }
+        let slots = EntryStorage::Mmap {
+            mmap,
+            offset: slots_offset,
+        };
+        let can_grow = Self::identity_tables_complete(
+            capacity,
+            64_u32.wrapping_sub(capacity.trailing_zeros()),
+            &slots,
+            &homes,
+            &tails,
+        );
         Self {
             mask: capacity.wrapping_sub(1),
             capacity,
             shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
             config,
-            slots: EntryStorage::Mmap {
-                mmap,
-                offset: slots_offset,
-            },
+            slots,
             homes: Mutex::new(homes),
             tails: Mutex::new(tails),
-            can_grow: false,
+            can_grow,
             len: AtomicU32::new(len),
             max_probe_len: AtomicU32::new(0),
         }
@@ -1407,10 +1465,9 @@ mod tests {
         found
     }
 
-    /// Whether a checkpoint-loaded index could grow from its persisted `homes`
-    /// and `tails`. Loaders disable growth (`can_grow == false`) on purpose, so
-    /// this decides the question without changing that: build a live index,
-    /// persist and load it, and check (a) a fully hydrated load has complete
+    /// Whether a checkpoint-loaded index grows from its persisted `homes` and
+    /// `tails`: build a live index, persist and load it, and check (a) a fully
+    /// hydrated load has complete
     /// identities, and growing it with the existing rehash gives the same keys,
     /// locators, length, per-pack counts and collision candidates; (b) a load
     /// whose identity side tables lost entries is detected as incomplete, does
@@ -1447,17 +1504,14 @@ mod tests {
 
         // (a) fully hydrated checkpoint load.
         let blob = live.serialize();
-        let mut loaded = LossyIndex::deserialize_with_config(&blob, config).unwrap();
-        assert!(!loaded.can_grow, "loaders disable growth today");
-        assert!(loaded.grow().is_none(), "and so refuse to grow");
+        let loaded = LossyIndex::deserialize_with_config(&blob, config).unwrap();
         assert!(
             identities_complete(&loaded),
             "v6 blobs persist full identities"
         );
-        loaded.can_grow = true; // what a hydrated-only gate would set
         let grown = loaded
             .grow()
-            .expect("a hydrated load grows from its side tables");
+            .expect("a complete hydrated load grows from its side tables");
         assert_eq!(grown.capacity(), live.capacity() * 2);
         assert_eq!(grown.len(), live.len());
         assert_eq!(grown.slot_counts(), live.slot_counts());
@@ -1615,13 +1669,11 @@ mod tests {
         assert_eq!(owned.len(), live.len() + 1);
 
         // Checkpoint, reopen 2, and grow the reloaded index from its tables.
-        let mut reopened = load_mapped(&owned, "second.bin").clone();
+        let reopened = load_mapped(&owned, "second.bin").clone();
         assert!(
             identities_complete(&reopened),
             "the second reopen is complete too"
         );
-        assert!(reopened.grow().is_none(), "loaders still disable growth");
-        reopened.can_grow = true; // what a completeness-gated loader would set
         let grown = reopened.grow().expect("grows from persisted identities");
         assert_eq!(grown.len(), owned.len());
         assert_eq!(grown.slot_counts(), owned.slot_counts());
@@ -1639,6 +1691,46 @@ mod tests {
             2 * owned.capacity() as usize
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Delta replay stores slot values straight into the table, with no
+    /// identity. An index that was complete when it was loaded is therefore
+    /// incomplete once a delta has been replayed onto it, and growing it from
+    /// its identity tables would place the replayed entries by zeros and lose
+    /// them. Growth must re-check completeness when it is used, not trust the
+    /// load-time answer (a power-cut recovery test lost a synced record to this).
+    #[test]
+    fn a_replayed_delta_makes_a_loaded_index_incomplete_so_it_must_not_grow() {
+        let config = IndexConfig {
+            seed: 0x5EED_1234_ABCD_0042,
+            ..IndexConfig::default()
+        };
+        let live = LossyIndex::with_config(256, config);
+        for seq in 0..100u64 {
+            live.insert(&spread_hash(seq), 1, seq * 64).unwrap();
+        }
+        let loaded = LossyIndex::deserialize_with_config(&live.serialize(), config).unwrap();
+        assert!(loaded.can_grow, "a complete load enables growth");
+        assert!(loaded.grow().is_some(), "and grows from its tables");
+
+        let empty_bucket = (0..loaded.capacity() as usize)
+            .find(|bucket| IndexEntry(loaded.entry_at(*bucket)).is_empty())
+            .unwrap();
+        let frame = DeltaFrame {
+            collection_id: [9; 16],
+            bucket: u32::try_from(empty_bucket).unwrap(),
+            generation: 0,
+            slot: IndexEntry::new(0x1234, 2, 4096).0,
+        };
+        loaded.replay_frames(&[frame]).unwrap();
+        assert!(
+            !loaded.identities_now_complete(),
+            "the replayed entry has no identity"
+        );
+        assert!(
+            loaded.grow().is_none(),
+            "so growth falls back to the pack-based path instead of losing it"
+        );
     }
 
     #[test]
