@@ -1061,8 +1061,9 @@ thread_local! {
 pub struct GroupDirectoryStats {
     /// Complete groups in the segment, one directory entry each.
     pub groups: u64,
-    /// Bytes the directory has allocated for them.
-    pub bytes: u64,
+    /// Bytes the directory's buffer has allocated (its capacity, an estimate
+    /// of memory use, not a count of live entries).
+    pub allocated_bytes: u64,
 }
 
 /// The smallest group the format allows: a header, one mutation frame and a
@@ -3515,7 +3516,7 @@ impl Journal {
     fn directory_stats(&self) -> GroupDirectoryStats {
         GroupDirectoryStats {
             groups: u64::try_from(self.groups.len()).unwrap_or(u64::MAX),
-            bytes: u64::try_from(
+            allocated_bytes: u64::try_from(
                 self.groups
                     .capacity()
                     .saturating_mul(std::mem::size_of::<GroupMark>()),
@@ -7210,7 +7211,7 @@ mod tests {
         let (journal, path) = shared_journal_with_groups("dir_accounting", 9);
         let stats = journal.directory_stats();
         assert_eq!(stats.groups, 9);
-        assert!(stats.bytes >= 9 * std::mem::size_of::<GroupMark>() as u64);
+        assert!(stats.allocated_bytes >= 9 * std::mem::size_of::<GroupMark>() as u64);
         drop(journal);
         let (mut journal, _) = Journal::open_shared(&path).unwrap();
         assert_eq!(journal.directory_stats().groups, 9);

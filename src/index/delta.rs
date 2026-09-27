@@ -2002,6 +2002,8 @@ mod tests {
 
     /// The two readers make the same durability decision from the same bytes,
     /// including for batches whose claim is misplaced or repeated.
+    /// Before the shape rule reached the tail scanner, a claim placed first in
+    /// its batch was honored by it (50 here) and rejected by the full reader (7).
     #[test]
     fn the_tail_scanner_and_the_full_reader_agree_on_coverage() {
         let incremental = DeltaOperation::Incremental(DeltaFrame {

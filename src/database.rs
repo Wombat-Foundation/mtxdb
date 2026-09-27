@@ -2074,6 +2074,11 @@ mod tests {
         // No sync ran during the burst, so it went straight past the trigger.
         db.pool(ShardType::EventDag).sync_all().unwrap();
         assert!(db.coordinator().segment_len() < db.coordinator().reclaim_trigger_len());
+        // Contract: the only pool contributing frames is the one that synced, so
+        // nothing was ever waiting on another pool. The refusal above is the
+        // whole failure path; there is no throttle, and no stall was recorded.
+        assert!(!db.coordinator().is_reclaim_stalled());
+        assert_eq!(db.coordinator().reclaim_stalls(), 0);
         commit_batch(&db, &pools, &mut next, 1).unwrap();
         // Every commit that succeeded before the refusal is still readable.
         let collection = [0x7c; 16];
