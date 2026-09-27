@@ -2899,6 +2899,38 @@ impl PackfileStorage {
         (BookkeepingSource::Sidecar, counts)
     }
 
+    /// Whether every pending redo set names a record that is really at its
+    /// locator: the frame there belongs to the same collection and carries the
+    /// same full hash. Any mismatch, or a frame that cannot be read, fails the
+    /// whole log closed to the caller's rescan.
+    fn redo_locators_verified(
+        shards: &ShardPool,
+        sets: &HashMap<[u8; 16], Vec<RedoRecord>>,
+        pack_lookup: &HashMap<u64, (u16, u64)>,
+    ) -> bool {
+        sets.values().flatten().all(|record| {
+            let RedoOp::Set {
+                full_hash,
+                pack_id,
+                offset,
+                ..
+            } = record.op
+            else {
+                return false;
+            };
+            let Some(shard) = pack_lookup
+                .get(&pack_id)
+                .and_then(|(slot, _)| shards.get_shard(*slot))
+            else {
+                return false;
+            };
+            matches!(
+                shards.record_identity_at(&shard, offset),
+                Ok((collection, hash)) if collection == record.collection_id && hash == full_hash
+            )
+        })
+    }
+
     /// Apply logical redo sets, in `delta_seq` order, to a loaded index whose
     /// slots are already this process's. The index is pre-sized once for the whole
     /// batch and grown from its persisted identity tables when a growth boundary
@@ -3295,6 +3327,17 @@ impl PackfileStorage {
                 // separately (see `durable_coverage_from_disk`).
                 DeltaOperation::Coverage { .. } => {}
             }
+        }
+
+        // Every redo record's locator must lead to the record it names. A locator
+        // that is in bounds but wrong would otherwise be installed, and the key
+        // would read as missing (the read compares the frame's hash and skips a
+        // mismatch). Offsets ascend within a pack in log order, since each set
+        // names a freshly appended record, so this is a sequential pass over
+        // pages the pack recovery has just read.
+        if !Self::redo_locators_verified(shards, &redo_by_collection, &pack_lookup) {
+            reject_log();
+            return None;
         }
 
         let slot_to_pack_id: HashMap<u16, u64> = open_shards
@@ -4284,12 +4327,15 @@ impl PackfileStorage {
         offset: u64,
         record_len: u64,
     ) {
-        let pack_id = self
-            .shards
-            .get_shard(slot)
-            .map_or(u64::from(slot), |shard| shard.pack_id);
+        // A slot with no open shard has no stable pack id to name. Falling back
+        // to the slot number would name a different pack that happens to carry
+        // that number, so such a record is not representable: the collection is
+        // snapshotted instead.
+        let pack_id = self.shards.get_shard(slot).map(|shard| shard.pack_id);
         let record_len = u32::try_from(record_len).unwrap_or(0);
-        let representable = record_len != 0 && offset <= crate::index::IndexEntry::MAX_OFFSET;
+        let representable =
+            pack_id.is_some() && record_len != 0 && offset <= crate::index::IndexEntry::MAX_OFFSET;
+        let pack_id = pack_id.unwrap_or(0);
         let mut state = self.delta_state.lock();
         let base_generation_matches =
             state.base_generations.get(collection_id) == Some(&generation);
@@ -18576,6 +18622,161 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A replayed record whose locator is wrong but in bounds (it points at
+    /// another valid record of the same pack) would install and then read as a
+    /// missing key. Replay verifies each locator's frame, so the log is rejected
+    /// and the open rescans, finding every record.
+    #[test]
+    fn a_wrong_but_in_bounds_locator_rejects_the_log_and_the_open_rescans() {
+        let dir = test_dir("wrong_locator");
+        let collection = [0xDB; 16];
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(&collection, &batch_node(0), &NodeData::from_slice(b"base"))
+            .unwrap();
+        store.sync_all().unwrap();
+        for id in 1..=5 {
+            store
+                .put(&collection, &batch_node(id), &NodeData::from_slice(&[7; 8]))
+                .unwrap();
+        }
+        store.sync_all().unwrap();
+        let base = store.delta_state.lock().base_fingerprint.unwrap();
+        drop(store);
+        let path = PackfileStorage::delta_path(&dir, base);
+        let log = delta::read_delta_log_v3(&path).unwrap();
+        let mut operations = log.operations;
+        let (donor_offset, donor_len) = operations
+            .iter()
+            .find_map(|operation| match operation {
+                DeltaOperation::Redo(RedoRecord {
+                    op:
+                        RedoOp::Set {
+                            offset, record_len, ..
+                        },
+                    ..
+                }) => Some((*offset, *record_len)),
+                _ => None,
+            })
+            .unwrap();
+        // Point the last record (id 5) at the first record's frame.
+        if let Some(DeltaOperation::Redo(record)) = operations
+            .iter_mut()
+            .filter(|operation| matches!(operation, DeltaOperation::Redo(_)))
+            .last()
+        {
+            if let RedoOp::Set {
+                offset, record_len, ..
+            } = &mut record.op
+            {
+                *offset = donor_offset;
+                *record_len = donor_len;
+            }
+        }
+        fs::remove_file(&path).unwrap();
+        delta::append_v3_batch_with_durability(
+            &path,
+            true,
+            log.base_fingerprint,
+            &operations,
+            log.tail_fingerprint,
+            false,
+        )
+        .unwrap();
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.open_timings().unwrap().path,
+            OpenPath::FullScan,
+            "the wrong locator must be caught at open, not at the first read"
+        );
+        for id in 0..=5 {
+            assert!(
+                reopened
+                    .get(&collection, &batch_node(id))
+                    .unwrap()
+                    .is_some(),
+                "record {id} must still be found after the rescan"
+            );
+        }
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Counts and pack identity across several packs: with small packs, growth,
+    /// overwrites and new packs created after the checkpoint (which the redo log
+    /// names by pack id), a reopen holds exactly the live session's records and
+    /// per-collection entry counts, on the checkpoint path.
+    #[test]
+    fn logical_replay_across_several_packs_keeps_counts_and_records() {
+        let dir = test_dir("logical_replay_packs");
+        let collection = [0xDC; 16];
+        let open = || PackfileStorage::open_with_max_shard_bytes(dir.clone(), 48 * 1024).unwrap();
+        let store = open();
+        store
+            .put(
+                &collection,
+                &batch_node(u32::MAX),
+                &NodeData::from_slice(b"seed"),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        let mut expected: HashMap<NodeId, Vec<u8>> = HashMap::new();
+        expected.insert(batch_node(u32::MAX), b"seed".to_vec());
+        for round in 1..=6u8 {
+            let entries: Vec<(NodeId, NodeData)> = (0..300u32)
+                .map(|i| {
+                    let id = batch_node(u32::from(round) * 1000 + i);
+                    (id, NodeData::from_slice(&[round; 40]))
+                })
+                .chain((0..50u32).map(|i| (batch_node(i * 3), NodeData::from_slice(&[round; 40]))))
+                .collect();
+            for (id, data) in &entries {
+                expected.insert(*id, data.bytes.to_vec());
+            }
+            store.put_many(&collection, &entries).unwrap();
+            store.sync_all().unwrap();
+        }
+        let live_summary = store.collection_summaries();
+        let live_packs = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+            .count();
+        assert!(
+            live_packs > 2,
+            "the workload must span several packs ({live_packs})"
+        );
+        drop(store);
+
+        let reopened = open();
+        assert_eq!(reopened.open_timings().unwrap().path, OpenPath::Checkpoint);
+        assert_eq!(
+            reopened
+                .collection_summaries()
+                .iter()
+                .map(|summary| (summary.0, summary.1))
+                .collect::<Vec<_>>(),
+            live_summary
+                .iter()
+                .map(|summary| (summary.0, summary.1))
+                .collect::<Vec<_>>(),
+            "per-collection entry counts"
+        );
+        for (id, value) in &expected {
+            assert_eq!(
+                reopened
+                    .get(&collection, id)
+                    .unwrap()
+                    .unwrap()
+                    .bytes
+                    .as_ref(),
+                value.as_slice()
+            );
+        }
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// The coverage step obeys the same rotation: with the log at the rotation
