@@ -54,14 +54,6 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
 
-/// Full checkpoints taken so far, per pool, in `ShardType::ALL` order.
-fn checkpoint_counts(db: &SharedDatabase) -> Vec<u64> {
-    ShardType::ALL
-        .iter()
-        .map(|pool| db.pool(*pool).stats().checkpoint_writes)
-        .collect()
-}
-
 /// The phases of the active pool's sync.
 fn print_phases(timings: &mtxdb::packfile::storage::SyncTimings) {
     println!(
@@ -76,16 +68,20 @@ fn print_phases(timings: &mtxdb::packfile::storage::SyncTimings) {
     );
 }
 
-/// Where the time of every full checkpoint taken since `before` went. A
+/// Where the time of every full checkpoint not yet printed went. A
 /// remediation checkpoint runs inside the sync, so `State` can appear too.
-fn print_checkpoint_breakdowns(db: &SharedDatabase, before: &[u64]) {
-    for (pool, was) in ShardType::ALL.iter().zip(before) {
-        if db.pool(*pool).stats().checkpoint_writes <= *was {
-            continue;
-        }
+fn print_checkpoint_breakdowns(db: &SharedDatabase, seen: &mut [String]) {
+    for (pool, seen) in ShardType::ALL.iter().zip(seen.iter_mut()) {
         let Some(b) = db.pool(*pool).checkpoint_breakdown() else {
             continue;
         };
+        // A background tail publishes its breakdown when it is collected, which
+        // is a later sync than the one that started it: print what is new.
+        let now = format!("{b:?}");
+        if *seen == now {
+            continue;
+        }
+        *seen = now;
         println!(
             "  {pool:?} checkpoint {:.0} ms: pre-sync {:.0}, lock wait {:.0}, locked sync {:.0}, \
              snapshot {:.0}, serialize {:.0}, write {:.0}, dir sync {:.0}, journal.lsn {:.0}, \
@@ -151,6 +147,7 @@ fn main() {
     print_header(coordinator, remediate, background);
     println!("commits/round={commits} batch={batch} payload={payload}");
 
+    let mut printed = vec![String::new(); ShardType::ALL.len()];
     let mut next = 0u64;
     let mut zone_syncs = 0u64;
     let mut zone_forced = 0u64;
@@ -175,7 +172,6 @@ fn main() {
         }
         let len = coordinator.segment_len();
         let coverage_before = db.pool(ShardType::EventDag).durable_coverage();
-        let checkpoints_before = checkpoint_counts(&db);
         let started = Instant::now();
         db.pool(ShardType::EventDag).sync_all().expect("sync_all");
         let sync_ms = millis(started.elapsed());
@@ -186,6 +182,7 @@ fn main() {
         if sync_state {
             db.pool(ShardType::State).sync_all().expect("sync_all");
         }
+        print_checkpoint_breakdowns(&db, &mut printed);
         if len < emergency && sync_ms < slow_ms {
             continue;
         }
@@ -205,7 +202,6 @@ fn main() {
             coordinator.reclaim_blockers()
         );
         print_phases(&event_timings);
-        print_checkpoint_breakdowns(&db, &checkpoints_before);
     }
 
     println!(

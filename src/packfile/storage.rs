@@ -4458,14 +4458,10 @@ impl PackfileStorage {
         let Some(captured) = self.capture_checkpoint()? else {
             return Ok(());
         };
-        let CapturedCheckpoint {
-            tail,
-            breakdown,
-            started,
-        } = captured;
+        let CapturedCheckpoint { tail, breakdown } = captured;
         match tail.run() {
             Ok(done) => {
-                self.record_checkpoint(breakdown, &done, started);
+                self.record_checkpoint(breakdown, &done);
                 Ok(())
             }
             Err(error) => {
@@ -4657,11 +4653,8 @@ impl PackfileStorage {
             #[cfg(test)]
             hook: self.checkpoint_tail_hook.lock().take(),
         };
-        Ok(Some(CapturedCheckpoint {
-            tail,
-            breakdown,
-            started,
-        }))
+        breakdown.total = started.elapsed();
+        Ok(Some(CapturedCheckpoint { tail, breakdown }))
     }
 
     /// Serialize snapshots and write their checkpoint, for the test mirrors of
@@ -4711,19 +4704,16 @@ impl PackfileStorage {
     }
 
     /// Fold a finished tail into the capture's breakdown and publish it.
-    fn record_checkpoint(
-        &self,
-        mut breakdown: CheckpointBreakdown,
-        done: &CheckpointBreakdown,
-        started: std::time::Instant,
-    ) {
+    fn record_checkpoint(&self, mut breakdown: CheckpointBreakdown, done: &CheckpointBreakdown) {
         breakdown.write = done.write;
         breakdown.directory_sync = done.directory_sync;
         breakdown.journal_lsn = done.journal_lsn;
         breakdown.reclaim = done.reclaim;
         breakdown.retire = done.retire;
         breakdown.checkpoint_bytes = done.checkpoint_bytes;
-        breakdown.total = started.elapsed();
+        // The capture's own time plus the tail's, not the time until somebody
+        // collected the worker.
+        breakdown.total = breakdown.total.saturating_add(done.total);
         *self.last_checkpoint_breakdown.lock() = Some(breakdown);
     }
 
@@ -4751,7 +4741,7 @@ impl PackfileStorage {
         }
         drop(slot);
         match worker.handle.join() {
-            Ok(Ok(done)) => self.record_checkpoint(worker.breakdown, &done, worker.started),
+            Ok(Ok(done)) => self.record_checkpoint(worker.breakdown, &done),
             Ok(Err(error)) => {
                 eprintln!("mtxdb: background checkpoint failed: {error}");
                 self.abandon_checkpoint();
@@ -4837,21 +4827,13 @@ impl PackfileStorage {
                 return;
             }
         };
-        let CapturedCheckpoint {
-            tail,
-            breakdown,
-            started,
-        } = captured;
+        let CapturedCheckpoint { tail, breakdown } = captured;
         let spawned = std::thread::Builder::new()
             .name("mtxdb-checkpoint".into())
             .spawn(move || tail.run());
         match spawned {
             Ok(handle) => {
-                *self.checkpoint_worker.lock() = Some(CheckpointWorker {
-                    handle,
-                    breakdown,
-                    started,
-                });
+                *self.checkpoint_worker.lock() = Some(CheckpointWorker { handle, breakdown });
             }
             Err(error) => {
                 eprintln!("mtxdb: could not start the checkpoint worker: {error}");
@@ -10297,6 +10279,7 @@ impl CheckpointTail {
                 )));
             }
         }
+        let tail_started = std::time::Instant::now();
         let mut done = CheckpointBreakdown::default();
         let path = PackfileStorage::index_checkpoint_path(&self.base_dir);
         let write_started = std::time::Instant::now();
@@ -10338,6 +10321,7 @@ impl CheckpointTail {
         let retire_started = std::time::Instant::now();
         retire_delta_epoch_file(&self.base_dir, self.old_base_fingerprint);
         done.retire = retire_started.elapsed();
+        done.total = tail_started.elapsed();
         Ok(done)
     }
 }
@@ -10346,14 +10330,12 @@ impl CheckpointTail {
 struct CapturedCheckpoint {
     tail: CheckpointTail,
     breakdown: CheckpointBreakdown,
-    started: std::time::Instant,
 }
 
 /// A tail running on its own thread, with the capture's phase timings.
 struct CheckpointWorker {
     handle: std::thread::JoinHandle<Result<CheckpointBreakdown, StorageError>>,
     breakdown: CheckpointBreakdown,
-    started: std::time::Instant,
 }
 
 impl Drop for PackfileStorage {
