@@ -174,6 +174,16 @@ pub struct OpenTimings {
     /// each affected collection (checkpoint path only; ZERO when there is no
     /// committed log to replay).
     pub delta_replay: std::time::Duration,
+    /// Grouping the replayed operations by collection and applying snapshot,
+    /// tombstone and generation gates, before any index is materialized
+    /// (checkpoint path only).
+    pub replay_prepare: std::time::Duration,
+    /// Seeding per-shard counts and home-shard assignment after the indexes are
+    /// materialized: the sidecar gate, or a slot walk (checkpoint path only).
+    pub bookkeeping: std::time::Duration,
+    /// Assembling the `PackfileStorage` from the loaded state, after the index
+    /// is built.
+    pub assemble: std::time::Duration,
     /// Number of delta-log operations validated and applied during this open:
     /// v3 slot frames, collection snapshots, and tombstones, or v2 frames
     /// (checkpoint path only; zero when no committed log was replayed). A
@@ -214,6 +224,9 @@ impl Default for OpenTimings {
             fingerprint: std::time::Duration::ZERO,
             index_materialization: std::time::Duration::ZERO,
             delta_replay: std::time::Duration::ZERO,
+            replay_prepare: std::time::Duration::ZERO,
+            bookkeeping: std::time::Duration::ZERO,
+            assemble: std::time::Duration::ZERO,
             delta_replay_operations: 0,
             full_scan: std::time::Duration::ZERO,
             total: std::time::Duration::ZERO,
@@ -2299,6 +2312,7 @@ impl PackfileStorage {
             )
         {
             timings.path = OpenPath::Checkpoint;
+            let assemble_started = std::time::Instant::now();
             let store = Self::assemble(
                 shards,
                 scan_out,
@@ -2311,6 +2325,7 @@ impl PackfileStorage {
                 checkpoint_covered,
                 read_covered,
             );
+            timings.assemble = assemble_started.elapsed();
             timings.total = started.elapsed();
             *store.last_open_timings.lock() = Some(timings);
             return Ok(store);
@@ -3027,6 +3042,7 @@ impl PackfileStorage {
             timings.delta_replay = delta_started.elapsed();
         }
 
+        let prepare_started = std::time::Instant::now();
         // Group the (gated) frames by target collection once, so the
         // materialization loop below applies each collection's frames by hash
         // lookup rather than re-scanning the whole frame list per collection.
@@ -3192,6 +3208,7 @@ impl PackfileStorage {
         let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
         let mut current_len: HashMap<[u8; 16], u32> =
             HashMap::with_capacity(checkpoint.collections.len());
+        timings.replay_prepare = prepare_started.elapsed();
         let materialization_started = std::time::Instant::now();
         for loaded in &checkpoint.collections {
             if deleted_collections.contains(&loaded.collection_id)
@@ -3279,6 +3296,7 @@ impl PackfileStorage {
                 .sort_unstable_by_key(|id| (live_order.get(id).copied().unwrap_or(u64::MAX), *id));
         }
         timings.index_materialization = materialization_started.elapsed();
+        let bookkeeping_started = std::time::Instant::now();
 
         let mut all_deleted_collections = deleted_collections.clone();
         all_deleted_collections.extend(v3_tombstones.iter().copied());
@@ -3358,6 +3376,8 @@ impl PackfileStorage {
         }
         // `SlotScan` derives counts straight from the live indexes; the
         // sidecar's `counts` are consumed above either way.
+
+        timings.bookkeeping = bookkeeping_started.elapsed();
 
         let delta_state = DeltaLogState {
             base_fingerprint: Some(checkpoint.fingerprint),

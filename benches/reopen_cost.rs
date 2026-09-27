@@ -119,6 +119,9 @@ fn print_open(label: &str, timings: &OpenTimings, first_read: Duration, dir: &Pa
         timings.checkpoint_decode,
         timings.fingerprint,
         timings.index_materialization,
+        timings.replay_prepare,
+        timings.bookkeeping,
+        timings.assemble,
     ]
     .into_iter()
     .fold(Duration::ZERO, Duration::saturating_add);
@@ -136,8 +139,9 @@ fn print_open(label: &str, timings: &OpenTimings, first_read: Duration, dir: &Pa
     println!(
         "         shard open {:.0} (discovery {:.0}, writer lock {:.0}, pack recovery {:.0} over {} \
          call(s), pack open {:.0}, metadata {:.0}) | metadata load {:.0} | checkpoint decode {:.0} | \
-         fingerprint {:.0} | index materialization {:.0} (delta replay {replay_ms:.0}: {} ops, {rate}) | \
-         unattributed {:.0} | first read {:.2} ms",
+         fingerprint {:.0} | replay prepare {:.0} | index materialization {:.0} (delta replay \
+         {replay_ms:.0}: {} ops, {rate}) | bookkeeping {:.0} | assemble {:.0} | unattributed {:.0} | \
+         first read {:.2} ms",
         millis(timings.shard_open),
         millis(timings.shard_discovery),
         millis(timings.writer_lock),
@@ -148,8 +152,11 @@ fn print_open(label: &str, timings: &OpenTimings, first_read: Duration, dir: &Pa
         millis(timings.metadata_load),
         millis(timings.checkpoint_decode),
         millis(timings.fingerprint),
+        millis(timings.replay_prepare),
         millis(timings.index_materialization),
         timings.delta_replay_operations,
+        millis(timings.bookkeeping),
+        millis(timings.assemble),
         millis(unattributed),
         millis(first_read),
     );
