@@ -12810,26 +12810,47 @@ mod tests {
     /// than misparsed as v7's 56-byte records. The sidecar is a rebuildable
     /// acceleration, so rejection just routes the caller to the full walk.
     #[test]
-    fn previous_version_shard_collections_sidecar_is_rejected() {
+    fn previous_version_shard_collections_sidecar_is_rejected_and_rebuilt() {
         let dir = test_dir("shard_collections_prev_version");
-        // Header: magic(4) + version(1) + fingerprint(8) + persisted_at(8),
-        // then one 72-byte v6 record (32-byte pack id + 16-byte collection id
-        // + three u64 fields). The body length is a multiple of the *old*
-        // record size but not necessarily the new one, and the version gate
-        // must reject it before any body parse.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(SHARD_ROOMS_MAGIC);
-        buf.push(SHARD_ROOMS_VERSION - 1);
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 32 + 16 + 8 + 8 + 8]);
-        std::fs::write(PackfileStorage::shard_collections_path(&dir), &buf).unwrap();
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let a = distinct_id(0xA0);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &a,
+                &NodeData::new(bytes::Bytes::from_static(b"data")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
+        drop(store);
+
+        let sidecar_path = PackfileStorage::shard_collections_path(&dir);
+        let mut buf = std::fs::read(&sidecar_path).unwrap();
+        assert_eq!(&buf[0..4], SHARD_ROOMS_MAGIC);
+        assert_eq!(buf[4], SHARD_ROOMS_VERSION);
+
+        // Overwrite version byte with v6:
+        buf[4] = SHARD_ROOMS_VERSION - 1;
+        std::fs::write(&sidecar_path, &buf).unwrap();
 
         assert!(
             read_persisted_shard_collections(&dir).is_none(),
             "a v{} shard-collections sidecar must be rejected by the v{SHARD_ROOMS_VERSION} reader",
             SHARD_ROOMS_VERSION - 1
         );
+
+        // Reopen: must fall back to scanning collections without error
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert!(reopened.collection_index_info(&TEST_COLLECTION).is_some());
+
+        // Rebuilding sidecar:
+        reopened.persist_shard_collections().unwrap();
+        drop(reopened);
+
+        let rebuilt = std::fs::read(&sidecar_path).unwrap();
+        assert_eq!(&rebuilt[0..4], SHARD_ROOMS_MAGIC);
+        assert_eq!(rebuilt[4], SHARD_ROOMS_VERSION);
     }
 
     #[test]

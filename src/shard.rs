@@ -3715,6 +3715,16 @@ mod tests {
             "a v{} stats snapshot must not be restored by the v{STATS_VERSION} reader",
             STATS_VERSION - 1
         );
+
+        // Opening the pool with a stale v5 snapshot must ignore it without error,
+        // and a subsequent persist must overwrite it with a fresh v6 snapshot.
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        pool.persist_stats().unwrap();
+        drop(pool);
+
+        let rebuilt = fs::read(ShardPool::stats_path(&dir)).unwrap();
+        assert_eq!(&rebuilt[0..4], STATS_MAGIC);
+        assert_eq!(rebuilt[4], STATS_VERSION);
     }
 
     /// Core invariant of the writer lock: at most one writer per
