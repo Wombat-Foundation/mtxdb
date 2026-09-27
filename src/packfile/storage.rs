@@ -18075,6 +18075,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The one-pass state also matches the separate readers when the log names
+    /// another checkpoint, and when its tail is torn.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn the_one_pass_durable_state_matches_for_a_foreign_or_torn_log() {
+        let dir = test_dir("one_pass_foreign_torn");
+        let wal = dir.join("wal.bin");
+        let writer = writer_with_coverage_steps(&dir, &wal, 5);
+        drop(writer);
+        let checkpoint = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+        let log_path = PackfileStorage::delta_path(&dir, checkpoint.fingerprint);
+        let intact = fs::read(&log_path).unwrap();
+
+        // Torn: cut inside the last batch. The fingerprint is whatever the last
+        // intact batch ended at, exactly as `read_durable_fingerprint` says.
+        fs::write(&log_path, &intact[..intact.len() - 3]).unwrap();
+        let torn = PackfileStorage::durable_index_state(&dir);
+        let reference = crate::index::checkpoint::read_durable_fingerprint(&dir)
+            .unwrap()
+            .expect("a fingerprint");
+        assert!(reference.torn_tail);
+        assert_eq!(torn.fingerprint, reference.fingerprint);
+        let tail = delta::read_delta_tail_fingerprint(&log_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            torn.covered_lsn,
+            checkpoint.covered_lsn.max(tail.coverage.unwrap_or(0))
+        );
+
+        // Foreign: a log that continues a different checkpoint is inert.
+        fs::remove_file(&log_path).unwrap();
+        delta::append_v3_batch_with_durability(
+            &log_path,
+            true,
+            checkpoint.fingerprint ^ 1,
+            &[delta::DeltaOperation::Coverage {
+                covered_lsn: u64::MAX,
+            }],
+            0x99,
+            false,
+        )
+        .unwrap();
+        let foreign = PackfileStorage::durable_index_state(&dir);
+        assert_eq!(foreign.fingerprint, checkpoint.fingerprint);
+        assert_eq!(foreign.covered_lsn, checkpoint.covered_lsn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The coverage step obeys the same rotation: with the log at the rotation
     /// length, a sync over the trigger takes the checkpoint rather than a batch.
     #[cfg(feature = "multi-reader")]
