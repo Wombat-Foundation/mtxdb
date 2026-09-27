@@ -451,7 +451,9 @@ impl SharedDatabase {
             let storage = weak_pools
                 .get(shard_index(pool))
                 .and_then(std::sync::Weak::upgrade);
-            if let Some(Err(error)) = storage.map(|storage| storage.force_index_checkpoint()) {
+            if let Some(Err(error)) =
+                storage.map(|storage| storage.force_index_checkpoint_detached())
+            {
                 eprintln!("warning: checkpointing {pool:?} to unblock WAL reclaim failed: {error}");
             }
         });

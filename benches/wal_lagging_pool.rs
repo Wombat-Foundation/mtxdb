@@ -58,11 +58,12 @@ fn millis(duration: Duration) -> f64 {
 fn print_phases(timings: &mtxdb::packfile::storage::SyncTimings) {
     println!(
         "  phases: pack_flush {:.0} ms, pack_fsync {:.0} ms, delta_log {:.0} ms, \
-         checkpoint {:.0} ms, wal {:.0} ms, journal_fsync {:.0} ms",
+         checkpoint {:.0} ms, reclaim {:.0} ms, wal {:.0} ms, journal_fsync {:.0} ms",
         millis(timings.pack_flush),
         millis(timings.pack_fsync),
         millis(timings.delta_log),
         millis(timings.checkpoint),
+        millis(timings.reclaim),
         millis(timings.wal),
         millis(timings.journal_fsync),
     );
@@ -115,6 +116,21 @@ fn print_header(
         coordinator.reclaim_trigger_len() >> 20,
         cap.saturating_sub(cap / 4) >> 20
     );
+}
+
+fn print_pool_stats(db: &SharedDatabase) {
+    for (name, pool) in [("EventDag", ShardType::EventDag), ("State", ShardType::State)] {
+        let stats = db.pool(pool).stats();
+        println!(
+            "{name}: tails started {}, syncs with a tail in flight {}, syncs waited for a tail {}, \
+             checkpoint writes {}, delta appends {}",
+            stats.checkpoint_tails_started,
+            stats.syncs_with_tail_in_flight,
+            stats.syncs_waited_for_tail,
+            stats.checkpoint_writes,
+            stats.delta_appends
+        );
+    }
 }
 
 fn main() {
@@ -218,6 +234,7 @@ fn main() {
         Some((round, message)) => println!("commits refused in round {round}: {message}"),
         None => println!("no commit was refused in {max_rounds} rounds"),
     }
+    print_pool_stats(&db);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

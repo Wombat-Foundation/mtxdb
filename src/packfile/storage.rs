@@ -314,6 +314,11 @@ pub struct SyncTimings {
     pub delta_log: std::time::Duration,
     /// Persisting the index checkpoint.
     pub checkpoint: std::time::Duration,
+    /// Coverage reporting and WAL reclaim performed by a coverage-step delta
+    /// batch (not by a checkpoint tail, whose phases are in
+    /// [`CheckpointBreakdown`]). This is the shared-segment rewrite and fsync
+    /// that shrinks the journal once every pool has reported.
+    pub reclaim: std::time::Duration,
     /// Committing the pending write-ahead journal group (one sequential
     /// fsync). Zero when no journal is configured.
     pub wal: std::time::Duration,
@@ -348,6 +353,7 @@ impl Default for SyncTimings {
             sidecar: std::time::Duration::ZERO,
             delta_log: std::time::Duration::ZERO,
             checkpoint: std::time::Duration::ZERO,
+            reclaim: std::time::Duration::ZERO,
             wal: std::time::Duration::ZERO,
             journal_lock_wait: std::time::Duration::ZERO,
             journal_fsync: std::time::Duration::ZERO,
@@ -1738,6 +1744,13 @@ pub struct PackfileStorage {
     sync_calls: AtomicU64,
     /// Syncs that rewrote the index checkpoint in full.
     checkpoint_writes: AtomicU64,
+    /// Background checkpoint tails started (one per detached checkpoint).
+    checkpoint_tails_started: AtomicU64,
+    /// Syncs that ran with a tail already in flight and appended to it rather
+    /// than starting another checkpoint.
+    syncs_with_tail_in_flight: AtomicU64,
+    /// Syncs that waited for an in-flight tail (emergency zone or rotation).
+    syncs_waited_for_tail: AtomicU64,
     /// Syncs that appended the incremental delta log instead.
     delta_appends: AtomicU64,
     /// Writes of the shard→collection inspection sidecar
@@ -2709,6 +2722,9 @@ impl PackfileStorage {
             delta_invalidations: AtomicU64::new(0),
             sync_calls: AtomicU64::new(0),
             checkpoint_writes: AtomicU64::new(0),
+            checkpoint_tails_started: AtomicU64::new(0),
+            syncs_with_tail_in_flight: AtomicU64::new(0),
+            syncs_waited_for_tail: AtomicU64::new(0),
             delta_appends: AtomicU64::new(0),
             sidecar_writes: AtomicU64::new(0),
             delta_state: parking_lot::Mutex::new(delta_state),
@@ -4768,8 +4784,16 @@ impl PackfileStorage {
             .journal()
             .is_some_and(|journal| journal.in_emergency_zone())
             || self.delta_state.lock().log_bytes >= self.delta_log_rotate_bytes();
+        let had_tail = self.checkpoint_worker.lock().is_some();
         if self.finish_checkpoint_worker(must_wait) {
             return true;
+        }
+        if had_tail {
+            self.syncs_with_tail_in_flight
+                .fetch_add(1, Ordering::Relaxed);
+            if must_wait {
+                self.syncs_waited_for_tail.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if self.index_checkpoint_dirty.load(Ordering::Relaxed)
             && !self.delta_state.lock().pending.is_empty()
@@ -4833,6 +4857,8 @@ impl PackfileStorage {
             .spawn(move || tail.run());
         match spawned {
             Ok(handle) => {
+                self.checkpoint_tails_started
+                    .fetch_add(1, Ordering::Relaxed);
                 *self.checkpoint_worker.lock() = Some(CheckpointWorker { handle, breakdown });
             }
             Err(error) => {
@@ -8408,15 +8434,23 @@ impl StorageEngine for PackfileStorage {
             .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
+        if result.is_ok() {
+            self.remediate_lagging_pools();
+        }
+        // Remediation (a synchronous blocker checkpoint in the non-background
+        // path) runs after the journal barrier and is part of what the caller
+        // waited for, so fold it into both the reclaim phase and the total: a
+        // sync that unblocks a stalled shared WAL pays that checkpoint here,
+        // and leaving it out made the phases not add up to the wall time.
+        timings.reclaim = timings
+            .reclaim
+            .saturating_add(started.elapsed().saturating_sub(timings.total));
         timings.total = started.elapsed();
         self.record_sync_diagnostics(&timings);
         if result.is_ok() {
             self.count_sync_persistence(&timings);
         }
         *self.last_sync_timings.lock() = Some(timings);
-        if result.is_ok() {
-            self.remediate_lagging_pools();
-        }
         result
     }
 
@@ -8647,15 +8681,20 @@ impl PackfileStorage {
             .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
+        if result.is_ok() {
+            self.remediate_lagging_pools();
+        }
+        // See `sync`: fold synchronous remediation into the reclaim phase and
+        // the total so the phase breakdown accounts for the wall time.
+        timings.reclaim = timings
+            .reclaim
+            .saturating_add(started.elapsed().saturating_sub(timings.total));
         timings.total = started.elapsed();
         self.record_sync_diagnostics(&timings);
         if result.is_ok() {
             self.count_sync_persistence(&timings);
         }
         *self.last_sync_timings.lock() = Some(timings);
-        if result.is_ok() {
-            self.remediate_lagging_pools();
-        }
         result
     }
 
@@ -8697,6 +8736,49 @@ impl PackfileStorage {
         self.shards.sync_dirty().map_err(StorageError::Io)?;
         let _persist_guard = self.index_persist_lock.lock();
         self.persist_index_checkpoint()
+    }
+
+    /// Checkpoint to unblock WAL reclaim, detaching the tail when the
+    /// background checkpoint is enabled.
+    ///
+    /// [`Self::force_index_checkpoint`] always joins and runs inline, so a
+    /// shared-WAL remediation that forced it would pay the whole checkpoint on
+    /// the syncing thread — exactly what the background path exists to avoid.
+    /// This captures under the locks and spawns the tail, returning once the
+    /// capture is done; the tail reports coverage when its image is durable.
+    /// Falls back to the synchronous path when backgrounding is off or a
+    /// capture cannot start.
+    ///
+    /// # Errors
+    /// Propagates any shard-fsync failure from the synchronous fallback.
+    pub fn force_index_checkpoint_detached(&self) -> Result<(), StorageError> {
+        if !self.background_checkpoint.load(Ordering::Relaxed) {
+            return self.force_index_checkpoint();
+        }
+        self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        self.shards.sync_dirty().map_err(StorageError::Io)?;
+        let captured = match self.capture_checkpoint() {
+            Ok(Some(captured)) => captured,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let CapturedCheckpoint { tail, breakdown } = captured;
+        let spawned = std::thread::Builder::new()
+            .name("mtxdb-checkpoint".into())
+            .spawn(move || tail.run());
+        match spawned {
+            Ok(handle) => {
+                self.checkpoint_tails_started
+                    .fetch_add(1, Ordering::Relaxed);
+                *self.checkpoint_worker.lock() = Some(CheckpointWorker { handle, breakdown });
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("mtxdb: could not start the checkpoint worker: {error}");
+                self.abandon_checkpoint();
+                Ok(())
+            }
+        }
     }
 
     /// Bound how often a structurally-needed full checkpoint rewrite may run.
@@ -9499,7 +9581,9 @@ impl PackfileStorage {
             match self.append_index_delta_v3(true) {
                 Ok(Some(covered)) => {
                     timings.delta_log = delta_started.elapsed();
+                    let reclaim_started = std::time::Instant::now();
                     self.report_coverage_and_reclaim(covered);
+                    timings.reclaim = reclaim_started.elapsed();
                     coverage_batch_written = true;
                 }
                 Ok(None) => {}
@@ -9822,6 +9906,9 @@ impl PackfileStorage {
             index_rebuild_count: self.index_rebuild_count.load(Ordering::Relaxed),
             delta_invalidations: self.delta_invalidations.load(Ordering::Relaxed),
             checkpoint_writes: self.checkpoint_writes.load(Ordering::Relaxed),
+            checkpoint_tails_started: self.checkpoint_tails_started.load(Ordering::Relaxed),
+            syncs_with_tail_in_flight: self.syncs_with_tail_in_flight.load(Ordering::Relaxed),
+            syncs_waited_for_tail: self.syncs_waited_for_tail.load(Ordering::Relaxed),
             checkpoint_skips: self.checkpoint_skips.load(Ordering::Relaxed),
             delta_appends: self.delta_appends.load(Ordering::Relaxed),
             read_reloads: self.read_reloads.load(Ordering::Relaxed),
@@ -10073,6 +10160,14 @@ pub struct RuntimeStats {
     pub delta_invalidations: u64,
     /// Syncs that rewrote the index checkpoint in full.
     pub checkpoint_writes: u64,
+    /// Background checkpoint tails started (one per detached checkpoint).
+    pub checkpoint_tails_started: u64,
+    /// Syncs that ran with a tail in flight and appended to it instead of
+    /// starting another checkpoint.
+    pub syncs_with_tail_in_flight: u64,
+    /// Syncs that waited for an in-flight tail (WAL emergency zone or delta-log
+    /// rotation), paying its duration on the foreground.
+    pub syncs_waited_for_tail: u64,
     /// Syncs that deferred a structurally-needed full checkpoint rewrite under
     /// the configured time/size budget (see
     /// [`PackfileStorage::set_checkpoint_rewrite_budget`]). Non-zero only when
@@ -10385,6 +10480,9 @@ impl Default for RuntimeStats {
             index_rebuild_count: 0,
             delta_invalidations: 0,
             checkpoint_writes: 0,
+            checkpoint_tails_started: 0,
+            syncs_with_tail_in_flight: 0,
+            syncs_waited_for_tail: 0,
             checkpoint_skips: 0,
             delta_appends: 0,
             read_reloads: 0,
