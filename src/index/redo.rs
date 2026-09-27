@@ -5,28 +5,29 @@
 //!
 //! A record names a change by content identity, not by table position, so it
 //! replays into a table of any capacity and a resize cannot invalidate it. It is
-//! a fixed 80-byte little-endian payload; the outer delta operation supplies the
+//! a fixed 100-byte little-endian payload; the outer delta operation supplies the
 //! frame type, length and CRC.
 //!
 //! ```text
-//!   0..16   collection_id
-//!  16       op                1 = set, 2 = collection tombstone
-//!  17       flags             must be zero
-//!  18..20   reserved          must be zero
-//!  20..36   full_hash         zero for a tombstone
-//!  36..44   pack_id           zero for a tombstone
-//!  44..48   reserved          must be zero (was the process-local shard slot)
-//!  48..56   offset            zero for a tombstone; a set above MAX_OFFSET is rejected
-//!  56..60   record_len        zero for a tombstone; nonzero for a set
-//!  60..68   delta_seq         per-pool ordering key, not a WAL LSN
-//!  68..76   base_generation   collection incarnation being continued
-//!  76..80   reserved          must be zero
+//!   0..16    collection_id
+//!  16        op                1 = set, 2 = collection tombstone
+//!  17        flags             must be zero
+//!  18..20    reserved          must be zero
+//!  20..36    full_hash         zero for a tombstone
+//!  36..68    pack_id           32-byte global pack identity, zero for a tombstone
+//!  68..76    offset            zero for a tombstone; a set above MAX_OFFSET is rejected
+//!  76..80    record_len        zero for a tombstone; nonzero for a set
+//!  80..88    delta_seq         per-pool ordering key, not a WAL LSN
+//!  88..96    base_generation   collection incarnation being continued
+//!  96..100   reserved          must be zero
 //! ```
+
+use crate::packfile::PackId;
 
 use super::IndexEntry;
 
 /// Encoded length of one record.
-pub const REDO_RECORD_LEN: usize = 80;
+pub const REDO_RECORD_LEN: usize = 100;
 
 const OP_SET: u8 = 1;
 const OP_COLLECTION_TOMBSTONE: u8 = 2;
@@ -39,8 +40,8 @@ pub enum RedoOp {
     Set {
         /// The authoritative content identity.
         full_hash: [u8; 16],
-        /// The pack holding the record (stable across processes, unlike a slot).
-        pack_id: u64,
+        /// The pack holding the record (globally unique and immutable).
+        pack_id: PackId,
         /// Byte offset of the frame within the pack.
         offset: u64,
         /// Expected on-disk length of the frame.
@@ -147,14 +148,14 @@ impl RedoRecord {
                 }
                 put(&mut buf, 16, &[OP_SET]);
                 put(&mut buf, 20, &full_hash);
-                put(&mut buf, 36, &pack_id.to_le_bytes());
-                put(&mut buf, 48, &offset.to_le_bytes());
-                put(&mut buf, 56, &record_len.to_le_bytes());
+                put(&mut buf, 36, pack_id.as_bytes());
+                put(&mut buf, 68, &offset.to_le_bytes());
+                put(&mut buf, 76, &record_len.to_le_bytes());
             }
             RedoOp::CollectionTombstone => put(&mut buf, 16, &[OP_COLLECTION_TOMBSTONE]),
         }
-        put(&mut buf, 60, &self.delta_seq.to_le_bytes());
-        put(&mut buf, 68, &self.base_generation.to_le_bytes());
+        put(&mut buf, 80, &self.delta_seq.to_le_bytes());
+        put(&mut buf, 88, &self.base_generation.to_le_bytes());
         Ok(buf)
     }
 
@@ -168,7 +169,7 @@ impl RedoRecord {
         if bytes.len() != REDO_RECORD_LEN {
             return Err(RedoError::BadLength(bytes.len()));
         }
-        let reserved_clear = [17..20, 44..48, 76..80].into_iter().all(|range| {
+        let reserved_clear = [17..20, 96..100].into_iter().all(|range| {
             bytes
                 .get(range)
                 .is_some_and(|part| part.iter().all(|b| *b == 0))
@@ -178,9 +179,9 @@ impl RedoRecord {
         }
         let op_byte = bytes.get(16).copied().unwrap_or(0);
         let full_hash = take::<16>(bytes, 20);
-        let pack_id = u64::from_le_bytes(take(bytes, 36));
-        let offset = u64::from_le_bytes(take(bytes, 48));
-        let record_len = u32::from_le_bytes(take(bytes, 56));
+        let pack_id = PackId(take::<32>(bytes, 36));
+        let offset = u64::from_le_bytes(take(bytes, 68));
+        let record_len = u32::from_le_bytes(take(bytes, 76));
         let op = match op_byte {
             OP_SET => {
                 if offset > IndexEntry::MAX_OFFSET {
@@ -197,7 +198,11 @@ impl RedoRecord {
                 }
             }
             OP_COLLECTION_TOMBSTONE => {
-                if full_hash != [0; 16] || pack_id != 0 || offset != 0 || record_len != 0 {
+                if full_hash != [0; 16]
+                    || pack_id != PackId([0; 32])
+                    || offset != 0
+                    || record_len != 0
+                {
                     return Err(RedoError::TombstoneCarriesLocator);
                 }
                 RedoOp::CollectionTombstone
@@ -207,8 +212,8 @@ impl RedoRecord {
         Ok(Self {
             collection_id: take(bytes, 0),
             op,
-            delta_seq: u64::from_le_bytes(take(bytes, 60)),
-            base_generation: u64::from_le_bytes(take(bytes, 68)),
+            delta_seq: u64::from_le_bytes(take(bytes, 80)),
+            base_generation: u64::from_le_bytes(take(bytes, 88)),
         })
     }
 }
@@ -243,7 +248,7 @@ mod tests {
             collection_id: [0xC1; 16],
             op: RedoOp::Set {
                 full_hash: [0xA5; 16],
-                pack_id: 7,
+                pack_id: PackId([7; 32]),
                 offset: 4096,
                 record_len: 61,
             },
@@ -296,7 +301,7 @@ mod tests {
             bytes[16] = op;
             assert_eq!(RedoRecord::decode(&bytes), Err(RedoError::UnknownOp(op)));
         }
-        for at in [17usize, 18, 19, 44, 45, 46, 47, 76, 77, 78, 79] {
+        for at in [17usize, 18, 19, 96, 97, 98, 99] {
             let mut bytes = good;
             bytes[at] = 1;
             assert_eq!(
@@ -313,13 +318,13 @@ mod tests {
         let mut record = set(1);
         record.op = RedoOp::Set {
             full_hash: [1; 16],
-            pack_id: 1,
+            pack_id: PackId([1; 32]),
             offset: too_far,
             record_len: 61,
         };
         assert_eq!(record.encode(), Err(RedoError::OffsetTooLarge(too_far)));
         let mut bytes = set(1).encode().unwrap();
-        bytes[48..56].copy_from_slice(&too_far.to_le_bytes());
+        bytes[68..76].copy_from_slice(&too_far.to_le_bytes());
         assert_eq!(
             RedoRecord::decode(&bytes),
             Err(RedoError::OffsetTooLarge(too_far))
@@ -328,7 +333,7 @@ mod tests {
         let mut ok = set(1);
         ok.op = RedoOp::Set {
             full_hash: [1; 16],
-            pack_id: 1,
+            pack_id: PackId([1; 32]),
             offset: IndexEntry::MAX_OFFSET,
             record_len: 61,
         };
@@ -338,9 +343,9 @@ mod tests {
     #[test]
     fn a_set_needs_a_length_and_a_tombstone_carries_no_locator() {
         let mut bytes = set(1).encode().unwrap();
-        bytes[56..60].fill(0);
+        bytes[76..80].fill(0);
         assert_eq!(RedoRecord::decode(&bytes), Err(RedoError::ZeroRecordLen));
-        for at in [20usize, 36, 48, 56] {
+        for at in [20usize, 36, 68, 76] {
             let mut bytes = tombstone(1).encode().unwrap();
             bytes[at] = 1;
             assert_eq!(

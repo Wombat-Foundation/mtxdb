@@ -26,6 +26,29 @@ mod tests {
         })
     }
 
+    fn current_pack_path(dir: &Path) -> PathBuf {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .expect("store directory must be readable")
+            .map(|entry| {
+                entry
+                    .expect("store directory entry must be readable")
+                    .path()
+            })
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "pack")
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem.starts_with("pack_"))
+            })
+            .collect();
+        assert_eq!(paths.len(), 1, "expected one live pack, found {paths:?}");
+        paths.pop().expect("the live pack path was just validated")
+    }
+
     fn assert_delete_then_recreate_in_log(
         operations: &[mtxdb::index::delta::DeltaOperation],
         collection: [u8; 16],
@@ -511,7 +534,7 @@ mod tests {
         // Snapshot the committed boundary BEFORE the unsynced buffered put:
         // the pack file's on-disk length and the checkpoint bytes holding
         // the pack_fingerprint (computed from exactly those lengths).
-        let pack_path = dir.join("pack_0000000000000000.pack");
+        let pack_path = current_pack_path(&dir);
         let pack_len_before = std::fs::metadata(&pack_path).unwrap().len();
         let checkpoint_before = std::fs::read(checkpoint_path(&dir)).unwrap();
         assert!(

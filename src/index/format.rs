@@ -4,6 +4,8 @@
 //! packfiles remain authoritative.  Keeping these records fixed-width makes a
 //! torn delta tail unambiguous and lets loaders bounds-check before allocating.
 
+use crate::packfile::PackId;
+
 #[cfg(not(target_endian = "little"))]
 compile_error!("the persisted index cache is currently supported only on little-endian targets");
 
@@ -13,8 +15,8 @@ pub const DELTA_FRAME_LEN: usize = 36;
 pub const CHECKPOINT_HEADER_LEN: usize = 88;
 /// Bytes in one collection directory entry.
 pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
-/// Bytes in one [`PackTableEntry`].
-pub const PACK_TABLE_ENTRY_LEN: usize = 12;
+/// Bytes in one [`PackTableEntry`]: `slot`(2) + reserved(2) + `PackId`(32).
+pub const PACK_TABLE_ENTRY_LEN: usize = 36;
 
 /// One slot overwrite after a checkpoint.
 ///
@@ -153,21 +155,19 @@ impl CheckpointHeader {
 
 /// One `(slot, pack_id)` binding in a checkpoint's pack table: the writer's
 /// local `ShardPool` slot for a live pack at checkpoint-write time, and that
-/// pack's stable, monotonically-allocated identity (`ShardPool::next_pack_id`
-/// is persisted and never decremented or reused within a pool — see
-/// `shard.rs`). A reader translates every checkpoint-encoded `slot`
-/// through this table into its own local slot for the same `pack_id`,
-/// rather than trusting the writer's raw slot number directly — slot
-/// numbers are a process-local, ephemeral handle, not identity, and drift
-/// after any shard retirement leaves a hole in the writer's slot table that
-/// a fresh reader's `discover_shards` (first-free-slot in `pack_id` order)
-/// does not reproduce.
+/// pack's stable, globally unique identity ([`PackId`]). A reader translates
+/// every checkpoint-encoded `slot` through this table into its own local slot
+/// for the same `pack_id`, rather than trusting the writer's raw slot number
+/// directly — slot numbers are a process-local, ephemeral handle, not
+/// identity, and drift after any shard retirement leaves a hole in the
+/// writer's slot table that a fresh reader's `discover_shards` (first-free-slot
+/// in `pack_id` order) does not reproduce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackTableEntry {
     /// The writer's local shard slot at checkpoint-write time.
     pub slot: u16,
     /// The pack's stable identity.
-    pub pack_id: u64,
+    pub pack_id: PackId,
 }
 
 impl PackTableEntry {
@@ -176,7 +176,7 @@ impl PackTableEntry {
     pub fn encode(self) -> [u8; PACK_TABLE_ENTRY_LEN] {
         let mut bytes = [0; PACK_TABLE_ENTRY_LEN];
         bytes[..2].copy_from_slice(&self.slot.to_le_bytes());
-        bytes[4..12].copy_from_slice(&self.pack_id.to_le_bytes());
+        bytes[4..36].copy_from_slice(self.pack_id.as_bytes());
         bytes
     }
 
@@ -184,9 +184,11 @@ impl PackTableEntry {
     /// Decodes exactly one fixed-width pack table entry, rejecting other lengths.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; PACK_TABLE_ENTRY_LEN] = bytes.try_into().ok()?;
+        let mut pack_id = [0u8; crate::packfile::PACK_ID_LEN];
+        pack_id.copy_from_slice(&bytes[4..36]);
         Some(Self {
             slot: u16::from_le_bytes(bytes[..2].try_into().ok()?),
-            pack_id: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
+            pack_id: PackId(pack_id),
         })
     }
 }
@@ -287,7 +289,7 @@ mod tests {
 
         let pack_entry = PackTableEntry {
             slot: 3,
-            pack_id: 0xDEAD_BEEF_0000_0001,
+            pack_id: PackId([0xAB; crate::packfile::PACK_ID_LEN]),
         };
         assert_eq!(
             PackTableEntry::decode(&pack_entry.encode()),

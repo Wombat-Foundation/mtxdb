@@ -14,7 +14,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Seek};
 use std::path::Path;
 
-use super::{read_header, read_record_metadata};
+use super::{read_header, read_record_metadata, PackId};
 
 /// Raw, on-disk physical layout of every pack file in a directory.
 #[derive(Debug, Default)]
@@ -22,7 +22,7 @@ pub struct PhysicalLayout {
     /// Per-collection physical footprint, keyed by collection ID.
     pub collections: HashMap<[u8; 16], CollectionPhysicalLayout>,
     /// Per-pack physical composition, keyed by `pack_id`.
-    pub packs: HashMap<u64, PackPhysicalLayout>,
+    pub packs: HashMap<PackId, PackPhysicalLayout>,
 }
 
 /// One collection's physical footprint across every pack file scanned.
@@ -32,7 +32,7 @@ pub struct CollectionPhysicalLayout {
     /// superseded frames a live index would no longer reference.
     pub disk_bytes: u64,
     /// On-disk bytes contributed to each pack this collection appears in.
-    pub pack_bytes: HashMap<u64, u64>,
+    pub pack_bytes: HashMap<PackId, u64>,
     /// Number of maximal contiguous runs of this collection's own
     /// records, across every shard file — a fragmentation signal
     /// sharper than "distinct packs touched": one collection's records
@@ -145,18 +145,12 @@ fn is_canonical_pack_path(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return false;
     };
-    let Some(id) = stem.strip_prefix("pack_") else {
-        return false;
-    };
     path.extension()
         .is_some_and(|extension| extension == "pack")
-        && id.len() == 16
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && PackId::parse_filename_prefix(stem).is_some()
 }
 
-fn finish_physical_run(layout: &mut PhysicalLayout, pack_id: u64, run: Option<([u8; 16], u64)>) {
+fn finish_physical_run(layout: &mut PhysicalLayout, pack_id: PackId, run: Option<([u8; 16], u64)>) {
     let Some((collection_id, bytes)) = run else {
         return;
     };
@@ -174,6 +168,12 @@ mod tests {
     use crate::packfile::{write_header, write_record, Record};
     use bytes::Bytes;
 
+    fn pack_id_for(n: u64) -> PackId {
+        let mut bytes = [0u8; crate::packfile::PACK_ID_LEN];
+        bytes[..8].copy_from_slice(&n.to_be_bytes());
+        PackId(bytes)
+    }
+
     #[test]
     fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
         let dir = std::env::temp_dir().join(format!(
@@ -188,12 +188,15 @@ mod tests {
         let collection_a = [0xA1; 16];
         let collection_b = [0xB2; 16];
         for (pack_id, records) in [
-            (0_u64, vec![collection_a, collection_b, collection_a]),
-            (1_u64, vec![collection_a]),
+            (
+                pack_id_for(0),
+                vec![collection_a, collection_b, collection_a],
+            ),
+            (pack_id_for(1), vec![collection_a]),
         ] {
-            let path = dir.join(format!("pack_{pack_id:016x}.pack"));
+            let path = dir.join(pack_id.filename());
             let mut file = File::create(path).unwrap();
-            write_header(&mut file, pack_id).unwrap();
+            write_header(&mut file, &pack_id).unwrap();
             for (index, collection_id) in records.into_iter().enumerate() {
                 write_record(
                     &mut file,
@@ -212,8 +215,8 @@ mod tests {
         let a = &layout.collections[&collection_a];
         assert_eq!(a.pack_bytes.len(), 2, "A spans two packs");
         assert_eq!(a.segments, 3, "A-B-A in pack 0 plus A in pack 1");
-        assert_eq!(layout.packs[&0].segments, 3);
-        assert_eq!(layout.packs[&1].segments, 1);
+        assert_eq!(layout.packs[&pack_id_for(0)].segments, 3);
+        assert_eq!(layout.packs[&pack_id_for(1)].segments, 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -224,14 +227,16 @@ mod tests {
             disk_bytes: capacity.saturating_add(100),
             ..CollectionPhysicalLayout::default()
         };
-        ideal.pack_bytes.insert(0, capacity);
-        ideal.pack_bytes.insert(1, 100);
+        ideal.pack_bytes.insert(pack_id_for(0), capacity);
+        ideal.pack_bytes.insert(pack_id_for(1), 100);
         assert_eq!(avoidable_spread_bytes(Some(&ideal)), 0);
 
         let mut fragmented = ideal;
         fragmented.pack_bytes.clear();
-        fragmented.pack_bytes.insert(0, capacity / 2);
-        fragmented.pack_bytes.insert(1, capacity / 2 + 100);
+        fragmented.pack_bytes.insert(pack_id_for(0), capacity / 2);
+        fragmented
+            .pack_bytes
+            .insert(pack_id_for(1), capacity / 2 + 100);
         assert_eq!(
             avoidable_spread_bytes(Some(&fragmented)),
             capacity.saturating_sub(capacity / 2 + 100)

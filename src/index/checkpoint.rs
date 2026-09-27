@@ -39,6 +39,7 @@ use super::format::{
     CheckpointHeader, CollectionDirEntry, PackTableEntry, CHECKPOINT_HEADER_LEN,
     COLLECTION_DIR_ENTRY_LEN, PACK_TABLE_ENTRY_LEN,
 };
+use crate::packfile::PackId;
 
 /// Magic identifying the persisted-index checkpoint format.
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
@@ -52,11 +53,10 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// which does not reproduce the writer's numbering once any shard has ever
 /// been retired (retirement leaves a permanent hole in the writer's table).
 /// The pack table lets a reader translate every checkpoint-encoded slot to
-/// its own local slot for the same `pack_id` (stable: `ShardPool::next_pack_id`
-/// is persisted and monotonic-only within a pool, never reused) instead of
-/// trusting the writer's raw slot number. A v5 checkpoint has no pack table
-/// and is rejected outright by the strict magic/version check below,
-/// forcing the normal full-rescan fallback — never a partial/best-effort
+/// its own local slot for the same `pack_id` (globally unique and immutable)
+/// instead of trusting the writer's raw slot number. A v5 checkpoint has no
+/// pack table and is rejected outright by the strict magic/version check
+/// below, forcing the normal full-rescan fallback — never a partial/best-effort
 /// read of a v5 file under the v6 reader.
 ///
 /// Bumped to 7: the header carries `base_delta_seq`, the highest redo `delta_seq`
@@ -136,7 +136,7 @@ pub struct LoadedCheckpoint {
     /// one of these slots — translate through this table to a reader's own
     /// local slot rather than trusting the slot number directly. See the
     /// `CHECKPOINT_VERSION` doc comment for why.
-    pub pack_table: Vec<(u16, u64)>,
+    pub pack_table: Vec<(u16, PackId)>,
 }
 
 /// One collection's raw slots, homes, and tails in the checkpoint mapping.
@@ -167,13 +167,13 @@ pub struct LoadedCollection {
 /// (or an open store's current packs) describes. The set is sorted before
 /// hashing so the result is order-independent.
 #[must_use]
-pub fn pack_fingerprint(packs: &[(u64, u64)]) -> u64 {
-    let mut sorted: Vec<(u64, u64)> = packs.to_vec();
+pub fn pack_fingerprint(packs: &[(PackId, u64)]) -> u64 {
+    let mut sorted: Vec<(PackId, u64)> = packs.to_vec();
     sorted.sort_unstable();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for (pack_id, file_len) in sorted {
-        for byte in pack_id.to_le_bytes() {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        for byte in pack_id.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
         for byte in file_len.to_le_bytes() {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -236,7 +236,7 @@ pub fn write_checkpoint(
     covered_lsn: u64,
     base_delta_seq: u64,
     collections: &[([u8; 16], u64, &[u8])],
-    pack_table: &[(u16, u64)],
+    pack_table: &[(u16, PackId)],
 ) -> std::io::Result<()> {
     let pack_table_count = u32::try_from(pack_table.len())
         .map_err(|_| std::io::Error::other("too many packs for checkpoint pack table u32"))?;
@@ -720,6 +720,13 @@ mod tests {
         hash
     }
 
+    /// Deterministic [`PackId`] fixture from a small integer.
+    fn pid(n: u64) -> PackId {
+        let mut bytes = [0u8; crate::packfile::PACK_ID_LEN];
+        bytes[..8].copy_from_slice(&n.to_be_bytes());
+        PackId(bytes)
+    }
+
     fn index_with_entries(seed: u16, count: usize) -> LossyIndex {
         let index = LossyIndex::new(count.max(16).saturating_mul(2));
         for i in 0..count {
@@ -731,21 +738,21 @@ mod tests {
 
     #[test]
     fn fingerprint_is_deterministic_but_sensitive() {
-        let packs = [(3, 100), (1, 50), (2, 75)];
+        let packs = [(pid(3), 100), (pid(1), 50), (pid(2), 75)];
         assert_eq!(pack_fingerprint(&packs), pack_fingerprint(&packs));
         assert_eq!(
             pack_fingerprint(&packs),
-            pack_fingerprint(&[(1, 50), (2, 75), (3, 100)])
+            pack_fingerprint(&[(pid(1), 50), (pid(2), 75), (pid(3), 100)])
         );
         // A length change (append/rotation) must change the fingerprint.
         assert_ne!(
             pack_fingerprint(&packs),
-            pack_fingerprint(&[(1, 51), (2, 75), (3, 100)])
+            pack_fingerprint(&[(pid(1), 51), (pid(2), 75), (pid(3), 100)])
         );
         // A pack-id change (repack/retire) must change it too.
         assert_ne!(
             pack_fingerprint(&packs),
-            pack_fingerprint(&[(1, 50), (2, 75), (4, 100)])
+            pack_fingerprint(&[(pid(1), 50), (pid(2), 75), (pid(4), 100)])
         );
     }
 
@@ -767,7 +774,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
 
-        let fingerprint = pack_fingerprint(&[(7, 12345)]);
+        let fingerprint = pack_fingerprint(&[(pid(7), 12345)]);
         write_checkpoint(
             &path,
             fingerprint,
@@ -1121,14 +1128,14 @@ mod tests {
         let blobs = [([3u8; 16], index_with_entries(1, 20).serialize())];
         write_checkpoint(
             &path,
-            pack_fingerprint(&[(1, 10)]),
+            pack_fingerprint(&[(pid(1), 10)]),
             5,
             0xDEAD_BEEF_0042,
             &blobs
                 .iter()
                 .map(|(id, b)| (*id, 1, b.as_slice()))
                 .collect::<Vec<_>>(),
-            &[(0, 1)],
+            &[(0, pid(1))],
         )
         .unwrap();
         assert_eq!(

@@ -196,10 +196,10 @@ pub struct Shard {
     /// Pool-local allocator slot (index into the open-shard table).
     /// Ephemeral, recycled on retire. Never shown to operators.
     pub slot: u16,
-    /// Pool-local `pack_id`, distinct from the slot index.
-    /// Ensures a reused slot never collides on-disk with a still-referenced
-    /// older file at that slot.
-    pub pack_id: u64,
+    /// The pack's globally unique, immutable identity. Unlike the old
+    /// pool-local `pack_id`, this is stable across pools/hosts, so an adopted
+    /// (imported/extracted) pack keeps its identity wherever it lands.
+    pub pack_id: packfile::PackId,
     /// The open file handle backing this shard.
     pub file: File,
     /// Filesystem path to this shard's file.
@@ -304,13 +304,13 @@ pub struct ShardStats {
     pub sync_count: u64,
 }
 
-/// Basic size, `pack_id`, and IO/sync info for one open shard.
+/// Basic size, address, and IO/sync info for one open shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardSummary {
     /// Pool-local allocator slot (ephemeral).
     pub slot: u16,
-    /// Pool-local `pack_id` for this shard incarnation.
-    pub pack_id: u64,
+    /// The pack's globally unique, immutable identity.
+    pub pack_id: packfile::PackId,
     /// Current on-disk file length in bytes.
     pub file_bytes: u64,
     /// IO/sync counters for this shard.
@@ -322,11 +322,10 @@ const STATS_FILENAME: &str = "shard_stats.bin";
 
 /// Magic bytes + version identifying the stats file format.
 const STATS_MAGIC: &[u8; 4] = b"MSTA";
-/// v4 replaces the v3 `slot_id`(2) + epoch(8) key with a single `pack_id`(8)
-/// key, cutting the per-record overhead by 2 bytes and eliminating the
-/// ephemeral slot-vs-epoch disambiguation. A v3 file is read as a
-/// legacy fallback; a v2 file is simply not restored.
-const STATS_VERSION: u8 = 4;
+/// v5 keys each record by the pack's full 32-byte [`packfile::PackId`]
+/// instead of a numeric id. The snapshot is a rebuildable observability cache,
+/// so a stale or unreadable file is simply not restored.
+const STATS_VERSION: u8 = 5;
 
 /// Minimum interval between implicit stats-snapshot writes from the hot
 /// dirty-sync path ([`ShardPool::sync_dirty`]). The snapshot is
@@ -335,26 +334,23 @@ const STATS_VERSION: u8 = 4;
 /// still persist it.
 const STATS_FLUSH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// On-disk size of one v4 stats record: `pack_id`(8) + 3×counter(8) = 32 bytes.
-const STATS_RECORD_LEN: usize = 8 + 8 * 3;
+/// On-disk size of one v5 stats record: `pack_address`(32) + 3×counter(8) = 56.
+const STATS_RECORD_LEN: usize = packfile::PACK_ID_LEN + 8 * 3;
 
 /// Header size: magic(4) + version(1) + `persisted_at`(8).
 const STATS_HEADER_LEN: usize = 4 + 1 + 8;
 
-/// Pool metadata filename — persists the `next_pack_id` high-water mark
-/// so a restarted process never reuses a `pack_id` that was already
-/// assigned, even if all shards from that range have been retired and
-/// deleted.
+/// Pool metadata filename. Persists the per-pool `bucket_seed`; the pack
+/// identity is now a globally unique random address, so there is no counter to
+/// reserve here.
 const POOL_META_FILENAME: &str = "pool.meta";
 
 /// Pool metadata format version.
-const POOL_META_VERSION: u8 = 2;
+const POOL_META_VERSION: u8 = 3;
 
 /// Parsed pool metadata from `pool.meta`.
 #[derive(Debug, Clone, Copy)]
 struct PoolMeta {
-    /// First `pack_id` not yet allocated.
-    next_pack_id: u64,
     /// Per-pool seed mixed into index bucket/tag derivation.
     bucket_seed: u64,
 }
@@ -425,20 +421,22 @@ static STATS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PACK_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl ShardStats {
-    fn encode(self, pack_id: u64, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&pack_id.to_le_bytes());
+    fn encode(self, pack_id: &packfile::PackId, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(pack_id.as_bytes());
         buf.extend_from_slice(&self.write_count.to_le_bytes());
         buf.extend_from_slice(&self.bytes_written.to_le_bytes());
         buf.extend_from_slice(&self.sync_count.to_le_bytes());
     }
 
-    fn decode(rec: &[u8; STATS_RECORD_LEN]) -> (u64, Self) {
-        let pack_id = u64::from_le_bytes(rec[0..8].try_into().unwrap());
-        let write_count = u64::from_le_bytes(rec[8..16].try_into().unwrap());
-        let bytes_written = u64::from_le_bytes(rec[16..24].try_into().unwrap());
-        let sync_count = u64::from_le_bytes(rec[24..32].try_into().unwrap());
+    fn decode(rec: &[u8; STATS_RECORD_LEN]) -> (packfile::PackId, Self) {
+        let mut pack_id = [0u8; packfile::PACK_ID_LEN];
+        pack_id.copy_from_slice(&rec[0..packfile::PACK_ID_LEN]);
+        let cursor = packfile::PACK_ID_LEN;
+        let write_count = u64::from_le_bytes(rec[cursor..cursor + 8].try_into().unwrap());
+        let bytes_written = u64::from_le_bytes(rec[cursor + 8..cursor + 16].try_into().unwrap());
+        let sync_count = u64::from_le_bytes(rec[cursor + 16..cursor + 24].try_into().unwrap());
         (
-            pack_id,
+            packfile::PackId(pack_id),
             Self {
                 write_count,
                 bytes_written,
@@ -449,7 +447,7 @@ impl ShardStats {
 }
 
 impl Shard {
-    fn new(slot: u16, pack_id: u64, file: File, path: PathBuf, file_len: u64) -> Self {
+    fn new(slot: u16, pack_id: packfile::PackId, file: File, path: PathBuf, file_len: u64) -> Self {
         Self {
             slot,
             pack_id,
@@ -615,11 +613,6 @@ pub struct ShardPool {
     bucket_seed: u64,
     /// Shard IDs written to since the last sync, for scoped fsync.
     dirty: parking_lot::Mutex<HashSet<u16>>,
-    /// Monotonically increasing `pack_id` counter for pack filenames.
-    /// Each newly created shard file gets a unique `pack_id`, so a
-    /// reused slot never collides on-disk with a still-referenced old
-    /// shard at the same slot.
-    next_pack_id: AtomicU64,
     /// Total number of shards retired (garbage-collected after a repack)
     /// over the pool's lifetime.
     retired_count: AtomicU64,
@@ -716,7 +709,7 @@ pub struct ShardOpenTimings {
     pub packfile_open_calls: u64,
     /// Time spent restoring pool metadata and persisted shard statistics.
     pub metadata_restore: Duration,
-    /// Restoring pool.meta header and reading next pack ID.
+    /// Restoring pool.meta bucket seed.
     pub pool_meta_restore: Duration,
     /// Reading and restoring persisted snapshot counters from `shard_stats.bin`.
     pub persisted_stats_restore: Duration,
@@ -882,17 +875,17 @@ impl ShardPool {
 
     /// Discovers packfiles in the pool directory.
     ///
-    /// Only v4 filenames are accepted: `pack_XXXXXXXXXXXXXXXX.pack`
-    /// where the 16 lowercase hex digits encode the `pack_id`. Uppercase
-    /// hex is rejected to prevent case-insensitive collisions on
-    /// case-insensitive filesystems and to enforce a single canonical
-    /// spelling per ID.
+    /// A canonical filename is `pack_<16 lowercase hex digits>` with optional
+    /// `_<16 hex>` continuation groups, a truncated, disambiguated prefix of
+    /// the pack's 256-bit [`packfile::PackId`]. The filename is only a
+    /// lookup key: the authoritative identity is read from (and validated
+    /// against) the file's header. Uppercase hex is rejected to prevent
+    /// case-insensitive collisions and enforce one canonical spelling.
     ///
-    /// A `pack_*.pack` file that doesn't match the v4 format, or a legacy
-    /// `shard_*.pack` file, is rejected with `Unsupported` — this is a hard
-    /// cutover, not a silent skip. Other applications' `.pack` files are
-    /// unrelated and ignored. Duplicate `pack_id`s are also rejected.
-    fn discover_pack_files(base_dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    /// A `shard_*.pack` file is rejected with `Unsupported` (hard cutover).
+    /// Other applications' `.pack` files are ignored. Duplicate full addresses
+    /// are rejected.
+    fn discover_pack_files(base_dir: &Path) -> io::Result<Vec<(packfile::PackId, PathBuf)>> {
         let mut pack_files = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for entry in fs::read_dir(base_dir)? {
@@ -904,67 +897,73 @@ impl ShardPool {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let id_hex = match stem.strip_prefix("pack_") {
-                Some(id_hex) => id_hex,
-                None if stem.starts_with("shard_") => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!(
-                            "found pre-v4 shard file {}; \
-                             use a fresh pool or explicitly migrate/reset it",
-                            path.display()
-                        ),
-                    ));
-                }
-                None => continue,
-            };
-
-            // v4 format: exactly 16 lowercase hex digits for pack_id.
-            if id_hex.len() != 16 {
+            if stem.starts_with("shard_") {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
-                        "found pre-v4 pack file {}; \
+                        "found pre-v4 shard file {}; \
                          use a fresh pool or explicitly migrate/reset it",
                         path.display()
                     ),
                 ));
             }
-            if !id_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if packfile::PackId::parse_filename_prefix(stem).is_none() {
+                if stem.starts_with("pack_") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid pack filename {}; \
+                             expected pack_{{lowercase hex digits}}.pack",
+                            path.display()
+                        ),
+                    ));
+                }
+                // Another application's `.pack` file: ignore it.
+                continue;
+            }
+            // The filename is a truncated prefix; read the header for the
+            // authoritative full address and validate prefix agreement.
+            let file = File::open(&path)?;
+            let mut reader = BufReader::new(&file);
+            let Some(header) = packfile::read_header(&mut reader)? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid pack header in {}", path.display()),
+                ));
+            };
+            let (prefix_bytes, prefix_digits) =
+                packfile::PackId::parse_filename_prefix(stem).expect("checked immediately above");
+            let name_hex = packfile::hex_lower(&prefix_bytes[..prefix_digits.div_ceil(2)]);
+            if !header.pack_id.as_hex().starts_with(&name_hex) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "pack filename {} contains non-hex characters",
+                        "pack {} identifies itself as {} but its filename prefix disagrees",
+                        path.display(),
+                        header.pack_id,
+                    ),
+                ));
+            }
+            if !seen.insert(header.pack_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "duplicate pack address {} found in {}",
+                        header.pack_id,
                         path.display()
                     ),
                 ));
             }
-            if id_hex != id_hex.to_ascii_lowercase() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("pack filename {} must use lowercase hex", path.display()),
-                ));
-            }
-            let pack_id = u64::from_str_radix(id_hex, 16).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("{id_hex}: {e}"))
-            })?;
-            if !seen.insert(pack_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "duplicate pack_id {pack_id:#018x} found in {}",
-                        path.display()
-                    ),
-                ));
-            }
-            pack_files.push((pack_id, path));
+            pack_files.push((header.pack_id, path));
         }
         Ok(pack_files)
     }
 
     /// Discover and sort pack files in `base_dir`, enforcing the
-    /// `MAX_SHARDS` capacity bound.
-    fn discover_pack_files_sorted(base_dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    /// `MAX_SHARDS` capacity bound. Files are ordered by address, which is
+    /// stable and independent of creation order (ordering policy is the
+    /// caller's concern, not the address's).
+    fn discover_pack_files_sorted(base_dir: &Path) -> io::Result<Vec<(packfile::PackId, PathBuf)>> {
         let mut pack_files = Self::discover_pack_files(base_dir)?;
         if pack_files.len() > MAX_SHARDS {
             return Err(io::Error::new(
@@ -976,7 +975,7 @@ impl ShardPool {
                 ),
             ));
         }
-        pack_files.sort_unstable_by_key(|(pack_id, _)| *pack_id);
+        pack_files.sort_unstable_by_key(|(address, _)| *address);
         Ok(pack_files)
     }
 
@@ -986,10 +985,9 @@ impl ShardPool {
     /// recovery_calls, packfile_open_time, packfile_open_calls)`.
     fn recover_and_open_packs(
         writable: bool,
-        pack_files: Vec<(u64, PathBuf)>,
+        pack_files: Vec<(packfile::PackId, PathBuf)>,
         shards: &mut [Option<Arc<Shard>>],
         next_slot: &mut u16,
-        max_pack_id: &mut u64,
     ) -> io::Result<(Duration, u64, Duration, u64)> {
         let mut recovery_time = Duration::ZERO;
         let mut recovery_calls: u64 = 0;
@@ -1015,7 +1013,7 @@ impl ShardPool {
             }
 
             let packfile_open_started = Instant::now();
-            let file = packfile::open_packfile(&path, writable, pack_id).map_err(|error| {
+            let file = packfile::open_packfile(&path, writable, &pack_id).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("corrupt pack {}; failed to open: {error}", path.display()),
@@ -1029,9 +1027,6 @@ impl ShardPool {
             *next_slot = next_slot.saturating_add(1);
             let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));
             shards[slot as usize] = Some(shard);
-            if pack_id >= *max_pack_id {
-                *max_pack_id = pack_id.saturating_add(1);
-            }
         }
         Ok((
             recovery_time,
@@ -1043,8 +1038,8 @@ impl ShardPool {
 
     /// Bootstrap a brand-new pool: create the first pack file, persist
     /// `pool.meta` (with a fresh seed if needed), and write `store.meta`.
-    /// Returns `(next_pack_id, bucket_seed, store_meta_write_time,
-    /// pool_meta_persist_time, initial_pack_create_time)`.
+    /// Returns `(bucket_seed, store_meta_write_time, pool_meta_persist_time,
+    /// initial_pack_create_time)`.
     ///
     /// # Errors
     /// Returns `io::Error` if the pool is empty and not writable.
@@ -1052,10 +1047,9 @@ impl ShardPool {
     fn initialize_empty_pool(
         base_dir: &Path,
         shards: &mut [Option<Arc<Shard>>],
-        mut next_pack_id: u64,
         mut bucket_seed: u64,
         writable: bool,
-    ) -> io::Result<(u64, u64, Duration, Duration, Duration)> {
+    ) -> io::Result<(u64, Duration, Duration, Duration)> {
         if !writable {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1065,7 +1059,6 @@ impl ShardPool {
                 ),
             ));
         }
-        let pack_id = next_pack_id;
 
         let t_store_meta = Instant::now();
         if !base_dir.join(STORE_META_FILENAME).exists() {
@@ -1080,25 +1073,18 @@ impl ShardPool {
         }
 
         let t_pool_meta_persist = Instant::now();
-        Self::persist_pool_meta_at_sync_dir(
-            base_dir,
-            pack_id.checked_add(1).expect("pack_id overflow"),
-            bucket_seed,
-            false,
-        )?;
+        Self::persist_pool_meta_at_sync_dir(base_dir, bucket_seed, false)?;
         let pool_meta_persist_time = t_pool_meta_persist.elapsed();
 
         let t_initial_pack = Instant::now();
-        let (file, path) = Self::create_packfile_atomically(base_dir, pack_id)?;
+        let (file, path, pack_id) = Self::create_packfile_atomically(base_dir, &[])?;
         let file_len = file.metadata()?.len();
         shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
-        next_pack_id = pack_id.checked_add(1).expect("pack_id overflow");
 
         sync_directory(base_dir)?;
         let initial_pack_create_time = t_initial_pack.elapsed();
 
         Ok((
-            next_pack_id,
             bucket_seed,
             store_meta_write_time,
             pool_meta_persist_time,
@@ -1106,19 +1092,13 @@ impl ShardPool {
         ))
     }
 
-    /// Restore `next_pack_id` and `bucket_seed` from `pool.meta`, falling
-    /// back to `max_pack_id` from discovered files. Returns
-    /// `(next_pack_id, bucket_seed, pool_meta_restore_time)`.
-    fn restore_pool_meta_state(
-        base_dir: &Path,
-        max_pack_id: u64,
-    ) -> io::Result<(u64, u64, Duration)> {
+    /// Restore `bucket_seed` from `pool.meta`. Returns `(bucket_seed,
+    /// pool_meta_restore_time)`.
+    fn restore_pool_meta_state(base_dir: &Path) -> io::Result<(u64, Duration)> {
         let started = Instant::now();
         let restored_meta = Self::restore_pool_meta(base_dir)?;
-        let next_pack_id =
-            restored_meta.map_or(max_pack_id, |meta| meta.next_pack_id.max(max_pack_id));
         let bucket_seed = restored_meta.map_or(0u64, |meta| meta.bucket_seed);
-        Ok((next_pack_id, bucket_seed, started.elapsed()))
+        Ok((bucket_seed, started.elapsed()))
     }
 
     /// Restore persisted stats from `shard_stats.bin`. Returns
@@ -1143,7 +1123,6 @@ impl ShardPool {
         base_dir: PathBuf,
         max_shard_bytes: u64,
         bucket_seed: u64,
-        next_pack_id: u64,
         highest_active: u16,
         writable: bool,
         compress: bool,
@@ -1178,7 +1157,6 @@ impl ShardPool {
             max_shard_bytes,
             bucket_seed,
             dirty: parking_lot::Mutex::new(HashSet::new()),
-            next_pack_id: AtomicU64::new(next_pack_id),
             retired_count: AtomicU64::new(0),
             stats_snapshots: AtomicU64::new(0),
             collection_home: RwLock::new(HashMap::new()),
@@ -1223,58 +1201,29 @@ impl ShardPool {
 
         let mut shards: Vec<Option<Arc<Shard>>> = (0..MAX_SHARDS).map(|_| None).collect();
         let mut next_slot: u16 = 0;
-        let mut max_pack_id: u64 = 0;
 
         let discovery_started = Instant::now();
         let pack_files = Self::discover_pack_files_sorted(&base_dir)?;
         let discovery_time = discovery_started.elapsed();
 
         let (recovery_time, recovery_calls, packfile_open_time, packfile_open_calls) =
-            Self::recover_and_open_packs(
-                writable,
-                pack_files,
-                &mut shards,
-                &mut next_slot,
-                &mut max_pack_id,
-            )?;
+            Self::recover_and_open_packs(writable, pack_files, &mut shards, &mut next_slot)?;
 
         let highest_active = next_slot.saturating_sub(1);
 
-        // Restore next_pack_id and bucket_seed from pool.meta if available,
-        // falling back to max_pack_id computed from discovered files. The meta
-        // file survives retired-and-deleted shards, so it's strictly more
-        // conservative than the file scan. A corrupt pool.meta is a hard
-        // error — it means pack_ids could be reused, which is data corruption.
+        // Restore bucket_seed from pool.meta if available. A corrupt pool.meta
+        // is a hard error.
         let metadata_started = Instant::now();
-        let (next_pack_id, bucket_seed, pool_meta_restore_time) =
-            Self::restore_pool_meta_state(&base_dir, max_pack_id)?;
+        let (bucket_seed, pool_meta_restore_time) = Self::restore_pool_meta_state(&base_dir)?;
 
-        let (
-            store_meta_write_time,
-            pool_meta_persist_time,
-            initial_pack_create_time,
-            shards,
-            next_pack_id,
-            bucket_seed,
-        ) = if shards.iter().all(std::option::Option::is_none) {
-            let (npi, bs, smw, pmp, ipc) = Self::initialize_empty_pool(
-                &base_dir,
-                &mut shards,
-                next_pack_id,
-                bucket_seed,
-                writable,
-            )?;
-            (smw, pmp, ipc, shards, npi, bs)
-        } else {
-            (
-                Duration::ZERO,
-                Duration::ZERO,
-                Duration::ZERO,
-                shards,
-                next_pack_id,
-                bucket_seed,
-            )
-        };
+        let (store_meta_write_time, pool_meta_persist_time, initial_pack_create_time, bucket_seed) =
+            if shards.iter().all(std::option::Option::is_none) {
+                let (bs, smw, pmp, ipc) =
+                    Self::initialize_empty_pool(&base_dir, &mut shards, bucket_seed, writable)?;
+                (smw, pmp, ipc, bs)
+            } else {
+                (Duration::ZERO, Duration::ZERO, Duration::ZERO, bucket_seed)
+            };
 
         // Restoring is a pure read of shard_stats.bin applied to our own
         // in-memory Shard objects — unconditional regardless of writable.
@@ -1289,7 +1238,6 @@ impl ShardPool {
             base_dir,
             max_shard_bytes,
             bucket_seed,
-            next_pack_id,
             highest_active,
             writable,
             compress,
@@ -1519,7 +1467,7 @@ impl ShardPool {
     pub fn discover_shards(&self) -> io::Result<()> {
         let pack_files = Self::discover_pack_files(&self.base_dir)?;
         let mut shards = self.shards.write();
-        let existing: std::collections::HashSet<u64> =
+        let existing: std::collections::HashSet<packfile::PackId> =
             shards.iter().flatten().map(|s| s.pack_id).collect();
         let mut sorted_files = pack_files;
         sorted_files.sort_unstable_by_key(|(id, _)| *id);
@@ -1533,7 +1481,7 @@ impl ShardPool {
                     "shard pool full while discovering pack files",
                 )
             })?;
-            let file = crate::packfile::open_packfile(&path, false, pack_id)?;
+            let file = crate::packfile::open_packfile(&path, false, &pack_id)?;
             let file_len = file.metadata()?.len();
             let slot = u16::try_from(slot)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid shard slot"))?;
@@ -1597,12 +1545,11 @@ impl ShardPool {
         base_dir.join(POOL_META_FILENAME)
     }
 
-    /// Persist `next_pack_id` and `bucket_seed` to `pool.meta` using an atomic
-    /// tmp+rename + dir-fsync pattern. The high-water mark is written
-    /// *before* the pack file it protects is created, so a crash at any
-    /// point never leaves a `pack_id` that could be reused.
-    fn persist_pool_meta_at(base_dir: &Path, next: u64, bucket_seed: u64) -> io::Result<()> {
-        Self::persist_pool_meta_at_sync_dir(base_dir, next, bucket_seed, true)
+    /// Persist the per-pool `bucket_seed` to `pool.meta` using an atomic
+    /// tmp+rename + dir-fsync pattern.
+    #[allow(dead_code, reason = "kept for callers that persist seed changes")]
+    fn persist_pool_meta_at(base_dir: &Path, bucket_seed: u64) -> io::Result<()> {
+        Self::persist_pool_meta_at_sync_dir(base_dir, bucket_seed, true)
     }
 
     /// Internal form of [`Self::persist_pool_meta_at`] allowing callers that
@@ -1610,14 +1557,12 @@ impl ShardPool {
     /// synchronization until all renames have completed.
     fn persist_pool_meta_at_sync_dir(
         base_dir: &Path,
-        next: u64,
         bucket_seed: u64,
         sync_dir: bool,
     ) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(21);
+        let mut buf = Vec::with_capacity(13);
         buf.extend_from_slice(b"MTXP");
         buf.push(POOL_META_VERSION);
-        buf.extend_from_slice(&next.to_le_bytes());
         buf.extend_from_slice(&bucket_seed.to_le_bytes());
 
         let final_path = Self::pool_meta_path(base_dir);
@@ -1630,8 +1575,7 @@ impl ShardPool {
             fs::rename(&tmp_path, &final_path)?;
             if sync_dir {
                 // Fsync the containing directory so the rename is durable
-                // across power loss — without this, a crash could leave the
-                // old pool.meta (or no file) in place, allowing pack_id reuse.
+                // across power loss.
                 sync_directory(base_dir)?;
             }
             Ok(())
@@ -1645,9 +1589,7 @@ impl ShardPool {
 
     /// Restore pool metadata from `pool.meta`. Returns an error if
     /// the file exists but is corrupt, truncated, or has an unknown
-    /// version — a corrupt pool.meta means `pack_id`s could be reused,
-    /// which is unrecoverable data corruption. Returns `Ok(None)` if
-    /// the file does not exist (fresh pool).
+    /// version. Returns `Ok(None)` if the file does not exist (fresh pool).
     fn restore_pool_meta(base_dir: &Path) -> io::Result<Option<PoolMeta>> {
         let path = Self::pool_meta_path(base_dir);
         let data = match fs::read(&path) {
@@ -1655,11 +1597,11 @@ impl ShardPool {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if data.len() < 21 {
+        if data.len() < 13 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "pool.meta is truncated ({} bytes, expected >= 21)",
+                    "pool.meta is truncated ({} bytes, expected >= 13)",
                     data.len()
                 ),
             ));
@@ -1679,12 +1621,8 @@ impl ShardPool {
                 ),
             ));
         }
-        let next_pack_id = u64::from_le_bytes(data[5..13].try_into().unwrap());
-        let bucket_seed = u64::from_le_bytes(data[13..21].try_into().unwrap());
-        Ok(Some(PoolMeta {
-            next_pack_id,
-            bucket_seed,
-        }))
+        let bucket_seed = u64::from_le_bytes(data[5..13].try_into().unwrap());
+        Ok(Some(PoolMeta { bucket_seed }))
     }
 
     /// Load a persisted stats snapshot, if one exists, and restore each
@@ -1736,7 +1674,7 @@ impl ShardPool {
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
         for (_slot, shard) in self.all_shards() {
-            shard.stats().encode(shard.pack_id, &mut buf);
+            shard.stats().encode(&shard.pack_id, &mut buf);
         }
 
         // Unique per (process, call) — the same base_dir can be opened by
@@ -1772,20 +1710,33 @@ impl ShardPool {
         Ok(())
     }
 
-    /// On-disk path for a pack file.
+    /// On-disk path for a pack file, given its id and the ids of its
+    /// siblings (used only to disambiguate a truncated filename prefix).
     #[must_use]
-    pub fn pack_path(base_dir: &Path, pack_id: u64) -> PathBuf {
-        base_dir.join(format!("pack_{pack_id:016x}.pack"))
+    pub fn pack_path(
+        base_dir: &Path,
+        pack_id: &packfile::PackId,
+        siblings: &[packfile::PackId],
+    ) -> PathBuf {
+        base_dir.join(pack_id.filename_for(siblings))
     }
 
     /// Initialize a pack under a non-discoverable temporary name, then rename
     /// it into place. Directory scanners consequently observe either no pack
     /// or a fully written header, never a partially initialized canonical file.
-    fn create_packfile_atomically(base_dir: &Path, pack_id: u64) -> io::Result<(File, PathBuf)> {
-        let path = Self::pack_path(base_dir, pack_id);
+    ///
+    /// A fresh random [`packfile::PackId`] is chosen for the new pack; the
+    /// sibling ids are consulted only to pick an unambiguous filename.
+    /// Returns the opened file, its final path, and its id.
+    fn create_packfile_atomically(
+        base_dir: &Path,
+        siblings: &[packfile::PackId],
+    ) -> io::Result<(File, PathBuf, packfile::PackId)> {
+        let pack_id = packfile::PackId::random();
+        let path = Self::pack_path(base_dir, &pack_id, siblings);
         let unique = PACK_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{}.{unique}", std::process::id()));
-        let file = match packfile::open_packfile(&tmp_path, true, pack_id) {
+        let file = match packfile::open_packfile(&tmp_path, true, &pack_id) {
             Ok(file) => file,
             Err(error) => {
                 let _ = fs::remove_file(&tmp_path);
@@ -1796,7 +1747,7 @@ impl ShardPool {
             let _ = fs::remove_file(&tmp_path);
             return Err(error);
         }
-        Ok((file, path))
+        Ok((file, path, pack_id))
     }
 
     /// Get a reference to a shard by ID.
@@ -2689,21 +2640,14 @@ impl ShardPool {
         for offset in 1..=MAX_SHARDS_U16 {
             let candidate = current.wrapping_add(offset).wrapping_rem(MAX_SHARDS_U16);
             if shards[candidate as usize].is_none() {
-                let pack_id = self.next_pack_id.load(Ordering::Relaxed);
-                let next = pack_id.checked_add(1).expect("pack_id overflow");
-
-                // Persist the high-water mark BEFORE creating the pack file.
-                // A crash after pack creation but before the next persist
-                // would leave a pack_id in use with no pool.meta reservation.
-                Self::persist_pool_meta_at(&self.base_dir, next, self.bucket_seed)?;
-
-                let (file, path) = Self::create_packfile_atomically(&self.base_dir, pack_id)?;
+                let sibling_ids: Vec<packfile::PackId> =
+                    shards.iter().flatten().map(|s| s.pack_id).collect();
+                let (file, path, pack_id) =
+                    Self::create_packfile_atomically(&self.base_dir, &sibling_ids)?;
                 let file_len = file.metadata()?.len();
                 shards[candidate as usize] = Some(Arc::new(Shard::new(
                     candidate, pack_id, file, path, file_len,
                 )));
-                // Advance the in-memory counter only after successful creation.
-                self.next_pack_id.store(next, Ordering::Relaxed);
                 drop(shards);
                 *self.active_write.lock() = candidate;
                 return Ok(());
@@ -3145,6 +3089,15 @@ mod tests {
             data: bytes::Bytes::copy_from_slice(data),
             metadata: None,
         }
+    }
+
+    /// A deterministic [`packfile::PackId`] for fixtures: the value `n` in the
+    /// leading 8 bytes, so its 16-hex filename prefix is a stable function of
+    /// `n` and ordering by full bytes matches ordering by `n`.
+    fn pack_id_for(n: u64) -> packfile::PackId {
+        let mut bytes = [0u8; packfile::PACK_ID_LEN];
+        bytes[..8].copy_from_slice(&n.to_be_bytes());
+        packfile::PackId(bytes)
     }
 
     #[test]
@@ -3940,11 +3893,11 @@ mod tests {
     fn test_shard_pool_open_fails_on_identity_mismatch() {
         let dir = test_dir("pool_open_identity_mismatch");
         std::fs::create_dir_all(&dir).unwrap();
-        // A valid header claiming pack_id 0, filed under a
-        // filename that claims pack_id 7.
-        let path = ShardPool::pack_path(&dir, 7);
+        // A valid header claiming one address, filed under a
+        // filename whose prefix claims another.
+        let path = ShardPool::pack_path(&dir, &pack_id_for(7), &[]);
         let mut buf = Vec::new();
-        packfile::write_header(&mut buf, 0).unwrap();
+        packfile::write_header(&mut buf, &pack_id_for(0)).unwrap();
         std::fs::write(&path, &buf).unwrap();
         // The pool fails to open — identity mismatch is corruption.
         match ShardPool::open(dir) {
@@ -3959,9 +3912,10 @@ mod tests {
     fn test_shard_pool_open_fails_on_corrupt_header_crc() {
         let dir = test_dir("pool_open_bad_crc");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = ShardPool::pack_path(&dir, 0);
+        let pack_id = pack_id_for(0);
+        let path = ShardPool::pack_path(&dir, &pack_id, &[]);
         let mut buf = Vec::new();
-        packfile::write_header(&mut buf, 0).unwrap();
+        packfile::write_header(&mut buf, &pack_id).unwrap();
         buf[12] ^= 0xFF; // corrupt a byte inside the CRC-covered region
         std::fs::write(&path, &buf).unwrap();
 
@@ -3979,7 +3933,7 @@ mod tests {
     fn test_shard_pool_open_fails_on_v1_with_v4_filename() {
         let dir = test_dir("pool_open_v1_store");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = ShardPool::pack_path(&dir, 0);
+        let path = ShardPool::pack_path(&dir, &pack_id_for(0), &[]);
         let mut buf = Vec::new();
         buf.extend_from_slice(&packfile::MAGIC);
         buf.push(0x01);
@@ -4032,174 +3986,6 @@ mod tests {
         }
     }
 
-    /// `pool.meta` persists `next_pack_id` across restarts so a
-    /// reopened pool never reuses a `pack_id` that was already assigned,
-    /// even if all shards from that range have been retired and deleted.
-    #[test]
-    fn test_pool_meta_persists_next_pack_id_across_restarts() {
-        let dir = test_dir("pool_meta_persist");
-        let pool = ShardPool::open(dir.clone()).unwrap();
-
-        // pool.meta is written before the initial pack file, so it
-        // exists from the very first open with next_pack_id = 1.
-        assert!(
-            ShardPool::pool_meta_path(&dir).exists(),
-            "pool.meta must exist after initial pack creation"
-        );
-        let restored = ShardPool::restore_pool_meta(&dir).unwrap();
-        assert_eq!(
-            restored.map(|m| m.next_pack_id),
-            Some(1),
-            "pool.meta should contain next_pack_id = 1 after initial shard 0"
-        );
-
-        // Create a record so shard 0 has data, then force rotation.
-        let record = test_record(0x01, 0xAA, b"first");
-        pool.put_record(&record).unwrap();
-
-        // Force a rotation — this creates pack_id 1 and persists pool.meta
-        // with next_pack_id = 2.
-        pool.rotate().unwrap();
-        pool.put_record(&test_record(0x02, 0xBB, b"second"))
-            .unwrap();
-
-        // pool.meta should now have next_pack_id = 2.
-        assert!(ShardPool::pool_meta_path(&dir).exists());
-        let restored = ShardPool::restore_pool_meta(&dir).unwrap();
-        assert_eq!(
-            restored.map(|m| m.next_pack_id),
-            Some(2),
-            "pool.meta should contain next_pack_id = 2"
-        );
-
-        // Delete all shard files to simulate full retirement.
-        drop(pool);
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "pack") {
-                std::fs::remove_file(&path).unwrap();
-            }
-        }
-
-        // Reopen: pool.meta survives, so next_pack_id must be >= 2
-        // even though no shard files remain.
-        let pool2 = ShardPool::open(dir.clone()).unwrap();
-        assert!(
-            pool2.next_pack_id.load(Ordering::Relaxed) >= 2,
-            "pool.meta must prevent pack_id reuse after all shards are deleted"
-        );
-
-        // Creating a new shard should get pack_id 2 (not 0).
-        let record = test_record(0x03, 0xCC, b"after restart");
-        let (_, offset) = pool2.put_record(&record).unwrap();
-        assert!(offset > 0, "record should have been written");
-
-        // Verify pack_id 2 was assigned to the new shard.
-        let summaries = pool2.summaries();
-        assert!(
-            summaries.iter().any(|s| s.pack_id == 2),
-            "new shard should have pack_id 2, got: {:?}",
-            summaries.iter().map(|s| s.pack_id).collect::<Vec<_>>()
-        );
-    }
-
-    /// Simulated intermediate recovery states during fresh pool initialization.
-    /// Exercises recovery from synthetic intermediate directory states representing
-    /// crashes or interruptions before or between filesystem operations, verifying that:
-    /// 1. Stale temporary files from an aborted open are ignored safely.
-    /// 2. If pool.meta was renamed (`next_pack_id` = 1) but the packfile creation
-    ///    aborted before pack rename, reopen discovers 0 shards, respects the
-    ///    persisted pool.meta high-water mark, and allocates `pack_id` = 1,
-    ///    never reusing `pack_id` = 0.
-    /// 3. Normal clean initialization produces durable pool.meta = 1 and pack 0.
-    #[test]
-    fn test_fresh_pool_recovery_states() {
-        // State 1: interruption before any rename (only tmp files exist)
-        {
-            let dir = test_dir("interruption_state_1");
-            // Place fake orphaned .tmp files
-            fs::write(
-                dir.join("pool.meta.tmp.1234"),
-                b"MTXP\x01\x01\x00\x00\x00\x00\x00\x00\x00",
-            )
-            .unwrap();
-            fs::write(dir.join("pack_0000000000000000.tmp.1234.0"), b"PACK\x02...").unwrap();
-
-            let pool = ShardPool::open(dir.clone()).unwrap();
-            assert_eq!(pool.all_shards().len(), 1);
-            let summaries = pool.summaries();
-            assert_eq!(
-                summaries[0].pack_id, 0,
-                "fresh allocation after tmp crash gets pack_id 0"
-            );
-            let restored = ShardPool::restore_pool_meta(&dir).unwrap();
-            assert_eq!(
-                restored.map(|m| m.next_pack_id),
-                Some(1),
-                "pool.meta must have next_pack_id = 1"
-            );
-        }
-
-        // State 2: Crash after pool.meta rename, but before initial pack rename
-        {
-            let dir = test_dir("interruption_state_2");
-            // Simulate pool.meta was renamed with next_pack_id = 1, but
-            // before the deferred directory sync.
-            ShardPool::persist_pool_meta_at_sync_dir(&dir, 1, 0xDEAD_BEEF, false).unwrap();
-            // Stale pack tmp left behind
-            fs::write(
-                dir.join("pack_0000000000000000.tmp.1234.0"),
-                b"fake pack tmp",
-            )
-            .unwrap();
-
-            // Reopen must succeed, see 0 canonical shards, read pool.meta (next_pack_id = 1),
-            // and allocate pack_id = 1 (preventing reuse of pack_id 0).
-            let pool = ShardPool::open(dir.clone()).unwrap();
-            let summaries = pool.summaries();
-            assert_eq!(summaries.len(), 1);
-            assert_eq!(
-                summaries[0].pack_id, 1,
-                "must assign pack_id 1 to prevent reuse of 0"
-            );
-            let restored = ShardPool::restore_pool_meta(&dir).unwrap();
-            assert_eq!(
-                restored.map(|m| m.next_pack_id),
-                Some(2),
-                "pool.meta must now be advanced to 2"
-            );
-        }
-
-        // State 3: Clean fresh initialization
-        {
-            let dir = test_dir("interruption_state_3");
-            let pool = ShardPool::open(dir.clone()).unwrap();
-            let summaries = pool.summaries();
-            assert_eq!(summaries.len(), 1);
-            assert_eq!(summaries[0].pack_id, 0);
-            assert_eq!(
-                ShardPool::restore_pool_meta(&dir)
-                    .unwrap()
-                    .map(|m| m.next_pack_id),
-                Some(1)
-            );
-            drop(pool);
-
-            // Reopen sees existing pack 0
-            let pool2 = ShardPool::open(dir.clone()).unwrap();
-            let summaries2 = pool2.summaries();
-            assert_eq!(summaries2.len(), 1);
-            assert_eq!(summaries2[0].pack_id, 0);
-            assert_eq!(
-                ShardPool::restore_pool_meta(&dir)
-                    .unwrap()
-                    .map(|m| m.next_pack_id),
-                Some(1)
-            );
-        }
-    }
-
     /// A retired shard's file must survive as long as any `Arc<Shard>`
     /// reference is held (e.g. via `PackfileStorage::pin_shards`, so a
     /// repack reading stale offsets from it can't be undercut), and must
@@ -4242,25 +4028,27 @@ mod tests {
     }
 
     /// Crash-recovery: multiple valid shard files are discovered and
-    /// assigned to sequential slots in `pack_id` order.
+    /// assigned to sequential slots in address order.
     #[test]
     fn test_scan_discovers_valid_shards_in_pack_id_order() {
         let dir = test_dir("scan_pack_id_order");
         let pool = ShardPool::open(dir.clone()).unwrap();
 
-        // Write a record so slot 0 exists (pack_id 0), then discard it —
-        // this test hand-constructs on-disk files below instead, since
-        // each one's embedded header must genuinely match its own filename.
+        // Write a record so a real pack exists, capture its path, then
+        // discard it — this test hand-constructs on-disk files below
+        // instead, since each one's embedded header must genuinely match
+        // its own filename.
         let record = test_record(0x01, 0xAA, b"live data");
         pool.put_record(&record).unwrap();
+        let old_path = pool.get_shard(0).unwrap().path.clone();
         drop(pool);
-        let old_path = ShardPool::pack_path(&dir, 0);
         std::fs::remove_file(&old_path).unwrap();
 
         // Create a valid pack_id 99 file.
-        let live_path = ShardPool::pack_path(&dir, 99);
+        let live_pack = pack_id_for(99);
+        let live_path = dir.join(live_pack.filename());
         let mut live_buf = Vec::new();
-        packfile::write_header(&mut live_buf, 99).unwrap();
+        packfile::write_header(&mut live_buf, &live_pack).unwrap();
         packfile::write_record(
             &mut live_buf,
             &packfile::Record {
@@ -4274,8 +4062,10 @@ mod tests {
         std::fs::write(&live_path, &live_buf).unwrap();
 
         // Create a valid pack_id 0 file (the crash leftover).
+        let leftover_pack = pack_id_for(0);
+        let leftover_path = dir.join(leftover_pack.filename());
         let mut buf = Vec::new();
-        packfile::write_header(&mut buf, 0).unwrap();
+        packfile::write_header(&mut buf, &leftover_pack).unwrap();
         packfile::write_record(
             &mut buf,
             &packfile::Record {
@@ -4286,45 +4076,49 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(&old_path, &buf).unwrap();
+        std::fs::write(&leftover_path, &buf).unwrap();
 
         // Both files exist on disk.
         assert!(live_path.exists(), "pack_id 99 file missing");
-        assert!(old_path.exists(), "pack_id 0 file missing");
+        assert!(leftover_path.exists(), "pack_id 0 file missing");
 
         // Reopen the pool — the scan must discover both, assign them
-        // to slots 0 and 1 in pack_id order.
+        // to slots 0 and 1 in address order.
         let pool = ShardPool::open(dir.clone()).unwrap();
         let shard0 = pool.get_shard(0).unwrap();
-        assert_eq!(shard0.pack_id, 0, "pack_id 0 should be assigned to slot 0");
-        assert_eq!(shard0.path, old_path);
+        assert_eq!(
+            shard0.pack_id, leftover_pack,
+            "pack_id 0 should be assigned to slot 0"
+        );
+        assert_eq!(shard0.path, leftover_path);
 
         let shard1 = pool.get_shard(1).unwrap();
         assert_eq!(
-            shard1.pack_id, 99,
+            shard1.pack_id, live_pack,
             "pack_id 99 should be assigned to slot 1"
         );
         assert_eq!(shard1.path, live_path);
         drop(pool);
 
-        // Both files should still exist (no dedup in v4 — each pack_id is unique).
-        assert!(old_path.exists(), "pack_id 0 file should still exist");
+        // Both files should still exist (each pack address is unique).
+        assert!(leftover_path.exists(), "pack_id 0 file should still exist");
         assert!(live_path.exists(), "pack_id 99 file should still exist");
     }
 
-    /// A torn header in a v4-named shard file causes pool open to fail.
+    /// A torn header in a validly-named shard file causes pool open to fail.
     #[test]
     fn test_scan_retains_valid_shard_when_newer_header_is_torn() {
         let dir = test_dir("scan_torn_newer_pack");
-        let old_path = ShardPool::pack_path(&dir, 1);
+        let valid_pack = pack_id_for(1);
+        let old_path = dir.join(valid_pack.filename());
         let mut old = Vec::new();
-        packfile::write_header(&mut old, 1).unwrap();
+        packfile::write_header(&mut old, &valid_pack).unwrap();
         std::fs::write(&old_path, old).unwrap();
 
-        // A higher pack_id filename with a torn header — pool open
-        // must fail because this corrupt shard is a valid v4 filename
+        // A higher-address filename with a torn header — pool open
+        // must fail because this corrupt shard is a valid filename
         // that can't be read.
-        let torn_path = ShardPool::pack_path(&dir, 2);
+        let torn_path = dir.join(pack_id_for(2).filename());
         std::fs::write(&torn_path, b"MTX").unwrap();
 
         match ShardPool::open(dir) {
@@ -4344,7 +4138,7 @@ mod tests {
     fn discover_shards_reports_an_unopenable_new_pack() {
         let dir = test_dir("discover_unopenable_pack");
         let pool = ShardPool::open(dir.clone()).unwrap();
-        let path = ShardPool::pack_path(&dir, 1);
+        let path = dir.join(pack_id_for(1).filename());
         std::fs::write(path, b"MTX").unwrap();
 
         let error = pool.discover_shards().unwrap_err();
@@ -4398,17 +4192,17 @@ mod tests {
         assert_eq!(pool.stats(slot.wrapping_add(1)), None);
     }
 
-    /// Backward compatibility: the startup scan must correctly parse
-    /// v4 filename format and assign shards to sequential slots.
+    /// The startup scan correctly parses the `pack_<16hex>.pack` filename
+    /// format and assigns shards to sequential slots in address order.
     #[test]
-    fn test_scan_parses_v4_filename_format() {
-        let dir = test_dir("scan_v4_format");
+    fn test_scan_parses_pack_id_filename_format() {
+        let dir = test_dir("scan_pack_id_format");
 
-        // Manually create files in v4 format. Each file's header must
-        // genuinely match the pack_id implied by its own filename.
-        let make_pack = |collection_byte: u8, pack_id: u64| -> Vec<u8> {
+        // Manually create files. Each file's header must genuinely match
+        // the address encoded by its own filename prefix.
+        let make_pack = |collection_byte: u8, pack_id: packfile::PackId| -> Vec<u8> {
             let mut buf = Vec::new();
-            packfile::write_header(&mut buf, pack_id).unwrap();
+            packfile::write_header(&mut buf, &pack_id).unwrap();
             packfile::write_record(
                 &mut buf,
                 &packfile::Record {
@@ -4426,28 +4220,26 @@ mod tests {
             buf
         };
 
-        // Pack ID 0: "pack_0000000000000000.pack"
-        std::fs::write(dir.join("pack_0000000000000000.pack"), make_pack(0x01, 0)).unwrap();
-
-        // Pack ID 5: "pack_0000000000000005.pack"
-        std::fs::write(dir.join("pack_0000000000000005.pack"), make_pack(0x02, 5)).unwrap();
-
-        // Pack ID 3: "pack_0000000000000003.pack"
-        std::fs::write(dir.join("pack_0000000000000003.pack"), make_pack(0x03, 3)).unwrap();
+        let zero = pack_id_for(0);
+        let three = pack_id_for(3);
+        let five = pack_id_for(5);
+        std::fs::write(dir.join(zero.filename()), make_pack(0x01, zero)).unwrap();
+        std::fs::write(dir.join(five.filename()), make_pack(0x02, five)).unwrap();
+        std::fs::write(dir.join(three.filename()), make_pack(0x03, three)).unwrap();
 
         let pool = ShardPool::open(dir).unwrap();
 
-        // Files are assigned to slots in pack_id order (0, 3, 5).
+        // Files are assigned to slots in address order (0, 3, 5).
         let s0 = pool.get_shard(0).unwrap();
-        assert_eq!(s0.pack_id, 0, "pack_0000000000000000.pack → pack_id 0");
+        assert_eq!(s0.pack_id, zero, "pack_0000000000000000.pack → id 0");
         assert_eq!(s0.slot, 0);
 
         let s1 = pool.get_shard(1).unwrap();
-        assert_eq!(s1.pack_id, 3, "pack_0000000000000003.pack → pack_id 3");
+        assert_eq!(s1.pack_id, three, "pack_0000000000000003.pack → id 3");
         assert_eq!(s1.slot, 1);
 
         let s2 = pool.get_shard(2).unwrap();
-        assert_eq!(s2.pack_id, 5, "pack_0000000000000005.pack → pack_id 5");
+        assert_eq!(s2.pack_id, five, "pack_0000000000000005.pack → id 5");
         assert_eq!(s2.slot, 2);
 
         // Slot 3 was never created; pool should have no shard there.

@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use crate::journal::{Journal, Mutation as JournalMutation};
 use crate::storage::{NodeData, NodeId, StorageError};
 
-use super::{OpenTimings, PackfileStorage, ReloadMode};
+use super::{OpenTimings, PackId, PackfileStorage, ReloadMode};
 
 /// How many bytes ending at the last consumed group the overlay remembers to
 /// notice that the consumed prefix was rewritten.
@@ -634,7 +634,7 @@ impl PackfileStorage {
         // checkpoint fingerprint mismatch forever. New/grown live packs are
         // included at their current lengths, and the checkpoint delta log
         // validates the suffix from the checkpoint's original fingerprint.
-        let mut open_shards: Vec<(u16, u64, PathBuf, u64)> = Vec::new();
+        let mut open_shards: Vec<(u16, PackId, PathBuf, u64)> = Vec::new();
         for (id, shard) in self.shards.all_shards() {
             match fs::metadata(&shard.path) {
                 Ok(metadata) => {

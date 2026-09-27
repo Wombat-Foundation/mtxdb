@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context};
 use mtxdb::auxiliary::AuxiliaryIndex;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
+use mtxdb::packfile::PackId;
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
@@ -2463,7 +2464,7 @@ fn interleaving_worth_noting(collections: u64, excess_runs: u64) -> bool {
 /// runs, interleaving excess, and — when fragmentation is worth acting on —
 /// the note that repack is never automatic.
 fn print_pack_physical_layout(
-    shard_entries: &[(u64, u64, u8)],
+    shard_entries: &[(PackId, u64, u8)],
     physical: &mtxdb::packfile::layout::PhysicalLayout,
 ) {
     // Aggregate only over the packs listed in `shard_entries`: the caller
@@ -2483,8 +2484,8 @@ fn print_pack_physical_layout(
         .sum();
     println!("physical layout: {runs} contiguous runs; {interleaved} excess runs from interleaving (includes superseded frames)");
     println!(
-        "{:>19}  {:>11}  {:>6}  {:>10}  {:>12}",
-        "pack id", "collections", "runs", "excess", "largest run"
+        "{:>21}  {:>11}  {:>6}  {:>10}  {:>12}",
+        "pack", "collections", "runs", "excess", "largest run"
     );
     for (pack_id, _, _) in shard_entries {
         let stats = physical.packs.get(pack_id);
@@ -2493,7 +2494,8 @@ fn print_pack_physical_layout(
         let excess = runs.saturating_sub(collections as u64);
         let largest = stats.map_or(0, |stats| stats.largest_segment_bytes);
         println!(
-            "0x{pack_id:016x}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
+            "{}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
+            pack_id.filename_stem(),
             fmt_bytes(largest)
         );
     }
@@ -2534,7 +2536,7 @@ fn cmd_shards_coalesced(
 ) -> anyhow::Result<()> {
     struct ShardRow {
         db_label: String,
-        pack_id: u64,
+        pack_id: PackId,
         file_bytes: u64,
         version: u8,
         is_active: bool,
@@ -2580,7 +2582,7 @@ fn cmd_shards_coalesced(
                 continue;
             }
             shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
-            let active_pack_id = shard_entries.iter().map(|(id, _, _)| *id).max();
+            let active_pack_id = shard_entries.last().map(|(id, _, _)| *id);
             let (stats_map, _) = decode_stats_snapshot(&pool_dir);
             let node_counts = PackfileStorage::shard_node_counts_from_disk(&pool_dir);
             let collection_counts = PackfileStorage::shard_collection_counts_from_disk(&pool_dir);
@@ -2703,8 +2705,8 @@ fn cmd_shards_coalesced(
             .max(8);
 
         println!(
-            "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
-            "database", "pack id", "ver", "bytes", "nodes", "collections", "index", "syncs",
+            "{:<db_width$}  {:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "database", "pack", "ver", "bytes", "nodes", "collections", "index", "syncs",
         );
         for row in &rows {
             let nodes_str = row.nodes.map_or_else(|| "?".to_owned(), |n| n.to_string());
@@ -2715,11 +2717,11 @@ fn cmd_shards_coalesced(
                 .index_bytes
                 .map_or_else(|| "?".to_owned(), fmt_megabytes);
             println!(
-                "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+                "{:<db_width$}  {:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
                 row.db_label,
                 format!(
-                    "0x{:016x}{}",
-                    row.pack_id,
+                    "{}{}",
+                    row.pack_id.filename_stem(),
                     if row.is_active { "*" } else { " " }
                 ),
                 row.version,
@@ -2732,7 +2734,7 @@ fn cmd_shards_coalesced(
         }
         println!();
         println!(
-            "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "{:<db_width$}  {:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
             "total",
             "",
             "",
@@ -3573,7 +3575,7 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
             bail!("unknown shards sort column `{column}`");
         }
         shard_entries.sort_by(|left, right| {
-            let value = |entry: &(u64, u64, u8)| match column {
+            let value = |entry: &(PackId, u64, u8)| match column {
                 "bytes" => entry.1,
                 "nodes" => node_counts
                     .as_ref()
@@ -3639,7 +3641,7 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
 
 /// Calculate each pack's associated collection-index allocation and the
 /// de-duplicated allocation for the whole pool from the persisted directory.
-fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize>)> {
+fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<PackId, usize>)> {
     let summaries = PackfileStorage::collection_summaries_from_disk(dir)?;
     let collection_shards = PackfileStorage::collection_shards_from_disk(dir)?;
     let mut total = 0_usize;
@@ -3654,9 +3656,13 @@ fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize
     Some((total, by_shard))
 }
 
-/// Discover only canonical v4 `pack_{pack_id:016x}.pack` files.
+/// Discover canonical `pack_<hex>.pack` files.
 ///
-fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
+/// The filename carries only a truncated (optionally full) address prefix; the
+/// authoritative 256-bit address is read from the header and checked against
+/// the filename prefix. Returns `(address, bytes, format version)` ordered by
+/// address.
+fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(PackId, u64, u8)>> {
     let mut packs = Vec::new();
     let mut seen = HashSet::new();
     for entry in fs::read_dir(dir)? {
@@ -3668,61 +3674,65 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let id_hex = match stem.strip_prefix("pack_") {
-            Some(id_hex) => id_hex,
-            None if stem.starts_with("shard_") => {
-                bail!(
-                    "found pre-v4 shard file {}; reset it rather than opening it as v4",
-                    path.display()
-                );
-            }
-            None => continue,
-        };
-        if id_hex.len() != 16
-            || !id_hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
+        if stem.starts_with("shard_") {
             bail!(
-                "invalid v4 pack filename {}; expected pack_{{16 lowercase hex digits}}.pack",
+                "found pre-v4 shard file {}; reset it rather than opening it as v4",
                 path.display()
             );
         }
-        let pack_id = u64::from_str_radix(id_hex, 16)?;
-        if !seen.insert(pack_id) {
-            bail!("duplicate pack_id {pack_id:#x} in {}", dir.display());
-        }
+        let Some((prefix_bytes, prefix_digits)) = PackId::parse_filename_prefix(stem) else {
+            if stem.starts_with("pack_") {
+                bail!(
+                    "invalid pack filename {}; expected pack_<lowercase hex digits>.pack",
+                    path.display()
+                );
+            }
+            // Another application's `.pack` file: ignore it.
+            continue;
+        };
+        let name_hex = mtxdb::packfile::hex_lower(&prefix_bytes[..prefix_digits.div_ceil(2)]);
         let file = fs::File::open(&path)
             .with_context(|| format!("failed to open pack `{}`", path.display()))?;
         let header = mtxdb::packfile::read_header(&mut BufReader::new(file))
             .with_context(|| format!("unsupported or corrupt pack `{}`", path.display()))?
             .with_context(|| format!("invalid pack header `{}`", path.display()))?;
-        if header.pack_id != pack_id {
+        if !header.pack_id.as_hex().starts_with(&name_hex) {
             bail!(
-                "pack {} identifies itself as {:#x}",
+                "pack {} identifies itself as {} but its filename prefix disagrees",
                 path.display(),
                 header.pack_id
             );
         }
-        packs.push((pack_id, entry.metadata()?.len(), mtxdb::packfile::VERSION));
+        if !seen.insert(header.pack_id) {
+            bail!(
+                "duplicate pack address {} in {}",
+                header.pack_id,
+                dir.display()
+            );
+        }
+        packs.push((
+            header.pack_id,
+            entry.metadata()?.len(),
+            mtxdb::packfile::VERSION,
+        ));
     }
     packs.sort_unstable_by_key(|(pack_id, _, _)| *pack_id);
     Ok(packs)
 }
 
-/// Pack ID to `(write_count, bytes_written, sync_count)`, as decoded from
+/// Pack address to `(write_count, bytes_written, sync_count)`, as decoded from
 /// `shard_stats.bin`.
-type ShardStatsMap = std::collections::HashMap<u64, (u64, u64, u64)>;
+type ShardStatsMap = std::collections::HashMap<PackId, (u64, u64, u64)>;
 
 /// Decode `shard_stats.bin` — same binary format as
 /// `ShardPool::restore_persisted_stats`, but standalone. Returns a map
-/// from a `pack_id` key to `(write_count,
-/// bytes_written, sync_count)` and the snapshot's persisted-at timestamp.
+/// from a pack address to `(write_count, bytes_written, sync_count)` and the
+/// snapshot's persisted-at timestamp.
 fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
-    const STATS_VERSION: u8 = 4;
+    const STATS_VERSION: u8 = 5;
     const STATS_HEADER_LEN: usize = 4 + 1 + 8;
-    const STATS_RECORD_LEN: usize = 8 + 8 * 3;
+    const STATS_RECORD_LEN: usize = mtxdb::packfile::PACK_ID_LEN + 8 * 3;
 
     let mut stats_map = std::collections::HashMap::new();
     let mut persisted_at = None;
@@ -3739,10 +3749,12 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     let body = &buf[STATS_HEADER_LEN..];
     for chunk in body.chunks(STATS_RECORD_LEN) {
         if let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) {
-            let pack_id = u64::from_le_bytes(rec[0..8].try_into().unwrap());
-            let write_count = u64::from_le_bytes(rec[8..16].try_into().unwrap());
-            let bytes_written = u64::from_le_bytes(rec[16..24].try_into().unwrap());
-            let sync_count = u64::from_le_bytes(rec[24..32].try_into().unwrap());
+            let pack_id = PackId(rec[0..mtxdb::packfile::PACK_ID_LEN].try_into().unwrap());
+            let cursor = mtxdb::packfile::PACK_ID_LEN;
+            let write_count = u64::from_le_bytes(rec[cursor..cursor + 8].try_into().unwrap());
+            let bytes_written =
+                u64::from_le_bytes(rec[cursor + 8..cursor + 16].try_into().unwrap());
+            let sync_count = u64::from_le_bytes(rec[cursor + 16..cursor + 24].try_into().unwrap());
             stats_map.insert(pack_id, (write_count, bytes_written, sync_count));
         }
     }
@@ -3751,21 +3763,23 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 
 /// Print the shard table header and rows.
 fn print_shard_table(
-    shard_entries: &[(u64, u64, u8)],
+    shard_entries: &[(PackId, u64, u8)],
     stats_map: &ShardStatsMap,
-    node_counts: Option<&std::collections::HashMap<u64, u64>>,
-    collection_counts: Option<&std::collections::HashMap<u64, u64>>,
+    node_counts: Option<&std::collections::HashMap<PackId, u64>>,
+    collection_counts: Option<&std::collections::HashMap<PackId, u64>>,
     total_collections: Option<usize>,
     index_requirement: Option<usize>,
-    index_requirements_by_shard: Option<&HashMap<u64, usize>>,
+    index_requirements_by_shard: Option<&HashMap<PackId, usize>>,
 ) {
-    // `ShardPool::open_internal` restores the newest pack as its append
+    // `ShardPool::open_internal` restores the last-slotted pack as its append
     // destination. Mirror that recovery rule here without opening a writer.
-    let active_pack_id = shard_entries.iter().map(|(pack_id, _, _)| *pack_id).max();
+    // Shards are discovered in address order, so the last entry is the newest
+    // slot (addresses are random, so this is discovery order, not age).
+    let active_pack_id = shard_entries.last().map(|(pack_id, _, _)| *pack_id);
 
     println!(
-        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
-        "pack id", "ver", "bytes", "nodes", "collections", "index", "syncs",
+        "{:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+        "pack", "ver", "bytes", "nodes", "collections", "index", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
@@ -3782,9 +3796,10 @@ fn print_shard_table(
             .and_then(|requirements| requirements.get(&pack_id))
             .map_or_else(|| "?".to_owned(), |bytes| fmt_megabytes(*bytes));
         println!(
-            "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "{:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
             format!(
-                "0x{pack_id:016x}{}",
+                "{}{}",
+                pack_id.filename_stem(),
                 if active_pack_id == Some(pack_id) {
                     "*"
                 } else {
@@ -3806,7 +3821,7 @@ fn print_shard_table(
     }
     println!();
     println!(
-        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+        "{:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
         "total",
         "",
         fmt_bytes(total_bytes),
@@ -3871,12 +3886,13 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
         return Ok(InfoTarget::Collection);
     };
     match hex.len() {
-        1..=16 => Ok(InfoTarget::Pack),
+        1..=16 | 64 => Ok(InfoTarget::Pack),
         32 => Ok(InfoTarget::Collection),
         found => {
             bail!(
-                "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection) or \
-                 1-16 (a pack), found {found} characters{}",
+                "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection), \
+                 1-16 (a pack filename prefix), or 64 (a full pack address), found {found} \
+                 characters{}",
                 if hex.starts_with("0x") {
                     " (the `0x` prefix is doubled)"
                 } else {
@@ -3961,7 +3977,7 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
             Ok(())
         }
         InfoTarget::Pack => {
-            let pack_id = parse_pack_id_selector(selector)?;
+            let selector = parse_pack_id_selector(selector)?;
             let mut matches = Vec::new();
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
@@ -3971,28 +3987,31 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    let shard_entries: Vec<(u64, u64, u8)> = match glob_pack_files(&dir) {
-                        Ok(files) => files
-                            .into_iter()
-                            .filter(|&(id, _, _)| id == pack_id)
-                            .collect(),
-                        Err(_) => continue,
+                    let Ok(files) = glob_pack_files(&dir) else {
+                        continue;
                     };
-                    if !shard_entries.is_empty() {
-                        matches.push((db_dir.clone(), shard_type, dir, shard_entries));
-                    }
+                    let ids: Vec<PackId> = files.iter().map(|&(id, _, _)| id).collect();
+                    let Ok(pack_id) = selector.resolve(ids.iter()) else {
+                        continue;
+                    };
+                    let shard_entries: Vec<(PackId, u64, u8)> = files
+                        .into_iter()
+                        .filter(|&(id, _, _)| id == pack_id)
+                        .collect();
+                    matches.push((db_dir.clone(), shard_type, dir, pack_id, shard_entries));
                 }
             }
 
             if matches.is_empty() {
                 eprintln!(
-                    "pack 0x{pack_id:016x}: not found across {} database(s)",
+                    "pack {selector}: not found across {} database(s)",
                     valid_dirs.len()
                 );
                 return Ok(());
             }
 
-            for (i, (db_dir, shard_type, dir, shard_entries)) in matches.iter().enumerate() {
+            for (i, (db_dir, shard_type, dir, pack_id, shard_entries)) in matches.iter().enumerate()
+            {
                 if i > 0 {
                     println!();
                 }
@@ -4001,7 +4020,7 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
                     db_dir.display(),
                     shard_type.as_str()
                 );
-                print_pack_info(dir, pack_id, shard_entries, *shard_type);
+                print_pack_info(dir, *pack_id, shard_entries, *shard_type);
             }
             if matches.len() > 1 {
                 println!();
@@ -4363,7 +4382,7 @@ fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize,
         for path in packs.into_iter().skip(offset).take(limit) {
             match pack_identity(&path) {
                 PackIdentity::Valid { pack_id, length } => report.line(format!(
-                    "  {}: {} bytes, pack_id={pack_id:#x}",
+                    "  {}: {} bytes, pack_id={pack_id}",
                     path.display(),
                     length
                 )),
@@ -4379,7 +4398,7 @@ fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize,
 }
 
 enum PackIdentity {
-    Valid { pack_id: u64, length: u64 },
+    Valid { pack_id: PackId, length: u64 },
     NonCanonical(String),
     Invalid(anyhow::Error),
 }
@@ -4407,29 +4426,20 @@ fn pack_identity(path: &Path) -> PackIdentity {
     let Some(stem) = stem else {
         return PackIdentity::Invalid(anyhow!("pack filename is not valid UTF-8"));
     };
-    let Some(hex) = stem.strip_prefix("pack_") else {
+    let Some((prefix_bytes, prefix_digits)) = PackId::parse_filename_prefix(&stem) else {
         return PackIdentity::NonCanonical(format!(
-            "pack filename `{stem}` is non-canonical; expected pack_<16 hex digits>.pack"
+            "pack filename `{stem}` is non-canonical; expected pack_<lowercase hex digits>.pack"
         ));
     };
-    if hex.len() != 16
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return PackIdentity::NonCanonical(format!(
-            "pack filename `{stem}` is non-canonical; expected pack_<16 lowercase hex digits>.pack"
-        ));
-    }
-    let result = (|| -> anyhow::Result<(u64, u64)> {
-        let filename_id = u64::from_str_radix(hex, 16)?;
+    let name_hex = mtxdb::packfile::hex_lower(&prefix_bytes[..prefix_digits.div_ceil(2)]);
+    let result = (|| -> anyhow::Result<(PackId, u64)> {
         let length = fs::metadata(path)?.len();
         let mut file = BufReader::new(fs::File::open(path)?);
         let header =
             mtxdb::packfile::read_header(&mut file)?.ok_or_else(|| anyhow!("not a packfile"))?;
-        if header.pack_id != filename_id {
+        if !header.pack_id.as_hex().starts_with(&name_hex) {
             bail!(
-                "pack filename id {filename_id:#x} disagrees with header id {:#x}",
+                "pack filename prefix {name_hex} disagrees with header id {}",
                 header.pack_id
             );
         }
@@ -5019,8 +5029,8 @@ fn print_pack_lifetime(path: &Path) {
 )]
 fn print_pack_info(
     dir: &Path,
-    pack_id: u64,
-    shard_entries: &[(u64, u64, u8)],
+    pack_id: PackId,
+    shard_entries: &[(PackId, u64, u8)],
     shard_type: ShardType,
 ) {
     let (stats_map, _) = decode_stats_snapshot(dir);
@@ -5052,8 +5062,8 @@ fn print_pack_info(
 
     println!();
     println!("type: {}", shard_type.as_str());
-    println!("generation: {pack_id} (0x{pack_id:016x})");
-    let path = dir.join(format!("pack_{pack_id:016x}.pack"));
+    println!("pack: {pack_id}");
+    let path = dir.join(pack_id.filename());
     println!("path: {}", path.display());
 
     print_pack_lifetime(&path);
@@ -5135,38 +5145,44 @@ fn print_pack_info(
 }
 
 fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
-    let pack_id = parse_pack_id_selector(selector)?;
+    let selector = parse_pack_id_selector(selector)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
-            let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
+            let all = glob_pack_files(&dir)?;
+            let ids: Vec<PackId> = all.iter().map(|&(id, _, _)| id).collect();
+            let Ok(pack_id) = selector.resolve(ids.iter()) else {
+                continue;
+            };
+            let shard_entries: Vec<(PackId, u64, u8)> = all
                 .into_iter()
                 .filter(|&(id, _, _)| id == pack_id)
                 .collect();
-            if !shard_entries.is_empty() {
-                if matched_any {
-                    println!();
-                    println!();
-                }
-                print_section_header(shard_type);
-                print_pack_info(&dir, pack_id, &shard_entries, shard_type);
-                matched_any = true;
+            if matched_any {
+                println!();
+                println!();
             }
+            print_section_header(shard_type);
+            print_pack_info(&dir, pack_id, &shard_entries, shard_type);
+            matched_any = true;
         }
         if !matched_any {
-            eprintln!("pack 0x{pack_id:016x}: not found");
+            eprintln!("pack {selector}: not found");
         }
         return Ok(());
     }
     let dir = selected_pool_dir(cli)?;
-    let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
+    let all = glob_pack_files(&dir)?;
+    let ids: Vec<PackId> = all.iter().map(|&(id, _, _)| id).collect();
+    let pack_id = selector.resolve(ids.iter())?;
+    let shard_entries: Vec<(PackId, u64, u8)> = all
         .into_iter()
         .filter(|&(id, _, _)| id == pack_id)
         .collect();
     if shard_entries.is_empty() {
-        eprintln!("pack 0x{pack_id:016x}: not found");
+        eprintln!("pack {selector}: not found");
         return Ok(());
     }
     print_pack_info(&dir, pack_id, &shard_entries, cli.require_shard_type()?);
@@ -5179,7 +5195,7 @@ fn print_collection_info(
     len: usize,
     mem: usize,
     capacity: u32,
-    shards: &[u64],
+    shards: &[PackId],
     deep: bool,
 ) {
     let hex = format_id(collection_id);
@@ -5213,7 +5229,7 @@ fn print_collection_info(
                         pack_bytes.sort_unstable_by_key(|(pack_id, _)| **pack_id);
                         println!("    per pack:");
                         for (pack_id, bytes) in pack_bytes {
-                            println!("      0x{pack_id:016x}: {}", fmt_bytes(*bytes));
+                            println!("      {}: {}", pack_id.filename_stem(), fmt_bytes(*bytes));
                         }
                     }
                 }
@@ -5975,40 +5991,115 @@ fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
     }
 }
 
-fn print_collection_shards(shards: &[u64]) {
+fn print_collection_shards(shards: &[PackId]) {
     match shards {
-        [shard] => println!("  {:<12} 0x{shard:016x}", "pack:"),
+        [shard] => println!("  {:<12} {shard}", "pack:"),
         [] => {}
         _ => println!(
             "  {:<12} {}",
             "packs:",
             shards
                 .iter()
-                .map(|id| format!("0x{id:016x}"))
+                .map(PackId::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-/// Parse an operator-facing pack identifier. Slots are deliberately not
-/// accepted here: they are recycled implementation details, while a pack ID
-/// is the permanent identity printed by `mtxdb shards`.
-fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
-    let Some(hex) = selector.strip_prefix("0x") else {
-        bail!("invalid pack ID `{selector}`; use the lowercase 0x-prefixed ID shown by `mtxdb shards`");
-    };
-    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+/// An operator-facing pack identifier. Slots are deliberately not accepted
+/// here: they are recycled implementation details, while a pack address is the
+/// permanent identity printed by `mtxdb shards`. A selector is either the full
+/// 64-hex address or a 1–16 hex filename prefix; the prefix is resolved against
+/// a pool's discovered packs, where it must be unique.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PackSelector {
+    /// A full 256-bit address, matched exactly.
+    Exact(PackId),
+    /// A lowercase hex prefix of an address (typically the 16-hex filename stem).
+    Prefix(String),
+}
+
+impl PackSelector {
+    fn parse(selector: &str) -> anyhow::Result<Self> {
+        let Some(hex) = selector.strip_prefix("0x") else {
+            bail!(
+                "invalid pack ID `{selector}`; use the lowercase 0x-prefixed ID shown by \
+                 `mtxdb shards`"
+            );
+        };
+        if hex.is_empty()
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            bail!("invalid pack ID `{selector}`; expected lowercase hexadecimal digits after 0x");
+        }
+        if hex.len() == PACK_ID_HEX_LEN {
+            let id = PackId::from_hex(hex)
+                .ok_or_else(|| anyhow!("invalid pack ID `{selector}`; not a 256-bit address"))?;
+            return Ok(Self::Exact(id));
+        }
         if hex.len() == 32 {
             bail!(
                 "invalid pack ID `{selector}`; that's 32 hex digits, which looks like a \
-                 collection ID, not a pack ID — pack IDs are 1–16 hex digits, shown by \
-                 `mtxdb shards`"
+                 collection ID, not a pack ID — pack IDs are 1–16 hex digits (a filename \
+                 prefix) or 64 (the full address), shown by `mtxdb shards`"
             );
         }
-        bail!("invalid pack ID `{selector}`; expected 1–16 hexadecimal digits after 0x");
+        if hex.len() > PACK_FILENAME_PREFIX_HEX {
+            bail!(
+                "invalid pack ID `{selector}`; expected 1–{PACK_FILENAME_PREFIX_HEX} hex digits \
+                 (a filename prefix) or {PACK_ID_HEX_LEN} (the full address)"
+            );
+        }
+        Ok(Self::Prefix(hex.to_owned()))
     }
-    u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
+
+    /// Whether `id` matches this selector.
+    fn matches(&self, id: &PackId) -> bool {
+        match self {
+            Self::Exact(exact) => id == exact,
+            Self::Prefix(prefix) => id.has_hex_prefix(prefix),
+        }
+    }
+
+    /// Resolve to exactly one address among `candidates`, erroring on zero or
+    /// multiple matches (a short prefix must be unambiguous).
+    fn resolve<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = &'a PackId>,
+    ) -> anyhow::Result<PackId> {
+        let matches: Vec<PackId> = candidates
+            .into_iter()
+            .filter(|id| self.matches(id))
+            .copied()
+            .collect();
+        match matches.as_slice() {
+            [id] => Ok(*id),
+            [] => bail!("pack {self}: not found"),
+            _ => bail!("pack {self}: matches multiple packs; use a longer selector"),
+        }
+    }
+}
+
+impl std::fmt::Display for PackSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(id) => write!(f, "{id}"),
+            Self::Prefix(prefix) => write!(f, "0x{prefix}"),
+        }
+    }
+}
+
+/// Hex digits in a full [`PackId`] address.
+const PACK_ID_HEX_LEN: usize = mtxdb::packfile::PACK_ID_LEN * 2;
+/// Hex digits in the truncated filename prefix of a pack address.
+const PACK_FILENAME_PREFIX_HEX: usize = mtxdb::packfile::PACK_FILENAME_PREFIX_HEX;
+
+/// Parse an operator-facing pack identifier into a selector.
+fn parse_pack_id_selector(selector: &str) -> anyhow::Result<PackSelector> {
+    PackSelector::parse(selector)
 }
 
 /// Common options shared by `scan_pack` and `cmd_scan_collection`.
@@ -6113,7 +6204,7 @@ fn cmd_scan_coalesced(
             }
         }
         InfoTarget::Pack => {
-            let pack_id = parse_pack_id_selector(selector)?;
+            let selector = parse_pack_id_selector(selector)?;
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
                     continue;
@@ -6124,7 +6215,7 @@ fn cmd_scan_coalesced(
                         continue;
                     };
                     if let Ok(files) = glob_pack_files(&dir) {
-                        if files.iter().any(|&(id, _, _)| id == pack_id) {
+                        if files.iter().any(|&(id, _, _)| selector.matches(&id)) {
                             found_in_db = true;
                             break;
                         }
@@ -6251,7 +6342,7 @@ fn cmd_scan_single(
         }
         return cmd_scan_collection(cli, selector, &opts);
     }
-    let pack_id = parse_pack_id_selector(selector)?;
+    let selector = parse_pack_id_selector(selector)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
@@ -6260,11 +6351,15 @@ fn cmd_scan_single(
             let Ok(pool) = ShardPool::open_read_only(pool_dir) else {
                 continue;
             };
-            let shard = pool
-                .all_shards()
+            let shards = pool.all_shards();
+            let ids: Vec<PackId> = shards.iter().map(|(_, shard)| shard.pack_id).collect();
+            let Ok(pack_id) = selector.resolve(ids.iter()) else {
+                continue;
+            };
+            if let Some((_, shard)) = shards
                 .into_iter()
-                .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard));
-            if let Some(shard) = shard {
+                .find(|(_, shard)| shard.pack_id == pack_id)
+            {
                 if matched_any {
                     println!();
                     println!();
@@ -6275,18 +6370,21 @@ fn cmd_scan_single(
             }
         }
         if !matched_any {
-            eprintln!("pack 0x{pack_id:016x}: not found");
+            eprintln!("pack {selector}: not found");
         }
         return Ok(());
     }
     let shard_type = cli.require_shard_type()?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
-    let shard = pool
-        .all_shards()
+    let shards = pool.all_shards();
+    let ids: Vec<PackId> = shards.iter().map(|(_, shard)| shard.pack_id).collect();
+    let pack_id = selector.resolve(ids.iter())?;
+    let shard = shards
         .into_iter()
-        .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
-        .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
+        .find(|(_, shard)| shard.pack_id == pack_id)
+        .map(|(_, shard)| shard)
+        .with_context(|| format!("pack {selector} not found"))?;
     scan_pack(cli, &shard, pack_id, collection_filter, &opts, shard_type)
 }
 
@@ -6298,7 +6396,7 @@ fn cmd_scan_single(
 fn scan_pack(
     _cli: &Cli,
     shard: &std::sync::Arc<mtxdb::shard::Shard>,
-    pack_id: u64,
+    pack_id: PackId,
     collection_filter: Option<[u8; 16]>,
     opts: &ScanOptions,
     shard_type: ShardType,
@@ -6353,7 +6451,7 @@ fn scan_pack(
             out.write_all(&data.data)?;
             if opts.verbose {
                 eprintln!(
-                    "pack 0x{pack_id:016x}: raw frame @ {offset} ({} bytes, checksum verified)",
+                    "pack {pack_id}: raw frame @ {offset} ({} bytes, checksum verified)",
                     data.data.len()
                 );
             }
@@ -6366,13 +6464,13 @@ fn scan_pack(
     }
     if truncated {
         println!(
-            "pack 0x{pack_id:016x}: {} bytes, showing first {max_rows} matching records (at least {})",
+            "pack {pack_id}: {} bytes, showing first {max_rows} matching records (at least {})",
             std::fs::metadata(path)?.len(),
             matched_records,
         );
     } else {
         println!(
-            "pack 0x{pack_id:016x}: {} bytes, {} records",
+            "pack {pack_id}: {} bytes, {} records",
             std::fs::metadata(path)?.len(),
             matched_records,
         );
@@ -6786,7 +6884,7 @@ fn print_collection_record(
     println!(
         "{}",
         scan_table_row(
-            &format!("0x{:016x}", shard.pack_id),
+            &shard.pack_id.filename_stem(),
             &format_id(&record_id),
             offset,
             payload.as_deref(),
@@ -7412,28 +7510,26 @@ fn export_lines(
     collection_id: &[u8; 16],
     format: ExportFormat,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut shards = pool.all_shards();
-    shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
+    let shards = pool.all_shards();
 
-    // Enumerate the collection's frames in physical order. `seen` fixes the
-    // output order at first sight; `winners` records the highest-pack-id frame
-    // for each node id (latest offset within a pack wins on ties). Since open
-    // slots shards in ascending pack-id order and the index overwrites on
-    // duplicate hashes, this reproduces the live index's winner.
+    // Enumerate the collection's node ids in physical scan order; `seen` fixes
+    // the output order at first sight. The winning frame for each id is not
+    // chosen here: pack addresses are random, so ordering by address would not
+    // reproduce the live index. The envelope path asks the index for the live
+    // location instead (see `get_location`), so it always exports the same
+    // frame that `get` would return.
     let mut seen = HashSet::new();
     let mut ordered_ids = Vec::new();
-    let mut winners: HashMap<NodeId, (u64, u64)> = HashMap::new();
-    let mut pack_paths: HashMap<u64, PathBuf> = HashMap::new();
+    let mut pack_paths: HashMap<PackId, PathBuf> = HashMap::new();
     for (_, shard) in &shards {
         pack_paths.insert(shard.pack_id, shard.path.clone());
-        for_each_frame(&shard.path, |offset, frame| {
+        for_each_frame(&shard.path, |_offset, frame| {
             if frame.collection_id != *collection_id {
                 return Ok(());
             }
             if seen.insert(frame.hash) {
                 ordered_ids.push(frame.hash);
             }
-            winners.insert(frame.hash, (shard.pack_id, offset));
             Ok(())
         })?;
     }
@@ -7441,7 +7537,7 @@ fn export_lines(
     // Keep one open handle per pack for the whole pass: envelope export reads
     // the winning frame at its offset, and reopening each pack per record would
     // turn a large export into an open/close storm.
-    let mut readers: HashMap<u64, BufReader<fs::File>> = HashMap::new();
+    let mut readers: HashMap<PackId, BufReader<fs::File>> = HashMap::new();
 
     let mut lines = Vec::with_capacity(ordered_ids.len());
     for node_id in ordered_ids {
@@ -7455,8 +7551,9 @@ fn export_lines(
                 // Read the winning frame directly so the payload and the frame
                 // metadata in one envelope always describe the same frame,
                 // rather than mixing an index-resolved payload with a
-                // separately scanned metadata copy.
-                let Some(&(pack_id, offset)) = winners.get(&node_id) else {
+                // separately scanned metadata copy. The winning location comes
+                // from the live index, matching what `get` returns.
+                let Some((pack_id, offset)) = store.get_location(collection_id, &node_id)? else {
                     continue;
                 };
                 let Some(path) = pack_paths.get(&pack_id) else {
@@ -7482,8 +7579,8 @@ fn export_lines(
 /// cached handle (opened on first use) so a per-record read is a seek, not an
 /// open/close pair.
 fn read_frame_at(
-    readers: &mut HashMap<u64, BufReader<fs::File>>,
-    pack_id: u64,
+    readers: &mut HashMap<PackId, BufReader<fs::File>>,
+    pack_id: PackId,
     path: &Path,
     offset: u64,
 ) -> anyhow::Result<mtxdb::packfile::Record> {
@@ -7684,34 +7781,40 @@ fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
             pack,
             collection,
             out,
-            dest_pack_id,
-        } => cmd_packs_extract(cli, pack, collection, out, dest_pack_id.as_deref()),
+        } => cmd_packs_extract(cli, pack, collection, out),
     }
 }
 
-/// Resolve a numeric pack ID to its shard pool type and physical file path.
-/// Refuses to resolve if the pack ID is ambiguous across multiple pools unless
-/// `-t` narrows the search.
-fn resolve_pack_file(cli: &Cli, pack_id: u64) -> anyhow::Result<(ShardType, PathBuf)> {
+/// Resolve a pack selector to its shard pool type, physical file path, and
+/// address. Refuses to resolve if the selector is ambiguous across multiple
+/// pools unless `-t` narrows the search.
+fn resolve_pack_file(
+    cli: &Cli,
+    selector: &PackSelector,
+) -> anyhow::Result<(ShardType, PathBuf, PackId)> {
     let layout = open_layout(cli)?;
-    let mut matches: Vec<(ShardType, PathBuf)> = Vec::new();
+    let mut matches: Vec<(ShardType, PathBuf, PackId)> = Vec::new();
     for shard_type in cli.shard_types() {
         let dir = pool_dir(&layout, shard_type)?;
         if !dir.is_dir() {
             continue;
         }
-        let path = dir.join(format!("pack_{pack_id:016x}.pack"));
-        if path.is_file() {
-            matches.push((shard_type, path));
+        let Ok(packs) = glob_pack_files(&dir) else {
+            continue;
+        };
+        for (pack_id, _, _) in packs {
+            if selector.matches(&pack_id) {
+                matches.push((shard_type, dir.join(pack_id.filename()), pack_id));
+            }
         }
     }
     match matches.as_slice() {
-        [(shard_type, path)] => Ok((*shard_type, path.clone())),
-        [] => bail!("pack 0x{pack_id:016x}: not found"),
+        [(shard_type, path, pack_id)] => Ok((*shard_type, path.clone(), *pack_id)),
+        [] => bail!("pack {selector}: not found"),
         _ => {
-            let pools: Vec<&str> = matches.iter().map(|(kind, _)| kind.as_str()).collect();
+            let pools: Vec<&str> = matches.iter().map(|(kind, _, _)| kind.as_str()).collect();
             bail!(
-                "pack 0x{pack_id:016x} exists in multiple pools ({}); pass -t <type> to disambiguate — pack IDs are pool-local",
+                "pack {selector} is ambiguous (matches in {}); pass -t <type> or a longer selector",
                 pools.join(", ")
             );
         }
@@ -7730,14 +7833,14 @@ fn cmd_packs_dump(
     out: Option<&Path>,
 ) -> anyhow::Result<()> {
     cli.require_single_dir("packs dump")?;
-    let pack_id = parse_pack_id_selector(pack_selector)?;
+    let selector = parse_pack_id_selector(pack_selector)?;
     let collection_filter = collection_selector
         .map(parse_collection_selector)
         .transpose()?;
 
-    // `pack_id` is pool-local, so the same numeric id can exist in more than
-    // one pool. Refuse to merge two different packs into one output stream.
-    let (shard_type, path) = resolve_pack_file(cli, pack_id)?;
+    // Refuse to merge two different packs (e.g. a short prefix matching in more
+    // than one pool) into one output stream.
+    let (shard_type, path, pack_id) = resolve_pack_file(cli, &selector)?;
 
     let stdout = io::stdout();
     let mut writer: Box<dyn Write> = match out {
@@ -7755,19 +7858,19 @@ fn cmd_packs_dump(
             continue;
         }
         writer
-            .write_all(pack_dump_line(shard_type.as_str(), pack_id, offset, &record).as_bytes())?;
+            .write_all(pack_dump_line(shard_type.as_str(), &pack_id, offset, &record).as_bytes())?;
         writer.write_all(b"\n")?;
         written = written.saturating_add(1);
     }
     writer.flush()?;
     if scanner.torn_tail() {
         eprintln!(
-            "warning: pack 0x{pack_id:016x} ends in a torn frame; its tail was not dumped \
+            "warning: pack {pack_id} ends in a torn frame; its tail was not dumped \
              (a concurrent writer can cause this)"
         );
     }
     eprintln!(
-        "dumped {written} frames from pack 0x{pack_id:016x} ({} pool)",
+        "dumped {written} frames from pack {pack_id} ({} pool)",
         shard_type.as_str()
     );
     Ok(())
@@ -7780,12 +7883,11 @@ fn cmd_packs_extract(
     pack_selector: &str,
     collection_selector: &str,
     out: &Path,
-    dest_pack_id_selector: Option<&str>,
 ) -> anyhow::Result<()> {
     cli.require_single_dir("packs extract")?;
-    let pack_id = parse_pack_id_selector(pack_selector)?;
+    let selector = parse_pack_id_selector(pack_selector)?;
     let collection_id = parse_collection_selector(collection_selector)?;
-    let (shard_type, source_path) = resolve_pack_file(cli, pack_id)?;
+    let (shard_type, source_path, pack_id) = resolve_pack_file(cli, &selector)?;
 
     // Guard against accidental source file truncation when --out points to the same file.
     if let (Ok(src_canon), Ok(dst_canon)) = (source_path.canonicalize(), out.canonicalize()) {
@@ -7809,13 +7911,16 @@ fn cmd_packs_extract(
         }
     }
 
-    let dest_pack_id = resolve_dest_pack_id(out, dest_pack_id_selector)?;
+    // The extracted pack is a brand-new globally unique pack, so it gets a
+    // fresh random address rather than inheriting the source's (or one derived
+    // from the output filename).
+    let dest_pack_id = PackId::random();
 
     let stats = mtxdb::packfile::extract_packfile_collection(
         &source_path,
         out,
         &collection_id,
-        dest_pack_id,
+        &dest_pack_id,
     )
     .with_context(|| {
         format!(
@@ -7828,53 +7933,32 @@ fn cmd_packs_extract(
 
     if stats.torn_tail {
         eprintln!(
-            "warning: pack 0x{pack_id:016x} ends in a torn frame; its tail was not extracted \
+            "warning: pack {pack_id} ends in a torn frame; its tail was not extracted \
              (a concurrent writer can cause this)"
         );
     }
     eprintln!(
-        "extracted {} frames ({} bytes) from pack 0x{pack_id:016x} ({} pool) into {}",
+        "extracted {} frames ({} bytes) from pack {pack_id} ({} pool) into {} as new pack {}",
         stats.frames_extracted,
         stats.frame_bytes_written,
         shard_type.as_str(),
         out.display(),
+        dest_pack_id,
     );
     Ok(())
-}
-
-/// Determine the pack identity to stamp in the extracted packfile's header.
-/// If an explicit selector is given, parses it; otherwise if the output file
-/// is named `pack_{16 hex digits}.pack`, parses that ID to preserve pool naming
-/// invariants; otherwise defaults to 0.
-fn resolve_dest_pack_id(dest_path: &Path, override_id: Option<&str>) -> anyhow::Result<u64> {
-    if let Some(selector) = override_id {
-        return parse_pack_id_selector(selector);
-    }
-    if let Some(stem) = dest_path.file_stem().and_then(|s| s.to_str()) {
-        if dest_path.extension().is_some_and(|ext| ext == "pack") {
-            if let Some(hex) = stem.strip_prefix("pack_") {
-                if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    if let Ok(id) = u64::from_str_radix(hex, 16) {
-                        return Ok(id);
-                    }
-                }
-            }
-        }
-    }
-    Ok(0)
 }
 
 /// Render one `mtxdb.pack.dump/v1` line for a pack frame.
 fn pack_dump_line(
     pool: &str,
-    pack_id: u64,
+    pack_id: &PackId,
     offset: u64,
     record: &mtxdb::packfile::Record,
 ) -> String {
     let mut fields: Vec<(&'static str, String)> = vec![
         ("schema", json_string(PACK_DUMP_SCHEMA)),
         ("pool", json_string(pool)),
-        ("pack_id", json_string(&format!("0x{pack_id:016x}"))),
+        ("pack_id", json_string(&pack_id.to_string())),
         ("offset", offset.to_string()),
         (
             "collection_id",
@@ -9934,23 +10018,23 @@ fn cmd_repack(
 /// what was shown.
 struct RepackPreview {
     collections: Vec<[u8; 16]>,
-    pack_ids: Vec<u64>,
+    pack_ids: Vec<PackId>,
 }
 
 enum RepackTarget {
     Collection([u8; 16]),
-    Packs(Vec<u64>),
+    Packs(Vec<PackSelector>),
     All,
 }
 
-/// Parse one or more permanent pack IDs. Numeric slots and ranges are not
+/// Parse one or more permanent pack selectors. Numeric slots and ranges are not
 /// accepted because slots are recycled implementation details.
-fn parse_pack_selectors(selectors: &[String]) -> anyhow::Result<Vec<u64>> {
-    let mut pack_ids = std::collections::BTreeSet::new();
+fn parse_pack_selectors(selectors: &[String]) -> anyhow::Result<Vec<PackSelector>> {
+    let mut selectors_out = std::collections::BTreeSet::new();
     for selector in selectors {
-        pack_ids.insert(parse_pack_id_selector(selector)?);
+        selectors_out.insert(parse_pack_id_selector(selector)?);
     }
-    Ok(pack_ids.into_iter().collect())
+    Ok(selectors_out.into_iter().collect())
 }
 
 fn resolve_repack_target(
@@ -9981,17 +10065,19 @@ fn resolve_repack_target(
 
 fn resolve_repack_packs(
     store: &PackfileStorage,
-    pack_ids: &[u64],
+    selectors: &[PackSelector],
 ) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
-    let slots = pack_ids
+    let summaries = store.shard_summaries();
+    let ids: Vec<PackId> = summaries.iter().map(|summary| summary.pack_id).collect();
+    let slots = selectors
         .iter()
-        .map(|&pack_id| {
-            store
-                .shard_summaries()
-                .into_iter()
+        .map(|selector| {
+            let pack_id = selector.resolve(ids.iter())?;
+            summaries
+                .iter()
                 .find(|summary| summary.pack_id == pack_id)
                 .map(|summary| summary.slot)
-                .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))
+                .with_context(|| format!("pack {selector} not found"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     resolve_repack_slots(store, &slots)
@@ -10035,13 +10121,13 @@ fn repack_preview(
     let (collections, shards) = resolve_repack_target(&preview_store, target)?;
     if collections.is_empty() {
         match target {
-            RepackTarget::Packs(pack_ids) => {
-                let pack_ids = pack_ids
+            RepackTarget::Packs(selectors) => {
+                let selectors = selectors
                     .iter()
-                    .map(|id| format!("0x{id:016x}"))
+                    .map(PackSelector::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!("no collections reference selected packs: {pack_ids}");
+                println!("no collections reference selected packs: {selectors}");
             }
             RepackTarget::All => println!("no collections found in active packs"),
             RepackTarget::Collection(_) => {}
@@ -10070,7 +10156,7 @@ fn repack_preview(
         total_dropped_bytes = total_dropped_bytes.saturating_add(plan.dropped_bytes);
     }
 
-    let pack_summaries: std::collections::HashMap<u16, (u64, u64)> = preview_store
+    let pack_summaries: std::collections::HashMap<u16, (PackId, u64)> = preview_store
         .shard_summaries()
         .into_iter()
         .map(|summary| (summary.slot, (summary.pack_id, summary.file_bytes)))
@@ -10084,7 +10170,7 @@ fn repack_preview(
     });
     let pack_labels = pack_ids
         .iter()
-        .map(|id| format!("0x{id:016x}"))
+        .map(PackId::filename_stem)
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -10095,10 +10181,13 @@ fn repack_preview(
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
     );
-    let label_width = "0x0000000000000000".len();
+    let label_width = "pack_0000000000000000".len();
     for slot in &shards {
-        let (pack_id, bytes) = pack_summaries.get(slot).copied().unwrap_or((0, 0));
-        println!("  0x{pack_id:016x}: {:>9}", fmt_bytes(bytes));
+        let (pack_id, bytes) = pack_summaries
+            .get(slot)
+            .copied()
+            .unwrap_or((PackId([0; mtxdb::packfile::PACK_ID_LEN]), 0));
+        println!("  {}: {:>9}", pack_id.filename_stem(), fmt_bytes(bytes));
     }
     println!(
         "  {:>label_width$}: {:>9}",
@@ -10136,7 +10225,7 @@ fn repack_collections(
             .find(|summary| summary.slot == slot)
             .map_or_else(
                 || "retired pack".to_owned(),
-                |summary| format!("0x{:016x}", summary.pack_id),
+                |summary| summary.pack_id.filename_stem(),
             )
     };
     let results = if topo {
@@ -10517,6 +10606,7 @@ mod tests {
     use crate::{Cli, Commands};
     use bytes::Bytes;
     use mtxdb::packfile::storage::PackfileStorage;
+    use mtxdb::packfile::PackId;
     use mtxdb::shard::ShardPool;
     use mtxdb::storage::{NodeData, StorageEngine};
     use mtxdb::template::{
@@ -11037,7 +11127,15 @@ mod tests {
 
     #[test]
     fn only_the_canonical_lowercase_prefix_is_accepted() {
-        assert_eq!(super::parse_pack_id_selector("0x1f").unwrap(), 0x1f);
+        // A short 0x-prefixed prefix is a filename-prefix selector.
+        let short = super::parse_pack_id_selector("0x1f").unwrap();
+        assert!(short.matches(&PackId([0x1f; 32])));
+        assert!(!short.matches(&PackId([0x20; 32])));
+        // A full 64-hex address is an exact selector.
+        let full = "ab".repeat(32);
+        assert!(super::parse_pack_id_selector(&format!("0x{full}")).is_ok());
+        assert!(super::parse_pack_id_selector(&format!("0x{}", full.to_uppercase())).is_err());
+
         let id = format_id(&[0xABu8; 16]);
         let upper = id.replacen("0x", "0X", 1);
         assert!(super::parse_pack_id_selector("0X1f").is_err());
@@ -11183,7 +11281,7 @@ mod tests {
             },
         };
         let out_file = dir.join("dump.jsonl");
-        super::cmd_packs_dump(&cli, &format!("0x{pack_id:016x}"), None, Some(&out_file)).unwrap();
+        super::cmd_packs_dump(&cli, &pack_id.to_string(), None, Some(&out_file)).unwrap();
 
         let content = std::fs::read_to_string(&out_file).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -11194,7 +11292,7 @@ mod tests {
             Some("mtxdb.pack.dump/v1")
         );
         assert_eq!(json_str(&value, "pool").as_deref(), Some("mtpl-event"));
-        let expected_pack = format!("0x{pack_id:016x}");
+        let expected_pack = pack_id.to_string();
         assert_eq!(
             json_str(&value, "pack_id").as_deref(),
             Some(expected_pack.as_str())
@@ -11218,20 +11316,19 @@ mod tests {
     }
 
     #[test]
-    fn packs_dump_rejects_a_pack_id_present_in_multiple_pools() {
+    fn packs_dump_rejects_a_pack_selector_present_in_multiple_pools() {
         let dir = unique_temp_dir();
         let layout = DatabaseLayout::open(dir.clone()).unwrap();
-        for shard_type in [ShardType::EventDag, ShardType::State] {
-            let store =
-                PackfileStorage::open(layout.pool_dir_read_only(shard_type).unwrap()).unwrap();
-            store
-                .put(
-                    &[0x11; 16],
-                    &[0x22; 16],
-                    &NodeData::new(Bytes::from_static(b"shared-id")),
-                )
-                .unwrap();
-            store.sync().unwrap();
+        // Deterministic addresses sharing the leading hex digits `ab` in two
+        // pools: a `0xab` prefix selector is ambiguous across them.
+        for (shard_type, tail) in [(ShardType::EventDag, 1u8), (ShardType::State, 2u8)] {
+            let pool = layout.pool_dir_read_only(shard_type).unwrap();
+            let mut bytes = [0u8; mtxdb::packfile::PACK_ID_LEN];
+            bytes[0] = 0xAB;
+            bytes[31] = tail;
+            let pack_id = PackId(bytes);
+            let mut file = std::fs::File::create(pool.join(pack_id.filename())).unwrap();
+            mtxdb::packfile::write_header(&mut file, &pack_id).unwrap();
         }
         let cli = Cli {
             dirs: vec![dir.clone()],
@@ -11242,8 +11339,8 @@ mod tests {
                 action: super::PacksAction::List { all: true },
             },
         };
-        let error = super::cmd_packs_dump(&cli, "0x0", None, None).unwrap_err();
-        assert!(error.to_string().contains("multiple pools"), "{error}");
+        let error = super::cmd_packs_dump(&cli, "0xab", None, None).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -11323,14 +11420,7 @@ mod tests {
         };
 
         let out_pack = dir.join("room1_extracted.pack");
-        super::cmd_packs_extract(
-            &cli,
-            &format!("0x{pack_id:016x}"),
-            room1_selector,
-            &out_pack,
-            Some("0xabc"),
-        )
-        .unwrap();
+        super::cmd_packs_extract(&cli, &pack_id.to_string(), room1_selector, &out_pack).unwrap();
 
         assert!(out_pack.is_file());
 
@@ -11348,17 +11438,22 @@ mod tests {
         assert!(scanner.next().is_none());
         assert!(!scanner.torn_tail());
 
-        // Validate header pack_id stamped in dest pack
+        // Validate header address stamped in dest pack: a fresh identity,
+        // distinct from the source pack's.
         let mut file = std::fs::File::open(&out_pack).unwrap();
         let header = mtxdb::packfile::read_header(&mut file).unwrap().unwrap();
-        assert_eq!(header.pack_id, 0xabc);
+        assert_ne!(header.pack_id, pack_id);
+        assert_eq!(
+            header.pack_id.as_hex().len(),
+            mtxdb::packfile::PACK_ID_LEN * 2
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A temp database with one record synced into an `EventDag` pack, and a
     /// `packs` CLI over it. Returns the directory, the CLI and the pack's id.
-    fn one_record_pack_fixture() -> (PathBuf, Cli, u64) {
+    fn one_record_pack_fixture() -> (PathBuf, Cli, PackId) {
         let dir = unique_temp_dir();
         let layout = DatabaseLayout::open(dir.clone()).unwrap();
         let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
@@ -11394,41 +11489,19 @@ mod tests {
             .unwrap()
             .pool_dir_read_only(ShardType::EventDag)
             .unwrap()
-            .join(format!("pack_{pack_id:016x}.pack"));
+            .join(pack_id.filename());
 
         let error = super::cmd_packs_extract(
             &cli,
-            &format!("0x{pack_id:016x}"),
+            &pack_id.to_string(),
             "0x11111111111111111111111111111111",
             &source_path,
-            None,
         )
         .unwrap_err();
         assert!(
             error.to_string().contains("cannot be the same file"),
             "{error}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn packs_extract_derives_pack_id_from_filename_when_unspecified() {
-        let (dir, cli, pack_id) = one_record_pack_fixture();
-
-        let out_pack = dir.join("pack_000000000000000f.pack");
-        super::cmd_packs_extract(
-            &cli,
-            &format!("0x{pack_id:016x}"),
-            "0x11111111111111111111111111111111",
-            &out_pack,
-            None,
-        )
-        .unwrap();
-
-        let mut file = std::fs::File::open(&out_pack).unwrap();
-        let header = mtxdb::packfile::read_header(&mut file).unwrap().unwrap();
-        assert_eq!(header.pack_id, 0x0f);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -12118,7 +12191,7 @@ mod tests {
             return total;
         }
         for (pack_id, _, _) in glob_pack_files(pool_dir).unwrap() {
-            let pack = pool_dir.join(format!("pack_{pack_id:016x}.pack"));
+            let pack = pool_dir.join(pack_id.filename());
             let file = std::fs::File::open(pack).unwrap();
             let mut reader = std::io::BufReader::new(file);
             if mtxdb::packfile::read_header(&mut reader).unwrap().is_none() {
@@ -12258,7 +12331,6 @@ mod tests {
 
     #[test]
     fn pack_selectors_accept_only_pack_ids_and_deduplicate() {
-        assert_eq!(parse_pack_id_selector("0x3").unwrap(), 3);
         assert!(
             parse_pack_id_selector("3").is_err(),
             "decimal slots are not pack IDs"
@@ -12267,11 +12339,18 @@ mod tests {
             parse_pack_id_selector("0x3-5").is_err(),
             "ranges are not pack IDs"
         );
-        assert_eq!(
-            parse_pack_selectors(&["0x3".to_owned(), "0x0002".to_owned(), "0x3".to_owned()])
-                .unwrap(),
-            vec![2, 3]
-        );
+        // 32 hex digits look like a collection, not a pack.
+        assert!(parse_pack_id_selector(&format!("0x{}", "a".repeat(32))).is_err());
+        // A short prefix and a full 64-hex address are both accepted, and
+        // exact duplicates are collapsed.
+        let full = "ab".repeat(32);
+        let selectors = parse_pack_selectors(&[
+            format!("0x{full}"),
+            "0x0002".to_owned(),
+            format!("0x{full}"),
+        ])
+        .unwrap();
+        assert_eq!(selectors.len(), 2);
     }
 
     #[test]
@@ -14134,10 +14213,9 @@ mod tests {
         let r2 = out_store.get(&col, &node2).unwrap();
         assert!(r2.is_some());
 
-        // Target store must have exactly 1 pack (linearized canonical pack 0)
+        // Target store must have exactly 1 pack (a freshly materialized one)
         let summaries = out_store.shard_summaries();
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].pack_id, 0);
 
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();

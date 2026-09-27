@@ -16,12 +16,18 @@ pub const MAGIC: [u8; 4] = *b"MTDB";
 /// Packfile format version byte following `MAGIC` in the header (see
 /// [`write_header`]/[`read_header`]).
 ///
-/// Version 4: replaces the v3 `shard_id`/`epoch` header fields with a
-/// single `pack_id: u64` — the pool-local monotonic identity for the
-/// shard. Adds `features: u32`. Filename changes from
-/// `shard_{slot:04x}_{epoch:016x}.pack` to `shard_{pack_id:016x}.pack`.
-/// Hard cutover: v3 files are rejected at open.
-pub const VERSION: u8 = 0x04;
+/// Version 5: replaces the pool-local monotonic `pack_id: u64` identity with a
+/// globally unique, cryptographically random 256-bit [`PackId`]. The
+/// address is unique across pools, databases, and hosts, so an extracted or
+/// imported pack can be adopted verbatim (no rename, no header rewrite) and
+/// referenced globally. Filename changes from `pack_{pack_id:016x}.pack` to
+/// `pack_{short_address}.pack`. Hard cutover: earlier versions are rejected.
+///
+/// There is no persisted numeric id, runtime slot, or creation sequence in the
+/// header: identity is the address, ordering is the caller's concern (by
+/// timestamp/offset or an explicit conflict policy), and the runtime
+/// slot/index is entirely internal to the storage implementation.
+pub const VERSION: u8 = 0x05;
 
 /// Total reserved header size in bytes: every shard file's first record
 /// starts at exactly this offset. One 4KiB page — ample collection for the
@@ -29,27 +35,251 @@ pub const VERSION: u8 = 0x04;
 /// reservation (see [`write_header`] for the field layout).
 pub const HEADER_LEN: usize = 4096;
 
+/// Byte length of a [`PackId`].
+pub const PACK_ID_LEN: usize = 32;
+
+/// Filenames carry a shortened address prefix by default (64 bits), extended
+/// with additional `_<chunk>` groups only to break a prefix collision within a
+/// pool directory. The full address is always the identity; the filename is a
+/// lossy, disambiguated lookup key.
+pub const PACK_FILENAME_PREFIX_HEX: usize = 16;
+
+/// A pack's globally unique, immutable identity: 32 cryptographically random
+/// bytes assigned at creation.
+///
+/// Unlike the old pool-local monotonic counter, this address is unique across
+/// pools, databases, and hosts, so an extracted or imported pack keeps the same
+/// identity wherever it lands. It is written once at pack creation and never
+/// changes while the pack grows.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PackId(pub [u8; PACK_ID_LEN]);
+
+impl PackId {
+    /// Generate a fresh random address from OS entropy.
+    ///
+    /// Uses `std`'s `RandomState` (OS-seeded) mixed with the process's
+    /// monotonic clock and an atomic counter, then expanded to 256 bits through
+    /// BLAKE3. There is no security adversary selecting pack identities here;
+    /// the requirement is collision-freedom across pools/hosts, which this
+    /// satisfies without adding a `getrandom` dependency.
+    #[must_use]
+    pub fn random() -> Self {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let mut hasher = blake3::Hasher::new();
+        // Two independently-seeded RandomState draws (each OS-seeded) plus a
+        // process-local counter make accidental repetition effectively
+        // impossible even across rapid creation bursts.
+        let seed_a = RandomState::new().build_hasher().finish();
+        let seed_b = RandomState::new().build_hasher().finish();
+        hasher.update(&seed_a.to_le_bytes());
+        hasher.update(&seed_b.to_le_bytes());
+        hasher.update(&counter.to_le_bytes());
+        if let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(&elapsed.as_nanos().to_le_bytes());
+        }
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// The raw 32 address bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; PACK_ID_LEN] {
+        &self.0
+    }
+
+    /// The full 64 lowercase hex digits of the address.
+    #[must_use]
+    pub fn as_hex(&self) -> String {
+        hex_lower(&self.0)
+    }
+
+    /// The canonical filename stem for an un-disambiguated pack:
+    /// `pack_<first 16 hex digits>`. See [`PackId::filename_for`] for the
+    /// full-width form used when a truncated prefix would collide.
+    #[must_use]
+    pub fn filename_stem(&self) -> String {
+        format!("pack_{}", &hex_lower(&self.0)[..PACK_FILENAME_PREFIX_HEX])
+    }
+
+    /// The canonical filename (`stem` + `.pack`) for an un-disambiguated pack.
+    #[must_use]
+    pub fn filename(&self) -> String {
+        format!("{}.pack", self.filename_stem())
+    }
+
+    /// The filename to use when creating this pack among `siblings`.
+    ///
+    /// Normally the compact `pack_<16 hex digits>.pack`. If that 16-hex prefix
+    /// collides with an existing sibling, fall back to the full 64-hex name so
+    /// the choice is a single deterministic widening at creation time. This is
+    /// only consulted when *creating* a pack: an existing file's name is fixed
+    /// on disk and never recomputed, so adding a later sibling can never rename
+    /// an already-written pack.
+    #[must_use]
+    pub fn filename_for(&self, siblings: &[PackId]) -> String {
+        let hex = self.as_hex();
+        let prefix = &hex[..PACK_FILENAME_PREFIX_HEX];
+        let collides = siblings
+            .iter()
+            .any(|other| other != self && other.as_hex()[..PACK_FILENAME_PREFIX_HEX] == *prefix);
+        if collides {
+            format!("pack_{hex}.pack")
+        } else {
+            self.filename()
+        }
+    }
+
+    /// Parse an address from a filename stem (the part before `.pack`). Accepts
+    /// the compact `pack_<16hex>` form, the underscore-joined
+    /// `pack_<16hex>[_<16hex>...]` form, and the full `pack_<64hex>` collision
+    /// form, and requires at least [`PACK_FILENAME_PREFIX_HEX`] lowercase hex
+    /// digits.
+    ///
+    /// Returns the parsed prefix bytes and how many hex digits were present, so
+    /// callers can match against a full address's prefix.
+    ///
+    /// # Errors
+    /// Returns `None` if the stem is not `pack_` followed by groups of exactly
+    /// 16 lowercase hex digits (underscore-separated).
+    #[must_use]
+    pub fn parse_filename_prefix(stem: &str) -> Option<(Vec<u8>, usize)> {
+        let rest = stem.strip_prefix("pack_")?;
+        let mut digits = String::new();
+        for (index, group) in rest.split('_').enumerate() {
+            // The first group is normally the 16-hex truncated prefix, but the
+            // collision fallback emitted by [`PackId::filename_for`] is a single
+            // full 64-hex address. Later groups are always 16-hex continuation
+            // chunks of an underscore-joined prefix.
+            let valid_len = group.len() == PACK_FILENAME_PREFIX_HEX
+                || (index == 0 && group.len() == PACK_ID_LEN * 2);
+            if !valid_len {
+                return None;
+            }
+            if !group
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return None;
+            }
+            digits.push_str(group);
+        }
+        if digits.is_empty() {
+            return None;
+        }
+        let byte_len = digits.len() / 2;
+        let mut bytes = vec![0u8; byte_len];
+        for (index, chunk) in digits.as_bytes().chunks_exact(2).enumerate() {
+            let hi = hex_value(chunk[0])?;
+            let lo = hex_value(chunk[1])?;
+            bytes[index] = (hi << 4) | lo;
+        }
+        Some((bytes, digits.len()))
+    }
+
+    /// Parse a full address from 64 lowercase hex digits (as stored in the
+    /// header, and as accepted by `--json`/`--long` displays and exact
+    /// selectors).
+    ///
+    /// # Errors
+    /// Returns `None` for the wrong length or any non-lowercase-hex character.
+    #[must_use]
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != PACK_ID_LEN * 2 {
+            return None;
+        }
+        let mut bytes = [0u8; PACK_ID_LEN];
+        for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let hi = hex_value(chunk[0])?;
+            let lo = hex_value(chunk[1])?;
+            bytes[index] = (hi << 4) | lo;
+        }
+        Some(Self(bytes))
+    }
+
+    /// Whether this address's lowercase hex begins with the given lowercase
+    /// hex prefix.
+    #[must_use]
+    pub fn has_hex_prefix(&self, prefix: &str) -> bool {
+        hex_lower(&self.0).starts_with(prefix)
+    }
+}
+
+impl std::fmt::Debug for PackId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PackId(0x{})", hex_lower(&self.0))
+    }
+}
+
+impl std::fmt::Display for PackId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{}", hex_lower(&self.0))
+    }
+}
+
+/// Lowercase hex encoding without pulling in a formatter dependency.
+///
+/// Public so sibling modules (e.g. `shard`) can render address prefixes when
+/// validating filename agreement.
+#[must_use]
+pub fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+/// Decode one lowercase-hex nibble, rejecting uppercase and non-hex.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0' => Some(0),
+        b'1' => Some(1),
+        b'2' => Some(2),
+        b'3' => Some(3),
+        b'4' => Some(4),
+        b'5' => Some(5),
+        b'6' => Some(6),
+        b'7' => Some(7),
+        b'8' => Some(8),
+        b'9' => Some(9),
+        b'a' => Some(10),
+        b'b' => Some(11),
+        b'c' => Some(12),
+        b'd' => Some(13),
+        b'e' => Some(14),
+        b'f' => Some(15),
+        _ => None,
+    }
+}
+
 /// Byte layout within the reserved header, up to where the CRC starts.
 /// Everything from `CRC_COVERED_LEN` to `HEADER_LEN` is the CRC itself
 /// (4 bytes) followed by zero padding.
 const CRC_COVERED_LEN: usize = 4 // magic
     + 1 // version
     + 4 // header_len (u32)
-    + 8 // pack_id (u64)
+    + PACK_ID_LEN // pack_address
     + 8 // created_at (u64, unix seconds)
     + 4; // feature_flags (u32, reserved)
 
 /// A shard's immutable descriptor, parsed from its reserved header.
 ///
-/// Recording `pack_id` in the file itself (not just its filename) lets a
-/// reader detect a shard file that's been copied or renamed
-/// inconsistently — the two should always agree, and a mismatch means
-/// something outside mtxdb moved this file.
+/// Recording the [`PackId`] in the file itself (not just its filename)
+/// lets a reader detect a shard file that's been copied or renamed
+/// inconsistently — the two should always agree (by prefix), and a mismatch
+/// means something outside mtxdb moved this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardHeader {
-    /// Pool-local monotonic pack ID. The shard's permanent external identity.
-    pub pack_id: u64,
-    /// Unix-seconds creation timestamp.
+    /// The pack's globally unique, immutable identity.
+    pub pack_id: PackId,
+    /// Unix-seconds creation timestamp (telemetry only; never identity).
     pub created_at: u64,
 }
 
@@ -1146,7 +1376,7 @@ fn read_record_metadata_skip_payload_with_end(
 /// # Panics
 /// Never in practice: the only internal conversion (`HEADER_LEN` as
 /// `u32`) is a compile-time constant well within range.
-pub fn write_header(writer: &mut impl Write, pack_id: u64) -> io::Result<()> {
+pub fn write_header(writer: &mut impl Write, pack_id: &PackId) -> io::Result<()> {
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -1157,9 +1387,13 @@ pub fn write_header(writer: &mut impl Write, pack_id: u64) -> io::Result<()> {
     buf[4] = VERSION;
     let header_len = u32::try_from(HEADER_LEN).expect("HEADER_LEN fits in u32");
     buf[5..9].copy_from_slice(&header_len.to_le_bytes());
-    buf[9..17].copy_from_slice(&pack_id.to_le_bytes());
-    buf[17..25].copy_from_slice(&created_at.to_le_bytes());
-    // buf[25..29] (feature_flags) stays zero — reserved for future use.
+    let mut cursor: usize = 9;
+    buf[cursor..cursor.saturating_add(PACK_ID_LEN)].copy_from_slice(pack_id.as_bytes());
+    cursor = cursor.saturating_add(PACK_ID_LEN);
+    buf[cursor..cursor.saturating_add(8)].copy_from_slice(&created_at.to_le_bytes());
+    cursor = cursor.saturating_add(8);
+    // feature_flags (u32) follows; stays zero — reserved for future use.
+    let _ = cursor;
 
     let crc = crc32fast::hash(&buf[..CRC_COVERED_LEN]);
     buf[CRC_COVERED_LEN..CRC_COVERED_LEN.wrapping_add(4)].copy_from_slice(&crc.to_le_bytes());
@@ -1299,30 +1533,32 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
         ));
     }
 
-    let pack_id = u64::from_le_bytes(buf[9..17].try_into().unwrap());
-    let created_at = u64::from_le_bytes(buf[17..25].try_into().unwrap());
+    let mut cursor: usize = 9;
+    let mut pack_id = [0u8; PACK_ID_LEN];
+    pack_id.copy_from_slice(&buf[cursor..cursor.saturating_add(PACK_ID_LEN)]);
+    cursor = cursor.saturating_add(PACK_ID_LEN);
+    let created_at = u64::from_le_bytes(buf[cursor..cursor.saturating_add(8)].try_into().unwrap());
 
     Ok(Some(ShardHeader {
-        pack_id,
+        pack_id: PackId(pack_id),
         created_at,
     }))
 }
 
 /// Open or create a packfile, writing the header if it's new.
 ///
-/// `pack_id` is the caller's expectation for this file — derived from
-/// its filename. On creation it's written into the new header; on
-/// opening an existing file it's cross-checked against what the header
-/// actually says, so a shard file that's been copied or renamed
-/// inconsistently with its own recorded identity is caught here rather
-/// than silently trusted.
+/// `pack_id` is the caller's expectation for this file — derived from its
+/// filename. On creation it is written into the new header; on opening an
+/// existing file it is cross-checked against what the header actually says
+/// (they must match exactly on the full 256-bit id), so a shard file
+/// that's been copied or renamed inconsistently with its own recorded identity
+/// is caught here rather than silently trusted.
 ///
 /// # Errors
 /// Returns `io::Error` on open/write failure, `io::ErrorKind::InvalidData`
-/// if the existing header is invalid or its CRC fails, or
-/// `io::ErrorKind::InvalidData` if the header's recorded `pack_id`
-/// doesn't match what the filename says it should be.
-pub fn open_packfile(path: &Path, create: bool, pack_id: u64) -> io::Result<File> {
+/// if the existing header is invalid or its CRC fails, or if the header's
+/// recorded id doesn't match what the filename says it should be.
+pub fn open_packfile(path: &Path, create: bool, pack_id: &PackId) -> io::Result<File> {
     if create {
         let mut options = OpenOptions::new();
         options.read(true).create(true);
@@ -1347,15 +1583,16 @@ pub fn open_packfile(path: &Path, create: bool, pack_id: u64) -> io::Result<File
                     "invalid packfile header",
                 ));
             };
-            if header.pack_id != pack_id {
+            if header.pack_id != *pack_id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "shard file {} identifies itself as pack_id {:#018x} in its header, \
-                         but its filename says pack_id {pack_id:#018x} — \
+                        "shard file {} identifies itself as {} in its header, \
+                         but its filename says {} — \
                          copied or renamed inconsistently with its own history",
                         path.display(),
                         header.pack_id,
+                        pack_id,
                     ),
                 ));
             }
@@ -1372,15 +1609,16 @@ pub fn open_packfile(path: &Path, create: bool, pack_id: u64) -> io::Result<File
                 "invalid packfile header",
             ));
         };
-        if header.pack_id != pack_id {
+        if header.pack_id != *pack_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "shard file {} identifies itself as pack_id {:#018x} in its header, \
-                     but its filename says pack_id {pack_id:#018x} — \
+                    "shard file {} identifies itself as {} in its header, \
+                     but its filename says {} — \
                      copied or renamed inconsistently with its own history",
                     path.display(),
                     header.pack_id,
+                    pack_id,
                 ),
             ));
         }
@@ -1688,7 +1926,7 @@ pub fn extract_packfile_collection(
     source_path: &Path,
     dest_path: &Path,
     target_collection: &[u8; 16],
-    dest_pack_id: u64,
+    dest_pack_id: &PackId,
 ) -> io::Result<PackExtractStats> {
     let src_file = File::open(source_path)?;
     let mut reader = BufReader::with_capacity(RECOVERY_BUFFER_BYTES, src_file);
@@ -1923,6 +2161,15 @@ mod tests {
             data: Bytes::copy_from_slice(data),
             metadata: None,
         }
+    }
+
+    /// Deterministic [`PackId`] fixture: the integer's big-endian bytes in the
+    /// first 8 of 32, so its hex display leads with the integer (matching the
+    /// filenames used in these tests).
+    fn test_pack_id(n: u64) -> PackId {
+        let mut bytes = [0u8; PACK_ID_LEN];
+        bytes[..8].copy_from_slice(&n.to_be_bytes());
+        PackId(bytes)
     }
 
     #[test]
@@ -2352,12 +2599,12 @@ mod tests {
     #[test]
     fn test_header_roundtrip() {
         let mut buf = Vec::new();
-        write_header(&mut buf, 42).unwrap();
+        write_header(&mut buf, &test_pack_id(42)).unwrap();
         assert_eq!(buf.len(), HEADER_LEN);
 
         let mut cursor = Cursor::new(&buf);
         let header = read_header(&mut cursor).unwrap().expect("valid header");
-        assert_eq!(header.pack_id, 42);
+        assert_eq!(header.pack_id, test_pack_id(42));
         assert!(header.created_at > 0);
     }
 
@@ -2379,7 +2626,7 @@ mod tests {
     #[test]
     fn test_header_crc_mismatch_is_an_error_not_none() {
         let mut buf = Vec::new();
-        write_header(&mut buf, 1).unwrap();
+        write_header(&mut buf, &test_pack_id(1)).unwrap();
         // Corrupt a byte inside the CRC-covered region (the pack_id
         // field) without touching magic/version/header_len — this must
         // surface as corruption, not as "not a packfile".
@@ -2471,7 +2718,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         std::fs::write(&path, b"BADC\x02extra").unwrap();
-        let result = open_packfile(&path, false, 0);
+        let result = open_packfile(&path, false, &test_pack_id(0));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
@@ -2491,10 +2738,10 @@ mod tests {
         // Header genuinely says pack_id 0 — a valid v4 header on its
         // own terms, just not what this filename claims.
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         std::fs::write(&path, &buf).unwrap();
 
-        let err = open_packfile(&path, false, 2).unwrap_err();
+        let err = open_packfile(&path, false, &test_pack_id(2)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let msg = err.to_string();
         assert!(
@@ -2506,7 +2753,7 @@ mod tests {
         // succeed — the check is about the mismatch, not the file itself.
         let ok_path = dir.join("pack_0000000000000000.pack");
         std::fs::write(&ok_path, &buf).unwrap();
-        open_packfile(&ok_path, false, 0).unwrap();
+        open_packfile(&ok_path, false, &test_pack_id(0)).unwrap();
     }
 
     /// A recognizable pre-cutover v1 file (right magic, version 0x01,
@@ -2527,7 +2774,7 @@ mod tests {
         write_record(&mut buf, &test_record_raw([0x11; 16], b"old data")).unwrap();
         std::fs::write(&path, &buf).unwrap();
 
-        let err = open_packfile(&path, false, 0).unwrap_err();
+        let err = open_packfile(&path, false, &test_pack_id(0)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         let msg = err.to_string();
         assert!(
@@ -2591,7 +2838,7 @@ mod tests {
         // bytes, so read_record can't even complete reading the length
         // prefix and hits UnexpectedEof.
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(&mut buf, &test_record_raw([0xaa; 16], b"data")).unwrap();
         buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes
         std::fs::write(&path, &buf).unwrap();
@@ -2605,7 +2852,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pack_0000000000000000.pack");
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(&mut buf, &test_record_raw([0xaa; 16], b"data")).unwrap();
         buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes
         std::fs::write(&path, &buf).unwrap();
@@ -2633,7 +2880,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(&mut buf, &test_record_raw([0xaa; 16], b"good")).unwrap();
         let valid_len = buf.len();
         // Simulate a realistic torn tail: valid length prefix declaring a
@@ -2660,7 +2907,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pack_0000000000000000.pack");
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(&mut buf, &test_record_raw([0xaa; 16], b"good")).unwrap();
         let valid_len = buf.len();
         buf.extend_from_slice(&[0x12, 0x34, 0x56]);
@@ -2677,7 +2924,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(&mut buf, &test_record_raw([0xbb; 16], b"ok")).unwrap();
         write_record(&mut buf, &test_record_raw([0xcc; 16], b"ok2")).unwrap();
         let expected_len = buf.len();
@@ -2696,7 +2943,7 @@ mod tests {
         let dir = test_dir("recover_matches");
         std::fs::create_dir_all(&dir).unwrap();
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         let header_len = buf.len();
         for (index, byte) in [0xa1u8, 0xa2, 0xa3, 0xa4].into_iter().enumerate() {
             let payload = vec![byte; 7 + index * 40];
@@ -2765,7 +3012,7 @@ mod tests {
         let collection1 = [0x01; 16];
         let collection2 = [0x02; 16];
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(
             &mut buf,
             &test_record(collection1, [0xAA; 16], b"collection1 msg"),
@@ -2796,7 +3043,7 @@ mod tests {
         let collection1 = [0x01; 16];
         let collection2 = [0x02; 16];
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(
             &mut buf,
             &test_record(collection1, [0xAA; 16], b"short raw payload"),
@@ -2831,7 +3078,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard_00.pack");
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(&mut buf, &test_record([0x01; 16], [0xAA; 16], b"complete")).unwrap();
         let complete_len = buf.len();
         write_record(&mut buf, &test_record([0x02; 16], [0xBB; 16], b"torn")).unwrap();
@@ -2868,7 +3115,7 @@ mod tests {
         frame[tlv_len_at..tlv_len_at + 4].copy_from_slice(&(u32::MAX - 5).to_le_bytes());
 
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         buf.extend_from_slice(&frame);
         std::fs::write(&path, &buf).unwrap();
 
@@ -2895,7 +3142,7 @@ mod tests {
         let collection_b = [0x22; 16];
 
         let mut buf = Vec::new();
-        write_header(&mut buf, 0x100).unwrap();
+        write_header(&mut buf, &test_pack_id(0x100)).unwrap();
 
         let target_record_first = Record {
             collection_id: collection_a,
@@ -2933,7 +3180,8 @@ mod tests {
         std::fs::write(&src_path, &buf).unwrap();
 
         let stats =
-            extract_packfile_collection(&src_path, &dst_path, &collection_a, 0x200).unwrap();
+            extract_packfile_collection(&src_path, &dst_path, &collection_a, &test_pack_id(0x200))
+                .unwrap();
         assert_eq!(stats.frames_extracted, 2);
         assert_eq!(stats.frames_scanned, 3);
         assert!(!stats.torn_tail);
@@ -2958,7 +3206,7 @@ mod tests {
         // Verify header pack_id in dest file
         let mut dst_file = File::open(&dst_path).unwrap();
         let header = read_header(&mut dst_file).unwrap().unwrap();
-        assert_eq!(header.pack_id, 0x200);
+        assert_eq!(header.pack_id, test_pack_id(0x200));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2972,7 +3220,7 @@ mod tests {
 
         let collection_a = [0x11; 16];
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(
             &mut buf,
             &test_record(collection_a, [0x01; 16], b"valid record"),
@@ -2981,7 +3229,9 @@ mod tests {
         buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes (< 4 prefix bytes)
         std::fs::write(&src_path, &buf).unwrap();
 
-        let stats = extract_packfile_collection(&src_path, &dst_path, &collection_a, 1).unwrap();
+        let stats =
+            extract_packfile_collection(&src_path, &dst_path, &collection_a, &test_pack_id(1))
+                .unwrap();
         assert_eq!(stats.frames_extracted, 1);
         assert_eq!(stats.frames_scanned, 1);
         assert!(stats.torn_tail);
@@ -3007,7 +3257,7 @@ mod tests {
 
         let collection_a = [0x11; 16];
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(
             &mut buf,
             &test_record(collection_a, [0x01; 16], b"valid record"),
@@ -3018,7 +3268,9 @@ mod tests {
         buf.extend_from_slice(&[0x00; 5]); // only 5 bytes of payload written before crash
         std::fs::write(&src_path, &buf).unwrap();
 
-        let stats = extract_packfile_collection(&src_path, &dst_path, &collection_a, 1).unwrap();
+        let stats =
+            extract_packfile_collection(&src_path, &dst_path, &collection_a, &test_pack_id(1))
+                .unwrap();
         assert_eq!(stats.frames_extracted, 1);
         assert_eq!(stats.frames_scanned, 1);
         assert!(stats.torn_tail);
@@ -3040,7 +3292,7 @@ mod tests {
 
         let collection_a = [0x11; 16];
         let mut buf = Vec::new();
-        write_header(&mut buf, 0).unwrap();
+        write_header(&mut buf, &test_pack_id(0)).unwrap();
         write_record(
             &mut buf,
             &test_record(collection_a, [0x01; 16], b"valid record"),
@@ -3051,7 +3303,9 @@ mod tests {
         buf[corrupt_idx] ^= 0x55;
         std::fs::write(&src_path, &buf).unwrap();
 
-        let err = extract_packfile_collection(&src_path, &dst_path, &collection_a, 1).unwrap_err();
+        let err =
+            extract_packfile_collection(&src_path, &dst_path, &collection_a, &test_pack_id(1))
+                .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_dir_all(&dir);

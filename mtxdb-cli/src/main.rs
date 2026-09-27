@@ -208,7 +208,6 @@ pub(crate) enum PacksAction {
         pack: String,
         collection: String,
         out: PathBuf,
-        dest_pack_id: Option<String>,
     },
 }
 
@@ -724,7 +723,7 @@ fn sub_packs_extract() -> Command {
                 .long("pack")
                 .required(true)
                 .value_name("PACK_ID")
-                .help("Source pack identity (0x-prefixed 16 hex digits)"),
+                .help("Source pack identity (full 64-hex 0x-prefixed id, or a unique filename prefix)"),
         )
         .arg(
             Arg::new("collection")
@@ -740,13 +739,7 @@ fn sub_packs_extract() -> Command {
                 .long("out")
                 .required(true)
                 .value_name("FILE")
-                .help("Path for the extracted packfile"),
-        )
-        .arg(
-            Arg::new("dest_pack_id")
-                .long("dest-pack-id")
-                .value_name("PACK_ID")
-                .help("Pack identity to stamp in the output header (defaults to 0, or parsed from pack_{hex}.pack filename)"),
+                .help("Path for the extracted packfile; it is stamped with a fresh random pack identity"),
         )
 }
 
@@ -1019,7 +1012,6 @@ fn parse_cli() -> Cli {
                     pack: sub.get_one::<String>("pack").unwrap().clone(),
                     collection: sub.get_one::<String>("collection").unwrap().clone(),
                     out: PathBuf::from(sub.get_one::<String>("out").unwrap()),
-                    dest_pack_id: sub.get_one::<String>("dest_pack_id").cloned(),
                 },
                 _ => unreachable!("subcommand_required enforces a packs action"),
             },
