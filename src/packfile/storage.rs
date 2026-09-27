@@ -252,6 +252,9 @@ pub struct CheckpointBreakdown {
     pub retire: std::time::Duration,
     /// The whole call.
     pub total: std::time::Duration,
+    /// Size of the checkpoint file this call wrote, in bytes (0 if it could not
+    /// be read back).
+    pub checkpoint_bytes: u64,
 }
 
 impl CheckpointBreakdown {
@@ -927,17 +930,30 @@ const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexEntry::MAX_OFFSET;
 /// of ~230k appends between full rewrites.
 const DELTA_LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Log length at which a sync rewrites the checkpoint (which starts a fresh
-/// log) instead of appending, three quarters of the cap. Coverage batches and
-/// ordinary deltas both grow the log and neither rotates it, so without this a
-/// pool that only takes those steps reaches the cap and the append fails; the
-/// fallback then rewrites the checkpoint at an unplanned moment. The quarter
-/// left over is room for the batch in hand and one racing append.
-const DELTA_LOG_ROTATE_BYTES: u64 = DELTA_LOG_CAP_BYTES / 4 * 3;
-const _: () = assert!(
-    DELTA_LOG_ROTATE_BYTES < DELTA_LOG_CAP_BYTES,
-    "the rotation length must leave room under the cap"
-);
+/// A delta batch that does not fit under the delta-log cap.
+#[derive(Debug)]
+struct DeltaBatchTooLarge {
+    batch_bytes: usize,
+    log_bytes: u64,
+    cap: u64,
+}
+
+impl std::fmt::Display for DeltaBatchTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the next delta batch of {} bytes does not fit: log {} bytes, cap {}",
+            self.batch_bytes, self.log_bytes, self.cap
+        )
+    }
+}
+
+impl std::error::Error for DeltaBatchTooLarge {}
+
+// The delta-log rotation length is three quarters of the cap, see
+// `PackfileStorage::delta_log_rotate_bytes`. It cannot promise the next batch
+// fits: a batch can carry whole-index snapshots, so a batch that does not is
+// caught when it is built (`is_delta_batch_too_large`) and also rotates.
 
 /// Candidate offsets closer than this on the same shard count as one
 /// sequential read run when measuring a `get_many` batch's locality.
@@ -1512,6 +1528,10 @@ pub struct PackfileStorage {
     last_open_timings: parking_lot::Mutex<Option<OpenTimings>>,
     /// Wall-clock breakdown of the most recent `sync_all`, by phase.
     last_sync_timings: parking_lot::Mutex<Option<SyncTimings>>,
+    /// Test-only: a smaller delta-log cap (0 = the real one), so a batch that
+    /// does not fit can be produced without writing a 256 MiB log.
+    #[cfg(test)]
+    delta_log_cap_override: AtomicU64,
     /// Phase breakdown of the most recent full index checkpoint.
     last_checkpoint_breakdown: parking_lot::Mutex<Option<CheckpointBreakdown>>,
     /// Lifetime per-phase sync totals, accumulated once per sync in
@@ -2576,6 +2596,8 @@ impl PackfileStorage {
             read_reload_failures: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            delta_log_cap_override: AtomicU64::new(0),
             last_checkpoint_breakdown: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
             sync_diagnostics: parking_lot::Mutex::new(SyncDiagnostics::default()),
@@ -4361,6 +4383,8 @@ impl PackfileStorage {
         )
         .map_err(StorageError::Io)?;
         breakdown.write = write_started.elapsed().saturating_sub(breakdown.serialize);
+        breakdown.checkpoint_bytes =
+            fs::metadata(Self::index_checkpoint_path(&self.base_dir)).map_or(0, |meta| meta.len());
         let directory_started = std::time::Instant::now();
         // `write_checkpoint` fsyncs the new checkpoint's own bytes before
         // renaming it into place, but the rename itself — the directory
@@ -4788,9 +4812,14 @@ impl PackfileStorage {
             } else {
                 0
             });
-        if next_len > DELTA_LOG_CAP_BYTES {
+        let cap = self.delta_log_cap();
+        if next_len > cap {
             return Err(StorageError::Io(std::io::Error::other(
-                "v3 delta log cap reached",
+                DeltaBatchTooLarge {
+                    batch_bytes,
+                    log_bytes: state.log_bytes,
+                    cap,
+                },
             )));
         }
         let bytes_written = delta::append_v3_batch_with_durability(
@@ -8952,6 +8981,35 @@ impl PackfileStorage {
         state.base_fingerprint.is_some() && state.log_version == 3
     }
 
+    /// The delta-log size limit: the real cap, or a test's smaller one.
+    fn delta_log_cap(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let limit = self.delta_log_cap_override.load(Ordering::Relaxed);
+            if limit != 0 {
+                return limit;
+            }
+        }
+        let _ = self;
+        DELTA_LOG_CAP_BYTES
+    }
+
+    /// Log length at which a sync rewrites the checkpoint instead of appending:
+    /// three quarters of [`Self::delta_log_cap`].
+    fn delta_log_rotate_bytes(&self) -> u64 {
+        self.delta_log_cap().saturating_div(4).saturating_mul(3)
+    }
+
+    /// Whether `error` is a delta batch that does not fit under the cap. That is
+    /// a planned rotation, not a failure: the batch may carry whole-index
+    /// snapshots, so its size is only known once it is built.
+    fn is_delta_batch_too_large(error: &StorageError) -> bool {
+        matches!(
+            error,
+            StorageError::Io(io) if io.get_ref().and_then(|inner| inner.downcast_ref::<DeltaBatchTooLarge>()).is_some()
+        )
+    }
+
     /// Whether every live pack is one the base checkpoint's pack table names,
     /// so every slot a delta operation of this epoch carries resolves through
     /// that table for any reader. A pack created since forces a full
@@ -9015,11 +9073,12 @@ impl PackfileStorage {
         // the claim is, and only then is the journal reclaimed.
         let mut coverage_batch_written = false;
         let log_bytes = self.delta_state.lock().log_bytes;
-        let rotating = log_bytes >= DELTA_LOG_ROTATE_BYTES;
+        let rotating = log_bytes >= self.delta_log_rotate_bytes();
         if rotating {
             eprintln!(
-                "mtxdb: delta log is at {log_bytes} of {DELTA_LOG_CAP_BYTES} bytes, rewriting the \
-                 checkpoint before it reaches the cap"
+                "mtxdb: delta log is at {log_bytes} of {} bytes, rewriting the checkpoint \
+                 before it reaches the cap",
+                self.delta_log_cap()
             );
         }
         if journal_needs_reclaim
@@ -9035,6 +9094,9 @@ impl PackfileStorage {
                     coverage_batch_written = true;
                 }
                 Ok(None) => {}
+                Err(error) if Self::is_delta_batch_too_large(&error) => {
+                    eprintln!("mtxdb: rotating the delta log, {error}; rewriting the checkpoint");
+                }
                 Err(error) => {
                     eprintln!("mtxdb: delta coverage batch failed, rewriting checkpoint: {error}");
                 }
@@ -9077,7 +9139,11 @@ impl PackfileStorage {
                 // no longer reflects the live indexes. Fall back to a full
                 // rewrite rather than leaving the acceleration files stale until
                 // the next sync notices the gap.
-                eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
+                if Self::is_delta_batch_too_large(&error) {
+                    eprintln!("mtxdb: rotating the delta log, {error}; rewriting the checkpoint");
+                } else {
+                    eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
+                }
                 let checkpoint_started = std::time::Instant::now();
                 self.persist_index_checkpoint_best_effort();
                 self.note_checkpoint_rewrite();
@@ -12424,53 +12490,77 @@ mod tests {
         );
     }
 
+    fn batch_node(index: u32) -> NodeId {
+        let mut id = [0u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xB7;
+        id
+    }
+
+    /// A batch that does not fit under the cap rotates the log, though the log is
+    /// still well below the rotation length: the batch (which can carry
+    /// whole-index snapshots) is bigger than the room left. The rotation is
+    /// planned and reported as such, and nothing is lost.
     #[test]
-    fn oversized_v3_delta_falls_back_to_checkpoint_without_losing_data() {
-        let dir = test_dir("v3_delta_cap_fallback");
+    fn a_batch_that_crosses_the_cap_below_the_rotation_length_rotates_the_log() {
+        let dir = test_dir("v3_delta_cap_batch");
         let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0xD3; 16];
         store
             .put(
-                &TEST_COLLECTION,
+                &collection,
                 &distinct_id(90),
-                &NodeData::new(bytes::Bytes::from_static(b"checkpoint base")),
+                &NodeData::from_slice(b"base"),
             )
             .unwrap();
         store.sync_all().unwrap();
 
-        let state = store.delta_state.lock();
-        let base = state.base_fingerprint.expect("baseline checkpoint exists");
-        let delta_path = PackfileStorage::delta_path(&dir, base);
-        drop(state);
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&delta_path)
-            .unwrap();
-        file.set_len(DELTA_LOG_CAP_BYTES.saturating_sub(1)).unwrap();
-        store.delta_state.lock().log_bytes = DELTA_LOG_CAP_BYTES.saturating_sub(1);
-
-        let collection = [0xD3; 16];
-        let node = distinct_id(91);
-        let value = bytes::Bytes::from_static(b"survives oversized snapshot fallback");
-        store
-            .put(&collection, &node, &NodeData::new(value.clone()))
-            .unwrap();
+        store.delta_log_cap_override.store(8192, Ordering::Relaxed);
+        store.delta_state.lock().log_bytes = 100;
+        assert!(
+            100 < store.delta_log_rotate_bytes(),
+            "below the rotation length"
+        );
+        // Enough frames that the batch alone is larger than the room under the
+        // (test) cap.
+        for id in 0..400u32 {
+            store
+                .put(&collection, &batch_node(id), &NodeData::from_slice(b"v"))
+                .unwrap();
+        }
         let before = store.stats();
         store.sync_all().unwrap();
         let after = store.stats();
         assert_eq!(after.delta_appends - before.delta_appends, 0);
         assert_eq!(after.checkpoint_writes - before.checkpoint_writes, 1);
-        assert_eq!(store.get(&collection, &node).unwrap().unwrap().bytes, value);
+        assert!(
+            store.delta_state.lock().log_bytes < 100,
+            "the rotation starts a fresh log"
+        );
         drop(store);
 
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
-        assert_eq!(
-            reopened.get(&collection, &node).unwrap().unwrap().bytes,
-            value
-        );
+        for id in 0..400u32 {
+            assert!(reopened
+                .get(&collection, &batch_node(id))
+                .unwrap()
+                .is_some());
+        }
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A delta error that is not "does not fit" stays a failure, not a rotation.
+    #[test]
+    fn only_a_batch_that_does_not_fit_counts_as_a_planned_rotation() {
+        let full = StorageError::Io(std::io::Error::other(DeltaBatchTooLarge {
+            batch_bytes: 10,
+            log_bytes: 5,
+            cap: 12,
+        }));
+        let other = StorageError::Io(std::io::Error::other("disk on fire"));
+        assert!(PackfileStorage::is_delta_batch_too_large(&full));
+        assert!(!PackfileStorage::is_delta_batch_too_large(&other));
     }
 
     /// A log that has grown to the rotation length is replaced by a checkpoint
@@ -12501,7 +12591,8 @@ mod tests {
         assert_eq!(after.checkpoint_writes - before.checkpoint_writes, 0);
 
         // At the rotation length: a checkpoint, with no failed append first.
-        store.delta_state.lock().log_bytes = DELTA_LOG_ROTATE_BYTES;
+        let at = store.delta_log_rotate_bytes();
+        store.delta_state.lock().log_bytes = at;
         store
             .put(&collection, &distinct_id(3), &NodeData::from_slice(b"at"))
             .unwrap();
@@ -12511,7 +12602,7 @@ mod tests {
         assert_eq!(after.delta_appends - before.delta_appends, 0);
         assert_eq!(after.checkpoint_writes - before.checkpoint_writes, 1);
         assert!(
-            store.delta_state.lock().log_bytes < DELTA_LOG_ROTATE_BYTES,
+            store.delta_state.lock().log_bytes < store.delta_log_rotate_bytes(),
             "the rotation starts a fresh log"
         );
         drop(store);
@@ -17824,7 +17915,8 @@ mod tests {
         let wal = dir.join("wal.bin");
         let writer = writer_with_coverage_steps(&dir, &wal, 3);
         assert!(!writer.sync_timings().unwrap().delta_log.is_zero());
-        writer.delta_state.lock().log_bytes = DELTA_LOG_ROTATE_BYTES;
+        let at = writer.delta_log_rotate_bytes();
+        writer.delta_state.lock().log_bytes = at;
         writer
             .put(
                 &[0x4Du8; 16],
