@@ -1515,29 +1515,89 @@ pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<Scan
 /// # Errors
 /// Returns `io::Error` on read or truncate failure.
 pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
+    recover_packfile_with(path, |entry| entries.push(entry))?;
+    Ok(entries)
+}
+
+/// What [`recover_packfile`] found in one pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackRecovery {
+    /// Complete, CRC-valid records in the pack.
+    pub records: u64,
+    /// Offset just past the last valid record (the header's end for an empty pack).
+    pub valid_len: u64,
+    /// Whether a torn tail was cut off at `valid_len`.
+    pub truncated: bool,
+}
+
+/// [`scan_and_recover_packfile`] for a caller that only needs the pack made
+/// safe to append to: the same validation of every frame and CRC, and the same
+/// truncation of a torn tail, but no per-record result is built.
+///
+/// # Errors
+/// As [`scan_and_recover_packfile`].
+pub fn recover_packfile(path: &Path) -> io::Result<PackRecovery> {
+    recover_packfile_with(path, |_| {})
+}
+
+/// Buffer for a recovery scan: a few large sequential reads, not one per 8 KiB.
+const RECOVERY_BUFFER_BYTES: usize = 1 << 20;
+
+/// A reader that counts the bytes it hands out, so the scan knows each frame's
+/// offset without asking the file for its position (an `lseek` system call per
+/// frame on a buffered reader).
+struct CountingReader<R> {
+    inner: R,
+    position: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.position = self
+            .position
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        Ok(read)
+    }
+}
+
+/// The shared recovery walk: validates every frame, calls `on_record` for each
+/// valid one, and truncates a torn tail.
+fn recover_packfile_with(
+    path: &Path,
+    mut on_record: impl FnMut(ScanEntry),
+) -> io::Result<PackRecovery> {
+    let file = File::open(path)?;
+    let mut reader = CountingReader {
+        inner: BufReader::with_capacity(RECOVERY_BUFFER_BYTES, file),
+        position: 0,
+    };
+    let mut recovery = PackRecovery {
+        records: 0,
+        valid_len: 0,
+        truncated: false,
+    };
 
     if read_header(&mut reader)?.is_none() {
-        return Ok(entries);
+        return Ok(recovery);
     }
 
-    let mut last_valid_offset = reader.stream_position()?;
-    let mut truncated = false;
+    recovery.valid_len = reader.position;
     loop {
-        let offset = reader.stream_position()?;
+        let offset = reader.position;
         match read_record_metadata(&mut reader) {
             Ok(Some(meta)) => {
-                entries.push((meta.collection_id, meta.hash, offset));
-                last_valid_offset = reader.stream_position()?;
+                on_record((meta.collection_id, meta.hash, offset));
+                recovery.records = recovery.records.saturating_add(1);
+                recovery.valid_len = reader.position;
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 // Torn tail: a write crashed mid-frame. Truncate to the
                 // last valid record boundary so future appends don't land
                 // after a corrupt frame.
-                truncated = true;
+                recovery.truncated = true;
                 break;
             }
             Err(e) => {
@@ -1551,14 +1611,14 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
 
     // Only truncate if we actually hit a torn tail — not on clean EOF
     // or mid-file corruption (which was propagated as an error above).
-    if truncated {
+    if recovery.truncated {
         drop(reader);
         let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(last_valid_offset)?;
+        file.set_len(recovery.valid_len)?;
         file.sync_all()?;
     }
 
-    Ok(entries)
+    Ok(recovery)
 }
 
 #[cfg(test)]
@@ -2329,6 +2389,66 @@ mod tests {
         let entries = scan_and_recover_packfile(&path).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len as u64);
+    }
+
+    /// The counting recovery does what the collecting one does: at every
+    /// truncation point of a multi-record pack it finds the same records, keeps
+    /// the same length and reports the truncation the same way; a corrupt frame
+    /// is the same error and leaves the file alone.
+    #[test]
+    fn test_recover_packfile_matches_scan_and_recover_at_every_cut() {
+        let dir = test_dir("recover_matches");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        let header_len = buf.len();
+        for (index, byte) in [0xa1u8, 0xa2, 0xa3, 0xa4].into_iter().enumerate() {
+            let payload = vec![byte; 7 + index * 40];
+            write_record(&mut buf, &test_record_raw([byte; 16], &payload)).unwrap();
+        }
+        for cut in 0..=buf.len() {
+            let collecting = dir.join("collecting.pack");
+            let counting = dir.join("counting.pack");
+            std::fs::write(&collecting, &buf[..cut]).unwrap();
+            std::fs::write(&counting, &buf[..cut]).unwrap();
+            let entries = scan_and_recover_packfile(&collecting).map(|entries| entries.len());
+            let recovery = recover_packfile(&counting);
+            match (&entries, &recovery) {
+                (Ok(records), Ok(found)) => {
+                    assert_eq!(u64::try_from(*records).unwrap(), found.records, "cut {cut}");
+                    assert_eq!(
+                        std::fs::metadata(&collecting).unwrap().len(),
+                        std::fs::metadata(&counting).unwrap().len(),
+                        "cut {cut}: the two left different lengths"
+                    );
+                    if cut >= header_len {
+                        assert_eq!(
+                            found.valid_len,
+                            std::fs::metadata(&counting).unwrap().len(),
+                            "cut {cut}"
+                        );
+                    }
+                }
+                (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind(), "cut {cut}"),
+                _ => panic!("cut {cut}: {entries:?} vs {recovery:?}"),
+            }
+        }
+        // A flipped payload byte is corruption: the same error, and no truncation.
+        let mut corrupt = buf.clone();
+        let flip = header_len + 60;
+        corrupt[flip] ^= 0x40;
+        let collecting = dir.join("collecting.pack");
+        let counting = dir.join("counting.pack");
+        std::fs::write(&collecting, &corrupt).unwrap();
+        std::fs::write(&counting, &corrupt).unwrap();
+        let a = scan_and_recover_packfile(&collecting).unwrap_err();
+        let b = recover_packfile(&counting).unwrap_err();
+        assert_eq!(a.kind(), b.kind());
+        assert_eq!(
+            std::fs::metadata(&counting).unwrap().len(),
+            corrupt.len() as u64
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -998,7 +998,10 @@ impl ShardPool {
         for (pack_id, path) in pack_files {
             if writable {
                 let recovery_started = Instant::now();
-                let _ = packfile::scan_and_recover_packfile(&path).map_err(|error| {
+                // Only the safety of appending matters here (every frame and CRC
+                // validated, a torn tail cut off); the records are indexed from
+                // the checkpoint, or rescanned on the fallback path.
+                packfile::recover_packfile(&path).map_err(|error| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
