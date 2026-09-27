@@ -52,6 +52,57 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
 
+/// Full checkpoints taken so far, per pool, in `ShardType::ALL` order.
+fn checkpoint_counts(db: &SharedDatabase) -> Vec<u64> {
+    ShardType::ALL
+        .iter()
+        .map(|pool| db.pool(*pool).stats().checkpoint_writes)
+        .collect()
+}
+
+/// The phases of the active pool's sync.
+fn print_phases(timings: &mtxdb::packfile::storage::SyncTimings) {
+    println!(
+        "  phases: pack_flush {:.0} ms, pack_fsync {:.0} ms, delta_log {:.0} ms, \
+         checkpoint {:.0} ms, wal {:.0} ms, journal_fsync {:.0} ms",
+        millis(timings.pack_flush),
+        millis(timings.pack_fsync),
+        millis(timings.delta_log),
+        millis(timings.checkpoint),
+        millis(timings.wal),
+        millis(timings.journal_fsync),
+    );
+}
+
+/// Where the time of every full checkpoint taken since `before` went. A
+/// remediation checkpoint runs inside the sync, so `State` can appear too.
+fn print_checkpoint_breakdowns(db: &SharedDatabase, before: &[u64]) {
+    for (pool, was) in ShardType::ALL.iter().zip(before) {
+        if db.pool(*pool).stats().checkpoint_writes <= *was {
+            continue;
+        }
+        let Some(b) = db.pool(*pool).checkpoint_breakdown() else {
+            continue;
+        };
+        println!(
+            "  {pool:?} checkpoint {:.0} ms: pre-sync {:.0}, lock wait {:.0}, locked sync {:.0}, \
+             snapshot {:.0}, serialize {:.0}, write {:.0}, dir sync {:.0}, journal.lsn {:.0}, \
+             WAL reclaim {:.0}, retire {:.0}",
+            millis(b.total),
+            millis(b.pre_sync),
+            millis(b.lock_wait),
+            millis(b.locked_sync),
+            millis(b.snapshot),
+            millis(b.serialize),
+            millis(b.write),
+            millis(b.directory_sync),
+            millis(b.journal_lsn),
+            millis(b.reclaim),
+            millis(b.retire),
+        );
+    }
+}
+
 fn main() {
     let commits = env_u64("MTXDB_WL_COMMITS", 100);
     let batch = env_u64("MTXDB_WL_BATCH", 20);
@@ -107,9 +158,14 @@ fn main() {
         }
         let len = coordinator.segment_len();
         let coverage_before = db.pool(ShardType::EventDag).durable_coverage();
+        let checkpoints_before = checkpoint_counts(&db);
         let started = Instant::now();
         db.pool(ShardType::EventDag).sync_all().expect("sync_all");
         let sync_ms = millis(started.elapsed());
+        let event_timings = db
+            .pool(ShardType::EventDag)
+            .sync_timings()
+            .expect("sync timings");
         if sync_state {
             db.pool(ShardType::State).sync_all().expect("sync_all");
         }
@@ -131,6 +187,8 @@ fn main() {
             coordinator.reclaim_stalls(),
             coordinator.reclaim_blockers()
         );
+        print_phases(&event_timings);
+        print_checkpoint_breakdowns(&db, &checkpoints_before);
     }
 
     println!(

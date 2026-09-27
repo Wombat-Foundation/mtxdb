@@ -223,6 +223,37 @@ impl Default for OpenTimings {
     }
 }
 
+/// Where the time of one full index checkpoint went, phase by phase, so a
+/// slow rewrite (the delta-log rotation, a forced reclaim) can be attributed
+/// before anything is redesigned. Read through
+/// [`PackfileStorage::checkpoint_breakdown`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CheckpointBreakdown {
+    /// The fsync of unsynced pack bytes done before any lock is taken.
+    pub pre_sync: std::time::Duration,
+    /// Waiting for every collection's put mutex and the creation lock.
+    pub lock_wait: std::time::Duration,
+    /// The pack flush and fsync under the locks (writers stalled).
+    pub locked_sync: std::time::Duration,
+    /// Fingerprint, snapshots, delta-epoch rotation and the coverage capture,
+    /// under the locks.
+    pub snapshot: std::time::Duration,
+    /// Serializing every collection's index into the checkpoint blobs.
+    pub serialize: std::time::Duration,
+    /// Writing the checkpoint, its fsync and rename.
+    pub write: std::time::Duration,
+    /// The directory fsync that makes the rename durable.
+    pub directory_sync: std::time::Duration,
+    /// Writing `journal.lsn`.
+    pub journal_lsn: std::time::Duration,
+    /// Reporting coverage and reclaiming the WAL (its rewrite and fsyncs).
+    pub reclaim: std::time::Duration,
+    /// Retiring the previous delta epoch.
+    pub retire: std::time::Duration,
+    /// The whole call.
+    pub total: std::time::Duration,
+}
+
 /// Wall-clock breakdown of one sync — the append-path `sync()` (dirty-scoped
 /// flush/fsync) or the full `sync_all` — by phase. The pack phases come from
 /// `ShardPool::last_sync_split` (which measures the flush and fsync legs
@@ -1458,6 +1489,8 @@ pub struct PackfileStorage {
     last_open_timings: parking_lot::Mutex<Option<OpenTimings>>,
     /// Wall-clock breakdown of the most recent `sync_all`, by phase.
     last_sync_timings: parking_lot::Mutex<Option<SyncTimings>>,
+    /// Phase breakdown of the most recent full index checkpoint.
+    last_checkpoint_breakdown: parking_lot::Mutex<Option<CheckpointBreakdown>>,
     /// Lifetime per-phase sync totals, accumulated once per sync in
     /// `count_sync_persistence`, so the scatter-vs-rewrite split can be read
     /// across a whole run instead of only the most recent barrier (which
@@ -2520,6 +2553,7 @@ impl PackfileStorage {
             read_reload_failures: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
+            last_checkpoint_breakdown: parking_lot::Mutex::new(None),
             sync_totals: SyncTotals::default(),
             sync_diagnostics: parking_lot::Mutex::new(SyncDiagnostics::default()),
             publish_calls: AtomicU64::new(0),
@@ -4141,6 +4175,8 @@ impl PackfileStorage {
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
+        let started = std::time::Instant::now();
+        let mut breakdown = CheckpointBreakdown::default();
         // With a journal, this checkpoint must make the packs durable before it
         // records coverage, and it does so below with every collection locked,
         // which stalls every writer for as long as the fsync takes. Do the bulk
@@ -4149,6 +4185,8 @@ impl PackfileStorage {
         if self.journal().is_some() {
             self.shards.sync_dirty()?;
         }
+        breakdown.pre_sync = started.elapsed();
+        let lock_started = std::time::Instant::now();
         // Epoch-handoff protocol: hold every collection's put_mutex only
         // across the snapshot + epoch rotation below (same sorted-lock
         // pattern as `retire_empty_shards_after_batch`), then release it
@@ -4212,6 +4250,8 @@ impl PackfileStorage {
         // Now build the lock guards: the arcs must outlive them (collected
         // in `lock_arcs` above and reused below for the dirty-check).
         let guards: Vec<_> = lock_arcs.iter().map(|arc| arc.lock()).collect();
+        breakdown.lock_wait = lock_started.elapsed();
+        let locked_started = std::time::Instant::now();
 
         // Commit any buffered frames first: the fingerprint below pins each
         // shard to its committed on-disk length, and the serialized index
@@ -4227,6 +4267,8 @@ impl PackfileStorage {
         } else {
             self.shards.flush_all()?;
         }
+        breakdown.locked_sync = locked_started.elapsed();
+        let snapshot_started = std::time::Instant::now();
         let live_shards = self.shards.all_shards();
         let packs: Vec<(u64, u64)> = live_shards
             .iter()
@@ -4269,6 +4311,7 @@ impl PackfileStorage {
         // reclaim floor both describe only frames this index holds.
         let wal_lsn = self.checkpoint_covered_lsn();
         drop(guards);
+        breakdown.snapshot = snapshot_started.elapsed();
         // `create_guard` is deliberately NOT dropped here, unlike the
         // per-collection put mutexes above. An existing collection's
         // concurrent put after this point is safe to let through: its frame
@@ -4285,7 +4328,8 @@ impl PackfileStorage {
         // silently omits it. Keep new-collection publication excluded until
         // the checkpoint is durably renamed.
 
-        Self::write_checkpoint_snapshot(
+        let write_started = std::time::Instant::now();
+        breakdown.serialize = Self::write_checkpoint_snapshot(
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             wal_lsn.unwrap_or(0),
@@ -4293,6 +4337,8 @@ impl PackfileStorage {
             &pack_table,
         )
         .map_err(StorageError::Io)?;
+        breakdown.write = write_started.elapsed().saturating_sub(breakdown.serialize);
+        let directory_started = std::time::Instant::now();
         // `write_checkpoint` fsyncs the new checkpoint's own bytes before
         // renaming it into place, but the rename itself — the directory
         // entry now pointing at the new inode — is only durable once the
@@ -4308,6 +4354,7 @@ impl PackfileStorage {
         // passes) or doesn't (falls back to the still-valid predecessor
         // checkpoint) — never a torn or partially-visible rename.
         let _ = crate::shard::sync_directory(&self.base_dir);
+        breakdown.directory_sync = directory_started.elapsed();
         // The checkpoint naming `fingerprint` is now durably in place, so a
         // new collection publishing from here on lands after it — same
         // recovery story a reopen already has for any other post-checkpoint
@@ -4323,10 +4370,16 @@ impl PackfileStorage {
         // without bound. Best-effort — a failed compaction costs disk, never
         // correctness (the checkpoint is already durable).
         if let Some(lsn) = wal_lsn {
+            let lsn_started = std::time::Instant::now();
             self.write_journal_lsn(lsn)?;
+            breakdown.journal_lsn = lsn_started.elapsed();
+            let reclaim_started = std::time::Instant::now();
             self.report_coverage_and_reclaim(lsn);
+            breakdown.reclaim = reclaim_started.elapsed();
         }
+        let retire_started = std::time::Instant::now();
         self.retire_delta_epoch(old_base_fingerprint);
+        breakdown.retire = retire_started.elapsed();
         // The unlocked serialize/write window above let concurrent puts land
         // after the rotation. C1 was snapshotted before them, so such a put
         // is durable only as a pending delta frame — if any frames, or a new
@@ -4347,6 +4400,8 @@ impl PackfileStorage {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         }
         drop(guards);
+        breakdown.total = started.elapsed();
+        *self.last_checkpoint_breakdown.lock() = Some(breakdown);
         Ok(())
     }
 
@@ -4359,7 +4414,8 @@ impl PackfileStorage {
         covered_lsn: u64,
         snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
         pack_table: &[(u16, u64)],
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<std::time::Duration> {
+        let serialize_started = std::time::Instant::now();
         let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
             .iter()
             .map(|(collection_id, generation, room)| {
@@ -4370,13 +4426,15 @@ impl PackfileStorage {
             .iter()
             .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
             .collect();
+        let serialized = serialize_started.elapsed();
         crate::index::checkpoint::write_checkpoint(
             path,
             fingerprint,
             covered_lsn,
             &blobs,
             pack_table,
-        )
+        )?;
+        Ok(serialized)
     }
 
     /// Switch the live delta-log state onto a fresh epoch named for
@@ -9050,6 +9108,12 @@ impl PackfileStorage {
         *self.last_sync_timings.lock()
     }
 
+    /// Phase breakdown of the most recent full index checkpoint, if one ran.
+    #[must_use]
+    pub fn checkpoint_breakdown(&self) -> Option<CheckpointBreakdown> {
+        *self.last_checkpoint_breakdown.lock()
+    }
+
     /// Commit every open shard's buffered frames to the page cache without
     /// fsyncing (see [`ShardPool::flush_all`]). No-op under the default
     /// [`crate::shard::AppendPolicy::Eager`], where every put already wrote
@@ -12436,6 +12500,39 @@ mod tests {
                 .is_some());
         }
         drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A full checkpoint records where its time went, and the phases account for
+    /// the whole of it (the parts are disjoint stretches of one call).
+    #[test]
+    fn a_checkpoint_records_a_phase_breakdown() {
+        let dir = test_dir("checkpoint_breakdown");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        assert!(store.checkpoint_breakdown().is_none());
+        store
+            .put(&[0xD5; 16], &distinct_id(1), &NodeData::from_slice(b"one"))
+            .unwrap();
+        store.sync_all().unwrap();
+        let breakdown = store.checkpoint_breakdown().expect("a checkpoint ran");
+        let parts = breakdown.pre_sync
+            + breakdown.lock_wait
+            + breakdown.locked_sync
+            + breakdown.snapshot
+            + breakdown.serialize
+            + breakdown.write
+            + breakdown.directory_sync
+            + breakdown.journal_lsn
+            + breakdown.reclaim
+            + breakdown.retire;
+        assert!(breakdown.total > Duration::ZERO);
+        assert!(
+            parts <= breakdown.total,
+            "phases {parts:?} exceed the whole {:?}",
+            breakdown.total
+        );
+        assert!(breakdown.write > Duration::ZERO, "the write fsyncs");
+        drop(store);
         fs::remove_dir_all(dir).unwrap();
     }
 
