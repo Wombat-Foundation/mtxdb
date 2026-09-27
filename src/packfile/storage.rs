@@ -943,6 +943,15 @@ const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexEntry::MAX_OFFSET;
 /// of ~230k appends between full rewrites.
 const DELTA_LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
+/// What the disk records of a store's durable index state, read in one pass:
+/// the newest journal coverage the checkpoint and its delta log claim, and the
+/// fingerprint of the durable pack state they describe (0 if unknown).
+#[derive(Debug, Default, Clone, Copy)]
+struct DurableIndexState {
+    covered_lsn: u64,
+    fingerprint: u64,
+}
+
 /// A delta batch that does not fit under the delta-log cap.
 #[derive(Debug)]
 struct DeltaBatchTooLarge {
@@ -2296,7 +2305,8 @@ impl PackfileStorage {
         // can never be newer than the index this handle builds. A writer writes
         // `journal.lsn` only after its covering checkpoint, so reading it first
         // always yields a bound <= the coverage of the checkpoint/scan below.
-        let read_covered = Self::read_journal_lsn(&base_dir);
+        let durable_state = Self::durable_index_state(&base_dir);
+        let read_covered = Self::journal_lsn_with(&base_dir, durable_state.covered_lsn);
         timings.metadata_load = metadata_started.elapsed();
         if let Some((scan_out, collection_order, delta_state, checkpoint_covered)) =
             Self::checkpoint_scan_out(
@@ -2324,6 +2334,7 @@ impl PackfileStorage {
                 delta_state,
                 checkpoint_covered,
                 read_covered,
+                durable_state.fingerprint,
             );
             timings.assemble = assemble_started.elapsed();
             timings.total = started.elapsed();
@@ -2424,6 +2435,7 @@ impl PackfileStorage {
             DeltaLogState::default(),
             read_covered,
             read_covered,
+            durable_state.fingerprint,
         );
         // A writer that had to rescan has no checkpoint describing this pack
         // set. Mark it dirty so the next sync persists one; otherwise a store
@@ -2536,6 +2548,7 @@ impl PackfileStorage {
         delta_state: DeltaLogState,
         read_covered: u64,
         durable_coverage: u64,
+        initial_durable_fp: u64,
     ) -> Self {
         let index_config = crate::index::IndexConfig {
             seed: shards.bucket_seed(),
@@ -2544,11 +2557,6 @@ impl PackfileStorage {
         // Seed the per-collection refresh fingerprint from the persisted
         // checkpoint/delta state so the first miss for each collection can
         // skip refresh when nothing durable changed.
-        let initial_durable_fp = match crate::index::checkpoint::read_durable_fingerprint(&base_dir)
-        {
-            Ok(Some(dfp)) => dfp.fingerprint,
-            Ok(None) | Err(_) => 0,
-        };
         let initial_fingerprints: HashMap<[u8; 16], u64> = collection_order
             .iter()
             .map(|&cid| (cid, initial_durable_fp))
@@ -2729,40 +2737,55 @@ impl PackfileStorage {
     /// result can only be lower than the truth, which makes recovery replay
     /// more, never less. It reads the disk (and scans the delta log), so a
     /// writer uses [`Self::durable_coverage`] instead.
+    #[must_use]
     pub fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
+        Self::journal_lsn_with(base_dir, Self::durable_index_state(base_dir).covered_lsn)
+    }
+
+    /// `read_journal_lsn` given the coverage a checkpoint and its delta log
+    /// already yielded, so an open that also needs the log's fingerprint scans
+    /// the log once.
+    fn journal_lsn_with(base_dir: &std::path::Path, checkpoint_and_delta: u64) -> u64 {
         let recorded = fs::read(Self::journal_lsn_path(base_dir))
             .ok()
             .and_then(|bytes| bytes.get(..8).map(<[u8; 8]>::try_from))
             .and_then(Result::ok)
             .map_or(0, u64::from_le_bytes);
-        recorded.max(Self::checkpoint_and_delta_coverage(base_dir))
+        recorded.max(checkpoint_and_delta)
     }
 
-    /// The coverage the checkpoint on disk records, or that a committed batch
-    /// of the delta log continuing it claims, whichever is newer; 0 when there
-    /// is neither. The log only counts if it names that checkpoint's
+    /// What the disk records of the durable index state, in one pass over the
+    /// checkpoint and its delta log: the coverage the checkpoint records or a
+    /// committed batch of the log continuing it claims (whichever is newer; 0
+    /// when there is neither), and the fingerprint of the durable pack state
+    /// (0 when unknown). The log only counts if it names that checkpoint's
     /// fingerprint; a stale epoch left by a crash is inert.
     ///
     /// Reading the checkpoint's own record matters: a new checkpoint retires
     /// the delta epoch that held the newest claim, and `journal.lsn` is written
     /// only after the checkpoint is durable, so for a moment the checkpoint's
     /// header is the only place that coverage is written down.
-    fn checkpoint_and_delta_coverage(base_dir: &std::path::Path) -> u64 {
+    fn durable_index_state(base_dir: &std::path::Path) -> DurableIndexState {
         let Ok(Some(summary)) = crate::index::checkpoint::read_checkpoint_summary(
             &Self::index_checkpoint_path(base_dir),
         ) else {
-            return 0;
+            return DurableIndexState::default();
         };
-        let from_log = match delta::read_delta_tail_fingerprint(&Self::delta_path(
-            base_dir,
-            summary.fingerprint,
-        )) {
+        // One pass over the delta log yields both what it claims and where it
+        // ends; the log is only trusted if it names this checkpoint.
+        let tail =
+            delta::read_delta_tail_fingerprint(&Self::delta_path(base_dir, summary.fingerprint));
+        let (log_coverage, fingerprint) = match tail {
             Ok(Some(tail)) if tail.base_fingerprint == summary.fingerprint => {
-                tail.coverage.unwrap_or(0)
+                (tail.coverage.unwrap_or(0), tail.tail_fingerprint)
             }
-            _ => 0,
+            Ok(Some(_) | None) => (0, summary.fingerprint),
+            Err(_) => (0, 0),
         };
-        summary.covered_lsn.max(from_log)
+        DurableIndexState {
+            covered_lsn: summary.covered_lsn.max(log_coverage),
+            fingerprint,
+        }
     }
 
     /// The journal LSN this pool's packs are known to durably cover, held in
@@ -18013,6 +18036,42 @@ mod tests {
         );
         drop(writer);
         drop(reopen_and_read_all(&dir, &wal, 4));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The one-pass durable state gives what the two separate readers gave: the
+    /// coverage `read_journal_lsn` reports and the fingerprint
+    /// `read_durable_fingerprint` reports, with and without a coverage claim in
+    /// the delta log.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn the_one_pass_durable_state_matches_the_separate_readers() {
+        let dir = test_dir("one_pass_durable_state");
+        let wal = dir.join("wal.bin");
+        let writer = writer_with_coverage_steps(&dir, &wal, 5);
+        drop(writer);
+        let state = PackfileStorage::durable_index_state(&dir);
+        let fingerprint = crate::index::checkpoint::read_durable_fingerprint(&dir)
+            .unwrap()
+            .expect("a durable fingerprint")
+            .fingerprint;
+        assert_eq!(state.fingerprint, fingerprint);
+        assert!(state.covered_lsn > 0, "the log must carry a claim");
+        assert_eq!(
+            PackfileStorage::read_journal_lsn(&dir),
+            state
+                .covered_lsn
+                .max(PackfileStorage::journal_lsn_with(&dir, 0)),
+        );
+        // No log for the checkpoint: the fingerprint is the checkpoint's own.
+        let checkpoint = crate::index::checkpoint::read_checkpoint(
+            &PackfileStorage::index_checkpoint_path(&dir),
+        )
+        .unwrap();
+        fs::remove_file(PackfileStorage::delta_path(&dir, checkpoint.fingerprint)).unwrap();
+        let bare = PackfileStorage::durable_index_state(&dir);
+        assert_eq!(bare.fingerprint, checkpoint.fingerprint);
+        assert_eq!(bare.covered_lsn, checkpoint.covered_lsn);
         let _ = fs::remove_dir_all(&dir);
     }
 

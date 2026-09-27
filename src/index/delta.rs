@@ -425,8 +425,46 @@ pub(crate) fn io_error(
     }
 }
 
+/// A sequential reader over a delta log that remembers its position, so the
+/// tail scanners can walk every frame through one large buffer instead of a
+/// `seek` and a `read` system call per frame. A seek to where the reader
+/// already is costs nothing; any other seek discards the buffer.
+struct TrackedReader {
+    reader: io::BufReader<fs::File>,
+    position: u64,
+}
+
+impl TrackedReader {
+    /// Buffer size: large enough that a log scan is a few big sequential reads.
+    const BUFFER_BYTES: usize = 1 << 20;
+
+    /// Wrap `file`, whose read position is currently `position`.
+    fn new(file: fs::File, position: u64) -> Self {
+        Self {
+            reader: io::BufReader::with_capacity(Self::BUFFER_BYTES, file),
+            position,
+        }
+    }
+
+    fn seek_to(&mut self, target: u64) -> io::Result<()> {
+        if target != self.position {
+            io::Seek::seek(&mut self.reader, io::SeekFrom::Start(target))?;
+            self.position = target;
+        }
+        Ok(())
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        io::Read::read_exact(&mut self.reader, buf)?;
+        self.position = self
+            .position
+            .saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        Ok(())
+    }
+}
+
 fn read_v3_tail_fingerprint(
-    file: &mut fs::File,
+    file: &mut TrackedReader,
     path: &Path,
     len: u64,
     header: &[u8; DELTA_LOG_HEADER_LEN],
@@ -448,7 +486,7 @@ fn read_v3_tail_fingerprint(
         if batch_header_end > len {
             break;
         }
-        file.seek(std::io::SeekFrom::Start(pos))
+        file.seek_to(pos)
             .map_err(|error| io_error(path, "seek v3 batch header", error))?;
         let mut batch_header = [0u8; DELTA_BATCH_HEADER_LEN];
         if let Err(error) = file.read_exact(&mut batch_header) {
@@ -476,7 +514,7 @@ fn read_v3_tail_fingerprint(
         if trailer_end > len {
             break;
         }
-        file.seek(std::io::SeekFrom::Start(cursor))
+        file.seek_to(cursor)
             .map_err(|error| io_error(path, "seek v3 batch trailer", error))?;
         let mut trailer = [0u8; DELTA_LOG_TRAILER_LEN];
         file.read_exact(&mut trailer)
@@ -510,7 +548,7 @@ fn read_v3_tail_fingerprint(
 }
 
 fn scan_v3_frames(
-    file: &mut fs::File,
+    file: &mut TrackedReader,
     path: &Path,
     file_len: u64,
     mut cursor: u64,
@@ -541,7 +579,7 @@ fn scan_v3_frames(
 }
 
 fn scan_v3_frame(
-    file: &mut fs::File,
+    file: &mut TrackedReader,
     path: &Path,
     file_len: u64,
     cursor: u64,
@@ -555,7 +593,7 @@ fn scan_v3_frame(
     else {
         return Ok(None);
     };
-    file.seek(std::io::SeekFrom::Start(cursor))
+    file.seek_to(cursor)
         .map_err(|error| io_error(path, "seek v3 frame header", error))?;
     let mut header = [0u8; V3_FRAME_HEADER_LEN];
     file.read_exact(&mut header)
@@ -702,7 +740,8 @@ pub fn read_delta_tail_fingerprint(
         return Err(invalid(path, "unrecognized magic"));
     }
     if log_hdr[4] == DELTA_LOG_VERSION_V3 {
-        return read_v3_tail_fingerprint(&mut file, path, len, &log_hdr).map(Some);
+        let mut reader = TrackedReader::new(file, log_header_len);
+        return read_v3_tail_fingerprint(&mut reader, path, len, &log_hdr).map(Some);
     }
     if log_hdr[4] != DELTA_LOG_VERSION {
         return Err(invalid(path, "unrecognized version"));
@@ -2027,6 +2066,67 @@ mod tests {
         let written =
             append_v3_batch_with_durability(&path, false, 0xABC, &operations, 0x1, false).unwrap();
         assert_eq!(written, projected);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The tail scanner reads through a buffer, so a torn log has to end its scan
+    /// exactly where the full reader does. Every truncation point of a log with
+    /// several batches gives the same tail fingerprint and coverage from both.
+    #[test]
+    fn the_buffered_tail_scanner_agrees_with_the_full_reader_at_every_cut() {
+        let dir = coverage_log_dir("buffered_cuts");
+        let path = dir.join(INDEX_DELTA_FILE);
+        let incremental = |slot| {
+            DeltaOperation::Incremental(DeltaFrame {
+                collection_id: [2; 16],
+                bucket: 1,
+                generation: 1,
+                slot,
+            })
+        };
+        append_v3_batch_with_durability(&path, true, 0xABC, &[incremental(1)], 0x111, false)
+            .unwrap();
+        append_v3_batch_with_durability(
+            &path,
+            false,
+            0xABC,
+            &[incremental(2), DeltaOperation::Coverage { covered_lsn: 9 }],
+            0x222,
+            false,
+        )
+        .unwrap();
+        append_v3_batch_with_durability(
+            &path,
+            false,
+            0xABC,
+            &[
+                incremental(3),
+                incremental(4),
+                DeltaOperation::Coverage { covered_lsn: 20 },
+            ],
+            0x333,
+            false,
+        )
+        .unwrap();
+        let full = fs::read(&path).unwrap();
+        for cut in DELTA_LOG_HEADER_LEN..=full.len() {
+            fs::write(&path, &full[..cut]).unwrap();
+            let log = read_delta_log_v3(&path);
+            let tail = read_delta_tail_fingerprint(&path);
+            match (log, tail) {
+                (Some(log), Ok(Some(tail))) => {
+                    assert_eq!(log.tail_fingerprint, tail.tail_fingerprint, "cut {cut}");
+                    assert_eq!(log.coverage, tail.coverage, "cut {cut}");
+                    assert_eq!(log.torn_tail, tail.torn_tail, "cut {cut}");
+                }
+                (None, Err(_) | Ok(None)) => {}
+                (log, tail) => panic!(
+                    "cut {cut}: full reader {:?}, tail scanner {:?}",
+                    log.map(|log| log.tail_fingerprint),
+                    tail.map(|tail| tail.map(|tail| tail.tail_fingerprint)).ok()
+                ),
+            }
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
