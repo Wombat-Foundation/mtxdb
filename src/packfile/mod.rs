@@ -3,7 +3,7 @@ pub mod layout;
 /// The [`PackfileStorage`](storage::PackfileStorage) engine and its supporting types.
 pub mod storage;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;
 
 use bytes::Bytes;
@@ -1596,6 +1596,180 @@ impl Iterator for RecordScanner {
 
 impl std::iter::FusedIterator for RecordScanner {}
 
+/// What [`extract_packfile_collection`] extracted from a packfile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackExtractStats {
+    /// Number of frames extracted for the target collection.
+    pub frames_extracted: u64,
+    /// Total bytes of extracted frames written (excluding the header).
+    pub frame_bytes_written: u64,
+    /// Total frames scanned in the source packfile.
+    pub frames_scanned: u64,
+    /// Whether the scan stopped at a torn trailing frame.
+    pub torn_tail: bool,
+}
+
+/// Extract all frames belonging to `target_collection` from `source_path` and write
+/// them verbatim into a new valid packfile at `dest_path` with header `dest_pack_id`.
+///
+/// Every frame's framing and CRC is verified. Frame bytes (including compression
+/// and optional frame metadata) are copied without decompressing or re-serializing,
+/// ensuring byte-level fidelity. If the source pack ends in a torn tail, extraction
+/// stops cleanly at the last valid frame and records `torn_tail: true` in the returned
+/// stats.
+fn validate_extracted_frame(frame_buf: &[u8], frame_len: u32) -> io::Result<()> {
+    let total_frame_len = frame_buf.len();
+    let flags = *frame_buf
+        .get(4)
+        .ok_or_else(|| invalid_data("truncated frame"))?;
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported record flags: {flags:#04x}"),
+        ));
+    }
+
+    if flags & FLAG_METADATA != 0 {
+        let meta_offset = (4_usize).saturating_add(FRAME_FIXED_LEN as usize);
+        let header_end = meta_offset.saturating_add(5).saturating_add(4);
+        if total_frame_len < header_end {
+            return Err(invalid_data("frame too short for metadata header"));
+        }
+        let version = *frame_buf
+            .get(meta_offset)
+            .ok_or_else(|| invalid_data("missing metadata version"))?;
+        if version != METADATA_VERSION {
+            return Err(invalid_data(&format!(
+                "frame metadata: unsupported version {version}"
+            )));
+        }
+        let tlv_bytes: [u8; 4] = frame_buf
+            .get(meta_offset.saturating_add(1)..meta_offset.saturating_add(5))
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| invalid_data("truncated metadata length prefix"))?;
+        let tlv_len = u32::from_le_bytes(tlv_bytes);
+        let _ = checked_metadata_block_len(tlv_len, frame_len)?;
+    }
+
+    if flags & FLAG_CRC_DISABLED == 0 {
+        let crc_start = total_frame_len.saturating_sub(4);
+        let expected_bytes: [u8; 4] = frame_buf
+            .get(crc_start..total_frame_len)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| invalid_data("truncated CRC"))?;
+        let expected_crc = u32::from_le_bytes(expected_bytes);
+        let actual_crc = crc32fast::hash(&frame_buf[..crc_start]);
+        if actual_crc != expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame CRC mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract all frames belonging to `target_collection` from `source_path` and write
+/// them verbatim into a new valid packfile at `dest_path` with header `dest_pack_id`.
+///
+/// Every frame's framing and CRC is verified. Frame bytes (including compression
+/// and optional frame metadata) are copied without decompressing or re-serializing,
+/// ensuring byte-level fidelity. If the source pack ends in a torn tail, extraction
+/// stops cleanly at the last valid frame and records `torn_tail: true` in the returned
+/// stats.
+///
+/// # Errors
+/// Returns an I/O error if files cannot be opened/created, if `source_path` does not
+/// have a valid pack header, or if any frame has invalid framing or CRC mismatch.
+pub fn extract_packfile_collection(
+    source_path: &Path,
+    dest_path: &Path,
+    target_collection: &[u8; 16],
+    dest_pack_id: u64,
+) -> io::Result<PackExtractStats> {
+    let src_file = File::open(source_path)?;
+    let mut reader = BufReader::with_capacity(RECOVERY_BUFFER_BYTES, src_file);
+
+    let Some(_header) = read_header(&mut reader)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "not an mtxdb packfile (missing magic header): {}",
+                source_path.display()
+            ),
+        ));
+    };
+
+    let dst_file = File::create(dest_path)?;
+    let mut writer = BufWriter::new(dst_file);
+    write_header(&mut writer, dest_pack_id)?;
+
+    let mut stats = PackExtractStats {
+        frames_extracted: 0,
+        frame_bytes_written: 0,
+        frames_scanned: 0,
+        torn_tail: false,
+    };
+
+    let mut frame_buf = Vec::new();
+
+    loop {
+        let len_buf = match read_frame_len_prefix(&mut reader) {
+            Ok(Some(buf)) => buf,
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                stats.torn_tail = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let frame_len = u32::from_le_bytes(len_buf);
+        if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid record length: {frame_len}"),
+            ));
+        }
+
+        let total_frame_len = (frame_len as usize).saturating_add(8);
+        frame_buf.resize(total_frame_len, 0);
+        frame_buf[0..4].copy_from_slice(&len_buf);
+
+        match reader.read_exact(&mut frame_buf[4..total_frame_len]) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                stats.torn_tail = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+
+        validate_extracted_frame(&frame_buf, frame_len)?;
+
+        stats.frames_scanned = stats.frames_scanned.saturating_add(1);
+
+        let mut frame_collection = [0u8; 16];
+        frame_collection.copy_from_slice(&frame_buf[9..25]);
+
+        if frame_collection == *target_collection {
+            writer.write_all(&frame_buf)?;
+            stats.frames_extracted = stats.frames_extracted.saturating_add(1);
+            stats.frame_bytes_written = stats
+                .frame_bytes_written
+                .saturating_add(u64::try_from(total_frame_len).unwrap_or(u64::MAX));
+        }
+    }
+
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+
+    Ok(stats)
+}
+
 /// Scan a packfile and truncate any torn tail at the last valid record
 /// boundary. Used during explicit recovery to repair a packfile before
 /// reopening for append.
@@ -2708,5 +2882,178 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_extract_packfile_collection_slices_target_collection_verbatim() {
+        let dir = test_dir("extract_collection_verbatim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("source.pack");
+        let dst_path = dir.join("dest.pack");
+
+        let collection_a = [0x11; 16];
+        let collection_b = [0x22; 16];
+
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0x100).unwrap();
+
+        let target_record_first = Record {
+            collection_id: collection_a,
+            hash: [0xA1; 16],
+            data: Bytes::from_static(b"room A record 1"),
+            metadata: Some(FrameMetadata {
+                logical_id: Some([0xAA; 32]),
+                content_digest: Some([0xD1; 32]),
+                digest_algorithm: DigestAlgorithm::Blake3,
+                role: Some(b"event".to_vec()),
+                unknown: vec![(0x7f, vec![0xDE, 0xAD])],
+            }),
+        };
+        write_record(&mut buf, &target_record_first).unwrap();
+
+        let other_collection_record = Record {
+            collection_id: collection_b,
+            hash: [0xB1; 16],
+            data: Bytes::from_static(b"room B record 1"),
+            metadata: Some(FrameMetadata {
+                role: Some(b"state".to_vec()),
+                ..FrameMetadata::default()
+            }),
+        };
+        write_record(&mut buf, &other_collection_record).unwrap();
+
+        let target_record_second = Record {
+            collection_id: collection_a,
+            hash: [0xA2; 16],
+            data: Bytes::from_static(b" { \"whitespace\" : true } "),
+            metadata: None,
+        };
+        write_record(&mut buf, &target_record_second).unwrap();
+
+        std::fs::write(&src_path, &buf).unwrap();
+
+        let stats =
+            extract_packfile_collection(&src_path, &dst_path, &collection_a, 0x200).unwrap();
+        assert_eq!(stats.frames_extracted, 2);
+        assert_eq!(stats.frames_scanned, 3);
+        assert!(!stats.torn_tail);
+        assert!(stats.frame_bytes_written > 0);
+
+        // Verify the destination packfile
+        let mut scanner = scan_records_iter(&dst_path).unwrap();
+        let first = scanner.next().unwrap().unwrap().1;
+        assert_eq!(first.collection_id, collection_a);
+        assert_eq!(first.hash, [0xA1; 16]);
+        assert_eq!(first.data.as_ref(), b"room A record 1");
+        assert_eq!(first.metadata, target_record_first.metadata);
+
+        let second = scanner.next().unwrap().unwrap().1;
+        assert_eq!(second.collection_id, collection_a);
+        assert_eq!(second.hash, [0xA2; 16]);
+        assert_eq!(second.data.as_ref(), b" { \"whitespace\" : true } ");
+        assert_eq!(second.metadata, None);
+
+        assert!(scanner.next().is_none());
+
+        // Verify header pack_id in dest file
+        let mut dst_file = File::open(&dst_path).unwrap();
+        let header = read_header(&mut dst_file).unwrap().unwrap();
+        assert_eq!(header.pack_id, 0x200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_packfile_collection_handles_torn_tail() {
+        let dir = test_dir("extract_collection_torn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("source.pack");
+        let dst_path = dir.join("dest.pack");
+
+        let collection_a = [0x11; 16];
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        write_record(
+            &mut buf,
+            &test_record(collection_a, [0x01; 16], b"valid record"),
+        )
+        .unwrap();
+        buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes (< 4 prefix bytes)
+        std::fs::write(&src_path, &buf).unwrap();
+
+        let stats = extract_packfile_collection(&src_path, &dst_path, &collection_a, 1).unwrap();
+        assert_eq!(stats.frames_extracted, 1);
+        assert_eq!(stats.frames_scanned, 1);
+        assert!(stats.torn_tail);
+
+        let mut scanner = scan_records_iter(&dst_path).unwrap();
+        let record = scanner.next().unwrap().unwrap().1;
+        assert_eq!(record.data.as_ref(), b"valid record");
+        assert!(scanner.next().is_none());
+        assert!(
+            !scanner.torn_tail(),
+            "extracted destination must have clean EOF"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_packfile_collection_handles_torn_payload_body() {
+        let dir = test_dir("extract_collection_torn_body");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("source.pack");
+        let dst_path = dir.join("dest.pack");
+
+        let collection_a = [0x11; 16];
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        write_record(
+            &mut buf,
+            &test_record(collection_a, [0x01; 16], b"valid record"),
+        )
+        .unwrap();
+        // Valid frame len prefix, but truncated payload body
+        buf.extend_from_slice(&(FRAME_FIXED_LEN + 10).to_le_bytes());
+        buf.extend_from_slice(&[0x00; 5]); // only 5 bytes of payload written before crash
+        std::fs::write(&src_path, &buf).unwrap();
+
+        let stats = extract_packfile_collection(&src_path, &dst_path, &collection_a, 1).unwrap();
+        assert_eq!(stats.frames_extracted, 1);
+        assert_eq!(stats.frames_scanned, 1);
+        assert!(stats.torn_tail);
+
+        let mut scanner = scan_records_iter(&dst_path).unwrap();
+        let record = scanner.next().unwrap().unwrap().1;
+        assert_eq!(record.data.as_ref(), b"valid record");
+        assert!(scanner.next().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_packfile_collection_rejects_corrupted_crc() {
+        let dir = test_dir("extract_collection_corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("source.pack");
+        let dst_path = dir.join("dest.pack");
+
+        let collection_a = [0x11; 16];
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        write_record(
+            &mut buf,
+            &test_record(collection_a, [0x01; 16], b"valid record"),
+        )
+        .unwrap();
+        // Corrupt a byte in the frame
+        let corrupt_idx = HEADER_LEN + 10;
+        buf[corrupt_idx] ^= 0x55;
+        std::fs::write(&src_path, &buf).unwrap();
+
+        let err = extract_packfile_collection(&src_path, &dst_path, &collection_a, 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

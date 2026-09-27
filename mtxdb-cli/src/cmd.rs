@@ -7680,6 +7680,41 @@ fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
             collection,
             out,
         } => cmd_packs_dump(cli, pack, collection.as_deref(), out.as_deref()),
+        PacksAction::Extract {
+            pack,
+            collection,
+            out,
+            dest_pack_id,
+        } => cmd_packs_extract(cli, pack, collection, out, dest_pack_id.as_deref()),
+    }
+}
+
+/// Resolve a numeric pack ID to its shard pool type and physical file path.
+/// Refuses to resolve if the pack ID is ambiguous across multiple pools unless
+/// `-t` narrows the search.
+fn resolve_pack_file(cli: &Cli, pack_id: u64) -> anyhow::Result<(ShardType, PathBuf)> {
+    let layout = open_layout(cli)?;
+    let mut matches: Vec<(ShardType, PathBuf)> = Vec::new();
+    for shard_type in cli.shard_types() {
+        let dir = pool_dir(&layout, shard_type)?;
+        if !dir.is_dir() {
+            continue;
+        }
+        let path = dir.join(format!("pack_{pack_id:016x}.pack"));
+        if path.is_file() {
+            matches.push((shard_type, path));
+        }
+    }
+    match matches.as_slice() {
+        [(shard_type, path)] => Ok((*shard_type, path.clone())),
+        [] => bail!("pack 0x{pack_id:016x}: not found"),
+        _ => {
+            let pools: Vec<&str> = matches.iter().map(|(kind, _)| kind.as_str()).collect();
+            bail!(
+                "pack 0x{pack_id:016x} exists in multiple pools ({}); pass -t <type> to disambiguate — pack IDs are pool-local",
+                pools.join(", ")
+            );
+        }
     }
 }
 
@@ -7702,30 +7737,7 @@ fn cmd_packs_dump(
 
     // `pack_id` is pool-local, so the same numeric id can exist in more than
     // one pool. Refuse to merge two different packs into one output stream.
-    // Filenames are canonical (`pack_{id:016x}.pack`), so a direct stat is
-    // enough — no need to open and header-validate every unrelated pack.
-    let layout = open_layout(cli)?;
-    let mut matches: Vec<(ShardType, PathBuf)> = Vec::new();
-    for shard_type in cli.shard_types() {
-        let dir = pool_dir(&layout, shard_type)?;
-        if !dir.is_dir() {
-            continue;
-        }
-        let path = dir.join(format!("pack_{pack_id:016x}.pack"));
-        if path.is_file() {
-            matches.push((shard_type, path));
-        }
-    }
-    let [(shard_type, path)] = matches.as_slice() else {
-        if matches.is_empty() {
-            bail!("pack 0x{pack_id:016x}: not found");
-        }
-        let pools: Vec<&str> = matches.iter().map(|(kind, _)| kind.as_str()).collect();
-        bail!(
-            "pack 0x{pack_id:016x} exists in multiple pools ({}); pass -t <type> to disambiguate — pack IDs are pool-local",
-            pools.join(", ")
-        );
-    };
+    let (shard_type, path) = resolve_pack_file(cli, pack_id)?;
 
     let stdout = io::stdout();
     let mut writer: Box<dyn Write> = match out {
@@ -7736,7 +7748,7 @@ fn cmd_packs_dump(
     };
 
     let mut written = 0_usize;
-    let mut scanner = mtxdb::packfile::scan_records_iter(path)?;
+    let mut scanner = mtxdb::packfile::scan_records_iter(&path)?;
     for frame in scanner.by_ref() {
         let (offset, record) = frame?;
         if collection_filter.is_some_and(|filter| record.collection_id != filter) {
@@ -7759,6 +7771,97 @@ fn cmd_packs_dump(
         shard_type.as_str()
     );
     Ok(())
+}
+
+/// Extract frames belonging to a collection from one pack into a new valid
+/// packfile with a fresh pack header, copying frame bytes verbatim.
+fn cmd_packs_extract(
+    cli: &Cli,
+    pack_selector: &str,
+    collection_selector: &str,
+    out: &Path,
+    dest_pack_id_selector: Option<&str>,
+) -> anyhow::Result<()> {
+    cli.require_single_dir("packs extract")?;
+    let pack_id = parse_pack_id_selector(pack_selector)?;
+    let collection_id = parse_collection_selector(collection_selector)?;
+    let (shard_type, source_path) = resolve_pack_file(cli, pack_id)?;
+
+    // Guard against accidental source file truncation when --out points to the same file.
+    if let (Ok(src_canon), Ok(dst_canon)) = (source_path.canonicalize(), out.canonicalize()) {
+        if src_canon == dst_canon {
+            bail!(
+                "--out cannot be the same file as the source pack `{}`",
+                source_path.display()
+            );
+        }
+    } else if source_path == out {
+        bail!(
+            "--out cannot be the same file as the source pack `{}`",
+            source_path.display()
+        );
+    }
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating directory `{}`", parent.display()))?;
+        }
+    }
+
+    let dest_pack_id = resolve_dest_pack_id(out, dest_pack_id_selector)?;
+
+    let stats = mtxdb::packfile::extract_packfile_collection(
+        &source_path,
+        out,
+        &collection_id,
+        dest_pack_id,
+    )
+    .with_context(|| {
+        format!(
+            "extracting collection {} from `{}` into `{}`",
+            format_id(&collection_id),
+            source_path.display(),
+            out.display(),
+        )
+    })?;
+
+    if stats.torn_tail {
+        eprintln!(
+            "warning: pack 0x{pack_id:016x} ends in a torn frame; its tail was not extracted \
+             (a concurrent writer can cause this)"
+        );
+    }
+    eprintln!(
+        "extracted {} frames ({} bytes) from pack 0x{pack_id:016x} ({} pool) into {}",
+        stats.frames_extracted,
+        stats.frame_bytes_written,
+        shard_type.as_str(),
+        out.display(),
+    );
+    Ok(())
+}
+
+/// Determine the pack identity to stamp in the extracted packfile's header.
+/// If an explicit selector is given, parses it; otherwise if the output file
+/// is named `pack_{16 hex digits}.pack`, parses that ID to preserve pool naming
+/// invariants; otherwise defaults to 0.
+fn resolve_dest_pack_id(dest_path: &Path, override_id: Option<&str>) -> anyhow::Result<u64> {
+    if let Some(selector) = override_id {
+        return parse_pack_id_selector(selector);
+    }
+    if let Some(stem) = dest_path.file_stem().and_then(|s| s.to_str()) {
+        if dest_path.extension().is_some_and(|ext| ext == "pack") {
+            if let Some(hex) = stem.strip_prefix("pack_") {
+                if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    if let Ok(id) = u64::from_str_radix(hex, 16) {
+                        return Ok(id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(0)
 }
 
 /// Render one `mtxdb.pack.dump/v1` line for a pack frame.
@@ -11159,6 +11262,189 @@ mod tests {
         };
         let error = super::cmd_packs_dump(&cli, "0x0", None, None).unwrap_err();
         assert!(error.to_string().contains("not found"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn packs_extract_slices_target_collection_into_valid_pack() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+        let store = PackfileStorage::open(pool).unwrap();
+
+        let room1_selector = "!room1:example.org";
+        let room1_id = super::parse_collection_selector(room1_selector).unwrap();
+        let room2_selector = "!room2:example.org";
+        let room2_id = super::parse_collection_selector(room2_selector).unwrap();
+
+        let node1_id = [0x11; 16];
+        let node2_id = [0x22; 16];
+
+        let payload1 = b"{\"event\":\"room1\"}";
+        let digest1 = mtxdb::content_digest(DigestAlgorithm::Blake3, payload1);
+        store
+            .put_verified(
+                &room1_id,
+                &node1_id,
+                &NodeData::new(Bytes::from_static(payload1)),
+                &[0x01; 32],
+                DigestAlgorithm::Blake3,
+                &digest1,
+                Some(b"timeline"),
+            )
+            .unwrap();
+
+        let payload2 = b"{\"event\":\"room2\"}";
+        let digest2 = mtxdb::content_digest(DigestAlgorithm::Blake3, payload2);
+        store
+            .put_verified(
+                &room2_id,
+                &node2_id,
+                &NodeData::new(Bytes::from_static(payload2)),
+                &[0x02; 32],
+                DigestAlgorithm::Blake3,
+                &digest2,
+                Some(b"state"),
+            )
+            .unwrap();
+
+        store.sync().unwrap();
+        let pack_id = store.shard_summaries()[0].pack_id;
+        drop(store);
+
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Packs {
+                action: super::PacksAction::List { all: false },
+            },
+        };
+
+        let out_pack = dir.join("room1_extracted.pack");
+        super::cmd_packs_extract(
+            &cli,
+            &format!("0x{pack_id:016x}"),
+            room1_selector,
+            &out_pack,
+            Some("0xabc"),
+        )
+        .unwrap();
+
+        assert!(out_pack.is_file());
+
+        // Validate extracted pack
+        let mut scanner = mtxdb::packfile::scan_records_iter(&out_pack).unwrap();
+        let (offset, record) = scanner.next().unwrap().unwrap();
+        assert_eq!(offset, mtxdb::packfile::HEADER_LEN as u64);
+        assert_eq!(record.collection_id, room1_id);
+        assert_eq!(record.hash, node1_id);
+        assert_eq!(record.data.as_ref(), b"{\"event\":\"room1\"}");
+        assert_eq!(
+            record.metadata.as_ref().and_then(|m| m.role.as_deref()),
+            Some(b"timeline".as_slice())
+        );
+        assert!(scanner.next().is_none());
+        assert!(!scanner.torn_tail());
+
+        // Validate header pack_id stamped in dest pack
+        let mut file = std::fs::File::open(&out_pack).unwrap();
+        let header = mtxdb::packfile::read_header(&mut file).unwrap().unwrap();
+        assert_eq!(header.pack_id, 0xabc);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn packs_extract_rejects_same_source_and_dest() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+        let store = PackfileStorage::open(pool).unwrap();
+        store
+            .put(
+                &[0x11; 16],
+                &[0x22; 16],
+                &NodeData::new(Bytes::from_static(b"data")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        let pack_id = store.shard_summaries()[0].pack_id;
+        drop(store);
+
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Packs {
+                action: super::PacksAction::List { all: false },
+            },
+        };
+
+        let source_path = layout
+            .pool_dir_read_only(ShardType::EventDag)
+            .unwrap()
+            .join(format!("pack_{pack_id:016x}.pack"));
+
+        let error = super::cmd_packs_extract(
+            &cli,
+            &format!("0x{pack_id:016x}"),
+            "0x11111111111111111111111111111111",
+            &source_path,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be the same file"),
+            "{error}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn packs_extract_derives_pack_id_from_filename_when_unspecified() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+        let store = PackfileStorage::open(pool).unwrap();
+        store
+            .put(
+                &[0x11; 16],
+                &[0x22; 16],
+                &NodeData::new(Bytes::from_static(b"data")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        let pack_id = store.shard_summaries()[0].pack_id;
+        drop(store);
+
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Packs {
+                action: super::PacksAction::List { all: false },
+            },
+        };
+
+        let out_pack = dir.join("pack_000000000000000f.pack");
+        super::cmd_packs_extract(
+            &cli,
+            &format!("0x{pack_id:016x}"),
+            "0x11111111111111111111111111111111",
+            &out_pack,
+            None,
+        )
+        .unwrap();
+
+        let mut file = std::fs::File::open(&out_pack).unwrap();
+        let header = mtxdb::packfile::read_header(&mut file).unwrap().unwrap();
+        assert_eq!(header.pack_id, 0x0f);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

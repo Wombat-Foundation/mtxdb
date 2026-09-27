@@ -203,6 +203,13 @@ pub(crate) enum PacksAction {
         collection: Option<String>,
         out: Option<PathBuf>,
     },
+    /// Extract frames for one collection into a new standalone pack.
+    Extract {
+        pack: String,
+        collection: String,
+        out: PathBuf,
+        dest_pack_id: Option<String>,
+    },
 }
 
 fn build_cli() -> Command {
@@ -661,41 +668,85 @@ fn sub_packs() -> Command {
                         .help("Pack identity (0x-prefixed 16 hex digits)"),
                 ),
         )
-        .subcommand(
-            Command::new("dump")
-                .about("Dump every frame in one pack as decoded JSONL")
-                .long_about(
-                    "Dump every frame in a pack, in physical order and without deduplication, as one \
-                     JSON object per line: pool, pack identity, frame offset, collection id, node \
-                     id, payload, and frame metadata. `payload_base64` is the exact stored bytes; \
-                     `payload` is a decoded JSON convenience value (which may differ in whitespace, \
-                     key order, or numeric spelling) and is absent for binary payloads. Unlike \
-                     `export`, this is a complete view of one pack (all collections, superseded \
-                     frames included), not a collection's live set. Pack IDs are pool-local, so a \
-                     pack id present in more than one pool is rejected unless -t selects one.",
-                )
-                .arg(
-                    Arg::new("pack")
-                        .short('p')
-                        .long("pack")
-                        .required(true)
-                        .value_name("PACK_ID")
-                        .help("Pack identity (0x-prefixed 16 hex digits)"),
-                )
-                .arg(
-                    Arg::new("collection")
-                        .short('r')
-                        .long("collection")
-                        .value_name("COLLECTION")
-                        .help("Only dump frames for this collection (0x-prefixed id or !room:server)"),
-                )
-                .arg(
-                    Arg::new("out")
-                        .short('o')
-                        .long("out")
-                        .value_name("FILE")
-                        .help("Write JSONL to FILE instead of stdout"),
-                ),
+        .subcommand(sub_packs_dump())
+        .subcommand(sub_packs_extract())
+}
+
+fn sub_packs_dump() -> Command {
+    Command::new("dump")
+        .about("Dump every frame in one pack as decoded JSONL")
+        .long_about(
+            "Dump every frame in a pack, in physical order and without deduplication, as one \
+             JSON object per line: pool, pack identity, frame offset, collection id, node \
+             id, payload, and frame metadata. `payload_base64` is the exact stored bytes; \
+             `payload` is a decoded JSON convenience value (which may differ in whitespace, \
+             key order, or numeric spelling) and is absent for binary payloads. Unlike \
+             `export`, this is a complete view of one pack (all collections, superseded \
+             frames included), not a collection's live set. Pack IDs are pool-local, so a \
+             pack id present in more than one pool is rejected unless -t selects one.",
+        )
+        .arg(
+            Arg::new("pack")
+                .short('p')
+                .long("pack")
+                .required(true)
+                .value_name("PACK_ID")
+                .help("Pack identity (0x-prefixed 16 hex digits)"),
+        )
+        .arg(
+            Arg::new("collection")
+                .short('r')
+                .long("collection")
+                .value_name("COLLECTION")
+                .help("Only dump frames for this collection (0x-prefixed id or !room:server)"),
+        )
+        .arg(
+            Arg::new("out")
+                .short('o')
+                .long("out")
+                .value_name("FILE")
+                .help("Write JSONL to FILE instead of stdout"),
+        )
+}
+
+fn sub_packs_extract() -> Command {
+    Command::new("extract")
+        .about("Extract frames for one collection into a new standalone pack")
+        .long_about(
+            "Extract frames belonging to a collection from one pack into a new valid packfile, \
+             copying frame bytes verbatim (preserving compression, metadata, and CRCs) with a \
+             fresh pack header. The collection can be specified as a `0x`-prefixed 32-hex-digit ID \
+             or a Matrix room ID (`!room:server`).",
+        )
+        .arg(
+            Arg::new("pack")
+                .short('p')
+                .long("pack")
+                .required(true)
+                .value_name("PACK_ID")
+                .help("Source pack identity (0x-prefixed 16 hex digits)"),
+        )
+        .arg(
+            Arg::new("collection")
+                .short('r')
+                .long("collection")
+                .required(true)
+                .value_name("COLLECTION")
+                .help("Collection to extract (0x-prefixed id or !room:server)"),
+        )
+        .arg(
+            Arg::new("out")
+                .short('o')
+                .long("out")
+                .required(true)
+                .value_name("FILE")
+                .help("Path for the extracted packfile"),
+        )
+        .arg(
+            Arg::new("dest_pack_id")
+                .long("dest-pack-id")
+                .value_name("PACK_ID")
+                .help("Pack identity to stamp in the output header (defaults to 0, or parsed from pack_{hex}.pack filename)"),
         )
 }
 
@@ -963,6 +1014,12 @@ fn parse_cli() -> Cli {
                     pack: sub.get_one::<String>("pack").unwrap().clone(),
                     collection: sub.get_one::<String>("collection").cloned(),
                     out: sub.get_one::<String>("out").map(PathBuf::from),
+                },
+                Some(("extract", sub)) => PacksAction::Extract {
+                    pack: sub.get_one::<String>("pack").unwrap().clone(),
+                    collection: sub.get_one::<String>("collection").unwrap().clone(),
+                    out: PathBuf::from(sub.get_one::<String>("out").unwrap()),
+                    dest_pack_id: sub.get_one::<String>("dest_pack_id").cloned(),
                 },
                 _ => unreachable!("subcommand_required enforces a packs action"),
             },
