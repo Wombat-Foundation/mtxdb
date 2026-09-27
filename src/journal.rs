@@ -7000,7 +7000,8 @@ mod tests {
         let (mut journal, _) = Journal::open_shared(&path).unwrap();
         for i in 0..groups {
             let first = ShardType::ALL[usize::from(i) % 3];
-            let second = ShardType::ALL[(usize::from(i) + 1) % 3];
+            let second =
+                ShardType::ALL[usize::from(i).checked_add(1).expect("index fits in usize") % 3];
             journal
                 .append_group_tagged_with_sequence(
                     &[

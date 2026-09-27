@@ -22,7 +22,7 @@ use mtxdb::{
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
 
-use crate::{Cli, Commands};
+use crate::{Cli, Commands, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
 const STATE_GROUP_DIGEST_BYTES: usize = 32;
@@ -262,6 +262,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
         Commands::Export { .. } => "export",
+        Commands::Packs { .. } => "packs",
         Commands::Repack { .. } => "repack",
         Commands::Completions { .. } => "completions",
         _ => "internal",
@@ -279,6 +280,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             | Commands::Sync { .. }
             | Commands::Scan { .. }
             | Commands::Info { .. }
+            | Commands::Packs { .. }
             | Commands::Repack { out: Some(_), .. } => {}
             Commands::Repack { out: None, .. } => {
                 bail!("--coalesce is not supported for in-place repack; coalescing repack requires --out <DIR>");
@@ -372,10 +374,15 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.require_single_dir("import")?;
             cmd_import(cli, paths, collection.as_deref(), template.as_deref())
         }
-        Commands::Export { collection } => {
+        Commands::Export {
+            collection,
+            format,
+            metadata,
+        } => {
             cli.require_single_dir("export")?;
-            cmd_export(cli, collection)
+            cmd_export(cli, collection, format, *metadata)
         }
+        Commands::Packs { action } => cmd_packs(cli, action),
         Commands::Repack {
             collection,
             packs,
@@ -7342,51 +7349,448 @@ fn template_string_at<'a>(value: &'a OwnedValue, keys: &[&str]) -> Option<&'a st
     }
 }
 
-/// Export every live JSON record in one collection as a JSONL stream. A read-only
+/// Output layout for `mtxdb export`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    /// One raw stored payload per line, re-importable by `mtxdb import`.
+    Payload,
+    /// One schema-versioned envelope per line, carrying frame metadata.
+    Envelope,
+}
+
+/// Schema identifier stamped on every envelope line.
+const EXPORT_ENVELOPE_SCHEMA: &str = "mtxdb.export/v1";
+
+/// Export every live record in one collection as a JSONL stream. A read-only
 /// frame scan avoids stale persisted collection summaries and rebuilding every
 /// collection's in-memory index just to enumerate one collection. Scanning packs
 /// in pack-ID order lets a later physical copy replace an older one with the same
 /// node ID.
-fn cmd_export(cli: &Cli, collection: &str) -> anyhow::Result<()> {
-    let collection_id = parse_collection_id(collection)?;
+///
+/// `--format jsonl` (default) is the re-importable interchange form.
+/// `--format envelope` is an **inspection-only** representation: it carries
+/// the exact stored bytes (`payload_base64`), a decoded JSON convenience
+/// value, and frame metadata from the same physical frame. It enumerates only
+/// pack-resident frames (like jsonl's ordering scan) and `mtxdb import` does
+/// not accept it.
+fn cmd_export(cli: &Cli, collection: &str, format: &str, metadata: bool) -> anyhow::Result<()> {
+    let format = match (format, metadata) {
+        ("jsonl", false) => ExportFormat::Payload,
+        ("jsonl", true) | ("envelope", _) => ExportFormat::Envelope,
+        (other, _) => bail!("unsupported export format `{other}`; choose jsonl or envelope"),
+    };
+    let collection_id = parse_collection_selector(collection)?;
     let pool_dir = selected_pool_dir(cli)?;
     let store = open_store_read_only(cli)?;
     if store.collection_index_info(&collection_id).is_none() {
         bail!("collection {collection} not found");
     }
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
-    let mut shards = pool.all_shards();
-    shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
-
-    let mut seen = HashSet::new();
-    let mut ordered_ids = Vec::new();
-    for (_, shard) in &shards {
-        for (candidate_collection, node_id, _) in mtxdb::packfile::scan_packfile(&shard.path)? {
-            if candidate_collection == collection_id
-                && seen.insert(node_id)
-                && store.get(&collection_id, &node_id)?.is_some()
-            {
-                ordered_ids.push(node_id);
-            }
-        }
-    }
+    let lines = export_lines(&store, &pool, &collection_id, format)?;
 
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
-    let mut exported = 0_usize;
-    for node_id in ordered_ids {
-        if let Some(data) = store.get(&collection_id, &node_id)? {
-            output.write_all(&data.bytes)?;
-            output.write_all(b"\n")?;
-            exported = exported.saturating_add(1);
-        }
+    for line in &lines {
+        output.write_all(line)?;
+        output.write_all(b"\n")?;
     }
     output.flush()?;
     eprintln!(
-        "exported {exported} records from collection {}",
+        "exported {} records from collection {}",
+        lines.len(),
         format_id(&collection_id)
     );
     Ok(())
+}
+
+/// Enumerate one collection's live records and render each as a line (without
+/// its trailing newline). Payload format returns the raw stored bytes; envelope
+/// format reads the winning frame so payload and metadata come from one frame.
+fn export_lines(
+    store: &PackfileStorage,
+    pool: &ShardPool,
+    collection_id: &[u8; 16],
+    format: ExportFormat,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut shards = pool.all_shards();
+    shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
+
+    // Enumerate the collection's frames in physical order. `seen` fixes the
+    // output order at first sight; `winners` records the highest-pack-id frame
+    // for each node id (latest offset within a pack wins on ties). Since open
+    // slots shards in ascending pack-id order and the index overwrites on
+    // duplicate hashes, this reproduces the live index's winner.
+    let mut seen = HashSet::new();
+    let mut ordered_ids = Vec::new();
+    let mut winners: HashMap<NodeId, (u64, u64)> = HashMap::new();
+    let mut pack_paths: HashMap<u64, PathBuf> = HashMap::new();
+    for (_, shard) in &shards {
+        pack_paths.insert(shard.pack_id, shard.path.clone());
+        for_each_frame(&shard.path, |offset, frame| {
+            if frame.collection_id != *collection_id {
+                return Ok(());
+            }
+            if seen.insert(frame.hash) {
+                ordered_ids.push(frame.hash);
+            }
+            winners.insert(frame.hash, (shard.pack_id, offset));
+            Ok(())
+        })?;
+    }
+
+    // Keep one open handle per pack for the whole pass: envelope export reads
+    // the winning frame at its offset, and reopening each pack per record would
+    // turn a large export into an open/close storm.
+    let mut readers: HashMap<u64, BufReader<fs::File>> = HashMap::new();
+
+    let mut lines = Vec::with_capacity(ordered_ids.len());
+    for node_id in ordered_ids {
+        match format {
+            ExportFormat::Payload => {
+                if let Some(data) = store.get(collection_id, &node_id)? {
+                    lines.push(data.bytes.to_vec());
+                }
+            }
+            ExportFormat::Envelope => {
+                // Read the winning frame directly so the payload and the frame
+                // metadata in one envelope always describe the same frame,
+                // rather than mixing an index-resolved payload with a
+                // separately scanned metadata copy.
+                let Some(&(pack_id, offset)) = winners.get(&node_id) else {
+                    continue;
+                };
+                let Some(path) = pack_paths.get(&pack_id) else {
+                    continue;
+                };
+                let record = read_frame_at(&mut readers, pack_id, path, offset)?;
+                lines.push(
+                    export_envelope_line(
+                        collection_id,
+                        &node_id,
+                        &record.data,
+                        record.metadata.as_ref(),
+                    )
+                    .into_bytes(),
+                );
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// Read one frame at a known committed byte offset from a pack, reusing a
+/// cached handle (opened on first use) so a per-record read is a seek, not an
+/// open/close pair.
+fn read_frame_at(
+    readers: &mut HashMap<u64, BufReader<fs::File>>,
+    pack_id: u64,
+    path: &Path,
+    offset: u64,
+) -> anyhow::Result<mtxdb::packfile::Record> {
+    let reader = match readers.entry(pack_id) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let file =
+                fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            entry.insert(BufReader::new(file))
+        }
+    };
+    reader
+        .seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking to offset {offset} in {}", path.display()))?;
+    mtxdb::packfile::read_record(reader)?
+        .with_context(|| format!("frame at offset {offset} in {} is missing", path.display()))
+}
+
+/// Call `visit` for every frame in a pack file with its byte offset and parsed
+/// identity/metadata. Payloads are streamed for CRC verification but never
+/// materialized or decompressed. A torn active tail stops the scan cleanly.
+fn for_each_frame(
+    path: &Path,
+    mut visit: impl FnMut(u64, mtxdb::packfile::RecordMetadata) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    // A missing magic header is a broken packfile, not an empty one; without
+    // this check the record loop would start at offset 4 and mis-frame.
+    mtxdb::packfile::read_header(&mut reader)?.with_context(|| {
+        format!(
+            "not an mtxdb packfile (missing magic header): {}",
+            path.display()
+        )
+    })?;
+    loop {
+        let offset = reader.stream_position()?;
+        match mtxdb::packfile::read_record_metadata(&mut reader) {
+            Ok(Some(frame)) => visit(offset, frame)?,
+            Ok(None) => break,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Render one `mtxdb.export/v1` envelope as a single JSON line.
+fn export_envelope_line(
+    collection_id: &[u8; 16],
+    node_id: &[u8; 16],
+    payload: &[u8],
+    metadata: Option<&mtxdb::packfile::FrameMetadata>,
+) -> String {
+    let mut fields: Vec<(&'static str, String)> = vec![
+        ("schema", json_string(EXPORT_ENVELOPE_SCHEMA)),
+        (
+            "collection_id",
+            json_string(&format!("0x{}", hex::encode(collection_id))),
+        ),
+        (
+            "node_id",
+            json_string(&format!("0x{}", hex::encode(node_id))),
+        ),
+    ];
+    fields.extend(payload_fields(payload));
+    fields.push((
+        "metadata",
+        metadata.map_or_else(|| "null".to_owned(), render_frame_metadata),
+    ));
+    json_compact_object(&fields)
+}
+
+/// Compact, single-line JSON object from pre-rendered fields. Keys are static
+/// ASCII literals, so only the values need escaping (done by the callers).
+fn json_compact_object(fields: &[(&str, String)]) -> String {
+    let mut out = String::from("{");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(key);
+        out.push_str("\":");
+        out.push_str(value);
+    }
+    out.push('}');
+    out
+}
+
+/// Payload fields shared by the export envelope and the pack dump:
+/// `payload_base64` is always the exact stored bytes (so the representation is
+/// lossless); `payload` is a decoded convenience value present only when the
+/// bytes are a single JSON document. The decoded value may differ
+/// byte-for-byte from the stored bytes (whitespace, key order, numeric
+/// spelling), which is why `payload_base64` is authoritative.
+fn payload_fields(payload: &[u8]) -> Vec<(&'static str, String)> {
+    let mut fields = vec![("payload_base64", json_string(&base64_encode(payload)))];
+    match compact_json_value(payload) {
+        Some(value) => {
+            fields.push(("payload_encoding", json_string("json")));
+            fields.push(("payload", value));
+        }
+        None => fields.push(("payload_encoding", json_string("base64"))),
+    }
+    fields
+}
+
+/// Compact single-line JSON encoding of one stored value, or `None` if the
+/// payload is not a single JSON document (e.g. a binary HAMT node).
+fn compact_json_value(bytes: &[u8]) -> Option<String> {
+    let mut copy = bytes.to_vec();
+    let value = simd_json::to_owned_value(&mut copy).ok()?;
+    Some(value.encode())
+}
+
+/// Render a frame metadata block as a compact JSON object.
+fn render_frame_metadata(metadata: &mtxdb::packfile::FrameMetadata) -> String {
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    if let Some(logical_id) = &metadata.logical_id {
+        fields.push((
+            "logical_id",
+            json_string(&format!("0x{}", hex::encode(logical_id))),
+        ));
+    }
+    if let Some(content_digest) = &metadata.content_digest {
+        fields.push((
+            "content_digest",
+            json_string(&format!("0x{}", hex::encode(content_digest))),
+        ));
+        fields.push((
+            "digest_algorithm",
+            json_string(digest_algorithm_name(metadata.digest_algorithm)),
+        ));
+        fields.push((
+            "digest_algorithm_id",
+            json_string(&metadata.digest_algorithm.id().to_string()),
+        ));
+    }
+    if let Some(role) = &metadata.role {
+        let (encoding, value) = match std::str::from_utf8(role) {
+            Ok(text) => ("utf8", text.to_owned()),
+            Err(_) => ("base64", base64_encode(role)),
+        };
+        fields.push((
+            "role",
+            json_compact_object(&[
+                ("encoding", json_string(encoding)),
+                ("value", json_string(&value)),
+            ]),
+        ));
+    }
+    if !metadata.unknown.is_empty() {
+        let encoded: Vec<String> = metadata
+            .unknown
+            .iter()
+            .map(|(tag, value)| {
+                json_compact_object(&[
+                    ("tag", tag.to_string()),
+                    ("value_base64", json_string(&base64_encode(value))),
+                ])
+            })
+            .collect();
+        fields.push(("unknown", format!("[{}]", encoded.join(","))));
+    }
+    json_compact_object(&fields)
+}
+
+/// Human-readable name for a content-digest algorithm.
+fn digest_algorithm_name(algorithm: DigestAlgorithm) -> &'static str {
+    match algorithm {
+        DigestAlgorithm::Sha256 => "sha256",
+        DigestAlgorithm::Blake3 => "blake3",
+        DigestAlgorithm::Unknown(_) => "unknown",
+    }
+}
+
+/// Standard (padded) base64, used for non-JSON payloads and metadata bytes.
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Schema identifier stamped on every `packs dump` line.
+const PACK_DUMP_SCHEMA: &str = "mtxdb.pack.dump/v1";
+
+/// Read-only `packs` group: list packs or dump one pack's frames as JSONL.
+fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
+    match action {
+        PacksAction::List { all } => cmd_shards(cli, *all, false, None),
+        PacksAction::Inspect { pack } => cmd_info_pack(cli, pack),
+        PacksAction::Dump {
+            pack,
+            collection,
+            out,
+        } => cmd_packs_dump(cli, pack, collection.as_deref(), out.as_deref()),
+    }
+}
+
+/// Dump every frame in one pack, in physical order and without deduplication,
+/// as one JSON object per line. This is a complete view of a single pack's
+/// contents (all collections, superseded frames included) rather than a
+/// collection's live set. `payload_base64` carries the exact stored bytes;
+/// `payload` is a decoded convenience value for JSON payloads.
+fn cmd_packs_dump(
+    cli: &Cli,
+    pack_selector: &str,
+    collection_selector: Option<&str>,
+    out: Option<&Path>,
+) -> anyhow::Result<()> {
+    cli.require_single_dir("packs dump")?;
+    let pack_id = parse_pack_id_selector(pack_selector)?;
+    let collection_filter = collection_selector
+        .map(parse_collection_selector)
+        .transpose()?;
+
+    // `pack_id` is pool-local, so the same numeric id can exist in more than
+    // one pool. Refuse to merge two different packs into one output stream.
+    // Filenames are canonical (`pack_{id:016x}.pack`), so a direct stat is
+    // enough — no need to open and header-validate every unrelated pack.
+    let layout = open_layout(cli)?;
+    let mut matches: Vec<(ShardType, PathBuf)> = Vec::new();
+    for shard_type in cli.shard_types() {
+        let dir = pool_dir(&layout, shard_type)?;
+        if !dir.is_dir() {
+            continue;
+        }
+        let path = dir.join(format!("pack_{pack_id:016x}.pack"));
+        if path.is_file() {
+            matches.push((shard_type, path));
+        }
+    }
+    let [(shard_type, path)] = matches.as_slice() else {
+        if matches.is_empty() {
+            bail!("pack 0x{pack_id:016x}: not found");
+        }
+        let pools: Vec<&str> = matches.iter().map(|(kind, _)| kind.as_str()).collect();
+        bail!(
+            "pack 0x{pack_id:016x} exists in multiple pools ({}); pass -t <type> to disambiguate — pack IDs are pool-local",
+            pools.join(", ")
+        );
+    };
+
+    let stdout = io::stdout();
+    let mut writer: Box<dyn Write> = match out {
+        Some(path) => Box::new(BufWriter::new(
+            fs::File::create(path).with_context(|| format!("creating {}", path.display()))?,
+        )),
+        None => Box::new(BufWriter::new(stdout.lock())),
+    };
+
+    let mut written = 0_usize;
+    let mut scanner = mtxdb::packfile::scan_records_iter(path)?;
+    for frame in scanner.by_ref() {
+        let (offset, record) = frame?;
+        if collection_filter.is_some_and(|filter| record.collection_id != filter) {
+            continue;
+        }
+        writer
+            .write_all(pack_dump_line(shard_type.as_str(), pack_id, offset, &record).as_bytes())?;
+        writer.write_all(b"\n")?;
+        written = written.saturating_add(1);
+    }
+    writer.flush()?;
+    if scanner.torn_tail() {
+        eprintln!(
+            "warning: pack 0x{pack_id:016x} ends in a torn frame; its tail was not dumped \
+             (a concurrent writer can cause this)"
+        );
+    }
+    eprintln!(
+        "dumped {written} frames from pack 0x{pack_id:016x} ({} pool)",
+        shard_type.as_str()
+    );
+    Ok(())
+}
+
+/// Render one `mtxdb.pack.dump/v1` line for a pack frame.
+fn pack_dump_line(
+    pool: &str,
+    pack_id: u64,
+    offset: u64,
+    record: &mtxdb::packfile::Record,
+) -> String {
+    let mut fields: Vec<(&'static str, String)> = vec![
+        ("schema", json_string(PACK_DUMP_SCHEMA)),
+        ("pool", json_string(pool)),
+        ("pack_id", json_string(&format!("0x{pack_id:016x}"))),
+        ("offset", offset.to_string()),
+        (
+            "collection_id",
+            json_string(&format!("0x{}", hex::encode(record.collection_id))),
+        ),
+        (
+            "node_id",
+            json_string(&format!("0x{}", hex::encode(record.hash))),
+        ),
+    ];
+    fields.extend(payload_fields(&record.data));
+    fields.push((
+        "metadata",
+        record
+            .metadata
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), render_frame_metadata),
+    ));
+    json_compact_object(&fields)
 }
 
 #[allow(
@@ -9053,7 +9457,7 @@ fn cmd_repack_coalesced(
     }
 
     let target_collections: HashSet<[u8; 16]> = if let Some(col_str) = collection {
-        let cid = parse_collection_id(col_str)?;
+        let cid = parse_collection_selector(col_str)?;
         let mut set = HashSet::new();
         set.insert(cid);
         set
@@ -9364,7 +9768,7 @@ fn cmd_repack(
 ) -> anyhow::Result<()> {
     let target = match (collection, packs.is_empty(), all) {
         (Some(collection), true, false) => {
-            RepackTarget::Collection(parse_collection_id(collection)?)
+            RepackTarget::Collection(parse_collection_selector(collection)?)
         }
         (None, false, false) => RepackTarget::Packs(parse_pack_selectors(packs)?),
         (None, true, true) => RepackTarget::All,
@@ -9995,21 +10399,22 @@ mod tests {
         collection_canonical_id, compile_import_template, compute_state_groups_partial,
         decode_event_json_record, decode_hamt_node, decode_hamt_root,
         default_matrix_import_template, derive_template_key, display_collection_role, event_id,
-        event_room_id, event_short_id, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
-        format_canonical_display, format_id, glob_pack_files, import_pdu_events,
-        interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
-        matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints,
-        meta_lock_line, meta_pools, meta_raw, pack_identity, parse_federation_input,
-        parse_pack_id_selector, parse_pack_selectors, pretty_print_payload, redacted_event_bytes,
-        resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-        template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-        verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, PackIdentity,
-        StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
-        STATE_GROUP_NAMESPACE,
+        event_room_id, event_short_id, export_envelope_line, extract_pointer_string,
+        fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
+        import_pdu_events, interleaving_worth_noting, listing_shard_types, load_state_groups,
+        matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
+        meta_checkpoints, meta_lock_line, meta_pools, meta_raw, pack_identity,
+        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+        split_canonical_display, template_collection_id, template_node_id, topological_event_order,
+        valid_state_group_id, verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension,
+        MetaReport, PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+        STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
     use mtxdb::packfile::storage::PackfileStorage;
+    use mtxdb::shard::ShardPool;
     use mtxdb::storage::{NodeData, StorageEngine};
     use mtxdb::template::{
         CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
@@ -10029,6 +10434,15 @@ mod tests {
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
         simd_json::to_owned_value(&mut bytes).expect("valid JSON fixture")
+    }
+
+    /// A string field of a JSON object, or `None` if the key is absent or not
+    /// a string. Used to assert on parsed output rather than substrings.
+    fn json_str(value: &OwnedValue, key: &str) -> Option<String> {
+        match value.get(key) {
+            Some(OwnedValue::String(text)) => Some(text.clone()),
+            _ => None,
+        }
     }
 
     #[test]
@@ -10555,6 +10969,287 @@ mod tests {
         let id = [0xABu8; 16];
         assert_eq!(super::parse_collection_id(&format_id(&id)).unwrap(), id);
         assert!(!format_id(&id).starts_with("0x0x"));
+    }
+
+    #[test]
+    fn export_envelope_carries_exact_bytes_and_frame_metadata() {
+        let collection_id = [0x11u8; 16];
+        let node_id = [0x22u8; 16];
+        let metadata = mtxdb::packfile::FrameMetadata {
+            logical_id: Some([0x33u8; 32]),
+            content_digest: Some([0x44u8; 32]),
+            digest_algorithm: DigestAlgorithm::Blake3,
+            role: Some(b"event".to_vec()),
+            unknown: vec![(0x7f, vec![0xDE, 0xAD])],
+        };
+        // Deliberately non-canonical JSON (spaces) so a reserialized payload
+        // would differ from the exact bytes.
+        let payload = b"{ \"event_id\" : \"$x\" }";
+        let line = export_envelope_line(&collection_id, &node_id, payload, Some(&metadata));
+
+        let value = owned_value(&line);
+        assert_eq!(
+            json_str(&value, "schema").as_deref(),
+            Some("mtxdb.export/v1")
+        );
+        assert_eq!(
+            json_str(&value, "collection_id").as_deref(),
+            Some("0x11111111111111111111111111111111")
+        );
+        assert_eq!(
+            json_str(&value, "node_id").as_deref(),
+            Some("0x22222222222222222222222222222222")
+        );
+        assert_eq!(
+            json_str(&value, "payload_encoding").as_deref(),
+            Some("json")
+        );
+
+        // `payload_base64` is the exact stored bytes, not the decoded value.
+        let expected = base64::engine::general_purpose::STANDARD.encode(payload);
+        assert_eq!(
+            json_str(&value, "payload_base64").as_deref(),
+            Some(expected.as_str())
+        );
+        let decoded = value.get("payload").expect("decoded JSON payload");
+        assert_eq!(json_str(decoded, "event_id").as_deref(), Some("$x"));
+
+        let meta = value.get("metadata").expect("metadata object");
+        assert_eq!(
+            json_str(meta, "digest_algorithm").as_deref(),
+            Some("blake3")
+        );
+        assert_eq!(json_str(meta, "digest_algorithm_id").as_deref(), Some("2"));
+        assert!(
+            json_str(meta, "logical_id").unwrap().starts_with("0x3333"),
+            "{line}"
+        );
+        let role = meta.get("role").expect("role object");
+        assert_eq!(json_str(role, "encoding").as_deref(), Some("utf8"));
+        assert_eq!(json_str(role, "value").as_deref(), Some("event"));
+        let unknown = meta.get("unknown").expect("unknown array");
+        assert_eq!(
+            unknown.encode(),
+            "[{\"tag\":127,\"value_base64\":\"3q0=\"}]"
+        );
+    }
+
+    #[test]
+    fn export_envelope_base64_encodes_non_json_payloads() {
+        let line = export_envelope_line(&[0x11u8; 16], &[0x22u8; 16], &[0xDE, 0xAD], None);
+        let value = owned_value(&line);
+        assert_eq!(
+            json_str(&value, "payload_encoding").as_deref(),
+            Some("base64")
+        );
+        assert_eq!(json_str(&value, "payload_base64").as_deref(), Some("3q0="));
+        assert!(
+            value.get("payload").is_none(),
+            "binary payloads carry no decoded JSON value"
+        );
+        assert_eq!(value.get("metadata").unwrap().encode(), "null");
+    }
+
+    #[test]
+    fn packs_dump_writes_decoded_jsonl_for_a_pack() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+        let store = PackfileStorage::open(pool).unwrap();
+        let collection_id = [0x11; 16];
+        let node_id = [0x22; 16];
+        let payload = b"{ \"event_id\" : \"$dump\" }";
+        store
+            .put(
+                &collection_id,
+                &node_id,
+                &NodeData::new(Bytes::copy_from_slice(payload)),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        let pack_id = store.shard_summaries()[0].pack_id;
+        drop(store);
+
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Packs {
+                action: super::PacksAction::List { all: false },
+            },
+        };
+        let out_file = dir.join("dump.jsonl");
+        super::cmd_packs_dump(&cli, &format!("0x{pack_id:016x}"), None, Some(&out_file)).unwrap();
+
+        let content = std::fs::read_to_string(&out_file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "{content}");
+        let value = owned_value(lines[0]);
+        assert_eq!(
+            json_str(&value, "schema").as_deref(),
+            Some("mtxdb.pack.dump/v1")
+        );
+        assert_eq!(json_str(&value, "pool").as_deref(), Some("mtpl-event"));
+        let expected_pack = format!("0x{pack_id:016x}");
+        assert_eq!(
+            json_str(&value, "pack_id").as_deref(),
+            Some(expected_pack.as_str())
+        );
+        let expected_node = format!("0x{}", hex::encode(node_id));
+        assert_eq!(
+            json_str(&value, "node_id").as_deref(),
+            Some(expected_node.as_str())
+        );
+        let expected = base64::engine::general_purpose::STANDARD.encode(payload);
+        assert_eq!(
+            json_str(&value, "payload_base64").as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            json_str(value.get("payload").unwrap(), "event_id").as_deref(),
+            Some("$dump")
+        );
+        assert_eq!(value.get("metadata").unwrap().encode(), "null");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn packs_dump_rejects_a_pack_id_present_in_multiple_pools() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        for shard_type in [ShardType::EventDag, ShardType::State] {
+            let store =
+                PackfileStorage::open(layout.pool_dir_read_only(shard_type).unwrap()).unwrap();
+            store
+                .put(
+                    &[0x11; 16],
+                    &[0x22; 16],
+                    &NodeData::new(Bytes::from_static(b"shared-id")),
+                )
+                .unwrap();
+            store.sync().unwrap();
+        }
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: None,
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Packs {
+                action: super::PacksAction::List { all: true },
+            },
+        };
+        let error = super::cmd_packs_dump(&cli, "0x0", None, None).unwrap_err();
+        assert!(error.to_string().contains("multiple pools"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn packs_dump_errors_when_the_pack_is_absent() {
+        let dir = unique_temp_dir();
+        DatabaseLayout::open(dir.clone()).unwrap();
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Packs {
+                action: super::PacksAction::List { all: false },
+            },
+        };
+        let error = super::cmd_packs_dump(&cli, "0x0", None, None).unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_envelope_resolves_the_winning_frame_after_an_overwrite() {
+        let dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let pool_dir = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+
+        let collection_id = [0x11; 16];
+        let node_id = [0x22; 16];
+        // Two versions of the same node, each with distinct payload, logical id,
+        // and role. A small rotation threshold puts the second version in a
+        // later (higher pack-id) shard, so it is the live winner the envelope
+        // must report — and the one whose metadata must accompany the payload.
+        let first = b"{ \"version\" : 1 }";
+        let second = b"{ \"version\" : 2 }";
+
+        {
+            // One record per pack: the threshold admits a single frame after the
+            // 4 KiB header, so each write rotates to a fresh shard.
+            let store = PackfileStorage::open_with_max_shard_bytes(pool_dir.clone(), 4200).unwrap();
+            let first_digest = mtxdb::content_digest(DigestAlgorithm::Blake3, first);
+            store
+                .put_verified(
+                    &collection_id,
+                    &node_id,
+                    &NodeData::new(Bytes::copy_from_slice(first)),
+                    &[0xA1; 32],
+                    DigestAlgorithm::Blake3,
+                    &first_digest,
+                    Some(b"v1"),
+                )
+                .unwrap();
+            store.sync().unwrap();
+            let second_digest = mtxdb::content_digest(DigestAlgorithm::Blake3, second);
+            store
+                .put_verified(
+                    &collection_id,
+                    &node_id,
+                    &NodeData::new(Bytes::copy_from_slice(second)),
+                    &[0xB2; 32],
+                    DigestAlgorithm::Blake3,
+                    &second_digest,
+                    Some(b"v2"),
+                )
+                .unwrap();
+            store.sync().unwrap();
+            assert!(
+                store.shard_summaries().len() >= 2,
+                "overwrite must land in a later pack to exercise winner resolution"
+            );
+        }
+
+        // Drive the real export pipeline (scan -> winner selection -> frame
+        // read) rather than the line-rendering helper in isolation.
+        let store = PackfileStorage::open_read_only(pool_dir.clone()).unwrap();
+        let pool = ShardPool::open_read_only(pool_dir).unwrap();
+        let lines =
+            super::export_lines(&store, &pool, &collection_id, super::ExportFormat::Envelope)
+                .unwrap();
+
+        assert_eq!(lines.len(), 1, "one live record after physical dedup");
+        let value = owned_value(std::str::from_utf8(&lines[0]).unwrap());
+        let expected = base64::engine::general_purpose::STANDARD.encode(second);
+        assert_eq!(
+            json_str(&value, "payload_base64").as_deref(),
+            Some(expected.as_str()),
+            "winner must be the later frame's exact bytes"
+        );
+        assert_eq!(
+            value
+                .get("payload")
+                .unwrap()
+                .get("version")
+                .unwrap()
+                .encode(),
+            "2"
+        );
+        let meta = value.get("metadata").expect("metadata object");
+        let role = meta.get("role").expect("role object");
+        assert_eq!(
+            json_str(role, "value").as_deref(),
+            Some("v2"),
+            "metadata must come from the same winning frame as the payload"
+        );
+        assert!(
+            json_str(meta, "logical_id").unwrap().starts_with("0xb2b2"),
+            "logical id must be the winner's, not the overwritten version's"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -13070,6 +13765,8 @@ mod tests {
             },
             Commands::Export {
                 collection: "0x00000000000000000000000000000000".to_owned(),
+                format: "jsonl".to_owned(),
+                metadata: false,
             },
             Commands::Repack {
                 collection: None,
@@ -13173,6 +13870,53 @@ mod tests {
 
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn coalesced_repack_accepts_matrix_room_selectors() {
+        let dir = unique_temp_dir();
+        let out_dir = unique_temp_dir();
+        let layout = DatabaseLayout::open(dir.clone()).unwrap();
+        let room = "!selector:example.org";
+        let collection_id = matrix_room_collection_id(room);
+        let node_id = [0x44; 16];
+
+        let store =
+            PackfileStorage::open(layout.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+        store
+            .put(
+                &collection_id,
+                &node_id,
+                &NodeData::new(Bytes::from_static(br#"{"origin_server_ts":1}"#)),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        drop(store);
+
+        let cli = Cli {
+            dirs: vec![dir.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Repack {
+                collection: Some(room.to_owned()),
+                packs: vec![],
+                all: false,
+                root: vec![],
+                topo: false,
+                out: Some(out_dir.clone()),
+                yes: true,
+            },
+        };
+        cmd_repack_coalesced(&cli, &out_dir, Some(room), &[], false, &[], false, true).unwrap();
+
+        let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
+        let out_pool = out_layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+        let out_store = PackfileStorage::open_read_only(out_pool).unwrap();
+        assert!(out_store.get(&collection_id, &node_id).unwrap().is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
 

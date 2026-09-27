@@ -142,6 +142,11 @@ pub(crate) enum Commands {
     },
     Export {
         collection: String,
+        format: String,
+        metadata: bool,
+    },
+    Packs {
+        action: PacksAction,
     },
     Repack {
         collection: Option<String>,
@@ -185,6 +190,21 @@ pub(crate) enum Commands {
     },
 }
 
+/// Sub-operations for the read-only `packs` inspection group.
+#[derive(Clone)]
+pub(crate) enum PacksAction {
+    /// List open packs with size and IO/sync stats.
+    List { all: bool },
+    /// Show one pack's header, collection composition, and node counts.
+    Inspect { pack: String },
+    /// Dump every frame in one pack as decoded JSONL.
+    Dump {
+        pack: String,
+        collection: Option<String>,
+        out: Option<PathBuf>,
+    },
+}
+
 fn build_cli() -> Command {
     global_args(Command::new("mtxdb").subcommand_precedence_over_arg(true))
         .version(concat!(
@@ -216,6 +236,7 @@ fn build_cli() -> Command {
         .subcommand(sub_completions())
         .subcommand(sub_import())
         .subcommand(sub_export())
+        .subcommand(sub_packs())
         .subcommand(sub_repack())
         .subcommand(sub_scan())
         .subcommand(sub_info())
@@ -584,14 +605,97 @@ fn sub_export() -> Command {
     Command::new("export")
         .about("Export a collection's records as JSONL to stdout")
         .long_about(
-            "Export a collection's stored records as one JSON value per line on stdout. Redirect the \
-             output to make an input accepted by `mtxdb import`.",
+            "Export a collection's stored records as one JSON value per line on stdout. The default \
+             `jsonl` output is accepted by `mtxdb import`. A `!room:server` selector or a \
+             `0x`-prefixed collection ID are both accepted. `--format envelope` (or `--metadata`) \
+             emits a schema-versioned `mtxdb.export/v1` envelope per record with the exact stored \
+             bytes, frame metadata (logical id, content digest, role), and a decoded JSON payload; \
+             envelopes are inspection-only and are NOT accepted by `mtxdb import`.",
         )
         .arg(
             Arg::new("collection")
                 .required(true)
                 .value_name("COLLECTION")
-                .help("Collection ID (0x-prefixed, 32 hex digits)"),
+                .help("Collection ID (0x-prefixed) or Matrix room ID (!room:server)"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_name("FORMAT")
+                .value_parser(["jsonl", "envelope"])
+                .help("Output format: raw payload lines (jsonl, default) or schema-versioned envelopes (envelope)"),
+        )
+        .arg(
+            Arg::new("metadata")
+                .long("metadata")
+                .action(ArgAction::SetTrue)
+                .help("Include frame metadata (implies --format envelope)"),
+        )
+}
+
+fn sub_packs() -> Command {
+    Command::new("packs")
+        .about("Inspect and dump pack frames (read-only)")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("list")
+                .about("List open packs with size and IO/sync stats")
+                .arg(
+                    Arg::new("all")
+                        .short('a')
+                        .long("all")
+                        .action(ArgAction::SetTrue)
+                        .help("List packs in every independent pool"),
+                ),
+        )
+        .subcommand(
+            Command::new("inspect")
+                .about("Show one pack's header, collections, and node counts")
+                .arg(
+                    Arg::new("pack")
+                        .short('p')
+                        .long("pack")
+                        .required(true)
+                        .value_name("PACK_ID")
+                        .help("Pack identity (0x-prefixed 16 hex digits)"),
+                ),
+        )
+        .subcommand(
+            Command::new("dump")
+                .about("Dump every frame in one pack as decoded JSONL")
+                .long_about(
+                    "Dump every frame in a pack, in physical order and without deduplication, as one \
+                     JSON object per line: pool, pack identity, frame offset, collection id, node \
+                     id, payload, and frame metadata. `payload_base64` is the exact stored bytes; \
+                     `payload` is a decoded JSON convenience value (which may differ in whitespace, \
+                     key order, or numeric spelling) and is absent for binary payloads. Unlike \
+                     `export`, this is a complete view of one pack (all collections, superseded \
+                     frames included), not a collection's live set. Pack IDs are pool-local, so a \
+                     pack id present in more than one pool is rejected unless -t selects one.",
+                )
+                .arg(
+                    Arg::new("pack")
+                        .short('p')
+                        .long("pack")
+                        .required(true)
+                        .value_name("PACK_ID")
+                        .help("Pack identity (0x-prefixed 16 hex digits)"),
+                )
+                .arg(
+                    Arg::new("collection")
+                        .short('r')
+                        .long("collection")
+                        .value_name("COLLECTION")
+                        .help("Only dump frames for this collection (0x-prefixed id or !room:server)"),
+                )
+                .arg(
+                    Arg::new("out")
+                        .short('o')
+                        .long("out")
+                        .value_name("FILE")
+                        .help("Write JSONL to FILE instead of stdout"),
+                ),
         )
 }
 
@@ -841,6 +945,27 @@ fn parse_cli() -> Cli {
         },
         Some(("export", m)) => Commands::Export {
             collection: m.get_one::<String>("collection").unwrap().clone(),
+            format: m
+                .get_one::<String>("format")
+                .cloned()
+                .unwrap_or_else(|| "jsonl".to_owned()),
+            metadata: m.get_flag("metadata"),
+        },
+        Some(("packs", m)) => Commands::Packs {
+            action: match m.subcommand() {
+                Some(("list", sub)) => PacksAction::List {
+                    all: sub.get_flag("all"),
+                },
+                Some(("inspect", sub)) => PacksAction::Inspect {
+                    pack: sub.get_one::<String>("pack").unwrap().clone(),
+                },
+                Some(("dump", sub)) => PacksAction::Dump {
+                    pack: sub.get_one::<String>("pack").unwrap().clone(),
+                    collection: sub.get_one::<String>("collection").cloned(),
+                    out: sub.get_one::<String>("out").map(PathBuf::from),
+                },
+                _ => unreachable!("subcommand_required enforces a packs action"),
+            },
         },
         Some(("repack", m)) => Commands::Repack {
             collection: m.get_one::<String>("collection").cloned(),

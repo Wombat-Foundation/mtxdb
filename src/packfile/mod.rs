@@ -1512,6 +1512,90 @@ pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<Scan
     Ok(entries)
 }
 
+/// Streaming reader yielding each frame's full [`Record`] — payload, identity,
+/// and optional metadata — in file order, paired with the frame's byte offset.
+///
+/// This is the materializing counterpart to [`scan_packfile`] (which reads only
+/// identity metadata). A torn tail (a crashed append) is treated as end-of-file,
+/// matching the other scanners; mid-file corruption is propagated as an error.
+#[derive(Debug)]
+pub struct RecordScanner {
+    reader: BufReader<File>,
+    done: bool,
+    torn_tail: bool,
+}
+
+impl RecordScanner {
+    /// Whether the scan stopped at a torn (truncated) trailing frame rather
+    /// than at a clean frame boundary. A concurrent writer can legitimately
+    /// leave an in-flight torn tail, so this is a diagnostic signal, not
+    /// necessarily corruption.
+    #[must_use]
+    pub fn torn_tail(&self) -> bool {
+        self.torn_tail
+    }
+}
+
+/// Open a streaming scanner yielding full [`Record`]s from a packfile.
+///
+/// # Errors
+/// Returns an I/O error if the packfile cannot be opened or its header cannot
+/// be read, and [`io::ErrorKind::InvalidData`] if the file does not start with
+/// an mtxdb packfile header (rather than silently yielding an empty stream).
+pub fn scan_records_iter(path: &Path) -> io::Result<RecordScanner> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    match read_header(&mut reader)? {
+        Some(_) => Ok(RecordScanner {
+            reader,
+            done: false,
+            torn_tail: false,
+        }),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "not an mtxdb packfile (missing magic header): {}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+impl Iterator for RecordScanner {
+    type Item = io::Result<(u64, Record)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let offset = match self.reader.stream_position() {
+            Ok(offset) => offset,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        };
+        match read_record(&mut self.reader) {
+            Ok(Some(record)) => Some(Ok((offset, record))),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                self.done = true;
+                self.torn_tail = true;
+                None
+            }
+            Err(error) => {
+                self.done = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl std::iter::FusedIterator for RecordScanner {}
+
 /// Scan a packfile and truncate any torn tail at the last valid record
 /// boundary. Used during explicit recovery to repair a packfile before
 /// reopening for append.
@@ -2339,6 +2423,34 @@ mod tests {
         std::fs::write(&path, &buf).unwrap();
         let entries = scan_packfile(&path).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_records_iter_reports_torn_tail() {
+        let dir = test_dir("records_iter_torn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pack_0000000000000000.pack");
+        let mut buf = Vec::new();
+        write_header(&mut buf, 0).unwrap();
+        write_record(&mut buf, &test_record_raw([0xaa; 16], b"data")).unwrap();
+        buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut scanner = scan_records_iter(&path).unwrap();
+        let first = scanner.next().unwrap().unwrap();
+        assert_eq!(first.1.data.as_ref(), b"data");
+        assert!(scanner.next().is_none());
+        assert!(scanner.torn_tail(), "torn trailing bytes should be flagged");
+    }
+
+    #[test]
+    fn test_scan_records_iter_rejects_a_non_packfile() {
+        let dir = test_dir("records_iter_not_a_pack");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pack_0000000000000000.pack");
+        std::fs::write(&path, b"not an mdb pack").unwrap();
+        let error = scan_records_iter(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
