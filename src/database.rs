@@ -1860,6 +1860,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Pools sync one after another, so the first to cross the trigger cannot
+    /// yet reclaim what the others have not reported. That is normal: it must
+    /// neither be counted nor logged as a stall, and the later pool's coverage
+    /// clears the pending state.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
+        let (db, root) = small_segment_database("healthy_sequential");
+        let pools = [ShardType::State, ShardType::EventDag];
+        let coordinator = db.coordinator();
+        let mut next = 0u64;
+        let mut saw_pending = false;
+        for round in 0..150 {
+            commit_batch(&db, &pools, &mut next, 1)
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            db.pool(ShardType::EventDag).sync_all().unwrap();
+            saw_pending |= coordinator.is_reclaim_stalled();
+            db.pool(ShardType::State).sync_all().unwrap();
+            assert_eq!(
+                coordinator.reclaim_stalls(),
+                0,
+                "round {round}: a healthy crossing was reported as a stall"
+            );
+        }
+        assert!(
+            saw_pending,
+            "the first pool to cross must have seen a pending stall, or this proves nothing"
+        );
+        assert!(
+            !coordinator.is_reclaim_stalled(),
+            "the second pool's coverage must clear it"
+        );
+        assert!(coordinator.reclaim_trigger_len() > 0);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A pool that stays silent is reported, but only after the segment has
+    /// grown by an eighth of the trigger past the first failed reclaim.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_silent_contributor_is_reported_after_the_grace_period() {
+        let (db, root) = small_segment_database("stall_grace");
+        db.coordinator().set_blocker_remediation(|_| {});
+        let pools = [ShardType::State, ShardType::EventDag];
+        let coordinator = db.coordinator();
+        let grace = coordinator.reclaim_trigger_len() / 8;
+        let mut next = 0u64;
+        let mut first_len = None;
+        let mut reported_at = None;
+        for _ in 0..200 {
+            if commit_batch(&db, &pools, &mut next, 1).is_err() {
+                break;
+            }
+            db.pool(ShardType::EventDag).sync_all().unwrap();
+            if first_len.is_none() && coordinator.is_reclaim_stalled() {
+                first_len = Some(coordinator.segment_len());
+                assert_eq!(coordinator.reclaim_stalls(), 0, "reported with no grace");
+            }
+            if reported_at.is_none() && coordinator.reclaim_stalls() > 0 {
+                reported_at = Some(coordinator.segment_len());
+            }
+        }
+        let first_len = first_len.expect("the pending stall was never seen");
+        let reported_at = reported_at.expect("a silent pool was never reported");
+        assert!(
+            reported_at >= first_len + grace,
+            "reported at {reported_at}, only {} past the first failure",
+            reported_at - first_len
+        );
+        assert_eq!(coordinator.reclaim_stalls(), 1, "one stall, reported once");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Measurement, not policy: with a pool that never reports, count what the
     /// emergency zone costs. Every sync there may force a checkpoint; this
     /// records how many did, whether any reclaimed anything, and how much

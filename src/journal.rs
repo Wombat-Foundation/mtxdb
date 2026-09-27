@@ -1042,6 +1042,13 @@ struct ReclaimStall {
     /// `coverage_epoch` at that moment; a later value means a pool advanced its
     /// coverage, so a reclaim may now succeed.
     coverage_epoch: u64,
+    /// Segment length when this run of failed reclaims began: the start of the
+    /// grace period. Coverage moving does not restart it (the active pool's own
+    /// reports would keep it from ever ending); only a reclaim that gets the
+    /// segment back under the trigger does, by clearing the stall.
+    grace_from: u64,
+    /// Whether the stall has been counted and logged.
+    reported: bool,
 }
 
 /// Something that makes a named pool checkpoint so it reports coverage, given
@@ -1789,18 +1796,32 @@ impl JournalCoordinator {
         let epoch = self.coverage_epoch.load(Ordering::Acquire);
         let mut stall = self.reclaim_stall.lock();
         let previous = *stall;
+        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
+        // The first reclaim to leave the segment over the trigger is normal:
+        // pools sync one after another, so the first to cross it cannot yet
+        // reclaim what the others have not reported. It is only worth saying
+        // once the segment has grown by an eighth of the trigger without a
+        // reclaim getting it back under the trigger, or it reaches the
+        // emergency zone. The
+        // back-off and remediation below act on the stall from the start.
+        let grace_from = previous.map_or(len, |old| old.grace_from);
+        let already_reported = previous.is_some_and(|old| old.reported);
+        let report = !already_reported
+            && (emergency || len >= grace_from.saturating_add(self.reclaim_retry_growth()));
         *stall = Some(ReclaimStall {
             at_len: len,
             coverage_epoch: epoch,
+            grace_from,
+            reported: already_reported || report,
         });
-        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
-        let was_emergency = previous.is_some_and(|old| {
-            old.at_len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4)
-        });
-        if previous.is_none() {
+        let entered_emergency = emergency
+            && previous.is_some_and(|old| {
+                old.at_len < journal.segment_cap.saturating_sub(journal.segment_cap / 4)
+            });
+        if report {
             self.reclaim_stalls.fetch_add(1, Ordering::Relaxed);
         }
-        if previous.is_none() || (emergency && !was_emergency) {
+        if report || (already_reported && entered_emergency) {
             eprintln!(
                 "warning: shared WAL reclaim is stalled at {len} of {} bytes (trigger {}); \
                  waiting on pools {:?} to report coverage",

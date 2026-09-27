@@ -873,6 +873,18 @@ const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexEntry::MAX_OFFSET;
 /// of ~230k appends between full rewrites.
 const DELTA_LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Log length at which a sync rewrites the checkpoint (which starts a fresh
+/// log) instead of appending, three quarters of the cap. Coverage batches and
+/// ordinary deltas both grow the log and neither rotates it, so without this a
+/// pool that only takes those steps reaches the cap and the append fails; the
+/// fallback then rewrites the checkpoint at an unplanned moment. The quarter
+/// left over is room for the batch in hand and one racing append.
+const DELTA_LOG_ROTATE_BYTES: u64 = DELTA_LOG_CAP_BYTES / 4 * 3;
+const _: () = assert!(
+    DELTA_LOG_ROTATE_BYTES < DELTA_LOG_CAP_BYTES,
+    "the rotation length must leave room under the cap"
+);
+
 /// Candidate offsets closer than this on the same shard count as one
 /// sequential read run when measuring a `get_many` batch's locality.
 /// `record_disk_len` is `frame_len + 8` and frames are at least
@@ -8921,7 +8933,16 @@ impl PackfileStorage {
         // the whole index: the packs are made durable, then the batch carrying
         // the claim is, and only then is the journal reclaimed.
         let mut coverage_batch_written = false;
+        let log_bytes = self.delta_state.lock().log_bytes;
+        let rotating = log_bytes >= DELTA_LOG_ROTATE_BYTES;
+        if rotating {
+            eprintln!(
+                "mtxdb: delta log is at {log_bytes} of {DELTA_LOG_CAP_BYTES} bytes, rewriting the \
+                 checkpoint before it reaches the cap"
+            );
+        }
         if journal_needs_reclaim
+            && !rotating
             && self.delta_base_is_usable()
             && self.packs_match_checkpoint_table()
         {
@@ -8946,11 +8967,12 @@ impl PackfileStorage {
             } else {
                 self.shard_collections_stale.store(true, Ordering::Relaxed);
             }
-        } else if journal_needs_reclaim || self.delta_state_needs_full_rewrite() {
+        } else if journal_needs_reclaim || rotating || self.delta_state_needs_full_rewrite() {
             // A deferral budget postpones acceleration rewrites; it must not
             // postpone the one that lets the journal be reclaimed, or the segment
-            // fills and commits fail.
-            if !journal_needs_reclaim && self.should_defer_checkpoint_rewrite() {
+            // fills and commits fail, nor the one that keeps the delta log under
+            // its cap.
+            if !journal_needs_reclaim && !rotating && self.should_defer_checkpoint_rewrite() {
                 // Write-neutral stopgap: the caller already synced the
                 // packfiles, so skipping the acceleration rewrite costs only
                 // the next open a rescan — the stale on-disk checkpoint no
@@ -12360,6 +12382,59 @@ mod tests {
             reopened.get(&collection, &node).unwrap().unwrap().bytes,
             value
         );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A log that has grown to the rotation length is replaced by a checkpoint
+    /// at the next sync, on purpose and before the cap; below it, the append
+    /// path is untouched.
+    #[test]
+    fn a_delta_log_is_rotated_before_it_reaches_the_cap() {
+        let dir = test_dir("delta_log_rotation");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0xD4; 16];
+        store
+            .put(&collection, &distinct_id(1), &NodeData::from_slice(b"base"))
+            .unwrap();
+        store.sync_all().unwrap();
+
+        // Well under the rotation length: an ordinary append.
+        store
+            .put(
+                &collection,
+                &distinct_id(2),
+                &NodeData::from_slice(b"below"),
+            )
+            .unwrap();
+        let before = store.stats();
+        store.sync_all().unwrap();
+        let after = store.stats();
+        assert_eq!(after.delta_appends - before.delta_appends, 1);
+        assert_eq!(after.checkpoint_writes - before.checkpoint_writes, 0);
+
+        // At the rotation length: a checkpoint, with no failed append first.
+        store.delta_state.lock().log_bytes = DELTA_LOG_ROTATE_BYTES;
+        store
+            .put(&collection, &distinct_id(3), &NodeData::from_slice(b"at"))
+            .unwrap();
+        let before = store.stats();
+        store.sync_all().unwrap();
+        let after = store.stats();
+        assert_eq!(after.delta_appends - before.delta_appends, 0);
+        assert_eq!(after.checkpoint_writes - before.checkpoint_writes, 1);
+        assert!(
+            store.delta_state.lock().log_bytes < DELTA_LOG_ROTATE_BYTES,
+            "the rotation starts a fresh log"
+        );
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        for id in 1..=3 {
+            assert!(reopened
+                .get(&collection, &distinct_id(id))
+                .unwrap()
+                .is_some());
+        }
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -17627,6 +17702,31 @@ mod tests {
         );
         drop(writer);
         drop(reopen_and_read_all(&dir, &wal, 4));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The coverage step obeys the same rotation: with the log at the rotation
+    /// length, a sync over the trigger takes the checkpoint rather than a batch.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_coverage_step_is_replaced_by_a_checkpoint_at_the_rotation_length() {
+        let dir = test_dir("coverage_rotation");
+        let wal = dir.join("wal.bin");
+        let writer = writer_with_coverage_steps(&dir, &wal, 3);
+        assert!(!writer.sync_timings().unwrap().delta_log.is_zero());
+        writer.delta_state.lock().log_bytes = DELTA_LOG_ROTATE_BYTES;
+        writer
+            .put(
+                &[0x4Du8; 16],
+                &[9; 16],
+                &NodeData::new(bytes::Bytes::from(vec![9; 16])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let timings = writer.sync_timings().unwrap();
+        assert!(!timings.checkpoint.is_zero(), "a full checkpoint ran");
+        assert!(timings.delta_log.is_zero(), "no batch was appended");
+        drop(writer);
         let _ = fs::remove_dir_all(&dir);
     }
 
