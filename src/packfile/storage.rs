@@ -1785,7 +1785,7 @@ pub struct PackfileStorage {
     delta_invalidations: AtomicU64,
     /// `sync`/`sync_all` calls.
     sync_calls: AtomicU64,
-    /// Syncs that rewrote the index checkpoint in full.
+    /// Syncs and forced checkpoints that rewrote the index checkpoint in full.
     checkpoint_writes: AtomicU64,
     /// Background checkpoint tails started (one per detached checkpoint).
     checkpoint_tails_started: AtomicU64,
@@ -8776,7 +8776,16 @@ impl PackfileStorage {
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
         let _persist_guard = self.index_persist_lock.lock();
-        self.persist_index_checkpoint()
+        self.persist_index_checkpoint()?;
+        // A forced rewrite is a full checkpoint like a sync's, but it never
+        // passes through `sync`/`sync_all`, so `count_sync_persistence` cannot
+        // see it. Without this, a pool touched only by WAL-reclaim
+        // remediation reports zero checkpoint writes despite rewriting its
+        // checkpoint. `index_checkpoint_dirty` is forced true above, so
+        // `persist_index_checkpoint` always writes here; the bump is
+        // unconditional rather than gated on that.
+        self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Checkpoint to unblock WAL reclaim, detaching the tail when the
@@ -10187,7 +10196,9 @@ pub struct RuntimeStats {
     /// Collection structural changes that promote pending slots to snapshot or
     /// tombstone operations; this does not imply a checkpoint rewrite.
     pub delta_invalidations: u64,
-    /// Syncs that rewrote the index checkpoint in full.
+    /// Syncs that rewrote the index checkpoint in full, plus forced ones
+    /// (`force_index_checkpoint`, e.g. WAL-reclaim remediation on the BG=0
+    /// path) that never pass through `sync`/`sync_all`.
     pub checkpoint_writes: u64,
     /// Background checkpoint tails started (one per detached checkpoint).
     pub checkpoint_tails_started: u64,
