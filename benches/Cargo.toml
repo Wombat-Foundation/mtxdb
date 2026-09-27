@@ -136,3 +136,9 @@ harness = false
 name = "reopen_cost"
 path = "reopen_cost.rs"
 harness = false
+
+# Where the time of a pack recovery scan goes.
+[[bench]]
+name = "pack_scan_profile"
+path = "pack_scan_profile.rs"
+harness = false
