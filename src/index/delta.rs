@@ -2040,6 +2040,66 @@ mod tests {
         }
     }
 
+    /// What a reader that predates the `Coverage` kind does: it cannot decode the
+    /// claim frame, so it rejects that whole batch and everything after it. The
+    /// frame's kind byte is rewritten to an unknown one with every checksum
+    /// recomputed, so only the kind is unfamiliar. It keeps the earlier batches
+    /// and loses the ops in the batch that carries the claim (the writer then
+    /// recovers them by replaying more, never by skipping).
+    #[test]
+    fn a_reader_that_does_not_know_the_coverage_kind_stops_at_that_batch() {
+        let dir = coverage_log_dir("old_reader");
+        let path = dir.join(INDEX_DELTA_FILE);
+        let incremental = |slot| {
+            DeltaOperation::Incremental(DeltaFrame {
+                collection_id: [2; 16],
+                bucket: 1,
+                generation: 1,
+                slot,
+            })
+        };
+        append_v3_batch_with_durability(&path, true, 0xABC, &[incremental(1)], 0x111, true)
+            .unwrap();
+        let first_len = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
+        append_v3_batch_with_durability(
+            &path,
+            false,
+            0xABC,
+            &[incremental(2), DeltaOperation::Coverage { covered_lsn: 9 }],
+            0x222,
+            true,
+        )
+        .unwrap();
+        let intact = read_delta_log_v3(&path).unwrap();
+        assert_eq!(intact.coverage, Some(9));
+        assert_eq!(intact.operations.len(), 3);
+
+        let mut bytes = fs::read(&path).unwrap();
+        let frame_len = V3_FRAME_HEADER_LEN + V3_COVERAGE_LEN + V3_FRAME_TRAILER_LEN;
+        let trailer_start = bytes.len() - DELTA_LOG_TRAILER_LEN;
+        let frame_start = trailer_start - frame_len;
+        bytes[frame_start] = 0x7F;
+        let frame_crc_at = trailer_start - V3_FRAME_TRAILER_LEN;
+        let crc = crc32fast::hash(&bytes[frame_start..frame_crc_at]).to_le_bytes();
+        bytes[frame_crc_at..trailer_start].copy_from_slice(&crc);
+        let frames_start = first_len + DELTA_BATCH_HEADER_LEN;
+        let batch_fingerprint = u64::from_le_bytes(
+            bytes[trailer_start + TRAILER_FINGERPRINT_OFFSET..trailer_start + 16]
+                .try_into()
+                .unwrap(),
+        );
+        let batch = batch_crc(&bytes[frames_start..trailer_start], batch_fingerprint);
+        bytes[trailer_start + TRAILER_CRC_OFFSET..trailer_start + 8]
+            .copy_from_slice(&batch.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let old = read_delta_log_v3(&path).unwrap();
+        assert_eq!(old.coverage, None, "an unknown frame claims nothing");
+        assert_eq!(old.operations.len(), 1, "only the first batch survives");
+        assert!(old.torn_tail, "the rest is treated as an unreadable tail");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A torn batch, or one whose bytes were damaged, claims nothing: coverage
     /// is whatever the last intact batch proved. This is the conservative
     /// outcome, since a lower coverage only makes recovery replay more.
