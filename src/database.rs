@@ -1437,6 +1437,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// On a shared WAL, one pool's checkpoint tail in flight holds only that
+    /// pool's coverage: the other pool checkpoints and reports as usual, the
+    /// shared segment keeps what the held pool has not covered (and names it as
+    /// the blocker), a crash at that instant loses nothing, and once the tail
+    /// installs its image the segment is reclaimed.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_pool_in_a_background_checkpoint_holds_only_its_own_coverage() {
+        let root = test_root("shared_wal_background_checkpoint");
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let collection = [0x5B; 16];
+        let state = db.pool(ShardType::State);
+        let events = db.pool(ShardType::EventDag);
+        state.set_background_checkpoint(true);
+        let commit = |seq: u8| {
+            let txn = db.begin_transaction();
+            for pool in [ShardType::State, ShardType::EventDag] {
+                txn.put(pool, collection, node(seq), &data(b"payload"))
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        commit(1);
+        let release = state.hold_next_checkpoint_tail(false);
+        state.sync().unwrap();
+        assert!(state.checkpoint_in_flight());
+        let state_before = state.durable_coverage();
+
+        commit(2);
+        events.sync_all().unwrap();
+        assert!(
+            events.durable_coverage() > 0,
+            "the other pool checkpoints and reports as usual"
+        );
+        assert_eq!(
+            state.durable_coverage(),
+            state_before,
+            "the held pool claims nothing until its image is durable"
+        );
+        assert!(
+            db.coordinator()
+                .reclaim_blockers()
+                .contains(&ShardType::State),
+            "the held pool is what holds the shared segment back"
+        );
+        // Another sync of the held pool appends only; it starts no second tail.
+        state.sync().unwrap();
+        assert!(state.checkpoint_in_flight());
+
+        // A crash now (packs cut to what an fsync covered): the copy reopens
+        // with every committed record.
+        let crashed = test_root("shared_wal_background_checkpoint_crash");
+        crash_image(&db, &root, &crashed);
+        let after_crash = SharedDatabase::open(crashed.clone()).unwrap();
+        for pool in [ShardType::State, ShardType::EventDag] {
+            for seq in [1, 2] {
+                assert!(
+                    live_get(&after_crash, pool, collection, node(seq)).is_some(),
+                    "{pool:?} record {seq} must survive a crash mid-tail"
+                );
+            }
+        }
+        drop(after_crash);
+        let _ = std::fs::remove_dir_all(crashed);
+
+        drop(release);
+        state.wait_for_checkpoint();
+        assert!(state.durable_coverage() > state_before);
+        state.sync().unwrap();
+        events.sync_all().unwrap();
+        assert!(
+            !db.coordinator()
+                .reclaim_blockers()
+                .contains(&ShardType::State),
+            "the installed image releases the segment"
+        );
+        drop(db);
+        let reopened = SharedDatabase::open(root.clone()).unwrap();
+        for pool in [ShardType::State, ShardType::EventDag] {
+            for seq in [1, 2] {
+                assert!(live_get(&reopened, pool, collection, node(seq)).is_some());
+            }
+        }
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// While a transaction holds the overlay it is on the read path, so its
     /// staged group is visible before materialization; once the last user
     /// releases it, the overlay leaves the read path, and writer reads stop
