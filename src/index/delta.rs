@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
 use super::format::{DeltaFrame, DELTA_FRAME_LEN};
+use super::redo::{RedoRecord, REDO_RECORD_LEN};
 
 /// File name of the incremental index delta log inside a store's base dir.
 pub const INDEX_DELTA_FILE: &str = "index.delta";
@@ -124,6 +125,7 @@ const V3_INCREMENTAL: u8 = 0x01;
 const V3_COLLECTION_SNAPSHOT: u8 = 0x02;
 const V3_COLLECTION_TOMBSTONE: u8 = 0x03;
 const V3_COVERAGE: u8 = 0x04;
+const V3_REDO: u8 = 0x05;
 const V3_FRAME_HEADER_LEN: usize = 1 + 4;
 const V3_FRAME_TRAILER_LEN: usize = 4;
 const V3_SNAPSHOT_FIXED_LEN: usize = 16 + 8 + 8 + 4;
@@ -135,6 +137,10 @@ const V3_COVERAGE_LEN: usize = 8;
 pub enum DeltaOperation {
     /// Apply one fixed-shape insertion to a reconstructed collection index.
     Incremental(DeltaFrame),
+    /// One logical redo record: a change named by content identity, not by table
+    /// position, so it replays into a table of any capacity. See
+    /// [`super::redo`].
+    Redo(RedoRecord),
     /// Create or replace a collection from a complete serialized index.
     /// `order_key` preserves the store's durable collection order even when
     /// the inspection sidecar is unavailable or stale.
@@ -178,6 +184,13 @@ pub enum DeltaOperation {
 pub fn encode_v3_frame(operation: &DeltaOperation) -> io::Result<Vec<u8>> {
     let (kind, payload) = match operation {
         DeltaOperation::Incremental(frame) => (V3_INCREMENTAL, frame.encode().to_vec()),
+        DeltaOperation::Redo(record) => (
+            V3_REDO,
+            record
+                .encode()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+                .to_vec(),
+        ),
         DeltaOperation::CollectionSnapshot {
             collection_id,
             generation,
@@ -244,6 +257,7 @@ pub fn decode_v3_frame(bytes: &[u8]) -> Option<(DeltaOperation, usize)> {
 
     let operation = match kind {
         V3_INCREMENTAL => DeltaFrame::decode(payload).map(DeltaOperation::Incremental)?,
+        V3_REDO => RedoRecord::decode(payload).ok().map(DeltaOperation::Redo)?,
         V3_COLLECTION_SNAPSHOT => {
             if payload.len() < V3_SNAPSHOT_FIXED_LEN {
                 return None;
@@ -614,6 +628,7 @@ fn scan_v3_frame(
     }
     let fixed_len = match header[0] {
         V3_INCREMENTAL if payload_len == u64::try_from(DELTA_FRAME_LEN).unwrap_or(u64::MAX) => 0,
+        V3_REDO if payload_len == u64::try_from(REDO_RECORD_LEN).unwrap_or(u64::MAX) => 0,
         V3_COLLECTION_SNAPSHOT
             if payload_len >= u64::try_from(V3_SNAPSHOT_FIXED_LEN).unwrap_or(u64::MAX) =>
         {
@@ -889,6 +904,12 @@ pub const fn v3_incremental_frame_len() -> usize {
     V3_FRAME_HEADER_LEN + DELTA_FRAME_LEN + V3_FRAME_TRAILER_LEN
 }
 
+/// Length of one framed logical redo record.
+#[must_use]
+pub const fn v3_redo_frame_len() -> usize {
+    V3_FRAME_HEADER_LEN + REDO_RECORD_LEN + V3_FRAME_TRAILER_LEN
+}
+
 /// Length of one framed collection tombstone.
 #[must_use]
 pub const fn v3_tombstone_frame_len() -> usize {
@@ -916,6 +937,7 @@ pub fn v3_batch_len(operations: &[DeltaOperation]) -> Option<usize> {
     for operation in operations {
         let frame_len = match operation {
             DeltaOperation::Incremental(_) => v3_incremental_frame_len(),
+            DeltaOperation::Redo(_) => v3_redo_frame_len(),
             DeltaOperation::CollectionSnapshot { index_blob, .. } => {
                 v3_snapshot_frame_len(index_blob.len())?
             }

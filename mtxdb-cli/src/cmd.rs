@@ -4750,6 +4750,27 @@ fn format_delta_operation(operation: &mtxdb::index::delta::DeltaOperation) -> St
         DeltaOperation::Coverage { covered_lsn } => {
             format!("kind=coverage covered_lsn={covered_lsn}")
         }
+        DeltaOperation::Redo(record) => {
+            use mtxdb::index::redo::RedoOp;
+            let detail = match record.op {
+                RedoOp::Set {
+                    full_hash,
+                    pack_id,
+                    offset,
+                    record_len,
+                } => format!(
+                    "op=set hash=0x{} pack_id={pack_id} offset={offset} record_len={record_len}",
+                    hex::encode(full_hash)
+                ),
+                RedoOp::CollectionTombstone => "op=collection_tombstone".to_owned(),
+            };
+            format!(
+                "kind=redo collection=0x{} delta_seq={} base_generation={} {detail}",
+                hex::encode(record.collection_id),
+                record.delta_seq,
+                record.base_generation
+            )
+        }
     }
 }
 
@@ -10152,6 +10173,7 @@ mod tests {
             &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
             0xdead_beef,
             0,
+            0,
             &[],
             &[],
         )
@@ -10183,6 +10205,7 @@ mod tests {
             &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
             mtxdb::index::checkpoint::pack_fingerprint(&[]),
             0,
+            0,
             &[],
             &[],
         )
@@ -10207,6 +10230,7 @@ mod tests {
         mtxdb::index::checkpoint::write_checkpoint(
             &state.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
             mtxdb::index::checkpoint::pack_fingerprint(&[]),
+            0,
             0,
             &[],
             &[],

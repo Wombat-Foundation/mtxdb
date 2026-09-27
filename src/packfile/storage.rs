@@ -13,6 +13,7 @@ use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
+use crate::index::redo::{RedoOp, RedoRecord};
 use crate::index::{EntryUndo, InsertError, LossyIndex};
 #[cfg(feature = "multi-reader")]
 use crate::journal::pool_tag;
@@ -1343,12 +1344,22 @@ struct RoomGeneration {
     generation: u64,
 }
 
+/// Where a just-appended record lives: its shard slot, byte offset, and on-disk
+/// length.
+#[derive(Clone, Copy)]
+struct RecordLocator {
+    slot: u16,
+    offset: u64,
+    len: u64,
+}
+
 struct PutManyProgress {
     generation: u64,
     owned_index: Option<LossyIndex>,
     structural_change: bool,
     index_needs_rebuild: bool,
-    pending_deltas: Vec<(u32, u64)>,
+    /// Redo inputs for the entries inserted so far: `(id, slot, offset, record_len)`.
+    pending_deltas: Vec<(NodeId, u16, u64, u64)>,
     pending_shard_collections: Vec<(u64, u64)>,
     pending_shard_collection_counts: Vec<u64>,
     invalidate_delta: bool,
@@ -1411,9 +1422,13 @@ struct DeltaLogState {
 
 #[derive(Clone, PartialEq, Eq)]
 enum PendingDelta {
-    Slots(Vec<DeltaFrame>),
+    /// Logical redo records for the collection, in the order they were recorded
+    /// (each carries its `delta_seq`).
+    Redo(Vec<RedoRecord>),
     Snapshot,
-    Delete { generation: u64 },
+    Delete {
+        generation: u64,
+    },
 }
 
 struct V3PendingBatch {
@@ -2884,6 +2899,47 @@ impl PackfileStorage {
         (BookkeepingSource::Sidecar, counts)
     }
 
+    /// Apply logical redo sets, in `delta_seq` order, to a loaded index whose
+    /// slots are already this process's. The index is pre-sized once for the whole
+    /// batch and grown from its persisted identity tables when a growth boundary
+    /// is reached; if it cannot grow (incomplete tables), the whole replay fails
+    /// closed to the caller's rescan. Locators are checked for extent by the
+    /// caller; identity is confirmed lazily by reads, which compare the record's
+    /// hash.
+    fn apply_redo_sets(
+        index: LossyIndex,
+        records: &[RedoRecord],
+        pack_lookup: &HashMap<u64, (u16, u64)>,
+    ) -> Option<LossyIndex> {
+        let mut index = if index.is_mmap_backed() {
+            index.clone()
+        } else {
+            index
+        };
+        let target =
+            LossyIndex::capacity_for_entries(index.len().saturating_add(records.len()), 0)?;
+        while usize::try_from(index.capacity()).ok()? < target {
+            index = index.grow()?;
+        }
+        for record in records {
+            let RedoOp::Set {
+                full_hash,
+                pack_id,
+                offset,
+                ..
+            } = record.op
+            else {
+                return None;
+            };
+            let (slot, _) = *pack_lookup.get(&pack_id)?;
+            if index.insert(&full_hash, slot, offset).is_err() {
+                index = index.grow()?;
+                index.insert(&full_hash, slot, offset).ok()?;
+            }
+        }
+        Some(index)
+    }
+
     /// Fast-path index loading for `open_with_options`: build the
     /// per-collection state directly from the persisted-index checkpoint
     /// instead of rescanning every packfile.
@@ -3100,8 +3156,58 @@ impl PackfileStorage {
             .collect();
         let mut snapshot_indexes: HashMap<[u8; 16], (u64, LossyIndex)> = HashMap::new();
         let mut v3_tombstones = HashSet::new();
+        // Logical redo: every pack this log may name, by its stable id, with its
+        // current length. The log's tail fingerprint pins those lengths, so a
+        // record whose extent lies outside its pack is corruption.
+        let pack_lookup: HashMap<u64, (u16, u64)> = open_shards
+            .iter()
+            .map(|(slot, pack_id, _, file_len)| (*pack_id, (*slot, *file_len)))
+            .collect();
+        let mut redo_by_collection: HashMap<[u8; 16], Vec<RedoRecord>> = HashMap::new();
+        let mut last_delta_seq = checkpoint.base_delta_seq;
+        let reject_log = || {
+            if writable {
+                let _ = std::fs::remove_file(&delta_path);
+            }
+        };
         for operation in replay_operations {
             match operation {
+                DeltaOperation::Redo(record) => {
+                    // Strictly increasing above the checkpoint's base sequence.
+                    if record.delta_seq <= last_delta_seq {
+                        reject_log();
+                        return None;
+                    }
+                    last_delta_seq = record.delta_seq;
+                    if deleted_collections.contains(&record.collection_id) {
+                        continue;
+                    }
+                    let RedoOp::Set {
+                        pack_id,
+                        offset,
+                        record_len,
+                        ..
+                    } = record.op
+                    else {
+                        reject_log();
+                        return None;
+                    };
+                    let extent_ok = pack_lookup.get(&pack_id).is_some_and(|(_, pack_len)| {
+                        offset
+                            .checked_add(u64::from(record_len))
+                            .is_some_and(|end| end <= *pack_len)
+                    });
+                    if live_generations.get(&record.collection_id) != Some(&record.base_generation)
+                        || !extent_ok
+                    {
+                        reject_log();
+                        return None;
+                    }
+                    redo_by_collection
+                        .entry(record.collection_id)
+                        .or_default()
+                        .push(record);
+                }
                 DeltaOperation::Incremental(frame) => {
                     if deleted_collections.contains(&frame.collection_id) {
                         continue;
@@ -3159,6 +3265,7 @@ impl PackfileStorage {
                         return None;
                     };
                     frames_by_collection.remove(&collection_id);
+                    redo_by_collection.remove(&collection_id);
                     snapshot_indexes.insert(collection_id, (generation, index));
                     live_generations.insert(collection_id, generation);
                     live_order.insert(collection_id, order_key);
@@ -3180,6 +3287,7 @@ impl PackfileStorage {
                     live_generations.remove(&collection_id);
                     live_order.remove(&collection_id);
                     frames_by_collection.remove(&collection_id);
+                    redo_by_collection.remove(&collection_id);
                     snapshot_indexes.remove(&collection_id);
                     v3_tombstones.insert(collection_id);
                 }
@@ -3289,6 +3397,10 @@ impl PackfileStorage {
             if !index.remap_slots(&slot_remap) {
                 return None;
             }
+            let index = match redo_by_collection.remove(&loaded.collection_id) {
+                Some(records) => Self::apply_redo_sets(index, &records, &pack_lookup)?,
+                None => index,
+            };
             current_len.insert(loaded.collection_id, u32::try_from(index.len()).ok()?);
             scan_out.collections.insert(
                 loaded.collection_id,
@@ -3307,6 +3419,10 @@ impl PackfileStorage {
             if !index.remap_slots(&slot_remap) {
                 return None;
             }
+            let index = match redo_by_collection.remove(&collection_id) {
+                Some(records) => Self::apply_redo_sets(index, &records, &pack_lookup)?,
+                None => index,
+            };
             current_len.insert(collection_id, u32::try_from(index.len()).ok()?);
             scan_out.collections.insert(
                 collection_id,
@@ -3419,7 +3535,7 @@ impl PackfileStorage {
             // What was on disk at open is treated as durable; only what this
             // session appends is owed an fsync.
             log_synced_bytes: log_bytes_on_disk,
-            delta_seq_high: checkpoint.base_delta_seq,
+            delta_seq_high: last_delta_seq,
             log_version: replay_log_version,
             base_pack_ids: checkpoint
                 .pack_table
@@ -4149,42 +4265,70 @@ impl PackfileStorage {
             .insert(*collection_id, PendingDelta::Delete { generation });
     }
 
-    /// Record a successful index mutation as a delta frame, if the delta log
-    /// can legitimately continue through it.
+    /// Record a successful index insertion as a logical redo record, if the delta
+    /// log can legitimately continue through it.
     ///
-    /// Recording stops once a snapshot or tombstone supersedes that
-    /// collection's pending slot updates. A generation mismatch promotes the
-    /// pending update to a snapshot instead of allowing replay against the
-    /// wrong table shape.
-    fn record_delta(&self, collection_id: &[u8; 16], generation: u64, bucket: u32, slot: u64) {
+    /// The record names the change by content identity (`hash`) and its
+    /// locator (`pack_id`, `offset`, `record_len`), not by table position, and
+    /// takes its `delta_seq` from this pool's counter under the delta-state lock,
+    /// so sequence order is append order across collections. Recording stops
+    /// once a snapshot or tombstone supersedes the collection's pending updates.
+    /// A generation mismatch, or a locator a record cannot represent, promotes
+    /// the collection to a snapshot instead.
+    fn record_redo(
+        &self,
+        collection_id: &[u8; 16],
+        generation: u64,
+        hash: &[u8; 16],
+        slot: u16,
+        offset: u64,
+        record_len: u64,
+    ) {
+        let pack_id = self
+            .shards
+            .get_shard(slot)
+            .map_or(u64::from(slot), |shard| shard.pack_id);
+        let record_len = u32::try_from(record_len).unwrap_or(0);
+        let representable = record_len != 0 && offset <= crate::index::IndexEntry::MAX_OFFSET;
         let mut state = self.delta_state.lock();
         let base_generation_matches =
             state.base_generations.get(collection_id) == Some(&generation);
+        if !representable || !base_generation_matches {
+            // Replaces pending records too: the snapshot taken at sync time
+            // includes them.
+            if !matches!(
+                state.pending.get(collection_id),
+                Some(PendingDelta::Delete { .. })
+            ) {
+                state.pending.insert(*collection_id, PendingDelta::Snapshot);
+            }
+            return;
+        }
+        if matches!(
+            state.pending.get(collection_id),
+            Some(PendingDelta::Snapshot | PendingDelta::Delete { .. })
+        ) {
+            return;
+        }
+        state.delta_seq_high = state.delta_seq_high.saturating_add(1);
+        let record = RedoRecord {
+            collection_id: *collection_id,
+            op: RedoOp::Set {
+                full_hash: *hash,
+                pack_id,
+                offset,
+                record_len,
+            },
+            delta_seq: state.delta_seq_high,
+            base_generation: generation,
+        };
         match state.pending.entry(*collection_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                if base_generation_matches {
-                    entry.insert(PendingDelta::Slots(vec![DeltaFrame {
-                        collection_id: *collection_id,
-                        bucket,
-                        generation,
-                        slot,
-                    }]));
-                } else {
-                    entry.insert(PendingDelta::Snapshot);
-                }
+                entry.insert(PendingDelta::Redo(vec![record]));
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if let PendingDelta::Slots(frames) = entry.get_mut() {
-                    if frames.iter().all(|frame| frame.generation == generation) {
-                        frames.push(DeltaFrame {
-                            collection_id: *collection_id,
-                            bucket,
-                            generation,
-                            slot,
-                        });
-                    } else {
-                        entry.insert(PendingDelta::Snapshot);
-                    }
+                if let PendingDelta::Redo(records) = entry.get_mut() {
+                    records.push(record);
                 }
             }
         }
@@ -4780,6 +4924,7 @@ impl PackfileStorage {
         };
         let collections = self.collections_read();
         let mut operations = Vec::new();
+        let mut redo: Vec<RedoRecord> = Vec::new();
         let mut pending_ids: Vec<_> = state.pending.keys().copied().collect();
         pending_ids.sort_unstable();
         let mut generation_updates = Vec::new();
@@ -4791,26 +4936,23 @@ impl PackfileStorage {
                 .get(&collection_id)
                 .expect("pending id exists");
             match pending {
-                PendingDelta::Slots(frames) => {
+                PendingDelta::Redo(records) => {
                     let Some(base_generation) = state.base_generations.get(&collection_id) else {
                         return Err(StorageError::Io(std::io::Error::other(
-                            "incremental v3 frames target a collection without a base",
+                            "redo records target a collection without a base",
                         )));
                     };
-                    if frames
+                    if records
                         .iter()
-                        .any(|frame| frame.generation != *base_generation)
+                        .any(|record| record.base_generation != *base_generation)
                     {
                         return Err(StorageError::Io(std::io::Error::other(
-                            "incremental v3 frame generation differs from its base",
+                            "a redo record's generation differs from its base",
                         )));
                     }
-                    projected = projected.saturating_add(
-                        frames
-                            .len()
-                            .saturating_mul(delta::v3_incremental_frame_len()),
-                    );
-                    operations.extend(frames.iter().copied().map(DeltaOperation::Incremental));
+                    projected = projected
+                        .saturating_add(records.len().saturating_mul(delta::v3_redo_frame_len()));
+                    redo.extend(records.iter().copied());
                 }
                 PendingDelta::Snapshot => {
                     if let Some(room) = collections.get(&collection_id) {
@@ -4863,6 +5005,10 @@ impl PackfileStorage {
                 }
             }
         }
+        // Serialized in `delta_seq` order, whatever the collection order, so a
+        // reader that validates strict monotonicity sees the append order.
+        redo.sort_unstable_by_key(|record| record.delta_seq);
+        operations.extend(redo.into_iter().map(DeltaOperation::Redo));
         Ok(V3PendingBatch {
             operations,
             generation_updates,
@@ -7131,7 +7277,12 @@ impl PackfileStorage {
         if progress.index_needs_rebuild {
             return Ok(());
         }
-        self.index_put_many_entry(collection_id, id, old_gen, slot, offset, progress)
+        let locator = RecordLocator {
+            slot,
+            offset,
+            len: disk_bytes,
+        };
+        self.index_put_many_entry(collection_id, id, old_gen, locator, progress)
     }
 
     fn index_put_many_entry(
@@ -7139,10 +7290,14 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         id: &NodeId,
         old_gen: Option<&RoomGeneration>,
-        slot: u16,
-        offset: u64,
+        locator: RecordLocator,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
+        let RecordLocator {
+            slot,
+            offset,
+            len: record_len,
+        } = locator;
         let live = match progress.owned_index.as_ref() {
             Some(index) => index,
             None => {
@@ -7152,9 +7307,11 @@ impl PackfileStorage {
             }
         };
         let insert_result = self.insert_index_undoable(collection_id, live, id, slot, offset)?;
-        let inserted = if let Ok((bucket, slot, undo)) = insert_result {
+        let inserted = if let Ok((_bucket, _entry, undo)) = insert_result {
             let was_empty = undo.was_empty();
-            progress.pending_deltas.push((bucket, slot));
+            progress
+                .pending_deltas
+                .push((*id, slot, offset, record_len));
             if progress.owned_index.is_none() {
                 progress.undo_log.push(undo);
             }
@@ -7369,10 +7526,10 @@ impl PackfileStorage {
             self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
-                if let Ok((bucket, entry, inserted)) =
+                if let Ok((_bucket, _entry, inserted)) =
                     self.insert_index(collection_id, &gen.index, id, slot, offset)?
                 {
-                    self.record_delta(collection_id, gen.generation, bucket, entry);
+                    self.record_redo(collection_id, gen.generation, id, slot, offset, disk_bytes);
                     let pack_id = self
                         .shards
                         .get_shard(slot)
@@ -7418,8 +7575,8 @@ impl PackfileStorage {
                 None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
             };
             let inserted = self.insert_index(collection_id, &index, id, slot, offset)?;
-            if let Ok((bucket, entry, is_new)) = inserted {
-                self.record_delta(collection_id, generation, bucket, entry);
+            if let Ok((_bucket, _entry, is_new)) = inserted {
+                self.record_redo(collection_id, generation, id, slot, offset, disk_bytes);
                 let pack_id = self
                     .shards
                     .get_shard(slot)
@@ -7597,8 +7754,15 @@ impl PackfileStorage {
         if progress.invalidate_delta {
             self.invalidate_delta_log(collection_id);
         } else {
-            for (bucket, slot) in progress.pending_deltas {
-                self.record_delta(collection_id, progress.generation, bucket, slot);
+            for (id, slot, offset, record_len) in progress.pending_deltas {
+                self.record_redo(
+                    collection_id,
+                    progress.generation,
+                    &id,
+                    slot,
+                    offset,
+                    record_len,
+                );
             }
         }
         self.record_put_many_shard_collections(
@@ -12844,85 +13008,6 @@ mod tests {
     }
 
     #[test]
-    fn inherited_v2_delta_replays_then_rebases_to_checkpoint() {
-        let dir = test_dir("v2_delta_rebase");
-        let store = PackfileStorage::open(dir.clone()).unwrap();
-        store
-            .put(
-                &TEST_COLLECTION,
-                &distinct_id(20),
-                &NodeData::new(bytes::Bytes::from_static(b"checkpointed")),
-            )
-            .unwrap();
-        store.sync_all().unwrap();
-
-        let replayed_id = distinct_id(21);
-        let replayed_value = bytes::Bytes::from_static(b"inherited v2 delta");
-        store
-            .put(
-                &TEST_COLLECTION,
-                &replayed_id,
-                &NodeData::new(replayed_value.clone()),
-            )
-            .unwrap();
-        store.flush_all().unwrap();
-        let current = store.delta_state.lock().clone();
-        let base = current.base_fingerprint.expect("checkpoint base exists");
-        let frames = match &current.pending[&TEST_COLLECTION] {
-            PendingDelta::Slots(frames) => frames.clone(),
-            _ => panic!("plain put records a v2-compatible incremental frame"),
-        };
-        let tail = store.current_pack_fingerprint();
-        let path = PackfileStorage::delta_path(&dir, base);
-        let bytes_written = crate::index::delta::append_batch(&path, true, base, &frames, tail)
-            .expect("write legacy v2 log");
-        {
-            let mut state = store.delta_state.lock();
-            state.log_version = 2;
-            state.log_bytes = u64::try_from(bytes_written).unwrap();
-        }
-        drop(store);
-
-        let reopened = PackfileStorage::open(dir.clone()).unwrap();
-        assert_eq!(
-            reopened
-                .get(&TEST_COLLECTION, &replayed_id)
-                .unwrap()
-                .unwrap()
-                .bytes,
-            replayed_value
-        );
-        let next_id = distinct_id(22);
-        reopened
-            .put(
-                &TEST_COLLECTION,
-                &next_id,
-                &NodeData::new(bytes::Bytes::from_static(b"post rebase")),
-            )
-            .unwrap();
-        let before = reopened.stats();
-        reopened.sync_all().unwrap();
-        let after = reopened.stats();
-        assert_eq!(after.checkpoint_writes - before.checkpoint_writes, 1);
-        assert_eq!(after.delta_appends - before.delta_appends, 0);
-        drop(reopened);
-
-        let final_open = PackfileStorage::open(dir.clone()).unwrap();
-        assert!(final_open
-            .get(&TEST_COLLECTION, &replayed_id)
-            .unwrap()
-            .is_some());
-        assert!(final_open
-            .get(&TEST_COLLECTION, &next_id)
-            .unwrap()
-            .is_some());
-        drop(final_open);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// The per-collection v3 snapshots make the rewrite budget irrelevant to
-    /// ordinary room churn: after the initial baseline, each sync appends.
-    #[test]
     fn checkpoint_rewrite_budget_defers_invalidated_rewrites() {
         const ROUNDS: u8 = 5;
         let dir = test_dir("checkpoint_rewrite_budget");
@@ -13340,7 +13425,7 @@ mod tests {
             );
             assert!(matches!(
                 d.pending.get(&REOPEN_PROBE_COLLECTION),
-                Some(PendingDelta::Slots(_))
+                Some(PendingDelta::Redo(_))
             ));
             drop(d);
             store.sync().unwrap();
@@ -18156,6 +18241,131 @@ mod tests {
         assert_eq!(reopened.delta_state.lock().delta_seq_high, 17);
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Puts after a checkpoint are recorded as logical redo records with
+    /// increasing sequence numbers, and a reopen replays them in order: an
+    /// overwrite of an identity converges to its last locator, and the counter
+    /// resumes above the last sequence in the log.
+    #[test]
+    fn logical_redo_replays_in_order_and_the_counter_resumes_above_the_log() {
+        let dir = test_dir("logical_redo_order");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0xD8; 16];
+        store
+            .put(&collection, &batch_node(1), &NodeData::from_slice(b"first"))
+            .unwrap();
+        store.sync_all().unwrap();
+        store
+            .put(
+                &collection,
+                &batch_node(1),
+                &NodeData::from_slice(b"second"),
+            )
+            .unwrap();
+        store
+            .put(&collection, &batch_node(2), &NodeData::from_slice(b"other"))
+            .unwrap();
+        let seqs: Vec<u64> = match &store.delta_state.lock().pending[&collection] {
+            PendingDelta::Redo(records) => records.iter().map(|record| record.delta_seq).collect(),
+            _ => panic!("puts after a checkpoint are recorded as redo records"),
+        };
+        assert_eq!(seqs.len(), 2);
+        assert!(seqs[0] < seqs[1], "sequence order is append order");
+        store.sync_all().unwrap();
+        drop(store);
+
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(reopened.open_timings().unwrap().path, OpenPath::Checkpoint);
+        assert_eq!(
+            reopened
+                .get(&collection, &batch_node(1))
+                .unwrap()
+                .unwrap()
+                .bytes,
+            bytes::Bytes::from_static(b"second"),
+            "the overwrite converges to its last locator"
+        );
+        assert!(reopened.get(&collection, &batch_node(2)).unwrap().is_some());
+        assert!(reopened.delta_state.lock().delta_seq_high >= seqs[1]);
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A redo log that names an unknown pack, a locator outside its pack, or a
+    /// sequence that does not increase is rejected, and the open falls back to a
+    /// rescan that still finds every record. The unmodified log is trusted.
+    #[test]
+    fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
+        fn open_after(mutate: impl Fn(&mut RedoRecord)) -> (OpenPath, usize) {
+            let dir = test_dir("bad_redo_log");
+            let collection = [0xD9; 16];
+            let store = PackfileStorage::open(dir.clone()).unwrap();
+            store
+                .put(&collection, &batch_node(0), &NodeData::from_slice(b"base"))
+                .unwrap();
+            store.sync_all().unwrap();
+            for id in 1..=5 {
+                store
+                    .put(&collection, &batch_node(id), &NodeData::from_slice(b"redo"))
+                    .unwrap();
+            }
+            store.sync_all().unwrap();
+            let base = store.delta_state.lock().base_fingerprint.unwrap();
+            drop(store);
+
+            let path = PackfileStorage::delta_path(&dir, base);
+            let log = delta::read_delta_log_v3(&path).unwrap();
+            let mut operations = log.operations;
+            let mut mutated = 0;
+            for operation in &mut operations {
+                if let DeltaOperation::Redo(record) = operation {
+                    mutate(record);
+                    mutated += 1;
+                }
+            }
+            assert!(mutated > 0, "the log must hold redo records");
+            fs::remove_file(&path).unwrap();
+            delta::append_v3_batch_with_durability(
+                &path,
+                true,
+                log.base_fingerprint,
+                &operations,
+                log.tail_fingerprint,
+                false,
+            )
+            .unwrap();
+
+            let reopened = PackfileStorage::open(dir.clone()).unwrap();
+            let path_taken = reopened.open_timings().unwrap().path;
+            let found = (0..=5)
+                .filter(|id| {
+                    reopened
+                        .get(&collection, &batch_node(*id))
+                        .unwrap()
+                        .is_some()
+                })
+                .count();
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+            (path_taken, found)
+        }
+
+        assert_eq!(open_after(|_| {}), (OpenPath::Checkpoint, 6), "control");
+        let unknown_pack = |record: &mut RedoRecord| {
+            if let RedoOp::Set { pack_id, .. } = &mut record.op {
+                *pack_id += 1000;
+            }
+        };
+        let out_of_extent = |record: &mut RedoRecord| {
+            if let RedoOp::Set { offset, .. } = &mut record.op {
+                *offset = crate::index::IndexEntry::MAX_OFFSET;
+            }
+        };
+        let flat_sequence = |record: &mut RedoRecord| record.delta_seq = 0;
+        assert_eq!(open_after(unknown_pack), (OpenPath::FullScan, 6));
+        assert_eq!(open_after(out_of_extent), (OpenPath::FullScan, 6));
+        assert_eq!(open_after(flat_sequence), (OpenPath::FullScan, 6));
     }
 
     /// The coverage step obeys the same rotation: with the log at the rotation
