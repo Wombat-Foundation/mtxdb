@@ -4843,15 +4843,18 @@ impl PackfileStorage {
             self.persist_index_checkpoint_best_effort();
             return;
         }
-        let captured = match self.capture_checkpoint() {
-            Ok(Some(captured)) => captured,
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!("mtxdb: failed to persist index checkpoint: {error}");
-                return;
-            }
+        if let Err(error) = self.start_checkpoint_worker() {
+            eprintln!("mtxdb: failed to persist index checkpoint: {error}");
+        }
+    }
+
+    /// Capture a checkpoint under the locks and hand its tail to a worker
+    /// thread, returning once the capture is done. A failed spawn abandons the
+    /// capture (the next sync rewrites the checkpoint).
+    fn start_checkpoint_worker(&self) -> Result<(), StorageError> {
+        let Some(CapturedCheckpoint { tail, breakdown }) = self.capture_checkpoint()? else {
+            return Ok(());
         };
-        let CapturedCheckpoint { tail, breakdown } = captured;
         let spawned = std::thread::Builder::new()
             .name("mtxdb-checkpoint".into())
             .spawn(move || tail.run());
@@ -4860,10 +4863,11 @@ impl PackfileStorage {
                 self.checkpoint_tails_started
                     .fetch_add(1, Ordering::Relaxed);
                 *self.checkpoint_worker.lock() = Some(CheckpointWorker { handle, breakdown });
+                Ok(())
             }
             Err(error) => {
-                eprintln!("mtxdb: could not start the checkpoint worker: {error}");
                 self.abandon_checkpoint();
+                Err(StorageError::Io(error))
             }
         }
     }
@@ -8757,28 +8761,7 @@ impl PackfileStorage {
         }
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
-        let captured = match self.capture_checkpoint() {
-            Ok(Some(captured)) => captured,
-            Ok(None) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let CapturedCheckpoint { tail, breakdown } = captured;
-        let spawned = std::thread::Builder::new()
-            .name("mtxdb-checkpoint".into())
-            .spawn(move || tail.run());
-        match spawned {
-            Ok(handle) => {
-                self.checkpoint_tails_started
-                    .fetch_add(1, Ordering::Relaxed);
-                *self.checkpoint_worker.lock() = Some(CheckpointWorker { handle, breakdown });
-                Ok(())
-            }
-            Err(error) => {
-                eprintln!("mtxdb: could not start the checkpoint worker: {error}");
-                self.abandon_checkpoint();
-                Ok(())
-            }
-        }
+        self.start_checkpoint_worker()
     }
 
     /// Bound how often a structurally-needed full checkpoint rewrite may run.

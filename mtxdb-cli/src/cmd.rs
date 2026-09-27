@@ -11356,8 +11356,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn packs_extract_rejects_same_source_and_dest() {
+    /// A temp database with one record synced into an `EventDag` pack, and a
+    /// `packs` CLI over it. Returns the directory, the CLI and the pack's id.
+    fn one_record_pack_fixture() -> (PathBuf, Cli, u64) {
         let dir = unique_temp_dir();
         let layout = DatabaseLayout::open(dir.clone()).unwrap();
         let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
@@ -11382,8 +11383,15 @@ mod tests {
                 action: super::PacksAction::List { all: false },
             },
         };
+        (dir, cli, pack_id)
+    }
 
-        let source_path = layout
+    #[test]
+    fn packs_extract_rejects_same_source_and_dest() {
+        let (dir, cli, pack_id) = one_record_pack_fixture();
+
+        let source_path = DatabaseLayout::open(dir.clone())
+            .unwrap()
             .pool_dir_read_only(ShardType::EventDag)
             .unwrap()
             .join(format!("pack_{pack_id:016x}.pack"));
@@ -11406,30 +11414,7 @@ mod tests {
 
     #[test]
     fn packs_extract_derives_pack_id_from_filename_when_unspecified() {
-        let dir = unique_temp_dir();
-        let layout = DatabaseLayout::open(dir.clone()).unwrap();
-        let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
-        let store = PackfileStorage::open(pool).unwrap();
-        store
-            .put(
-                &[0x11; 16],
-                &[0x22; 16],
-                &NodeData::new(Bytes::from_static(b"data")),
-            )
-            .unwrap();
-        store.sync().unwrap();
-        let pack_id = store.shard_summaries()[0].pack_id;
-        drop(store);
-
-        let cli = Cli {
-            dirs: vec![dir.clone()],
-            shard_type: Some(ShardType::EventDag),
-            coalesce: false,
-            read_plan: mtxdb::ReadPlanPolicy::disabled(),
-            command: Commands::Packs {
-                action: super::PacksAction::List { all: false },
-            },
-        };
+        let (dir, cli, pack_id) = one_record_pack_fixture();
 
         let out_pack = dir.join("pack_000000000000000f.pack");
         super::cmd_packs_extract(
