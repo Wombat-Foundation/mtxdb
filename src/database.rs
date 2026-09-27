@@ -1504,14 +1504,27 @@ mod tests {
 
         drop(release);
         state.wait_for_checkpoint();
-        assert!(state.durable_coverage() > state_before);
-        state.sync().unwrap();
+        let covered_by_tail = state.durable_coverage();
+        assert!(covered_by_tail > state_before);
+        // The tail covered what was committed at its handoff. Commit 2 came
+        // later, so State still holds the segment until a coverage step covers
+        // it: force one by making the segment over its trigger.
+        assert!(
+            db.coordinator()
+                .reclaim_blockers()
+                .contains(&ShardType::State),
+            "commit 2 is not covered by the tail's image"
+        );
+        db.coordinator().set_reclaim_trigger_len(1);
+        state.sync_all().unwrap();
+        state.wait_for_checkpoint();
         events.sync_all().unwrap();
+        assert!(state.durable_coverage() > covered_by_tail);
         assert!(
             !db.coordinator()
                 .reclaim_blockers()
                 .contains(&ShardType::State),
-            "the installed image releases the segment"
+            "once State covers commit 2 it no longer holds the segment"
         );
         drop(db);
         let reopened = SharedDatabase::open(root.clone()).unwrap();
