@@ -339,10 +339,22 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             offset,
             decode,
         } => cmd_meta(cli, target, *json, *limit, *offset, decode.as_deref()),
-        Commands::Info { collection, stats } => match collection {
-            Some(collection) => cmd_info(cli, collection),
-            None => cmd_info_default(cli, *stats),
-        },
+        Commands::Info {
+            selector,
+            pack,
+            collection,
+            stats,
+        } => {
+            if let Some(pack) = pack {
+                cmd_info(cli, pack, Some(InfoTarget::Pack))
+            } else if let Some(collection) = collection {
+                cmd_info(cli, collection, Some(InfoTarget::Collection))
+            } else if let Some(selector) = selector {
+                cmd_info(cli, selector, None)
+            } else {
+                cmd_info_default(cli, *stats)
+            }
+        }
         Commands::Scan {
             selector,
             verbose,
@@ -3872,32 +3884,60 @@ fn fmt_duration(secs: u64) -> String {
 /// therefore resolves that length against the selected store — a live pack
 /// with that exact address, and/or a live collection with that id — and
 /// errors when both match so the caller must disambiguate explicitly
-/// (`--collection`). Bare hex is not accepted.
+/// (`--pack` or `--collection`). Bare hex is not accepted.
 /// What an `info` selector names.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InfoTarget {
     Pack,
     Collection,
 }
 
-/// Whether a live pack with this exact address exists in any selected pool.
+/// One live pack discovered in a selected pool, with enough provenance to name
+/// it in an ambiguity diagnostic.
+struct PackLocation {
+    database: PathBuf,
+    shard_type: ShardType,
+    pack_id: PackId,
+}
+
+impl std::fmt::Display for PackLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} [{}]",
+            self.pack_id,
+            pool_label(&self.database, self.shard_type)
+        )
+    }
+}
+
+/// A short human label for a pool: the database dir name plus shard type.
+fn pool_label(database: &Path, shard_type: ShardType) -> String {
+    let db = database
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| database.to_str().unwrap_or("?"));
+    format!("{db}:{shard_type:?}")
+}
+
+/// Every live pack across the selected pools, with its database and shard type.
 ///
 /// Cost: opens every selected database and globs every selected pool's pack
-/// directory. This is fine once per `info` invocation (the only caller,
-/// `classify_info_selector`, runs on a single selector), but must not be
-/// called per-selector inside a multi-selector command — hoist the pool walk
-/// and reuse it instead.
-fn pack_id_exists(cli: &Cli, target_id: &PackId) -> bool {
+/// directory. This is fine once per `info` invocation, but must not be called
+/// per-selector inside a multi-selector command — hoist the pool walk and
+/// reuse it instead.
+fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
     let Ok(dirs) = valid_database_dirs(cli) else {
-        return false;
+        return Vec::new();
     };
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
     } else {
         cli.shard_types().collect()
     };
+    let mut locations = Vec::new();
     for db_dir in dirs {
-        let Ok(layout) = DatabaseLayout::open_read_only(db_dir) else {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
             continue;
         };
         for &shard_type in &shard_types {
@@ -3905,13 +3945,22 @@ fn pack_id_exists(cli: &Cli, target_id: &PackId) -> bool {
                 continue;
             };
             if let Ok(files) = glob_pack_files(&dir) {
-                if files.iter().any(|(id, _, _)| id == target_id) {
-                    return true;
-                }
+                locations.extend(files.into_iter().map(|(pack_id, _, _)| PackLocation {
+                    database: db_dir.clone(),
+                    shard_type,
+                    pack_id,
+                }));
             }
         }
     }
-    false
+    locations
+}
+
+/// Whether a live pack with this exact address exists in any selected pool.
+fn pack_id_exists(cli: &Cli, target_id: &PackId) -> bool {
+    pack_locations_in_selected_pools(cli)
+        .iter()
+        .any(|location| &location.pack_id == target_id)
 }
 
 /// Whether a live collection with this id exists in any selected pool.
@@ -3951,17 +4000,95 @@ fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
     false
 }
 
-/// Classify an `info` selector by the digits after its canonical lowercase
-/// `0x` prefix: 1-16 name a pack prefix, exactly 32 can name either a full pack
-/// address or a collection, and any other count is an error. A selector without
-/// a `0x` prefix is handed to the collection parser (which accepts only a canonical
-/// sigil such as `!room`); an uppercase `0X` prefix is rejected rather than guessed at.
+/// Classify an `info`/`scan` selector by inference. See
+/// [`classify_info_selector_explicit`]; this is the no-override form.
+fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
+    classify_info_selector_explicit(cli, selector, None)
+}
+
+/// Classify a selector, optionally under an explicit namespace.
 ///
-/// For an ambiguous 32-hex selector, the database is checked:
+/// With `explicit` set (from `info --pack` / `info --collection`), the requested
+/// type is used directly — inference is skipped — and the selector is validated
+/// against that type: `--pack` accepts the full 0x-prefixed 32-hex address or a
+/// 1-16 hex filename prefix that resolves to exactly one pack (ambiguity errors
+/// and asks for the full address); `--collection` accepts an exact 32-hex id or
+/// a canonical `!room` sigil. Either errors if nothing of that type matches.
+///
+/// Without it, classification is inferred by the digits after the canonical
+/// lowercase `0x` prefix: 1-16 name a pack prefix, exactly 32 can name either a
+/// full pack address or a collection, and any other count is an error. A
+/// selector without a `0x` prefix is handed to the collection parser (which
+/// accepts only a canonical sigil such as `!room`); an uppercase `0X` prefix is
+/// rejected rather than guessed at. For an ambiguous 32-hex selector the
+/// database is checked:
 /// - If only an existing pack matches, it resolves as [`InfoTarget::Pack`].
 /// - If only a collection exists (or neither exists yet), it resolves as [`InfoTarget::Collection`].
-/// - If both a live pack and a collection match the same ID, an error requires an explicit selector.
-fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
+/// - If both a live pack and a collection match the same ID, an error requires
+///   an explicit `--pack` or `--collection` (with the exact 32-hex id).
+fn classify_info_selector_explicit(
+    cli: &Cli,
+    selector: &str,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<InfoTarget> {
+    match explicit {
+        Some(InfoTarget::Pack) => {
+            // A full 32-hex address, or a 1-16 hex filename prefix (64 bits is
+            // the ergonomic default). A prefix must resolve to exactly one
+            // pack in exactly one pool; anything else is reported with the
+            // specific conflict. Never a collection.
+            let pack_selector = parse_pack_id_selector(selector)?;
+            let locations = pack_locations_in_selected_pools(cli);
+            let matched: Vec<&PackLocation> = locations
+                .iter()
+                .filter(|location| pack_selector.matches(&location.pack_id))
+                .collect();
+            let distinct: std::collections::BTreeSet<PackId> =
+                matched.iter().map(|location| location.pack_id).collect();
+            match (distinct.len(), matched.len()) {
+                (0, _) => bail!("pack {selector}: not found"),
+                (1, 1) => return Ok(InfoTarget::Pack),
+                (1, _) => {
+                    // One pack, present in more than one selected pool.
+                    let where_ = matched
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    bail!(
+                        "pack {selector} exists in {} selected pools ({where_}); narrow with \
+                         --dir or -t to a single pool",
+                        matched.len()
+                    )
+                }
+                (n, m) => {
+                    // More than one distinct pack matches the prefix.
+                    let ids = distinct
+                        .iter()
+                        .map(PackId::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let pool_hint = if m > n {
+                        " (some also appear in more than one pool, so narrow with --dir or -t)"
+                    } else {
+                        ""
+                    };
+                    bail!(
+                        "pack prefix `{selector}` matches {n} different packs ({ids}); use the \
+                         full 0x-prefixed {PACK_ID_HEX_LEN}-hex id{pool_hint}"
+                    )
+                }
+            }
+        }
+        Some(InfoTarget::Collection) => {
+            let id = parse_collection_selector(selector)?;
+            if !collection_id_exists(cli, &id) {
+                bail!("collection {selector}: not found");
+            }
+            return Ok(InfoTarget::Collection);
+        }
+        None => {}
+    }
     let Some(hex) = selector.strip_prefix("0x") else {
         if selector.starts_with("0X") {
             bail!("invalid ID `{selector}`: the prefix must be lowercase `0x`");
@@ -3984,9 +4111,9 @@ fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarge
 
             if pack_matches && collection_matches {
                 bail!(
-                    "ambiguous 32-hex selector `{selector}` matches both a live pack and a collection; \
-                     use a pack-specific command (e.g. `mtxdb packs inspect --pack {selector}`), \
-                     an unambiguous pack prefix, or `--collection {selector}` to disambiguate"
+                    "selector `{selector}` matches both a pack and a collection; specify one:\n  \
+                     mtxdb info --pack {selector}\n  \
+                     mtxdb info --collection {selector}"
                 );
             }
             if pack_matches {
@@ -4010,9 +4137,13 @@ fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarge
 }
 
 #[allow(clippy::too_many_lines)]
-fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+fn cmd_info_coalesced(
+    cli: &Cli,
+    selector: &str,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<()> {
     let deep = matches!(cli.command, Commands::Info { stats: true, .. });
-    let target = classify_info_selector(cli, selector)?;
+    let target = classify_info_selector_explicit(cli, selector, explicit)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -5073,16 +5204,16 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+fn cmd_info(cli: &Cli, selector: &str, explicit: Option<InfoTarget>) -> anyhow::Result<()> {
     if cli.coalesce {
-        return cmd_info_coalesced(cli, selector);
+        return cmd_info_coalesced(cli, selector, explicit);
     }
-    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector))
+    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector, explicit))
 }
 
-fn cmd_info_single(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+fn cmd_info_single(cli: &Cli, selector: &str, explicit: Option<InfoTarget>) -> anyhow::Result<()> {
     let deep = matches!(cli.command, Commands::Info { stats: true, .. });
-    match classify_info_selector(cli, selector)? {
+    match classify_info_selector_explicit(cli, selector, explicit)? {
         InfoTarget::Pack => cmd_info_pack(cli, selector),
         InfoTarget::Collection => cmd_info_collection(cli, selector, deep),
     }
@@ -11185,13 +11316,15 @@ mod tests {
             coalesce: false,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
-                collection: Some(String::new()),
+                selector: Some(String::new()),
+                pack: None,
+                collection: None,
                 stats: false,
             },
         };
-        let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63").unwrap_err();
+        let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63", None).unwrap_err();
         assert!(doubled.to_string().contains("doubled"), "{doubled}");
-        let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF").unwrap_err();
+        let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF", None).unwrap_err();
         assert!(short.to_string().contains("found 30 characters"), "{short}");
     }
 
@@ -11203,6 +11336,8 @@ mod tests {
             coalesce: false,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
+                selector: None,
+                pack: None,
                 collection: None,
                 stats: false,
             },
@@ -11258,6 +11393,8 @@ mod tests {
             coalesce: false,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
+                selector: None,
+                pack: None,
                 collection: None,
                 stats: false,
             },
@@ -11283,16 +11420,137 @@ mod tests {
         store.sync_all().unwrap();
         drop(store);
 
+        // Positional inference now fails with actionable advice naming both
+        // real flags (they exist and are verified below).
         let ambiguous_err = super::classify_info_selector(&cli, &pack_hex).unwrap_err();
         let msg = ambiguous_err.to_string();
-        assert!(msg.contains("ambiguous 32-hex selector"), "{msg}");
-        // The advice must name a real disambiguator. `--collection` exists and
-        // forces the collection interpretation; there is no `--pack`, and a
-        // prefix is not guaranteed unique, so the message must not promise one.
+        assert!(
+            msg.contains("matches both a pack and a collection"),
+            "{msg}"
+        );
+        assert!(msg.contains("--pack"), "{msg}");
         assert!(msg.contains("--collection"), "{msg}");
-        assert!(!msg.contains("use a pack prefix"), "{msg}");
+
+        // `--pack` bypasses inference and resolves the pack even under collision.
+        assert_eq!(
+            super::classify_info_selector_explicit(&cli, &pack_hex, Some(super::InfoTarget::Pack))
+                .unwrap(),
+            super::InfoTarget::Pack
+        );
+        // `--collection` bypasses inference and resolves the collection.
+        assert_eq!(
+            super::classify_info_selector_explicit(
+                &cli,
+                &col_hex,
+                Some(super::InfoTarget::Collection)
+            )
+            .unwrap(),
+            super::InfoTarget::Collection
+        );
+        // A unique prefix resolves under `--pack`...
+        let prefix = format!("0x{}", &pack_id.as_hex()[..16]);
+        assert_eq!(
+            super::classify_info_selector_explicit(&cli, &prefix, Some(super::InfoTarget::Pack))
+                .unwrap(),
+            super::InfoTarget::Pack
+        );
+        // ...and `--pack` with an unknown id errors rather than falling through.
+        let missing = format!("0x{}", "ff".repeat(mtxdb::packfile::PACK_ID_LEN));
+        assert!(super::classify_info_selector_explicit(
+            &cli,
+            &missing,
+            Some(super::InfoTarget::Pack)
+        )
+        .is_err());
+        // `--collection` never falls back to a pack: an address with no such
+        // collection errors, even though it is a live pack.
+        let no_collection = format!("0x{}", "ee".repeat(mtxdb::packfile::PACK_ID_LEN));
+        assert!(super::classify_info_selector_explicit(
+            &cli,
+            &no_collection,
+            Some(super::InfoTarget::Collection)
+        )
+        .is_err());
+        // The deliberately-created colliding collection *does* resolve under
+        // `--collection` for the pack's address — that is the point of the flag.
+        assert_eq!(
+            super::classify_info_selector_explicit(
+                &cli,
+                &pack_hex,
+                Some(super::InfoTarget::Collection)
+            )
+            .unwrap(),
+            super::InfoTarget::Collection
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn info_pack_flag_reports_same_id_in_multiple_pools() {
+        // A full PackId present in two selected pools cannot be disambiguated
+        // by using the full address — the error must say to narrow the pool.
+        let dir1 = unique_temp_dir();
+        let dir2 = unique_temp_dir();
+        let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
+        let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
+        let p1 = l1.pool_dir_read_only(ShardType::EventDag).unwrap();
+        let p2 = l2.pool_dir_read_only(ShardType::EventDag).unwrap();
+
+        let s1 = PackfileStorage::open(p1.clone()).unwrap();
+        s1.put(
+            &[0x11; 16],
+            &[0x33; 16],
+            &NodeData::new(Bytes::from_static(b"a")),
+        )
+        .unwrap();
+        // Fully durable before the file is copied into the second pool.
+        s1.sync_all().unwrap();
+        drop(s1);
+        // Give dir2 its own pool, then copy dir1's pack into it so the same
+        // PackId is live in both selected pools.
+        let s2 = PackfileStorage::open(p2.clone()).unwrap();
+        s2.put(
+            &[0x22; 16],
+            &[0x44; 16],
+            &NodeData::new(Bytes::from_static(b"b")),
+        )
+        .unwrap();
+        s2.sync_all().unwrap();
+        drop(s2);
+
+        let pack_file = std::fs::read_dir(&p1)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+            .expect("dir1 pool has a pack file");
+        let pack_id = glob_pack_files(&p1).unwrap()[0].0;
+        std::fs::copy(&pack_file, p2.join(pack_file.file_name().unwrap())).unwrap();
+
+        let cli = Cli {
+            dirs: vec![dir1.clone(), dir2.clone()],
+            shard_type: Some(ShardType::EventDag),
+            coalesce: false,
+            read_plan: mtxdb::ReadPlanPolicy::disabled(),
+            command: Commands::Info {
+                selector: None,
+                pack: None,
+                collection: None,
+                stats: false,
+            },
+        };
+
+        let full = format!("0x{}", pack_id.as_hex());
+        let err =
+            super::classify_info_selector_explicit(&cli, &full, Some(super::InfoTarget::Pack))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("selected pools"), "{msg}");
+        assert!(msg.contains("--dir or -t"), "{msg}");
+
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     #[test]
@@ -11303,6 +11561,8 @@ mod tests {
             coalesce: false,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
+                selector: None,
+                pack: None,
                 collection: None,
                 stats: false,
             },
@@ -11957,12 +12217,14 @@ mod tests {
             coalesce: false,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
-                collection: Some(col_hex.clone()),
+                selector: Some(col_hex.clone()),
+                pack: None,
+                collection: None,
                 stats: false,
             },
         };
 
-        cmd_info(&cli, &col_hex).unwrap();
+        cmd_info(&cli, &col_hex, None).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -14492,11 +14754,13 @@ mod tests {
             coalesce: true,
             read_plan: mtxdb::ReadPlanPolicy::disabled(),
             command: Commands::Info {
-                collection: Some(format_id(&col1)),
+                selector: Some(format_id(&col1)),
+                pack: None,
+                collection: None,
                 stats: false,
             },
         };
-        cmd_info(&cli_info, &format_id(&col1)).unwrap();
+        cmd_info(&cli_info, &format_id(&col1), None).unwrap();
 
         let cli_scan = Cli {
             dirs: vec![dir1.clone(), dir2.clone()],

@@ -120,6 +120,12 @@ pub(crate) enum Commands {
         decode: Option<String>,
     },
     Info {
+        /// Positional selector; its namespace is inferred (pack for a 1-16 hex
+        /// prefix, pack or collection for 32 hex by existence).
+        selector: Option<String>,
+        /// Explicit `--pack` selector; bypasses inference.
+        pack: Option<String>,
+        /// Explicit `--collection` selector; bypasses inference.
         collection: Option<String>,
         stats: bool,
     },
@@ -557,13 +563,39 @@ fn sub_info() -> Command {
     Command::new("info")
         .about("Show storage info for a collection or a pack")
         .arg(
-            Arg::new("collection")
+            Arg::new("selector")
                 .required(false)
+                .conflicts_with_all(["pack", "collection"])
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A `0x`-prefixed collection ID (32 hex digits after `0x`) or a pack ID \
-                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits). Omit it to \
-                     show database and pool metadata.",
+                    "A `0x`-prefixed 32-hex id naming a pack or a collection, or a canonical \
+                     collection sigil such as !room:server. A 32-hex selector is inferred: it \
+                     resolves to a pack if only a pack matches, to a collection if only a \
+                     collection matches, and is an error if both match (specify --pack or \
+                     --collection to disambiguate). Mutually exclusive with --pack/--collection. \
+                     Omit to show database and pool metadata.",
+                ),
+        )
+        .arg(
+            Arg::new("pack")
+                .long("pack")
+                .conflicts_with("collection")
+                .value_name("PACK_ID")
+                .help(
+                    "Interpret the selector as a pack (0x-prefixed full 32-hex id, or a unique \
+                     1-16 hex filename prefix). Bypasses inference; errors if no such pack \
+                     exists.",
+                ),
+        )
+        .arg(
+            Arg::new("collection")
+                .long("collection")
+                .conflicts_with("pack")
+                .value_name("COLLECTION")
+                .help(
+                    "Interpret the selector as a collection (0x-prefixed 32-hex id, or a \
+                     canonical sigil such as !room:server). Bypasses inference; errors if no \
+                     such collection exists.",
                 ),
         )
         .arg(
@@ -962,6 +994,8 @@ fn parse_cli() -> Cli {
             decode: m.get_one::<String>("decode").cloned(),
         },
         Some(("info", m)) => Commands::Info {
+            selector: m.get_one::<String>("selector").cloned(),
+            pack: m.get_one::<String>("pack").cloned(),
             collection: m.get_one::<String>("collection").cloned(),
             stats: m.get_flag("stats"),
         },
@@ -1209,6 +1243,34 @@ mod parse_tests {
             Some("target")
         );
         assert!(sub.get_flag("yes"));
+    }
+
+    #[test]
+    fn test_info_selector_modes_and_mutual_exclusion() {
+        // Positional, --pack, and --collection are each accepted alone.
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "info", "0x1f"])
+            .is_ok());
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "info", "--pack", "0x1f"])
+            .is_ok());
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "info", "--collection", "!room:server"])
+            .is_ok());
+        // Bare `info` is the default (database/pool metadata).
+        assert!(build_cli().try_get_matches_from(["mtxdb", "info"]).is_ok());
+
+        // The two flags conflict with each other...
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "info", "--pack", "0x1f", "--collection", "0x2f"])
+            .is_err());
+        // ...and each conflicts with the positional selector.
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "info", "0x1f", "--pack", "0x2f"])
+            .is_err());
+        assert!(build_cli()
+            .try_get_matches_from(["mtxdb", "info", "0x1f", "--collection", "0x2f"])
+            .is_err());
     }
 
     #[test]
