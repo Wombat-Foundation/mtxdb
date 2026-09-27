@@ -3659,7 +3659,7 @@ fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<PackId, us
 /// Discover canonical `pack_<hex>.pack` files.
 ///
 /// The filename carries only a truncated (optionally full) address prefix; the
-/// authoritative 256-bit address is read from the header and checked against
+/// authoritative 128-bit address is read from the header and checked against
 /// the filename prefix. Returns `(address, bytes, format version)` ordered by
 /// address.
 fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(PackId, u64, u8)>> {
@@ -6010,11 +6010,11 @@ fn print_collection_shards(shards: &[PackId]) {
 /// An operator-facing pack identifier. Slots are deliberately not accepted
 /// here: they are recycled implementation details, while a pack address is the
 /// permanent identity printed by `mtxdb shards`. A selector is either the full
-/// 64-hex address or a 1–16 hex filename prefix; the prefix is resolved against
+/// 32-hex address or a 1–16 hex filename prefix; the prefix is resolved against
 /// a pool's discovered packs, where it must be unique.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PackSelector {
-    /// A full 256-bit address, matched exactly.
+    /// A full 128-bit address, matched exactly.
     Exact(PackId),
     /// A lowercase hex prefix of an address (typically the 16-hex filename stem).
     Prefix(String),
@@ -6037,15 +6037,8 @@ impl PackSelector {
         }
         if hex.len() == PACK_ID_HEX_LEN {
             let id = PackId::from_hex(hex)
-                .ok_or_else(|| anyhow!("invalid pack ID `{selector}`; not a 256-bit address"))?;
+                .ok_or_else(|| anyhow!("invalid pack ID `{selector}`; not a 128-bit address"))?;
             return Ok(Self::Exact(id));
-        }
-        if hex.len() == 32 {
-            bail!(
-                "invalid pack ID `{selector}`; that's 32 hex digits, which looks like a \
-                 collection ID, not a pack ID — pack IDs are 1–16 hex digits (a filename \
-                 prefix) or 64 (the full address), shown by `mtxdb shards`"
-            );
         }
         if hex.len() > PACK_FILENAME_PREFIX_HEX {
             bail!(
@@ -11129,10 +11122,10 @@ mod tests {
     fn only_the_canonical_lowercase_prefix_is_accepted() {
         // A short 0x-prefixed prefix is a filename-prefix selector.
         let short = super::parse_pack_id_selector("0x1f").unwrap();
-        assert!(short.matches(&PackId([0x1f; 32])));
-        assert!(!short.matches(&PackId([0x20; 32])));
-        // A full 64-hex address is an exact selector.
-        let full = "ab".repeat(32);
+        assert!(short.matches(&PackId([0x1f; mtxdb::packfile::PACK_ID_LEN])));
+        assert!(!short.matches(&PackId([0x20; mtxdb::packfile::PACK_ID_LEN])));
+        // A full 32-hex address is an exact selector.
+        let full = "ab".repeat(mtxdb::packfile::PACK_ID_LEN);
         assert!(super::parse_pack_id_selector(&format!("0x{full}")).is_ok());
         assert!(super::parse_pack_id_selector(&format!("0x{}", full.to_uppercase())).is_err());
 
@@ -11325,7 +11318,7 @@ mod tests {
             let pool = layout.pool_dir_read_only(shard_type).unwrap();
             let mut bytes = [0u8; mtxdb::packfile::PACK_ID_LEN];
             bytes[0] = 0xAB;
-            bytes[31] = tail;
+            bytes[mtxdb::packfile::PACK_ID_LEN - 1] = tail;
             let pack_id = PackId(bytes);
             let mut file = std::fs::File::create(pool.join(pack_id.filename())).unwrap();
             mtxdb::packfile::write_header(&mut file, &pack_id).unwrap();
@@ -12339,11 +12332,15 @@ mod tests {
             parse_pack_id_selector("0x3-5").is_err(),
             "ranges are not pack IDs"
         );
-        // 32 hex digits look like a collection, not a pack.
-        assert!(parse_pack_id_selector(&format!("0x{}", "a".repeat(32))).is_err());
-        // A short prefix and a full 64-hex address are both accepted, and
+        // Anything longer than the full address is rejected.
+        assert!(parse_pack_id_selector(&format!(
+            "0x{}",
+            "a".repeat(mtxdb::packfile::PACK_ID_LEN * 2 + 2)
+        ))
+        .is_err());
+        // A short prefix and a full 32-hex address are both accepted, and
         // exact duplicates are collapsed.
-        let full = "ab".repeat(32);
+        let full = "ab".repeat(mtxdb::packfile::PACK_ID_LEN);
         let selectors = parse_pack_selectors(&[
             format!("0x{full}"),
             "0x0002".to_owned(),

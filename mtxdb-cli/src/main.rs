@@ -723,7 +723,7 @@ fn sub_packs_extract() -> Command {
                 .long("pack")
                 .required(true)
                 .value_name("PACK_ID")
-                .help("Source pack identity (full 64-hex 0x-prefixed id, or a unique filename prefix)"),
+                .help("Source pack identity (full 32-hex 0x-prefixed id, or a unique filename prefix)"),
         )
         .arg(
             Arg::new("collection")

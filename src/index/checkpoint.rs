@@ -73,7 +73,13 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// with empty identity side tables (cold-start tag-collision verification
 /// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
 /// reads for tag collisions on cold start.
-pub const CHECKPOINT_VERSION: u32 = 7;
+///
+/// Bumped to 8: the pack table's [`PackTableEntry`] stores the 16-byte
+/// [`PackId`] identity (v7 used the 32-byte form), so each entry shrank from
+/// 36 to 20 bytes. The magic/version check below rejects a v7 file outright,
+/// forcing the normal full-rescan fallback rather than misreading the
+/// narrower entries.
+pub const CHECKPOINT_VERSION: u32 = 8;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 

@@ -971,14 +971,15 @@ fn disk_bytes_from_physical(
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
 /// v5 adds physical bytes to the reduced bookkeeping and pins it to the exact
 /// `(pack_id, file_len)` set by carrying the same `pack_fingerprint` as the
-/// index checkpoint. v6 widens the record's pack identity from a numeric id to
-/// the 32-byte [`PackId`].
-const SHARD_ROOMS_VERSION: u8 = 6;
+/// index checkpoint. v7 uses the 16-byte [`PackId`] identity (v6 used the
+/// 32-byte form); the record width changed, so the version must advance and a
+/// v6 file is rejected and rebuilt.
+const SHARD_ROOMS_VERSION: u8 = 7;
 /// Header size: magic(4) + version(1) + `pack_fingerprint(8)` + `persisted_at(8)`.
 const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
-/// One entry: `pack_id`(32) + `collection_id`(16) + count(8) + the
+/// One entry: `pack_id`(16) + `collection_id`(16) + count(8) + the
 /// collection's stable insertion ordinal(8) + disk bytes(8).
-const SHARD_ROOMS_RECORD_LEN: usize = 32 + 16 + 8 + 8 + 8;
+const SHARD_ROOMS_RECORD_LEN: usize = crate::packfile::PACK_ID_LEN + 16 + 8 + 8 + 8;
 
 /// The largest record offset `IndexEntry` can represent: its 32-bit offset
 /// field stores `offset + 1`, reserving the all-zeros encoding for the empty
@@ -1329,19 +1330,28 @@ pub fn read_persisted_shard_collections(
     let records = body
         .chunks_exact(SHARD_ROOMS_RECORD_LEN)
         .map(|chunk| {
+            // The record is fixed-width, so destructure by const offsets
+            // rather than accumulating them: `SR_PACK_ID`(16) +
+            // `SR_COLLECTION`(16) + `SR_COUNT`(8) + `SR_INSERTION`(8) +
+            // `SR_DISK`(8).
+            const SR_PACK_ID: usize = crate::packfile::PACK_ID_LEN;
+            const SR_COLLECTION: usize = 16;
+            const SR_COUNT: usize = 8;
+            const SR_INSERTION: usize = 8;
+            let (pack_id_bytes, rest) = chunk.split_at(SR_PACK_ID);
+            let (collection_bytes, rest) = rest.split_at(SR_COLLECTION);
+            let (count_bytes, rest) = rest.split_at(SR_COUNT);
+            let (insertion_bytes, disk_bytes) = rest.split_at(SR_INSERTION);
             let mut pack_id = [0u8; crate::packfile::PACK_ID_LEN];
-            pack_id.copy_from_slice(&chunk[0..32]);
+            pack_id.copy_from_slice(pack_id_bytes);
             let mut collection_id = [0u8; 16];
-            collection_id.copy_from_slice(&chunk[32..48]);
-            let count = u64::from_le_bytes(chunk[48..56].try_into().ok()?);
-            let insertion_order = u64::from_le_bytes(chunk[56..64].try_into().ok()?);
-            let disk_bytes = u64::from_le_bytes(chunk[64..72].try_into().ok()?);
+            collection_id.copy_from_slice(collection_bytes);
             Some(PersistedShardRoom {
                 pack_id: PackId(pack_id),
                 collection_id,
-                count,
-                insertion_order,
-                disk_bytes,
+                count: u64::from_le_bytes(count_bytes.try_into().ok()?),
+                insertion_order: u64::from_le_bytes(insertion_bytes.try_into().ok()?),
+                disk_bytes: u64::from_le_bytes(disk_bytes.try_into().ok()?),
             })
         })
         .collect::<Option<Vec<_>>>()?;

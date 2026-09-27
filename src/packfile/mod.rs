@@ -17,7 +17,7 @@ pub const MAGIC: [u8; 4] = *b"MTDB";
 /// [`write_header`]/[`read_header`]).
 ///
 /// Version 5: replaces the pool-local monotonic `pack_id: u64` identity with a
-/// globally unique, cryptographically random 256-bit [`PackId`]. The
+/// globally unique, cryptographically random 128-bit [`PackId`]. The
 /// address is unique across pools, databases, and hosts, so an extracted or
 /// imported pack can be adopted verbatim (no rename, no header rewrite) and
 /// referenced globally. Filename changes from `pack_{pack_id:016x}.pack` to
@@ -36,7 +36,7 @@ pub const VERSION: u8 = 0x05;
 pub const HEADER_LEN: usize = 4096;
 
 /// Byte length of a [`PackId`].
-pub const PACK_ID_LEN: usize = 32;
+pub const PACK_ID_LEN: usize = 16;
 
 /// Filenames carry a shortened address prefix by default (64 bits), extended
 /// with additional `_<chunk>` groups only to break a prefix collision within a
@@ -44,7 +44,7 @@ pub const PACK_ID_LEN: usize = 32;
 /// lossy, disambiguated lookup key.
 pub const PACK_FILENAME_PREFIX_HEX: usize = 16;
 
-/// A pack's globally unique, immutable identity: 32 cryptographically random
+/// A pack's globally unique, immutable identity: 16 cryptographically random
 /// bytes assigned at creation.
 ///
 /// Unlike the old pool-local monotonic counter, this address is unique across
@@ -58,8 +58,9 @@ impl PackId {
     /// Generate a fresh random address from OS entropy.
     ///
     /// Uses `std`'s `RandomState` (OS-seeded) mixed with the process's
-    /// monotonic clock and an atomic counter, then expanded to 256 bits through
-    /// BLAKE3. There is no security adversary selecting pack identities here;
+    /// monotonic clock and an atomic counter, then hashed through BLAKE3 and
+    /// truncated to 128 bits. There is no security adversary selecting pack
+    /// identities here;
     /// the requirement is collision-freedom across pools/hosts, which this
     /// satisfies without adding a `getrandom` dependency.
     #[must_use]
@@ -83,16 +84,19 @@ impl PackId {
         if let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             hasher.update(&elapsed.as_nanos().to_le_bytes());
         }
-        Self(*hasher.finalize().as_bytes())
+        let digest = *hasher.finalize().as_bytes();
+        let mut bytes = [0u8; PACK_ID_LEN];
+        bytes.copy_from_slice(&digest[..PACK_ID_LEN]);
+        Self(bytes)
     }
 
-    /// The raw 32 address bytes.
+    /// The raw 16 address bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; PACK_ID_LEN] {
         &self.0
     }
 
-    /// The full 64 lowercase hex digits of the address.
+    /// The full 32 lowercase hex digits of the address.
     #[must_use]
     pub fn as_hex(&self) -> String {
         hex_lower(&self.0)
@@ -115,7 +119,7 @@ impl PackId {
     /// The filename to use when creating this pack among `siblings`.
     ///
     /// Normally the compact `pack_<16 hex digits>.pack`. If that 16-hex prefix
-    /// collides with an existing sibling, fall back to the full 64-hex name so
+    /// collides with an existing sibling, fall back to the full 32-hex name so
     /// the choice is a single deterministic widening at creation time. This is
     /// only consulted when *creating* a pack: an existing file's name is fixed
     /// on disk and never recomputed, so adding a later sibling can never rename
@@ -153,7 +157,7 @@ impl PackId {
         for (index, group) in rest.split('_').enumerate() {
             // The first group is normally the 16-hex truncated prefix, but the
             // collision fallback emitted by [`PackId::filename_for`] is a single
-            // full 64-hex address. Later groups are always 16-hex continuation
+            // full 32-hex address. Later groups are always 16-hex continuation
             // chunks of an underscore-joined prefix.
             let valid_len = group.len() == PACK_FILENAME_PREFIX_HEX
                 || (index == 0 && group.len() == PACK_ID_LEN * 2);
@@ -181,7 +185,7 @@ impl PackId {
         Some((bytes, digits.len()))
     }
 
-    /// Parse a full address from 64 lowercase hex digits (as stored in the
+    /// Parse a full address from 32 lowercase hex digits (as stored in the
     /// header, and as accepted by `--json`/`--long` displays and exact
     /// selectors).
     ///
@@ -265,7 +269,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 const CRC_COVERED_LEN: usize = 4 // magic
     + 1 // version
     + 4 // header_len (u32)
-    + PACK_ID_LEN // pack_address
+    + PACK_ID_LEN // pack_id
     + 8 // created_at (u64, unix seconds)
     + 4; // feature_flags (u32, reserved)
 

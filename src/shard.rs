@@ -322,10 +322,10 @@ const STATS_FILENAME: &str = "shard_stats.bin";
 
 /// Magic bytes + version identifying the stats file format.
 const STATS_MAGIC: &[u8; 4] = b"MSTA";
-/// v5 keys each record by the pack's full 32-byte [`packfile::PackId`]
-/// instead of a numeric id. The snapshot is a rebuildable observability cache,
+/// v6 keys each record by the pack's full 16-byte [`packfile::PackId`] (v5
+/// used the 32-byte form). The snapshot is a rebuildable observability cache,
 /// so a stale or unreadable file is simply not restored.
-const STATS_VERSION: u8 = 5;
+const STATS_VERSION: u8 = 6;
 
 /// Minimum interval between implicit stats-snapshot writes from the hot
 /// dirty-sync path ([`ShardPool::sync_dirty`]). The snapshot is
@@ -334,7 +334,7 @@ const STATS_VERSION: u8 = 5;
 /// still persist it.
 const STATS_FLUSH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// On-disk size of one v5 stats record: `pack_address`(32) + 3×counter(8) = 56.
+/// On-disk size of one v6 stats record: `pack_id`(16) + 3×counter(8) = 40.
 const STATS_RECORD_LEN: usize = packfile::PACK_ID_LEN + 8 * 3;
 
 /// Header size: magic(4) + version(1) + `persisted_at`(8).
@@ -877,7 +877,7 @@ impl ShardPool {
     ///
     /// A canonical filename is `pack_<16 lowercase hex digits>` with optional
     /// `_<16 hex>` continuation groups, a truncated, disambiguated prefix of
-    /// the pack's 256-bit [`packfile::PackId`]. The filename is only a
+    /// the pack's 128-bit [`packfile::PackId`]. The filename is only a
     /// lookup key: the authoritative identity is read from (and validated
     /// against) the file's header. Uppercase hex is rejected to prevent
     /// case-insensitive collisions and enforce one canonical spelling.

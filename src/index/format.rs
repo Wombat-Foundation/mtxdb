@@ -15,8 +15,8 @@ pub const DELTA_FRAME_LEN: usize = 36;
 pub const CHECKPOINT_HEADER_LEN: usize = 88;
 /// Bytes in one collection directory entry.
 pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
-/// Bytes in one [`PackTableEntry`]: `slot`(2) + reserved(2) + `PackId`(32).
-pub const PACK_TABLE_ENTRY_LEN: usize = 36;
+/// Bytes in one [`PackTableEntry`]: `slot`(2) + reserved(2) + `PackId`(16).
+pub const PACK_TABLE_ENTRY_LEN: usize = 20;
 
 /// One slot overwrite after a checkpoint.
 ///
@@ -176,7 +176,7 @@ impl PackTableEntry {
     pub fn encode(self) -> [u8; PACK_TABLE_ENTRY_LEN] {
         let mut bytes = [0; PACK_TABLE_ENTRY_LEN];
         bytes[..2].copy_from_slice(&self.slot.to_le_bytes());
-        bytes[4..36].copy_from_slice(self.pack_id.as_bytes());
+        bytes[4..20].copy_from_slice(self.pack_id.as_bytes());
         bytes
     }
 
@@ -185,7 +185,7 @@ impl PackTableEntry {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; PACK_TABLE_ENTRY_LEN] = bytes.try_into().ok()?;
         let mut pack_id = [0u8; crate::packfile::PACK_ID_LEN];
-        pack_id.copy_from_slice(&bytes[4..36]);
+        pack_id.copy_from_slice(&bytes[4..20]);
         Some(Self {
             slot: u16::from_le_bytes(bytes[..2].try_into().ok()?),
             pack_id: PackId(pack_id),
