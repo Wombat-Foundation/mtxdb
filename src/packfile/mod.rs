@@ -1006,6 +1006,16 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
 /// Never in practice: `read_frame_header` validates that `frame_len` is at
 /// least `FRAME_FIXED_LEN` before the checked subtraction below.
 pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordMetadata>> {
+    read_record_metadata_scratch(reader, &mut [0u8; SCAN_DISCARD_BUF_LEN])
+}
+
+/// [`read_record_metadata`] with the payload-discard buffer supplied by the
+/// caller. A scan over many frames passes one buffer for all of them: zeroing a
+/// fresh 8 KiB for every frame costs more than parsing a small one.
+fn read_record_metadata_scratch(
+    reader: &mut impl Read,
+    discard: &mut [u8; SCAN_DISCARD_BUF_LEN],
+) -> io::Result<Option<RecordMetadata>> {
     let Some(header) = read_frame_header(reader)? else {
         return Ok(None);
     };
@@ -1032,7 +1042,6 @@ pub fn read_record_metadata(reader: &mut impl Read) -> io::Result<Option<RecordM
     // For a CRC-disabled frame the checksum field is zero and unused; the
     // payload still must be consumed to advance the stream, just without the
     // hashing pass.
-    let mut discard = [0u8; SCAN_DISCARD_BUF_LEN];
     while remaining > 0 {
         let chunk_len = remaining.min(discard.len());
         reader.read_exact(&mut discard[..chunk_len])?;
@@ -1584,9 +1593,10 @@ fn recover_packfile_with(
     }
 
     recovery.valid_len = reader.position;
+    let mut scratch = [0u8; SCAN_DISCARD_BUF_LEN];
     loop {
         let offset = reader.position;
-        match read_record_metadata(&mut reader) {
+        match read_record_metadata_scratch(&mut reader, &mut scratch) {
             Ok(Some(meta)) => {
                 on_record((meta.collection_id, meta.hash, offset));
                 recovery.records = recovery.records.saturating_add(1);
