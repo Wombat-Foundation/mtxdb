@@ -1517,7 +1517,7 @@ pub struct PackfileStorage {
     /// snapshotted in the same checkpoint. Existing-collection puts never
     /// touch it (their `put_mutex` already gates them), so the shrink-latency
     /// property the epoch-handoff window exists to protect is untouched.
-    collection_creation: Arc<parking_lot::RwLock<()>>,
+    collection_creation: parking_lot::RwLock<()>,
     /// In-memory cache of the `deleted.collections` file, seeded once at
     /// `open()` from disk. Guards both the set and the read-modify-write of
     /// the backing file, so a plain membership check (the common case: most
@@ -2614,7 +2614,7 @@ impl PackfileStorage {
             refresh_locks: parking_lot::Mutex::new(HashMap::new()),
             last_refresh_fingerprint: parking_lot::Mutex::new(initial_fingerprints),
             initial_durable_fingerprint: initial_durable_fp,
-            collection_creation: Arc::new(parking_lot::RwLock::new(())),
+            collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
@@ -4546,7 +4546,7 @@ impl PackfileStorage {
         // beforehand (its collection is in the snapshot) or runs entirely
         // afterwards (its bytes land post-fingerprint, and the fingerprint
         // mismatch on reopen routes to the full rescan).
-        let create_guard = self.collection_creation.clone().write_arc();
+        let create_guard = self.collection_creation.write();
         // A collection created between the initial scan above and this lock
         // wasn't in the locked set and must be now — otherwise a put to one
         // serially dispatched by the engine could still squeeze under the
@@ -4633,14 +4633,16 @@ impl PackfileStorage {
         breakdown.snapshot = snapshot_started
             .elapsed()
             .saturating_sub(breakdown.serialize);
-        // The creation lock rides out the tail (moved into `CheckpointTail`
-        // below and dropped after the install + retire), so no collection can
-        // be published between this snapshot and the durable install. The
-        // snapshot was captured with publication excluded, so a collection
-        // published only after the tail finishes lands after `fingerprint` and
-        // is recovered by the new epoch or the rescan — never silently
-        // omitted. Holding it here costs new-collection creation, not puts to
-        // existing collections.
+        // A collection published after this point lands after `fingerprint`
+        // (its frames change a pack length), so a reopen that trusts C1 either
+        // finds its frames in the new epoch or fails the tail-fingerprint gate
+        // and rescans; it can never be silently omitted, because the image was
+        // captured with publication excluded. The creation lock therefore drops
+        // with the put mutexes rather than riding out the tail: every in-flight
+        // sync appends to the new epoch through `append_index_delta_v3`, which
+        // also takes this lock, so holding it across the tail would stall every
+        // sync for the tail's duration and defeat the background checkpoint.
+        drop(create_guard);
         let tail = CheckpointTail {
             base_dir: self.base_dir.clone(),
             fingerprint,
@@ -4652,7 +4654,6 @@ impl PackfileStorage {
             journal: self.journal(),
             pool_tag: self.journal_pool.load(Ordering::Acquire),
             durable_coverage: Arc::clone(&self.durable_coverage),
-            create_guard,
             #[cfg(test)]
             hook: self.checkpoint_tail_hook.lock().take(),
         };
@@ -10272,13 +10273,6 @@ struct CheckpointTail {
     journal: Option<Arc<JournalCoordinator>>,
     pool_tag: u8,
     durable_coverage: Arc<AtomicU64>,
-    /// Held from capture until the new checkpoint is durably installed and the
-    /// retired epoch removed, so a collection published mid-tail cannot be
-    /// absent from the checkpoint's pack table and snapshot while its records
-    /// enter the new epoch. Owned (not borrowed) so it can ride the worker
-    /// thread. This excludes new-collection publication only; puts to existing
-    /// collections are gated by their own `put_mutex` and are unaffected.
-    create_guard: parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>,
     #[cfg(test)]
     hook: Option<TailHook>,
 }
@@ -10344,11 +10338,6 @@ impl CheckpointTail {
         let retire_started = std::time::Instant::now();
         retire_delta_epoch_file(&self.base_dir, self.old_base_fingerprint);
         done.retire = retire_started.elapsed();
-        // The creation lock is held as `self.create_guard` and released only
-        // when this method returns (the field drops with `self`), i.e. after
-        // the image is durably installed and the retired epoch removed. This
-        // explicit use documents that the guard must outlive every step above.
-        drop(self.create_guard);
         Ok(done)
     }
 }
