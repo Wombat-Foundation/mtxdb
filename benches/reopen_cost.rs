@@ -84,8 +84,24 @@ fn on_disk_sizes(dir: &Path) -> (u64, u64) {
     (checkpoint, log)
 }
 
+/// Total bytes and count of the pack files in `dir`.
+fn pack_sizes(dir: &Path) -> (u64, usize) {
+    let mut bytes = 0u64;
+    let mut count = 0usize;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".pack") {
+                bytes = bytes.saturating_add(file_len(&entry.path()));
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    (bytes, count)
+}
+
 fn print_open(label: &str, timings: &OpenTimings, first_read: Duration, dir: &Path) {
     let (checkpoint, log) = on_disk_sizes(dir);
+    let (pack_bytes, packs) = pack_sizes(dir);
     let replay_ms = millis(timings.delta_replay);
     let rate = if replay_ms > 0.0 {
         format!(
@@ -96,19 +112,45 @@ fn print_open(label: &str, timings: &OpenTimings, first_read: Duration, dir: &Pa
     } else {
         "n/a".to_owned()
     };
+    // Whatever the named phases do not cover, so a large open cannot hide.
+    let named = [
+        timings.shard_open,
+        timings.metadata_load,
+        timings.checkpoint_decode,
+        timings.fingerprint,
+        timings.index_materialization,
+    ]
+    .into_iter()
+    .fold(Duration::ZERO, Duration::saturating_add);
+    let unattributed = timings.total.saturating_sub(named);
     println!(
-        "  {label:<8} total {:>7.0} ms | path {:?} | checkpoint {} MiB, log {} MiB | \
-         checkpoint decode {:.0}, fingerprint {:.0}, index materialization {:.0}, \
-         delta replay {replay_ms:.0} ({} ops, {rate}), shard open {:.0} | first read {:.2} ms",
+        "  {label:<6} total {:>6.0} ms | {:?}, bookkeeping {:?} | checkpoint {} MiB, log {} MiB, \
+         {packs} pack(s) {} MiB",
         millis(timings.total),
         timings.path,
+        timings.bookkeeping_source,
         checkpoint >> 20,
         log >> 20,
+        pack_bytes >> 20,
+    );
+    println!(
+        "         shard open {:.0} (discovery {:.0}, writer lock {:.0}, pack recovery {:.0} over {} \
+         call(s), pack open {:.0}, metadata {:.0}) | metadata load {:.0} | checkpoint decode {:.0} | \
+         fingerprint {:.0} | index materialization {:.0} (delta replay {replay_ms:.0}: {} ops, {rate}) | \
+         unattributed {:.0} | first read {:.2} ms",
+        millis(timings.shard_open),
+        millis(timings.shard_discovery),
+        millis(timings.writer_lock),
+        millis(timings.packfile_recovery),
+        timings.packfile_recovery_calls,
+        millis(timings.packfile_open),
+        millis(timings.metadata_restore),
+        millis(timings.metadata_load),
         millis(timings.checkpoint_decode),
         millis(timings.fingerprint),
         millis(timings.index_materialization),
         timings.delta_replay_operations,
-        millis(timings.shard_open),
+        millis(unattributed),
         millis(first_read),
     );
 }
