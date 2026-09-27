@@ -7334,7 +7334,11 @@ impl PackfileStorage {
                 progress.invalidate_delta = true;
                 return Ok(());
             };
-            progress.invalidate_delta = true;
+            // Growth is logical: the entry that hit the boundary is logged like
+            // the others and replay grows the table, so no snapshot is needed.
+            progress
+                .pending_deltas
+                .push((*id, slot, offset, record_len));
             progress.structural_change = true;
             self.index_grow_count.fetch_add(1, Ordering::Relaxed);
             self.index_clone_time_ns.fetch_add(
@@ -7587,23 +7591,27 @@ impl PackfileStorage {
                     self.record_disk_bytes(pack_id, collection_id, disk_bytes);
                 }
             } else {
-                // The insert was rejected (table full). The collection's shape
-                // is about to change, so any delta frames would no longer be
-                // replayable against a checkpoint at this generation.
-                self.invalidate_delta_log(collection_id);
+                // The insert was rejected (table full). Capacity growth changes
+                // the table's shape but not what a logical redo record says, so
+                // it does not invalidate the delta log: the record that hit the
+                // boundary is logged like any other, and replay grows the table
+                // itself. Only a rebuild re-derives the collection wholesale.
                 if let Some(grown) = index.grow() {
                     // The failed insert did not mutate the table, so retry it
                     // after the in-memory rehash. This is the normal capacity
                     // path and must not turn into a full-pack scan.
                     let _ = grown.insert(id, slot, offset);
                     index = grown;
+                    self.record_redo(collection_id, generation, id, slot, offset, disk_bytes);
                 } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
                     // A checkpoint-backed index has locations but not homes.
                     // Recovering the hashes from those locations is bounded
                     // by this collection, unlike `rebuild_index`'s pack scan.
                     let _ = grown.insert(id, slot, offset);
                     index = grown;
+                    self.record_redo(collection_id, generation, id, slot, offset, disk_bytes);
                 } else {
+                    self.invalidate_delta_log(collection_id);
                     index = self.rebuild_index(collection_id)?;
                     let _ = index.insert(id, slot, offset);
                 }
@@ -12729,7 +12737,8 @@ mod tests {
         // Arm C: force that same collection past the index's 75%-load grow
         // threshold with a batch (`put_many` is the path that sizes and grows
         // an index; the single-record `put` grow path is not what
-        // `index_grow_count` tracks). The grow emits a replacement snapshot.
+        // `index_grow_count` tracks). Growth is logical: it emits redo records,
+        // not a replacement snapshot.
         let before_c = store_b.stats();
         let entries: Vec<(NodeId, NodeData)> = (next..80u8)
             .map(|i| {
@@ -12747,20 +12756,42 @@ mod tests {
             grows >= 1,
             "crossing the load threshold must grow the index"
         );
-        assert!(
-            after_c.delta_invalidations - before_c.delta_invalidations >= grows,
-            "each grow invalidates the pending log"
+        assert_eq!(
+            after_c.delta_invalidations - before_c.delta_invalidations,
+            0,
+            "growth does not invalidate the log: replay grows the table itself"
         );
         assert_eq!(
             after_c.delta_appends - before_c.delta_appends,
             1,
-            "a growing collection appends one replacement snapshot"
+            "a growing collection appends its redo records in one batch"
         );
+        assert_log_has_redo_and_no_snapshot(&store_b, entries.len());
         assert_eq!(
             after_c.checkpoint_writes - before_c.checkpoint_writes,
             0,
             "growth no longer rewrites the whole checkpoint"
         );
+    }
+
+    /// The store's current delta log holds at least `min_redo` redo records and
+    /// no whole-index snapshot.
+    fn assert_log_has_redo_and_no_snapshot(store: &PackfileStorage, min_redo: usize) {
+        let base = store.delta_state.lock().base_fingerprint.unwrap();
+        let log =
+            delta::read_delta_log_v3(&PackfileStorage::delta_path(&store.base_dir, base)).unwrap();
+        assert!(
+            log.operations
+                .iter()
+                .all(|operation| !matches!(operation, DeltaOperation::CollectionSnapshot { .. })),
+            "no whole-index snapshot for a growth"
+        );
+        let redo_ops = log
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation, DeltaOperation::Redo(_)))
+            .count();
+        assert!(redo_ops >= min_redo, "the batch's records are logged");
     }
 
     fn batch_node(index: u32) -> NodeId {
@@ -13554,11 +13585,12 @@ mod tests {
             assert_eq!(after_put.index_grow_count - before.index_grow_count, 1);
             assert_eq!(
                 after_put.delta_invalidations - before.delta_invalidations,
-                1
+                0,
+                "growth of a reopened index is logical, not a snapshot"
             );
             assert!(matches!(
                 d.pending.get(&REOPEN_PROBE_COLLECTION),
-                Some(PendingDelta::Snapshot)
+                Some(PendingDelta::Redo(_))
             ));
             drop(d);
             store.sync().unwrap();
@@ -18366,6 +18398,184 @@ mod tests {
         assert_eq!(open_after(unknown_pack), (OpenPath::FullScan, 6));
         assert_eq!(open_after(out_of_extent), (OpenPath::FullScan, 6));
         assert_eq!(open_after(flat_sequence), (OpenPath::FullScan, 6));
+    }
+
+    /// Differential: a collection driven through many batches, overwrites and
+    /// several capacity growths after its checkpoint, synced only as deltas, must
+    /// reopen to exactly what the live session held: every identity at its last
+    /// value and the same number of entries. Growth is logical, so the log holds
+    /// redo records only. Repeated across two reopens so a log continues a log.
+    #[test]
+    fn logical_replay_across_growth_matches_the_live_index() {
+        let dir = test_dir("logical_replay_differential");
+        let collection = [0xDA; 16];
+        let mut expected: HashMap<NodeId, Vec<u8>> = HashMap::new();
+        let mut next = 0u32;
+        let mut round_value = 0u8;
+        let mut drive = |store: &PackfileStorage, expected: &mut HashMap<NodeId, Vec<u8>>| {
+            round_value = round_value.wrapping_add(1);
+            let mut batch = Vec::new();
+            // New identities (enough over the rounds to cross several growths).
+            for _ in 0..400 {
+                batch.push((batch_node(next), vec![round_value; 8]));
+                next += 1;
+            }
+            // Overwrites of earlier identities with a new value.
+            for old in (0..next.saturating_sub(400)).step_by(37) {
+                batch.push((batch_node(old), vec![round_value; 8]));
+            }
+            let entries: Vec<(NodeId, NodeData)> = batch
+                .iter()
+                .map(|(id, value)| (*id, NodeData::from_slice(value)))
+                .collect();
+            store.put_many(&collection, &entries).unwrap();
+            for (id, value) in batch {
+                expected.insert(id, value);
+            }
+            // A few single puts too (the other recording path).
+            for _ in 0..5 {
+                store
+                    .put(
+                        &collection,
+                        &batch_node(next),
+                        &NodeData::from_slice(&[round_value; 8]),
+                    )
+                    .unwrap();
+                expected.insert(batch_node(next), vec![round_value; 8]);
+                next += 1;
+            }
+            store.sync_all().unwrap();
+        };
+        let verify = |store: &PackfileStorage, expected: &HashMap<NodeId, Vec<u8>>| {
+            for (id, value) in expected {
+                assert_eq!(
+                    store.get(&collection, id).unwrap().unwrap().bytes.as_ref(),
+                    value.as_slice(),
+                    "a record diverged from the live session"
+                );
+            }
+            assert_eq!(
+                store.generation(&collection).unwrap().index.len(),
+                expected.len(),
+                "the index holds a different number of entries"
+            );
+        };
+
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &collection,
+                &batch_node(u32::MAX),
+                &NodeData::from_slice(b"seed"),
+            )
+            .unwrap();
+        expected.insert(batch_node(u32::MAX), b"seed".to_vec());
+        store.sync_all().unwrap(); // the checkpoint every later batch continues
+        let grows_before = store.stats().index_grow_count;
+        for _ in 0..8 {
+            drive(&store, &mut expected);
+        }
+        assert!(
+            store.stats().index_grow_count > grows_before,
+            "the workload must cross capacity growths after the checkpoint"
+        );
+        drop(store);
+
+        // Reopen 1: replays a log of redo records, then keeps appending to it.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(reopened.open_timings().unwrap().path, OpenPath::Checkpoint);
+        verify(&reopened, &expected);
+        assert_log_has_redo_and_no_snapshot(&reopened, 1);
+        for _ in 0..4 {
+            drive(&reopened, &mut expected);
+        }
+        drop(reopened);
+
+        // Reopen 2: a log that continued a replayed log.
+        let again = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(again.open_timings().unwrap().path, OpenPath::Checkpoint);
+        verify(&again, &expected);
+        drop(again);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Applying redo sets is idempotent and order-convergent: replaying the whole
+    /// sequence twice, or over an image that already holds a prefix of it, gives
+    /// the same identities and locators as applying it once, with the last write
+    /// of an identity winning.
+    #[test]
+    fn applying_redo_sets_is_idempotent_and_order_convergent() {
+        let config = crate::index::IndexConfig {
+            seed: 0x1D3A,
+            ..crate::index::IndexConfig::default()
+        };
+        let pack_lookup: HashMap<u64, (u16, u64)> = HashMap::from([(7, (2, 1 << 20))]);
+        let hash = |seq: u32| {
+            let mut hash = [0u8; 16];
+            hash[..4].copy_from_slice(&seq.to_le_bytes());
+            hash[4..8].copy_from_slice(&seq.wrapping_mul(0x9E37_79B1).to_le_bytes());
+            hash[8..12].copy_from_slice(&seq.wrapping_mul(0x85EB_CA6B).to_le_bytes());
+            hash[12..].copy_from_slice(&seq.wrapping_mul(0xC2B2_AE35).to_le_bytes());
+            hash
+        };
+        // 300 distinct identities, then overwrites of every third to new locators.
+        let mut records = Vec::new();
+        let mut seq = 0u64;
+        for id in 0..300u32 {
+            seq += 1;
+            records.push(RedoRecord {
+                collection_id: [1; 16],
+                op: RedoOp::Set {
+                    full_hash: hash(id),
+                    pack_id: 7,
+                    offset: 1_000 + u64::from(id) * 64,
+                    record_len: 61,
+                },
+                delta_seq: seq,
+                base_generation: 1,
+            });
+        }
+        for id in (0..300u32).step_by(3) {
+            seq += 1;
+            records.push(RedoRecord {
+                collection_id: [1; 16],
+                op: RedoOp::Set {
+                    full_hash: hash(id),
+                    pack_id: 7,
+                    offset: 500_000 + u64::from(id) * 64,
+                    record_len: 61,
+                },
+                delta_seq: seq,
+                base_generation: 1,
+            });
+        }
+        let fresh = || LossyIndex::with_config(16, config);
+        let once = PackfileStorage::apply_redo_sets(fresh(), &records, &pack_lookup).unwrap();
+        let twice = PackfileStorage::apply_redo_sets(once.clone(), &records, &pack_lookup).unwrap();
+        let over_prefix = {
+            let prefix =
+                PackfileStorage::apply_redo_sets(fresh(), &records[..350], &pack_lookup).unwrap();
+            PackfileStorage::apply_redo_sets(prefix, &records, &pack_lookup).unwrap()
+        };
+        assert_eq!(once.len(), 300, "300 distinct identities");
+        for candidate in [&twice, &over_prefix] {
+            assert_eq!(candidate.len(), once.len());
+            assert_eq!(candidate.slot_counts(), once.slot_counts());
+        }
+        for id in 0..300u32 {
+            let expected_offset = if id % 3 == 0 {
+                500_000 + u64::from(id) * 64
+            } else {
+                1_000 + u64::from(id) * 64
+            };
+            for index in [&once, &twice, &over_prefix] {
+                assert_eq!(
+                    index.lookup(&hash(id)),
+                    Some((2, expected_offset)),
+                    "identity {id}: the last write wins"
+                );
+            }
+        }
     }
 
     /// The coverage step obeys the same rotation: with the log at the rotation
