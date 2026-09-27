@@ -130,3 +130,9 @@ harness = false
 name = "wal_lagging_pool"
 path = "wal_lagging_pool.rs"
 harness = false
+
+# Reopen time against index size and delta-log size.
+[[bench]]
+name = "reopen_cost"
+path = "reopen_cost.rs"
+harness = false
