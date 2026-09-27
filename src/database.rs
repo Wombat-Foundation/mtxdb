@@ -1585,6 +1585,23 @@ mod tests {
             "the other pool's remediation leaves the held pool's coverage alone"
         );
 
+        // A crash at this instant — State's tail still held, EventDag's already
+        // installed — must lose nothing: the copy reopens with every committed
+        // record of both pools.
+        let crashed = test_root("shared_wal_remediation_with_tail_crash");
+        crash_image(&db, &root, &crashed);
+        let after_crash = SharedDatabase::open(crashed.clone()).unwrap();
+        for pool in [ShardType::State, ShardType::EventDag] {
+            for seq in [1, 2] {
+                assert!(
+                    live_get(&after_crash, pool, collection, node(seq)).is_some(),
+                    "{pool:?} record {seq} must survive a crash with a tail held"
+                );
+            }
+        }
+        drop(after_crash);
+        let _ = std::fs::remove_dir_all(crashed);
+
         drop(release);
         state.wait_for_checkpoint();
         assert!(state.durable_coverage() > state_before);
