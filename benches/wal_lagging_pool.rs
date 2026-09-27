@@ -87,7 +87,7 @@ fn print_checkpoint_breakdowns(db: &SharedDatabase, before: &[u64]) {
         println!(
             "  {pool:?} checkpoint {:.0} ms: pre-sync {:.0}, lock wait {:.0}, locked sync {:.0}, \
              snapshot {:.0}, serialize {:.0}, write {:.0}, dir sync {:.0}, journal.lsn {:.0}, \
-             WAL reclaim {:.0}, retire {:.0}",
+             WAL reclaim {:.0}, retire {:.0}, unaccounted {:.0}",
             millis(b.total),
             millis(b.pre_sync),
             millis(b.lock_wait),
@@ -99,6 +99,7 @@ fn print_checkpoint_breakdowns(db: &SharedDatabase, before: &[u64]) {
             millis(b.journal_lsn),
             millis(b.reclaim),
             millis(b.retire),
+            millis(b.unaccounted()),
         );
     }
 }

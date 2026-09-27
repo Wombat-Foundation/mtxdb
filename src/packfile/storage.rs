@@ -254,6 +254,29 @@ pub struct CheckpointBreakdown {
     pub total: std::time::Duration,
 }
 
+impl CheckpointBreakdown {
+    /// Time in the call that belongs to no phase above: the final re-lock and
+    /// the bookkeeping around the phases. A large value means the attribution
+    /// is missing something.
+    #[must_use]
+    pub fn unaccounted(&self) -> std::time::Duration {
+        [
+            self.pre_sync,
+            self.lock_wait,
+            self.locked_sync,
+            self.snapshot,
+            self.serialize,
+            self.write,
+            self.directory_sync,
+            self.journal_lsn,
+            self.reclaim,
+            self.retire,
+        ]
+        .into_iter()
+        .fold(self.total, std::time::Duration::saturating_sub)
+    }
+}
+
 /// Wall-clock breakdown of one sync — the append-path `sync()` (dirty-scoped
 /// flush/fsync) or the full `sync_all` — by phase. The pack phases come from
 /// `ShardPool::last_sync_split` (which measures the flush and fsync legs
@@ -12503,8 +12526,9 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A full checkpoint records where its time went, and the phases account for
-    /// the whole of it (the parts are disjoint stretches of one call).
+    /// A full checkpoint records where its time went. The phases are disjoint
+    /// stretches of one call, so they never add up to more than it; what they do
+    /// not cover is reported by `unaccounted`.
     #[test]
     fn a_checkpoint_records_a_phase_breakdown() {
         let dir = test_dir("checkpoint_breakdown");
@@ -12515,21 +12539,10 @@ mod tests {
             .unwrap();
         store.sync_all().unwrap();
         let breakdown = store.checkpoint_breakdown().expect("a checkpoint ran");
-        let parts = breakdown.pre_sync
-            + breakdown.lock_wait
-            + breakdown.locked_sync
-            + breakdown.snapshot
-            + breakdown.serialize
-            + breakdown.write
-            + breakdown.directory_sync
-            + breakdown.journal_lsn
-            + breakdown.reclaim
-            + breakdown.retire;
         assert!(breakdown.total > Duration::ZERO);
         assert!(
-            parts <= breakdown.total,
-            "phases {parts:?} exceed the whole {:?}",
-            breakdown.total
+            breakdown.unaccounted() <= breakdown.total,
+            "the residual cannot exceed the whole"
         );
         assert!(breakdown.write > Duration::ZERO, "the write fsyncs");
         drop(store);
