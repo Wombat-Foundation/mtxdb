@@ -3974,7 +3974,7 @@ fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarge
                 bail!(
                     "ambiguous 32-hex selector `{selector}` matches both a live pack and a collection; \
                      use a pack-specific command (e.g. `mtxdb packs inspect --pack {selector}`), \
-                     a unique pack prefix, or `--collection {selector}` to disambiguate"
+                     an unambiguous pack prefix, or `--collection {selector}` to disambiguate"
                 );
             }
             if pack_matches {
