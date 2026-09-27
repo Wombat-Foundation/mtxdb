@@ -220,8 +220,11 @@ fn main() {
             }
             drop(store);
             println!("  log target {percent}% of checkpoint");
-            store = open_and_report("warm", &dir);
+            // Only one process may hold the writer lock: report here, release
+            // it, let the child open and report, then take it back to continue.
+            drop(open_and_report("warm", &dir));
             reopen_in_child(&dir);
+            store = PackfileStorage::open(dir.clone()).expect("reopen to continue");
             if keep {
                 println!("  kept: {}", dir.display());
             }
