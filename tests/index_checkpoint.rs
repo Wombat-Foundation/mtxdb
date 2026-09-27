@@ -380,9 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn v7_checkpoint_with_old_pack_table_falls_back_to_rescan_and_rebuilds_v8() {
-        let dir = std::env::temp_dir()
-            .join(format!("mtxdb_index_checkpoint_v7_{}", std::process::id()));
+    fn previous_version_checkpoint_falls_back_to_rescan_and_rebuilds_current() {
+        use mtxdb::packfile::storage::OpenPath;
+
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_v7_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -393,12 +395,14 @@ mod tests {
         let mut buf = std::fs::read(&cp_file).unwrap();
         assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 8);
 
-        // Tamper version to 7:
+        // Patch only the version field to the previous version (7). This is
+        // enough to exercise the version gate: the reader must reject the
+        // file *before* it looks at the body, so a real v7-width body (36-byte
+        // pack-table entries) need not be constructed here.
         buf[8..12].copy_from_slice(&7u32.to_le_bytes());
         std::fs::write(&cp_file, &buf).unwrap();
 
         // Reopen: must reject v7 and fall back to FullScan
-        use mtxdb::packfile::storage::OpenPath;
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
         assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
         assert_all_records(&reopened);
@@ -412,7 +416,10 @@ mod tests {
 
         // Next open should use Checkpoint path
         let reopened_v8 = PackfileStorage::open(dir.clone()).unwrap();
-        assert_eq!(reopened_v8.open_timings().unwrap().path, OpenPath::Checkpoint);
+        assert_eq!(
+            reopened_v8.open_timings().unwrap().path,
+            OpenPath::Checkpoint
+        );
         assert_all_records(&reopened_v8);
 
         std::fs::remove_dir_all(&dir).unwrap();

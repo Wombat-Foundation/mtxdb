@@ -3862,10 +3862,17 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// `info` accepts a collection selector (a canonical sigil, or a
-/// `0x`-prefixed 32-hex logical ID) or a pack selector (`0x`-prefixed, 1–16 hex
-/// digits, as printed by `mtxdb shards`). Dispatch on the hex length the same
-/// way `scan` does; bare hex is not accepted.
+/// `info` accepts a collection selector (a canonical sigil, a bare `0x`-less
+/// sigil, or a `0x`-prefixed 32-hex logical ID) or a pack selector
+/// (`0x`-prefixed, 1–16 hex digits, as printed by `mtxdb shards`).
+///
+/// A `0x`-prefixed 32-hex selector is genuinely ambiguous now that a pack's
+/// full address is 32 hex digits: it can name either a collection or a pack,
+/// and the two are indistinguishable by length. `classify_info_selector`
+/// therefore resolves that length against the selected store — a live pack
+/// with that exact address, and/or a live collection with that id — and
+/// errors when both match so the caller must disambiguate explicitly
+/// (`--collection`). Bare hex is not accepted.
 /// What an `info` selector names.
 #[derive(Debug, PartialEq, Eq)]
 enum InfoTarget {
@@ -3966,8 +3973,8 @@ fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarge
             if pack_matches && collection_matches {
                 bail!(
                     "ambiguous 32-hex selector `{selector}` matches both a live pack and a collection; \
-                     use a pack prefix (e.g. 0x{}) to inspect the pack",
-                    &hex[..mtxdb::packfile::PACK_FILENAME_PREFIX_HEX.min(hex.len())]
+                     use a pack-specific command (e.g. `mtxdb packs inspect --pack {selector}`), \
+                     a unique pack prefix, or `--collection {selector}` to disambiguate"
                 );
             }
             if pack_matches {

@@ -12805,10 +12805,13 @@ mod tests {
         );
     }
 
-    /// The shard→collection sidecar at the immediately preceding version (v6:
-    /// 72-byte records keyed by the 32-byte `PackId`) must be rejected rather
-    /// than misparsed as v7's 56-byte records. The sidecar is a rebuildable
-    /// acceleration, so rejection just routes the caller to the full walk.
+    /// The shard→collection sidecar stamped with the previous version byte (v6)
+    /// must be rejected by the version gate before attempting to parse records.
+    /// (Patching only the version byte is sufficient: the reader rejects the file
+    /// before looking at the body, so a real v6-width body need not be constructed.)
+    /// The sidecar is a rebuildable acceleration, so rejection routes open to
+    /// scanning the collection directory, and a subsequent persist rewrites a
+    /// valid v7 sidecar.
     #[test]
     fn previous_version_shard_collections_sidecar_is_rejected_and_rebuilt() {
         let dir = test_dir("shard_collections_prev_version");

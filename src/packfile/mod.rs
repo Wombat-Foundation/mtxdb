@@ -2658,6 +2658,8 @@ mod tests {
         assert!(PackId::from_hex(&"0".repeat(PACK_ID_LEN * 2)).is_none());
         // A nonzero address of the same length still parses.
         assert!(PackId::from_hex(&"a".repeat(PACK_ID_LEN * 2)).is_some());
+        // `random` never returns the reserved sentinel.
+        assert!(!PackId::random().is_zero());
     }
 
     #[test]
@@ -2728,28 +2730,6 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let err = read_header(&mut cursor).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn test_pack_id_zero_rejected() {
-        let zero = PackId([0u8; PACK_ID_LEN]);
-        assert!(zero.is_zero());
-        assert!(PackId::from_hex(&"0".repeat(PACK_ID_LEN * 2)).is_none());
-        assert!(!PackId::random().is_zero());
-
-        // Header write and read reject zero
-        let mut buf = Vec::new();
-        assert!(write_header(&mut buf, &zero).is_err());
-
-        // parse_filename_prefix rejects full 32-hex all-zero but accepts 16-hex all-zero prefix
-        assert!(
-            PackId::parse_filename_prefix(&format!("pack_{}", "0".repeat(PACK_ID_LEN * 2)))
-                .is_none()
-        );
-        let (bytes, digits) = PackId::parse_filename_prefix("pack_0000000000000000")
-            .expect("16-hex zero is a valid prefix of a nonzero id");
-        assert_eq!(digits, 16);
-        assert_eq!(bytes, vec![0u8; 8]);
     }
 
     #[test]
