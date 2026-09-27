@@ -1002,8 +1002,10 @@ enum SharedBoundary {
     Untrusted,
     /// Even the first group is still needed (or the segment is empty).
     NothingCovered,
-    /// Every group through this LSN may be dropped.
-    Through(u64),
+    /// Every group through this LSN may be dropped. The second field names the
+    /// pool whose missing coverage stopped the cut (None when an untagged frame
+    /// did, or when the whole segment is droppable).
+    Through(u64, Option<ShardType>),
 }
 
 // Pool bits are `1 << index`, so they must stay below the unattributed bit.
@@ -1129,22 +1131,29 @@ fn marks_from_scan(scan: &Scan) -> Vec<GroupMark> {
 /// The one place this rule lives: the directory and the scan fallback both call
 /// it, so they cannot disagree.
 #[cfg(feature = "multi-reader")]
-fn boundary_through(groups: &[GroupMark], covered: &HashMap<ShardType, u64>) -> Option<u64> {
+fn boundary_through(
+    groups: &[GroupMark],
+    covered: &HashMap<ShardType, u64>,
+) -> Option<(u64, Option<ShardType>)> {
     let mut boundary = None;
-    'groups: for group in groups {
+    for group in groups {
         for (index, pool) in ShardType::ALL.into_iter().enumerate() {
             if group.pools & (1_u8 << index) != 0
                 && !covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn)
             {
-                break 'groups;
+                // This pool's coverage stops the cut here; report it as the
+                // blocker so reclaim can say why the suffix was retained.
+                return boundary.map(|lsn| (lsn, Some(pool)));
             }
         }
         if group.pools & UNATTRIBUTED_POOL_BIT != 0 {
-            break 'groups;
+            // No pool's coverage can account for an untagged frame: a real
+            // blocker with no pool to name.
+            return boundary.map(|lsn| (lsn, None));
         }
         boundary = Some(group.last_lsn);
     }
-    boundary
+    boundary.map(|lsn| (lsn, None))
 }
 
 /// Result of validating a journal file.
@@ -1209,6 +1218,14 @@ pub struct Reclaim {
     pub retained_groups: u64,
     /// Bytes removed from the segment.
     pub reclaimed_bytes: u64,
+    /// Bytes the rewrite moved and fsynced: the retained suffix, i.e. the
+    /// rebuilt segment minus its header. This is what makes `copy`/`fsync`
+    /// scale with segment size, so it is the number to bound.
+    pub retained_bytes: u64,
+    /// The pool whose missing coverage stopped the cut, so the suffix could not
+    /// be dropped. None when an untagged frame stopped it, the whole segment
+    /// was droppable, or the caller could not say. Diagnostics only.
+    pub blocked_by: Option<ShardType>,
     /// Time deciding the reclaim boundary (directory lookup, or a scan when the
     /// directory could not be trusted).
     pub boundary: std::time::Duration,
@@ -1224,6 +1241,8 @@ impl Default for Reclaim {
         Self {
             retained_groups: 0,
             reclaimed_bytes: 0,
+            retained_bytes: 0,
+            blocked_by: None,
             boundary: std::time::Duration::ZERO,
             copy: std::time::Duration::ZERO,
             fsync: std::time::Duration::ZERO,
@@ -1742,8 +1761,10 @@ impl JournalCoordinator {
                 journal.shared_reclaim_boundary(&coverage.covered)
             };
             match boundary {
-                SharedBoundary::Through(covered_lsn) => {
-                    let reclaimed = journal.reclaim_through(covered_lsn).map(Some);
+                SharedBoundary::Through(covered_lsn, blocked_by) => {
+                    let reclaimed = journal
+                        .reclaim_through_with_blocker(covered_lsn, blocked_by)
+                        .map(Some);
                     let coverage = self.coverage.lock();
                     self.record_reclaim_outcome(&journal, &coverage.covered);
                     return reclaimed;
@@ -1764,7 +1785,9 @@ impl JournalCoordinator {
             boundary_through(&marks, &coverage.covered)
         };
         match boundary {
-            Some(covered_lsn) => self.reclaim_through(covered_lsn).map(Some),
+            Some((covered_lsn, blocked_by)) => self
+                .reclaim_through_with_blocker(covered_lsn, blocked_by)
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -2897,6 +2920,19 @@ impl JournalCoordinator {
         let mut journal = self.journal.lock();
         journal.reclaim_through(covered_lsn)
     }
+
+    /// [`Self::reclaim_through`] recording the pool whose missing coverage
+    /// stopped the cut on the returned [`Reclaim`]. Diagnostics only.
+    #[cfg(feature = "multi-reader")]
+    fn reclaim_through_with_blocker(
+        &self,
+        covered_lsn: u64,
+        blocked_by: Option<ShardType>,
+    ) -> io::Result<Reclaim> {
+        let _sync = self.sync_lock.lock();
+        let mut journal = self.journal.lock();
+        journal.reclaim_through_with_blocker(covered_lsn, blocked_by)
+    }
 }
 
 impl Journal {
@@ -3493,6 +3529,19 @@ impl Journal {
     /// Returns `io::Error` if the handle is poisoned, the segment cannot be
     /// read or re-encoded, or the replacement cannot be synced or renamed.
     pub fn reclaim_through(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
+        self.reclaim_through_with_blocker(covered_lsn, None)
+    }
+
+    /// [`Self::reclaim_through`] with the pool whose missing coverage stopped
+    /// the cut recorded on the returned [`Reclaim`], for diagnostics only.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::reclaim_through`].
+    pub fn reclaim_through_with_blocker(
+        &mut self,
+        covered_lsn: u64,
+        blocked_by: Option<ShardType>,
+    ) -> io::Result<Reclaim> {
         if self.poisoned {
             return Err(io::Error::other(
                 "journal handle is poisoned after an earlier failed commit",
@@ -3504,11 +3553,13 @@ impl Journal {
                 "cannot reclaim an LSN that has not been committed",
             ));
         }
-        if self.directory_matches_file() {
-            self.reclaim_through_directory(covered_lsn)
+        let mut reclaimed = if self.directory_matches_file() {
+            self.reclaim_through_directory(covered_lsn)?
         } else {
-            self.reclaim_through_scan(covered_lsn)
-        }
+            self.reclaim_through_scan(covered_lsn)?
+        };
+        reclaimed.blocked_by = blocked_by;
+        Ok(reclaimed)
     }
 
     /// Record a group just appended, ending at `file_len`, in the directory.
@@ -3593,7 +3644,9 @@ impl Journal {
             return SharedBoundary::Untrusted;
         }
         boundary_through(&self.groups, covered)
-            .map_or(SharedBoundary::NothingCovered, SharedBoundary::Through)
+            .map_or(SharedBoundary::NothingCovered, |(lsn, blocked_by)| {
+                SharedBoundary::Through(lsn, blocked_by)
+            })
     }
 
     /// Reclaim using the group directory: pick the cut from it and read only
@@ -3664,6 +3717,7 @@ impl Journal {
             })
             .collect::<Vec<_>>();
         let copy = copy_started.elapsed();
+        let rebuilt_len = rebuilt.len();
         let fsync_started = std::time::Instant::now();
         self.install_rebuilt(rebuilt, new_base_sequence, new_base_lsn)?;
         let fsync = fsync_started.elapsed();
@@ -3671,6 +3725,8 @@ impl Journal {
         Ok(Reclaim {
             retained_groups,
             reclaimed_bytes,
+            retained_bytes: u64::try_from(rebuilt_len.saturating_sub(FILE_HEADER_LEN))
+                .unwrap_or(u64::MAX),
             copy,
             fsync,
             ..Default::default()
@@ -3727,6 +3783,7 @@ impl Journal {
         }
         let copy = copy_started.elapsed();
         let retained_groups = u64::try_from(retained.len()).unwrap_or(u64::MAX);
+        let rebuilt_len = rebuilt.len();
         let reclaimed_bytes =
             u64::try_from(bytes.len().saturating_sub(rebuilt.len())).unwrap_or(u64::MAX);
         let fsync_started = std::time::Instant::now();
@@ -3736,9 +3793,12 @@ impl Journal {
         Ok(Reclaim {
             retained_groups,
             reclaimed_bytes,
+            retained_bytes: u64::try_from(rebuilt_len.saturating_sub(FILE_HEADER_LEN))
+                .unwrap_or(u64::MAX),
             boundary,
             copy,
             fsync,
+            ..Default::default()
         })
     }
 
@@ -7201,14 +7261,12 @@ mod tests {
                             covered.insert(pool, lsn);
                         }
                     }
-                    assert_eq!(
-                        journal.shared_reclaim_boundary(&covered),
-                        by_scan(&covered).map_or(
-                            super::SharedBoundary::NothingCovered,
-                            super::SharedBoundary::Through
-                        ),
-                        "coverage {covered:?}"
-                    );
+                    let from_directory = match journal.shared_reclaim_boundary(&covered) {
+                        super::SharedBoundary::Through(lsn, _) => Some(lsn),
+                        super::SharedBoundary::NothingCovered
+                        | super::SharedBoundary::Untrusted => None,
+                    };
+                    assert_eq!(from_directory, by_scan(&covered), "coverage {covered:?}");
                 }
             }
         }
@@ -7237,11 +7295,22 @@ mod tests {
             mark(3, state),
         ];
         let covered = HashMap::from([(ShardType::State, 99_u64)]);
-        assert_eq!(boundary_through(&groups, &covered), Some(1));
+        assert_eq!(boundary_through(&groups, &covered), Some((1, None)));
         assert_eq!(boundary_through(&groups[1..], &covered), None);
-        assert_eq!(boundary_through(&groups[2..], &covered), Some(3));
+        assert_eq!(boundary_through(&groups[2..], &covered), Some((3, None)));
         // A tagged pool that has not reported blocks its group.
         assert_eq!(boundary_through(&groups[..1], &HashMap::new()), None);
+        // With a prefix covered, the blocking pool is named: group 2 carries a
+        // State frame whose coverage (1) does not reach it, so State blocks.
+        let partial = HashMap::from([(ShardType::State, 1_u64)]);
+        assert_eq!(
+            boundary_through(&groups, &partial),
+            Some((1, Some(ShardType::State)))
+        );
+        // With State covered through group 2, only the untagged frame blocks it,
+        // and there is no pool to name.
+        let through_two = HashMap::from([(ShardType::State, 2_u64)]);
+        assert_eq!(boundary_through(&groups, &through_two), Some((1, None)));
     }
 
     /// A directory whose offsets make the retained suffix start mid-group must

@@ -72,6 +72,13 @@ fn print_phases(timings: &mtxdb::packfile::storage::SyncTimings) {
         millis(timings.wal),
         millis(timings.journal_fsync),
     );
+    if timings.reclaim_retained_bytes > 0 || timings.reclaim_blocked_by.is_some() {
+        println!(
+            "  reclaim suffix: retained {} MiB, blocked_by {:?}",
+            timings.reclaim_retained_bytes >> 20,
+            timings.reclaim_blocked_by,
+        );
+    }
 }
 
 /// Where the time of every full checkpoint not yet printed went. A

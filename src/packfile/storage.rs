@@ -328,6 +328,13 @@ pub struct SyncTimings {
     /// Breakdown of [`Self::reclaim`]: writing, fsyncing and renaming the
     /// rebuilt segment into place. The likely disk cost.
     pub reclaim_fsync: std::time::Duration,
+    /// Bytes the last reclaim rewrite moved and fsynced: the retained suffix.
+    /// This is what `reclaim_copy`/`reclaim_fsync` scale with.
+    pub reclaim_retained_bytes: u64,
+    /// The pool whose missing coverage stopped the last reclaim cut, so the
+    /// suffix could not be dropped sooner. None when an untagged frame stopped
+    /// it or the caller could not attribute it. Diagnostics only.
+    pub reclaim_blocked_by: Option<crate::layout::ShardType>,
     /// Time spent in `remediate_lagging_pools`: in the non-background path this
     /// force-checkpoints a pool holding the shared WAL back, and the caller
     /// waits for it. Kept separate from [`Self::reclaim`] so a phase breakdown
@@ -372,6 +379,8 @@ impl Default for SyncTimings {
             reclaim_boundary: std::time::Duration::ZERO,
             reclaim_copy: std::time::Duration::ZERO,
             reclaim_fsync: std::time::Duration::ZERO,
+            reclaim_retained_bytes: 0,
+            reclaim_blocked_by: None,
             remediation: std::time::Duration::ZERO,
             wal: std::time::Duration::ZERO,
             journal_lock_wait: std::time::Duration::ZERO,
@@ -397,6 +406,8 @@ impl SyncTimings {
             self.reclaim_boundary = reclaim.boundary;
             self.reclaim_copy = reclaim.copy;
             self.reclaim_fsync = reclaim.fsync;
+            self.reclaim_retained_bytes = reclaim.retained_bytes;
+            self.reclaim_blocked_by = reclaim.blocked_by;
         }
     }
 }
