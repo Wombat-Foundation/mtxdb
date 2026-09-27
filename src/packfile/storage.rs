@@ -18043,6 +18043,92 @@ mod tests {
         drop(writer);
         let _ = fs::remove_dir_all(&dir);
     }
+    /// A reader attached before a burst that grows the collection's table
+    /// several times reloads through the delta coverage prefix: it replays the
+    /// redo records with the same rules as an open, growing its own copy of the
+    /// table, and finds every record. The burst reaches the log as redo records
+    /// only, no snapshot.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn a_reader_reloads_through_a_burst_that_grows_the_table() {
+        let dir = test_dir("reader_reload_growth");
+        let wal = dir.join("wal.bin");
+        let collection = [0x4D; 16];
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer.journal().unwrap().set_reclaim_trigger_len(1);
+        writer
+            .put(
+                &collection,
+                &batch_node(u32::MAX),
+                &NodeData::from_slice(b"seed"),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let capacity_before = writer.generation(&collection).unwrap().index.capacity();
+
+        // The reader attaches now: its index is the small first checkpoint.
+        let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        reader.enable_read_journal(&wal).unwrap();
+
+        let entries: Vec<(NodeId, NodeData)> = (0..700u32)
+            .map(|i| (batch_node(i), NodeData::from_slice(&i.to_le_bytes())))
+            .collect();
+        writer.put_many(&collection, &entries).unwrap();
+        writer.sync().unwrap();
+        assert!(
+            writer.generation(&collection).unwrap().index.capacity() > capacity_before * 4,
+            "the burst must grow the table more than once"
+        );
+        assert!(
+            writer.sync_timings().unwrap().checkpoint.is_zero(),
+            "the burst is a delta step, not a checkpoint"
+        );
+        assert_log_has_redo_and_no_snapshot(&writer, entries.len());
+
+        // One more record that stays only in the WAL (no coverage step for it):
+        // the reader then sees a journal that starts past its index and must
+        // reload through the delta prefix, so the burst's records are served
+        // from a replayed (grown) table, not by refreshing on a miss.
+        writer.journal().unwrap().set_reclaim_trigger_len(u64::MAX);
+        writer
+            .put(
+                &collection,
+                &batch_node(9_999),
+                &NodeData::from_slice(b"tail"),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let seed = reader
+            .get_read_committed(&collection, &[batch_node(u32::MAX)])
+            .unwrap();
+        assert_eq!(seed[0].as_ref().unwrap().bytes.as_ref(), b"seed");
+        let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
+        let found = reader.get_read_committed(&collection, &ids).unwrap();
+        for (index, ((_, expected), value)) in entries.iter().zip(found.iter()).enumerate() {
+            let data = value
+                .as_ref()
+                .unwrap_or_else(|| panic!("record {index} of the burst is missing for the reader"));
+            assert_eq!(data.bytes, expected.bytes);
+        }
+        let tail = reader
+            .get_read_committed(&collection, &[batch_node(9_999)])
+            .unwrap();
+        assert_eq!(tail[0].as_ref().unwrap().bytes.as_ref(), b"tail");
+        assert!(
+            reader.stats().read_reloads >= 1,
+            "the reclaim must have forced a reload"
+        );
+        assert_eq!(reader.stats().read_reload_failures, 0);
+        assert_eq!(
+            reader.stats().miss_refreshes,
+            0,
+            "every record came from the replayed table, none by refreshing on a miss"
+        );
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A writer with a journal that syncs under the size trigger: every sync
     /// past the first is a delta coverage step. Returns the store and the keys.
     #[cfg(feature = "multi-reader")]
