@@ -944,6 +944,15 @@ impl LossyIndex {
         true
     }
 
+    /// Length of [`Self::serialize`]'s output, `8 + capacity * 24` bytes, known
+    /// without building it.
+    #[must_use]
+    pub fn serialized_len(&self) -> usize {
+        (self.capacity as usize)
+            .saturating_mul(24)
+            .saturating_add(8)
+    }
+
     /// Serialize the index to bytes for persistence.
     ///
     /// Format (all little-endian):

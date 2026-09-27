@@ -828,24 +828,61 @@ pub fn batch_len(frame_count: usize) -> Option<usize> {
         .checked_add(DELTA_LOG_TRAILER_LEN)
 }
 
+/// Length in bytes of one v3 frame around a payload of `payload_len` bytes, or
+/// `None` if the payload does not fit the frame's `u32` length.
+#[must_use]
+pub fn v3_frame_len(payload_len: usize) -> Option<usize> {
+    u32::try_from(payload_len).ok()?;
+    V3_FRAME_HEADER_LEN
+        .checked_add(payload_len)?
+        .checked_add(V3_FRAME_TRAILER_LEN)
+}
+
+/// Length of a batch with no operations: its header and trailer.
+#[must_use]
+pub const fn v3_empty_batch_len() -> usize {
+    DELTA_BATCH_HEADER_LEN + DELTA_LOG_TRAILER_LEN
+}
+
+/// Length of one framed incremental slot operation.
+#[must_use]
+pub const fn v3_incremental_frame_len() -> usize {
+    V3_FRAME_HEADER_LEN + DELTA_FRAME_LEN + V3_FRAME_TRAILER_LEN
+}
+
+/// Length of one framed collection tombstone.
+#[must_use]
+pub const fn v3_tombstone_frame_len() -> usize {
+    V3_FRAME_HEADER_LEN + V3_TOMBSTONE_LEN + V3_FRAME_TRAILER_LEN
+}
+
+/// Length of one framed coverage claim.
+#[must_use]
+pub const fn v3_coverage_frame_len() -> usize {
+    V3_FRAME_HEADER_LEN + V3_COVERAGE_LEN + V3_FRAME_TRAILER_LEN
+}
+
+/// Length of one framed collection snapshot whose index blob is `blob_len`
+/// bytes, known without building the blob.
+#[must_use]
+pub fn v3_snapshot_frame_len(blob_len: usize) -> Option<usize> {
+    v3_frame_len(V3_SNAPSHOT_FIXED_LEN.checked_add(blob_len)?)
+}
+
 /// Length in bytes of one framed v3 batch carrying `operations`, or `None` if a
 /// payload does not fit the frame's `u32` length or the total overflows `usize`.
 #[must_use]
 pub fn v3_batch_len(operations: &[DeltaOperation]) -> Option<usize> {
-    let mut total = DELTA_BATCH_HEADER_LEN.checked_add(DELTA_LOG_TRAILER_LEN)?;
+    let mut total = v3_empty_batch_len();
     for operation in operations {
-        let payload_len = match operation {
-            DeltaOperation::Incremental(_) => DELTA_FRAME_LEN,
+        let frame_len = match operation {
+            DeltaOperation::Incremental(_) => v3_incremental_frame_len(),
             DeltaOperation::CollectionSnapshot { index_blob, .. } => {
-                V3_SNAPSHOT_FIXED_LEN.checked_add(index_blob.len())?
+                v3_snapshot_frame_len(index_blob.len())?
             }
-            DeltaOperation::CollectionTombstone { .. } => V3_TOMBSTONE_LEN,
-            DeltaOperation::Coverage { .. } => V3_COVERAGE_LEN,
+            DeltaOperation::CollectionTombstone { .. } => v3_tombstone_frame_len(),
+            DeltaOperation::Coverage { .. } => v3_coverage_frame_len(),
         };
-        u32::try_from(payload_len).ok()?;
-        let frame_len = V3_FRAME_HEADER_LEN
-            .checked_add(payload_len)?
-            .checked_add(V3_FRAME_TRAILER_LEN)?;
         total = total.checked_add(frame_len)?;
     }
     Some(total)
@@ -1954,6 +1991,43 @@ mod tests {
             Some(40)
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The lengths computed without building a batch equal the built batch's.
+    #[test]
+    fn projected_frame_lengths_match_the_built_batch() {
+        let blob = vec![7u8; 1000];
+        let operations = [
+            DeltaOperation::Incremental(DeltaFrame {
+                collection_id: [1; 16],
+                bucket: 1,
+                generation: 1,
+                slot: 1,
+            }),
+            DeltaOperation::CollectionSnapshot {
+                collection_id: [2; 16],
+                generation: 2,
+                order_key: 3,
+                index_blob: blob.clone(),
+            },
+            DeltaOperation::CollectionTombstone {
+                collection_id: [3; 16],
+                generation: 4,
+            },
+            DeltaOperation::Coverage { covered_lsn: 5 },
+        ];
+        let projected = v3_empty_batch_len()
+            + v3_incremental_frame_len()
+            + v3_snapshot_frame_len(blob.len()).unwrap()
+            + v3_tombstone_frame_len()
+            + v3_coverage_frame_len();
+        assert_eq!(v3_batch_len(&operations), Some(projected));
+        let dir = coverage_log_dir("projected_len");
+        let path = dir.join(INDEX_DELTA_FILE);
+        let written =
+            append_v3_batch_with_durability(&path, false, 0xABC, &operations, 0x1, false).unwrap();
+        assert_eq!(written, projected);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A batch whose claim is not its last operation, or that holds two, was

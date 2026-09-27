@@ -4689,10 +4689,39 @@ impl PackfileStorage {
         self.append_index_delta_v3(false).map(|_| ())
     }
 
+    /// The delta-log cap, the bytes still free under it for a batch, and the
+    /// length of a batch before any operation is added to it.
+    fn delta_batch_budget(&self, state: &DeltaLogState, with_coverage: bool) -> (u64, u64, usize) {
+        let cap = self.delta_log_cap();
+        let header = if state.log_bytes == 0 {
+            DELTA_LOG_HEADER_LEN as u64
+        } else {
+            0
+        };
+        let budget = cap.saturating_sub(state.log_bytes).saturating_sub(header);
+        let mut projected = delta::v3_empty_batch_len();
+        if with_coverage {
+            projected = projected.saturating_add(delta::v3_coverage_frame_len());
+        }
+        (cap, budget, projected)
+    }
+
     fn build_v3_pending_batch(
         &self,
         state: &DeltaLogState,
+        with_coverage: bool,
     ) -> Result<V3PendingBatch, StorageError> {
+        // The batch's length is known from its parts without building them, so
+        // one that cannot fit under the delta-log cap is refused before a
+        // whole-index snapshot is serialized just to be thrown away.
+        let (cap, budget, mut projected) = self.delta_batch_budget(state, with_coverage);
+        let too_large = |projected: usize| {
+            StorageError::Io(std::io::Error::other(DeltaBatchTooLarge {
+                batch_bytes: projected,
+                log_bytes: state.log_bytes,
+                cap,
+            }))
+        };
         let collections = self.collections_read();
         let mut operations = Vec::new();
         let mut pending_ids: Vec<_> = state.pending.keys().copied().collect();
@@ -4720,11 +4749,27 @@ impl PackfileStorage {
                             "incremental v3 frame generation differs from its base",
                         )));
                     }
+                    projected = projected.saturating_add(
+                        frames
+                            .len()
+                            .saturating_mul(delta::v3_incremental_frame_len()),
+                    );
                     operations.extend(frames.iter().copied().map(DeltaOperation::Incremental));
                 }
                 PendingDelta::Snapshot => {
                     if let Some(room) = collections.get(&collection_id) {
                         let generation = arc_swap::ArcSwapAny::load_full(room);
+                        let frame_len =
+                            delta::v3_snapshot_frame_len(generation.index.serialized_len())
+                                .ok_or_else(|| {
+                                    StorageError::Io(std::io::Error::other(
+                                        "v3 batch size overflow",
+                                    ))
+                                })?;
+                        projected = projected.saturating_add(frame_len);
+                        if u64::try_from(projected).unwrap_or(u64::MAX) > budget {
+                            return Err(too_large(projected));
+                        }
                         let order_key =
                             if let Some(order_key) = state.base_order.get(&collection_id) {
                                 *order_key
@@ -4742,6 +4787,7 @@ impl PackfileStorage {
                         generation_updates.push((collection_id, generation.generation));
                         order_updates.push((collection_id, order_key));
                     } else if let Some(&generation) = state.base_generations.get(&collection_id) {
+                        projected = projected.saturating_add(delta::v3_tombstone_frame_len());
                         operations.push(DeltaOperation::CollectionTombstone {
                             collection_id,
                             generation,
@@ -4751,6 +4797,7 @@ impl PackfileStorage {
                 }
                 PendingDelta::Delete { generation } => {
                     if state.base_generations.contains_key(&collection_id) {
+                        projected = projected.saturating_add(delta::v3_tombstone_frame_len());
                         operations.push(DeltaOperation::CollectionTombstone {
                             collection_id,
                             generation: *generation,
@@ -4921,7 +4968,7 @@ impl PackfileStorage {
             )));
         }
 
-        let batch = self.build_v3_pending_batch(&snapshot_state)?;
+        let batch = self.build_v3_pending_batch(&snapshot_state, with_coverage)?;
         let V3PendingBatch {
             mut operations,
             generation_updates,
@@ -9000,14 +9047,16 @@ impl PackfileStorage {
         self.delta_log_cap().saturating_div(4).saturating_mul(3)
     }
 
-    /// Whether `error` is a delta batch that does not fit under the cap. That is
-    /// a planned rotation, not a failure: the batch may carry whole-index
-    /// snapshots, so its size is only known once it is built.
-    fn is_delta_batch_too_large(error: &StorageError) -> bool {
-        matches!(
-            error,
-            StorageError::Io(io) if io.get_ref().and_then(|inner| inner.downcast_ref::<DeltaBatchTooLarge>()).is_some()
-        )
+    /// The details of `error` if it is a delta batch that does not fit under the
+    /// cap. That is a planned rotation, not a failure: the batch may carry
+    /// whole-index snapshots, so it is refused by its projected length.
+    fn delta_batch_too_large(error: &StorageError) -> Option<&DeltaBatchTooLarge> {
+        match error {
+            StorageError::Io(io) => io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<DeltaBatchTooLarge>()),
+            _ => None,
+        }
     }
 
     /// Whether every live pack is one the base checkpoint's pack table names,
@@ -9094,8 +9143,12 @@ impl PackfileStorage {
                     coverage_batch_written = true;
                 }
                 Ok(None) => {}
-                Err(error) if Self::is_delta_batch_too_large(&error) => {
-                    eprintln!("mtxdb: rotating the delta log, {error}; rewriting the checkpoint");
+                Err(error) if Self::delta_batch_too_large(&error).is_some() => {
+                    if let Some(detail) = Self::delta_batch_too_large(&error) {
+                        eprintln!(
+                            "mtxdb: rotating the delta log: {detail}; rewriting the checkpoint"
+                        );
+                    }
                 }
                 Err(error) => {
                     eprintln!("mtxdb: delta coverage batch failed, rewriting checkpoint: {error}");
@@ -9139,8 +9192,8 @@ impl PackfileStorage {
                 // no longer reflects the live indexes. Fall back to a full
                 // rewrite rather than leaving the acceleration files stale until
                 // the next sync notices the gap.
-                if Self::is_delta_batch_too_large(&error) {
-                    eprintln!("mtxdb: rotating the delta log, {error}; rewriting the checkpoint");
+                if let Some(detail) = Self::delta_batch_too_large(&error) {
+                    eprintln!("mtxdb: rotating the delta log: {detail}; rewriting the checkpoint");
                 } else {
                     eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
                 }
@@ -12550,6 +12603,43 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A pending whole-index snapshot that cannot fit is refused from its
+    /// projected length while the batch is being built, before the index is
+    /// serialized, and the projection is the length the batch would have had.
+    #[test]
+    fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
+        let dir = test_dir("v3_snapshot_preflight");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0xD6; 16];
+        store
+            .put(&collection, &batch_node(1), &NodeData::from_slice(b"one"))
+            .unwrap();
+        store.sync_all().unwrap();
+        store.delta_log_cap_override.store(1024, Ordering::Relaxed);
+        store.invalidate_delta_log(&collection);
+
+        let state = store.delta_state.lock().clone();
+        let Err(error) = store.build_v3_pending_batch(&state, false) else {
+            panic!("the snapshot must not fit under a 1 KiB cap");
+        };
+        let detail = PackfileStorage::delta_batch_too_large(&error).expect("a too-large batch");
+        let blob_len = store
+            .collections_read()
+            .get(&collection)
+            .map(|room| room.load_full().index.serialized_len())
+            .unwrap();
+        let expected =
+            delta::v3_empty_batch_len() + delta::v3_snapshot_frame_len(blob_len).unwrap();
+        assert_eq!(detail.batch_bytes, expected);
+        assert_eq!(detail.cap, 1024);
+
+        // With the real cap the same pending snapshot builds.
+        store.delta_log_cap_override.store(0, Ordering::Relaxed);
+        assert!(store.build_v3_pending_batch(&state, false).is_ok());
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A delta error that is not "does not fit" stays a failure, not a rotation.
     #[test]
     fn only_a_batch_that_does_not_fit_counts_as_a_planned_rotation() {
@@ -12559,8 +12649,8 @@ mod tests {
             cap: 12,
         }));
         let other = StorageError::Io(std::io::Error::other("disk on fire"));
-        assert!(PackfileStorage::is_delta_batch_too_large(&full));
-        assert!(!PackfileStorage::is_delta_batch_too_large(&other));
+        assert!(PackfileStorage::delta_batch_too_large(&full).is_some());
+        assert!(PackfileStorage::delta_batch_too_large(&other).is_none());
     }
 
     /// A log that has grown to the rotation length is replaced by a checkpoint
