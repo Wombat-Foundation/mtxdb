@@ -3699,9 +3699,9 @@ mod tests {
     fn previous_version_stats_snapshot_is_not_restored() {
         let dir = test_dir("stats_prev_version");
         // Hand-write a v5-format file: magic, version 5, timestamp, then one
-        // 56-byte record (32-byte pack id + three u64 counters). No shard is
-        // needed: the version gate rejects the whole file before any record is
-        // matched, which is exactly the behavior under test.
+        // 56-byte record (32-byte pack id + three u64 counters). No live shard
+        // is needed: the version gate rejects the whole file before any record
+        // is matched or decoded, which is exactly the behavior under test.
         let mut buf = Vec::new();
         buf.extend_from_slice(STATS_MAGIC);
         buf.push(STATS_VERSION - 1);

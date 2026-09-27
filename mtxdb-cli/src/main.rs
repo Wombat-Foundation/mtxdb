@@ -664,7 +664,7 @@ fn sub_packs() -> Command {
                         .long("pack")
                         .required(true)
                         .value_name("PACK_ID")
-                        .help("Pack identity (0x-prefixed 16 hex digits)"),
+                        .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
                 ),
         )
         .subcommand(sub_packs_dump())
@@ -681,23 +681,24 @@ fn sub_packs_dump() -> Command {
              `payload` is a decoded JSON convenience value (which may differ in whitespace, \
              key order, or numeric spelling) and is absent for binary payloads. Unlike \
              `export`, this is a complete view of one pack (all collections, superseded \
-             frames included), not a collection's live set. Pack IDs are pool-local, so a \
-             pack id present in more than one pool is rejected unless -t selects one.",
+             frames included), not a collection's live set. Pack identities are globally \
+             unique addresses, so if the same id is present in more than one selected pool \
+             it is still rejected as ambiguous unless -t selects one.",
         )
-        .arg(
-            Arg::new("pack")
-                .short('p')
-                .long("pack")
-                .required(true)
-                .value_name("PACK_ID")
-                .help("Pack identity (0x-prefixed 16 hex digits)"),
-        )
-        .arg(
-            Arg::new("collection")
-                .short('r')
-                .long("collection")
-                .value_name("COLLECTION")
-                .help("Only dump frames for this collection (0x-prefixed id or !room:server)"),
+                .arg(
+                    Arg::new("pack")
+                        .short('p')
+                        .long("pack")
+                        .required(true)
+                        .value_name("PACK_ID")
+                        .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
+                )
+                .arg(
+                    Arg::new("collection")
+                        .short('r')
+                        .long("collection")
+                        .value_name("COLLECTION")
+                        .help("Only dump frames for this collection (0x-prefixed id or !room:server)"),
         )
         .arg(
             Arg::new("out")

@@ -3880,6 +3880,13 @@ enum InfoTarget {
     Collection,
 }
 
+/// Whether a live pack with this exact address exists in any selected pool.
+///
+/// Cost: opens every selected database and globs every selected pool's pack
+/// directory. This is fine once per `info` invocation (the only caller,
+/// `classify_info_selector`, runs on a single selector), but must not be
+/// called per-selector inside a multi-selector command — hoist the pool walk
+/// and reuse it instead.
 fn pack_id_exists(cli: &Cli, target_id: &PackId) -> bool {
     let Ok(dirs) = valid_database_dirs(cli) else {
         return false;
@@ -3907,6 +3914,10 @@ fn pack_id_exists(cli: &Cli, target_id: &PackId) -> bool {
     false
 }
 
+/// Whether a live collection with this id exists in any selected pool.
+///
+/// Same cost caveat as [`pack_id_exists`]: a single `info` disambiguation is
+/// fine, a per-selector loop in a multi-selector command is not.
 fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
     let Ok(dirs) = valid_database_dirs(cli) else {
         return false;
@@ -3924,8 +3935,7 @@ fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
             let Ok(dir) = pool_dir(&layout, shard_type) else {
                 continue;
             };
-            let has = if let Some(summaries) =
-                PackfileStorage::collection_summaries_from_disk(&dir)
+            let has = if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir)
             {
                 summaries.iter().any(|(id, _, _, _)| id == target_id)
             } else if let Ok(store) = PackfileStorage::open_read_only(dir) {
@@ -3961,10 +3971,12 @@ fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarge
     match hex.len() {
         1..=16 => Ok(InfoTarget::Pack),
         32 => {
-            let pack_id = parse_pack_id_selector(selector).ok().and_then(|sel| match sel {
-                PackSelector::Exact(id) => Some(id),
-                PackSelector::Prefix(_) => None,
-            });
+            let pack_id = parse_pack_id_selector(selector)
+                .ok()
+                .and_then(|sel| match sel {
+                    PackSelector::Exact(id) => Some(id),
+                    PackSelector::Prefix(_) => None,
+                });
             let collection_id = parse_collection_id(selector).ok();
 
             let pack_matches = pack_id.is_some_and(|id| pack_id_exists(cli, &id));
@@ -11265,15 +11277,20 @@ mod tests {
 
         // If a collection with the EXACT same ID as pack_id is created, it becomes ambiguous:
         let collision_data = mtxdb::NodeData::new(bytes::Bytes::from_static(b"collision"));
-        store.put(pack_id.as_bytes(), &[0x02; 16], &collision_data).unwrap();
+        store
+            .put(pack_id.as_bytes(), &[0x02; 16], &collision_data)
+            .unwrap();
         store.sync_all().unwrap();
         drop(store);
 
         let ambiguous_err = super::classify_info_selector(&cli, &pack_hex).unwrap_err();
-        assert!(
-            ambiguous_err.to_string().contains("ambiguous 32-hex selector"),
-            "{ambiguous_err}"
-        );
+        let msg = ambiguous_err.to_string();
+        assert!(msg.contains("ambiguous 32-hex selector"), "{msg}");
+        // The advice must name a real disambiguator. `--collection` exists and
+        // forces the collection interpretation; there is no `--pack`, and a
+        // prefix is not guaranteed unique, so the message must not promise one.
+        assert!(msg.contains("--collection"), "{msg}");
+        assert!(!msg.contains("use a pack prefix"), "{msg}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

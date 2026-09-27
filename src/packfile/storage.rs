@@ -12833,7 +12833,8 @@ mod tests {
         assert_eq!(&buf[0..4], SHARD_ROOMS_MAGIC);
         assert_eq!(buf[4], SHARD_ROOMS_VERSION);
 
-        // Overwrite version byte with v6:
+        // Patch only the version byte to the previous version; the body stays
+        // at the current width (the gate rejects before parsing it).
         buf[4] = SHARD_ROOMS_VERSION - 1;
         std::fs::write(&sidecar_path, &buf).unwrap();
 
