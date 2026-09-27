@@ -2082,13 +2082,13 @@ mod tests {
         let frame_crc_at = trailer_start - V3_FRAME_TRAILER_LEN;
         let crc = crc32fast::hash(&bytes[frame_start..frame_crc_at]).to_le_bytes();
         bytes[frame_crc_at..trailer_start].copy_from_slice(&crc);
-        let frames_start = first_len + DELTA_BATCH_HEADER_LEN;
+        let batch_body_start = first_len + DELTA_BATCH_HEADER_LEN;
         let batch_fingerprint = u64::from_le_bytes(
             bytes[trailer_start + TRAILER_FINGERPRINT_OFFSET..trailer_start + 16]
                 .try_into()
                 .unwrap(),
         );
-        let batch = batch_crc(&bytes[frames_start..trailer_start], batch_fingerprint);
+        let batch = batch_crc(&bytes[batch_body_start..trailer_start], batch_fingerprint);
         bytes[trailer_start + TRAILER_CRC_OFFSET..trailer_start + 8]
             .copy_from_slice(&batch.to_le_bytes());
         fs::write(&path, &bytes).unwrap();
