@@ -1554,6 +1554,93 @@ mod tests {
         );
     }
 
+    /// The whole lifecycle a real store goes through: load a checkpoint mapped
+    /// with its identity tables, clone on the first write, overwrite an existing
+    /// identity and add a new one, checkpoint again, reload, then grow. Every
+    /// entry must keep a complete identity throughout, and the grown index must
+    /// answer as the pre-growth one did, including tag collisions.
+    #[test]
+    fn identities_survive_reopen_write_checkpoint_reopen_and_growth() {
+        let config = IndexConfig {
+            seed: 0x5EED_1234_ABCD_0042,
+            ..IndexConfig::default()
+        };
+        let live = LossyIndex::with_config(4096, config);
+        let mut locators: HashMap<(u16, u64), [u8; 16]> = HashMap::new();
+        let mut expected: HashMap<[u8; 16], (u16, u64)> = HashMap::new();
+        for seq in 0..2500u64 {
+            let hash = spread_hash(seq);
+            let locator = (u16::try_from(seq % 4).unwrap(), seq * 64);
+            live.insert(&hash, locator.0, locator.1).unwrap();
+            locators.insert(locator, hash);
+            expected.insert(hash, locator);
+        }
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb-index-lifecycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let load_mapped = |index: &LossyIndex, name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, index.serialize()).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            let capacity = index.capacity() as usize;
+            LossyIndex::from_mmap_slots_with_homes_tails(
+                Arc::new(crate::packfile::map_pack(&file).unwrap()),
+                8,
+                8 + capacity * 8,
+                8 + capacity * 16,
+                index.capacity(),
+                u32::try_from(index.len()).unwrap(),
+                config,
+            )
+        };
+
+        // Reopen 1: mapped, then cloned by the first write.
+        let mapped = load_mapped(&live, "first.bin");
+        assert!(identities_complete(&mapped));
+        let owned = mapped.clone();
+        assert!(identities_complete(&owned), "the clone keeps identities");
+        // Overwrite an existing identity with a new locator, and add a new one.
+        let overwritten = spread_hash(7);
+        owned.insert(&overwritten, 2, 999_936).unwrap();
+        locators.insert((2, 999_936), overwritten);
+        expected.insert(overwritten, (2, 999_936));
+        let added = spread_hash(90_000);
+        owned.insert(&added, 3, 1_000_000).unwrap();
+        locators.insert((3, 1_000_000), added);
+        expected.insert(added, (3, 1_000_000));
+        assert!(
+            identities_complete(&owned),
+            "writes keep identities complete"
+        );
+        assert_eq!(owned.len(), live.len() + 1);
+
+        // Checkpoint, reopen 2, and grow the reloaded index from its tables.
+        let mut reopened = load_mapped(&owned, "second.bin").clone();
+        assert!(
+            identities_complete(&reopened),
+            "the second reopen is complete too"
+        );
+        assert!(reopened.grow().is_none(), "loaders still disable growth");
+        reopened.can_grow = true; // what a completeness-gated loader would set
+        let grown = reopened.grow().expect("grows from persisted identities");
+        assert_eq!(grown.len(), owned.len());
+        assert_eq!(grown.slot_counts(), owned.slot_counts());
+        for (hash, locator) in &expected {
+            assert_eq!(grown.lookup(hash), Some(*locator), "locator after growth");
+            assert_eq!(candidates(&grown, hash), candidates(&owned, hash));
+        }
+        assert!(identities_complete(&grown));
+
+        // Memory: the clone holds owned slots plus both tables, 24 bytes per slot
+        // (what `memory_usage` charges a live index); the mapped source held the
+        // two tables in memory already, with its slots in the page cache.
+        assert_eq!(
+            owned.homes.lock().len() + owned.tails.lock().len(),
+            2 * owned.capacity() as usize
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_slot_packing() {
         let entry = IndexEntry::new(0xCDEF, 42, 0x0FFF_FFF0);
