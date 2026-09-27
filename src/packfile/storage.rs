@@ -1403,6 +1403,10 @@ struct DeltaLogState {
     /// coverage batch, which must be durable, would pay for every batch written
     /// since the epoch began in one fsync.
     log_synced_bytes: u64,
+    /// The highest redo `delta_seq` assigned so far in this pool. It resumes above
+    /// the checkpoint's base sequence at open and is written into the next
+    /// checkpoint as its base, so the ordering key survives reopen and rotation.
+    delta_seq_high: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -3415,6 +3419,7 @@ impl PackfileStorage {
             // What was on disk at open is treated as durable; only what this
             // session appends is owed an fsync.
             log_synced_bytes: log_bytes_on_disk,
+            delta_seq_high: checkpoint.base_delta_seq,
             log_version: replay_log_version,
             base_pack_ids: checkpoint
                 .pack_table
@@ -4381,6 +4386,9 @@ impl PackfileStorage {
         // checkpoint (C1) is durable; every collection's writers already
         // target the new epoch (D1) by the time the locks drop next.
         let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        // Every put mutex is held, so no redo record is in flight: the sequence
+        // reached so far is exactly what this checkpoint incorporates.
+        let base_delta_seq = self.delta_state.lock().delta_seq_high;
         self.delta_state.lock().base_pack_ids =
             pack_table.iter().map(|&(_, pack_id)| pack_id).collect();
         // Every collection's put mutex is held here, so no `put` is mid-flight
@@ -4421,6 +4429,7 @@ impl PackfileStorage {
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             wal_lsn.unwrap_or(0),
+            base_delta_seq,
             &snapshots,
             &pack_table,
         )
@@ -4502,6 +4511,7 @@ impl PackfileStorage {
         path: &Path,
         fingerprint: u64,
         covered_lsn: u64,
+        base_delta_seq: u64,
         snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
         pack_table: &[(u16, u64)],
     ) -> std::io::Result<std::time::Duration> {
@@ -4521,6 +4531,7 @@ impl PackfileStorage {
             path,
             fingerprint,
             covered_lsn,
+            base_delta_seq,
             &blobs,
             pack_table,
         )?;
@@ -4614,6 +4625,7 @@ impl PackfileStorage {
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             covered_lsn,
+            self.delta_state.lock().delta_seq_high,
             &snapshots,
             &pack_table,
         )
@@ -4696,6 +4708,7 @@ impl PackfileStorage {
             &Self::index_checkpoint_path(&self.base_dir),
             fingerprint,
             covered_lsn,
+            self.delta_state.lock().delta_seq_high,
             &snapshots,
             &pack_table,
         )
@@ -18125,6 +18138,24 @@ mod tests {
         assert_eq!(foreign.fingerprint, checkpoint.fingerprint);
         assert_eq!(foreign.covered_lsn, checkpoint.covered_lsn);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The redo ordering key survives a checkpoint and a reopen: the counter
+    /// resumes at the base sequence the checkpoint recorded.
+    #[test]
+    fn the_delta_sequence_resumes_from_the_checkpoints_base_after_a_reopen() {
+        let dir = test_dir("delta_seq_reopen");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(&[0xD7; 16], &batch_node(1), &NodeData::from_slice(b"one"))
+            .unwrap();
+        store.delta_state.lock().delta_seq_high = 17;
+        store.sync_all().unwrap();
+        drop(store);
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(reopened.delta_state.lock().delta_seq_high, 17);
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// The coverage step obeys the same rotation: with the log at the rotation

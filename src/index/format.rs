@@ -10,7 +10,7 @@ compile_error!("the persisted index cache is currently supported only on little-
 /// Bytes in one [`DeltaFrame`].
 pub const DELTA_FRAME_LEN: usize = 36;
 /// Bytes in the checkpoint header.
-pub const CHECKPOINT_HEADER_LEN: usize = 80;
+pub const CHECKPOINT_HEADER_LEN: usize = 88;
 /// Bytes in one collection directory entry.
 pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
 /// Bytes in one [`PackTableEntry`].
@@ -101,6 +101,11 @@ pub struct CheckpointHeader {
     /// Total byte length of the pack table section
     /// (`pack_table_count * PACK_TABLE_ENTRY_LEN`).
     pub pack_table_bytes: u64,
+    /// The highest `delta_seq` (the per-pool redo ordering key) this checkpoint
+    /// incorporates, so ordering survives a reopen and a delta-log rotation: the
+    /// counter resumes above it, and replay rejects a log whose first record does
+    /// not exceed it. Zero before any redo record has been assigned.
+    pub base_delta_seq: u64,
 }
 
 impl CheckpointHeader {
@@ -120,6 +125,7 @@ impl CheckpointHeader {
         bytes[60..68].copy_from_slice(&self.covered_lsn.to_le_bytes());
         bytes[68..72].copy_from_slice(&self.pack_table_count.to_le_bytes());
         bytes[72..80].copy_from_slice(&self.pack_table_bytes.to_le_bytes());
+        bytes[80..88].copy_from_slice(&self.base_delta_seq.to_le_bytes());
         bytes
     }
 
@@ -140,6 +146,7 @@ impl CheckpointHeader {
             covered_lsn: u64::from_le_bytes(bytes[60..68].try_into().ok()?),
             pack_table_count: u32::from_le_bytes(bytes[68..72].try_into().ok()?),
             pack_table_bytes: u64::from_le_bytes(bytes[72..80].try_into().ok()?),
+            base_delta_seq: u64::from_le_bytes(bytes[80..88].try_into().ok()?),
         })
     }
 }
@@ -263,6 +270,7 @@ mod tests {
             covered_lsn: 11,
             pack_table_count: 2,
             pack_table_bytes: 24,
+            base_delta_seq: 0x0123_4567_89AB,
         };
         assert_eq!(CheckpointHeader::decode(&header.encode()), Some(header));
 

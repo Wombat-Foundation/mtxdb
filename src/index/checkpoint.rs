@@ -59,6 +59,10 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// forcing the normal full-rescan fallback — never a partial/best-effort
 /// read of a v5 file under the v6 reader.
 ///
+/// Bumped to 7: the header carries `base_delta_seq`, the highest redo `delta_seq`
+/// the checkpoint incorporates (see `CheckpointHeader::base_delta_seq`). A v6
+/// checkpoint has no such field and is rebuilt.
+///
 /// Bumped to 5: the header now carries the journal `covered_lsn` the index
 /// snapshot incorporates, so a read-committed reader binds its overlay
 /// coverage to the exact index it loaded instead of a separately-read
@@ -69,7 +73,7 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// with empty identity side tables (cold-start tag-collision verification
 /// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
 /// reads for tag collisions on cold start.
-pub const CHECKPOINT_VERSION: u32 = 6;
+pub const CHECKPOINT_VERSION: u32 = 7;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 
@@ -119,6 +123,8 @@ pub struct LoadedCheckpoint {
     /// with the snapshot. Zero when the checkpoint was written without a
     /// journal.
     pub covered_lsn: u64,
+    /// The highest redo `delta_seq` this checkpoint incorporates.
+    pub base_delta_seq: u64,
     /// One entry per collection, in the checkpoint's directory order.
     pub collections: Vec<LoadedCollection>,
     /// Keeps the raw slot arrays alive for mmap-backed indexes built from
@@ -228,6 +234,7 @@ pub fn write_checkpoint(
     path: &Path,
     fingerprint: u64,
     covered_lsn: u64,
+    base_delta_seq: u64,
     collections: &[([u8; 16], u64, &[u8])],
     pack_table: &[(u16, u64)],
 ) -> std::io::Result<()> {
@@ -389,6 +396,7 @@ pub fn write_checkpoint(
         covered_lsn,
         pack_table_count,
         pack_table_bytes,
+        base_delta_seq,
     };
     buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
@@ -576,6 +584,7 @@ pub fn read_checkpoint_with_policy(
     Some(LoadedCheckpoint {
         fingerprint: header.pack_fingerprint,
         covered_lsn: header.covered_lsn,
+        base_delta_seq: header.base_delta_seq,
         collections,
         mmap,
         pack_table,
@@ -605,6 +614,8 @@ pub struct CheckpointSummary {
     pub fingerprint: u64,
     /// The journal LSN its index covers, or zero when written without a journal.
     pub covered_lsn: u64,
+    /// The highest redo `delta_seq` it incorporates.
+    pub base_delta_seq: u64,
 }
 
 /// Lightweight read of a checkpoint's header: its `pack_fingerprint` and the
@@ -641,6 +652,7 @@ pub fn read_checkpoint_summary(
     Ok(Some(CheckpointSummary {
         fingerprint: header.pack_fingerprint,
         covered_lsn: header.covered_lsn,
+        base_delta_seq: header.base_delta_seq,
     }))
 }
 
@@ -760,6 +772,7 @@ mod tests {
             &path,
             fingerprint,
             0,
+            0,
             &blobs
                 .iter()
                 .map(|(id, blob)| (*id, 0, blob.as_slice()))
@@ -837,7 +850,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_CHECKPOINT_FILE);
-        write_checkpoint(&path, pack_fingerprint(&[]), 0, &[], &[]).unwrap();
+        write_checkpoint(&path, pack_fingerprint(&[]), 0, 0, &[], &[]).unwrap();
         let loaded = read_checkpoint(&path).expect("empty checkpoint is still a valid file");
         assert_eq!(loaded.fingerprint, pack_fingerprint(&[]));
         assert!(loaded.collections.is_empty());
@@ -860,6 +873,7 @@ mod tests {
             &path,
             0,
             0,
+            0,
             &blobs
                 .iter()
                 .map(|(id, b)| (*id, 0, b.as_slice()))
@@ -879,6 +893,7 @@ mod tests {
         // Wrong version byte in an otherwise valid file.
         write_checkpoint(
             &path,
+            0,
             0,
             0,
             &blobs
@@ -919,6 +934,7 @@ mod tests {
         let blobs = [([7u8; 16], index_with_entries(3, 40).serialize())];
         write_checkpoint(
             &path,
+            0,
             0,
             0,
             &blobs
@@ -1023,6 +1039,7 @@ mod tests {
             covered_lsn: 0,
             pack_table_count: 0,
             pack_table_bytes: 0,
+            base_delta_seq: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 
@@ -1065,6 +1082,7 @@ mod tests {
             covered_lsn: 0,
             pack_table_count: 0,
             pack_table_bytes: 0,
+            base_delta_seq: 0,
         };
         std::fs::write(&path, header.encode()).unwrap();
 
@@ -1091,5 +1109,35 @@ mod tests {
             read_pack_fingerprint(&path).is_err(),
             "malformed checkpoint must return Err"
         );
+    }
+
+    /// The base sequence a checkpoint incorporates survives the header round trip
+    /// and is visible without reading the body.
+    #[test]
+    fn base_delta_seq_round_trips_through_the_header() {
+        let dir = std::env::temp_dir().join(format!("mtxdb-base-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_CHECKPOINT_FILE);
+        let blobs = [([3u8; 16], index_with_entries(1, 20).serialize())];
+        write_checkpoint(
+            &path,
+            pack_fingerprint(&[(1, 10)]),
+            5,
+            0xDEAD_BEEF_0042,
+            &blobs
+                .iter()
+                .map(|(id, b)| (*id, 1, b.as_slice()))
+                .collect::<Vec<_>>(),
+            &[(0, 1)],
+        )
+        .unwrap();
+        assert_eq!(
+            read_checkpoint(&path).unwrap().base_delta_seq,
+            0xDEAD_BEEF_0042
+        );
+        let summary = read_checkpoint_summary(&path).unwrap().unwrap();
+        assert_eq!(summary.base_delta_seq, 0xDEAD_BEEF_0042);
+        assert_eq!(summary.covered_lsn, 5);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
