@@ -6,6 +6,7 @@ use std::sync::Arc;
 pub mod checkpoint;
 pub mod delta;
 pub mod format;
+pub mod redo;
 
 use crate::index::delta::DeltaReplayError;
 use crate::index::format::DeltaFrame;
