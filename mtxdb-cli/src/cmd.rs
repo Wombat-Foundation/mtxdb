@@ -10295,14 +10295,14 @@ fn persist_matrix_edges(
     // Parent references contain Matrix event IDs, so a custom record identity
     // such as /sender cannot be derived for a referenced event. The checked-in
     // Matrix importer profile requires /event_id; generic templates that use
-    // another identity do not publish this Mtx-specific adjacency index.
+    // another identity do not publish MtxAdjacency records.
     if !matches!(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
     ) {
         return Ok(());
     }
-    let mut by_collection: HashMap<[u8; 16], HashMap<NodeId, Mtx>> = HashMap::new();
+    let mut by_collection: HashMap<[u8; 16], HashMap<NodeId, MtxAdjacency>> = HashMap::new();
     for event in events {
         let Some(source_id) = template_node_id(template, event)? else {
             continue;
@@ -10364,7 +10364,7 @@ fn persist_matrix_edges(
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Mtx {
+struct MtxAdjacency {
     prev: Vec<NodeId>,
     auth: Vec<NodeId>,
     related: Vec<(NodeId, String)>,
@@ -10374,8 +10374,8 @@ struct Mtx {
 /// related edges that may arrive in a later import or duplicate batch record.
 /// Returns true only when the destination adjacency changed.
 fn reconcile_mtx_adjacency(
-    existing: &mut Mtx,
-    incoming: &Mtx,
+    existing: &mut MtxAdjacency,
+    incoming: &MtxAdjacency,
 ) -> anyhow::Result<bool> {
     anyhow::ensure!(existing.prev == incoming.prev, "prev edges differ");
     anyhow::ensure!(existing.auth == incoming.auth, "auth edges differ");
@@ -10389,7 +10389,7 @@ fn reconcile_mtx_adjacency(
     Ok(changed)
 }
 
-fn encode_mtx_adjacency(adjacency: &Mtx) -> anyhow::Result<Vec<u8>> {
+fn encode_mtx_adjacency(adjacency: &MtxAdjacency) -> anyhow::Result<Vec<u8>> {
     let prev_count = u32::try_from(adjacency.prev.len()).context("too many prev edges")?;
     let auth_count = u32::try_from(adjacency.auth.len()).context("too many auth edges")?;
     let related_count = u32::try_from(adjacency.related.len()).context("too many related edges")?;
@@ -10440,7 +10440,7 @@ fn encode_mtx_adjacency(adjacency: &Mtx) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_mtx_adjacency(bytes: &[u8]) -> anyhow::Result<Mtx> {
+fn decode_mtx_adjacency(bytes: &[u8]) -> anyhow::Result<MtxAdjacency> {
     anyhow::ensure!(
         bytes.len() >= EDGE_MAGIC.len(),
         "truncated edge adjacency magic"
@@ -10527,7 +10527,7 @@ fn decode_mtx_adjacency(bytes: &[u8]) -> anyhow::Result<Mtx> {
         related.push((id, kind));
     }
     anyhow::ensure!(offset == bytes.len(), "trailing bytes in edge adjacency");
-    Ok(Mtx {
+    Ok(MtxAdjacency {
         prev,
         auth,
         related,
@@ -10556,8 +10556,8 @@ fn matrix_event_id_for_template(
 fn mtx_relationships(
     template: &CollectionTemplate,
     event: &OwnedValue,
-) -> anyhow::Result<Mtx> {
-    let mut adjacency = Mtx::default();
+) -> anyhow::Result<MtxAdjacency> {
+    let mut adjacency = MtxAdjacency::default();
     let OwnedValue::Object(fields) = event else {
         return Ok(adjacency);
     };
@@ -10707,7 +10707,7 @@ mod tests {
         parse_pack_id_selector, parse_pack_selectors, persist_matrix_edges, pretty_print_payload,
         redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
         split_canonical_display, template_collection_id, template_node_id, topological_event_order,
-        valid_state_group_id, verify_auth_chain_edges, CollectionTemplate, Mtx,
+        valid_state_group_id, verify_auth_chain_edges, CollectionTemplate, MtxAdjacency,
         MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
         MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
     };
@@ -13438,7 +13438,7 @@ mod tests {
         assert_eq!(adjacency.prev.len(), 2);
         assert_eq!(adjacency.auth.len(), 1);
         assert_eq!(adjacency.related.len(), 1);
-        let expected = encode_mtx_adjacency(&Mtx {
+        let expected = encode_mtx_adjacency(&MtxAdjacency {
             prev: vec![
                 matrix_event_id_for_template(&template, "$prev1").unwrap(),
                 matrix_event_id_for_template(&template, "$prev2").unwrap(),
@@ -13472,7 +13472,7 @@ mod tests {
 
     #[test]
     fn mtx_adjacency_round_trip_and_rejects_malformed_records() {
-        let adjacency = Mtx {
+        let adjacency = MtxAdjacency {
             prev: vec![[1; 16], [2; 16]],
             auth: vec![[3; 16]],
             related: vec![([4; 16], "relates_to:m.reference".to_owned())],
@@ -13511,12 +13511,12 @@ mod tests {
             .expect("leaf marker");
         assert_eq!(
             decode_mtx_adjacency(&stored.bytes).unwrap(),
-            Mtx::default()
+            MtxAdjacency::default()
         );
 
-        let conflicting = encode_mtx_adjacency(&Mtx {
+        let conflicting = encode_mtx_adjacency(&MtxAdjacency {
             prev: vec![[8; 16]],
-            ..Mtx::default()
+            ..MtxAdjacency::default()
         })
         .unwrap();
         store
