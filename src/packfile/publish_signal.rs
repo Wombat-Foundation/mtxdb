@@ -205,6 +205,10 @@ impl PublishSignal {
 /// the mapping and the file is only ever grown to `SIGNAL_LEN` at creation.
 #[allow(unsafe_code)]
 fn map_writable(file: &File) -> io::Result<memmap2::MmapMut> {
+    debug_assert!(
+        file.metadata().is_ok_and(|meta| meta.len() >= SIGNAL_LEN),
+        "the signal file must be sized before it is mapped"
+    );
     // SAFETY: a `SIGNAL_LEN`-sized region of a read/write file, kept alive by
     // the returned mapping and never shrunk while mapped.
     unsafe { memmap2::MmapMut::map_mut(file) }
@@ -218,6 +222,10 @@ fn map_writable(file: &File) -> io::Result<memmap2::MmapMut> {
 /// mapping and a writer only ever grows the file to `SIGNAL_LEN`.
 #[allow(unsafe_code)]
 fn map_readable(file: &File) -> io::Result<memmap2::Mmap> {
+    debug_assert!(
+        file.metadata().is_ok_and(|meta| meta.len() >= SIGNAL_LEN),
+        "the signal file must be sized before it is mapped"
+    );
     // SAFETY: a `SIGNAL_LEN`-sized region of a read-only file, kept alive by
     // the returned mapping and never shrunk while mapped.
     unsafe { memmap2::Mmap::map(file) }

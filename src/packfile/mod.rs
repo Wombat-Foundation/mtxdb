@@ -134,6 +134,11 @@ impl PackId {
     /// only consulted when *creating* a pack: an existing file's name is fixed
     /// on disk and never recomputed, so adding a later sibling can never rename
     /// an already-written pack.
+    ///
+    /// A pack placed in the pool out of band (a manual file copy) bypasses this
+    /// check, so a hand-copied pack should use its full 32-hex name: a 16-hex
+    /// name cannot be widened later, and a collision then surfaces as a
+    /// filename/header disagreement at discovery.
     #[must_use]
     pub fn filename_for(&self, siblings: &[PackId]) -> String {
         let hex = self.as_hex();
