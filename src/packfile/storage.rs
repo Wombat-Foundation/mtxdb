@@ -8817,7 +8817,16 @@ impl PackfileStorage {
             return Ok(());
         }
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-        self.start_checkpoint_worker()
+        self.start_checkpoint_worker()?;
+        // A forced rewrite is a full checkpoint like a sync's, but it never
+        // passes through `sync`/`sync_all`, so `count_sync_persistence` cannot
+        // see it. Count it at hand-off, matching that barrier accounting (which
+        // counts a backgrounded sync checkpoint at capture, not at tail
+        // completion). Without this, a pool touched only by WAL-reclaim
+        // remediation reports zero checkpoint writes when background
+        // checkpointing is on and one when it is off.
+        self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Bound how often a structurally-needed full checkpoint rewrite may run.
@@ -11708,6 +11717,45 @@ mod tests {
         assert_eq!(
             forced.covered_lsn, committed,
             "force must advance coverage to the committed journal tail"
+        );
+    }
+
+    #[test]
+    fn detached_force_checkpoint_counts_like_the_synchronous_fallback() {
+        let dir = test_dir("detached_force_checkpoint_metric");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(dir.join("wal.bin")).unwrap();
+
+        // Background off: the detached call falls back to the synchronous path,
+        // which counts the write it performed.
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0x22; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"y")),
+            )
+            .unwrap();
+        let before = store.stats().checkpoint_writes;
+        store.force_index_checkpoint_detached().unwrap();
+        assert_eq!(store.stats().checkpoint_writes - before, 1);
+
+        // Background on: the tail runs detached, but the write must still be
+        // counted so the reported total does not depend on that setting.
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0x23; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"z")),
+            )
+            .unwrap();
+        store.set_background_checkpoint(true);
+        let before = store.stats().checkpoint_writes;
+        store.force_index_checkpoint_detached().unwrap();
+        store.wait_for_checkpoint();
+        assert_eq!(
+            store.stats().checkpoint_writes - before,
+            1,
+            "a detached forced checkpoint must count like the synchronous one"
         );
     }
 
