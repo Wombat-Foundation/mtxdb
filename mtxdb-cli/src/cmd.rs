@@ -10283,64 +10283,68 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
 }
 
 const EDGE_MAGIC: &[u8] = b"EDG1";
-const EDGE_ID_PREFIX: &[u8] = b"mtxdb-edge\0";
-const EDGE_FIELD_COUNT: usize = 3;
-const EDGE_SEPARATOR_COUNT: usize = 2;
+const EDGE_ID_BYTES: usize = 16;
+const EDGE_COUNT_BYTES: usize = 4;
 
-/// Persist the relationships carried by Matrix events in the general edges
-/// pool. Event records remain lossless in the event-dag pool; these compact
-/// records make common graph traversals possible without reparsing every
-/// event payload.
+/// Persist one compact adjacency record per Matrix event in the edges pool.
+/// The source's 128-bit logical ID is the pack record key; the payload stores
+/// typed target IDs, not repeated source/target event-ID strings.
 fn persist_matrix_edges(
     store: &PackfileStorage,
     template: &CollectionTemplate,
     events: &[OwnedValue],
 ) -> anyhow::Result<()> {
-    let mut by_collection: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+    // Parent references contain Matrix event IDs, so a custom record identity
+    // such as /sender cannot be derived for a referenced event. The checked-in
+    // Matrix importer profile requires /event_id; generic templates that use
+    // another identity do not publish this Matrix-specific adjacency index.
+    if !matches!(
+        &template.record_id_rule.policy,
+        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+    ) {
+        return Ok(());
+    }
+    let mut by_collection: HashMap<[u8; 16], HashMap<NodeId, Vec<u8>>> = HashMap::new();
     for event in events {
-        let Some(source) = event_id(event) else {
+        let Some(source_id) = template_node_id(template, event)? else {
             continue;
         };
         let Some(room_id) = event_room_id(event) else {
             continue;
         };
+        let adjacency = matrix_relationships(template, event)?;
+        let data = encode_matrix_adjacency(&adjacency)?;
+        // EDG1 is the initial adjacency format; it has not shipped, so no
+        // deployed legacy collection needs migration or versioned separation.
         let collection_id = template_collection_id(template, room_id);
-        for (target, kind) in matrix_relationships(event) {
-            let identity_capacity = source
-                .len()
-                .checked_add(target.len())
-                .and_then(|length| length.checked_add(kind.len()))
-                .and_then(|length| {
-                    length
-                        .checked_add(EDGE_ID_PREFIX.len())
-                        .and_then(|length| length.checked_add(EDGE_SEPARATOR_COUNT))
-                })
-                .context("edge identity length overflow")?;
-            let mut identity = Vec::with_capacity(identity_capacity);
-            identity.extend_from_slice(EDGE_ID_PREFIX);
-            identity.extend_from_slice(source.as_bytes());
-            identity.push(0);
-            identity.extend_from_slice(kind.as_bytes());
-            identity.push(0);
-            identity.extend_from_slice(target.as_bytes());
-            let digest = blake3_digest(&identity);
-            let id: NodeId = digest[..16].try_into().expect("BLAKE3 digest is 32 bytes");
-            let data = encode_matrix_edge(source, &target, &kind)?;
-            by_collection
-                .entry(collection_id)
-                .or_default()
-                .push((id, NodeData::new(bytes::Bytes::from(data))));
+        let records = by_collection.entry(collection_id).or_default();
+        if let Some(previous) = records.insert(source_id, data.clone()) {
+            anyhow::ensure!(
+                previous == data,
+                "event {} has conflicting edge lists in one import",
+                hex::encode(source_id)
+            );
         }
     }
 
-    for (collection_id, entries) in by_collection {
-        let ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
+    for (collection_id, records) in by_collection {
+        let ids: Vec<NodeId> = records.keys().copied().collect();
         let existing = store.get_many(&collection_id, &ids)?;
-        let to_write: Vec<(NodeId, NodeData)> = entries
-            .into_iter()
-            .zip(existing)
-            .filter_map(|(entry, old)| old.is_none().then_some(entry))
-            .collect();
+        let mut to_write = Vec::new();
+        for (id, old) in ids.into_iter().zip(existing) {
+            let data = records
+                .get(&id)
+                .expect("each requested source ID came from records");
+            if let Some(old) = old {
+                anyhow::ensure!(
+                    old.bytes.as_ref() == data.as_slice(),
+                    "stored edge adjacency for event {} differs from the imported event",
+                    hex::encode(id)
+                );
+            } else {
+                to_write.push((id, NodeData::new(bytes::Bytes::copy_from_slice(data))));
+            }
+        }
         if !to_write.is_empty() {
             store.put_many(&collection_id, &to_write)?;
         }
@@ -10348,34 +10352,173 @@ fn persist_matrix_edges(
     Ok(())
 }
 
-fn encode_matrix_edge(source: &str, target: &str, kind: &str) -> anyhow::Result<Vec<u8>> {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MatrixAdjacency {
+    prev: Vec<NodeId>,
+    auth: Vec<NodeId>,
+    related: Vec<(NodeId, String)>,
+}
+
+fn encode_matrix_adjacency(adjacency: &MatrixAdjacency) -> anyhow::Result<Vec<u8>> {
+    let prev_count = u32::try_from(adjacency.prev.len()).context("too many prev edges")?;
+    let auth_count = u32::try_from(adjacency.auth.len()).context("too many auth edges")?;
+    let related_count = u32::try_from(adjacency.related.len()).context("too many related edges")?;
+    let related_bytes = adjacency
+        .related
+        .iter()
+        .try_fold(0usize, |sum, (_, kind)| {
+            let kind_len = u16::try_from(kind.len()).context("edge kind is too long")?;
+            sum.checked_add(EDGE_ID_BYTES)
+                .and_then(|n| n.checked_add(std::mem::size_of::<u16>()))
+                .and_then(|n| n.checked_add(usize::from(kind_len)))
+                .context("edge adjacency length overflow")
+        })?;
+    let ids_bytes = adjacency
+        .prev
+        .len()
+        .checked_add(adjacency.auth.len())
+        .and_then(|count| count.checked_mul(EDGE_ID_BYTES))
+        .context("edge adjacency length overflow")?;
     let capacity = EDGE_MAGIC
         .len()
-        .checked_add(source.len())
-        .and_then(|length| length.checked_add(target.len()))
-        .and_then(|length| length.checked_add(kind.len()))
-        .and_then(|length| {
-            EDGE_FIELD_COUNT
-                .checked_mul(std::mem::size_of::<u32>())
-                .and_then(|fields_size| length.checked_add(fields_size))
-        })
-        .context("edge payload length overflow")?;
+        .checked_add(3 * EDGE_COUNT_BYTES)
+        .and_then(|n| n.checked_add(ids_bytes))
+        .and_then(|n| n.checked_add(related_bytes))
+        .context("edge adjacency length overflow")?;
     let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(EDGE_MAGIC);
-    for value in [source, target, kind] {
-        let length = u32::try_from(value.len()).context("edge field is too large")?;
-        out.extend_from_slice(&length.to_le_bytes());
-        out.extend_from_slice(value.as_bytes());
+    out.extend_from_slice(&prev_count.to_le_bytes());
+    for id in &adjacency.prev {
+        out.extend_from_slice(id);
     }
+    out.extend_from_slice(&auth_count.to_le_bytes());
+    for id in &adjacency.auth {
+        out.extend_from_slice(id);
+    }
+    out.extend_from_slice(&related_count.to_le_bytes());
+    for (id, kind) in &adjacency.related {
+        let kind_len = u16::try_from(kind.len()).context("edge kind is too long")?;
+        out.extend_from_slice(id);
+        out.extend_from_slice(&kind_len.to_le_bytes());
+        out.extend_from_slice(kind.as_bytes());
+    }
+    debug_assert_eq!(
+        out.len(),
+        capacity,
+        "encoded adjacency must match its computed size"
+    );
     Ok(out)
 }
 
-fn matrix_relationships(event: &OwnedValue) -> Vec<(String, String)> {
-    let mut relationships = Vec::new();
-    let OwnedValue::Object(fields) = event else {
-        return relationships;
+#[cfg(test)]
+fn decode_matrix_adjacency(bytes: &[u8]) -> anyhow::Result<MatrixAdjacency> {
+    anyhow::ensure!(
+        bytes.len() >= EDGE_MAGIC.len(),
+        "truncated edge adjacency magic"
+    );
+    anyhow::ensure!(
+        &bytes[..EDGE_MAGIC.len()] == EDGE_MAGIC,
+        "unknown edge adjacency version"
+    );
+    let mut offset = EDGE_MAGIC.len();
+    let read_count = |bytes: &[u8], offset: &mut usize| -> anyhow::Result<usize> {
+        let end = offset
+            .checked_add(EDGE_COUNT_BYTES)
+            .context("edge offset overflow")?;
+        let raw: [u8; EDGE_COUNT_BYTES] = bytes
+            .get(*offset..end)
+            .context("truncated edge adjacency count")?
+            .try_into()
+            .expect("slice length checked");
+        *offset = end;
+        Ok(u32::from_le_bytes(raw) as usize)
     };
-    for (field, kind) in [("prev_events", "prev"), ("auth_events", "auth")] {
+    let read_ids =
+        |bytes: &[u8], offset: &mut usize, count: usize| -> anyhow::Result<Vec<NodeId>> {
+            let total = count
+                .checked_mul(EDGE_ID_BYTES)
+                .context("edge ID count overflow")?;
+            let end = offset.checked_add(total).context("edge offset overflow")?;
+            let raw = bytes.get(*offset..end).context("truncated edge IDs")?;
+            *offset = end;
+            let (ids, remainder) = raw.as_chunks::<EDGE_ID_BYTES>();
+            debug_assert!(remainder.is_empty(), "ID byte length is a multiple of 16");
+            Ok(ids.to_vec())
+        };
+    let prev_count = read_count(bytes, &mut offset)?;
+    let prev = read_ids(bytes, &mut offset, prev_count)?;
+    let auth_count = read_count(bytes, &mut offset)?;
+    let auth = read_ids(bytes, &mut offset, auth_count)?;
+    let related_count = read_count(bytes, &mut offset)?;
+    let mut related = Vec::with_capacity(related_count);
+    for _ in 0..related_count {
+        let id_end = offset
+            .checked_add(EDGE_ID_BYTES)
+            .context("edge offset overflow")?;
+        let id: NodeId = bytes
+            .get(offset..id_end)
+            .context("truncated related-edge ID")?
+            .try_into()
+            .expect("slice length checked");
+        offset = id_end;
+        let kind_len_end = offset.checked_add(2).context("edge offset overflow")?;
+        let kind_len_raw: [u8; 2] = bytes
+            .get(offset..kind_len_end)
+            .context("truncated related-edge kind length")?
+            .try_into()
+            .expect("slice length checked");
+        offset = kind_len_end;
+        let kind_end = offset
+            .checked_add(usize::from(u16::from_le_bytes(kind_len_raw)))
+            .context("edge offset overflow")?;
+        let kind = std::str::from_utf8(
+            bytes
+                .get(offset..kind_end)
+                .context("truncated related-edge kind")?,
+        )?
+        .to_owned();
+        offset = kind_end;
+        related.push((id, kind));
+    }
+    anyhow::ensure!(offset == bytes.len(), "trailing bytes in edge adjacency");
+    Ok(MatrixAdjacency {
+        prev,
+        auth,
+        related,
+    })
+}
+
+fn matrix_event_id_for_template(
+    template: &CollectionTemplate,
+    event_id: &str,
+) -> anyhow::Result<NodeId> {
+    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
+        bail!("Matrix edge IDs require a pointer-based template record identity");
+    };
+    anyhow::ensure!(
+        pointer == "/event_id",
+        "Matrix edge IDs require record identity /event_id"
+    );
+    let algorithm = match template.record_id_rule.digest_algorithm {
+        DigestAlgorithm::Blake3 => "blake3-128",
+        DigestAlgorithm::Sha256 => "sha2-256",
+        DigestAlgorithm::Unknown(id) => bail!("unsupported template digest algorithm id {id}"),
+    };
+    derive_template_key(algorithm, event_id)
+}
+
+fn matrix_relationships(
+    template: &CollectionTemplate,
+    event: &OwnedValue,
+) -> anyhow::Result<MatrixAdjacency> {
+    let mut adjacency = MatrixAdjacency::default();
+    let OwnedValue::Object(fields) = event else {
+        return Ok(adjacency);
+    };
+    for (field, targets) in [
+        ("prev_events", &mut adjacency.prev),
+        ("auth_events", &mut adjacency.auth),
+    ] {
         if let Some(OwnedValue::Array(values)) = fields.get(field) {
             for value in values.iter() {
                 let target = match value {
@@ -10384,28 +10527,34 @@ fn matrix_relationships(event: &OwnedValue) -> Vec<(String, String)> {
                     _ => None,
                 };
                 if let Some(target) = target {
-                    relationships.push((target.to_owned(), kind.to_owned()));
+                    targets.push(matrix_event_id_for_template(template, target)?);
                 }
             }
         }
     }
     let Some(OwnedValue::Object(content)) = fields.get("content") else {
-        return relationships;
+        return Ok(adjacency);
     };
     let Some(OwnedValue::Object(relates_to)) = content.get("m.relates_to") else {
-        return relationships;
+        return Ok(adjacency);
     };
     if let (Some(OwnedValue::String(rel_type)), Some(OwnedValue::String(target))) =
         (relates_to.get("rel_type"), relates_to.get("event_id"))
     {
-        relationships.push((target.to_owned(), format!("relates_to:{rel_type}")));
+        adjacency.related.push((
+            matrix_event_id_for_template(template, target)?,
+            format!("relates_to:{rel_type}"),
+        ));
     }
     if let Some(OwnedValue::Object(reply)) = relates_to.get("m.in_reply_to") {
         if let Some(OwnedValue::String(target)) = reply.get("event_id") {
-            relationships.push((target.to_owned(), "relates_to:m.in_reply_to".to_owned()));
+            adjacency.related.push((
+                matrix_event_id_for_template(template, target)?,
+                "relates_to:m.in_reply_to".to_owned(),
+            ));
         }
     }
-    relationships
+    Ok(adjacency)
 }
 
 fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
@@ -10500,19 +10649,21 @@ mod tests {
         blake3_digest, build_event_dag, canonical_column_width, cmd_collections, cmd_get,
         cmd_import_file, cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
         collection_canonical_id, compile_import_template, compute_state_groups_partial,
-        decode_event_json_record, decode_hamt_node, decode_hamt_root,
-        default_matrix_import_template, derive_template_key, display_collection_role, event_id,
-        event_room_id, event_short_id, export_envelope_line, extract_pointer_string,
-        fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
-        import_pdu_events, interleaving_worth_noting, listing_shard_types, load_state_groups,
-        matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
-        meta_checkpoints, meta_lock_line, meta_pools, meta_raw, pack_identity,
-        parse_federation_input, parse_pack_id_selector, parse_pack_selectors, pretty_print_payload,
+        decode_event_json_record, decode_hamt_node, decode_hamt_root, decode_matrix_adjacency,
+        default_matrix_import_template, derive_template_key, display_collection_role,
+        encode_matrix_adjacency, event_id, event_room_id, event_short_id, export_envelope_line,
+        extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_canonical_display,
+        format_id, glob_pack_files, import_pdu_events, interleaving_worth_noting,
+        listing_shard_types, load_state_groups, matrix_batch_has_create,
+        matrix_event_id_for_template, matrix_event_node_id, matrix_relationships,
+        matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints,
+        meta_lock_line, meta_pools, meta_raw, pack_identity, parse_federation_input,
+        parse_pack_id_selector, parse_pack_selectors, persist_matrix_edges, pretty_print_payload,
         redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
         split_canonical_display, template_collection_id, template_node_id, topological_event_order,
-        valid_state_group_id, verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension,
-        MetaReport, PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
-        STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+        valid_state_group_id, verify_auth_chain_edges, CollectionTemplate, MatrixAdjacency,
+        MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
+        MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -12168,6 +12319,8 @@ mod tests {
             &mut established,
         )
         .unwrap();
+        let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
+        let first_import_records = count_pack_records(&auth_dir);
         // Declares the create so batch_has_create resolves for any follow-up.
         cmd_import_file(
             &store,
@@ -12180,11 +12333,10 @@ mod tests {
         )
         .unwrap();
 
-        let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
         assert_eq!(
             count_pack_records(&auth_dir),
-            2,
-            "the edges pool must hold genesis metadata and the one imported auth event, unchanged by the reimport"
+            first_import_records,
+            "reimport must not append duplicate edge or auth-chain records"
         );
         let auth_store = PackfileStorage::open(auth_dir).unwrap();
         let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");
@@ -13224,6 +13376,133 @@ mod tests {
         let msg_node = &frontier.nodes[2];
         assert_eq!(msg_node.prev.1, 1); // 1 prev_events
         assert_eq!(msg_node.auth.1, 2); // 2 auth_events
+    }
+
+    #[test]
+    fn matrix_edges_persist_as_one_compact_record_per_source_event() {
+        let root = unique_temp_dir();
+        let store = PackfileStorage::open(root.clone()).unwrap();
+        let mut template = default_matrix_import_template();
+        template.record_id_rule.digest_algorithm = DigestAlgorithm::Sha256;
+        let event = owned_value(
+            r#"{"event_id":"$source","room_id":"!r:x","type":"m.room.message","prev_events":["$prev1",["$prev2",{}]],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$related"}}}"#,
+        );
+        let source = template_node_id(&template, &event).unwrap().unwrap();
+        let adjacency = matrix_relationships(&template, &event).unwrap();
+        assert_eq!(adjacency.prev.len(), 2);
+        assert_eq!(adjacency.auth.len(), 1);
+        assert_eq!(adjacency.related.len(), 1);
+        let expected = encode_matrix_adjacency(&MatrixAdjacency {
+            prev: vec![
+                matrix_event_id_for_template(&template, "$prev1").unwrap(),
+                matrix_event_id_for_template(&template, "$prev2").unwrap(),
+            ],
+            auth: vec![matrix_event_id_for_template(&template, "$auth").unwrap()],
+            related: vec![(
+                matrix_event_id_for_template(&template, "$related").unwrap(),
+                "relates_to:m.reference".to_owned(),
+            )],
+        })
+        .unwrap();
+        assert_eq!(&expected[..4], b"EDG1");
+        assert_eq!(decode_matrix_adjacency(&expected).unwrap(), adjacency);
+
+        persist_matrix_edges(&store, &template, std::slice::from_ref(&event)).unwrap();
+        let collection = template_collection_id(&template, "!r:x");
+        let stored = store
+            .get(&collection, &source)
+            .unwrap()
+            .expect("source event adjacency record");
+        assert_eq!(stored.bytes.as_ref(), expected.as_slice());
+        assert_eq!(count_pack_records(&root), 1);
+
+        // Reimport is idempotent and verifies that a source key never silently
+        // accepts a different adjacency value.
+        persist_matrix_edges(&store, &template, &[event]).unwrap();
+        assert_eq!(count_pack_records(&root), 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matrix_adjacency_round_trip_and_rejects_malformed_records() {
+        let adjacency = MatrixAdjacency {
+            prev: vec![[1; 16], [2; 16]],
+            auth: vec![[3; 16]],
+            related: vec![([4; 16], "relates_to:m.reference".to_owned())],
+        };
+        let encoded = encode_matrix_adjacency(&adjacency).unwrap();
+        assert_eq!(decode_matrix_adjacency(&encoded).unwrap(), adjacency);
+        assert!(decode_matrix_adjacency(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_matrix_adjacency(&trailing).is_err());
+        assert!(decode_matrix_adjacency(b"EDG9").is_err());
+    }
+
+    #[test]
+    fn matrix_edges_preserve_empty_adjacencies_and_reject_conflicts() {
+        let root = unique_temp_dir();
+        let store = PackfileStorage::open(root.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let event = owned_value(
+            r#"{"event_id":"$leaf","room_id":"!r:x","type":"m.room.message","content":{"body":"leaf"}}"#,
+        );
+        let source = template_node_id(&template, &event).unwrap().unwrap();
+        let collection = template_collection_id(&template, "!r:x");
+        persist_matrix_edges(&store, &template, std::slice::from_ref(&event)).unwrap();
+        let stored = store
+            .get(&collection, &source)
+            .unwrap()
+            .expect("leaf marker");
+        assert_eq!(
+            decode_matrix_adjacency(&stored.bytes).unwrap(),
+            MatrixAdjacency::default()
+        );
+
+        let conflicting = encode_matrix_adjacency(&MatrixAdjacency {
+            prev: vec![[8; 16]],
+            ..MatrixAdjacency::default()
+        })
+        .unwrap();
+        store
+            .put(
+                &collection,
+                &source,
+                &NodeData::new(Bytes::from(conflicting)),
+            )
+            .unwrap();
+        assert!(persist_matrix_edges(&store, &template, &[event]).is_err());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matrix_edges_group_duplicates_per_source_and_separate_rooms() {
+        let root = unique_temp_dir();
+        let store = PackfileStorage::open(root.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let event_a = owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
+        let event_a_duplicate =
+            owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
+        let event_b = owned_value(r#"{"event_id":"$same","room_id":"!b:x","prev_events":["$q"]}"#);
+        persist_matrix_edges(&store, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
+        let source = matrix_event_node_id("$same").unwrap();
+        let collection_a = template_collection_id(&template, "!a:x");
+        let collection_b = template_collection_id(&template, "!b:x");
+        let a = store.get(&collection_a, &source).unwrap().unwrap();
+        let b = store.get(&collection_b, &source).unwrap().unwrap();
+        assert_eq!(
+            decode_matrix_adjacency(&a.bytes).unwrap().prev,
+            vec![matrix_event_node_id("$p").unwrap()]
+        );
+        assert_eq!(
+            decode_matrix_adjacency(&b.bytes).unwrap().prev,
+            vec![matrix_event_node_id("$q").unwrap()]
+        );
+        assert_eq!(count_pack_records(&root), 2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
