@@ -331,6 +331,12 @@ mod tests {
         let engine = InMemoryStorage::new();
         let index = AuxiliaryIndex::open(&engine, "empty_batch");
         assert_eq!(index.put_many(&[]).unwrap(), 0);
+        assert_eq!(
+            engine
+                .get_collection_metadata(&index.collection_id())
+                .unwrap(),
+            Some(index.metadata())
+        );
         index.put(b"key", b"value").unwrap();
         assert_eq!(index.get(b"key").unwrap(), Some(b"value".to_vec()));
     }

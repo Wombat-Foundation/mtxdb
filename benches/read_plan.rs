@@ -733,6 +733,7 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
                 .sync_all()?;
         }
     }
+    #[cfg(not(windows))]
     fs::File::open(dst)?.sync_all()?;
     Ok(())
 }
