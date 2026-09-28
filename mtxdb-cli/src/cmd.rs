@@ -4245,8 +4245,7 @@ fn cmd_info_coalesced(
                         locations
                             .iter()
                             .filter(|location| {
-                                location.database == *db_dir
-                                    && location.shard_type == shard_type
+                                location.database == *db_dir && location.shard_type == shard_type
                             })
                             .map(|location| {
                                 (location.pack_id, location.file_bytes, location.version)
