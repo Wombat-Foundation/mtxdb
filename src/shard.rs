@@ -875,12 +875,13 @@ impl ShardPool {
 
     /// Discovers packfiles in the pool directory.
     ///
-    /// A canonical filename is `pack_<16 lowercase hex digits>` with optional
-    /// `_<16 hex>` continuation groups, a truncated, disambiguated prefix of
-    /// the pack's 128-bit [`packfile::PackId`]. The filename is only a
-    /// lookup key: the authoritative identity is read from (and validated
-    /// against) the file's header. Uppercase hex is rejected to prevent
-    /// case-insensitive collisions and enforce one canonical spelling.
+    /// Writers emit `pack_<16 lowercase hex digits>`, or
+    /// `pack_<32 lowercase hex digits>` when the short prefix collides. For
+    /// compatibility, discovery also accepts legacy underscore-joined 16-hex
+    /// groups up to the full address width. The filename is only a lookup key:
+    /// the authoritative identity is read from (and validated against) the
+    /// file's header. Uppercase hex is rejected to prevent case-insensitive
+    /// collisions and enforce one canonical spelling.
     ///
     /// A `shard_*.pack` file is rejected with `Unsupported` (hard cutover).
     /// Other applications' `.pack` files are ignored. Duplicate full addresses

@@ -1577,9 +1577,9 @@ pub struct JournalCoordinator {
     /// Largest durable-LSN advance made by one fsync.
     max_commit_records: AtomicU64,
     /// Cross-process `(epoch, visible_lsn)` signal beside the segment. Lazily
-    /// created by [`Self::enable_publish_signal`]; `None` on a coordinator no
-    /// store enabled it for, so workers keep the stat-based refresh.
-    publish_signal: std::sync::OnceLock<Option<Arc<PublishSignal>>>,
+    /// created by [`Self::enable_publish_signal`]; a coordinator with no
+    /// signal cannot enable the worker fast path.
+    publish_signal: std::sync::OnceLock<Result<Arc<PublishSignal>, (io::ErrorKind, String)>>,
 }
 
 impl JournalCoordinator {
@@ -1668,22 +1668,32 @@ impl JournalCoordinator {
     }
 
     /// Create and map the cross-process publish signal beside this
-    /// coordinator's segment. Idempotent and best-effort.
+    /// coordinator's segment. Idempotent; journal setup fails if the signal
+    /// cannot be installed, since an old mapped signal could otherwise make
+    /// workers skip refreshes after this writer starts publishing.
     ///
     /// The store that enables a journal calls this so read-only workers can
     /// sample `(epoch, visible_lsn)` with a plain atomic load instead of a
-    /// per-call `fs::metadata`. A failure (or a store that never calls it)
-    /// leaves the signal absent, and workers fall back to the stat-based
-    /// refresh — correctness never depends on the signal.
-    pub(crate) fn enable_publish_signal(&self) {
-        self.publish_signal
-            .get_or_init(|| PublishSignal::writer(&self.path).ok().map(Arc::new));
+    /// per-call `fs::metadata`. A store that never calls it leaves the signal
+    /// absent, and workers fall back to the stat-based refresh.
+    pub(crate) fn enable_publish_signal(&self) -> io::Result<()> {
+        let result = self.publish_signal.get_or_init(|| {
+            PublishSignal::writer(&self.path)
+                .map(Arc::new)
+                .map_err(|error| (error.kind(), error.to_string()))
+        });
+        result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|(kind, message)| io::Error::new(*kind, message.clone()))
     }
 
     /// The publish signal, if [`Self::enable_publish_signal`] created one.
     #[must_use]
     pub(crate) fn publish_signal(&self) -> Option<&Arc<PublishSignal>> {
-        self.publish_signal.get().and_then(Option::as_ref)
+        self.publish_signal
+            .get()
+            .and_then(|result| result.as_ref().ok())
     }
 
     /// Advance the publish signal so a gated reader rescans. Called on a group
@@ -6443,7 +6453,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open(&path).unwrap();
         let coordinator = JournalCoordinator::new(journal, &scan);
-        coordinator.enable_publish_signal();
+        coordinator.enable_publish_signal().unwrap();
         let signal = coordinator.publish_signal().expect("signal created");
         let (epoch, revision) = signal.snapshot();
 
@@ -6470,6 +6480,22 @@ mod tests {
         let _ = fs::remove_file(crate::packfile::publish_signal::PublishSignal::path_for(
             &path,
         ));
+    }
+
+    #[test]
+    fn journal_signal_setup_failure_is_reported_before_attachment() {
+        let path = temp_path("publish_signal_setup_failure");
+        let signal_path = crate::packfile::publish_signal::PublishSignal::path_for(&path);
+        let _ = fs::remove_file(&signal_path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        fs::create_dir(&signal_path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+
+        assert!(coordinator.enable_publish_signal().is_err());
+        assert!(coordinator.publish_signal().is_none());
+
+        fs::remove_dir(&signal_path).unwrap();
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

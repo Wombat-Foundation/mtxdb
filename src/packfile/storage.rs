@@ -9150,9 +9150,9 @@ impl PackfileStorage {
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
         let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
-        // Best-effort cross-process visibility signal beside the segment; a
-        // failure just leaves workers on the stat-based refresh.
-        coordinator.enable_publish_signal();
+        coordinator
+            .enable_publish_signal()
+            .map_err(StorageError::Io)?;
         *self.journal.lock() = Some(coordinator);
         Ok(())
     }
@@ -9200,7 +9200,9 @@ impl PackfileStorage {
         let coordinator = Arc::new(JournalCoordinator::with_shared_sequence(
             journal, &scan, sequence,
         ));
-        coordinator.enable_publish_signal();
+        coordinator
+            .enable_publish_signal()
+            .map_err(StorageError::Io)?;
         *self.journal.lock() = Some(coordinator);
         Ok(())
     }
@@ -9244,7 +9246,7 @@ impl PackfileStorage {
             .clone_from(&journal.recovered_groups());
         self.journal_pool.store(pool_tag(pool), Ordering::Release);
         journal.report_pool_coverage(pool, self.durable_coverage());
-        journal.enable_publish_signal();
+        journal.enable_publish_signal().map_err(StorageError::Io)?;
         *slot = Some(journal);
         Ok(())
     }
@@ -10365,6 +10367,8 @@ impl PackfileStorage {
             &self.delta_appends,
             &self.read_reloads,
             &self.read_reload_failures,
+            &self.read_refreshes,
+            &self.read_refresh_bytes,
             &self.sidecar_writes,
             &self.sync_calls,
         ] {
@@ -12185,6 +12189,7 @@ mod tests {
             )
             .unwrap();
         assert!(store.get_read_committed(&collection, &[second]).unwrap()[0].is_some());
+        assert!(store.stats().read_refresh_bytes > 0);
         assert_eq!(
             store.read_journal_stat_checks(),
             baseline + 1,
@@ -15027,12 +15032,16 @@ mod tests {
         assert_eq!(snapshot.put_many_bytes, expected_bytes);
 
         // reset_stats zeroes the runtime counters but not open_count.
+        store.read_refreshes.store(7, Ordering::Relaxed);
+        store.read_refresh_bytes.store(123, Ordering::Relaxed);
         store.reset_stats();
         let snapshot = store.stats();
         assert_eq!(snapshot.open_count, 1);
         assert_eq!(snapshot.put_many_calls, 0);
         assert_eq!(snapshot.get_calls, 0);
         assert_eq!(snapshot.get_misses, 0);
+        assert_eq!(snapshot.read_refreshes, 0);
+        assert_eq!(snapshot.read_refresh_bytes, 0);
         assert_eq!(snapshot.get_latency.calls, 0);
         assert_eq!(snapshot.get_latency.max, std::time::Duration::ZERO);
         assert_eq!(snapshot.put_many_latency.calls, 0);

@@ -41,10 +41,10 @@ pub const HEADER_LEN: usize = 4096;
 /// Byte length of a [`PackId`].
 pub const PACK_ID_LEN: usize = 16;
 
-/// Filenames carry a shortened address prefix by default (64 bits), extended
-/// with additional `_<chunk>` groups only to break a prefix collision within a
-/// pool directory. The full address is always the identity; the filename is a
-/// lossy, disambiguated lookup key.
+/// Filenames carry a shortened address prefix by default (64 bits); a colliding
+/// prefix is disambiguated with the full 128-bit address. The full address in
+/// the pack header remains authoritative. The parser also accepts legacy
+/// underscore-joined 16-hex groups, up to the full address width.
 pub const PACK_FILENAME_PREFIX_HEX: usize = 16;
 
 /// A pack's globally unique, immutable identity: 16 cryptographically random
@@ -149,17 +149,16 @@ impl PackId {
     }
 
     /// Parse an address from a filename stem (the part before `.pack`). Accepts
-    /// the compact `pack_<16hex>` form, the underscore-joined
-    /// `pack_<16hex>[_<16hex>...]` form, and the full `pack_<32hex>` collision
-    /// form, and requires at least [`PACK_FILENAME_PREFIX_HEX`] lowercase hex
-    /// digits.
+    /// the compact `pack_<16hex>` form, legacy underscore-joined groups of
+    /// 16-hex chunks up to 32 digits total, and the full `pack_<32hex>` form
+    /// emitted by [`PackId::filename_for`] on collision.
     ///
     /// Returns the parsed prefix bytes and how many hex digits were present, so
     /// callers can match against a full address's prefix.
     ///
     /// # Errors
-    /// Returns `None` if the stem is not `pack_` followed by groups of exactly
-    /// 16 lowercase hex digits (underscore-separated), or if it is the full
+    /// Returns `None` if the stem is not one of those forms, if the combined
+    /// digits exceed a full [`PACK_ID_LEN`] address, or if it is the full
     /// all-zero address (reserved, never a valid identity). A *truncated*
     /// all-zero prefix is still accepted: it can legitimately belong to a
     /// nonzero 128-bit address whose leading bits happen to be zero.
@@ -188,6 +187,9 @@ impl PackId {
         if digits.is_empty() {
             return None;
         }
+        // Cap at a full address. `filename_for` emits only a 16-hex or 32-hex
+        // name; without this a longer underscore-joined stem would parse here
+        // and then fail the prefix-agreement check downstream.
         if digits.len() > PACK_ID_LEN * 2 {
             return None;
         }
@@ -2707,6 +2709,15 @@ mod tests {
             PackId::parse_filename_prefix("pack_0000000000000000").expect("truncated prefix ok");
         assert_eq!(digits, PACK_FILENAME_PREFIX_HEX);
         assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn filename_prefix_rejects_more_than_full_address_width() {
+        assert!(PackId::parse_filename_prefix("pack_0000000000000000_0000000000000001").is_some());
+        assert!(PackId::parse_filename_prefix(
+            "pack_0000000000000000_0000000000000001_0000000000000002"
+        )
+        .is_none());
     }
 
     #[test]

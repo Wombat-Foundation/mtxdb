@@ -205,8 +205,9 @@ pub(super) struct ReadJournal {
     /// publish-signal gate skips the stat when nothing was published.
     #[cfg(test)]
     pub(super) stat_checks: u64,
-    /// Test-only total of segment bytes scanned across refreshes, to show a
-    /// retained overlay scans only what was appended.
+    /// Total segment bytes scanned across refreshes, counted into
+    /// [`PackfileStorage::read_refresh_bytes`]. A retained overlay scans only
+    /// what was appended.
     pub(super) scanned_bytes: u64,
     /// Test-only switch that makes every stamp absent, as on a platform without
     /// inode numbers, to exercise the no-identity path on unix.
@@ -572,8 +573,11 @@ impl ReadJournal {
                 reset = true;
             }
             let full_scan = self.observed_valid_len == 0;
-            #[cfg(test)]
-            let scan_from = self.observed_valid_len;
+            let mut scan_from = if full_scan {
+                0
+            } else {
+                self.observed_valid_len
+            };
             let scan = if full_scan {
                 Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
             } else {
@@ -589,6 +593,7 @@ impl ReadJournal {
                 } else {
                     self.reset_overlay();
                     reset = true;
+                    scan_from = 0;
                     Journal::scan_read_only(&self.path).map_err(StorageError::Io)?
                 }
             };
@@ -637,12 +642,9 @@ impl ReadJournal {
             }
             // Resume from the last complete group, not the raw file length, so
             // a partial tail is re-probed once its trailer lands.
-            #[cfg(test)]
-            {
-                self.scanned_bytes = self
-                    .scanned_bytes
-                    .saturating_add(scan.valid_len.saturating_sub(scan_from));
-            }
+            self.scanned_bytes = self
+                .scanned_bytes
+                .saturating_add(scan.valid_len.saturating_sub(scan_from));
             self.observed_valid_len = scan.valid_len;
             self.observed_len = len;
             self.record_observed_tail(stamp, &scan.consumed_tail);
@@ -825,10 +827,17 @@ impl PackfileStorage {
             // guard only once the overlay is applied keeps another reader from
             // observing the just-cleared state.
             let covered = overlay.covered;
-            if overlay.refresh_checked(accept_reclaimed_prefix, || {
+            // Count the full rescan this reload triggers; it is usually the
+            // most expensive one, and it bypasses `refresh_worker_overlay`.
+            let scanned_before = overlay.scanned_bytes;
+            let result = overlay.refresh_checked(accept_reclaimed_prefix, || {
                 Self::read_journal_lsn(&self.base_dir) <= covered
-            })? == ReadRefresh::Applied
-            {
+            });
+            self.read_refresh_bytes.fetch_add(
+                overlay.scanned_bytes.saturating_sub(scanned_before),
+                Ordering::Relaxed,
+            );
+            if result? == ReadRefresh::Applied {
                 return Ok(guard);
             }
             drop(guard);

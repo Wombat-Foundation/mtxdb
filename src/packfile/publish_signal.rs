@@ -2,9 +2,9 @@
 //!
 //! A read-only worker proves its journal overlay is still current by stat-ing
 //! the writer's segment on every [`get_read_committed`] call. That
-//! `fs::metadata` (plus the tail comparison it gates) dominates the per-call
-//! cost — roughly 90-113 us, on par with or worse than an indexed SQL query —
-//! even when nothing changed between back-to-back reads.
+//! `fs::metadata` (plus the tail comparison it gates) is the dominant per-call
+//! cost — roughly 4 us in release, paid even when nothing changed between
+//! back-to-back reads.
 //!
 //! The writer already knows the answer for free. It bumps a monotonic revision
 //! both when a group's commit trailer lands (`publish_groups`) and whenever a
@@ -54,7 +54,8 @@ use super::entropy;
 pub(crate) const PUBLISH_SIGNAL_FILE: &str = "read_committed.gen";
 
 /// `epoch(8) | revision(8)`.
-const SIGNAL_LEN: u64 = 16;
+const SIGNAL_LEN_BYTES: usize = 16;
+const SIGNAL_LEN: u64 = SIGNAL_LEN_BYTES as u64;
 const EPOCH_OFFSET: usize = 0;
 const REVISION_OFFSET: usize = 8;
 
@@ -126,9 +127,13 @@ impl PublishSignal {
             return Ok(None);
         }
         let mapping = map_readable(&file)?;
-        Ok(Some(Self {
+        let signal = Self {
             mapping: Mapping::ReadOnly(mapping),
-        }))
+        };
+        if signal.atomic(EPOCH_OFFSET).load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        Ok(Some(signal))
     }
 
     /// Sample `(epoch, revision)` as a consistent pair.
@@ -251,6 +256,14 @@ mod tests {
     #[test]
     fn a_reader_for_an_absent_segment_is_none() {
         let segment = temp_segment("absent");
+        assert!(PublishSignal::reader(&segment).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_fully_sized_zeroed_signal_is_rejected() {
+        let segment = temp_segment("zeroed");
+        let signal_path = PublishSignal::path_for(&segment);
+        std::fs::write(&signal_path, [0_u8; SIGNAL_LEN_BYTES]).unwrap();
         assert!(PublishSignal::reader(&segment).unwrap().is_none());
     }
 }
