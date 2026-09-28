@@ -138,18 +138,30 @@ impl PublishSignal {
 
     /// Sample `(epoch, revision)` as a consistent pair.
     ///
-    /// `revision` only increases within an epoch and `epoch` only changes on
-    /// writer restart, so reading the revision around the epoch and retrying on
-    /// a mismatch can never return a pair that mixes two epochs.
+    /// A writer restart replaces `epoch` and resets `revision` as one ordered
+    /// pair, so the pair must be sampled as a unit. Reading the epoch once
+    /// around the revision is not enough: a reader could then observe the
+    /// previous epoch together with the new incarnation's reset revision, match
+    /// the `(old epoch, 0)` pair it cached after its last refresh, and skip the
+    /// refresh a restart must force.
+    ///
+    /// Bracket the revision with two epoch loads and require them equal.
+    /// `SeqCst` places both epoch loads and the revision load in one total
+    /// order with the writer's `SeqCst` epoch-then-revision stores. If the two
+    /// epoch loads agree, no restart's epoch store can sit between them, and
+    /// neither can the revision reset that the writer orders after it: the
+    /// revision read therefore belongs to the sampled epoch. Within one epoch
+    /// `revision` only rises, so a bump racing the read at worst costs one
+    /// extra refresh on the next call, never a stale skip.
     pub(crate) fn snapshot(&self) -> (u64, u64) {
         let epoch = self.atomic(EPOCH_OFFSET);
         let revision = self.atomic(REVISION_OFFSET);
         loop {
-            let before = revision.load(Ordering::Acquire);
-            let epoch_now = epoch.load(Ordering::Acquire);
-            let after = revision.load(Ordering::Acquire);
-            if before == after {
-                return (epoch_now, before);
+            let epoch_before = epoch.load(Ordering::SeqCst);
+            let revision_now = revision.load(Ordering::SeqCst);
+            let epoch_after = epoch.load(Ordering::SeqCst);
+            if epoch_before == epoch_after {
+                return (epoch_before, revision_now);
             }
         }
     }
@@ -265,5 +277,67 @@ mod tests {
         let signal_path = PublishSignal::path_for(&segment);
         std::fs::write(&signal_path, [0_u8; SIGNAL_LEN_BYTES]).unwrap();
         assert!(PublishSignal::reader(&segment).unwrap().is_none());
+    }
+
+    /// A worker that refreshed before any publish caches `(epoch, 0)`. A
+    /// restart installs a fresh epoch and resets the revision to zero, so the
+    /// sampled pair must move to the new epoch; if it could stay on the cached
+    /// one the worker would skip the refresh a restart must force.
+    #[test]
+    fn a_reopen_invalidates_a_cached_zero_revision_pair() {
+        let segment = temp_segment("reopen_pair");
+        let writer = PublishSignal::writer(&segment).unwrap();
+        let reader = PublishSignal::reader(&segment).unwrap().unwrap();
+
+        let cached = reader.snapshot();
+        assert_eq!(cached.1, 0, "no publish yet, so the revision is zero");
+        assert_eq!(writer.snapshot(), cached);
+
+        let reopened = PublishSignal::writer(&segment).unwrap();
+        let sampled = reader.snapshot();
+        assert_ne!(
+            sampled.0, cached.0,
+            "a reopen must change the sampled epoch"
+        );
+        assert_ne!(sampled, cached, "a reopen must invalidate the cached pair");
+        assert_eq!(sampled, reopened.snapshot());
+    }
+
+    /// Stress the pair read against repeated writer reopens so a sample can
+    /// never straddle a restart into a value equal to the previous epoch's
+    /// pair. The reader must always see a nonzero epoch and, once the writer
+    /// stops, exactly the final incarnation's pair.
+    #[test]
+    fn sampling_survives_repeated_writer_reopens() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let segment = temp_segment("reopen_stress");
+        let _ = PublishSignal::writer(&segment).unwrap();
+        let reader = PublishSignal::reader(&segment).unwrap().unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reopens = {
+            let stop = Arc::clone(&stop);
+            let segment = segment.clone();
+            std::thread::spawn(move || {
+                let mut last = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let writer = PublishSignal::writer(&segment).unwrap();
+                    for _ in 0..8 {
+                        writer.bump();
+                    }
+                    last = Some(writer.snapshot());
+                }
+                last.expect("at least one reopen")
+            })
+        };
+
+        for _ in 0..100_000 {
+            assert_ne!(reader.snapshot().0, 0, "a live epoch is never zero");
+        }
+        stop.store(true, Ordering::Relaxed);
+        let final_pair = reopens.join().unwrap();
+        assert_eq!(reader.snapshot(), final_pair);
     }
 }
