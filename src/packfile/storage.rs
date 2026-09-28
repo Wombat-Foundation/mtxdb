@@ -13811,6 +13811,10 @@ mod tests {
         for entry in fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_file() {
+                // The live writer lock is not database state in a crash image.
+                if entry.file_name() == ".mtxdb.lock" {
+                    continue;
+                }
                 fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
             }
         }
