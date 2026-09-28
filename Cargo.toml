@@ -113,6 +113,19 @@ zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
 [target.'cfg(windows)'.dependencies]
 zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
+# INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
+# target so `cargo test` links a single binary for them (see that file's
+# header). Feature-gated suites keep their own target with `required-features`,
+# so the default build neither compiles nor links them.
+[[test]]
+name = "unit"
+path = "tests/unit/main.rs"
+
+[[test]]
+name = "shared_wal_processes"
+path = "tests/shared_wal_processes.rs"
+required-features = ["multi-reader"]
+
 [lints]
 workspace = true
 
