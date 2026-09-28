@@ -4160,7 +4160,7 @@ fn cmd_info_coalesced(
     deep: bool,
     explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
-    let target = classify_info_selector_explicit(cli, selector, explicit)?;
+    let (target, inventory) = classify_info_selector_with_inventory(cli, selector, explicit)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -4241,8 +4241,22 @@ fn cmd_info_coalesced(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    let Ok(files) = glob_pack_files(&dir) else {
-                        continue;
+                    let files = if let Some(locations) = inventory.as_deref() {
+                        locations
+                            .iter()
+                            .filter(|location| {
+                                location.database == *db_dir
+                                    && location.shard_type == shard_type
+                            })
+                            .map(|location| {
+                                (location.pack_id, location.file_bytes, location.version)
+                            })
+                            .collect()
+                    } else {
+                        let Ok(files) = glob_pack_files(&dir) else {
+                            continue;
+                        };
+                        files
                     };
                     let ids: Vec<PackId> = files.iter().map(|&(id, _, _)| id).collect();
                     let Ok(pack_id) = selector.resolve(ids.iter()) else {
