@@ -570,8 +570,9 @@ fn sub_info() -> Command {
                 .conflicts_with_all(["pack", "collection"])
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A `0x`-prefixed 32-hex id naming a pack or a collection, or a canonical \
-                     collection sigil such as !room:server. A 32-hex selector is inferred: it \
+                    "A `0x`-prefixed pack filename prefix (1-16 hex digits, as shown by `mtxdb \
+                     shards`), a `0x`-prefixed 32-hex id naming a pack or a collection, or a \
+                     canonical collection sigil such as !room:server. A 32-hex selector is inferred: it \
                      resolves to a pack if only a pack matches, to a collection if only a \
                      collection matches, and is an error if both match (specify --pack or \
                      --collection to disambiguate). Mutually exclusive with --pack/--collection. \
