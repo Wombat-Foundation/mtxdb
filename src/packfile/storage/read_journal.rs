@@ -189,7 +189,6 @@ pub(super) struct ReadJournal {
     pub(super) tail_reads: u64,
     /// Test-only total of segment bytes scanned across refreshes, to show a
     /// retained overlay scans only what was appended.
-    #[cfg(test)]
     pub(super) scanned_bytes: u64,
     /// Test-only switch that makes every stamp absent, as on a platform without
     /// inode numbers, to exercise the no-identity path on unix.
@@ -258,7 +257,6 @@ impl ReadJournal {
             tail_quiet: false,
             #[cfg(test)]
             tail_reads: 0,
-            #[cfg(test)]
             scanned_bytes: 0,
             #[cfg(test)]
             force_no_identity: false,
@@ -622,6 +620,19 @@ impl ReadJournal {
 }
 
 impl PackfileStorage {
+    fn refresh_worker_overlay(
+        &self,
+        overlay: &mut ReadJournal,
+    ) -> Result<ReadRefresh, StorageError> {
+        let before = overlay.scanned_bytes;
+        let result = overlay.refresh(false);
+        self.read_refresh_bytes.fetch_add(
+            overlay.scanned_bytes.saturating_sub(before),
+            Ordering::Relaxed,
+        );
+        result
+    }
+
     /// Reload the durable index from the current on-disk checkpoint and rebind
     /// [`Self::read_covered_lsn`] to it.
     ///
@@ -704,6 +715,7 @@ impl PackfileStorage {
     pub(super) fn refresh_read_journal(
         &self,
     ) -> Result<parking_lot::MutexGuard<'_, Option<ReadJournal>>, StorageError> {
+        self.read_refreshes.fetch_add(1, Ordering::Relaxed);
         const RELOAD_ATTEMPTS: usize = 8;
         const MAX_BACKOFF_MS: u64 = 64;
         // Capture coverage once, before the first attempt. Comparing the final
@@ -723,7 +735,7 @@ impl PackfileStorage {
             let Some(overlay) = guard.as_mut() else {
                 return Ok(guard);
             };
-            if overlay.refresh(false)? == ReadRefresh::Applied {
+            if self.refresh_worker_overlay(overlay)? == ReadRefresh::Applied {
                 return Ok(guard);
             }
             if !self.reload_index_from_checkpoint() {

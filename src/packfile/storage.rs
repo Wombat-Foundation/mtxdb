@@ -1936,6 +1936,10 @@ pub struct PackfileStorage {
     /// Reload attempts that could not load a checkpoint matching the current
     /// packs, so the read-committed overlay failed closed.
     read_reload_failures: AtomicU64,
+    /// Number of read-journal refresh attempts, including no-op refreshes.
+    read_refreshes: AtomicU64,
+    /// Journal bytes scanned by read-only worker refreshes.
+    read_refresh_bytes: AtomicU64,
 }
 
 /// Per-collection state for incremental repack.
@@ -2721,6 +2725,8 @@ impl PackfileStorage {
             checkpoint_tail_hook: parking_lot::Mutex::new(None),
             read_reloads: AtomicU64::new(0),
             read_reload_failures: AtomicU64::new(0),
+            read_refreshes: AtomicU64::new(0),
+            read_refresh_bytes: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -10045,6 +10051,8 @@ impl PackfileStorage {
             delta_appends: self.delta_appends.load(Ordering::Relaxed),
             read_reloads: self.read_reloads.load(Ordering::Relaxed),
             read_reload_failures: self.read_reload_failures.load(Ordering::Relaxed),
+            read_refreshes: self.read_refreshes.load(Ordering::Relaxed),
+            read_refresh_bytes: self.read_refresh_bytes.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
             get_latency: self.operation_timings.get.snapshot(),
@@ -10313,6 +10321,11 @@ pub struct RuntimeStats {
     /// Read-committed overlay reload attempts that failed to load a checkpoint
     /// matching the current packs, so the read failed closed.
     pub read_reload_failures: u64,
+    /// Read-journal refresh attempts by read-only workers, including no-op
+    /// refreshes.
+    pub read_refreshes: u64,
+    /// Journal bytes scanned by read-only worker refreshes.
+    pub read_refresh_bytes: u64,
     /// Writes of the shard→collection inspection sidecar (every one counts,
     /// whichever caller triggered it).
     pub sidecar_writes: u64,
@@ -10631,6 +10644,8 @@ impl Default for RuntimeStats {
             delta_appends: 0,
             read_reloads: 0,
             read_reload_failures: 0,
+            read_refreshes: 0,
+            read_refresh_bytes: 0,
             sidecar_writes: 0,
             sync_calls: 0,
             get_latency: OperationLatency::default(),
