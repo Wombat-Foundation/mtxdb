@@ -1,6 +1,8 @@
 mod entropy;
+
 /// Physical, on-disk layout scanning — see [`layout::physical_layout`].
 pub mod layout;
+pub(crate) mod publish_signal;
 /// The [`PackfileStorage`](storage::PackfileStorage) engine and its supporting types.
 pub mod storage;
 use std::fs::{File, OpenOptions};

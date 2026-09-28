@@ -18,6 +18,7 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::layout::ShardType;
+use crate::packfile::publish_signal::PublishSignal;
 
 use crc32fast::Hasher;
 
@@ -1575,6 +1576,10 @@ pub struct JournalCoordinator {
     commit_records: AtomicU64,
     /// Largest durable-LSN advance made by one fsync.
     max_commit_records: AtomicU64,
+    /// Cross-process `(epoch, visible_lsn)` signal beside the segment. Lazily
+    /// created by [`Self::enable_publish_signal`]; `None` on a coordinator no
+    /// store enabled it for, so workers keep the stat-based refresh.
+    publish_signal: std::sync::OnceLock<Option<Arc<PublishSignal>>>,
 }
 
 impl JournalCoordinator {
@@ -1650,6 +1655,7 @@ impl JournalCoordinator {
             commits: AtomicU64::new(0),
             commit_records: AtomicU64::new(0),
             max_commit_records: AtomicU64::new(0),
+            publish_signal: std::sync::OnceLock::new(),
         }
     }
 
@@ -1659,6 +1665,33 @@ impl JournalCoordinator {
     #[must_use]
     pub fn recovered_groups(&self) -> Vec<CommittedGroup> {
         self.recovered.clone()
+    }
+
+    /// Create and map the cross-process publish signal beside this
+    /// coordinator's segment. Idempotent and best-effort.
+    ///
+    /// The store that enables a journal calls this so read-only workers can
+    /// sample `(epoch, visible_lsn)` with a plain atomic load instead of a
+    /// per-call `fs::metadata`. A failure (or a store that never calls it)
+    /// leaves the signal absent, and workers fall back to the stat-based
+    /// refresh — correctness never depends on the signal.
+    pub(crate) fn enable_publish_signal(&self) {
+        self.publish_signal
+            .get_or_init(|| PublishSignal::writer(&self.path).ok().map(Arc::new));
+    }
+
+    /// The publish signal, if [`Self::enable_publish_signal`] created one.
+    #[must_use]
+    pub(crate) fn publish_signal(&self) -> Option<&Arc<PublishSignal>> {
+        self.publish_signal.get().and_then(Option::as_ref)
+    }
+
+    /// Advance the publish signal so a gated reader rescans. Called on a group
+    /// publication and on a reclaim, the two events a reader must notice.
+    fn bump_publish_signal(&self) {
+        if let Some(signal) = self.publish_signal() {
+            signal.bump();
+        }
     }
 
     /// Record that `pool`'s durable checkpoint has materialized every frame it
@@ -2340,6 +2373,10 @@ impl JournalCoordinator {
             .fetch_max(receipt.last_lsn, Ordering::Release);
         self.visible_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
+        // Publish the read-committed change boundary for cross-process workers
+        // at the exact point the group becomes visible, before any fsync: a
+        // reader may observe a published-but-not-yet-durable group.
+        self.bump_publish_signal();
         drop(journal);
         // Wake the committer only when a burst is at or above its early-flush
         // bound; this is the hot path, so ordinary publishes must not pay a
@@ -2919,7 +2956,13 @@ impl JournalCoordinator {
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
-        journal.reclaim_through(covered_lsn)
+        let reclaim = journal.reclaim_through(covered_lsn)?;
+        // The rewrite replaced the segment inode and moved its base LSN without
+        // necessarily publishing a group. Advance the signal so a gated reader
+        // rescans and detects the base jump instead of serving an index older
+        // than the reclaimed prefix.
+        self.bump_publish_signal();
+        Ok(reclaim)
     }
 
     /// [`Self::reclaim_through`] recording the pool whose missing coverage
@@ -2932,7 +2975,11 @@ impl JournalCoordinator {
     ) -> io::Result<Reclaim> {
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
-        journal.reclaim_through_with_blocker(covered_lsn, blocked_by)
+        let reclaim = journal.reclaim_through_with_blocker(covered_lsn, blocked_by)?;
+        // See [`Self::reclaim_through`]: a reader gated on the signal must be
+        // forced to rescan after the segment is rewritten in place.
+        self.bump_publish_signal();
+        Ok(reclaim)
     }
 }
 
@@ -6385,6 +6432,44 @@ mod tests {
         assert_eq!(scan.groups.len(), 1);
         assert_eq!(scan.groups[0].first_lsn, lsn.saturating_add(1));
         fs::remove_file(path).unwrap();
+    }
+
+    /// A reclaim publishes no group, but it does replace the segment and move
+    /// its base LSN. A gated reader watching only publishes would skip the
+    /// base-jump check, so the reclaim must advance the publish signal too.
+    #[test]
+    fn a_reclaim_advances_the_publish_signal() {
+        let path = temp_path("reclaim_publish_signal");
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        coordinator.enable_publish_signal();
+        let signal = coordinator.publish_signal().expect("signal created");
+        let (epoch, revision) = signal.snapshot();
+
+        let receipt = coordinator
+            .publish_group(&[put(1, 1, b"first")])
+            .map(|receipt| receipt.last_lsn)
+            .unwrap();
+        assert_eq!(
+            signal.snapshot(),
+            (epoch, revision.saturating_add(1)),
+            "a publish advances the revision"
+        );
+
+        coordinator.sync().unwrap();
+        coordinator.reclaim_through(receipt).unwrap();
+        assert_eq!(
+            signal.snapshot(),
+            (epoch, revision.saturating_add(2)),
+            "a reclaim advances the revision even though it publishes nothing"
+        );
+
+        drop(coordinator);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(crate::packfile::publish_signal::PublishSignal::path_for(
+            &path,
+        ));
     }
 
     #[test]

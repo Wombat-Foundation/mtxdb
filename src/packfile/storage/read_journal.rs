@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::journal::{Journal, Mutation as JournalMutation};
+use crate::packfile::publish_signal::PublishSignal;
 use crate::storage::{NodeData, NodeId, StorageError};
 
 use super::{OpenTimings, PackId, PackfileStorage, ReloadMode};
@@ -150,6 +152,18 @@ pub(super) struct ReadJournal {
     /// packfile rescan: only loading the corresponding checkpoint may advance
     /// the index/coverage pair.
     pub(super) covered: u64,
+    /// Cross-process `(epoch, visible_lsn)` signal beside the segment. `None`
+    /// for a writer's transaction overlay, for a store that never enabled one,
+    /// or when the signal file is absent; every refresh then pays the stat.
+    /// See [`PublishSignal`].
+    publish_signal: Option<Arc<PublishSignal>>,
+    /// Writer epoch and change revision sampled before the refresh that made
+    /// the overlay current. A later sample equal to this pair proves no group
+    /// was published, no reclaim replaced the segment, and no writer restart
+    /// occurred since, so the stat can be skipped. Cleared whenever the overlay
+    /// is reset, forcing a resync.
+    last_epoch: Option<u64>,
+    last_revision: Option<u64>,
     /// Raw file length at the last scan. Skips a rescan when unchanged, so an
     /// unchanged partial tail is not re-probed on every read.
     observed_len: u64,
@@ -187,6 +201,10 @@ pub(super) struct ReadJournal {
     /// Test-only count of window reads, to show the fingerprint skips them.
     #[cfg(test)]
     pub(super) tail_reads: u64,
+    /// Test-only count of refreshes that reached `fs::metadata`, to show the
+    /// publish-signal gate skips the stat when nothing was published.
+    #[cfg(test)]
+    pub(super) stat_checks: u64,
     /// Test-only total of segment bytes scanned across refreshes, to show a
     /// retained overlay scans only what was appended.
     pub(super) scanned_bytes: u64,
@@ -248,6 +266,9 @@ impl ReadJournal {
             pool,
             path,
             covered,
+            publish_signal: None,
+            last_epoch: None,
+            last_revision: None,
             observed_len: 0,
             observed_valid_len: 0,
             observed_lsn: 0,
@@ -257,6 +278,8 @@ impl ReadJournal {
             tail_quiet: false,
             #[cfg(test)]
             tail_reads: 0,
+            #[cfg(test)]
+            stat_checks: 0,
             scanned_bytes: 0,
             #[cfg(test)]
             force_no_identity: false,
@@ -285,6 +308,10 @@ impl ReadJournal {
         // Zero the length too, so an equal-length segment after a reload still
         // forces a full rescan instead of short-circuiting on `len == observed_len`.
         self.observed_len = 0;
+        // The generation described an overlay that no longer exists; the next
+        // refresh must rescan rather than trust it.
+        self.last_epoch = None;
+        self.last_revision = None;
     }
 
     /// Discard overlay state the durable index this reader loaded now covers.
@@ -507,6 +534,10 @@ impl ReadJournal {
         // `journal.lsn` fresh would prune entries the reader's stale index has
         // not incorporated yet, dropping records from both sources.
         let covered = self.covered;
+        #[cfg(test)]
+        {
+            self.stat_checks = self.stat_checks.saturating_add(1);
+        }
         let (len, stamp) = match fs::metadata(&self.path) {
             Ok(meta) => (meta.len(), file_stamp(&meta)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -624,12 +655,40 @@ impl PackfileStorage {
         &self,
         overlay: &mut ReadJournal,
     ) -> Result<ReadRefresh, StorageError> {
+        // Sample the writer's publish revision before scanning. If it equals
+        // the pair recorded by the refresh that made this overlay current, no
+        // group was published, no reclaim replaced the segment, and no writer
+        // restart occurred since, so the overlay is still current and the stat
+        // plus scan can be skipped entirely. The snapshot is taken *before* the
+        // scan and only recorded when the epoch is unchanged after it, so an
+        // event racing the scan is never folded into the revision it records.
+        let snapshot = overlay
+            .publish_signal
+            .as_ref()
+            .map(|signal| signal.snapshot());
+        if let Some((epoch, revision)) = snapshot {
+            if overlay.last_epoch == Some(epoch) && overlay.last_revision == Some(revision) {
+                return Ok(ReadRefresh::Applied);
+            }
+        }
         let before = overlay.scanned_bytes;
         let result = overlay.refresh(false);
         self.read_refresh_bytes.fetch_add(
             overlay.scanned_bytes.saturating_sub(before),
             Ordering::Relaxed,
         );
+        if matches!(result, Ok(ReadRefresh::Applied)) {
+            if let Some((epoch, revision)) = snapshot {
+                let stable = overlay
+                    .publish_signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.snapshot().0 == epoch);
+                if stable {
+                    overlay.last_epoch = Some(epoch);
+                    overlay.last_revision = Some(revision);
+                }
+            }
+        }
         result
     }
 
@@ -937,11 +996,14 @@ impl PackfileStorage {
         // whatever `journal.lsn` says now: a concurrent checkpoint may already
         // have advanced past this handle's in-memory index.
         let covered = self.read_covered_lsn.load(Ordering::Acquire);
-        *self.read_journal.lock() = Some(ReadJournal::empty(
-            path.as_ref().to_path_buf(),
-            covered,
-            pool,
-        ));
+        let segment = path.as_ref().to_path_buf();
+        // Best-effort: map the writer's publish signal beside the segment. Its
+        // absence (an older store, or a worker opened before the writer) leaves
+        // this overlay on the stat-based refresh, so correctness is unaffected.
+        let publish_signal = PublishSignal::reader(&segment).ok().flatten().map(Arc::new);
+        let mut overlay = ReadJournal::empty(segment, covered, pool);
+        overlay.publish_signal = publish_signal;
+        *self.read_journal.lock() = Some(overlay);
         if let Err(error) = self.refresh_read_journal() {
             *self.read_journal.lock() = None;
             return Err(error);

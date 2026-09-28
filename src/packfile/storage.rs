@@ -9151,7 +9151,11 @@ impl PackfileStorage {
         self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
-        *self.journal.lock() = Some(Arc::new(JournalCoordinator::new(journal, &scan)));
+        let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+        // Best-effort cross-process visibility signal beside the segment; a
+        // failure just leaves workers on the stat-based refresh.
+        coordinator.enable_publish_signal();
+        *self.journal.lock() = Some(coordinator);
         Ok(())
     }
 
@@ -9195,9 +9199,11 @@ impl PackfileStorage {
         self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
-        *self.journal.lock() = Some(Arc::new(JournalCoordinator::with_shared_sequence(
+        let coordinator = Arc::new(JournalCoordinator::with_shared_sequence(
             journal, &scan, sequence,
-        )));
+        ));
+        coordinator.enable_publish_signal();
+        *self.journal.lock() = Some(coordinator);
         Ok(())
     }
 
@@ -9240,6 +9246,7 @@ impl PackfileStorage {
             .clone_from(&journal.recovered_groups());
         self.journal_pool.store(pool_tag(pool), Ordering::Release);
         journal.report_pool_coverage(pool, self.durable_coverage());
+        journal.enable_publish_signal();
         *slot = Some(journal);
         Ok(())
     }
@@ -9421,6 +9428,16 @@ impl PackfileStorage {
     #[cfg(all(test, feature = "multi-reader"))]
     pub(crate) fn read_journal_installed(&self) -> bool {
         self.read_journal.lock().is_some()
+    }
+
+    /// Test-only: refreshes on this store's overlay that reached
+    /// `fs::metadata`, i.e. were not skipped by the publish-signal gate.
+    #[cfg(all(test, feature = "multi-reader"))]
+    pub(crate) fn read_journal_stat_checks(&self) -> u64 {
+        self.read_journal
+            .lock()
+            .as_ref()
+            .map_or(0, |overlay| overlay.stat_checks)
     }
 
     /// Total segment bytes the retained transaction overlay has scanned.
@@ -12095,6 +12112,72 @@ mod tests {
         assert_eq!(
             read_committed[0].as_ref().map(|data| data.bytes.as_ref()),
             Some(&b"second"[..])
+        );
+    }
+
+    /// The publish-signal gate: a worker whose writer published nothing since
+    /// the last refresh must skip the `fs::metadata` refresh entirely, and must
+    /// still observe the next published group. This is the zero-staleness fast
+    /// path that replaces the per-call stat.
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn read_committed_publish_signal_skips_the_stat_until_a_group_is_published() {
+        let dir = test_dir("read_committed_publish_signal");
+        let wal = dir.join("wal.bin");
+        let collection = [0x51u8; 16];
+        let first = [0x11u8; 16];
+        let second = [0x12u8; 16];
+
+        // Seed a durable shard so the read-only handle can open.
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &[0x98u8; 16],
+            &[0x98u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        // The writer opens the journal, which creates the publish signal, then
+        // publishes one group through the coordinator (the real write path).
+        let writer = PackfileStorage::open(dir.clone()).unwrap();
+        writer.enable_journal(&wal).unwrap();
+        writer
+            .put(
+                &collection,
+                &first,
+                &NodeData::new(bytes::Bytes::from_static(b"first")),
+            )
+            .unwrap();
+
+        let store = PackfileStorage::open_read_committed(dir.clone(), &wal).unwrap();
+        assert!(store.get_read_committed(&collection, &[first]).unwrap()[0].is_some());
+        let baseline = store.read_journal_stat_checks();
+
+        // No publish since the last refresh: the gate must serve the overlay
+        // without another stat.
+        assert!(store.get_read_committed(&collection, &[first]).unwrap()[0].is_some());
+        assert_eq!(
+            store.read_journal_stat_checks(),
+            baseline,
+            "an unchanged publish generation must skip the stat"
+        );
+
+        // A new group advances the generation, so the next read must rescan and
+        // observe it.
+        writer
+            .put(
+                &collection,
+                &second,
+                &NodeData::new(bytes::Bytes::from_static(b"second")),
+            )
+            .unwrap();
+        assert!(store.get_read_committed(&collection, &[second]).unwrap()[0].is_some());
+        assert_eq!(
+            store.read_journal_stat_checks(),
+            baseline + 1,
+            "a published group must force exactly one stat refresh"
         );
     }
 
