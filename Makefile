@@ -15,7 +15,7 @@ _help:
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .PHONY: all
-all: format lint doc test install
+all: format lint doc test
 
 .PHONY: format check-cargo-sort
 format: check-cargo-sort ##H Format code
