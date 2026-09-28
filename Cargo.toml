@@ -113,6 +113,11 @@ zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
 [target.'cfg(windows)'.dependencies]
 zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
+# Keep cc's transitive jobserver below the release that introduced getrandom
+# 0.4, preserving the crate's Rust 1.81 build floor during cargo update.
+[build-dependencies]
+jobserver = "=0.1.32"
+
 [lints]
 workspace = true
 
