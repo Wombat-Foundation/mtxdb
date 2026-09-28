@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["fetch_frontier_batch","fetch_frontier_sequential"],"struct":["BfsLayer","FrontierBatch"]};
