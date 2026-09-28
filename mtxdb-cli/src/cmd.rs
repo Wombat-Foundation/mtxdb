@@ -8000,6 +8000,10 @@ fn cmd_import_file(
             // `--read-plan` choice over from the event store instead of
             // silently running the default.
             auth_store.set_read_plan_policy(store.read_plan_policy());
+            // Resolve the derived adjacency records before writing any auth
+            // events, so a structural conflict rejects the import before the
+            // edges pool is mutated.
+            let edge_plan = plan_matrix_edges(&auth_store, template, &federation.auth_chain)?;
             let mut auth_count = 0u64;
             let mut auth_skipped = 0u64;
             // Auth-chain events may span multiple rooms (collections). Group
@@ -8103,7 +8107,7 @@ fn cmd_import_file(
                     auth_count = auth_count.saturating_add(to_write.len() as u64);
                 }
             }
-            persist_matrix_edges(&auth_store, template, &federation.auth_chain)?;
+            write_matrix_edges(&auth_store, edge_plan)?;
             auth_store.sync_all()?;
             eprintln!(
                 "imported {auth_count} edges events ({} dangling references)",
@@ -8290,6 +8294,20 @@ fn import_pdu_events(
             to_write.push((id_bytes, data));
         }
     }
+    // Resolve the derived adjacency records before touching the event pool. A
+    // structural conflict (same source key, different prev/auth) is thus
+    // rejected before any primary write, keeping the event and edges pools in
+    // step; a later re-import repairs any missing derived records.
+    let edge_dir = dir
+        .parent()
+        .map(|parent| parent.join("mtpl-edges"))
+        .context("deriving edges pool path")?;
+    fs::create_dir_all(&edge_dir)?;
+    let edge_store = PackfileStorage::open(edge_dir)
+        .context("opening edges store")?
+        .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
+    let edge_plan = plan_matrix_edges(&edge_store, template, events)?;
+
     // Genesis metadata precedes the batch's records, so it is the collection's
     // first frame and is durable no later than any application record. A
     // failure here aborts the batch: proceeding would write records into a
@@ -8320,15 +8338,7 @@ fn import_pdu_events(
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
-    let edge_dir = dir
-        .parent()
-        .map(|parent| parent.join("mtpl-edges"))
-        .context("deriving edges pool path")?;
-    fs::create_dir_all(&edge_dir)?;
-    let edge_store = PackfileStorage::open(edge_dir)
-        .context("opening edges store")?
-        .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
-    persist_matrix_edges(&edge_store, template, events)?;
+    write_matrix_edges(&edge_store, edge_plan)?;
     edge_store.sync_all()?;
 
     // Replayed batches still need state-group repair when the derived index is
@@ -10284,14 +10294,23 @@ const EDGE_MAGIC: &[u8] = b"EDG1";
 const EDGE_ID_BYTES: usize = 16;
 const EDGE_COUNT_BYTES: usize = 4;
 
-/// Persist one compact adjacency record per Matrix event in the edges pool.
-/// The source's 128-bit logical ID is the pack record key; the payload stores
-/// typed target IDs, not repeated source/target event-ID strings.
-fn persist_matrix_edges(
+/// Adjacency records an import would append, grouped by collection.
+type MatrixEdgePlan = Vec<([u8; 16], Vec<(NodeId, NodeData)>)>;
+
+/// Resolve the compact adjacency records an import would append for each
+/// Matrix event. The source's 128-bit logical ID is the pack record key; the
+/// payload stores typed target IDs, not repeated source/target event-ID
+/// strings.
+///
+/// Decodes and reconciles against the store without mutating it. Splitting the
+/// read/reconcile pass from the write lets an importer reject a structural
+/// conflict *before* it appends the primary event records, so a conflicting
+/// input cannot leave the event and edges pools out of step.
+fn plan_matrix_edges(
     store: &PackfileStorage,
     template: &CollectionTemplate,
     events: &[OwnedValue],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MatrixEdgePlan> {
     // Parent references contain Matrix event IDs, so a custom record identity
     // such as /sender cannot be derived for a referenced event. The checked-in
     // Matrix importer profile requires /event_id; generic templates that use
@@ -10300,7 +10319,7 @@ fn persist_matrix_edges(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
     ) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Ordered maps so the written record order is deterministic across runs
     // (`put_many` preserves caller order); a `HashMap` would randomize it.
@@ -10329,6 +10348,7 @@ fn persist_matrix_edges(
         }
     }
 
+    let mut plan = Vec::new();
     for (collection_id, records) in by_collection {
         let ids: Vec<NodeId> = records.keys().copied().collect();
         let existing = store.get_many(&collection_id, &ids)?;
@@ -10359,8 +10379,16 @@ fn persist_matrix_edges(
             }
         }
         if !to_write.is_empty() {
-            store.put_many(&collection_id, &to_write)?;
+            plan.push((collection_id, to_write));
         }
+    }
+    Ok(plan)
+}
+
+/// Append a plan from [`plan_matrix_edges`] to the edges pool.
+fn write_matrix_edges(store: &PackfileStorage, plan: MatrixEdgePlan) -> anyhow::Result<()> {
+    for (collection_id, to_write) in plan {
+        store.put_many(&collection_id, &to_write)?;
     }
     Ok(())
 }
@@ -10589,10 +10617,15 @@ fn mtx_relationships(
     if let (Some(OwnedValue::String(rel_type)), Some(OwnedValue::String(target))) =
         (relates_to.get("rel_type"), relates_to.get("event_id"))
     {
-        adjacency.related.push((
-            matrix_event_id_for_template(template, target)?,
-            format!("relates_to:{rel_type}"),
-        ));
+        let kind = format!("relates_to:{rel_type}");
+        // Related edges are best-effort and EDG1 stores the kind length as a
+        // `u16`; a user-supplied `rel_type` too long to encode is dropped
+        // rather than failing the whole import.
+        if u16::try_from(kind.len()).is_ok() {
+            adjacency
+                .related
+                .push((matrix_event_id_for_template(template, target)?, kind));
+        }
     }
     if let Some(OwnedValue::Object(reply)) = relates_to.get("m.in_reply_to") {
         if let Some(OwnedValue::String(target)) = reply.get("event_id") {
@@ -10706,12 +10739,12 @@ mod tests {
         matrix_event_id_for_template, matrix_event_node_id, matrix_room_collection_id,
         matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
         mtx_relationships, pack_identity, parse_federation_input, parse_pack_id_selector,
-        parse_pack_selectors, persist_matrix_edges, pretty_print_payload, redacted_event_bytes,
+        parse_pack_selectors, plan_matrix_edges, pretty_print_payload, redacted_event_bytes,
         resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
         template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-        verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, MtxAdjacency,
-        PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
-        STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+        verify_auth_chain_edges, write_matrix_edges, CollectionTemplate, MatrixRoomExtension,
+        MetaReport, MtxAdjacency, PackIdentity, StateGroupLoad, StateSet,
+        MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -10732,6 +10765,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::Engine;
+
+    /// Plan and append in one step, mirroring the production import paths that
+    /// keep the two phases separate for preflight.
+    fn persist_matrix_edges(
+        store: &PackfileStorage,
+        template: &CollectionTemplate,
+        events: &[OwnedValue],
+    ) -> anyhow::Result<()> {
+        let plan = plan_matrix_edges(store, template, events)?;
+        write_matrix_edges(store, plan)
+    }
 
     fn owned_value(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
@@ -13612,6 +13656,130 @@ mod tests {
         let conflict =
             owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"]}"#);
         assert!(persist_matrix_edges(&store, &template, &[conflict]).is_err());
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matrix_edges_redacted_reimport_preserves_related_edges() {
+        let root = unique_temp_dir();
+        let store = PackfileStorage::open(root.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let unredacted = owned_value(
+            r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
+        );
+        // Redaction keeps event_id, prev_events and auth_events but empties content.
+        let redacted = owned_value(
+            r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
+        );
+        let source = matrix_event_node_id("$same").unwrap();
+        let collection = template_collection_id(&template, "!a:x");
+
+        persist_matrix_edges(&store, &template, std::slice::from_ref(&unredacted)).unwrap();
+        persist_matrix_edges(&store, &template, std::slice::from_ref(&redacted))
+            .expect("a redacted re-import must not be rejected");
+
+        let stored = store.get(&collection, &source).unwrap().unwrap();
+        assert_eq!(
+            decode_mtx_adjacency(&stored.bytes).unwrap().related,
+            vec![(
+                matrix_event_node_id("$target").unwrap(),
+                "relates_to:m.reference".to_owned()
+            )],
+            "the stored related edge must survive a redacted re-import"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matrix_edges_mixed_redacted_and_unredacted_duplicates_union_related() {
+        let root = unique_temp_dir();
+        let store = PackfileStorage::open(root.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let redacted = owned_value(
+            r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
+        );
+        let unredacted = owned_value(
+            r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
+        );
+        let source = matrix_event_node_id("$same").unwrap();
+        let collection = template_collection_id(&template, "!a:x");
+
+        // The redacted copy is seen first; the later unredacted duplicate must
+        // union its related edge rather than be rejected as a conflict.
+        persist_matrix_edges(&store, &template, &[redacted, unredacted]).unwrap();
+
+        let stored = store.get(&collection, &source).unwrap().unwrap();
+        assert_eq!(
+            decode_mtx_adjacency(&stored.bytes).unwrap().related,
+            vec![(
+                matrix_event_node_id("$target").unwrap(),
+                "relates_to:m.reference".to_owned()
+            )],
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matrix_edge_preflight_rejects_conflict_without_writing() {
+        let root = unique_temp_dir();
+        let store = PackfileStorage::open(root.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let original = owned_value(
+            r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
+        );
+        let conflicting = owned_value(
+            r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"],"auth_events":["$auth"],"content":{}}"#,
+        );
+        let source = matrix_event_node_id("$same").unwrap();
+        let collection = template_collection_id(&template, "!a:x");
+
+        persist_matrix_edges(&store, &template, std::slice::from_ref(&original)).unwrap();
+        let before = store.get(&collection, &source).unwrap().unwrap();
+
+        let error = plan_matrix_edges(&store, &template, &[conflicting])
+            .expect_err("a differing prev edge must be rejected during planning");
+        assert!(
+            error.to_string().contains("conflicting prev/auth"),
+            "saw: {error}"
+        );
+
+        let after = store.get(&collection, &source).unwrap().unwrap();
+        assert_eq!(
+            after.bytes, before.bytes,
+            "planning must not mutate the store when it rejects a conflict"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matrix_edges_drop_unrepresentable_relation_kind() {
+        let root = unique_temp_dir();
+        let store = PackfileStorage::open(root.clone()).unwrap();
+        let template = default_matrix_import_template();
+        // A `rel_type` long enough that `relates_to:<rel_type>` cannot fit the
+        // `u16` kind length EDG1 stores.
+        let long_rel_type = "x".repeat(usize::from(u16::MAX));
+        let event = owned_value(&format!(
+            r#"{{"event_id":"$same","room_id":"!a:x","content":{{"m.relates_to":{{"rel_type":"{long_rel_type}","event_id":"$target"}}}}}}"#
+        ));
+        let source = matrix_event_node_id("$same").unwrap();
+        let collection = template_collection_id(&template, "!a:x");
+
+        persist_matrix_edges(&store, &template, std::slice::from_ref(&event))
+            .expect("an unrepresentable related edge must be dropped, not fail the import");
+        let stored = store.get(&collection, &source).unwrap().unwrap();
+        assert!(decode_mtx_adjacency(&stored.bytes)
+            .unwrap()
+            .related
+            .is_empty());
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);
