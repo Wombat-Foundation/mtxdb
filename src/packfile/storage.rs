@@ -3956,6 +3956,14 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
     ) -> Result<CollectionScan<'_>, StorageError> {
+        // Puts update a non-mmap index in place without replacing its
+        // generation. Serialize snapshot construction with those updates so
+        // every locator we resolve belongs to the captured pack-length
+        // boundary. The guard is released before the lazy iterator is
+        // returned, so draining the scan does not block later puts.
+        let put_lock = self.put_mutex(collection_id);
+        let _put_guard = put_lock.lock();
+
         // Snapshot the read-committed overlay once: committed-but-unflushed
         // puts, plus the per-collection delete boundary a reader's stale index
         // may not yet cover.
