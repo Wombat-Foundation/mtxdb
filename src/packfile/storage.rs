@@ -4047,15 +4047,13 @@ impl PackfileStorage {
                 continue;
             }
 
-            for (id, data) in &overlay_puts {
-                let position = work.iter().position(
-                    |item| matches!(item, ScanWork::Locators(work_id, _) if work_id == id),
-                );
-                match position {
-                    Some(position) => work[position] = ScanWork::Data(*id, data.clone()),
-                    None => work.push(ScanWork::Data(*id, data.clone())),
-                }
-            }
+            // Durable keys shadowed by the overlay were skipped above, so each
+            // overlay put is appended once.
+            work.extend(
+                overlay_puts
+                    .iter()
+                    .map(|(id, data)| ScanWork::Data(*id, data.clone())),
+            );
 
             return Ok(CollectionScan {
                 store: self,

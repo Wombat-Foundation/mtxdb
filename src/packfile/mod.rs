@@ -188,6 +188,9 @@ impl PackId {
         if digits.is_empty() {
             return None;
         }
+        if digits.len() > PACK_ID_LEN * 2 {
+            return None;
+        }
         let byte_len = digits.len() / 2;
         let mut bytes = vec![0u8; byte_len];
         for (index, chunk) in digits.as_bytes().chunks_exact(2).enumerate() {

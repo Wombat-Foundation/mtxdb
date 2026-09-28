@@ -5399,9 +5399,10 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
             let dir = pool_dir(&db_layout, shard_type)?;
             let all = glob_pack_files(&dir)?;
             let ids: Vec<PackId> = all.iter().map(|&(id, _, _)| id).collect();
-            let Ok(pack_id) = selector.resolve(ids.iter()) else {
+            if !ids.iter().any(|id| selector.matches(id)) {
                 continue;
-            };
+            }
+            let pack_id = selector.resolve(ids.iter())?;
             let shard_entries: Vec<(PackId, u64, u8)> = all
                 .into_iter()
                 .filter(|&(id, _, _)| id == pack_id)
