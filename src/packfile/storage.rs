@@ -1844,7 +1844,7 @@ pub struct PackfileStorage {
     delta_invalidations: AtomicU64,
     /// `sync`/`sync_all` calls.
     sync_calls: AtomicU64,
-    /// Syncs that rewrote the index checkpoint in full.
+    /// Syncs and forced checkpoints that rewrote the index checkpoint in full.
     checkpoint_writes: AtomicU64,
     /// Background checkpoint tails started (one per detached checkpoint).
     checkpoint_tails_started: AtomicU64,
@@ -4720,17 +4720,21 @@ impl PackfileStorage {
     /// flag is cleared only when nothing after this rewrite's snapshot is
     /// left unpersisted (see the lock re-acquisition below), so a transient
     /// failure or a racing write defers rather than drops the update.
-    fn persist_index_checkpoint(&self) -> Result<(), StorageError> {
+    ///
+    /// Returns `true` when a checkpoint was written, `false` when nothing was
+    /// dirty to persist — callers that count writes must gate on this, since a
+    /// concurrent sync can consume the dirty flag first.
+    fn persist_index_checkpoint(&self) -> Result<bool, StorageError> {
         // A synchronous checkpoint never overlaps a worker's.
         self.finish_checkpoint_worker(true);
         let Some(captured) = self.capture_checkpoint()? else {
-            return Ok(());
+            return Ok(false);
         };
         let CapturedCheckpoint { tail, breakdown } = captured;
         match tail.run() {
             Ok(done) => {
                 self.record_checkpoint(breakdown, &done);
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 self.abandon_checkpoint();
@@ -8979,7 +8983,7 @@ impl PackfileStorage {
             .shards
             .sync_dirty()
             .map_err(StorageError::Io)
-            .and_then(|()| self.persist_index_checkpoint())
+            .and_then(|()| self.persist_index_checkpoint().map(|_| ()))
         {
             Ok(()) => error,
             Err(boundary_error) => boundary_error,
@@ -9056,7 +9060,19 @@ impl PackfileStorage {
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
         let _persist_guard = self.index_persist_lock.lock();
-        self.persist_index_checkpoint()
+        let wrote = self.persist_index_checkpoint()?;
+        // A forced rewrite is a full checkpoint like a sync's, but it never
+        // passes through `sync`/`sync_all`, so `count_sync_persistence` cannot
+        // see it. Without this, a pool touched only by WAL-reclaim
+        // remediation reports zero checkpoint writes despite rewriting its
+        // checkpoint. A sync can win `index_persist_lock` between the dirty
+        // store above and this lock and consume the flag, writing and counting
+        // the checkpoint through its own accounting; count only when this call
+        // actually wrote one, or the metric would double-count.
+        if wrote {
+            self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Checkpoint to unblock WAL reclaim, detaching the tail when the
@@ -9088,7 +9104,16 @@ impl PackfileStorage {
             return Ok(());
         }
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-        self.start_checkpoint_worker()
+        self.start_checkpoint_worker()?;
+        // A forced rewrite is a full checkpoint like a sync's, but it never
+        // passes through `sync`/`sync_all`, so `count_sync_persistence` cannot
+        // see it. Count it at hand-off, matching that barrier accounting (which
+        // counts a backgrounded sync checkpoint at capture, not at tail
+        // completion). Without this, a pool touched only by WAL-reclaim
+        // remediation reports zero checkpoint writes when background
+        // checkpointing is on and one when it is off.
+        self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Bound how often a structurally-needed full checkpoint rewrite may run.
@@ -10513,7 +10538,9 @@ pub struct RuntimeStats {
     /// Collection structural changes that promote pending slots to snapshot or
     /// tombstone operations; this does not imply a checkpoint rewrite.
     pub delta_invalidations: u64,
-    /// Syncs that rewrote the index checkpoint in full.
+    /// Syncs that rewrote the index checkpoint in full, plus forced ones
+    /// (`force_index_checkpoint`, e.g. WAL-reclaim remediation on the BG=0
+    /// path) that never pass through `sync`/`sync_all`.
     pub checkpoint_writes: u64,
     /// Background checkpoint tails started (one per detached checkpoint).
     pub checkpoint_tails_started: u64,
@@ -12038,6 +12065,67 @@ mod tests {
             forced.covered_lsn, committed,
             "force must advance coverage to the committed journal tail"
         );
+    }
+
+    #[test]
+    fn detached_force_checkpoint_counts_like_the_synchronous_fallback() {
+        let dir = test_dir("detached_force_checkpoint_metric");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(dir.join("wal.bin")).unwrap();
+
+        // Background off: the detached call falls back to the synchronous path,
+        // which counts the write it performed.
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0x22; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"y")),
+            )
+            .unwrap();
+        let before = store.stats().checkpoint_writes;
+        store.force_index_checkpoint_detached().unwrap();
+        assert_eq!(store.stats().checkpoint_writes - before, 1);
+
+        // Background on: the tail runs detached, but the write must still be
+        // counted so the reported total does not depend on that setting.
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0x23; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"z")),
+            )
+            .unwrap();
+        store.set_background_checkpoint(true);
+        let before = store.stats().checkpoint_writes;
+        store.force_index_checkpoint_detached().unwrap();
+        store.wait_for_checkpoint();
+        assert_eq!(
+            store.stats().checkpoint_writes - before,
+            1,
+            "a detached forced checkpoint must count like the synchronous one"
+        );
+    }
+
+    #[test]
+    fn persist_index_checkpoint_reports_whether_it_wrote() {
+        let dir = test_dir("persist_checkpoint_reports_write");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // A fresh store opens structurally invalidated, so the first checkpoint
+        // writes; a second with nothing dirty must report that no write
+        // happened (a concurrent sync may have consumed the dirty flag first).
+        assert!(store.persist_index_checkpoint().unwrap());
+        assert!(!store.persist_index_checkpoint().unwrap());
+
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0x24; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"w")),
+            )
+            .unwrap();
+        assert!(store.persist_index_checkpoint().unwrap());
+        assert!(!store.persist_index_checkpoint().unwrap());
     }
 
     #[cfg(feature = "multi-reader")]
@@ -14365,9 +14453,12 @@ mod tests {
 
         // Run the full-checkpoint path as a sync would, but without the
         // barrier that would advance `committed_lsn` past the pending put.
-        store
-            .persist_index_checkpoint()
-            .expect("checkpoint must succeed");
+        assert!(
+            store
+                .persist_index_checkpoint()
+                .expect("checkpoint must succeed"),
+            "a dirty store must write a checkpoint"
+        );
 
         let covered = PackfileStorage::read_journal_lsn(&dir);
         assert_eq!(
