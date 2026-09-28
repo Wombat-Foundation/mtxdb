@@ -715,9 +715,9 @@ impl PackfileStorage {
     pub(super) fn refresh_read_journal(
         &self,
     ) -> Result<parking_lot::MutexGuard<'_, Option<ReadJournal>>, StorageError> {
-        self.read_refreshes.fetch_add(1, Ordering::Relaxed);
         const RELOAD_ATTEMPTS: usize = 8;
         const MAX_BACKOFF_MS: u64 = 64;
+        self.read_refreshes.fetch_add(1, Ordering::Relaxed);
         // Capture coverage once, before the first attempt. Comparing the final
         // value against a per-iteration snapshot would only detect coverage that
         // advanced on the *last* attempt, misreporting a moving checkpoint as a
