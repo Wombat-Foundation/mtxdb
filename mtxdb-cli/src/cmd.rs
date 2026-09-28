@@ -10701,15 +10701,15 @@ mod tests {
         extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_canonical_display,
         format_id, glob_pack_files, import_pdu_events, interleaving_worth_noting,
         listing_shard_types, load_state_groups, matrix_batch_has_create,
-        matrix_event_id_for_template, matrix_event_node_id, mtx_relationships,
-        matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints,
-        meta_lock_line, meta_pools, meta_raw, pack_identity, parse_federation_input,
-        parse_pack_id_selector, parse_pack_selectors, persist_matrix_edges, pretty_print_payload,
-        redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-        split_canonical_display, template_collection_id, template_node_id, topological_event_order,
-        valid_state_group_id, verify_auth_chain_edges, CollectionTemplate, MtxAdjacency,
-        MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
-        MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+        matrix_event_id_for_template, matrix_event_node_id, matrix_room_collection_id,
+        matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
+        mtx_relationships, pack_identity, parse_federation_input, parse_pack_id_selector,
+        parse_pack_selectors, persist_matrix_edges, pretty_print_payload, redacted_event_bytes,
+        resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
+        template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
+        verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, MtxAdjacency,
+        PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+        STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
     };
     use crate::{Cli, Commands};
     use bytes::Bytes;
@@ -13599,10 +13599,7 @@ mod tests {
         persist_matrix_edges(&store, &template, &[event_c]).unwrap();
         let updated = store.get(&collection, &source).unwrap().unwrap();
         assert_eq!(
-            decode_mtx_adjacency(&updated.bytes)
-                .unwrap()
-                .related
-                .len(),
+            decode_mtx_adjacency(&updated.bytes).unwrap().related.len(),
             3
         );
 
