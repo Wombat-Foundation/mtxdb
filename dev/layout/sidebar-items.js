@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["ShardType"],"struct":["DatabaseLayout"]};
+window.SIDEBAR_ITEMS = {"constant":["DB_META_FILENAME"],"enum":["ShardType"],"fn":["enclosing_root","is_database_root"],"struct":["DatabaseLayout"]};

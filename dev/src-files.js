@@ -1,2 +1,2 @@
-createSrcSidebar('[["mtxdb",["",[["cache",[],["mod.rs"]],["csr",[],["mod.rs"]],["dag",[],["mod.rs"]],["index",[],["checkpoint.rs","delta.rs","format.rs","mod.rs"]],["packfile",[],["layout.rs","mod.rs","storage.rs"]]],["auxiliary.rs","frontier.rs","journal.rs","layout.rs","lib.rs","matrix_policy.rs","shard.rs","storage.rs","template.rs"]]]]');
-//{"start":19,"fragment_lengths":[321]}
+createSrcSidebar('[["mtxdb",["",[["cache",[],["mod.rs"]],["csr",[],["mod.rs"]],["dag",[],["mod.rs"]],["index",[],["checkpoint.rs","delta.rs","format.rs","mod.rs","redo.rs"]],["packfile",[["storage",[],["read_journal.rs"]]],["layout.rs","mod.rs","storage.rs"]]],["auxiliary.rs","frontier.rs","journal.rs","layout.rs","lib.rs","matrix_policy.rs","shard.rs","storage.rs","template.rs"]]]]');
+//{"start":19,"fragment_lengths":[365]}
