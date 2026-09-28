@@ -35,8 +35,9 @@
 //! native-endian atomics. `epoch` is regenerated from OS entropy every time a
 //! coordinator opens the segment, so a writer restart that discards a
 //! visible-but-undurable group can never leave a worker holding a generation
-//! that a later incarnation reissues: the epoch alone forces a resync. Within
-//! one epoch `revision` only ever increases.
+//! that a later incarnation reissues: the epoch alone forces a resync. The
+//! `revision` is preserved across opens and only ever increases, so a pair a
+//! reader sampled never recurs.
 //!
 //! The file is purely a cache-invalidation hint. Its absence (an older store,
 //! or a worker that opened before the writer) disables the fast path and the
@@ -86,8 +87,9 @@ impl PublishSignal {
     ///
     /// Regenerating the epoch on every open is what makes a restart safe: a
     /// worker that recorded the previous incarnation's epoch always observes a
-    /// different value and resyncs, even if the recovered `visible_lsn` happens
-    /// to equal the one it last saw.
+    /// different value and resyncs. The revision is deliberately preserved
+    /// across opens, so a new epoch can never be paired with a revision value
+    /// that the new writer will later reissue.
     pub(crate) fn writer(segment: &Path) -> io::Result<Self> {
         let path = Self::path_for(segment);
         let file = OpenOptions::new()
@@ -110,7 +112,6 @@ impl PublishSignal {
         // mistaken for a valid generation.
         let epoch = u64::from_le_bytes(epoch) | 1;
         signal.atomic(EPOCH_OFFSET).store(epoch, Ordering::SeqCst);
-        signal.atomic(REVISION_OFFSET).store(0, Ordering::SeqCst);
         Ok(signal)
     }
 
@@ -138,21 +139,18 @@ impl PublishSignal {
 
     /// Sample `(epoch, revision)` as a consistent pair.
     ///
-    /// A writer restart replaces `epoch` and resets `revision` as one ordered
-    /// pair, so the pair must be sampled as a unit. Reading the epoch once
-    /// around the revision is not enough: a reader could then observe the
-    /// previous epoch together with the new incarnation's reset revision, match
-    /// the `(old epoch, 0)` pair it cached after its last refresh, and skip the
-    /// refresh a restart must force.
+    /// A writer restart changes `epoch` while leaving the monotonically
+    /// increasing `revision` untouched, so the pair must be sampled as a unit.
+    /// Reading the epoch once around the revision is not enough: a reader could
+    /// otherwise observe an epoch from one incarnation and a revision from
+    /// another.
     ///
     /// Bracket the revision with two epoch loads and require them equal.
     /// `SeqCst` places both epoch loads and the revision load in one total
-    /// order with the writer's `SeqCst` epoch-then-revision stores. If the two
-    /// epoch loads agree, no restart's epoch store can sit between them, and
-    /// neither can the revision reset that the writer orders after it: the
-    /// revision read therefore belongs to the sampled epoch. Within one epoch
-    /// `revision` only rises, so a bump racing the read at worst costs one
-    /// extra refresh on the next call, never a stale skip.
+    /// order with the writer's epoch store. If the two epoch loads agree, no
+    /// restart's epoch store can sit between them. Since the revision is never
+    /// reset and only rises, a bump racing the read at worst costs one extra
+    /// refresh on the next call, never a stale skip.
     pub(crate) fn snapshot(&self) -> (u64, u64) {
         let epoch = self.atomic(EPOCH_OFFSET);
         let revision = self.atomic(REVISION_OFFSET);
@@ -265,12 +263,14 @@ mod tests {
             "a reader must observe exactly the writer's bumps"
         );
 
-        // A re-opened writer is a new incarnation: fresh epoch, revision reset.
+        // A re-opened writer is a new incarnation: fresh epoch, preserved revision.
         let reopened = PublishSignal::writer(&segment).unwrap();
         let (epoch_new, revision_new) = reader.snapshot();
         assert_ne!(epoch_new, epoch, "a reopen must install a new epoch");
-        assert_eq!(revision_new, 0);
+        assert_eq!(revision_new, revision_after);
         assert_eq!(reopened.snapshot(), (epoch_new, revision_new));
+        reopened.bump();
+        assert_eq!(reader.snapshot(), (epoch_new, revision_new + 1));
     }
 
     #[test]
@@ -287,18 +287,17 @@ mod tests {
         assert!(PublishSignal::reader(&segment).unwrap().is_none());
     }
 
-    /// A worker that refreshed before any publish caches `(epoch, 0)`. A
-    /// restart installs a fresh epoch and resets the revision to zero, so the
-    /// sampled pair must move to the new epoch; if it could stay on the cached
-    /// one the worker would skip the refresh a restart must force.
+    /// A worker may sample the new epoch before the writer has completed its
+    /// setup. Preserving the revision across reopens prevents the new writer
+    /// from later reissuing that sampled pair after publishing groups.
     #[test]
-    fn a_reopen_invalidates_a_cached_zero_revision_pair() {
+    fn a_reopen_invalidates_a_cached_pair_without_reissuing_revision() {
         let segment = temp_segment("reopen_pair");
         let writer = PublishSignal::writer(&segment).unwrap();
         let reader = PublishSignal::reader(&segment).unwrap().unwrap();
 
+        writer.bump();
         let cached = reader.snapshot();
-        assert_eq!(cached.1, 0, "no publish yet, so the revision is zero");
         assert_eq!(writer.snapshot(), cached);
 
         let reopened = PublishSignal::writer(&segment).unwrap();
@@ -308,7 +307,15 @@ mod tests {
             "a reopen must change the sampled epoch"
         );
         assert_ne!(sampled, cached, "a reopen must invalidate the cached pair");
+        assert_eq!(sampled.1, cached.1, "reopen preserves revision");
         assert_eq!(sampled, reopened.snapshot());
+
+        reopened.bump();
+        assert_ne!(
+            reader.snapshot(),
+            sampled,
+            "a publish cannot reissue the pair"
+        );
     }
 
     /// Stress the pair read against repeated writer reopens so a sample can
