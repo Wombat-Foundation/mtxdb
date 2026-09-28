@@ -15,6 +15,15 @@ authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "cli"]
 categories = ["database", "cli"]
 readme = "../README.md"
+# Test code is not part of the published surface. The extracted unit-test
+# module lives beside its source as `src/test_*.rs`, and integration tests
+# under `tests/`; exclude both from the packaged archive. Local `cargo test`
+# still compiles them through the out-of-line `mod tests;` declaration.
+exclude = [
+    "tests/",
+    "src/test_*.rs",
+    "src/**/test_*.rs",
+]
 
 # Standalone workspace root, like benches/: the parent `[workspace]`
 # must not include this crate, or its edition-2024 deps would raise the

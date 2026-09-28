@@ -16,6 +16,34 @@ license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "storage"]
+# Test code is not part of the published surface. Extracted unit-test modules
+# live beside their sources as `src/**/test_*.rs`, and integration tests under
+# `tests/`; exclude both from the packaged archive. Local `cargo test` still
+# compiles them through the out-of-line `mod tests;` declarations.
+exclude = [
+    "tests/",
+    "src/test_*.rs",
+    "src/**/test_*.rs",
+    "scripts/",
+    "pyproject.toml",
+    "rust-toolchain.toml",
+    "docs/",
+    "Makefile",
+    ".gitignore",
+    ".gitmodules",
+    ".jscpd.json",
+    ".pre-commit-config.yaml",
+    ".prettierignore",
+    ".prettierrc",
+    ".rgignore",
+    ".typos.toml",
+    ".github",
+    ".editorconfig",
+    ".env.template",
+    ".envrc",
+    ".gitconfig",
+    ".cargo",
+]
 
 [workspace]
 resolver = "2"
