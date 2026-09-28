@@ -9430,6 +9430,18 @@ impl PackfileStorage {
         self.read_journal.lock().is_some()
     }
 
+    /// Whether the read-journal overlay mapped the cross-process publish
+    /// signal. `false` means reads remain correct but use the stat-based
+    /// refresh path, either because no reader overlay is installed or the
+    /// signal sidecar was unavailable when the overlay opened.
+    #[must_use]
+    pub fn read_journal_publish_signal_active(&self) -> bool {
+        self.read_journal
+            .lock()
+            .as_ref()
+            .is_some_and(ReadJournal::publish_signal_active)
+    }
+
     /// Test-only: refreshes on this store's overlay that reached
     /// `fs::metadata`, i.e. were not skipped by the publish-signal gate.
     #[cfg(all(test, feature = "multi-reader"))]
@@ -12152,6 +12164,7 @@ mod tests {
             .unwrap();
 
         let store = PackfileStorage::open_read_committed(dir.clone(), &wal).unwrap();
+        assert!(store.read_journal_publish_signal_active());
         assert!(store.get_read_committed(&collection, &[first]).unwrap()[0].is_some());
         let baseline = store.read_journal_stat_checks();
 

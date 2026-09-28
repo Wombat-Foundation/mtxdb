@@ -257,6 +257,10 @@ impl Drop for FallbackReadGuard {
 }
 
 impl ReadJournal {
+    pub(super) fn publish_signal_active(&self) -> bool {
+        self.publish_signal.is_some()
+    }
+
     pub(super) fn empty(
         path: PathBuf,
         covered: u64,
