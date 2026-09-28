@@ -61,11 +61,9 @@ doc: ##H Build docs
 # Test & bench
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Optional Cargo profile for `make test` / `make cov`. Empty means Cargo's own
-# default; local `.env` may set it (e.g. dev-quick). The flag is only emitted
-# when the variable is non-empty — an unset `--profile` makes Cargo consume the
-# next argument (here `-p`) as its value and fail with a bogus subcommand.
-MTXDB_TEST_PROFILE ?=
+# Cargo profile for `make test` / `make cov`. Defaults to Cargo's test profile;
+# local `.env` may override it (e.g. dev-quick).
+MTXDB_TEST_PROFILE ?= test
 ifneq ($(strip $(MTXDB_TEST_PROFILE)),)
 MTXDB_TEST_PROFILE_FLAG := --profile $(MTXDB_TEST_PROFILE)
 endif

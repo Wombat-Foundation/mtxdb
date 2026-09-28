@@ -2198,6 +2198,14 @@ mod tests {
                 if entry.file_type().unwrap().is_dir() {
                     copy_tree(&entry.path(), &target);
                 } else {
+                    // Writer lock files are live byte-range locked handles on
+                    // Windows and are not part of a crash image.
+                    if matches!(
+                        entry.file_name().to_str(),
+                        Some(".mtxdb.lock" | ".mtxdb.wal.lock")
+                    ) {
+                        continue;
+                    }
                     std::fs::copy(entry.path(), &target).unwrap();
                 }
             }
@@ -2442,7 +2450,7 @@ mod tests {
             coordinator.segment_len() < before,
             "both pools have reported, so the segment shrinks"
         );
-        assert!(coordinator.reclaim_blockers().is_empty());
+        assert_eq!(coordinator.reclaim_blockers(), Vec::<ShardType>::new());
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -346,11 +346,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             stats,
         } => {
             if let Some(pack) = pack {
-                cmd_info(cli, pack, Some(InfoTarget::Pack))
+                cmd_info(cli, pack, Some(InfoTarget::Pack), *stats)
             } else if let Some(collection) = collection {
-                cmd_info(cli, collection, Some(InfoTarget::Collection))
+                cmd_info(cli, collection, Some(InfoTarget::Collection), *stats)
             } else if let Some(selector) = selector {
-                cmd_info(cli, selector, None)
+                cmd_info(cli, selector, None, *stats)
             } else {
                 cmd_info_default(cli, *stats)
             }
@@ -4140,9 +4140,9 @@ fn classify_info_selector_explicit(
 fn cmd_info_coalesced(
     cli: &Cli,
     selector: &str,
+    deep: bool,
     explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
-    let deep = matches!(cli.command, Commands::Info { stats: true, .. });
     let target = classify_info_selector_explicit(cli, selector, explicit)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
@@ -5204,15 +5204,24 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_info(cli: &Cli, selector: &str, explicit: Option<InfoTarget>) -> anyhow::Result<()> {
+fn cmd_info(
+    cli: &Cli,
+    selector: &str,
+    explicit: Option<InfoTarget>,
+    deep: bool,
+) -> anyhow::Result<()> {
     if cli.coalesce {
-        return cmd_info_coalesced(cli, selector, explicit);
+        return cmd_info_coalesced(cli, selector, deep, explicit);
     }
-    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector, explicit))
+    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector, deep, explicit))
 }
 
-fn cmd_info_single(cli: &Cli, selector: &str, explicit: Option<InfoTarget>) -> anyhow::Result<()> {
-    let deep = matches!(cli.command, Commands::Info { stats: true, .. });
+fn cmd_info_single(
+    cli: &Cli,
+    selector: &str,
+    deep: bool,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<()> {
     match classify_info_selector_explicit(cli, selector, explicit)? {
         InfoTarget::Pack => cmd_info_pack(cli, selector),
         InfoTarget::Collection => cmd_info_collection(cli, selector, deep),
@@ -11322,9 +11331,15 @@ mod tests {
                 stats: false,
             },
         };
-        let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63", None).unwrap_err();
+        let doubled = cmd_info(
+            &cli,
+            "0x0x144ACE34F53560B728FA9E33DD3FEF63",
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(doubled.to_string().contains("doubled"), "{doubled}");
-        let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF", None).unwrap_err();
+        let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF", None, false).unwrap_err();
         assert!(short.to_string().contains("found 30 characters"), "{short}");
     }
 
@@ -12224,7 +12239,7 @@ mod tests {
             },
         };
 
-        cmd_info(&cli, &col_hex, None).unwrap();
+        cmd_info(&cli, &col_hex, None, false).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -14760,7 +14775,7 @@ mod tests {
                 stats: false,
             },
         };
-        cmd_info(&cli_info, &format_id(&col1), None).unwrap();
+        cmd_info(&cli_info, &format_id(&col1), None, false).unwrap();
 
         let cli_scan = Cli {
             dirs: vec![dir1.clone(), dir2.clone()],

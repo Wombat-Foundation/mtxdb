@@ -490,12 +490,21 @@ impl ReadJournal {
     /// checkpoint-bound index to the writer's latest durable coverage for this
     /// pool. On a shared segment a base jump beyond that coverage can only be
     /// other pools' reclaimed frames, which this pool does not need, so the
-    /// jump is accepted instead of forcing another reload.
+    /// jump is accepted instead of forcing another reload, provided the
+    /// writer's durable LSN has not advanced past that coverage during scan.
     ///
     /// Returns [`ReadRefresh::NeedsReload`] when a reset reveals the writer
     /// reclaimed past this reader's incorporated coverage; the caller must
     /// reload the checkpoint-bound index and rebind `covered` before retrying.
     fn refresh(&mut self, accept_reclaimed_prefix: bool) -> Result<ReadRefresh, StorageError> {
+        self.refresh_checked(accept_reclaimed_prefix, || true)
+    }
+
+    fn refresh_checked(
+        &mut self,
+        accept_reclaimed_prefix: bool,
+        still_covered: impl FnOnce() -> bool,
+    ) -> Result<ReadRefresh, StorageError> {
         // Coverage is fixed to the index this reader loaded. Reading
         // `journal.lsn` fresh would prune entries the reader's stale index has
         // not incorporated yet, dropping records from both sources.
@@ -555,8 +564,8 @@ impl ReadJournal {
             // this, a reload that rebinds `covered` below the segment base
             // would silently serve a hole.
             if (reset || full_scan)
-                && !accept_reclaimed_prefix
                 && self.reset_has_coverage_gap(&scan)
+                && (!accept_reclaimed_prefix || !still_covered())
             {
                 return Ok(ReadRefresh::NeedsReload);
             }
@@ -740,7 +749,11 @@ impl PackfileStorage {
             // Rebuild immediately while still holding the guard: returning the
             // guard only once the overlay is applied keeps another reader from
             // observing the just-cleared state.
-            if overlay.refresh(accept_reclaimed_prefix)? == ReadRefresh::Applied {
+            let covered = overlay.covered;
+            if overlay.refresh_checked(accept_reclaimed_prefix, || {
+                Self::read_journal_lsn(&self.base_dir) <= covered
+            })? == ReadRefresh::Applied
+            {
                 return Ok(guard);
             }
             drop(guard);
@@ -1091,7 +1104,8 @@ mod tests {
     }
 
     /// A file that has been quiet longer than the timestamp granularity is
-    /// trusted on an unchanged fingerprint: repeated refreshes read nothing.
+    /// trusted on an unchanged fingerprint. Platforms without file identity
+    /// exercise the content-comparison fallback on every refresh.
     #[test]
     fn an_unchanged_quiet_file_is_not_re_read() {
         let wal = temp_wal("quiet_skip");
@@ -1104,23 +1118,26 @@ mod tests {
         for _ in 0..50 {
             assert!(matches!(overlay.refresh(true), Ok(ReadRefresh::Applied)));
         }
-        assert_eq!(
-            overlay.tail_reads, 0,
-            "an unchanged quiet file needs no read"
-        );
+        #[cfg(unix)]
+        assert_eq!(overlay.tail_reads, 0, "a quiet identity stamp skips reads");
+        #[cfg(not(unix))]
+        assert_eq!(overlay.tail_reads, 50, "fallback compares on every refresh");
         assert_eq!(overlay.tail_resets, 0);
     }
 
     /// Appending to the same segment reuses the held descriptor when the
-    /// overlay records each new consumed tail; only the initial recording
-    /// opens the WAL.
+    /// overlay records each new consumed tail. Identity platforms reuse the
+    /// held descriptor; the fallback opens and compares the path each time.
     #[test]
     fn same_file_appends_reuse_the_tail_descriptor() {
         let wal = temp_wal("reuse_tail_descriptor");
         write_two_groups(&wal);
         let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
         overlay.refresh(true).unwrap();
+        #[cfg(unix)]
         assert_eq!(overlay.tail_opens, 1);
+        #[cfg(not(unix))]
+        assert_eq!(overlay.tail_opens, 0);
 
         for (node, payload) in [([0x03; 16], &b"third"[..]), ([0x04; 16], &b"fourth"[..])] {
             let (mut journal, _) = Journal::open(&wal).unwrap();
@@ -1129,9 +1146,17 @@ mod tests {
             overlay.refresh(true).unwrap();
         }
 
+        #[cfg(unix)]
+        assert_eq!(overlay.tail_opens, 1, "same-file appends reuse the WAL");
+        #[cfg(not(unix))]
+        assert_eq!(overlay.tail_reads, 2, "fallback compares both appends");
         assert_eq!(
-            overlay.tail_opens, 1,
-            "same-file appends must reuse the WAL"
+            overlay
+                .puts
+                .get(&COLLECTION)
+                .and_then(|nodes| nodes.get(&[0x04; 16]))
+                .map(|(bytes, _)| bytes.to_vec()),
+            Some(b"fourth".to_vec())
         );
     }
 
@@ -1156,13 +1181,13 @@ mod tests {
         assert_eq!(overlay.tail_resets, 1);
     }
 
-    /// Reclaim renames a replacement over the segment. Even a byte-identical
-    /// replacement is a different file, and is caught by its inode before any
-    /// bytes are compared.
+    /// Reclaim renames a changed replacement over the segment. Identity
+    /// platforms detect the new file before reading; the fallback detects its
+    /// changed tail by comparing content at the path.
     #[test]
-    fn a_renamed_in_replacement_is_detected_by_identity_alone() {
+    fn a_renamed_replacement_is_detected_by_identity_or_content() {
         let wal = temp_wal("rename_replace");
-        write_two_groups(&wal);
+        let keep_len = write_two_groups(&wal);
         std::thread::sleep(QUIET_AFTER + Duration::from_millis(60));
 
         let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
@@ -1171,6 +1196,7 @@ mod tests {
 
         let copy = wal.with_extension("copy");
         fs::copy(&wal, &copy).unwrap();
+        restart_with_reissued_lsn(&copy, keep_len);
         fs::rename(&copy, &wal).unwrap();
 
         overlay.refresh(true).unwrap();
@@ -1178,11 +1204,17 @@ mod tests {
             overlay.tail_resets, 1,
             "a replaced file must rebuild the overlay"
         );
+        #[cfg(unix)]
         assert_eq!(
             overlay.tail_reads, reads_before,
-            "the replacement is caught before any window is read"
+            "identity catches replacement"
         );
-        assert_eq!(value(&overlay), Some(b"stale-".to_vec()));
+        #[cfg(not(unix))]
+        assert!(
+            overlay.tail_reads > reads_before,
+            "fallback compares replacement content"
+        );
+        assert_eq!(value(&overlay), Some(b"fresh-".to_vec()));
     }
 
     /// The real path: a stamp recorded right after a write is warm and not
@@ -1195,6 +1227,7 @@ mod tests {
         write_two_groups(&wal);
         let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
         overlay.refresh(true).unwrap();
+        #[cfg(unix)]
         if overlay.tail_quiet {
             eprintln!(
                 "skipped: the file was already quiet at the first refresh, so there \
@@ -1206,8 +1239,13 @@ mod tests {
         for _ in 0..20 {
             overlay.refresh(true).unwrap();
         }
-        assert_eq!(overlay.tail_reads, 1, "one verifying read, then trusted");
-        assert!(overlay.tail_quiet);
+        #[cfg(unix)]
+        {
+            assert_eq!(overlay.tail_reads, 1, "one verifying read, then trusted");
+            assert!(overlay.tail_quiet);
+        }
+        #[cfg(not(unix))]
+        assert_eq!(overlay.tail_reads, 20, "fallback compares on every refresh");
         assert_eq!(overlay.tail_resets, 0);
     }
 
@@ -1334,7 +1372,8 @@ mod tests {
 
     /// State-model test, not a real recording: the stamp is flipped to
     /// untrusted by hand after a genuine quiet period, to check the promotion
-    /// rule in isolation from timing. The real path is covered by
+    /// rule in isolation from timing. The fallback path instead keeps
+    /// comparing the unchanged tail. The real path is covered by
     /// `a_freshly_recorded_stamp_is_verified_then_promoted_once_quiet`.
     #[test]
     fn a_warm_fingerprint_is_verified_then_promoted_once_quiet() {
@@ -1344,13 +1383,21 @@ mod tests {
 
         let mut overlay = ReadJournal::empty(wal.clone(), 0, None);
         overlay.refresh(true).unwrap();
-        // Model a stamp recorded while the file was still warm.
-        overlay.tail_quiet = false;
+        #[cfg(unix)]
+        {
+            // Model a stamp recorded while the file was still warm.
+            overlay.tail_quiet = false;
+        }
         for _ in 0..20 {
             overlay.refresh(true).unwrap();
         }
-        assert_eq!(overlay.tail_reads, 1, "one verifying read, then trusted");
-        assert!(overlay.tail_quiet);
+        #[cfg(unix)]
+        {
+            assert_eq!(overlay.tail_reads, 1, "one verifying read, then trusted");
+            assert!(overlay.tail_quiet);
+        }
+        #[cfg(not(unix))]
+        assert_eq!(overlay.tail_reads, 20, "fallback compares on every refresh");
         assert_eq!(overlay.tail_resets, 0);
     }
 

@@ -130,6 +130,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # Override the repository toolchain pin for checks that install/use stable.
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
         with:
@@ -163,6 +166,8 @@ jobs:
 
       - name: Code Coverage
         run: make cov
+        env:
+          RUSTUP_TOOLCHAIN: nightly
 
       - name: Upload Test Results
         if: always()
