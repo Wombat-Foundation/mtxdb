@@ -10302,7 +10302,9 @@ fn persist_matrix_edges(
     ) {
         return Ok(());
     }
-    let mut by_collection: HashMap<[u8; 16], HashMap<NodeId, MtxAdjacency>> = HashMap::new();
+    // Ordered maps so the written record order is deterministic across runs
+    // (`put_many` preserves caller order); a `HashMap` would randomize it.
+    let mut by_collection: BTreeMap<[u8; 16], BTreeMap<NodeId, MtxAdjacency>> = BTreeMap::new();
     for event in events {
         let Some(source_id) = template_node_id(template, event)? else {
             continue;
