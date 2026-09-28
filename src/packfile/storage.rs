@@ -4511,17 +4511,21 @@ impl PackfileStorage {
     /// flag is cleared only when nothing after this rewrite's snapshot is
     /// left unpersisted (see the lock re-acquisition below), so a transient
     /// failure or a racing write defers rather than drops the update.
-    fn persist_index_checkpoint(&self) -> Result<(), StorageError> {
+    ///
+    /// Returns `true` when a checkpoint was written, `false` when nothing was
+    /// dirty to persist — callers that count writes must gate on this, since a
+    /// concurrent sync can consume the dirty flag first.
+    fn persist_index_checkpoint(&self) -> Result<bool, StorageError> {
         // A synchronous checkpoint never overlaps a worker's.
         self.finish_checkpoint_worker(true);
         let Some(captured) = self.capture_checkpoint()? else {
-            return Ok(());
+            return Ok(false);
         };
         let CapturedCheckpoint { tail, breakdown } = captured;
         match tail.run() {
             Ok(done) => {
                 self.record_checkpoint(breakdown, &done);
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 self.abandon_checkpoint();
@@ -8699,7 +8703,7 @@ impl PackfileStorage {
             .shards
             .sync_dirty()
             .map_err(StorageError::Io)
-            .and_then(|()| self.persist_index_checkpoint())
+            .and_then(|()| self.persist_index_checkpoint().map(|_| ()))
         {
             Ok(()) => error,
             Err(boundary_error) => boundary_error,
@@ -8776,15 +8780,18 @@ impl PackfileStorage {
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
         let _persist_guard = self.index_persist_lock.lock();
-        self.persist_index_checkpoint()?;
+        let wrote = self.persist_index_checkpoint()?;
         // A forced rewrite is a full checkpoint like a sync's, but it never
         // passes through `sync`/`sync_all`, so `count_sync_persistence` cannot
         // see it. Without this, a pool touched only by WAL-reclaim
         // remediation reports zero checkpoint writes despite rewriting its
-        // checkpoint. `index_checkpoint_dirty` is forced true above, so
-        // `persist_index_checkpoint` always writes here; the bump is
-        // unconditional rather than gated on that.
-        self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+        // checkpoint. A sync can win `index_persist_lock` between the dirty
+        // store above and this lock and consume the flag, writing and counting
+        // the checkpoint through its own accounting; count only when this call
+        // actually wrote one, or the metric would double-count.
+        if wrote {
+            self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -11759,6 +11766,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persist_index_checkpoint_reports_whether_it_wrote() {
+        let dir = test_dir("persist_checkpoint_reports_write");
+        let store = PackfileStorage::open(dir).unwrap();
+
+        // A fresh store opens structurally invalidated, so the first checkpoint
+        // writes; a second with nothing dirty must report that no write
+        // happened (a concurrent sync may have consumed the dirty flag first).
+        assert!(store.persist_index_checkpoint().unwrap());
+        assert!(!store.persist_index_checkpoint().unwrap());
+
+        store
+            .put(
+                &TEST_COLLECTION,
+                &[0x24; 16],
+                &NodeData::new(bytes::Bytes::from_static(b"w")),
+            )
+            .unwrap();
+        assert!(store.persist_index_checkpoint().unwrap());
+        assert!(!store.persist_index_checkpoint().unwrap());
+    }
+
     #[cfg(feature = "multi-reader")]
     #[test]
     fn reset_has_coverage_gap_is_a_pure_base_jump() {
@@ -13828,9 +13857,12 @@ mod tests {
 
         // Run the full-checkpoint path as a sync would, but without the
         // barrier that would advance `committed_lsn` past the pending put.
-        store
-            .persist_index_checkpoint()
-            .expect("checkpoint must succeed");
+        assert!(
+            store
+                .persist_index_checkpoint()
+                .expect("checkpoint must succeed"),
+            "a dirty store must write a checkpoint"
+        );
 
         let covered = PackfileStorage::read_journal_lsn(&dir);
         assert_eq!(
