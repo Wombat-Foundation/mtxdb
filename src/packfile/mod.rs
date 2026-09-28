@@ -1,3 +1,4 @@
+mod entropy;
 /// Physical, on-disk layout scanning — see [`layout::physical_layout`].
 pub mod layout;
 /// The [`PackfileStorage`](storage::PackfileStorage) engine and its supporting types.
@@ -57,9 +58,9 @@ pub struct PackId(pub [u8; PACK_ID_LEN]);
 impl PackId {
     /// Generate a fresh random address from the operating system's CSPRNG.
     ///
-    /// Fills the full [`PACK_ID_LEN`] bytes from `getrandom` (the OS entropy
-    /// source: `getrandom(2)`/`/dev/urandom`, `BCryptGenRandom`, etc.). The
-    /// identity is externally visible and portable across pools and hosts, so
+    /// Fills the full [`PACK_ID_LEN`] bytes from the operating system's CSPRNG
+    /// (`/dev/urandom` on unix, `BCryptGenRandom` on Windows). The identity is
+    /// externally visible and portable across pools and hosts, so
     /// it must carry real entropy rather than a hash of a weaker seed: this
     /// yields the full 128-bit collision bound the identity is documented to
     /// have (birthday bound ≈ 2^64 packs).
@@ -77,7 +78,7 @@ impl PackId {
         // `random` guarantees a nonzero identity by contract.
         loop {
             let mut bytes = [0u8; PACK_ID_LEN];
-            getrandom::fill(&mut bytes).expect("OS entropy source is available");
+            entropy::fill(&mut bytes).expect("OS entropy source is available");
             let id = Self(bytes);
             if !id.is_zero() {
                 return id;
