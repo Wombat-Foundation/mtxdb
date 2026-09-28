@@ -20163,4 +20163,113 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn scan_collection_excludes_a_post_snapshot_append() {
+        let dir = test_dir("scan_collection_boundary");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x91u8; 16];
+        let before = distinct_id(1);
+        let after = distinct_id(2);
+        store
+            .put(
+                &collection,
+                &before,
+                &NodeData::new(bytes::Bytes::from_static(b"before")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        // The boundary is fixed when `scan_collection` is called, so a record
+        // appended and synced before the iterator is drained must not appear.
+        let scan = store.scan_collection(&collection).unwrap();
+        store
+            .put(
+                &collection,
+                &after,
+                &NodeData::new(bytes::Bytes::from_static(b"after")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        let scanned: Vec<NodeId> = scan.map(|entry| entry.unwrap().0).collect();
+        assert_eq!(
+            scanned,
+            vec![before],
+            "the post-boundary append is excluded"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "multi-reader")]
+    #[test]
+    fn scan_collection_merges_the_read_committed_overlay() {
+        let dir = test_dir("scan_collection_overlay");
+        let wal = dir.join("wal.bin");
+        let collection = [0x42u8; 16];
+        let durable_only = distinct_id(1);
+        let superseded = distinct_id(2);
+        let overlay_only = distinct_id(3);
+
+        let seed = PackfileStorage::open(dir.clone()).unwrap();
+        seed.put(
+            &collection,
+            &durable_only,
+            &NodeData::new(bytes::Bytes::from_static(b"d")),
+        )
+        .unwrap();
+        seed.put(
+            &collection,
+            &superseded,
+            &NodeData::new(bytes::Bytes::from_static(b"old")),
+        )
+        .unwrap();
+        seed.sync().unwrap();
+        drop(seed);
+
+        let (mut journal, _) = Journal::open(&wal).unwrap();
+        journal
+            .append_group(&[
+                JournalMutation::Put {
+                    collection_id: collection,
+                    node_id: superseded,
+                    payload: b"overlay".to_vec(),
+                },
+                JournalMutation::Put {
+                    collection_id: collection,
+                    node_id: overlay_only,
+                    payload: b"new".to_vec(),
+                },
+            ])
+            .unwrap();
+        drop(journal);
+
+        let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
+        store.enable_read_journal(&wal).unwrap();
+
+        let mut scanned: Vec<(NodeId, bytes::Bytes)> = store
+            .scan_collection(&collection)
+            .unwrap()
+            .map(|entry| {
+                let (id, data) = entry.unwrap();
+                (id, data.bytes)
+            })
+            .collect();
+        scanned.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(scanned.len(), 3, "durable-only, superseded, overlay-only");
+        let find = |id: NodeId| {
+            scanned
+                .iter()
+                .find(|(entry_id, _)| *entry_id == id)
+                .map(|(_, data)| data.clone())
+        };
+        assert_eq!(find(durable_only).as_deref(), Some(&b"d"[..]));
+        assert_eq!(
+            find(superseded).as_deref(),
+            Some(&b"overlay"[..]),
+            "the overlay value wins over the durable one"
+        );
+        assert_eq!(find(overlay_only).as_deref(), Some(&b"new"[..]));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
