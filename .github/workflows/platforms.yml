@@ -56,5 +56,9 @@ jobs:
       - name: Test workspace
         run: cargo test --locked --workspace --all-features --lib --tests
 
+      - name: Install vmtouch (macOS)
+        if: runner.os == 'macOS'
+        run: brew install vmtouch
+
       - name: Run benchmarks
         run: cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets

@@ -39,6 +39,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
+      - name: Install vmtouch
+        run: sudo apt-get update && sudo apt-get install --yes vmtouch
+
       - name: Run benchmarks (tee to file)
         # benches/ is a standalone crate outside the root [workspace] (see
         # root Cargo.toml), so the harness must be reached via
