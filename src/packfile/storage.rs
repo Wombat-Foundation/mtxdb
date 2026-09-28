@@ -9541,12 +9541,10 @@ impl PackfileStorage {
     /// checkpoint, which records the new table.
     fn packs_match_checkpoint_table(&self) -> bool {
         let state = self.delta_state.lock();
-        !state.base_pack_ids.is_empty()
-            && self
-                .shards
-                .all_shards()
-                .iter()
-                .all(|(_, shard)| state.base_pack_ids.contains(&shard.pack_id))
+        self.shards
+            .all_shards()
+            .iter()
+            .all(|(_, shard)| state.base_pack_ids.contains(&shard.pack_id))
     }
 
     /// Persist the dirty index state for a sync barrier — a delta append when
@@ -9565,6 +9563,7 @@ impl PackfileStorage {
     /// A known missing/invalid sidecar (`shard_collections_dirty`) is still
     /// regenerated even on an otherwise clean barrier, because that is a rare
     /// recovery path rather than a steady-state write.
+    #[allow(clippy::too_many_lines)]
     fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         let _persist_guard = self.index_persist_lock.lock();
         if !self.settle_checkpoint_worker() {
@@ -9577,6 +9576,10 @@ impl PackfileStorage {
         // coverage and reclaims), even if its index is clean; a shared segment is
         // only reclaimed once every such pool has reported.
         let journal_needs_reclaim = self.journal_needs_reclaim_checkpoint();
+        let new_pack_requires_table_refresh = !self.packs_match_checkpoint_table();
+        if new_pack_requires_table_refresh {
+            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
         if journal_needs_reclaim {
             self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
@@ -9645,12 +9648,20 @@ impl PackfileStorage {
             } else {
                 self.shard_collections_stale.store(true, Ordering::Relaxed);
             }
-        } else if journal_needs_reclaim || rotating || self.delta_state_needs_full_rewrite() {
+        } else if journal_needs_reclaim
+            || rotating
+            || self.delta_state_needs_full_rewrite()
+            || new_pack_requires_table_refresh
+        {
             // A deferral budget postpones acceleration rewrites; it must not
             // postpone the one that lets the journal be reclaimed, or the segment
             // fills and commits fail, nor the one that keeps the delta log under
             // its cap.
-            if !journal_needs_reclaim && !rotating && self.should_defer_checkpoint_rewrite() {
+            if !journal_needs_reclaim
+                && !rotating
+                && !new_pack_requires_table_refresh
+                && self.should_defer_checkpoint_rewrite()
+            {
                 // Write-neutral stopgap: the caller already synced the
                 // packfiles, so skipping the acceleration rewrite costs only
                 // the next open a rescan — the stale on-disk checkpoint no
@@ -13822,6 +13833,10 @@ mod tests {
         for entry in fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_file() {
+                // The live writer lock is not database state in a crash image.
+                if entry.file_name() == ".mtxdb.lock" {
+                    continue;
+                }
                 fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
             }
         }
@@ -19507,6 +19522,7 @@ mod tests {
         writer.sync().unwrap();
         assert!(writer.sync_timings().unwrap().checkpoint.is_zero());
         assert!(writer.packs_match_checkpoint_table());
+        writer.set_checkpoint_rewrite_budget(std::time::Duration::from_secs(3600), 0);
         // Forget the table, as if a pack had been created since the checkpoint.
         writer.delta_state.lock().base_pack_ids.clear();
         assert!(!writer.packs_match_checkpoint_table());

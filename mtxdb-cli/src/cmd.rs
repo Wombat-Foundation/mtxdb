@@ -339,7 +339,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             decode,
         } => cmd_meta(cli, target, *json, *limit, *offset, decode.as_deref()),
         Commands::Info { collection, stats } => match collection {
-            Some(collection) => cmd_info(cli, collection),
+            Some(collection) => cmd_info(cli, collection, *stats),
             None => cmd_info_default(cli, *stats),
         },
         Commands::Scan {
@@ -3888,8 +3888,7 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn cmd_info_coalesced(cli: &Cli, selector: &str) -> anyhow::Result<()> {
-    let deep = matches!(cli.command, Commands::Info { stats: true, .. });
+fn cmd_info_coalesced(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<()> {
     let target = classify_info_selector(selector)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
@@ -4957,15 +4956,14 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_info(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+fn cmd_info(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<()> {
     if cli.coalesce {
-        return cmd_info_coalesced(cli, selector);
+        return cmd_info_coalesced(cli, selector, deep);
     }
-    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector))
+    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector, deep))
 }
 
-fn cmd_info_single(cli: &Cli, selector: &str) -> anyhow::Result<()> {
-    let deep = matches!(cli.command, Commands::Info { stats: true, .. });
+fn cmd_info_single(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<()> {
     match classify_info_selector(selector)? {
         InfoTarget::Pack => cmd_info_pack(cli, selector),
         InfoTarget::Collection => cmd_info_collection(cli, selector, deep),
@@ -11151,9 +11149,9 @@ mod tests {
                 stats: false,
             },
         };
-        let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63").unwrap_err();
+        let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63", false).unwrap_err();
         assert!(doubled.to_string().contains("doubled"), "{doubled}");
-        let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF").unwrap_err();
+        let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF", false).unwrap_err();
         assert!(short.to_string().contains("found 30 characters"), "{short}");
     }
 
@@ -11860,7 +11858,7 @@ mod tests {
             },
         };
 
-        cmd_info(&cli, &col_hex).unwrap();
+        cmd_info(&cli, &col_hex, false).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -14513,7 +14511,7 @@ mod tests {
                 stats: false,
             },
         };
-        cmd_info(&cli_info, &format_id(&col1)).unwrap();
+        cmd_info(&cli_info, &format_id(&col1), false).unwrap();
 
         let cli_scan = Cli {
             dirs: vec![dir1.clone(), dir2.clone()],
