@@ -1137,7 +1137,14 @@ mod tests {
         assert_eq!(overlay.tail_opens, 1, "same-file appends reuse the WAL");
         #[cfg(not(unix))]
         assert_eq!(overlay.tail_reads, 2, "fallback compares both appends");
-        assert_eq!(value(&overlay), Some(b"fourth".to_vec()));
+        assert_eq!(
+            overlay
+                .puts
+                .get(&COLLECTION)
+                .and_then(|nodes| nodes.get(&[0x04; 16]))
+                .map(|(bytes, _)| bytes.to_vec()),
+            Some(b"fourth".to_vec())
+        );
     }
 
     /// A same-length rewrite of a quiet file changes its change time, so the
