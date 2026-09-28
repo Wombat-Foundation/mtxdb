@@ -198,9 +198,14 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     /// not rely on any ordering between concurrent writers.
     ///
     /// # Errors
-    /// Returns [`StorageError::Corrupt`] for malformed existing envelopes or
-    /// digest collisions, and propagates storage errors.
+    /// Returns [`StorageError::Collision`] for distinct keys with the same
+    /// physical ID, [`StorageError::Corrupt`] for malformed existing envelopes,
+    /// and propagates storage errors.
     pub fn put_many(&self, entries: &[(&[u8], &[u8])]) -> Result<usize, StorageError> {
+        if entries.is_empty() {
+            self.ensure_metadata()?;
+            return Ok(0);
+        }
         let mut physical: Vec<(NodeId, NodeData)> = Vec::with_capacity(entries.len());
         let mut seen: HashMap<NodeId, AuxiliaryKeyDigest> = HashMap::with_capacity(entries.len());
         for (key, value) in entries {
@@ -208,7 +213,7 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             let node_id = physical_id(&digest);
             if let Some(previous) = seen.insert(node_id, digest) {
                 if previous != digest {
-                    return Err(StorageError::Corrupt(
+                    return Err(StorageError::Collision(
                         "auxiliary-index key digest collision".to_owned(),
                     ));
                 }
@@ -227,6 +232,7 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             physical.push((node_id, NodeData::new(bytes::Bytes::from(encoded))));
         }
 
+        self.ensure_metadata()?;
         let ids: Vec<NodeId> = physical.iter().map(|(id, _)| *id).collect();
         let existing = self.engine.get_many(&self.collection_id, &ids)?;
         for ((_, data), existing) in physical.iter().zip(existing) {
@@ -318,6 +324,15 @@ mod tests {
         assert_eq!(values[0], Some(Vec::new()));
         assert_eq!(values[1], None);
         assert_eq!(values[2], Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn empty_put_many_establishes_metadata_for_a_fresh_index() {
+        let engine = InMemoryStorage::new();
+        let index = AuxiliaryIndex::open(&engine, "empty_batch");
+        assert_eq!(index.put_many(&[]).unwrap(), 0);
+        index.put(b"key", b"value").unwrap();
+        assert_eq!(index.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
 
     #[test]

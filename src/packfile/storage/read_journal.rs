@@ -490,12 +490,21 @@ impl ReadJournal {
     /// checkpoint-bound index to the writer's latest durable coverage for this
     /// pool. On a shared segment a base jump beyond that coverage can only be
     /// other pools' reclaimed frames, which this pool does not need, so the
-    /// jump is accepted instead of forcing another reload.
+    /// jump is accepted instead of forcing another reload, provided the
+    /// writer's durable LSN has not advanced past that coverage during scan.
     ///
     /// Returns [`ReadRefresh::NeedsReload`] when a reset reveals the writer
     /// reclaimed past this reader's incorporated coverage; the caller must
     /// reload the checkpoint-bound index and rebind `covered` before retrying.
     fn refresh(&mut self, accept_reclaimed_prefix: bool) -> Result<ReadRefresh, StorageError> {
+        self.refresh_checked(accept_reclaimed_prefix, || true)
+    }
+
+    fn refresh_checked(
+        &mut self,
+        accept_reclaimed_prefix: bool,
+        still_covered: impl FnOnce() -> bool,
+    ) -> Result<ReadRefresh, StorageError> {
         // Coverage is fixed to the index this reader loaded. Reading
         // `journal.lsn` fresh would prune entries the reader's stale index has
         // not incorporated yet, dropping records from both sources.
@@ -555,8 +564,8 @@ impl ReadJournal {
             // this, a reload that rebinds `covered` below the segment base
             // would silently serve a hole.
             if (reset || full_scan)
-                && !accept_reclaimed_prefix
                 && self.reset_has_coverage_gap(&scan)
+                && (!accept_reclaimed_prefix || !still_covered())
             {
                 return Ok(ReadRefresh::NeedsReload);
             }
@@ -740,7 +749,11 @@ impl PackfileStorage {
             // Rebuild immediately while still holding the guard: returning the
             // guard only once the overlay is applied keeps another reader from
             // observing the just-cleared state.
-            if overlay.refresh(accept_reclaimed_prefix)? == ReadRefresh::Applied {
+            let covered = overlay.covered;
+            if overlay.refresh_checked(accept_reclaimed_prefix, || {
+                Self::read_journal_lsn(&self.base_dir) <= covered
+            })? == ReadRefresh::Applied
+            {
                 return Ok(guard);
             }
             drop(guard);

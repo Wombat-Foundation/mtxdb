@@ -758,16 +758,18 @@ impl StorageEngine for InMemoryStorage {
                 ));
             }
             for (id, data) in records {
-                if let Some(existing_rec) = collection.get(id) {
-                    if existing_rec.bytes != data.bytes {
-                        return Err(StorageError::Collision(format!(
-                            "record collision on node {}",
-                            hex16(id)
-                        )));
-                    }
-                } else {
-                    collection.insert(*id, data.clone());
+                if collection
+                    .get(id)
+                    .is_some_and(|existing_rec| existing_rec.bytes != data.bytes)
+                {
+                    return Err(StorageError::Collision(format!(
+                        "record collision on node {}",
+                        hex16(id)
+                    )));
                 }
+            }
+            for (id, data) in records {
+                collection.entry(*id).or_insert_with(|| data.clone());
             }
         } else {
             if !collection.is_empty() {
@@ -1526,6 +1528,20 @@ mod tests {
             .create_or_put_established(&col_id, &valid_meta, std::slice::from_ref(&collision_rec))
             .unwrap_err();
         assert!(matches!(err, StorageError::Collision(_)));
+        let batch_new_id = [0x04; 16];
+        let batch_new = (
+            batch_new_id,
+            NodeData::new(bytes::Bytes::from_static(b"new")),
+        );
+        assert!(matches!(
+            store.create_or_put_established(
+                &col_id,
+                &valid_meta,
+                &[batch_new.clone(), collision_rec.clone()]
+            ),
+            Err(StorageError::Collision(_))
+        ));
+        assert!(store.get(&col_id, &batch_new_id).unwrap().is_none());
 
         // 9. put_many_established on existing collection
         let node_c = [0x03; 16];
@@ -1538,9 +1554,19 @@ mod tests {
 
         // 10. put_many_established fails on payload collision
         let err = store
-            .put_many_established(&col_id, &[collision_rec])
+            .put_many_established(&col_id, std::slice::from_ref(&collision_rec))
             .unwrap_err();
         assert!(matches!(err, StorageError::Collision(_)));
+        let batch_new_id = [0x05; 16];
+        let batch_new = (
+            batch_new_id,
+            NodeData::new(bytes::Bytes::from_static(b"new")),
+        );
+        assert!(matches!(
+            store.put_many_established(&col_id, &[batch_new, collision_rec]),
+            Err(StorageError::Collision(_))
+        ));
+        assert!(store.get(&col_id, &batch_new_id).unwrap().is_none());
 
         // 11. put_many_established fails on non-existent collection
         assert!(store

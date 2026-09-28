@@ -267,7 +267,7 @@ fn global_args(cmd: Command) -> Command {
             .env("MTXDB_DIR")
             .value_name("DIR")
             .action(ArgAction::Append)
-            .num_args(1..)
+            .num_args(1)
             .global(true)
             .help("Database root directory (or multiple directories)"),
     )
@@ -376,6 +376,7 @@ fn sub_meta() -> Command {
                 .value_name("FORMAT")
                 .num_args(0..=1)
                 .default_missing_value("auto")
+                .require_equals(true)
                 .value_parser(["auto", "json", "raw"])
                 .help("Decode WAL payloads when possible (json or raw)"),
         )
@@ -524,6 +525,7 @@ fn sub_scan() -> Command {
                 .value_name("FORMAT")
                 .num_args(0..=1)
                 .default_missing_value("auto")
+                .require_equals(true)
                 .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
         )
         .arg(
@@ -869,6 +871,7 @@ fn sub_get() -> Command {
                 .value_name("FORMAT")
                 .num_args(0..=1)
                 .default_missing_value("auto")
+                .require_equals(true)
                 .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
         )
 }
@@ -1147,7 +1150,7 @@ mod parse_tests {
     #[test]
     fn test_dir_parsing() {
         let m = build_cli()
-            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2"])
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2"])
             .unwrap();
         let dirs: Vec<_> = m
             .get_many::<String>("dir")
@@ -1167,7 +1170,7 @@ mod parse_tests {
         assert_eq!(dirs, vec!["dir1", "dir2"]);
 
         let m = build_cli()
-            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2", "-a"])
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2", "-a"])
             .unwrap();
         let dirs: Vec<_> = m
             .get_many::<String>("dir")
@@ -1183,6 +1186,7 @@ mod parse_tests {
                 "0x0102030405060708090a0b0c0d0e0f10",
                 "-d",
                 "dir1",
+                "-d",
                 "dir2",
             ])
             .unwrap();
@@ -1195,18 +1199,18 @@ mod parse_tests {
         assert_eq!(m.subcommand_name(), Some("scan"));
 
         let m = build_cli()
-            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "dir2", "-c"])
+            .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2", "-c"])
             .unwrap();
         assert!(m.get_flag("coalesce"));
 
         let m = build_cli()
-            .try_get_matches_from(["mtxdb", "--coalesce", "shards", "-d", "dir1", "dir2"])
+            .try_get_matches_from(["mtxdb", "--coalesce", "shards", "-d", "dir1", "-d", "dir2"])
             .unwrap();
         assert!(m.get_flag("coalesce"));
 
         let m = build_cli()
             .try_get_matches_from([
-                "mtxdb", "repack", "-d", "dir1", "dir2", "-c", "--out", "target", "-y",
+                "mtxdb", "repack", "-d", "dir1", "-d", "dir2", "-c", "--out", "target", "-y",
             ])
             .unwrap();
         assert!(m.get_flag("coalesce"));
@@ -1216,6 +1220,37 @@ mod parse_tests {
             Some("target")
         );
         assert!(sub.get_flag("yes"));
+    }
+
+    #[test]
+    fn optional_decode_formats_require_equals_and_default_to_auto() {
+        fn check(bare: &[&str], explicit: &[&str]) {
+            let bare_matches = build_cli().try_get_matches_from(bare).unwrap();
+            let subcommand = bare_matches.subcommand_matches(bare[1]).unwrap();
+            assert_eq!(
+                subcommand.get_one::<String>("decode").map(String::as_str),
+                Some("auto")
+            );
+
+            let explicit_matches = build_cli().try_get_matches_from(explicit).unwrap();
+            let subcommand = explicit_matches.subcommand_matches(explicit[1]).unwrap();
+            assert_eq!(
+                subcommand.get_one::<String>("decode").map(String::as_str),
+                Some("json")
+            );
+
+            let spaced = [bare[0], bare[1], bare[2], "--decode", "json"];
+            assert!(build_cli().try_get_matches_from(spaced).is_err());
+        }
+
+        check(
+            &["mtxdb", "meta", "wal", "--decode"],
+            &["mtxdb", "meta", "wal", "--decode=json"],
+        );
+        check(
+            &["mtxdb", "scan", "0x01", "--decode"],
+            &["mtxdb", "scan", "0x01", "--decode=json"],
+        );
     }
 
     #[test]

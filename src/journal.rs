@@ -2181,7 +2181,8 @@ impl JournalCoordinator {
     /// lock wait and waiter count needed to tell contention from disk latency.
     fn warn_if_slow_fsync(&self, path: &Path, target_lsn: u64, timings: &JournalSyncTimings) {
         if timings.journal_fsync >= SLOW_FSYNC_WARN {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr().lock(),
                 "mtxdb: slow WAL fsync {}ms (through lsn {target_lsn}, lock wait {}ms, {} records, in-flight {}, waiters {}, {})",
                 timings.journal_fsync.as_millis(),
                 timings.journal_lock_wait.as_millis(),
