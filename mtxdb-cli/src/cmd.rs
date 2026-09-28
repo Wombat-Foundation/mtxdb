@@ -3898,6 +3898,8 @@ struct PackLocation {
     database: PathBuf,
     shard_type: ShardType,
     pack_id: PackId,
+    file_bytes: u64,
+    version: u8,
 }
 
 impl std::fmt::Display for PackLocation {
@@ -3945,10 +3947,14 @@ fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
                 continue;
             };
             if let Ok(files) = glob_pack_files(&dir) {
-                locations.extend(files.into_iter().map(|(pack_id, _, _)| PackLocation {
-                    database: db_dir.clone(),
-                    shard_type,
-                    pack_id,
+                locations.extend(files.into_iter().map(|(pack_id, file_bytes, version)| {
+                    PackLocation {
+                        database: db_dir.clone(),
+                        shard_type,
+                        pack_id,
+                        file_bytes,
+                        version,
+                    }
                 }));
             }
         }
@@ -3956,17 +3962,11 @@ fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
     locations
 }
 
-/// Whether a live pack with this exact address exists in any selected pool.
-fn pack_id_exists(cli: &Cli, target_id: &PackId) -> bool {
-    pack_locations_in_selected_pools(cli)
-        .iter()
-        .any(|location| &location.pack_id == target_id)
-}
-
 /// Whether a live collection with this id exists in any selected pool.
 ///
-/// Same cost caveat as [`pack_id_exists`]: a single `info` disambiguation is
-/// fine, a per-selector loop in a multi-selector command is not.
+/// Same cost caveat as [`pack_locations_in_selected_pools`]: a single `info`
+/// disambiguation is fine, a per-selector loop in a multi-selector command is
+/// not.
 fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
     let Ok(dirs) = valid_database_dirs(cli) else {
         return false;
@@ -4026,11 +4026,11 @@ fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarge
 /// - If only a collection exists (or neither exists yet), it resolves as [`InfoTarget::Collection`].
 /// - If both a live pack and a collection match the same ID, an error requires
 ///   an explicit `--pack` or `--collection` (with the exact 32-hex id).
-fn classify_info_selector_explicit(
+fn classify_info_selector_with_inventory(
     cli: &Cli,
     selector: &str,
     explicit: Option<InfoTarget>,
-) -> anyhow::Result<InfoTarget> {
+) -> anyhow::Result<(InfoTarget, Option<Vec<PackLocation>>)> {
     match explicit {
         Some(InfoTarget::Pack) => {
             // A full 32-hex address, or a 1-16 hex filename prefix (64 bits is
@@ -4047,7 +4047,9 @@ fn classify_info_selector_explicit(
                 matched.iter().map(|location| location.pack_id).collect();
             match (distinct.len(), matched.len()) {
                 (0, _) => bail!("pack {selector}: not found"),
-                (1, 1) => return Ok(InfoTarget::Pack),
+                // Hand the walk to the caller so the display path need not
+                // repeat it.
+                (1, 1) => return Ok((InfoTarget::Pack, Some(locations))),
                 (1, _) => {
                     // One pack, present in more than one selected pool.
                     let where_ = matched
@@ -4085,7 +4087,7 @@ fn classify_info_selector_explicit(
             if !collection_id_exists(cli, &id) {
                 bail!("collection {selector}: not found");
             }
-            return Ok(InfoTarget::Collection);
+            return Ok((InfoTarget::Collection, None));
         }
         None => {}
     }
@@ -4093,10 +4095,12 @@ fn classify_info_selector_explicit(
         if selector.starts_with("0X") {
             bail!("invalid ID `{selector}`: the prefix must be lowercase `0x`");
         }
-        return Ok(InfoTarget::Collection);
+        return Ok((InfoTarget::Collection, None));
     };
     match hex.len() {
-        1..=16 => Ok(InfoTarget::Pack),
+        // A bare prefix does not need a walk to classify; the display path
+        // resolves it against the pool it was narrowed to.
+        1..=16 => Ok((InfoTarget::Pack, None)),
         32 => {
             let pack_id = parse_pack_id_selector(selector)
                 .ok()
@@ -4106,7 +4110,9 @@ fn classify_info_selector_explicit(
                 });
             let collection_id = parse_collection_id(selector).ok();
 
-            let pack_matches = pack_id.is_some_and(|id| pack_id_exists(cli, &id));
+            let locations = pack_locations_in_selected_pools(cli);
+            let pack_matches =
+                pack_id.is_some_and(|id| locations.iter().any(|location| location.pack_id == id));
             let collection_matches = collection_id.is_some_and(|id| collection_id_exists(cli, &id));
 
             if pack_matches && collection_matches {
@@ -4117,9 +4123,9 @@ fn classify_info_selector_explicit(
                 );
             }
             if pack_matches {
-                Ok(InfoTarget::Pack)
+                Ok((InfoTarget::Pack, Some(locations)))
             } else {
-                Ok(InfoTarget::Collection)
+                Ok((InfoTarget::Collection, None))
             }
         }
         found => {
@@ -4134,6 +4140,17 @@ fn classify_info_selector_explicit(
             )
         }
     }
+}
+
+/// Classify a selector, returning only the target. Thin wrapper over
+/// [`classify_info_selector_with_inventory`] for callers that do not reuse the
+/// pack inventory the classification may have walked.
+fn classify_info_selector_explicit(
+    cli: &Cli,
+    selector: &str,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<InfoTarget> {
+    Ok(classify_info_selector_with_inventory(cli, selector, explicit)?.0)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5222,8 +5239,9 @@ fn cmd_info_single(
     deep: bool,
     explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
-    match classify_info_selector_explicit(cli, selector, explicit)? {
-        InfoTarget::Pack => cmd_info_pack(cli, selector),
+    let (target, inventory) = classify_info_selector_with_inventory(cli, selector, explicit)?;
+    match target {
+        InfoTarget::Pack => cmd_info_pack(cli, selector, inventory.as_deref()),
         InfoTarget::Collection => cmd_info_collection(cli, selector, deep),
     }
 }
@@ -5390,14 +5408,33 @@ fn print_pack_info(
     }
 }
 
-fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
+fn cmd_info_pack(
+    cli: &Cli,
+    selector: &str,
+    inventory: Option<&[PackLocation]>,
+) -> anyhow::Result<()> {
     let selector = parse_pack_id_selector(selector)?;
+    // Reuse the pack walk classification already did for this database when it
+    // is available; only a bare prefix (classified without a walk) falls back
+    // to globbing the pool.
+    let pool_packs = |shard_type: ShardType| -> Option<Vec<(PackId, u64, u8)>> {
+        inventory.map(|locations| {
+            locations
+                .iter()
+                .filter(|location| location.shard_type == shard_type)
+                .map(|location| (location.pack_id, location.file_bytes, location.version))
+                .collect()
+        })
+    };
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
-            let all = glob_pack_files(&dir)?;
+            let all = match pool_packs(shard_type) {
+                Some(all) => all,
+                None => glob_pack_files(&dir)?,
+            };
             let ids: Vec<PackId> = all.iter().map(|&(id, _, _)| id).collect();
             if !ids.iter().any(|id| selector.matches(id)) {
                 continue;
@@ -5421,7 +5458,11 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let dir = selected_pool_dir(cli)?;
-    let all = glob_pack_files(&dir)?;
+    let shard_type = cli.require_shard_type()?;
+    let all = match pool_packs(shard_type) {
+        Some(all) => all,
+        None => glob_pack_files(&dir)?,
+    };
     let ids: Vec<PackId> = all.iter().map(|&(id, _, _)| id).collect();
     let pack_id = selector.resolve(ids.iter())?;
     let shard_entries: Vec<(PackId, u64, u8)> = all
@@ -5432,7 +5473,7 @@ fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
         eprintln!("pack {selector}: not found");
         return Ok(());
     }
-    print_pack_info(&dir, pack_id, &shard_entries, cli.require_shard_type()?);
+    print_pack_info(&dir, pack_id, &shard_entries, shard_type);
     Ok(())
 }
 
@@ -8011,7 +8052,7 @@ const PACK_DUMP_SCHEMA: &str = "mtxdb.pack.dump/v1";
 fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
     match action {
         PacksAction::List { all } => cmd_shards(cli, *all, false, None),
-        PacksAction::Inspect { pack } => cmd_info_pack(cli, pack),
+        PacksAction::Inspect { pack } => cmd_info_pack(cli, pack, None),
         PacksAction::Dump {
             pack,
             collection,
