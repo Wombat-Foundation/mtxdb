@@ -355,7 +355,7 @@ fn compact_shard_intra(
     store: &PackfileStorage,
     shard_path: &Path,
     dest_path: &Path,
-    dest_pack_id: u64,
+    dest_pack_id: &packfile::PackId,
 ) -> std::io::Result<CompactionCost> {
     let start = Instant::now();
     let entries = packfile::scan_packfile(shard_path)?;
@@ -921,12 +921,12 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
     let mut total_write_time = Duration::ZERO;
     let mut total_fsync_time = Duration::ZERO;
     for summary in &summaries {
-        let shard_path = ShardPool::pack_path(&temp_dir, summary.pack_id);
-        let dest_path = ShardPool::pack_path(&compacted_dir, summary.pack_id);
+        let shard_path = ShardPool::pack_path(&temp_dir, &summary.pack_id, &[]);
+        let dest_path = ShardPool::pack_path(&compacted_dir, &summary.pack_id, &[]);
         let (records, bytes, write_time, fsync_time) =
-            compact_shard_intra(&store, &shard_path, &dest_path, summary.pack_id).unwrap();
+            compact_shard_intra(&store, &shard_path, &dest_path, &summary.pack_id).unwrap();
         subrow(
-            &format!("shard {:#06x}:", summary.pack_id),
+            &format!("shard {}:", summary.pack_id),
             format!(
                 "{records} records, {} — write {write_time:.2?}, fsync {fsync_time:.2?}",
                 format_bytes(bytes)
