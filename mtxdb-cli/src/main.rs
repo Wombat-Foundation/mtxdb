@@ -1251,6 +1251,10 @@ mod parse_tests {
             &["mtxdb", "scan", "0x01", "--decode"],
             &["mtxdb", "scan", "0x01", "--decode=json"],
         );
+        check(
+            &["mtxdb", "get", "0x01", "--decode"],
+            &["mtxdb", "get", "0x01", "--decode=json"],
+        );
     }
 
     #[test]
