@@ -1427,6 +1427,53 @@ struct PutManyProgress {
     undo_log: Vec<EntryUndo>,
 }
 
+/// A snapshot-consistent, lazily-read scan over one collection's live records.
+///
+/// Returned by [`PackfileStorage::scan_collection`]. Records are resolved
+/// against a single pinned generation snapshot, so superseded versions that
+/// are still physically present in earlier pack segments are never yielded,
+/// and records appended after the snapshot boundary are excluded. Each
+/// record's payload is read only as the iterator advances, so the whole
+/// collection is never buffered.
+pub struct CollectionScan<'a> {
+    store: &'a PackfileStorage,
+    pinned: HashMap<u16, Arc<Shard>>,
+    pending: std::vec::IntoIter<ScanWork>,
+}
+
+/// One pending emission for a [`CollectionScan`]: either locators to resolve
+/// lazily through the pinned generation, or an overlay payload the durable
+/// index does not yet contain.
+enum ScanWork {
+    Locators(NodeId, Vec<(u16, u64)>),
+    Data(NodeId, NodeData),
+}
+
+impl Iterator for CollectionScan<'_> {
+    type Item = Result<(NodeId, NodeData), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.pending.next()? {
+                ScanWork::Data(id, data) => return Some(Ok((id, data))),
+                ScanWork::Locators(id, candidates) => {
+                    match self
+                        .store
+                        .resolve_from_pinned(&id, &candidates, &self.pinned, false)
+                    {
+                        Ok(Some(data)) => return Some(Ok((id, data))),
+                        // A candidate set with no hash match is a tag
+                        // collision: the key's real locator was not in this
+                        // snapshot, so skip it rather than fail the scan.
+                        Ok(None) => {}
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Index tables that must advance together when a reader reloads a checkpoint.
 /// Individual table guards are mapped from this shared lock, so a reload's
 /// replacement is indivisible with respect to every table lookup.
@@ -3879,6 +3926,143 @@ impl PackfileStorage {
     /// bound.
     fn record_disk_len_at(shard: &Shard, offset: u64) -> Result<u64, StorageError> {
         ShardPool::record_disk_len_at(shard, offset)
+    }
+
+    /// Stream every live record of one collection from a single consistent
+    /// snapshot.
+    ///
+    /// The snapshot is a pinned generation plus the pack-file lengths captured
+    /// with it, so the scan yields exactly the keys [`Self::get`] would resolve
+    /// at that boundary — one live record per key, never a superseded version —
+    /// and excludes records appended after the boundary (the incremental path's
+    /// responsibility). If a concurrent repack swaps the generation, which can
+    /// retire the pinned shards, the scan restarts against the new generation,
+    /// mirroring `get`.
+    ///
+    /// When a read-committed journal overlay is installed, its committed puts
+    /// are merged in and win over the durable index (matching
+    /// `get_read_committed`), and a collection delete the durable index does not
+    /// yet reflect suppresses durable records entirely, so a live multi-reader
+    /// store is scanned completely.
+    ///
+    /// The scan covers bytes durable on disk at the boundary: writes still
+    /// buffered in this process are not included, since a rebuild exists to
+    /// recover what a crash left on disk.
+    ///
+    /// # Errors
+    /// Propagates pack-file read errors and journal-refresh errors
+    /// ([`StorageError::Corrupt`] / [`StorageError::Io`]).
+    pub fn scan_collection(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<CollectionScan<'_>, StorageError> {
+        // Snapshot the read-committed overlay once: committed-but-unflushed
+        // puts, plus the per-collection delete boundary a reader's stale index
+        // may not yet cover.
+        let (overlay_puts, overlay_deletes) = {
+            let guard = self.refresh_read_journal()?;
+            match guard.as_ref() {
+                Some(journal) => {
+                    let deleted = journal.delete_lsn.contains_key(collection_id);
+                    let puts: HashMap<NodeId, NodeData> = journal
+                        .puts
+                        .get(collection_id)
+                        .map(|committed| {
+                            committed
+                                .iter()
+                                .map(|(id, (payload, _lsn))| (*id, NodeData::new(payload.clone())))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (puts, deleted)
+                }
+                None => (HashMap::new(), false),
+            }
+        };
+
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let shards = self.shards.all_shards();
+            let mut pinned: HashMap<u16, Arc<Shard>> = HashMap::new();
+            let mut work: Vec<ScanWork> = Vec::new();
+
+            // A delete visible only in the overlay means the reader's durable
+            // index may still hold pre-delete records, so it cannot be trusted
+            // for this collection; the overlay puts are the whole answer.
+            if !overlay_deletes && gen_guard.is_some() {
+                let ends: HashMap<u16, u64> = shards
+                    .iter()
+                    .map(|(slot, shard)| (*slot, shard.file_len()))
+                    .collect();
+                let mut keys: Vec<NodeId> = Vec::new();
+                let mut seen: HashSet<NodeId> = HashSet::new();
+                for (slot, shard) in &shards {
+                    let end = ends[slot];
+                    for entry in packfile::scan_packfile_iter(&shard.path, false)? {
+                        let (record_collection, hash, offset) = entry?;
+                        if record_collection != *collection_id {
+                            continue;
+                        }
+                        // The scanner streams in file order, so crossing the
+                        // captured length means every later entry is
+                        // post-boundary.
+                        if offset >= end {
+                            break;
+                        }
+                        if seen.insert(hash) {
+                            keys.push(hash);
+                        }
+                    }
+                }
+                let index = gen_guard.as_deref().map(|generation| &generation.index);
+                for id in keys {
+                    if overlay_puts.contains_key(&id) {
+                        // The overlay value is newer than the durable one.
+                        continue;
+                    }
+                    let candidates: Vec<(u16, u64)> =
+                        index.map_or_else(Vec::new, |index| index.lookup_all(&id).collect());
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    for &(slot, _) in &candidates {
+                        if let Some((_, shard)) = shards.iter().find(|(s, _)| *s == slot) {
+                            pinned.entry(slot).or_insert_with(|| Arc::clone(shard));
+                        }
+                    }
+                    work.push(ScanWork::Locators(id, candidates));
+                }
+            }
+
+            // Retry if a repack swapped the generation between the pin and the
+            // walk, exactly as `get` does: the pinned shards may be retired.
+            let still_current = match gen_guard.as_ref() {
+                Some(loaded) => {
+                    let current = self.generation(collection_id);
+                    Self::same_generation(current.as_ref(), loaded)
+                }
+                None => true,
+            };
+            if !still_current {
+                continue;
+            }
+
+            for (id, data) in &overlay_puts {
+                let position = work.iter().position(
+                    |item| matches!(item, ScanWork::Locators(work_id, _) if work_id == id),
+                );
+                match position {
+                    Some(position) => work[position] = ScanWork::Data(*id, data.clone()),
+                    None => work.push(ScanWork::Data(*id, data.clone())),
+                }
+            }
+
+            return Ok(CollectionScan {
+                store: self,
+                pinned,
+                pending: work.into_iter(),
+            });
+        }
     }
 
     fn scan_collection_records(
@@ -19851,6 +20035,132 @@ mod tests {
         );
         drop(writer);
         drop(reopen_and_read_all(&dir, &wal, 3));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_collection_yields_each_live_key_once() {
+        let dir = test_dir("scan_collection_basic");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x5au8; 16];
+        for value in 0..32u8 {
+            store
+                .put(
+                    &collection,
+                    &distinct_id(value),
+                    &NodeData::new(bytes::Bytes::from(vec![value])),
+                )
+                .unwrap();
+        }
+        store.sync().unwrap();
+
+        let mut scanned: Vec<(NodeId, u8)> = store
+            .scan_collection(&collection)
+            .unwrap()
+            .map(|entry| {
+                let (id, data) = entry.unwrap();
+                (id, data.bytes[0])
+            })
+            .collect();
+        scanned.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(scanned.len(), 32);
+        for (position, (id, value)) in scanned.iter().enumerate() {
+            let expected = u8::try_from(position).expect("32 records fit in u8");
+            assert_eq!(*id, distinct_id(expected));
+            assert_eq!(*value, expected);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_collection_skips_superseded_versions() {
+        let dir = test_dir("scan_collection_superseded");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x6bu8; 16];
+        let key = distinct_id(7);
+        store
+            .put(
+                &collection,
+                &key,
+                &NodeData::new(bytes::Bytes::from_static(b"old")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        store
+            .put(
+                &collection,
+                &key,
+                &NodeData::new(bytes::Bytes::from_static(b"new")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        let scanned: Vec<(NodeId, bytes::Bytes)> = store
+            .scan_collection(&collection)
+            .unwrap()
+            .map(|entry| {
+                let (id, data) = entry.unwrap();
+                (id, data.bytes)
+            })
+            .collect();
+        assert_eq!(scanned.len(), 1, "each key is yielded once");
+        assert_eq!(scanned[0].0, key);
+        assert_eq!(scanned[0].1.as_ref(), b"new", "the live version wins");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_collection_isolates_the_requested_collection() {
+        let dir = test_dir("scan_collection_isolated");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let wanted = [0x81u8; 16];
+        let other = [0x82u8; 16];
+        store
+            .put(
+                &wanted,
+                &distinct_id(1),
+                &NodeData::new(bytes::Bytes::from_static(b"a")),
+            )
+            .unwrap();
+        store
+            .put(
+                &other,
+                &distinct_id(2),
+                &NodeData::new(bytes::Bytes::from_static(b"b")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+
+        let scanned: Vec<NodeId> = store
+            .scan_collection(&wanted)
+            .unwrap()
+            .map(|entry| entry.unwrap().0)
+            .collect();
+        assert_eq!(scanned, vec![distinct_id(1)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_collection_is_empty_after_delete() {
+        let dir = test_dir("scan_collection_deleted");
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        let collection = [0x7cu8; 16];
+        store
+            .put(
+                &collection,
+                &distinct_id(1),
+                &NodeData::new(bytes::Bytes::from_static(b"x")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        store.delete_collection(&collection).unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(
+            store.scan_collection(&collection).unwrap().count(),
+            0,
+            "a deleted collection scans empty"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
