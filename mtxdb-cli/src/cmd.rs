@@ -3479,7 +3479,7 @@ fn stats_json_object(
         let _ = writeln!(
             shards,
             "    {{\"pack_id\":{},\"bytes\":{},\"writes\":{},\"syncs\":{}}}{comma}",
-            summary.pack_id,
+            json_string(&summary.pack_id.to_string()),
             summary.stats.bytes_written,
             summary.stats.write_count,
             summary.stats.sync_count
@@ -11316,6 +11316,28 @@ mod tests {
         cmd_stats(&cli, false).unwrap();
         cmd_stats(&cli, true).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stats_json_quotes_the_pack_id() {
+        // `PackId`'s Display is `0x<hex>`, which is not a bare JSON number, so
+        // the shard entry must render it as a quoted string.
+        let id = mtxdb::packfile::PackId::from_hex("ab12cd34ef567890ab12cd34ef567890").unwrap();
+        let summaries = [mtxdb::shard::ShardSummary {
+            slot: 0,
+            pack_id: id,
+            file_bytes: 4096,
+            stats: mtxdb::shard::ShardStats::default(),
+        }];
+        let json = super::stats_json_object(
+            std::path::Path::new("/nonexistent"),
+            &mtxdb::packfile::storage::RuntimeStats::default(),
+            &summaries,
+        );
+        assert!(
+            json.contains("\"pack_id\":\"0xab12cd34ef567890ab12cd34ef567890\""),
+            "{json}"
+        );
     }
 
     #[test]
