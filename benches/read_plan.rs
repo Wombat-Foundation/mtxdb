@@ -698,13 +698,12 @@ fn repack_once(
     policy: ReadPlanPolicy,
     eviction: Eviction,
 ) -> Duration {
-    if eviction == Eviction::Manual {
-        wait_for_manual_drop(&format!("repack / {policy_name}"));
-    }
-
     // Reset the working copy to the pristine post-ingest store.
     let _ = fs::remove_dir_all(work);
     copy_dir(pristine, work).expect("copy pristine store for repack pass");
+    if eviction == Eviction::Manual {
+        wait_for_manual_drop(&format!("repack / {policy_name}"));
+    }
     let _ = evict(work, eviction);
 
     let store = PackfileStorage::open(work.to_path_buf()).unwrap();
@@ -727,8 +726,15 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
             copy_dir(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), target)?;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dst.join(entry.file_name()))?
+                .sync_all()?;
         }
     }
+    #[cfg(not(windows))]
+    fs::File::open(dst)?.sync_all()?;
     Ok(())
 }
 
@@ -1196,7 +1202,7 @@ fn main() {
         );
         eprintln!("  A cold read is impossible there. Point MTXDB_BENCH_ROOT at a");
         eprintln!("  real disk, e.g.:");
-        eprintln!("    MTXDB_BENCH_ROOT=/run/media/shane/shane4tb-ent/bench-scratch \\");
+        eprintln!("    MTXDB_BENCH_ROOT=/path/to/bench-scratch \\");
         eprintln!("      cargo bench --bench read_plan");
         let _ = fs::remove_dir_all(&root);
         std::process::exit(1);
