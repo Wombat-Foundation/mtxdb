@@ -4264,7 +4264,21 @@ impl PackfileStorage {
         overlay_deletes: bool,
         put_guard: &mut Option<MutexGuard<'_, ()>>,
     ) -> Result<CollectionScan<'_>, StorageError> {
-        let generation = self.generation(collection_id);
+        // ArcSwap keeps the generation itself stable, but a non-mmap index is
+        // updated in place by puts. Copy that index while the put lock is held
+        // so locator resolution after the unlock still uses this boundary.
+        let generation = self.generation(collection_id).map(|guard| {
+            let generation = Arc::clone(&*guard);
+            if generation.index.is_mmap_backed() {
+                generation
+            } else {
+                Arc::new(RoomGeneration {
+                    index: generation.index.clone(),
+                    cache: Arc::clone(&generation.cache),
+                    generation: generation.generation,
+                })
+            }
+        });
         let shards = self.shards.all_shards();
 
         // A delete visible only in the overlay means the reader's durable

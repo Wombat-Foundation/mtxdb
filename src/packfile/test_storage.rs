@@ -9469,6 +9469,45 @@ fn scan_collection_excludes_a_post_snapshot_append() {
 }
 
 #[test]
+fn scan_collection_keeps_a_pre_snapshot_overwrite() {
+    let dir = test_dir("scan_collection_overwrite_boundary");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let collection = [0x94u8; 16];
+    let key = distinct_id(1);
+    store
+        .put(
+            &collection,
+            &key,
+            &NodeData::new(bytes::Bytes::from_static(b"before")),
+        )
+        .unwrap();
+    store.sync().unwrap();
+
+    // The index snapshot is captured while scan_collection holds the put
+    // lock. An overwrite after it returns must not change the lazy result.
+    let scan = store.scan_collection(&collection).unwrap();
+    store
+        .put(
+            &collection,
+            &key,
+            &NodeData::new(bytes::Bytes::from_static(b"after")),
+        )
+        .unwrap();
+    store.sync().unwrap();
+
+    let scanned: Vec<(NodeId, bytes::Bytes)> = scan
+        .map(|entry| {
+            let (id, data) = entry.unwrap();
+            (id, data.bytes)
+        })
+        .collect();
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned[0].0, key);
+    assert_eq!(scanned[0].1.as_ref(), b"before");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scan_collection_at_snapshot_replays_later_durable_groups() {
     let dir = test_dir("scan_collection_replay_boundary");
     let wal = dir.join("wal.bin");

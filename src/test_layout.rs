@@ -1,5 +1,28 @@
 use super::{DatabaseLayout, ShardType, DB_META_FILENAME};
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CLEANUP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct CleanupDir(PathBuf);
+
+impl CleanupDir {
+    fn new(name: &str) -> Self {
+        let id = CLEANUP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(std::env::temp_dir().join(format!("mtxdb-layout-{name}-{}-{id}", std::process::id())))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn test_dir(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("mtxdb-layout-{name}-{}", std::process::id()));
@@ -78,10 +101,11 @@ fn initializes_named_pool_layout() {
 
 #[test]
 fn concurrent_first_open_installs_one_complete_descriptor() {
-    let root = test_dir("concurrent_first_open");
+    let root = CleanupDir::new("concurrent_first_open");
+    let root_path = root.path().to_path_buf();
     let workers: Vec<_> = (0..8)
         .map(|_| {
-            let root = root.clone();
+            let root = root_path.clone();
             std::thread::spawn(move || DatabaseLayout::open(root).unwrap())
         })
         .collect();
@@ -90,9 +114,9 @@ fn concurrent_first_open_installs_one_complete_descriptor() {
     }
 
     assert!(super::validate_db_meta(
-        &fs::read(root.join(DB_META_FILENAME)).unwrap()
+        &fs::read(root.path().join(DB_META_FILENAME)).unwrap()
     ));
-    assert!(fs::read_dir(&root).unwrap().all(|entry| {
+    assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
         !entry
             .unwrap()
             .file_name()
@@ -103,10 +127,10 @@ fn concurrent_first_open_installs_one_complete_descriptor() {
 
 #[test]
 fn descriptor_install_falls_back_to_rename_when_hard_links_are_unavailable() {
-    let root = test_dir("hard_link_fallback");
-    fs::create_dir_all(&root).unwrap();
-    let temporary = root.join(".db.meta.create.test");
-    let descriptor = root.join(DB_META_FILENAME);
+    let root = CleanupDir::new("hard_link_fallback");
+    fs::create_dir_all(root.path()).unwrap();
+    let temporary = root.path().join(".db.meta.create.test");
+    let descriptor = root.path().join(DB_META_FILENAME);
     fs::write(&temporary, super::db_meta_bytes()).unwrap();
 
     super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |_, _| {
@@ -123,10 +147,10 @@ fn descriptor_install_falls_back_to_rename_when_hard_links_are_unavailable() {
 
 #[test]
 fn descriptor_install_accepts_a_temp_swept_by_a_concurrent_opener() {
-    let root = test_dir("swept_temp_race");
-    fs::create_dir_all(&root).unwrap();
-    let temporary = root.join(".db.meta.create.racing.1");
-    let descriptor = root.join(DB_META_FILENAME);
+    let root = CleanupDir::new("swept_temp_race");
+    fs::create_dir_all(root.path()).unwrap();
+    let temporary = root.path().join(".db.meta.create.racing.1");
+    let descriptor = root.path().join(DB_META_FILENAME);
     fs::write(&temporary, super::db_meta_bytes()).unwrap();
 
     super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |temp, target| {
@@ -144,14 +168,14 @@ fn descriptor_install_accepts_a_temp_swept_by_a_concurrent_opener() {
 
 #[test]
 fn first_open_reaps_orphaned_descriptor_temps() {
-    let root = test_dir("orphaned_descriptor_temps");
-    fs::create_dir_all(&root).unwrap();
-    let orphan = root.join(".db.meta.create.dead.1");
+    let root = CleanupDir::new("orphaned_descriptor_temps");
+    fs::create_dir_all(root.path()).unwrap();
+    let orphan = root.path().join(".db.meta.create.dead.1");
     fs::write(&orphan, b"interrupted descriptor").unwrap();
 
-    DatabaseLayout::open(root.clone()).unwrap();
+    DatabaseLayout::open(root.path().to_path_buf()).unwrap();
 
-    assert!(root.join(DB_META_FILENAME).is_file());
+    assert!(root.path().join(DB_META_FILENAME).is_file());
     assert!(!orphan.exists());
 }
 

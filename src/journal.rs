@@ -1871,6 +1871,7 @@ struct ReplayPageStatsAtomic {
 struct ChangesWindow {
     base_lsn: u64,
     end: u64,
+    expected_lsn: u64,
     has_durable_group: bool,
     directory_trusted: bool,
 }
@@ -2615,9 +2616,14 @@ impl JournalCoordinator {
         let end = last_durable_group
             .as_ref()
             .map_or(cursor.resume_offset, |group| group.end_offset);
+        let expected_lsn = journal
+            .groups
+            .get(first)
+            .map_or(journal.next_lsn, |group| group.first_lsn);
         Ok(ChangesWindow {
             base_lsn: journal.base_lsn,
             end,
+            expected_lsn,
             has_durable_group: last_durable_group.is_some(),
             directory_trusted: journal.directory_matches_file() && !changes_since_force_untrusted(),
         })
@@ -2652,7 +2658,7 @@ impl JournalCoordinator {
             &self.path,
             cursor.resume_offset,
             end,
-            cursor.lsn.saturating_add(1),
+            window.expected_lsn,
         ) {
             let idle_tail =
                 scan.valid_len == cursor.resume_offset && scan.base_lsn == cursor.base_lsn;
