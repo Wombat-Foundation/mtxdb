@@ -384,10 +384,11 @@ impl DatabaseTransaction<'_> {
         if self.stage.state() == TxnStageState::Active {
             if self.stage.is_empty() {
                 let expectations = self.stage.expectations();
-                if !expectations.is_empty() {
+                let record_expectations = self.stage.record_expectations();
+                if !expectations.is_empty() || !record_expectations.is_empty() {
                     self.database
                         .coordinator
-                        .check_expectations(&expectations)
+                        .check_expectations(&expectations, &record_expectations)
                         .map_err(stale_read_from_publish)?;
                 }
                 self.stage
