@@ -1390,6 +1390,30 @@ impl JournalCursor {
     }
 }
 
+/// RAII pin that prevents journal reclaim from passing a replay cursor.
+///
+/// Keep this value alive while consuming pages from the cursor. Dropping it
+/// releases the retained-history guarantee; it deliberately pins the original
+/// cursor rather than advancing with individual pages, so an interrupted or
+/// partially applied replay can safely resume from its starting snapshot.
+#[must_use = "dropping the replay lease allows journal reclaim to expire its cursor"]
+pub struct JournalReplayLease {
+    registry: Arc<ReplayLeaseRegistry>,
+    id: u64,
+}
+
+impl Drop for JournalReplayLease {
+    fn drop(&mut self) {
+        self.registry.pins.lock().remove(&self.id);
+    }
+}
+
+#[derive(Default)]
+struct ReplayLeaseRegistry {
+    /// Lease ID to the last LSN represented by its snapshot cursor.
+    pins: Mutex<HashMap<u64, u64>>,
+}
+
 /// One bounded page of complete journal groups after a [`JournalCursor`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalChangesPage {
@@ -1637,6 +1661,11 @@ pub struct JournalCoordinator {
     /// created by [`Self::enable_publish_signal`]; a coordinator with no
     /// signal cannot enable the worker fast path.
     publish_signal: std::sync::OnceLock<Result<Arc<PublishSignal>, (io::ErrorKind, String)>>,
+    /// Active replay cursors pin the retained WAL prefix until their lease is
+    /// dropped. Shared by leases so their Drop implementation can release a
+    /// pin even after the coordinator borrow has ended.
+    replay_leases: Arc<ReplayLeaseRegistry>,
+    next_replay_lease: AtomicU64,
 }
 
 impl JournalCoordinator {
@@ -1713,6 +1742,8 @@ impl JournalCoordinator {
             commit_records: AtomicU64::new(0),
             max_commit_records: AtomicU64::new(0),
             publish_signal: std::sync::OnceLock::new(),
+            replay_leases: Arc::new(ReplayLeaseRegistry::default()),
+            next_replay_lease: AtomicU64::new(1),
         }
     }
 
@@ -1862,9 +1893,20 @@ impl JournalCoordinator {
             };
             match boundary {
                 SharedBoundary::Through(covered_lsn, blocked_by) => {
-                    let reclaimed = journal
-                        .reclaim_through_with_blocker(covered_lsn, blocked_by)
-                        .map(Some);
+                    // Shared reclaim computes its own per-group/per-pool
+                    // boundary, so apply the replay floor after that decision
+                    // and before the segment rewrite. The lease is global to
+                    // this segment and therefore protects groups from every
+                    // pool, including groups whose pool coverage is complete.
+                    let replay_limit = self.replay_reclaim_limit(covered_lsn);
+                    let blocked_by = (replay_limit == covered_lsn)
+                        .then_some(blocked_by)
+                        .flatten();
+                    let reclaimed = journal.reclaim_through_with_blocker(replay_limit, blocked_by);
+                    if reclaimed.is_ok() {
+                        self.bump_publish_signal();
+                    }
+                    let reclaimed = reclaimed.map(Some);
                     let coverage = self.coverage.lock();
                     self.record_reclaim_outcome(&journal, &coverage.covered);
                     return reclaimed;
@@ -2073,6 +2115,69 @@ impl JournalCoordinator {
         })
     }
 
+    /// Pin the journal history required by `cursor` until the returned lease
+    /// is dropped. The pin and reclaim share the `sync_lock` -> `journal` lock
+    /// order, so reclaim either observes this lease or completes first and
+    /// causes an explicit expired-cursor error here.
+    pub(crate) fn pin_replay_cursor(
+        &self,
+        cursor: &JournalCursor,
+    ) -> io::Result<JournalReplayLease> {
+        if cursor.path != self.path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal cursor belongs to a different segment",
+            ));
+        }
+        let signal = self.publish_signal().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "replay leases require an installed publish signal",
+            )
+        })?;
+
+        let _sync = self.sync_lock.lock();
+        let journal = self.journal.lock();
+        if signal.snapshot().0 != cursor.incarnation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal cursor belongs to a previous writer incarnation",
+            ));
+        }
+        if cursor.lsn.saturating_add(1) < journal.base_lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal cursor expired at LSN {}; retained history starts at {}",
+                    cursor.lsn, journal.base_lsn
+                ),
+            ));
+        }
+
+        let id = self
+            .next_replay_lease
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| io::Error::other("journal replay lease IDs exhausted"))?;
+        self.replay_leases.pins.lock().insert(id, cursor.lsn);
+        Ok(JournalReplayLease {
+            registry: Arc::clone(&self.replay_leases),
+            id,
+        })
+    }
+
+    /// Highest LSN reclaim may pass without expiring an active replay cursor.
+    fn replay_reclaim_limit(&self, covered_lsn: u64) -> u64 {
+        self.replay_leases
+            .pins
+            .lock()
+            .values()
+            .copied()
+            .min()
+            .map_or(covered_lsn, |pin| covered_lsn.min(pin))
+    }
+
     /// Read a bounded page of complete, durable groups after `cursor`.
     ///
     /// Pages preserve group boundaries and journal order. The durable horizon
@@ -2083,7 +2188,8 @@ impl JournalCoordinator {
     /// to remove history; if it has advanced past the cursor, this returns an
     /// `InvalidData` error so the caller can discard its partial rebuild and
     /// take a fresh snapshot. This method does not retain a lease across page
-    /// calls, so callers must handle that retry case.
+    /// calls. Hold a [`JournalReplayLease`] from the snapshot cursor while
+    /// paging if reclaim must not expire it during a long replay.
     ///
     /// # Errors
     /// Returns `InvalidInput` for a foreign cursor or zero page size, and
@@ -3144,7 +3250,8 @@ impl JournalCoordinator {
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
-        let reclaim = journal.reclaim_through(covered_lsn)?;
+        let replay_limit = self.replay_reclaim_limit(covered_lsn);
+        let reclaim = journal.reclaim_through(replay_limit)?;
         // The rewrite replaced the segment inode and moved its base LSN without
         // necessarily publishing a group. Advance the signal so a gated reader
         // rescans and detects the base jump instead of serving an index older
@@ -3163,7 +3270,11 @@ impl JournalCoordinator {
     ) -> io::Result<Reclaim> {
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
-        let reclaim = journal.reclaim_through_with_blocker(covered_lsn, blocked_by)?;
+        let replay_limit = self.replay_reclaim_limit(covered_lsn);
+        let blocked_by = (replay_limit == covered_lsn)
+            .then_some(blocked_by)
+            .flatten();
+        let reclaim = journal.reclaim_through_with_blocker(replay_limit, blocked_by)?;
         // See [`Self::reclaim_through`]: a reader gated on the signal must be
         // forced to rescan after the segment is rewritten in place.
         self.bump_publish_signal();

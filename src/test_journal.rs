@@ -2046,6 +2046,68 @@ fn changes_since_reports_cursor_expired_after_reclaim() {
 }
 
 #[test]
+fn replay_lease_pins_the_original_cursor_until_drop() {
+    let coordinator = open_replay_arc("changes_since_lease");
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+    assert!(!page.has_more);
+    drop(lease);
+
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
+    use crate::layout::ShardType;
+
+    let path = temp_path("shared_replay_lease");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator
+        .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"replay")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    coordinator.report_pool_coverage(ShardType::State, second.last_lsn);
+    coordinator.report_pool_coverage(ShardType::EventDag, second.last_lsn);
+
+    coordinator.reclaim_shared().unwrap();
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+
+    drop(lease);
+    coordinator.reclaim_shared().unwrap();
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn changes_since_rejects_a_cursor_from_a_previous_writer_incarnation() {
     let coordinator = open_replay_arc("changes_since_restart");
     let path = coordinator.path();

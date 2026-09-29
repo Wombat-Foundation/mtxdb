@@ -9425,7 +9425,7 @@ fn scan_collection_at_snapshot_replays_later_durable_groups() {
             &NodeData::new(bytes::Bytes::from_static(b"before")),
         )
         .unwrap();
-    let (scan, cursor) = store.scan_collection_at_snapshot(&collection).unwrap();
+    let (scan, cursor, _lease) = store.scan_collection_at_snapshot(&collection).unwrap();
 
     store
         .put(
@@ -9467,6 +9467,140 @@ fn scan_collection_at_snapshot_requires_a_journal() {
         panic!("replayable scans require a journal");
     };
     assert!(error.is_unsupported(), "expected Unsupported, got {error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_collection_at_snapshot_excludes_the_read_journal_overlay() {
+    let dir = test_dir("scan_collection_replay_with_reader_overlay");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(0x96),
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+    store.sync().unwrap();
+
+    // This is normally only installed on a read-only worker. The replayable
+    // scan is pack-only, so an overlay mutation cannot be returned both here
+    // and by changes_since.
+    store.enable_read_journal(&wal).unwrap();
+    let later = distinct_id(0x97);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &later,
+            &NodeData::new(bytes::Bytes::from_static(b"later")),
+        )
+        .unwrap();
+
+    let (scan, cursor, _lease) = store.scan_collection_at_snapshot(&TEST_COLLECTION).unwrap();
+    let scanned: Vec<NodeId> = scan.map(|entry| entry.unwrap().0).collect();
+    assert_eq!(scanned, vec![distinct_id(0x96), later]);
+    let changes = store.journal().unwrap().changes_since(&cursor, 8).unwrap();
+    assert!(
+        changes.groups.is_empty(),
+        "scanned records are not replayed"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "multi-reader")]
+#[test]
+fn replayable_scan_does_not_hold_transaction_lifecycle_lock_during_pack_walk() {
+    use crate::layout::ShardType;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    let dir = test_dir("scan_collection_lifecycle_window");
+    let wal = dir.join("wal.bin");
+    let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+    store.enable_journal(&wal).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(0x98),
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+
+    let (parked_tx, parked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    *store.replay_snapshot_hook.lock() = Some(Arc::new(move || {
+        parked_tx.send(()).ok();
+        release_rx.lock().unwrap().recv().ok();
+    }));
+
+    let scan_store = Arc::clone(&store);
+    let scanner = std::thread::spawn(move || {
+        let (scan, cursor, lease) = scan_store
+            .scan_collection_at_snapshot(&TEST_COLLECTION)
+            .unwrap();
+        (
+            scan.map(|entry| entry.unwrap().0).collect::<Vec<_>>(),
+            cursor,
+            lease,
+        )
+    });
+    parked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("snapshot should reach WAL sync");
+
+    let (activated_tx, activated_rx) = mpsc::channel();
+    let activate_store = Arc::clone(&store);
+    let post_boundary_id = distinct_id(0x99);
+    let activator = std::thread::spawn(move || {
+        if activate_store
+            .activate_transaction_overlay(&wal, ShardType::State)
+            .is_err()
+        {
+            activated_tx.send(false).unwrap();
+            return;
+        }
+        activated_tx.send(true).unwrap();
+        activate_store
+            .put(
+                &TEST_COLLECTION,
+                &post_boundary_id,
+                &NodeData::new(bytes::Bytes::from_static(b"after boundary")),
+            )
+            .unwrap();
+        activate_store.deactivate_transaction_overlay();
+    });
+    let activated = activated_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or(false);
+
+    release_tx.send(()).unwrap();
+    let (scan_results, cursor, _lease) = scanner.join().unwrap();
+    activator.join().unwrap();
+    assert!(
+        activated,
+        "transaction activation must not wait for the pack walk"
+    );
+    assert_eq!(scan_results, vec![distinct_id(0x98)]);
+    let journal = store.journal().unwrap();
+    journal.sync().unwrap();
+    let replay = journal.changes_since(&cursor, 8).unwrap();
+    let replayed_ids: Vec<NodeId> = replay
+        .groups
+        .iter()
+        .flat_map(|group| group.entries.iter())
+        .filter_map(|entry| match &entry.mutation {
+            JournalMutation::Put {
+                collection_id,
+                node_id,
+                ..
+            } if *collection_id == TEST_COLLECTION => Some(*node_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed_ids, vec![post_boundary_id]);
     let _ = fs::remove_dir_all(&dir);
 }
 

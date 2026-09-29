@@ -19,7 +19,7 @@ use crate::index::{EntryUndo, InsertError, LossyIndex};
 use crate::journal::pool_tag;
 use crate::journal::{
     pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator,
-    Mutation as JournalMutation,
+    JournalReplayLease, Mutation as JournalMutation,
 };
 use crate::packfile::{self, FrameMetadata, PackId, Record};
 use crate::shard;
@@ -1894,6 +1894,11 @@ pub struct PackfileStorage {
     /// swapped in, so a test can hold recovery inside that window.
     #[cfg(test)]
     recovery_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only pause after replay boundary/lease capture and before the
+    /// pack walk, used to prove transaction activation is no longer serialized
+    /// with the long scan phase.
+    #[cfg(test)]
+    replay_snapshot_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Session state for the incremental index delta log: the base checkpoint
     /// fingerprint + generations the log continues, and the frames accumulated
     /// since the last persist. See [`DeltaLogState`].
@@ -2752,6 +2757,8 @@ impl PackfileStorage {
             shard_collections_failure_logged: AtomicBool::new(false),
             #[cfg(test)]
             recovery_pause_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            replay_snapshot_hook: parking_lot::Mutex::new(None),
             journal: parking_lot::Mutex::new(None),
             journal_pool: std::sync::atomic::AtomicU8::new(0),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
@@ -3972,35 +3979,37 @@ impl PackfileStorage {
     /// snapshot construction. Thus every mutation for this collection through
     /// the returned cursor is represented by the scan; later mutations receive
     /// larger LSNs and are available from [`JournalCoordinator::changes_since`].
-    /// A store without a journal cannot provide this contract.
+    /// The returned [`crate::journal::JournalReplayLease`] pins that history
+    /// until dropped, preventing either per-pool or shared-WAL reclaim from
+    /// expiring the cursor while the caller catches up.
     ///
     /// In multi-reader mode, a transaction publishes its journal group before
-    /// materializing its pack records. While any transaction overlay is active
-    /// this method returns `WouldBlock` instead of risking a cursor ahead of
-    /// the scanned packs. The lifecycle lock prevents a new transaction from
-    /// entering that interval during the snapshot and is held across the pack
-    /// flush, WAL sync, and collection walk; transaction activation/deactivation
-    /// can therefore wait for the duration of a large scan.
+    /// materializing its pack records. The lifecycle lock covers the active
+    /// transaction check and WAL-boundary capture, then is released before the
+    /// pack walk. A transaction that starts later cannot materialize this
+    /// collection while its put mutex is held, and this method scans packs only
+    /// (never the read-journal overlay), so its mutations remain strictly in
+    /// replay. The lock can span the WAL sync, but not the collection scan or
+    /// the preceding pack flush.
     ///
     /// # Errors
     /// Returns `Unsupported` when no journal is enabled, `WouldBlock` while a
-    /// transaction is being materialized, or propagates pack/WAL errors.
+    /// transaction is already being materialized, or propagates pack/WAL
+    /// errors. It also returns an expired-cursor error if reclaim wins the race
+    /// before the replay lease is installed; in that case retry the snapshot.
     pub fn scan_collection_at_snapshot(
         &self,
         collection_id: &[u8; 16],
-    ) -> Result<(CollectionScan<'_>, crate::journal::JournalCursor), StorageError> {
+    ) -> Result<
+        (
+            CollectionScan<'_>,
+            crate::journal::JournalCursor,
+            JournalReplayLease,
+        ),
+        StorageError,
+    > {
         let put_lock = self.put_mutex(collection_id);
         let _put_guard = put_lock.lock();
-
-        #[cfg(feature = "multi-reader")]
-        let _transaction_lifecycle = self.transaction_overlay_lifecycle.lock();
-        #[cfg(feature = "multi-reader")]
-        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
-            return Err(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "cannot capture a replayable scan while a transaction is materializing",
-            )));
-        }
 
         let journal = self.journal().ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
@@ -4009,21 +4018,50 @@ impl PackfileStorage {
             ))
         })?;
 
-        // Flush pack buffers before making the journal boundary durable. A
-        // target-collection put is excluded by `put_mutex`; unrelated writes
-        // may proceed, but their records are irrelevant to this collection.
+        // Flush before taking the transaction lifecycle lock. A target-
+        // collection put is excluded by `put_mutex`; unrelated writes may
+        // proceed, but their records are irrelevant to this collection.
         self.shards.flush_all()?;
-        journal.sync().map_err(StorageError::Io)?;
 
-        // This is the pool-specific materialized watermark (floored below any
-        // published-but-not-yet-materialized transaction), also floored by the
-        // durable checkpoint coverage when the retained WAL prefix is empty.
-        let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
-        let cursor = journal
-            .replay_cursor(covered_lsn)
-            .map_err(StorageError::Io)?;
-        let scan = self.scan_collection_locked(collection_id)?;
-        Ok((scan, cursor))
+        let capture_boundary =
+            || -> Result<(crate::journal::JournalCursor, JournalReplayLease), StorageError> {
+                journal.sync().map_err(StorageError::Io)?;
+
+                // This is the pool-specific materialized watermark (floored below
+                // any published-but-not-yet-materialized transaction), also
+                // floored by durable checkpoint coverage when the retained WAL
+                // prefix is empty.
+                let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
+                let cursor = journal
+                    .replay_cursor(covered_lsn)
+                    .map_err(StorageError::Io)?;
+                let lease = journal
+                    .pin_replay_cursor(&cursor)
+                    .map_err(StorageError::Io)?;
+                Ok((cursor, lease))
+            };
+
+        #[cfg(feature = "multi-reader")]
+        let (cursor, lease) = {
+            let _transaction_lifecycle = self.transaction_overlay_lifecycle.lock();
+            if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "cannot capture a replayable scan while a transaction is materializing",
+                )));
+            }
+            capture_boundary()?
+        };
+        #[cfg(not(feature = "multi-reader"))]
+        let (cursor, lease) = capture_boundary()?;
+
+        #[cfg(test)]
+        if let Some(hook) = self.replay_snapshot_hook.lock().take() {
+            hook();
+        }
+
+        let scan = self.scan_collection_packs_locked(collection_id)?;
+        Ok((scan, cursor, lease))
     }
 
     /// Build the pinned scan while the caller holds this collection's put
@@ -4056,6 +4094,26 @@ impl PackfileStorage {
             }
         };
 
+        self.scan_collection_with_overlay(collection_id, &overlay_puts, overlay_deletes)
+    }
+
+    /// Snapshot only materialized pack records. The replayable scan uses this
+    /// form so an overlay mutation beyond its cursor cannot be included both in
+    /// the scan and in subsequent WAL replay.
+    fn scan_collection_packs_locked(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<CollectionScan<'_>, StorageError> {
+        let overlay_puts = HashMap::new();
+        self.scan_collection_with_overlay(collection_id, &overlay_puts, false)
+    }
+
+    fn scan_collection_with_overlay(
+        &self,
+        collection_id: &[u8; 16],
+        overlay_puts: &HashMap<NodeId, NodeData>,
+        overlay_deletes: bool,
+    ) -> Result<CollectionScan<'_>, StorageError> {
         loop {
             let gen_guard = self.generation(collection_id);
             let shards = self.shards.all_shards();
