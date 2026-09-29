@@ -4188,13 +4188,13 @@ impl PackfileStorage {
         for (end, scanner) in scanners {
             for entry in scanner {
                 let (record_collection, hash, offset) = entry?;
-                if record_collection != *collection_id {
-                    continue;
-                }
                 // The scanner streams in file order, so crossing the captured
                 // length means every later entry is post-boundary.
                 if offset >= end {
                     break;
+                }
+                if record_collection != *collection_id {
+                    continue;
                 }
                 if seen.insert(hash) {
                     keys.push(hash);
