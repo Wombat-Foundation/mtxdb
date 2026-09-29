@@ -1,6 +1,11 @@
-use super::*;
-use crate::index::IndexConfig;
-use crate::index::LossyIndex;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::index::checkpoint::*;
+use mtxdb::index::format::{CheckpointHeader, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN};
+use mtxdb::index::IndexConfig;
+use mtxdb::index::LossyIndex;
+use std::io::Write;
+use std::sync::Arc;
 
 fn hash_for(seed: u16, i: usize) -> [u8; 16] {
     let mut hash = [0u8; 16];

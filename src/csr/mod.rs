@@ -277,8 +277,3 @@ impl std::fmt::Display for CsrError {
 }
 
 impl std::error::Error for CsrError {}
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-#[path = "test_csr.rs"]
-mod tests;

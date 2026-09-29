@@ -1,4 +1,9 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::cache::*;
+use std::sync::Arc;
+
+use mtxdb::storage::{NodeData, NodeId};
 
 fn test_data(s: &str) -> Arc<NodeData> {
     Arc::new(NodeData::new(bytes::Bytes::copy_from_slice(s.as_bytes())))

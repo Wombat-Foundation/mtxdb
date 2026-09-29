@@ -10,5 +10,18 @@
 //! This lives at `tests/unit/main.rs` rather than `tests/unit.rs` so a bare
 //! `mod X;` finds each sibling file directly. Cargo does not autodiscover
 //! `tests/unit/`, so `Cargo.toml` declares this target explicitly.
+//!
+//! The `test_*` submodules are public-API-only unit tests relocated out of
+//! `src/`; each carries `#![allow(clippy::tests_outside_test_module)]` since it
+//! is test code by construction rather than a `#[cfg(test)] mod tests`.
 
 mod index_checkpoint;
+mod test_cache;
+mod test_csr;
+mod test_dag;
+mod test_format;
+mod test_frontier;
+mod test_index_checkpoint;
+mod test_matrix_policy;
+mod test_packfile_layout;
+mod test_redo;

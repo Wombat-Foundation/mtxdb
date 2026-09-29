@@ -1,4 +1,7 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::index::redo::*;
+use mtxdb::index::IndexEntry;
 
 fn set(seq: u64) -> RedoRecord {
     RedoRecord {

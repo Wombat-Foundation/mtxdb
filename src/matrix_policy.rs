@@ -338,7 +338,3 @@ pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
         edges: crate::database::PoolPolicy::default(),
     }
 }
-
-#[cfg(test)]
-#[path = "test_matrix_policy.rs"]
-mod tests;

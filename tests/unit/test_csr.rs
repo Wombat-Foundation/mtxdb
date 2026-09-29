@@ -1,4 +1,7 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::csr::*;
+use std::collections::HashMap;
 
 fn h(byte: u8) -> [u8; 16] {
     let mut id = [0u8; 16];

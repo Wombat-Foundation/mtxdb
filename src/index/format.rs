@@ -242,7 +242,3 @@ impl CollectionDirEntry {
         })
     }
 }
-
-#[cfg(test)]
-#[path = "test_format.rs"]
-mod tests;

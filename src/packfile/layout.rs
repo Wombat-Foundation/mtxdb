@@ -167,7 +167,3 @@ fn finish_physical_run(layout: &mut PhysicalLayout, pack_id: u64, run: Option<([
     pack.segments = pack.segments.saturating_add(1);
     pack.largest_segment_bytes = pack.largest_segment_bytes.max(bytes);
 }
-
-#[cfg(test)]
-#[path = "test_layout.rs"]
-mod tests;

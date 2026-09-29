@@ -1,6 +1,10 @@
-use super::*;
-use crate::packfile::{write_header, write_record, Record};
+#![allow(clippy::tests_outside_test_module)]
+
 use bytes::Bytes;
+use mtxdb::packfile::layout::*;
+use mtxdb::packfile::{write_header, write_record, Record};
+use std::fs::File;
+use std::io;
 
 #[test]
 fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
@@ -47,7 +51,7 @@ fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
 
 #[test]
 fn avoidable_spread_excludes_a_collections_required_spill() {
-    let capacity = crate::shard::MAX_SHARD_BYTES;
+    let capacity = mtxdb::shard::MAX_SHARD_BYTES;
     let mut ideal = CollectionPhysicalLayout {
         disk_bytes: capacity.saturating_add(100),
         ..CollectionPhysicalLayout::default()
