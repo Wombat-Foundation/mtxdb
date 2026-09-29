@@ -1388,6 +1388,10 @@ pub struct JournalCursor {
     path: PathBuf,
     incarnation: u64,
     lsn: u64,
+    /// Segment base LSN when this cursor was created or last advanced. A reclaim
+    /// rewrite raises it, which is how an empty incremental read is told apart
+    /// from a legitimately idle one.
+    base_lsn: u64,
     /// Absolute file offset of the first byte after the group at `lsn`, so the
     /// next [`JournalCoordinator::changes_since`] page reads only the appended
     /// tail instead of rescanning the retained prefix. A reclaim rewrite moves
@@ -1511,6 +1515,28 @@ fn changes_since_force_untrusted() -> bool {
 fn changes_since_force_untrusted() -> bool {
     false
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Count of [`JournalCoordinator::changes_since`] calls that had to rebuild
+    /// from the file header instead of resuming incrementally, so a test can
+    /// prove a page stayed on the resume path.
+    static CHANGES_SINCE_FULL_SCANS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_changes_since_full_scan() {
+    CHANGES_SINCE_FULL_SCANS.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn changes_since_full_scans() -> u64 {
+    CHANGES_SINCE_FULL_SCANS.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn note_changes_since_full_scan() {}
 
 struct BackgroundCommitter {
     stop: Arc<AtomicBool>,
@@ -2184,11 +2210,15 @@ impl JournalCoordinator {
                 "replay cursors require an installed publish signal",
             )
         })?;
-        let resume_offset = self.journal.lock().resume_offset_for(lsn);
+        let (base_lsn, resume_offset) = {
+            let journal = self.journal.lock();
+            (journal.base_lsn, journal.resume_offset_for(lsn))
+        };
         Ok(JournalCursor {
             path: self.path.clone(),
             incarnation: signal.snapshot().0,
             lsn,
+            base_lsn,
             resume_offset,
         })
     }
@@ -2409,18 +2439,23 @@ impl JournalCoordinator {
         // A reclaim rewrites the retained prefix, moving every surviving group,
         // so the cursor's offset can point past the new end. That read succeeds
         // with no groups even though the window says groups follow; treat it as
-        // invalid and rebuild. An empty read is only trusted when the window
-        // itself holds no group past the offset.
+        // invalid and rebuild. An empty read is otherwise trusted when the
+        // window itself holds no group past the offset, or when the read stopped
+        // exactly at the cursor's offset with the segment base unchanged — a
+        // legitimately idle tail rather than a moved one.
         if let Ok(scan) = Journal::scan_read_only_range(
             &self.path,
             cursor.resume_offset,
             end,
             cursor.lsn.saturating_add(1),
         ) {
-            if !scan.groups.is_empty() || end == cursor.resume_offset {
+            let idle_tail =
+                scan.valid_len == cursor.resume_offset && scan.base_lsn == cursor.base_lsn;
+            if !scan.groups.is_empty() || end == cursor.resume_offset || idle_tail {
                 return Ok(scan);
             }
         }
+        note_changes_since_full_scan();
         Journal::scan_read_only(&self.path)
     }
 
@@ -2474,6 +2509,7 @@ impl JournalCoordinator {
         limit: usize,
         scan: Scan,
     ) -> JournalChangesPage {
+        let base_lsn = scan.base_lsn;
         let mut following = scan
             .groups
             .into_iter()
@@ -2498,6 +2534,7 @@ impl JournalCoordinator {
                 path: self.path.clone(),
                 incarnation,
                 lsn: through_lsn,
+                base_lsn,
                 resume_offset,
             },
             through_lsn,

@@ -1,6 +1,7 @@
 use super::{
-    set_changes_since_before_read_hook, set_changes_since_force_untrusted, BackgroundFailure,
-    BackgroundState, GroupCommitConfig, Journal, JournalCoordinator, Mutation,
+    changes_since_full_scans, set_changes_since_before_read_hook,
+    set_changes_since_force_untrusted, BackgroundFailure, BackgroundState, GroupCommitConfig,
+    Journal, JournalCoordinator, Mutation,
 };
 #[cfg(feature = "multi-reader")]
 use super::{TxnStage, TxnStageState};
@@ -2078,6 +2079,30 @@ fn changes_since_resumes_incrementally_without_a_directory() {
     assert_eq!(page_two.groups[0].last_lsn, second.last_lsn);
     assert!(!page_two.has_more);
 
+    set_changes_since_force_untrusted(false);
+}
+
+/// A cursor parked at the end of the segment with no directory must report an
+/// idle tail from its own offset, not rebuild from the file header.
+#[test]
+fn changes_since_keeps_an_idle_tail_on_the_resume_path() {
+    let dir = ReplayTestDir::new("changes_since_idle_tail");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator.publish_group(&[put(1, 1, b"one")]).unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+
+    set_changes_since_force_untrusted(true);
+    let full_scans = changes_since_full_scans();
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert!(page.groups.is_empty());
+    assert!(!page.has_more);
+    assert_eq!(page.next_cursor.resume_offset, cursor.resume_offset);
+    assert_eq!(
+        changes_since_full_scans(),
+        full_scans,
+        "an idle tail must stay on the resume path"
+    );
     set_changes_since_force_untrusted(false);
 }
 
