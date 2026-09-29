@@ -154,9 +154,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.4.7"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54413ede23c2daf518f35156dfde027feb2374004d63bd497f983c8db9c0e313"
+checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -264,9 +264,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "float-cmp"
@@ -578,7 +578,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a395f2d1019131fab3d6ac151658636b52820634"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "imbl",
  "rz-core",
@@ -605,7 +605,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "rz-core"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a395f2d1019131fab3d6ac151658636b52820634"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -621,7 +621,7 @@ dependencies = [
 [[package]]
 name = "rz-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a395f2d1019131fab3d6ac151658636b52820634"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "ryu",
 ]
@@ -629,7 +629,7 @@ dependencies = [
 [[package]]
 name = "rz-reconcile"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a395f2d1019131fab3d6ac151658636b52820634"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "base64 0.22.1",
  "sha2",
@@ -688,9 +688,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "smallvec"
-version = "1.16.1"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "subtle"
