@@ -1372,6 +1372,37 @@ impl DurabilityToken {
     }
 }
 
+/// Position in one journal from which a caller may replay later committed
+/// groups. Cursors are created by a snapshot scan and are intentionally opaque
+/// so they cannot be accidentally reused with a different journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalCursor {
+    path: PathBuf,
+    lsn: u64,
+}
+
+impl JournalCursor {
+    /// The last LSN represented by the snapshot.
+    #[must_use]
+    pub const fn lsn(&self) -> u64 {
+        self.lsn
+    }
+}
+
+/// One bounded page of complete journal groups after a [`JournalCursor`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalChangesPage {
+    /// Complete groups in journal order. Groups are never split across pages.
+    pub groups: Vec<CommittedGroup>,
+    /// Cursor to pass to the next page; advances across all groups in this
+    /// page, including groups whose mutations a caller later filters out.
+    pub next_cursor: JournalCursor,
+    /// Last LSN included by `next_cursor`.
+    pub through_lsn: u64,
+    /// Whether another currently durable group follows this page.
+    pub has_more: bool,
+}
+
 struct BackgroundCommitter {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -1993,6 +2024,75 @@ impl JournalCoordinator {
     #[must_use]
     pub fn committed_lsn(&self) -> u64 {
         self.committed_lsn.load(Ordering::Acquire)
+    }
+
+    /// Create a replay cursor at a materialized LSN for this journal.
+    ///
+    /// The caller must establish that the snapshot contains the records through
+    /// `lsn` before creating the cursor. The cursor is scoped to this journal
+    /// path; if reclaim has already removed required history,
+    /// [`Self::changes_since`] reports an expired-cursor error.
+    pub(crate) fn replay_cursor(&self, lsn: u64) -> JournalCursor {
+        JournalCursor {
+            path: self.path.clone(),
+            lsn,
+        }
+    }
+
+    /// Read a bounded page of complete, durable groups after `cursor`.
+    ///
+    /// Pages preserve group boundaries and journal order. Reclaim is allowed
+    /// to remove history; if it has advanced past the cursor, this returns an
+    /// `InvalidData` error so the caller can discard its partial rebuild and
+    /// take a fresh snapshot. This method does not retain a lease across page
+    /// calls, so callers must handle that retry case.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a foreign cursor or zero page size, and
+    /// `InvalidData` when the cursor's required history has been reclaimed.
+    pub fn changes_since(
+        &self,
+        cursor: &JournalCursor,
+        limit: usize,
+    ) -> io::Result<JournalChangesPage> {
+        if cursor.path != self.path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal cursor belongs to a different segment",
+            ));
+        }
+        if limit == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal changes page size must be nonzero",
+            ));
+        }
+
+        let scan = Journal::scan_read_only(&self.path)?;
+        if cursor.lsn.saturating_add(1) < scan.base_lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal cursor expired at LSN {}; retained history starts at {}",
+                    cursor.lsn, scan.base_lsn
+                ),
+            ));
+        }
+
+        let durable_lsn = self.committed_lsn();
+        let mut following = scan
+            .groups
+            .into_iter()
+            .filter(|group| group.last_lsn > cursor.lsn && group.last_lsn <= durable_lsn);
+        let selected: Vec<CommittedGroup> = following.by_ref().take(limit).collect();
+        let has_more = following.next().is_some();
+        let through_lsn = selected.last().map_or(cursor.lsn, |group| group.last_lsn);
+        Ok(JournalChangesPage {
+            groups: selected,
+            next_cursor: self.replay_cursor(through_lsn),
+            through_lsn,
+            has_more,
+        })
     }
 
     /// Path of the journal segment used by this coordinator.

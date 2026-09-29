@@ -1967,6 +1967,77 @@ fn open_arc(label: &str) -> Arc<JournalCoordinator> {
     Arc::new(JournalCoordinator::new(journal, &scan))
 }
 
+#[test]
+fn changes_since_pages_complete_groups_in_order() {
+    let coordinator = open_arc("changes_since_pages");
+    let first = coordinator
+        .publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [1; 16],
+            payload: b"one".to_vec(),
+        }])
+        .unwrap();
+    let second = coordinator
+        .publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [2; 16],
+            payload: b"two".to_vec(),
+        }])
+        .unwrap();
+    coordinator.sync().unwrap();
+
+    let start = coordinator.replay_cursor(0);
+    let page_one = coordinator.changes_since(&start, 1).unwrap();
+    assert_eq!(page_one.groups.len(), 1);
+    assert_eq!(page_one.groups[0].last_lsn, first.last_lsn);
+    assert!(page_one.has_more);
+
+    let page_two = coordinator.changes_since(&page_one.next_cursor, 1).unwrap();
+    assert_eq!(page_two.groups.len(), 1);
+    assert_eq!(page_two.groups[0].last_lsn, second.last_lsn);
+    assert!(!page_two.has_more);
+    assert_eq!(page_two.through_lsn, second.last_lsn);
+}
+
+#[test]
+fn changes_since_does_not_publish_visible_but_undurable_groups() {
+    let coordinator = open_arc("changes_since_undurable");
+    coordinator
+        .publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [1; 16],
+            payload: b"pending".to_vec(),
+        }])
+        .unwrap();
+    let cursor = coordinator.replay_cursor(0);
+
+    let before_sync = coordinator.changes_since(&cursor, 10).unwrap();
+    assert!(before_sync.groups.is_empty());
+    assert!(!before_sync.has_more);
+
+    coordinator.sync().unwrap();
+    let after_sync = coordinator.changes_since(&cursor, 10).unwrap();
+    assert_eq!(after_sync.groups.len(), 1);
+}
+
+#[test]
+fn changes_since_reports_cursor_expired_after_reclaim() {
+    let coordinator = open_arc("changes_since_expired");
+    let receipt = coordinator
+        .publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [1; 16],
+            payload: b"one".to_vec(),
+        }])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let stale = coordinator.replay_cursor(0);
+
+    coordinator.reclaim_through(receipt.last_lsn).unwrap();
+    let error = coordinator.changes_since(&stale, 10).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
 fn wait_until(mut condition: impl FnMut() -> bool, label: &str) {
     let start = std::time::Instant::now();
     let deadline = start.checked_add(Duration::from_secs(5)).unwrap_or(start);

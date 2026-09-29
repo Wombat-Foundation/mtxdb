@@ -3963,7 +3963,71 @@ impl PackfileStorage {
         // returned, so draining the scan does not block later puts.
         let put_lock = self.put_mutex(collection_id);
         let _put_guard = put_lock.lock();
+        self.scan_collection_locked(collection_id)
+    }
 
+    /// Take a collection scan paired with a durable journal cursor.
+    ///
+    /// The collection lock spans the pack flush, WAL durability barrier, and
+    /// snapshot construction. Thus every mutation for this collection through
+    /// the returned cursor is represented by the scan; later mutations receive
+    /// larger LSNs and are available from [`JournalCoordinator::changes_since`].
+    /// A store without a journal cannot provide this contract.
+    ///
+    /// In multi-reader mode, a transaction publishes its journal group before
+    /// materializing its pack records. While any transaction overlay is active
+    /// this method returns `WouldBlock` instead of risking a cursor ahead of
+    /// the scanned packs. The lifecycle lock prevents a new transaction from
+    /// entering that interval during the snapshot.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` when no journal is enabled, `WouldBlock` while a
+    /// transaction is being materialized, or propagates pack/WAL errors.
+    pub fn scan_collection_at_snapshot(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<(CollectionScan<'_>, crate::journal::JournalCursor), StorageError> {
+        let put_lock = self.put_mutex(collection_id);
+        let _put_guard = put_lock.lock();
+
+        #[cfg(feature = "multi-reader")]
+        let _transaction_lifecycle = self.transaction_overlay_lifecycle.lock();
+        #[cfg(feature = "multi-reader")]
+        if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "cannot capture a replayable scan while a transaction is materializing",
+            )));
+        }
+
+        let journal = self.journal().ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "replayable collection scans require an enabled journal",
+            ))
+        })?;
+
+        // Flush pack buffers before making the journal boundary durable. A
+        // target-collection put is excluded by `put_mutex`; unrelated writes
+        // may proceed, but their records are irrelevant to this collection.
+        self.shards.flush_all()?;
+        journal.sync().map_err(StorageError::Io)?;
+
+        // This is the pool-specific materialized watermark (floored below any
+        // published-but-not-yet-materialized transaction), also floored by the
+        // durable checkpoint coverage when the retained WAL prefix is empty.
+        let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
+        let cursor = journal.replay_cursor(covered_lsn);
+        let scan = self.scan_collection_locked(collection_id)?;
+        Ok((scan, cursor))
+    }
+
+    /// Build the pinned scan while the caller holds this collection's put
+    /// mutex. Shared by the ordinary and cursor-bearing entry points.
+    fn scan_collection_locked(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<CollectionScan<'_>, StorageError> {
         // Snapshot the read-committed overlay once: committed-but-unflushed
         // puts, plus the per-collection delete boundary a reader's stale index
         // may not yet cover.

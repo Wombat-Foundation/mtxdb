@@ -9408,6 +9408,93 @@ fn scan_collection_excludes_a_post_snapshot_append() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn scan_collection_at_snapshot_replays_later_durable_groups() {
+    let dir = test_dir("scan_collection_replay_boundary");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+    let collection = [0x92u8; 16];
+    let before = distinct_id(1);
+    let after = distinct_id(2);
+
+    store
+        .put(
+            &collection,
+            &before,
+            &NodeData::new(bytes::Bytes::from_static(b"before")),
+        )
+        .unwrap();
+    let (scan, cursor) = store.scan_collection_at_snapshot(&collection).unwrap();
+
+    store
+        .put(
+            &collection,
+            &after,
+            &NodeData::new(bytes::Bytes::from_static(b"after")),
+        )
+        .unwrap();
+    let journal = store.journal().unwrap();
+    journal.sync().unwrap();
+
+    let scanned: Vec<NodeId> = scan.map(|entry| entry.unwrap().0).collect();
+    assert_eq!(scanned, vec![before], "scan is fixed at its cursor");
+
+    let changes = journal.changes_since(&cursor, 16).unwrap();
+    let replayed: Vec<NodeId> = changes
+        .groups
+        .iter()
+        .flat_map(|group| group.entries.iter())
+        .filter_map(|entry| match &entry.mutation {
+            JournalMutation::Put {
+                collection_id,
+                node_id,
+                ..
+            } if *collection_id == collection => Some(*node_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, vec![after]);
+    assert!(!changes.has_more);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_collection_at_snapshot_requires_a_journal() {
+    let dir = test_dir("scan_collection_replay_without_wal");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let Err(error) = store.scan_collection_at_snapshot(&[0x93u8; 16]) else {
+        panic!("replayable scans require a journal");
+    };
+    assert!(
+        matches!(error, StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::Unsupported)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "multi-reader")]
+#[test]
+fn scan_collection_at_snapshot_rejects_an_active_transaction_overlay() {
+    let dir = test_dir("scan_collection_replay_transaction");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+    store
+        .transaction_overlay_users
+        .fetch_add(1, Ordering::AcqRel);
+
+    let Err(error) = store.scan_collection_at_snapshot(&[0x94u8; 16]) else {
+        panic!("snapshot cannot cross transaction materialization");
+    };
+    store
+        .transaction_overlay_users
+        .fetch_sub(1, Ordering::AcqRel);
+    assert!(
+        matches!(error, StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[cfg(feature = "multi-reader")]
 #[test]
 fn scan_collection_merges_the_read_committed_overlay() {
