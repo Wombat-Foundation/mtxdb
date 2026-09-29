@@ -146,3 +146,12 @@ PROJECT_CRATES ?= mtxdb-cli/
 sub:	##H Run a command for each crate (set c)
 	@test -n "${c}" || (echo "error: set c=<command>"; exit 1)
 	@for d in $(PROJECT_CRATES); do echo "--- $$d ---"; (cd $$d && ${c}) || exit 1; done
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Extras
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.PHONY: extras/cloc
+extras/cloc:
+	cloc HEAD --fmt=2
