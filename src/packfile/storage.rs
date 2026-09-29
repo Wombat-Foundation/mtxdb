@@ -3978,7 +3978,9 @@ impl PackfileStorage {
     /// materializing its pack records. While any transaction overlay is active
     /// this method returns `WouldBlock` instead of risking a cursor ahead of
     /// the scanned packs. The lifecycle lock prevents a new transaction from
-    /// entering that interval during the snapshot.
+    /// entering that interval during the snapshot and is held across the pack
+    /// flush, WAL sync, and collection walk; transaction activation/deactivation
+    /// can therefore wait for the duration of a large scan.
     ///
     /// # Errors
     /// Returns `Unsupported` when no journal is enabled, `WouldBlock` while a
@@ -4017,7 +4019,9 @@ impl PackfileStorage {
         // published-but-not-yet-materialized transaction), also floored by the
         // durable checkpoint coverage when the retained WAL prefix is empty.
         let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
-        let cursor = journal.replay_cursor(covered_lsn);
+        let cursor = journal
+            .replay_cursor(covered_lsn)
+            .map_err(StorageError::Io)?;
         let scan = self.scan_collection_locked(collection_id)?;
         Ok((scan, cursor))
     }

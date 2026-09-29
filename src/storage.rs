@@ -548,6 +548,22 @@ pub enum StorageError {
     Collision(String),
 }
 
+impl StorageError {
+    /// Whether this error represents a retryable operation blocked by current
+    /// storage activity.
+    #[must_use]
+    pub fn is_would_block(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    }
+
+    /// Whether this storage configuration does not support the requested
+    /// operation.
+    #[must_use]
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::Unsupported)
+    }
+}
+
 pub(crate) fn collect_missing_established_records<F>(
     records: &[(NodeId, NodeData)],
     mut lookup: F,

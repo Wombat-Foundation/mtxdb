@@ -1378,6 +1378,7 @@ impl DurabilityToken {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalCursor {
     path: PathBuf,
+    incarnation: u64,
     lsn: u64,
 }
 
@@ -2030,13 +2031,21 @@ impl JournalCoordinator {
     ///
     /// The caller must establish that the snapshot contains the records through
     /// `lsn` before creating the cursor. The cursor is scoped to this journal
-    /// path; if reclaim has already removed required history,
+    /// path and writer incarnation. It must be reacquired after a writer
+    /// restart; if reclaim has already removed required history,
     /// [`Self::changes_since`] reports an expired-cursor error.
-    pub(crate) fn replay_cursor(&self, lsn: u64) -> JournalCursor {
-        JournalCursor {
+    pub(crate) fn replay_cursor(&self, lsn: u64) -> io::Result<JournalCursor> {
+        let signal = self.publish_signal().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "replay cursors require an installed publish signal",
+            )
+        })?;
+        Ok(JournalCursor {
             path: self.path.clone(),
+            incarnation: signal.snapshot().0,
             lsn,
-        }
+        })
     }
 
     /// Read a bounded page of complete, durable groups after `cursor`.
@@ -2049,7 +2058,8 @@ impl JournalCoordinator {
     ///
     /// # Errors
     /// Returns `InvalidInput` for a foreign cursor or zero page size, and
-    /// `InvalidData` when the cursor's required history has been reclaimed.
+    /// `InvalidData` when the writer incarnation differs or the cursor's
+    /// required history has been reclaimed.
     pub fn changes_since(
         &self,
         cursor: &JournalCursor,
@@ -2068,7 +2078,27 @@ impl JournalCoordinator {
             ));
         }
 
+        let signal = self.publish_signal().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "replay requires an installed publish signal",
+            )
+        })?;
+        let incarnation = signal.snapshot().0;
+        if cursor.incarnation != incarnation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal cursor belongs to a previous writer incarnation",
+            ));
+        }
+
         let scan = Journal::scan_read_only(&self.path)?;
+        if signal.snapshot().0 != incarnation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal writer restarted while reading changes",
+            ));
+        }
         if cursor.lsn.saturating_add(1) < scan.base_lsn {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2089,7 +2119,11 @@ impl JournalCoordinator {
         let through_lsn = selected.last().map_or(cursor.lsn, |group| group.last_lsn);
         Ok(JournalChangesPage {
             groups: selected,
-            next_cursor: self.replay_cursor(through_lsn),
+            next_cursor: JournalCursor {
+                path: self.path.clone(),
+                incarnation,
+                lsn: through_lsn,
+            },
             through_lsn,
             has_more,
         })

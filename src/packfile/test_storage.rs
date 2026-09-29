@@ -9466,9 +9466,7 @@ fn scan_collection_at_snapshot_requires_a_journal() {
     let Err(error) = store.scan_collection_at_snapshot(&[0x93u8; 16]) else {
         panic!("replayable scans require a journal");
     };
-    assert!(
-        matches!(error, StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::Unsupported)
-    );
+    assert!(error.is_unsupported(), "expected Unsupported, got {error}");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -9489,9 +9487,31 @@ fn scan_collection_at_snapshot_rejects_an_active_transaction_overlay() {
     store
         .transaction_overlay_users
         .fetch_sub(1, Ordering::AcqRel);
-    assert!(
-        matches!(error, StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(error.is_would_block(), "expected WouldBlock, got {error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_only_handles_cannot_take_replayable_snapshots() {
+    let dir = test_dir("scan_collection_replay_read_only");
+    let wal = dir.join("wal.bin");
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(0x95),
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+
+    let reader = PackfileStorage::open_read_committed(dir.clone(), &wal).unwrap();
+    let Err(error) = reader.scan_collection_at_snapshot(&TEST_COLLECTION) else {
+        panic!("read-only handles cannot create replay snapshots");
+    };
+    assert!(error.is_unsupported(), "expected Unsupported, got {error}");
     let _ = fs::remove_dir_all(&dir);
 }
 
