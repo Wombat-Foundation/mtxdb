@@ -9,6 +9,27 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static DESCRIPTOR_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 
 /// Immutable descriptor at a database root.
 ///
@@ -302,23 +323,64 @@ impl DatabaseLayout {
     }
 
     fn write_descriptor(path: &Path) -> io::Result<()> {
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(mut file) => {
-                file.write_all(&db_meta_bytes())?;
-                file.sync_all()
+        let (temporary, mut file) = loop {
+            let suffix = DESCRIPTOR_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                ".{}.create.{}.{}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(DB_META_FILENAME),
+                std::process::id(),
+                suffix,
+            );
+            let temporary = path.with_file_name(name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+        let _temporary_guard = TempFileGuard::new(temporary.clone());
+        file.write_all(&db_meta_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        // hard_link installs the fully-written file atomically without
+        // replacing a descriptor another opener may have installed first.
+        match fs::hard_link(&temporary, path) {
+            Ok(()) => {
+                // The descriptor contents are synced before installation.
+                // Directory sync is best-effort: some supported filesystems
+                // reject it, and a lost first-install directory entry can be
+                // safely recreated on the next open. `Ok` therefore means
+                // installed, not guaranteed durable across sudden power loss.
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let _ = crate::shard::sync_directory(parent);
+                Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let contents = fs::read(path)?;
-                if validate_db_meta(&contents) {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unrecognized mtxdb database descriptor: {}", path.display()),
-                    ))
-                }
+                Self::validate_existing_descriptor(path)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn validate_existing_descriptor(path: &Path) -> io::Result<()> {
+        let contents = fs::read(path)?;
+        if validate_db_meta(&contents) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unrecognized mtxdb database descriptor: {}", path.display()),
+            ))
         }
     }
 }

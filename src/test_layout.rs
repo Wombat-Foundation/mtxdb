@@ -53,6 +53,31 @@ fn initializes_named_pool_layout() {
 }
 
 #[test]
+fn concurrent_first_open_installs_one_complete_descriptor() {
+    let root = test_dir("concurrent_first_open");
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let root = root.clone();
+            std::thread::spawn(move || DatabaseLayout::open(root).unwrap())
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    assert!(super::validate_db_meta(
+        &fs::read(root.join(DB_META_FILENAME)).unwrap()
+    ));
+    assert!(fs::read_dir(&root).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".db.meta.create.")
+    }));
+}
+
+#[test]
 fn refuses_legacy_flat_packfiles() {
     let root = test_dir("legacy");
     fs::create_dir_all(&root).unwrap();
