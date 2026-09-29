@@ -166,6 +166,8 @@ pub const MEMBER_NAMESPACE_PREV: [u8; 4] = *b"PREV";
 pub const MEMBER_NAMESPACE_AUTH: [u8; 4] = *b"AUTH";
 /// Member namespace for state collections (`b"STAT"`).
 pub const MEMBER_NAMESPACE_STAT: [u8; 4] = *b"STAT";
+/// Member namespace for generation-scoped forward-edge collections (`b"FWD "`).
+pub const MEMBER_NAMESPACE_FWD: [u8; 4] = *b"FWD ";
 /// Member namespace for internal system collections (`b"INTL"`).
 pub const MEMBER_NAMESPACE_INTL: [u8; 4] = *b"INTL";
 
@@ -201,6 +203,12 @@ pub const NAMESPACE_BIAS_STAT: [u8; 32] = [
     0x45, 0x9d, 0x81, 0xae, 0xce, 0xde, 0x93, 0x9f, 0x16, 0xbe, 0xf2, 0x35, 0xf7, 0x89, 0xeb, 0x7d,
 ];
 
+/// Fixed 32-byte namespace bias constant for `b"FWD "`.
+pub const NAMESPACE_BIAS_FWD: [u8; 32] = [
+    0x08, 0x1f, 0xaf, 0x81, 0xa3, 0xa0, 0x30, 0xe3, 0x88, 0x02, 0xac, 0x00, 0x6c, 0x49, 0x7d, 0x45,
+    0x78, 0xc0, 0xe6, 0xbe, 0xb2, 0x3a, 0x7d, 0x9d, 0xc9, 0x1b, 0x6f, 0xf5, 0x60, 0x1c, 0xad, 0x8f,
+];
+
 /// Fixed 32-byte namespace bias constant for `b"INTL"`.
 ///
 /// Computed as `BLAKE3-256("mtxdb/namespace/v1/INTL")`.
@@ -211,7 +219,7 @@ pub const NAMESPACE_BIAS_INTL: [u8; 32] = [
 
 /// Map a 4-byte member namespace to its fixed 32-byte bias constant.
 ///
-/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `INTL`).
+/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `FWD `, `INTL`).
 /// Returns `None` for unrecognized namespaces (such as physical pool tags like `b"EDGE"`).
 #[must_use]
 pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
@@ -242,6 +250,12 @@ pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
         && namespace[3] == b'L'
     {
         Some(NAMESPACE_BIAS_INTL)
+    } else if namespace[0] == b'F'
+        && namespace[1] == b'W'
+        && namespace[2] == b'D'
+        && namespace[3] == b' '
+    {
+        Some(NAMESPACE_BIAS_FWD)
     } else {
         None
     }

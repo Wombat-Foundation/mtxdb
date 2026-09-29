@@ -217,6 +217,7 @@ fn open_db(dir: PathBuf, compress: bool) -> SharedDatabase {
         state: policy,
         event_dag: policy,
         edges: policy,
+        server_info: policy,
     };
     SharedDatabase::open_with_policies(dir, policies).expect("open shared database")
 }
