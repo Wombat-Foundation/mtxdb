@@ -265,10 +265,11 @@ impl DatabaseTransaction<'_> {
         // keeps that answer consistent with a concurrent commit or abort. The
         // live read below is only for records the stage says nothing about, so
         // it needs no lock and must not hold up a commit behind a large read.
-        let staged = {
-            let _lifecycle = self.lifecycle.lock();
-            self.stage.lookup_many(pool, collection_id, node_ids)
-        };
+        // Keep this transaction's stage fixed until the live records and
+        // version token have been sampled; otherwise a concurrent commit on
+        // this handle could make staged values pair with a post-commit token.
+        let _lifecycle = self.lifecycle.lock();
+        let staged = self.stage.lookup_many(pool, collection_id, node_ids);
         let mut results = Vec::with_capacity(node_ids.len());
         let mut live_slots = Vec::new();
         let mut live_ids = Vec::new();
@@ -295,6 +296,55 @@ impl DatabaseTransaction<'_> {
             }
         }
         Ok(results)
+    }
+
+    /// Read records through the transaction's own staged writes first, then the
+    /// live store, returning the collection's logical version alongside them.
+    ///
+    /// The version is the live collection clock; this transaction's staged
+    /// writes are uncommitted and do not advance it. Pass it to
+    /// [`Self::expect_collection_version`] to make the commit conditional on
+    /// the collection not having changed since this read.
+    ///
+    /// # Errors
+    /// Returns an error if the live pool cannot be read.
+    pub fn get_with_collection_version(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[NodeId],
+    ) -> Result<(Vec<Option<crate::storage::NodeData>>, u64), StorageError> {
+        // Keep this handle's staged view fixed until the live versioned read
+        // completes; otherwise this transaction could commit between stage
+        // lookup and the live token sample.
+        let _lifecycle = self.lifecycle.lock();
+        let staged = self.stage.lookup_many(pool, collection_id, node_ids);
+        let mut results = Vec::with_capacity(node_ids.len());
+        let mut live_slots = Vec::new();
+        let mut live_ids = Vec::new();
+        for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
+            match lookup {
+                StagedLookup::Put(payload) => {
+                    results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
+                        payload,
+                    ))));
+                }
+                StagedLookup::Deleted => results.push(None),
+                StagedLookup::Absent => {
+                    results.push(None);
+                    live_slots.push(slot);
+                    live_ids.push(*node_id);
+                }
+            }
+        }
+        let (live, version) = self
+            .database
+            .pool(pool)
+            .get_with_collection_version(collection_id, &live_ids)?;
+        for (slot, value) in live_slots.into_iter().zip(live) {
+            results[slot] = value;
+        }
+        Ok((results, version))
     }
 
     /// Commit the staged mutations. Pack/index application is performed once;

@@ -8010,6 +8010,34 @@ impl PackfileStorage {
         self.refresh_and_retry(collection_id, ids, missing, &mut results)?;
         Ok(results)
     }
+
+    /// Recheck a version token after consuming a lazy collection scan. Capture
+    /// the token with [`Self::get_with_collection_version`] before starting
+    /// the scan; `true` means no mutation to this collection occurred between
+    /// that read and this check. This does not attach a version to the scan's
+    /// own snapshot boundary.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Unsupported`] unless this store is attached to
+    /// a pool-tagged shared journal.
+    #[cfg(feature = "multi-reader")]
+    pub fn recheck_collection_version(
+        &self,
+        collection_id: &[u8; 16],
+        expected: u64,
+    ) -> Result<bool, StorageError> {
+        let journal = self.journal().ok_or_else(|| {
+            StorageError::Unsupported(
+                "collection logical versions require an enabled shared journal".to_owned(),
+            )
+        })?;
+        let pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire)).ok_or_else(|| {
+            StorageError::Unsupported(
+                "collection logical versions require a pool-tagged shared journal".to_owned(),
+            )
+        })?;
+        Ok(journal.collection_version(pool, collection_id) == expected)
+    }
 }
 
 impl PackfileStorage {

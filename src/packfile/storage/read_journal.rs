@@ -1046,11 +1046,36 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        self.get_read_committed_bounded(collection_id, ids)
+            .map(|(data, _)| data)
+    }
+
+    /// Like [`Self::get_read_committed`], also returning the visibility
+    /// boundary of the returned data: the applied-overlay LSN at the moment of
+    /// the read. Every published group at or below this LSN is reflected in the
+    /// result (from the overlay if unmaterialized, otherwise from the durable
+    /// index).
+    ///
+    /// The boundary is `u64::MAX` when no overlay is installed, where a writer
+    /// has no transaction in flight and the live index is fully materialized.
+    /// A caller pairing the data with a logical version should reject a token
+    /// above the returned boundary and retry, because the write that established
+    /// it may not yet be visible here.
+    pub(super) fn get_read_committed_bounded(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, u64), StorageError> {
         // Refresh outside the read lock: this may reload the checkpoint-bound
         // index if the writer reclaimed past this reader's coverage. The
         // returned guard keeps the applied overlay locked for the lookup below,
         // so another reader cannot reset it in between.
         let guard = self.refresh_read_journal()?;
+        // Capture the boundary from the same overlay state the lookup reads, so
+        // it cannot advance between sampling the data and reporting the LSN.
+        let boundary = guard
+            .as_ref()
+            .map_or(u64::MAX, |overlay| overlay.observed_lsn);
 
         // No overlay is installed (a writer with no transaction in flight):
         // the live index is the whole answer, so skip the per-id bookkeeping
@@ -1058,7 +1083,7 @@ impl PackfileStorage {
         if guard.is_none() {
             drop(guard);
             let _fallback = FallbackReadGuard::enter();
-            return self.get_many_with_refresh(collection_id, ids);
+            return Ok((self.get_many_with_refresh(collection_id, ids)?, boundary));
         }
 
         let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
@@ -1083,7 +1108,7 @@ impl PackfileStorage {
                 // missing keys would resurrect them. Return the overlay's view
                 // (post-delete puts only) until the delete is covered.
                 if overlay.delete_lsn.contains_key(collection_id) {
-                    return Ok(results);
+                    return Ok((results, boundary));
                 }
             } else {
                 unresolved.extend(0..ids.len());
@@ -1101,7 +1126,57 @@ impl PackfileStorage {
                 results[index] = value;
             }
         }
-        Ok(results)
+        Ok((results, boundary))
+    }
+
+    /// Read records with the logical collection version sampled at the same
+    /// visibility boundary. Publication advances the version before packfile
+    /// materialization, so a token newer than the overlay boundary forces a
+    /// refresh/retry. A second version read rejects a publication that landed
+    /// while the data was being assembled.
+    ///
+    /// # Errors
+    /// Propagates read errors, including a fail-closed overlay gap, and returns
+    /// [`StorageError::WouldBlock`] if the version keeps advancing.
+    pub fn get_with_collection_version(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, u64), StorageError> {
+        #[cfg(feature = "multi-reader")]
+        {
+            const ATTEMPTS: usize = 8;
+            let Some(pool) =
+                crate::journal::pool_from_tag(self.journal_pool.load(Ordering::Acquire))
+            else {
+                return Ok((self.get_read_committed(collection_id, ids)?, 0));
+            };
+            let Some(journal) = self.journal() else {
+                return Ok((self.get_read_committed(collection_id, ids)?, 0));
+            };
+            // Direct packfile puts hold this mutex while appending the record
+            // and publishing its journal mutation. Transactions publish first
+            // and materialize later, so this lock alone is insufficient; the
+            // overlay boundary below covers that separate path.
+            let collection_lock = self.put_mutex(collection_id);
+            let _collection_guard = collection_lock.lock();
+            for _ in 0..ATTEMPTS {
+                let version = journal.collection_version(pool, collection_id);
+                let (data, boundary) = self.get_read_committed_bounded(collection_id, ids)?;
+                if boundary >= version && journal.collection_version(pool, collection_id) == version
+                {
+                    return Ok((data, version));
+                }
+                std::thread::yield_now();
+            }
+            Err(StorageError::WouldBlock(
+                "collection version kept advancing during the read; retry".to_owned(),
+            ))
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        {
+            Ok((self.get_read_committed(collection_id, ids)?, 0))
+        }
     }
 }
 

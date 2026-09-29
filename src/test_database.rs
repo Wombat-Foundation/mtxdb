@@ -1820,6 +1820,212 @@ fn transaction_commit_applies_and_publishes_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(feature = "multi-reader")]
+#[test]
+fn versioned_transaction_read_rejects_stale_commit_and_retries() {
+    let root = test_root("versioned_transaction_read");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let pool = ShardType::Edges;
+    let collection = [0x73; 16];
+    let key = node(1);
+    let other_key = node(2);
+
+    let seed = db.begin_transaction();
+    seed.put(pool, collection, key, &data(b"seed")).unwrap();
+    seed.commit().unwrap();
+
+    let stale = db.begin_transaction();
+    let (records, expected) = stale
+        .get_with_collection_version(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(payload_of(records[0].as_ref()), Some(b"seed".to_vec()));
+    stale
+        .put(pool, collection, key, &data(b"stale-write"))
+        .unwrap();
+
+    let concurrent = db.begin_transaction();
+    concurrent
+        .put(pool, collection, other_key, &data(b"concurrent"))
+        .unwrap();
+    concurrent.commit().unwrap();
+
+    stale
+        .expect_collection_version(pool, collection, expected)
+        .unwrap();
+    match stale.commit() {
+        Err(crate::storage::StorageError::StaleRead {
+            pool: found_pool,
+            collection_id,
+            expected: found_expected,
+            actual,
+        }) => {
+            assert_eq!(found_pool, pool);
+            assert_eq!(collection_id, collection);
+            assert_eq!(found_expected, expected);
+            assert!(actual > expected);
+        }
+        other => panic!("expected stale-read rejection, got {other:?}"),
+    }
+
+    let retry = db.begin_transaction();
+    let (records, version) = retry
+        .get_with_collection_version(pool, &collection, &[key, other_key])
+        .unwrap();
+    assert_eq!(payload_of(records[0].as_ref()), Some(b"seed".to_vec()));
+    assert_eq!(
+        payload_of(records[1].as_ref()),
+        Some(b"concurrent".to_vec())
+    );
+    retry
+        .put(pool, collection, key, &data(b"retried-write"))
+        .unwrap();
+    retry
+        .expect_collection_version(pool, collection, version)
+        .unwrap();
+    retry.commit().unwrap();
+    assert_eq!(
+        live_get(&db, pool, collection, key),
+        Some(b"retried-write".to_vec())
+    );
+
+    let (_, scan_version) = db
+        .pool(pool)
+        .get_with_collection_version(&collection, &[key])
+        .unwrap();
+    let (scan, _cursor, lease) = db
+        .pool(pool)
+        .scan_collection_at_snapshot(&collection)
+        .unwrap();
+    let scanned = scan.collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(!scanned.is_empty());
+    assert!(db
+        .pool(pool)
+        .recheck_collection_version(&collection, scan_version)
+        .unwrap());
+    drop(lease);
+
+    let later = db.begin_transaction();
+    later
+        .put(pool, collection, other_key, &data(b"after-scan"))
+        .unwrap();
+    later.commit().unwrap();
+    assert!(!db
+        .pool(pool)
+        .recheck_collection_version(&collection, scan_version)
+        .unwrap());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "multi-reader")]
+#[test]
+fn versioned_point_reads_match_their_token_during_concurrent_publication() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    let root = test_root("versioned_point_read_concurrent");
+    let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let pool = ShardType::Edges;
+    let collection = [0x74; 16];
+    let key = node(3);
+
+    let seed = db.begin_transaction();
+    seed.put(
+        pool,
+        collection,
+        key,
+        &NodeData::new(0u64.to_le_bytes().to_vec().into()),
+    )
+    .unwrap();
+    seed.commit().unwrap();
+    let coordinator = db.coordinator();
+    let seed_version = coordinator.collection_version(pool, &collection);
+    let values = Arc::new(Mutex::new(HashMap::from([(seed_version, 0u64)])));
+    let done = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(Barrier::new(2));
+
+    let samples = std::thread::scope(|scope| {
+        let writer_db = Arc::clone(&db);
+        let writer_values = Arc::clone(&values);
+        let writer_done = Arc::clone(&done);
+        let writer_start = Arc::clone(&start);
+        let writer = scope.spawn(move || {
+            writer_start.wait();
+            for value in 1u64..=96 {
+                let transaction = writer_db.begin_transaction();
+                transaction
+                    .put(
+                        pool,
+                        collection,
+                        key,
+                        &NodeData::new(value.to_le_bytes().to_vec().into()),
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+                let version = writer_db
+                    .coordinator()
+                    .collection_version(pool, &collection);
+                writer_values.lock().unwrap().insert(version, value);
+                std::thread::yield_now();
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        let reader_db = Arc::clone(&db);
+        let reader_done = Arc::clone(&done);
+        let reader_start = Arc::clone(&start);
+        let reader = scope.spawn(move || {
+            reader_start.wait();
+            let mut samples = Vec::new();
+            while !reader_done.load(Ordering::Acquire) {
+                let (records, version) = reader_db
+                    .pool(pool)
+                    .get_with_collection_version(&collection, &[key])
+                    .unwrap();
+                let value = records[0]
+                    .as_ref()
+                    .map(|record| u64::from_le_bytes(record.bytes[..].try_into().unwrap()));
+                samples.push((version, value));
+            }
+            samples
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap()
+    });
+
+    assert!(!samples.is_empty(), "reader must overlap writer activity");
+    let values = values.lock().unwrap();
+    let (mut last_version, mut last_value) = (0u64, 0u64);
+    for (version, value) in samples {
+        // A published group can become readable to the reader before the
+        // writer's own clock sample observes the bump, so a token may lag the
+        // newest write it covers. The guarantee is one-directional: the data
+        // must reflect every write up to the token, never fewer. A token names
+        // an already-recorded publish, and the value read must be at least that
+        // publish's value.
+        let recorded = values
+            .get(&version)
+            .copied()
+            .expect("a returned token always corresponds to a recorded publish");
+        let value = value.expect("the seeded key must always read back");
+        assert!(
+            value >= recorded,
+            "value {value} read for token {version} predates its publish {recorded}"
+        );
+        assert!(
+            version >= last_version && value >= last_value,
+            "version and value must not go backwards"
+        );
+        last_version = version;
+        last_value = value;
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn retrying_commit_and_recovery_can_run_concurrently() {
     let root = test_root("transaction_concurrent_recovery");
