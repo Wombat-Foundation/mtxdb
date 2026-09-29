@@ -77,7 +77,10 @@ fn main() {
     let mut peak = 0u64;
     println!(
         "rounds={rounds} commits/round={commits} batch={batch} payload={payload} pack_budget={}",
-        pack_budget.map_or_else(|| "default".to_owned(), |bytes| format!("{} MiB", bytes >> 20))
+        pack_budget.map_or_else(
+            || "default".to_owned(),
+            |bytes| format!("{} MiB", bytes >> 20)
+        )
     );
     for round in 0..rounds {
         for _ in 0..commits {
@@ -113,7 +116,8 @@ fn main() {
     }
 
     delta_syncs.sort_by(f64::total_cmp);
-    if let (Some(median), Some(max)) = (delta_syncs.get(delta_syncs.len() / 2), delta_syncs.last()) {
+    if let (Some(median), Some(max)) = (delta_syncs.get(delta_syncs.len() / 2), delta_syncs.last())
+    {
         println!(
             "delta syncs: {} samples, median {median:.0} ms, max {max:.0} ms",
             delta_syncs.len()

@@ -119,6 +119,12 @@ name = "txn_contention"
 path = "txn_contention.rs"
 harness = false
 
+# Concurrent writers while a reader catches up through bounded WAL replay pages.
+[[bench]]
+name = "replay_paging"
+path = "replay_paging.rs"
+harness = false
+
 # Long-running writes and syncs against one shared WAL: the segment must stay bounded.
 [[bench]]
 name = "wal_steady_state"

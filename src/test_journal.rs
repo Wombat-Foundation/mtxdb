@@ -2063,6 +2063,7 @@ fn changes_since_resumes_incrementally_without_a_directory() {
     coordinator.sync().unwrap();
 
     let start = coordinator.replay_cursor(0).unwrap();
+    let replay_stats_before = coordinator.replay_page_stats();
     set_changes_since_force_untrusted(true);
 
     let page_one = coordinator.changes_since(&start, 1).unwrap();
@@ -2078,6 +2079,16 @@ fn changes_since_resumes_incrementally_without_a_directory() {
     assert_eq!(page_two.groups.len(), 1);
     assert_eq!(page_two.groups[0].last_lsn, second.last_lsn);
     assert!(!page_two.has_more);
+    let replay_stats_after = coordinator.replay_page_stats();
+    assert_eq!(
+        replay_stats_after.resumed_pages - replay_stats_before.resumed_pages,
+        2,
+        "both valid tail pages count as successful resumes"
+    );
+    assert_eq!(
+        replay_stats_after.full_scan_fallbacks, replay_stats_before.full_scan_fallbacks,
+        "the untrusted directory does not itself require a full scan"
+    );
 
     set_changes_since_force_untrusted(false);
 }
@@ -2104,6 +2115,34 @@ fn changes_since_keeps_an_idle_tail_on_the_resume_path() {
         "an idle tail must stay on the resume path"
     );
     set_changes_since_force_untrusted(false);
+}
+
+/// A reclaim can move the cursor offset such that a later equal-sized group
+/// ends at exactly the stale offset. The page must use the directory's group
+/// presence, not offset equality alone, to distinguish that case from idle.
+#[test]
+fn changes_since_falls_back_when_reclaimed_group_ends_at_stale_offset() {
+    let dir = ReplayTestDir::new("changes_since_reclaim_equal_offset");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator.publish_group(&[put(1, 1, b"same")]).unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let old_offset = cursor.resume_offset;
+
+    coordinator.reclaim_through(first.last_lsn).unwrap();
+    let second = coordinator.publish_group(&[put(1, 2, b"same")]).unwrap();
+    coordinator.sync().unwrap();
+    let full_scans_before = coordinator.replay_page_stats().full_scan_fallbacks;
+
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1, "the post-reclaim group is replayed");
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+    assert_eq!(page.next_cursor.resume_offset, old_offset);
+    assert_eq!(
+        coordinator.replay_page_stats().full_scan_fallbacks,
+        full_scans_before + 1,
+        "the moved resume offset is recorded as a full-scan fallback"
+    );
 }
 
 #[test]

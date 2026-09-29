@@ -1470,6 +1470,17 @@ pub struct JournalChangesPage {
     pub horizon_lsn: u64,
 }
 
+/// Cumulative path counters for [`JournalCoordinator::changes_since`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplayPageStats {
+    /// Pages read from the cursor's resume offset without rebuilding the scan
+    /// from the journal header.
+    pub resumed_pages: u64,
+    /// Pages that had to fall back to a full retained-segment scan because the
+    /// cursor's resume offset could not be trusted.
+    pub full_scan_fallbacks: u64,
+}
+
 #[cfg(test)]
 thread_local! {
     /// A one-shot hook run inside [`JournalCoordinator::changes_since`] after
@@ -1751,6 +1762,14 @@ pub struct JournalCoordinator {
     /// pin even after the coordinator borrow has ended.
     replay_leases: Arc<ReplayLeaseRegistry>,
     next_replay_lease: AtomicU64,
+    /// Cumulative incremental-resume and fallback counts for replay paging.
+    replay_page_stats: ReplayPageStatsAtomic,
+}
+
+#[derive(Default)]
+struct ReplayPageStatsAtomic {
+    resumed_pages: AtomicU64,
+    full_scan_fallbacks: AtomicU64,
 }
 
 /// Directory-derived boundaries for one [`JournalCoordinator::changes_since`]
@@ -1761,6 +1780,7 @@ pub struct JournalCoordinator {
 struct ChangesWindow {
     base_lsn: u64,
     end: u64,
+    has_durable_group: bool,
     directory_trusted: bool,
 }
 
@@ -1840,6 +1860,7 @@ impl JournalCoordinator {
             publish_signal: std::sync::OnceLock::new(),
             replay_leases: Arc::new(ReplayLeaseRegistry::default()),
             next_replay_lease: AtomicU64::new(1),
+            replay_page_stats: ReplayPageStatsAtomic::default(),
         }
     }
 
@@ -1849,6 +1870,18 @@ impl JournalCoordinator {
     #[must_use]
     pub fn recovered_groups(&self) -> Vec<CommittedGroup> {
         self.recovered.clone()
+    }
+
+    /// Snapshot cumulative replay paging path counters for this coordinator.
+    #[must_use]
+    pub fn replay_page_stats(&self) -> ReplayPageStats {
+        ReplayPageStats {
+            resumed_pages: self.replay_page_stats.resumed_pages.load(Ordering::Relaxed),
+            full_scan_fallbacks: self
+                .replay_page_stats
+                .full_scan_fallbacks
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Create and map the cross-process publish signal beside this
@@ -2340,8 +2373,13 @@ impl JournalCoordinator {
             hook();
         }
 
-        let scan = self.scan_changes(cursor, &window)?;
+        let (scan, resumed) = self.scan_changes(cursor, &window)?;
         self.validate_changes_scan(cursor, incarnation, &window, &scan)?;
+        if resumed {
+            self.replay_page_stats
+                .resumed_pages
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Ok(self.changes_page(cursor, incarnation, durable_lsn, limit, scan))
     }
 
@@ -2410,14 +2448,14 @@ impl JournalCoordinator {
             .iter()
             .skip(first)
             .take_while(|group| group.last_lsn <= durable_lsn);
-        let end = durable_groups
-            .by_ref()
-            .take(limit.saturating_add(1))
-            .last()
+        let last_durable_group = durable_groups.by_ref().take(limit.saturating_add(1)).last();
+        let end = last_durable_group
+            .as_ref()
             .map_or(cursor.resume_offset, |group| group.end_offset);
         Ok(ChangesWindow {
             base_lsn: journal.base_lsn,
             end,
+            has_durable_group: last_durable_group.is_some(),
             directory_trusted: journal.directory_matches_file() && !changes_since_force_untrusted(),
         })
     }
@@ -2430,7 +2468,11 @@ impl JournalCoordinator {
     /// A resume offset is invalidated by a reclaim rewrite, a replacement, or a
     /// rotation. Any failure therefore falls back to a full scan, and
     /// [`Self::validate_changes_scan`] decides whether the cursor survived.
-    fn scan_changes(&self, cursor: &JournalCursor, window: &ChangesWindow) -> io::Result<Scan> {
+    fn scan_changes(
+        &self,
+        cursor: &JournalCursor,
+        window: &ChangesWindow,
+    ) -> io::Result<(Scan, bool)> {
         let end = if window.directory_trusted {
             window.end
         } else {
@@ -2451,12 +2493,18 @@ impl JournalCoordinator {
         ) {
             let idle_tail =
                 scan.valid_len == cursor.resume_offset && scan.base_lsn == cursor.base_lsn;
-            if !scan.groups.is_empty() || end == cursor.resume_offset || idle_tail {
-                return Ok(scan);
+            if !scan.groups.is_empty()
+                || (!window.has_durable_group && end == cursor.resume_offset)
+                || idle_tail
+            {
+                return Ok((scan, true));
             }
         }
+        self.replay_page_stats
+            .full_scan_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
         note_changes_since_full_scan();
-        Journal::scan_read_only(&self.path)
+        Journal::scan_read_only(&self.path).map(|scan| (scan, false))
     }
 
     /// Re-check the writer incarnation and the reclaim guard after the WAL read,

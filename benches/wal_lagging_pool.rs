@@ -131,7 +131,10 @@ fn print_header(
 }
 
 fn print_pool_stats(db: &SharedDatabase) {
-    for (name, pool) in [("EventDag", ShardType::EventDag), ("State", ShardType::State)] {
+    for (name, pool) in [
+        ("EventDag", ShardType::EventDag),
+        ("State", ShardType::State),
+    ] {
         let stats = db.pool(pool).stats();
         println!(
             "{name}: tails started {}, syncs with a tail in flight {}, syncs waited for a tail {}, \

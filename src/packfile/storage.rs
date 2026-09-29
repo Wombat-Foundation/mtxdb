@@ -10533,32 +10533,8 @@ impl PackfileStorage {
         reason = "a hit-rate is inherently an approximate floating-point presentation; counters retain their exact u64 values"
     )]
     pub fn stats(&self) -> RuntimeStats {
-        let mut cache = CacheStats::default();
-        let mut index_bytes: u64 = 0;
-        let summaries = self.collection_summaries();
-        for summary in &summaries {
-            index_bytes = index_bytes.saturating_add(u64::try_from(summary.2).unwrap_or(u64::MAX));
-            if let Some(stats) = self.cache_stats_for(&summary.0) {
-                cache.hits = cache.hits.saturating_add(stats.hits);
-                cache.misses = cache.misses.saturating_add(stats.misses);
-            }
-        }
-        // Longest linear-probe chain observed across every live collection's
-        // index, for operator visibility into collision-chain growth (see
-        // `LossyIndex::max_probe_len` — pure observability, no cap, no
-        // effect on control flow).
-        let max_index_probe_len = self
-            .collections_read()
-            .values()
-            .map(|generation| generation.load().index.max_probe_len())
-            .max()
-            .unwrap_or(0);
-        let cache_accesses = cache.hits.saturating_add(cache.misses);
-        cache.hit_rate = if cache_accesses > 0 {
-            cache.hits as f64 / cache_accesses as f64
-        } else {
-            0.0
-        };
+        let (cache, index_bytes, collection_count, max_index_probe_len) =
+            self.stats_collection_summary();
         RuntimeStats {
             open_count: self.open_count.load(Ordering::Relaxed),
             get_calls: self.get_calls.load(Ordering::Relaxed),
@@ -10606,6 +10582,12 @@ impl PackfileStorage {
             read_refresh_bytes: self.read_refresh_bytes.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
+            replay_pages_resumed: self
+                .journal()
+                .map_or(0, |journal| journal.replay_page_stats().resumed_pages),
+            replay_full_scans: self
+                .journal()
+                .map_or(0, |journal| journal.replay_page_stats().full_scan_fallbacks),
             get_latency: self.operation_timings.get.snapshot(),
             get_many_latency: self.operation_timings.get_many.snapshot(),
             get_many_with_refresh_latency: self.operation_timings.get_many_with_refresh.snapshot(),
@@ -10632,10 +10614,49 @@ impl PackfileStorage {
             cache,
             shards: self.shard_stats(),
             index_bytes,
-            collection_count: summaries.len(),
+            collection_count,
             max_index_probe_len,
             dirty_lock_wait: self.shards.dirty_lock_wait(),
         }
+    }
+
+    /// Aggregate the loaded-collection metrics used by [`Self::stats`].
+    fn stats_collection_summary(&self) -> (CacheStats, u64, usize, u32) {
+        let mut cache = CacheStats::default();
+        let mut index_bytes = 0u64;
+        let summaries = self.collection_summaries();
+        for summary in &summaries {
+            index_bytes = index_bytes.saturating_add(u64::try_from(summary.2).unwrap_or(u64::MAX));
+            if let Some(stats) = self.cache_stats_for(&summary.0) {
+                cache.hits = cache.hits.saturating_add(stats.hits);
+                cache.misses = cache.misses.saturating_add(stats.misses);
+            }
+        }
+
+        // Longest linear-probe chain observed across every live collection's
+        // index, for operator visibility into collision-chain growth (see
+        // `LossyIndex::max_probe_len` — pure observability, no cap, no
+        // effect on control flow).
+        let max_index_probe_len = self
+            .collections_read()
+            .values()
+            .map(|generation| generation.load().index.max_probe_len())
+            .max()
+            .unwrap_or(0);
+        let cache_accesses = cache.hits.saturating_add(cache.misses);
+        cache.hit_rate = if cache_accesses > 0 {
+            let scaled_hits = u128::from(cache.hits)
+                .saturating_mul(1_000_000)
+                .saturating_add(u128::from(cache_accesses / 2));
+            let millionths = scaled_hits
+                .checked_div(u128::from(cache_accesses))
+                .unwrap_or(0);
+            let millionths = u32::try_from(millionths).unwrap_or(1_000_000);
+            f64::from(millionths) / 1_000_000.0
+        } else {
+            0.0
+        };
+        (cache, index_bytes, summaries.len(), max_index_probe_len)
     }
 
     /// Atomically take the current sync diagnostics and reset only those
@@ -10886,6 +10907,15 @@ pub struct RuntimeStats {
     pub sidecar_writes: u64,
     /// `sync`/`sync_all` calls.
     pub sync_calls: u64,
+    /// Replay pages served from a cursor's resume offset by this store's
+    /// journal coordinator. Coordinator-owned lifetime total; shared-WAL
+    /// stores report the same aggregate counters and `reset_stats` does not
+    /// reset them.
+    pub replay_pages_resumed: u64,
+    /// Replay pages that fell back to scanning the retained segment from its
+    /// header. Coordinator-owned lifetime total; shared-WAL stores report the
+    /// same aggregate counters and `reset_stats` does not reset them.
+    pub replay_full_scans: u64,
     /// Opt-in wall-clock latency for single-record reads.
     pub get_latency: OperationLatency,
     /// Opt-in wall-clock latency for batched reads.
@@ -11203,6 +11233,8 @@ impl Default for RuntimeStats {
             read_refresh_bytes: 0,
             sidecar_writes: 0,
             sync_calls: 0,
+            replay_pages_resumed: 0,
+            replay_full_scans: 0,
             get_latency: OperationLatency::default(),
             get_many_latency: OperationLatency::default(),
             get_many_with_refresh_latency: OperationLatency::default(),

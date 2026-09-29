@@ -30,9 +30,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use mtxdb::journal::JournalCoordinator;
 use mtxdb::layout::ShardType;
-use bytes::Bytes;
 use mtxdb::storage::{NodeData, NodeId};
 use mtxdb::{GroupCommitConfig, PhaseTiming, SharedDatabase};
 
@@ -117,7 +117,9 @@ fn main() {
         .flat_map(|h| h.join().expect("writer thread"))
         .collect();
     let wall = started.elapsed();
-    coordinator.stop_background_committer().expect("stop committer");
+    coordinator
+        .stop_background_committer()
+        .expect("stop committer");
 
     all.sort();
     let stats = db.commit_phase_stats();
