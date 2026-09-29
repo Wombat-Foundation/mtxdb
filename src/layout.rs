@@ -351,25 +351,48 @@ impl DatabaseLayout {
 
         // hard_link installs the fully-written file atomically without
         // replacing a descriptor another opener may have installed first.
-        match fs::hard_link(&temporary, path) {
+        Self::install_descriptor_temp(&temporary, path, |source, destination| {
+            fs::hard_link(source, destination)
+        })
+    }
+
+    fn install_descriptor_temp(
+        temporary: &Path,
+        path: &Path,
+        hard_link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match hard_link(temporary, path) {
             Ok(()) => {
-                // The descriptor contents are synced before installation.
-                // Directory sync is best-effort: some supported filesystems
-                // reject it, and a lost first-install directory entry can be
-                // safely recreated on the next open. `Ok` therefore means
-                // installed, not guaranteed durable across sudden power loss.
-                let parent = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                let _ = crate::shard::sync_directory(parent);
+                Self::sync_descriptor_parent(path);
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 Self::validate_existing_descriptor(path)
             }
-            Err(error) => Err(error),
+            Err(_) => {
+                // Some filesystems do not support hard links. The source is a
+                // fully synced sibling temp and first-create bytes are
+                // deterministic, so same-directory rename is a safe atomic
+                // install fallback. Version upgrades use a separate path and
+                // must not rely on this replace-capable fallback.
+                fs::rename(temporary, path)?;
+                Self::sync_descriptor_parent(path);
+                Ok(())
+            }
         }
+    }
+
+    fn sync_descriptor_parent(path: &Path) {
+        // The descriptor contents are synced before installation. Directory
+        // sync is best-effort: some supported filesystems reject it, and a
+        // lost first-install directory entry can be safely recreated on the
+        // next open. `Ok` means installed, not guaranteed durable across a
+        // sudden power loss.
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let _ = crate::shard::sync_directory(parent);
     }
 
     fn validate_existing_descriptor(path: &Path) -> io::Result<()> {

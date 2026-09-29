@@ -78,6 +78,26 @@ fn concurrent_first_open_installs_one_complete_descriptor() {
 }
 
 #[test]
+fn descriptor_install_falls_back_to_rename_when_hard_links_are_unavailable() {
+    let root = test_dir("hard_link_fallback");
+    fs::create_dir_all(&root).unwrap();
+    let temporary = root.join(".db.meta.create.test");
+    let descriptor = root.join(DB_META_FILENAME);
+    fs::write(&temporary, super::db_meta_bytes()).unwrap();
+
+    super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |_, _| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "hard links unavailable in test",
+        ))
+    })
+    .unwrap();
+
+    assert!(super::validate_db_meta(&fs::read(&descriptor).unwrap()));
+    assert!(!temporary.exists());
+}
+
+#[test]
 fn refuses_legacy_flat_packfiles() {
     let root = test_dir("legacy");
     fs::create_dir_all(&root).unwrap();
