@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Immutable descriptor at a database root.
 ///
@@ -356,6 +357,31 @@ impl DatabaseLayout {
             }
         }
 
+        let lock_path = path.with_file_name(".db.meta.upgrade.lock");
+        let _upgrade_lock = loop {
+            match crate::shard::ShardPool::acquire_lock_path(&lock_path) {
+                Ok(lock) => break lock,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        // Another opener may have completed the replacement while we waited
+        // for the lock. Never replace a current descriptor with a second
+        // upgrade attempt.
+        let contents = fs::read(path)?;
+        if validate_db_meta(&contents) {
+            return Ok(());
+        }
+        if !is_legacy_db_meta(&contents) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("descriptor changed during upgrade: {}", path.display()),
+            ));
+        }
+
         let (temporary, mut file) = loop {
             let suffix = UPGRADE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = format!(
@@ -382,11 +408,54 @@ impl DatabaseLayout {
         file.write_all(&db_meta_bytes())?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, path)?;
+        atomic_replace_file(&temporary, path)?;
         guard.1 = true;
         if let Some(parent) = path.parent() {
             crate::shard::sync_directory(parent)?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let replaced: Vec<u16> = to.as_os_str().encode_wide().chain([0]).collect();
+    let replacement: Vec<u16> = from.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: both strings are nul-terminated UTF-16 paths owned for the
+    // duration of the call; the optional backup and reserved pointers are
+    // null as permitted by ReplaceFileW.
+    let result = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            0x00000001, // REPLACEFILE_WRITE_THROUGH
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
         Ok(())
     }
 }
