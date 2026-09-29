@@ -1195,6 +1195,7 @@ impl PackfileStorage {
             // overlay boundary below covers that separate path.
             let collection_lock = self.put_mutex(collection_id);
             let _collection_guard = collection_lock.lock();
+            let mut sampled = (0u64, 0u64);
             for _ in 0..ATTEMPTS {
                 // Sample the version before the data. `boundary` is a true
                 // lower bound on the data's coverage, so `boundary >= version`
@@ -1207,14 +1208,17 @@ impl PackfileStorage {
                 // cover it while writers keep advancing the collection.
                 let version = journal.collection_version(pool, collection_id);
                 let (data, boundary) = self.get_read_committed_bounded(collection_id, ids, true)?;
+                sampled = (version, boundary);
                 if boundary >= version {
                     return Ok((data, version));
                 }
                 std::thread::yield_now();
             }
-            Err(StorageError::WouldBlock(
-                "collection version kept advancing during the read; retry".to_owned(),
-            ))
+            Err(StorageError::WouldBlock(format!(
+                "collection version kept advancing during the read; retry \
+                 (version={}, boundary={})",
+                sampled.0, sampled.1
+            )))
         }
         #[cfg(not(feature = "multi-reader"))]
         {
