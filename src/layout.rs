@@ -381,6 +381,7 @@ impl DatabaseLayout {
         let mut guard = TempFileGuard(&temporary, false);
         file.write_all(&db_meta_bytes())?;
         file.sync_all()?;
+        drop(file);
         fs::rename(&temporary, path)?;
         guard.1 = true;
         if let Some(parent) = path.parent() {
