@@ -1180,7 +1180,7 @@ impl PackfileStorage {
     ) -> Result<(Vec<Option<NodeData>>, u64), StorageError> {
         #[cfg(feature = "multi-reader")]
         {
-            const ATTEMPTS: usize = 8;
+            const ATTEMPTS: usize = 64;
             let Some(pool) =
                 crate::journal::pool_from_tag(self.journal_pool.load(Ordering::Acquire))
             else {
@@ -1206,14 +1206,22 @@ impl PackfileStorage {
             // is published and its materialization is what lifts the boundary.
             let version = journal.collection_version(pool, collection_id);
             let mut boundary = 0u64;
-            for _ in 0..ATTEMPTS {
+            for attempt in 0..ATTEMPTS {
                 let (data, read_boundary) =
                     self.get_read_committed_bounded(collection_id, ids, true)?;
                 boundary = read_boundary;
                 if boundary >= version {
                     return Ok((data, version));
                 }
-                std::thread::yield_now();
+                // The boundary lags by an in-flight group; its materialization
+                // runs on another thread, so yield first and then sleep
+                // briefly. A pure spin can exhaust the budget on a loaded
+                // machine before that thread is scheduled.
+                if attempt < 2 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(25));
+                }
             }
             Err(StorageError::WouldBlock(format!(
                 "collection version kept advancing during the read; retry \
