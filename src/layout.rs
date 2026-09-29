@@ -9,6 +9,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Immutable descriptor at a database root.
 ///
@@ -44,6 +45,7 @@ fn db_meta_pool_list() -> Vec<u8> {
 /// It is recognized only as an upgrade source; new descriptors always use the
 /// current [`ShardType::ALL`] list.
 const LEGACY_DB_META_POOL_LIST: &[u8] = b"mtpl-state\nmtpl-event\nmtpl-edges\n";
+static UPGRADE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
@@ -345,18 +347,84 @@ impl DatabaseLayout {
     }
 
     fn upgrade_descriptor(path: &Path) -> io::Result<()> {
-        let temporary = path.with_extension("meta.upgrade");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary)?;
-        file.write_all(&db_meta_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        if let Some(parent) = path.parent() {
-            OpenOptions::new().read(true).open(parent)?.sync_all()?;
+        let (temporary, mut file) = loop {
+            let suffix = UPGRADE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                ".{}.upgrade.{}.{}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("db.meta"),
+                std::process::id(),
+                suffix,
+            );
+            let temporary = path.with_file_name(name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+
+        let result = (|| {
+            file.write_all(&db_meta_bytes())?;
+            file.sync_all()?;
+            replace_file(&temporary, path)?;
+            if let Some(parent) = path.parent() {
+                crate::shard::sync_directory(parent)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
         }
+        result
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const REPLACEFILE_WRITE_THROUGH: u32 = 1;
+    extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut replaced = to.as_os_str().encode_wide().collect::<Vec<_>>();
+    replaced.push(0);
+    let mut replacement = from.as_os_str().encode_wide().collect::<Vec<_>>();
+    replacement.push(0);
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers valid for the
+    // duration of the call; the optional pointers are explicitly null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
         Ok(())
     }
 }
