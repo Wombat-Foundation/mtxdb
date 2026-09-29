@@ -1899,16 +1899,22 @@ impl JournalCoordinator {
                     // this segment and therefore protects groups from every
                     // pool, including groups whose pool coverage is complete.
                     let replay_limit = self.replay_reclaim_limit(covered_lsn);
-                    let blocked_by = (replay_limit == covered_lsn)
-                        .then_some(blocked_by)
-                        .flatten();
+                    let lease_limited = replay_limit < covered_lsn;
+                    let blocked_by = (!lease_limited).then_some(blocked_by).flatten();
                     let reclaimed = journal.reclaim_through_with_blocker(replay_limit, blocked_by);
                     if reclaimed.is_ok() {
                         self.bump_publish_signal();
                     }
                     let reclaimed = reclaimed.map(Some);
-                    let coverage = self.coverage.lock();
-                    self.record_reclaim_outcome(&journal, &coverage.covered);
+                    if !lease_limited {
+                        // A cut held back only by an active replay lease is not a
+                        // pool-coverage stall. Recording one would drive forced
+                        // checkpoints and warning logs for as long as a rebuild
+                        // pins its own window; the next reclaim after the lease
+                        // is dropped records the real outcome.
+                        let coverage = self.coverage.lock();
+                        self.record_reclaim_outcome(&journal, &coverage.covered);
+                    }
                     return reclaimed;
                 }
                 SharedBoundary::NothingCovered => {

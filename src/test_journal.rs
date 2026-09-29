@@ -2107,6 +2107,55 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
     let _ = fs::remove_file(path);
 }
 
+/// A reclaim the lease alone holds back is not a pool-coverage stall: it must
+/// not arm the stall/remediation path while a rebuild pins its own window.
+#[test]
+#[cfg(feature = "multi-reader")]
+fn lease_limited_shared_reclaim_is_not_recorded_as_a_stall() {
+    use crate::layout::ShardType;
+
+    let path = temp_path("shared_replay_lease_stall");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+    // Every reclaim leaves the segment over the trigger, so a recorded outcome
+    // would show up as a stall immediately.
+    coordinator.set_reclaim_trigger_len(1);
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 2, b"replay")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    coordinator.report_pool_coverage(ShardType::State, second.last_lsn);
+
+    coordinator.reclaim_shared().unwrap();
+    assert!(
+        !coordinator.is_reclaim_stalled(),
+        "the active lease, not missing coverage, held the cut back"
+    );
+    assert_eq!(coordinator.reclaim_stalls(), 0);
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+
+    drop(lease);
+    coordinator.reclaim_shared().unwrap();
+    assert_eq!(
+        coordinator.reclaim_stalls(),
+        1,
+        "without the lease the lease-free outcome is recorded"
+    );
+    let _ = fs::remove_file(path);
+}
+
 #[test]
 fn changes_since_rejects_a_cursor_from_a_previous_writer_incarnation() {
     let coordinator = open_replay_arc("changes_since_restart");
