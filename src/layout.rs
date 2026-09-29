@@ -13,21 +13,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static DESCRIPTOR_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-struct TempFileGuard {
-    path: Option<PathBuf>,
-}
+struct TempFileGuard(PathBuf);
 
 impl TempFileGuard {
     fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+        Self(path)
     }
 }
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -323,7 +319,7 @@ impl DatabaseLayout {
     }
 
     fn write_descriptor(path: &Path) -> io::Result<()> {
-        let (temporary, mut file) = loop {
+        let (temporary, file) = loop {
             let suffix = DESCRIPTOR_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = format!(
                 ".{}.create.{}.{}",
@@ -345,6 +341,10 @@ impl DatabaseLayout {
             }
         };
         let _temporary_guard = TempFileGuard::new(temporary.clone());
+        // Rebind so the handle is declared after the guard: on the `?` error
+        // paths `file` then closes first, and on Windows the guard's
+        // `remove_file` is not blocked by the still-open handle.
+        let mut file = file;
         file.write_all(&db_meta_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -363,26 +363,50 @@ impl DatabaseLayout {
     ) -> io::Result<()> {
         match hard_link(temporary, path) {
             Ok(()) => {
-                Self::sync_descriptor_parent(path);
+                Self::sync_and_sweep_descriptor_parent(path);
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Self::validate_existing_descriptor(path)
-            }
-            Err(_) => {
-                // Some filesystems do not support hard links. The source is a
-                // fully synced sibling temp and first-create bytes are
-                // deterministic, so same-directory rename is a safe atomic
-                // install fallback. Version upgrades use a separate path and
-                // must not rely on this replace-capable fallback.
-                fs::rename(temporary, path)?;
-                Self::sync_descriptor_parent(path);
+                Self::validate_existing_descriptor(path)?;
+                Self::sync_and_sweep_descriptor_parent(path);
                 Ok(())
             }
+            // A concurrent opener can install the canonical file and sweep
+            // this temp after we created it. In that case the canonical file
+            // is the result to validate, not a reason to fail initialization.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Self::validate_existing_descriptor(path)
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::Unsupported
+                    || error.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                // Some filesystems do not support hard links (and some report
+                // that as `PermissionDenied`). The source is a fully synced
+                // sibling temp and first-create bytes are deterministic, so
+                // same-directory rename is a safe atomic install fallback. Any
+                // other error is a real fault and is propagated below. Version
+                // upgrades use a separate path and must not rely on this
+                // replace-capable fallback.
+                match fs::rename(temporary, path) {
+                    Ok(()) => {
+                        Self::sync_and_sweep_descriptor_parent(path);
+                        Ok(())
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Self::validate_existing_descriptor(path)
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        Self::validate_existing_descriptor(path)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
-    fn sync_descriptor_parent(path: &Path) {
+    fn sync_and_sweep_descriptor_parent(path: &Path) {
         // The descriptor contents are synced before installation. Directory
         // sync is best-effort: some supported filesystems reject it, and a
         // lost first-install directory entry can be safely recreated on the
@@ -393,6 +417,26 @@ impl DatabaseLayout {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let _ = crate::shard::sync_directory(parent);
+
+        // Only reap this descriptor protocol's regular-file temps. This runs
+        // after a valid canonical descriptor exists. If it removes another
+        // opener's temp, that opener handles NotFound by validating the
+        // canonical descriptor above. Cleanup must never fail initialization.
+        let prefix = format!(
+            ".{}.create.",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(DB_META_FILENAME)
+        );
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix)
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     fn validate_existing_descriptor(path: &Path) -> io::Result<()> {

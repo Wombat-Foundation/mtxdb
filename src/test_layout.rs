@@ -98,6 +98,40 @@ fn descriptor_install_falls_back_to_rename_when_hard_links_are_unavailable() {
 }
 
 #[test]
+fn descriptor_install_accepts_a_temp_swept_by_a_concurrent_opener() {
+    let root = test_dir("swept_temp_race");
+    fs::create_dir_all(&root).unwrap();
+    let temporary = root.join(".db.meta.create.racing.1");
+    let descriptor = root.join(DB_META_FILENAME);
+    fs::write(&temporary, super::db_meta_bytes()).unwrap();
+
+    super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |temp, target| {
+        fs::remove_file(temp)?;
+        fs::write(target, super::db_meta_bytes())?;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "concurrent opener swept the temp after install",
+        ))
+    })
+    .unwrap();
+
+    assert!(super::validate_db_meta(&fs::read(&descriptor).unwrap()));
+}
+
+#[test]
+fn first_open_reaps_orphaned_descriptor_temps() {
+    let root = test_dir("orphaned_descriptor_temps");
+    fs::create_dir_all(&root).unwrap();
+    let orphan = root.join(".db.meta.create.dead.1");
+    fs::write(&orphan, b"interrupted descriptor").unwrap();
+
+    DatabaseLayout::open(root.clone()).unwrap();
+
+    assert!(root.join(DB_META_FILENAME).is_file());
+    assert!(!orphan.exists());
+}
+
+#[test]
 fn refuses_legacy_flat_packfiles() {
     let root = test_dir("legacy");
     fs::create_dir_all(&root).unwrap();
