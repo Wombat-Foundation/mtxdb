@@ -1196,14 +1196,17 @@ impl PackfileStorage {
             let collection_lock = self.put_mutex(collection_id);
             let _collection_guard = collection_lock.lock();
             for _ in 0..ATTEMPTS {
-                // Read the data first, then name the version it covers. The
-                // boundary is a true lower bound on the data's coverage, so
-                // `boundary >= version` already proves the data reflects every
-                // write at or below `version`; no quiescent window is needed.
-                // Requiring the version to be unchanged across the read would
-                // starve a hot collection under continuous publication.
-                let (data, boundary) = self.get_read_committed_bounded(collection_id, ids, true)?;
+                // Sample the version before the data. `boundary` is a true
+                // lower bound on the data's coverage, so `boundary >= version`
+                // proves the data reflects every write at or below `version`:
+                // return that version as the token, with no need for a
+                // quiescent window. Requiring the version to be unchanged
+                // across the read starves a hot collection under continuous
+                // publication. Sampling the version first (not last) keeps
+                // `version` older than the data, so the boundary can still
+                // cover it while writers keep advancing the collection.
                 let version = journal.collection_version(pool, collection_id);
+                let (data, boundary) = self.get_read_committed_bounded(collection_id, ids, true)?;
                 if boundary >= version {
                     return Ok((data, version));
                 }
