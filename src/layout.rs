@@ -430,7 +430,10 @@ impl DatabaseLayout {
         );
         if let Ok(entries) = fs::read_dir(parent) {
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&prefix)
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix))
                     && entry.file_type().is_ok_and(|kind| kind.is_file())
                 {
                     let _ = fs::remove_file(entry.path());
