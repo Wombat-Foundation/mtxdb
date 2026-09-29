@@ -1,4 +1,6 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::index::format::*;
 
 #[test]
 fn fixed_width_records_round_trip() {

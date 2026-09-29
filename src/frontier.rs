@@ -157,8 +157,3 @@ impl Default for BfsLayer {
         Self::new()
     }
 }
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-#[path = "test_frontier.rs"]
-mod tests;

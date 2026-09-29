@@ -1,4 +1,6 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::matrix_policy::*;
 
 #[test]
 #[cfg(feature = "multi-reader")]
@@ -9,7 +11,7 @@ fn matrix_pool_policies_skips_state_compression() {
     assert!(policies.edges.compress);
     assert_eq!(
         policies.state.checksum_policy,
-        crate::packfile::ChecksumPolicy::Full
+        mtxdb::packfile::ChecksumPolicy::Full
     );
 }
 

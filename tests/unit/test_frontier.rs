@@ -1,4 +1,7 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::frontier::*;
+use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 
 #[test]
 fn test_frontier_batch() {
@@ -50,7 +53,7 @@ fn test_bfs_layer_default() {
 
 #[test]
 fn test_fetch_frontier_sequential() {
-    use crate::storage::InMemoryStorage;
+    use mtxdb::storage::InMemoryStorage;
 
     let engine = InMemoryStorage::new();
     let collection = [0x01; 16];
