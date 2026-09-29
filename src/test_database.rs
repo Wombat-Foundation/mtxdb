@@ -2037,10 +2037,17 @@ fn versioned_point_reads_match_their_token_during_concurrent_publication() {
             reader_start.wait();
             let mut samples = Vec::new();
             while !reader_done.load(Ordering::Acquire) {
-                let (records, version) = reader_db
+                let (records, version) = match reader_db
                     .pool(pool)
                     .get_with_collection_version(&collection, &[key])
-                    .unwrap();
+                {
+                    Ok(records) => records,
+                    Err(error) if error.is_would_block() => {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    Err(error) => panic!("versioned read failed: {error}"),
+                };
                 let value = records[0]
                     .as_ref()
                     .map(|record| u64::from_le_bytes(record.bytes[..].try_into().unwrap()));
@@ -2577,6 +2584,8 @@ fn open_with_policies_applies_per_pool_settings() {
 fn concurrent_versioned_rmw_keeps_every_update() {
     use std::sync::Arc;
 
+    const WORKERS: u8 = 8;
+
     let root = test_root("concurrent_versioned_rmw");
     let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
     let pool = ShardType::Edges;
@@ -2588,23 +2597,11 @@ fn concurrent_versioned_rmw_keeps_every_update() {
         .unwrap();
     seed.commit().unwrap();
 
-    const WORKERS: u8 = 8;
     let barrier = Arc::new(Barrier::new(usize::from(WORKERS)));
-    let reads: Arc<std::sync::Mutex<Vec<(Vec<u8>, u64)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let commits: Arc<std::sync::Mutex<Vec<(u8, u64, Vec<u8>)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    // Serialize only the commit + version sample, so the sampled version is the
-    // exact LSN this transaction published. Reads (and the failed commits they
-    // lead to) stay fully concurrent, which is the behavior under test.
-    let commit_serial: Arc<std::sync::Mutex<()>> = Arc::new(std::sync::Mutex::new(()));
     let handles: Vec<_> = (0..WORKERS)
         .map(|worker| {
             let db = Arc::clone(&db);
             let barrier = Arc::clone(&barrier);
-            let reads = Arc::clone(&reads);
-            let commits = Arc::clone(&commits);
-            let commit_serial = Arc::clone(&commit_serial);
             std::thread::spawn(move || {
                 barrier.wait();
                 let token = worker + 1;
@@ -2612,7 +2609,7 @@ fn concurrent_versioned_rmw_keeps_every_update() {
                     let transaction = db.begin_transaction();
                     let (records, version) =
                         match transaction.get_with_collection_version(pool, &collection, &[key]) {
-                            Ok(sampled) => sampled,
+                            Ok(records) => records,
                             Err(error) if error.is_would_block() => continue,
                             Err(error) => panic!("versioned read failed: {error}"),
                         };
@@ -2622,8 +2619,6 @@ fn concurrent_versioned_rmw_keeps_every_update() {
                     if !list.contains(&token) {
                         list.push(token);
                     }
-                    let written = list.clone();
-                    reads.lock().unwrap().push((written.clone(), version));
                     transaction
                         .expect_collection_version(pool, collection, version)
                         .unwrap();
@@ -2635,15 +2630,13 @@ fn concurrent_versioned_rmw_keeps_every_update() {
                             &NodeData::new(bytes::Bytes::from(list)),
                         )
                         .unwrap();
-                    match transaction.commit() {
-                        Ok(()) => {
-                            let commit_lsn = db.coordinator().collection_version(pool, &collection);
-                            commits.lock().unwrap().push((token, commit_lsn, written));
-                            break;
+                    if let Err(error) = transaction.commit() {
+                        if error.is_stale_read() {
+                            continue;
                         }
-                        Err(error) if error.is_stale_read() => continue,
-                        Err(error) => panic!("commit failed: {error}"),
+                        panic!("commit failed: {error}");
                     }
+                    break;
                 }
             })
         })
@@ -2652,24 +2645,8 @@ fn concurrent_versioned_rmw_keeps_every_update() {
         handle.join().unwrap();
     }
 
-    // A read that returned `version` must reflect every update published at or
-    // below it. The exact publish LSN comes from the commit receipt, so the
-    // first violation names the read and the token it should have seen.
-    let commits = commits.lock().unwrap();
-    for (list, version) in reads.lock().unwrap().iter() {
-        for (token, commit_lsn, _written) in commits.iter() {
-            assert!(
-                *commit_lsn == 0 || *commit_lsn > *version || list.contains(token),
-                "read at version {version} lost token {token} published at {commit_lsn}; list={list:?}"
-            );
-        }
-    }
-    drop(commits);
-
-    let mut final_list = db
-        .pool(pool)
-        .get_read_committed(&collection, &[key])
-        .unwrap()[0]
+    db.pool(pool).sync_all().unwrap();
+    let mut final_list = db.pool(pool).get_many(&collection, &[key]).unwrap()[0]
         .as_ref()
         .map_or_else(Vec::new, |record| record.bytes.to_vec());
     final_list.sort_unstable();

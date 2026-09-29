@@ -9899,12 +9899,6 @@ impl PackfileStorage {
         }
     }
 
-    /// Return the LSN through which this handle's in-memory index is current.
-    #[cfg(feature = "multi-reader")]
-    pub(crate) fn materialized_lsn(&self) -> u64 {
-        self.materialized_lsn.load(Ordering::Acquire)
-    }
-
     /// Record that this handle's in-memory index now includes a published
     /// mutation or transaction group through `lsn`.
     #[cfg(feature = "multi-reader")]
@@ -9959,6 +9953,8 @@ impl PackfileStorage {
         if let Ok(Some(lsn)) = result {
             #[cfg(feature = "multi-reader")]
             self.note_materialized_lsn(lsn);
+            #[cfg(not(feature = "multi-reader"))]
+            let _ = lsn;
             self.record_published_mutation(started);
         }
         result

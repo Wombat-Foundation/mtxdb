@@ -1046,50 +1046,51 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        self.get_read_committed_bounded(collection_id, ids)
+        self.get_read_committed_bounded(collection_id, ids, false)
             .map(|(data, _)| data)
     }
 
     /// Like [`Self::get_read_committed`], also returning the visibility
-    /// boundary of the returned data: the applied-overlay LSN at the moment of
-    /// the read. Every published group at or below this LSN is reflected in the
-    /// result (from the overlay if unmaterialized, otherwise from the durable
-    /// index).
+    /// boundary of the returned data: the highest LSN whose groups are fully
+    /// reflected in the result (from the overlay if unmaterialized, otherwise
+    /// from the durable index). The boundary is the applied-overlay LSN,
+    /// clamped to this handle's materialized watermark, because an overlay can
+    /// run ahead of materialization and certify data the durable index has not
+    /// absorbed yet.
     ///
-    /// The boundary is `u64::MAX` when no overlay is installed, where a writer
-    /// has no transaction in flight and the live index is fully materialized.
     /// A caller pairing the data with a logical version should reject a token
     /// above the returned boundary and retry, because the write that established
-    /// it may not yet be visible here.
+    /// it may not yet be visible here. When `with_boundary` is false the
+    /// boundary is not computed (and `0` is returned); the hot non-versioned
+    /// read path uses this to skip the materialization bookkeeping.
     pub(super) fn get_read_committed_bounded(
         &self,
         collection_id: &[u8; 16],
         ids: &[NodeId],
+        with_boundary: bool,
     ) -> Result<(Vec<Option<NodeData>>, u64), StorageError> {
         // Refresh outside the read lock: this may reload the checkpoint-bound
         // index if the writer reclaimed past this reader's coverage. The
         // returned guard keeps the applied overlay locked for the lookup below,
         // so another reader cannot reset it in between.
         let guard = self.refresh_read_journal()?;
-        // Capture the boundary from the same state the lookup reads, so it
-        // cannot advance between sampling the data and reporting the LSN. With
-        // an overlay that is the applied LSN. Without one the live index is the
-        // source, so bound it by what this handle has actually materialized: a
-        // synthetic `u64::MAX` would let a reader pair data that predates a
-        // publication with the collection version that publication already
-        // advanced, since publication runs before the group reaches the index.
-        let boundary = match guard.as_ref() {
-            Some(overlay) => overlay.observed_lsn,
-            None => self.materialized_lsn.load(Ordering::Acquire),
+        // The overlay's applied LSN certifies journal-sourced data, but a key
+        // whose newest write was pruned as checkpoint-covered is served from
+        // the durable index, and a transaction group publishes before it
+        // materializes. So no read may be certified past this handle's
+        // materialized watermark (bounded by the earliest pending group): an
+        // overlay-ahead boundary would pair data that predates a publication
+        // with the version that publication already advanced, and the reader's
+        // conditional commit would then clobber the pending write.
+        let boundary = if with_boundary {
+            if let Some(overlay) = guard.as_ref() {
+                overlay.observed_lsn.min(self.durable_read_boundary())
+            } else {
+                self.durable_read_boundary()
+            }
+        } else {
+            0
         };
-        if std::env::var_os("MTXDB_TRACE_VERSION").is_some() {
-            eprintln!(
-                "RCM coll={:02x?} guard={} boundary={boundary} materialized={}",
-                collection_id,
-                guard.is_some(),
-                self.materialized_lsn.load(Ordering::Acquire)
-            );
-        }
 
         // No overlay is installed (a writer with no transaction in flight):
         // the live index is the whole answer, so skip the per-id bookkeeping
@@ -1143,6 +1144,26 @@ impl PackfileStorage {
         Ok((results, boundary))
     }
 
+    /// The highest LSN this handle's live index is known to have applied: the
+    /// materialized watermark, clamped by the earliest published-but-not-yet-
+    /// materialized transaction (groups can materialize out of order, so the
+    /// maximum alone could claim coverage ahead of a pending group). A durable
+    /// fallback cannot be certified beyond this.
+    fn durable_read_boundary(&self) -> u64 {
+        let materialized = self.materialized_lsn.load(Ordering::Acquire);
+        #[cfg(feature = "multi-reader")]
+        {
+            materialized.min(
+                self.journal()
+                    .map_or(u64::MAX, |journal| journal.unmaterialized_floor()),
+            )
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        {
+            materialized
+        }
+    }
+
     /// Read records with the logical collection version sampled at the same
     /// visibility boundary. Publication advances the version before packfile
     /// materialization, so a token newer than the overlay boundary forces a
@@ -1176,19 +1197,8 @@ impl PackfileStorage {
             let _collection_guard = collection_lock.lock();
             for _ in 0..ATTEMPTS {
                 let version = journal.collection_version(pool, collection_id);
-                let (data, boundary) = self.get_read_committed_bounded(collection_id, ids)?;
-                // An active overlay reports its observed LSN and may safely
-                // satisfy the read before pack materialization. Only replace
-                // the synthetic no-overlay MAX boundary with the in-memory
-                // materialization watermark; otherwise a valid overlay read
-                // would be forced to wait for durable index catch-up.
-                let effective_boundary = if boundary == u64::MAX {
-                    self.materialized_lsn()
-                } else {
-                    boundary
-                };
-                if effective_boundary >= version
-                    && journal.collection_version(pool, collection_id) == version
+                let (data, boundary) = self.get_read_committed_bounded(collection_id, ids, true)?;
+                if boundary >= version && journal.collection_version(pool, collection_id) == version
                 {
                     return Ok((data, version));
                 }

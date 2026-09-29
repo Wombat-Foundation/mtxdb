@@ -2125,6 +2125,24 @@ impl JournalCoordinator {
         self.unmaterialized.lock().remove(&first_lsn);
     }
 
+    /// Highest LSN a reader may treat as applied by every pool's index: one
+    /// below the earliest published-but-not-yet-materialized transaction group,
+    /// or `u64::MAX` when nothing is pending.
+    ///
+    /// A pool-wide *materialized* watermark is a maximum, so out-of-order
+    /// materialization can push it past an earlier group that is still pending.
+    /// Clamping a versioned read to this floor keeps it from pairing data that
+    /// predates a publication with the version that publication already
+    /// advanced.
+    #[must_use]
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn unmaterialized_floor(&self) -> u64 {
+        self.unmaterialized
+            .lock()
+            .first()
+            .map_or(u64::MAX, |first_lsn| first_lsn.saturating_sub(1))
+    }
+
     /// Record a durable commit and advance the generation that re-arms the
     /// background committer's threshold wake. Centralised so every commit path
     /// — background, explicit `sync_through`, and fallback — re-arms alike.
