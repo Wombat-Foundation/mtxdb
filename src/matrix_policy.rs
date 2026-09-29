@@ -336,5 +336,9 @@ pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
         },
         event_dag: crate::database::PoolPolicy::default(),
         edges: crate::database::PoolPolicy::default(),
+        server_info: crate::database::PoolPolicy {
+            compress: false,
+            checksum_policy: crate::packfile::ChecksumPolicy::Full,
+        },
     }
 }

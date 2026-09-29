@@ -484,6 +484,56 @@ fn opens_a_root_with_all_pools_behind_one_coordinator() {
 }
 
 #[test]
+fn server_info_is_a_shared_wal_transaction_pool() {
+    let root = test_root("server_info_shared_wal");
+    let collection = [0x64; 16];
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let transaction = db.begin_transaction();
+    transaction
+        .put(
+            ShardType::ServerInfo,
+            collection,
+            node(4),
+            &data(b"server-info"),
+        )
+        .unwrap();
+    transaction
+        .put(ShardType::State, collection, node(5), &data(b"state"))
+        .unwrap();
+    assert_eq!(
+        transaction.stage.touched_pools(),
+        [true, false, false, true]
+    );
+
+    transaction.commit().unwrap();
+    let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
+    assert_eq!(scan.groups.len(), 1);
+    let pools = scan.groups[0]
+        .entries
+        .iter()
+        .filter_map(|entry| entry.pool)
+        .collect::<Vec<_>>();
+    assert!(pools.contains(&ShardType::State));
+    assert!(pools.contains(&ShardType::ServerInfo));
+
+    drop(transaction);
+    drop(db);
+    let reopened = SharedDatabase::open(root.clone()).unwrap();
+    assert_eq!(
+        reopened
+            .pool(ShardType::ServerInfo)
+            .get(&collection, &node(4))
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"server-info"
+    );
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn transaction_abort_keeps_staged_mutations_invisible() {
     let root = test_root("transaction_abort");
     let db = SharedDatabase::open(root.clone()).unwrap();
@@ -1169,7 +1219,7 @@ fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
     let txn = db.begin_transaction();
     txn.put(ShardType::EventDag, collection, node(1), &data(b"staged"))
         .unwrap();
-    assert_eq!(txn.stage.touched_pools(), [false, true, false]);
+    assert_eq!(txn.stage.touched_pools(), [false, true, false, false]);
     let overlay = activate_for(&db, &txn.stage);
     assert!(db.pool(ShardType::EventDag).read_journal_installed());
     assert!(!db.pool(ShardType::State).read_journal_installed());
@@ -1184,7 +1234,7 @@ fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
     mixed
         .put(ShardType::Edges, collection, node(3), &data(b"edge"))
         .unwrap();
-    assert_eq!(mixed.stage.touched_pools(), [true, false, true]);
+    assert_eq!(mixed.stage.touched_pools(), [true, false, true, false]);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }

@@ -135,11 +135,13 @@ pub enum ShardType {
     EventDag,
     /// Edges pool: houses previous-event edges (`PREV`) and auth-chain edges (`AUTH`).
     Edges,
+    /// Server metadata, including federation signing keys and raw key responses.
+    ServerInfo,
 }
 
 impl ShardType {
     /// Every shard type defined by the current database layout.
-    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::Edges];
+    pub const ALL: [Self; 4] = [Self::State, Self::EventDag, Self::Edges, Self::ServerInfo];
 
     /// Stable on-disk directory name for this pool.
     #[must_use]
@@ -148,6 +150,7 @@ impl ShardType {
             Self::State => "mtpl-state",
             Self::EventDag => "mtpl-event",
             Self::Edges => "mtpl-edges",
+            Self::ServerInfo => "mtpl-server-info",
         }
     }
 
@@ -163,6 +166,7 @@ impl ShardType {
             Self::State => *b"STAT",
             Self::EventDag => *b"EVNT",
             Self::Edges => *b"EDGE",
+            Self::ServerInfo => *b"SINF",
         }
     }
 }

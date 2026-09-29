@@ -192,12 +192,12 @@ pub enum TxnStageState {
 #[derive(Debug)]
 #[cfg(feature = "multi-reader")]
 struct TxnStageData {
-    pools: [Vec<Mutation>; 3],
-    applied: [Vec<bool>; 3],
+    pools: [Vec<Mutation>; ShardType::ALL.len()],
+    applied: [Vec<bool>; ShardType::ALL.len()],
     bytes: usize,
     /// Successful pool appends. Retrying a callback after a partial error
     /// resumes at the failed pool instead of duplicating earlier groups.
-    appended: [bool; 3],
+    appended: [bool; ShardType::ALL.len()],
     /// Receipt identifying the published journal group owned by this stage.
     receipt: Option<CommitReceipt>,
 }
@@ -260,7 +260,7 @@ impl TxnStage {
                 pools: std::array::from_fn(|_| Vec::new()),
                 applied: std::array::from_fn(|_| Vec::new()),
                 bytes: 0,
-                appended: [false; 3],
+                appended: [false; ShardType::ALL.len()],
                 receipt: None,
             }),
             #[cfg(test)]
@@ -379,7 +379,7 @@ impl TxnStage {
 
     /// Snapshot staged mutations for application to storage at commit time.
     #[cfg(feature = "multi-reader")]
-    pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; 3] {
+    pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; ShardType::ALL.len()] {
         self.data.lock().pools.clone()
     }
 
@@ -650,9 +650,7 @@ impl TxnStage {
     /// cannot append the group's complete framing and trailer.
     pub fn publish(
         &self,
-        edges: Option<&JournalCoordinator>,
-        event_dag: Option<&JournalCoordinator>,
-        state: Option<&JournalCoordinator>,
+        coordinators: [Option<&JournalCoordinator>; ShardType::ALL.len()],
     ) -> io::Result<()> {
         let mut data = self.data.lock();
         match self.state.load(Ordering::Acquire) {
@@ -661,14 +659,21 @@ impl TxnStage {
             }
             _ => {}
         }
-        let coordinators = [edges, event_dag, state];
         if coordinators.iter().all(Option::is_none) {
             // Journaling is disabled process-wide, so there is no journal to
             // publish into.
             self.state.store(Self::PUBLISHED, Ordering::Release);
             return Ok(());
         }
-        let pools = [ShardType::Edges, ShardType::EventDag, ShardType::State];
+        // Preserve the historical per-pool append order for the existing
+        // pools; ServerInfo is appended after them without changing the WAL
+        // ordering of legacy frames.
+        let pools = [
+            ShardType::Edges,
+            ShardType::EventDag,
+            ShardType::State,
+            ShardType::ServerInfo,
+        ];
 
         // A shared-WAL database gives every pool the same coordinator. Keep
         // the transaction as one journal group in that case, so readers never
@@ -725,13 +730,13 @@ impl TxnStage {
             ));
         }
 
-        for (ordered_index, pool) in pools.into_iter().enumerate() {
+        for pool in pools {
             let index = pool_index(pool);
             if data.appended[index] || data.pools[index].is_empty() {
                 data.appended[index] = true;
                 continue;
             }
-            let coordinator = coordinators[ordered_index].ok_or_else(|| {
+            let coordinator = coordinators[pool_index(pool)].ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "staged pool has no journal")
             })?;
             let receipt = coordinator.publish_group_tagged(pool, &data.pools[index])?;
@@ -749,6 +754,7 @@ const fn pool_index(pool: ShardType) -> usize {
         ShardType::State => 0,
         ShardType::EventDag => 1,
         ShardType::Edges => 2,
+        ShardType::ServerInfo => 3,
     }
 }
 
@@ -756,12 +762,13 @@ const fn pool_index(pool: ShardType) -> usize {
 /// mutation frame's previously reserved flag byte.
 ///
 /// `0` is reserved for "untagged", which only a version-2 segment may contain;
-/// a version-3 frame must carry `1..=3`.
+/// a version-3 frame must carry `1..=4`.
 pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
     match pool {
         ShardType::State => 1,
         ShardType::EventDag => 2,
         ShardType::Edges => 3,
+        ShardType::ServerInfo => 4,
     }
 }
 
@@ -772,6 +779,7 @@ pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
         1 => Some(ShardType::State),
         2 => Some(ShardType::EventDag),
         3 => Some(ShardType::Edges),
+        4 => Some(ShardType::ServerInfo),
         _ => None,
     }
 }
@@ -4420,7 +4428,7 @@ fn decode_mutations(
             return Err(invalid_data("unsupported journal mutation flags"));
         }
         let pool = if version.is_pool_tagged() {
-            if !matches!(tag, 1..=3) {
+            if !matches!(tag, 1..=4) {
                 return Err(invalid_data("pool-tagged frame has no valid pool tag"));
             }
             pool_from_tag(tag)
