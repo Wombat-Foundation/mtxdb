@@ -9904,6 +9904,9 @@ impl PackfileStorage {
     #[cfg(feature = "multi-reader")]
     pub(crate) fn note_materialized_lsn(&self, lsn: u64) {
         self.materialized_lsn.fetch_max(lsn, Ordering::Release);
+        if let Some(journal) = self.journal() {
+            journal.notify_materialized();
+        }
     }
 
     /// Publish one mutation to the journal, if enabled. Returns the assigned

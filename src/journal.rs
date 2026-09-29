@@ -1741,6 +1741,14 @@ pub struct JournalCoordinator {
     /// First LSNs of transaction groups that are published but whose writes are
     /// not yet all in the packs. See [`Self::publish_groups`].
     unmaterialized: Mutex<std::collections::BTreeSet<u64>>,
+    /// Wakes versioned reads blocked until a published group reaches the packs.
+    /// A read that cannot certify its boundary waits here instead of polling;
+    /// `transaction_materialized` and each pool's materialized watermark
+    /// advance notify it.
+    #[cfg(feature = "multi-reader")]
+    materialized_cv: Condvar,
+    #[cfg(feature = "multi-reader")]
+    materialized_lock: Mutex<()>,
     /// Appended-but-not-yet-committed groups, with the highest LSN each carried
     /// per pool. Appending a transaction group makes it visible before it is
     /// fsynced; when a later durable commit passes it,
@@ -1940,6 +1948,10 @@ impl JournalCoordinator {
             #[cfg(feature = "multi-reader")]
             collection_versions: Mutex::new(collection_versions),
             unmaterialized: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(feature = "multi-reader")]
+            materialized_cv: Condvar::new(),
+            #[cfg(feature = "multi-reader")]
+            materialized_lock: Mutex::new(()),
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
@@ -2123,6 +2135,24 @@ impl JournalCoordinator {
     #[cfg(feature = "multi-reader")]
     pub fn transaction_materialized(&self, first_lsn: u64) {
         self.unmaterialized.lock().remove(&first_lsn);
+        self.notify_materialized();
+    }
+
+    /// Wake versioned reads waiting for a pending group to lift the read
+    /// boundary. Called when a pool's materialized watermark or the pending
+    /// set changes.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn notify_materialized(&self) {
+        self.materialized_cv.notify_all();
+    }
+
+    /// Block until a materialization may have advanced the read boundary, or
+    /// `timeout` elapses. A spurious wake is fine: callers re-check the
+    /// boundary and wait again.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn wait_for_materialized(&self, timeout: std::time::Duration) {
+        let mut guard = self.materialized_lock.lock();
+        self.materialized_cv.wait_for(&mut guard, timeout);
     }
 
     /// Highest LSN a reader may treat as applied by every pool's index: one

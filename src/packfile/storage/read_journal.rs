@@ -1217,14 +1217,15 @@ impl PackfileStorage {
                     );
                     return Ok((data, version));
                 }
-                // The boundary lags by an in-flight group; its materialization
-                // runs on another thread, so yield first and then sleep
-                // briefly. A pure spin can exhaust the budget on a loaded
-                // machine before that thread is scheduled.
+                // The boundary lags by an in-flight group whose materialization
+                // runs on another thread. Yield first, then block on the
+                // materialization signal so the read wakes as soon as that
+                // thread finishes instead of polling; the timeout bounds a
+                // missed wake.
                 if attempt < 2 {
                     std::thread::yield_now();
                 } else {
-                    std::thread::sleep(std::time::Duration::from_micros(25));
+                    journal.wait_for_materialized(std::time::Duration::from_micros(50));
                 }
             }
             Err(StorageError::WouldBlock(format!(
