@@ -79,6 +79,7 @@ fn checkpoint_round_trips_index_slots() {
             .map(|(id, blob)| (*id, 0, blob.as_slice()))
             .collect::<Vec<_>>(),
         &[],
+        &[],
     )
     .unwrap();
 
@@ -150,7 +151,7 @@ fn empty_checkpoint_round_trips() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
-    write_checkpoint(&path, pack_fingerprint(&[]), 0, 0, &[], &[]).unwrap();
+    write_checkpoint(&path, pack_fingerprint(&[]), 0, 0, &[], &[], &[]).unwrap();
     let loaded = read_checkpoint(&path).expect("empty checkpoint is still a valid file");
     assert_eq!(loaded.fingerprint, pack_fingerprint(&[]));
     assert!(loaded.collections.is_empty());
@@ -179,6 +180,7 @@ fn corrupt_checkpoints_read_as_none() {
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
         &[],
+        &[],
     )
     .unwrap();
     let full = std::fs::read(&path).unwrap();
@@ -200,6 +202,7 @@ fn corrupt_checkpoints_read_as_none() {
             .iter()
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
+        &[],
         &[],
     )
     .unwrap();
@@ -237,6 +240,7 @@ fn previous_version_checkpoint_is_rejected() {
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
         &[(0, pid(1))],
+        &[],
     )
     .unwrap();
     assert!(
@@ -288,6 +292,7 @@ fn content_crc32_catches_value_preserving_slot_corruption() {
             .iter()
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
+        &[],
         &[],
     )
     .unwrap();
@@ -385,6 +390,8 @@ fn read_pack_fingerprint_valid_roundtrip() {
         pack_table_count: 0,
         pack_table_bytes: 0,
         base_delta_seq: 0,
+        logical_version_count: 0,
+        logical_version_bytes: 0,
     };
     std::fs::write(&path, header.encode()).unwrap();
 
@@ -426,6 +433,8 @@ fn read_durable_fingerprint_checkpoint_only() {
         pack_table_count: 0,
         pack_table_bytes: 0,
         base_delta_seq: 0,
+        logical_version_count: 0,
+        logical_version_bytes: 0,
     };
     std::fs::write(&path, header.encode()).unwrap();
 
@@ -472,6 +481,7 @@ fn base_delta_seq_round_trips_through_the_header() {
             .map(|(id, b)| (*id, 1, b.as_slice()))
             .collect::<Vec<_>>(),
         &[(0, pid(1))],
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -481,5 +491,24 @@ fn base_delta_seq_round_trips_through_the_header() {
     let summary = read_checkpoint_summary(&path).unwrap().unwrap();
     assert_eq!(summary.base_delta_seq, 0xDEAD_BEEF_0042);
     assert_eq!(summary.covered_lsn, 5);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn checkpoint_round_trips_sorted_collection_versions() {
+    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_versions_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_CHECKPOINT_FILE);
+    let versions = [([1; 16], 3), ([2; 16], 7)];
+    write_checkpoint(&path, pack_fingerprint(&[]), 7, 0, &[], &[], &versions).unwrap();
+
+    let loaded = read_checkpoint(&path).expect("valid logical-version checkpoint");
+    assert_eq!(loaded.logical_versions, versions);
+
+    let unsorted = [([2; 16], 7), ([1; 16], 3)];
+    assert!(write_checkpoint(&path, pack_fingerprint(&[]), 7, 0, &[], &[], &unsorted).is_err());
+    let uncovered = [([1; 16], 8)];
+    assert!(write_checkpoint(&path, pack_fingerprint(&[]), 7, 0, &[], &[], &uncovered).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }

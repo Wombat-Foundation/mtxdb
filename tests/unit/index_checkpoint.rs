@@ -393,7 +393,7 @@ mod tests {
 
         let cp_file = checkpoint_path(&dir);
         let mut buf = std::fs::read(&cp_file).unwrap();
-        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 9);
 
         // Patch only the version field to the previous version (7). This is
         // enough to exercise the version gate: the reader must reject the
@@ -412,7 +412,7 @@ mod tests {
         drop(reopened);
 
         let rewritten = std::fs::read(&cp_file).unwrap();
-        assert_eq!(u32::from_le_bytes(rewritten[8..12].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(rewritten[8..12].try_into().unwrap()), 9);
 
         // Next open should use Checkpoint path
         let reopened_v8 = PackfileStorage::open(dir.clone()).unwrap();

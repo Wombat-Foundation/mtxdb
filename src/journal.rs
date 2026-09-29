@@ -1911,7 +1911,7 @@ impl JournalCoordinator {
                 let version = collection_versions
                     .entry((pool, collection_id))
                     .or_insert(0);
-                *version = (*version).max(entry.lsn);
+                *version = (*version).max(group.last_lsn);
             }
         }
         Self {
@@ -2058,6 +2058,43 @@ impl JournalCoordinator {
             .get(&(pool, *collection_id))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Snapshot the logical versions this pool's checkpoint can safely claim.
+    /// Versions above `covered_lsn` remain represented by retained WAL and
+    /// must not be folded into the checkpoint baseline.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn collection_versions_through(
+        &self,
+        pool: ShardType,
+        covered_lsn: u64,
+    ) -> Vec<([u8; 16], u64)> {
+        let mut versions = self
+            .collection_versions
+            .lock()
+            .iter()
+            .filter_map(|(&(version_pool, collection_id), &version)| {
+                (version_pool == pool && version <= covered_lsn).then_some((collection_id, version))
+            })
+            .collect::<Vec<_>>();
+        versions.sort_unstable_by_key(|(collection_id, _)| *collection_id);
+        versions
+    }
+
+    /// Merge a durable pool-checkpoint baseline with versions recovered from
+    /// the retained WAL. Newer WAL versions win; deleted collection IDs are
+    /// retained as tombstone versions too.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn restore_collection_versions(
+        &self,
+        pool: ShardType,
+        versions: &[([u8; 16], u64)],
+    ) {
+        let mut current = self.collection_versions.lock();
+        for &(collection_id, version) in versions {
+            let entry = current.entry((pool, collection_id)).or_insert(0);
+            *entry = (*entry).max(version);
+        }
     }
 
     /// Highest committed group `last_lsn` that carried at least one frame for

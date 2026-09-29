@@ -5008,6 +5008,22 @@ impl PackfileStorage {
         })
     }
 
+    /// Snapshot this pool's logical versions through the checkpoint coverage
+    /// boundary. Versions above that boundary remain in the retained WAL and
+    /// must not be claimed by the checkpoint.
+    fn checkpoint_logical_versions(&self, covered_lsn: Option<u64>) -> Vec<([u8; 16], u64)> {
+        #[cfg(feature = "multi-reader")]
+        if let (Some(journal), Some(pool), Some(covered_lsn)) = (
+            self.journal(),
+            pool_from_tag(self.journal_pool.load(Ordering::Acquire)),
+            covered_lsn,
+        ) {
+            return journal.collection_versions_through(pool, covered_lsn);
+        }
+        let _ = covered_lsn;
+        Vec::new()
+    }
+
     /// Persist the full per-collection index state to `index.checkpoint`, so
     /// the next open can load it instead of rescanning every packfile.
     ///
@@ -5203,6 +5219,7 @@ impl PackfileStorage {
         // pool's own committed watermark instead, so its coverage and the
         // reclaim floor both describe only frames this index holds.
         let wal_lsn = self.checkpoint_covered_lsn();
+        let logical_versions = self.checkpoint_logical_versions(wal_lsn);
         // The image is captured here, under the locks, as bytes: the tail never
         // reads the live table. Pending frames were cleared by the rotation and
         // no put is mid-flight, so clearing the flag now loses nothing; a put
@@ -5229,6 +5246,7 @@ impl PackfileStorage {
             fingerprint,
             covered_lsn: wal_lsn,
             base_delta_seq,
+            logical_versions,
             blobs,
             pack_table,
             old_base_fingerprint,
@@ -5252,6 +5270,7 @@ impl PackfileStorage {
         base_delta_seq: u64,
         snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
         pack_table: &[(u16, PackId)],
+        logical_versions: &[([u8; 16], u64)],
     ) -> std::io::Result<std::time::Duration> {
         let serialize_started = std::time::Instant::now();
         let entries: Vec<([u8; 16], u64, Vec<u8>)> = snapshots
@@ -5272,6 +5291,7 @@ impl PackfileStorage {
             base_delta_seq,
             &blobs,
             pack_table,
+            logical_versions,
         )?;
         Ok(serialized)
     }
@@ -5531,6 +5551,7 @@ impl PackfileStorage {
             self.delta_state.lock().delta_seq_high,
             &snapshots,
             &pack_table,
+            &[],
         )
         .map_err(StorageError::Io)?;
         let _ = crate::shard::sync_directory(&self.base_dir);
@@ -5614,6 +5635,7 @@ impl PackfileStorage {
             self.delta_state.lock().delta_seq_high,
             &snapshots,
             &pack_table,
+            &[],
         )
         .map_err(StorageError::Io)?;
         let _ = crate::shard::sync_directory(&self.base_dir);
@@ -9582,6 +9604,14 @@ impl PackfileStorage {
         self.journal_recovery
             .lock()
             .clone_from(&journal.recovered_groups());
+        // Checkpoint versions are the durable baseline for collection clocks;
+        // the coordinator already seeded versions from the retained WAL, so
+        // merging this pool-local table preserves whichever side is newer.
+        if let Some(checkpoint) =
+            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(&self.base_dir))
+        {
+            journal.restore_collection_versions(pool, &checkpoint.logical_versions);
+        }
         self.journal_pool.store(pool_tag(pool), Ordering::Release);
         journal.report_pool_coverage(pool, self.durable_coverage());
         journal.enable_publish_signal().map_err(StorageError::Io)?;
@@ -11086,6 +11116,7 @@ struct CheckpointTail {
     fingerprint: u64,
     covered_lsn: Option<u64>,
     base_delta_seq: u64,
+    logical_versions: Vec<([u8; 16], u64)>,
     blobs: Vec<([u8; 16], u64, Vec<u8>)>,
     pack_table: Vec<(u16, PackId)>,
     old_base_fingerprint: Option<u64>,
@@ -11132,6 +11163,7 @@ impl CheckpointTail {
             self.base_delta_seq,
             &blobs,
             &self.pack_table,
+            &self.logical_versions,
         )
         .map_err(StorageError::Io)?;
         done.write = write_started.elapsed();

@@ -12,11 +12,13 @@ compile_error!("the persisted index cache is currently supported only on little-
 /// Bytes in one [`DeltaFrame`].
 pub const DELTA_FRAME_LEN: usize = 36;
 /// Bytes in the checkpoint header.
-pub const CHECKPOINT_HEADER_LEN: usize = 88;
+pub const CHECKPOINT_HEADER_LEN: usize = 104;
 /// Bytes in one collection directory entry.
 pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
 /// Bytes in one [`PackTableEntry`]: `slot`(2) + reserved(2) + `PackId`(16).
 pub const PACK_TABLE_ENTRY_LEN: usize = 20;
+/// Bytes in one collection logical-version entry: collection id plus LSN.
+pub const COLLECTION_VERSION_ENTRY_LEN: usize = 24;
 
 /// One slot overwrite after a checkpoint.
 ///
@@ -108,6 +110,10 @@ pub struct CheckpointHeader {
     /// counter resumes above it, and replay rejects a log whose first record does
     /// not exceed it. Zero before any redo record has been assigned.
     pub base_delta_seq: u64,
+    /// Number of `(collection_id, last_write_lsn)` entries after the pack table.
+    pub logical_version_count: u32,
+    /// Total byte length of the logical-version section.
+    pub logical_version_bytes: u64,
 }
 
 impl CheckpointHeader {
@@ -128,6 +134,8 @@ impl CheckpointHeader {
         bytes[68..72].copy_from_slice(&self.pack_table_count.to_le_bytes());
         bytes[72..80].copy_from_slice(&self.pack_table_bytes.to_le_bytes());
         bytes[80..88].copy_from_slice(&self.base_delta_seq.to_le_bytes());
+        bytes[88..92].copy_from_slice(&self.logical_version_count.to_le_bytes());
+        bytes[96..104].copy_from_slice(&self.logical_version_bytes.to_le_bytes());
         bytes
     }
 
@@ -135,6 +143,9 @@ impl CheckpointHeader {
     /// Decodes exactly one fixed-width header, rejecting any other length.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; CHECKPOINT_HEADER_LEN] = bytes.try_into().ok()?;
+        if bytes[92..96] != [0; 4] {
+            return None;
+        }
         Some(Self {
             magic: bytes[..8].try_into().ok()?,
             version: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
@@ -149,6 +160,39 @@ impl CheckpointHeader {
             pack_table_count: u32::from_le_bytes(bytes[68..72].try_into().ok()?),
             pack_table_bytes: u64::from_le_bytes(bytes[72..80].try_into().ok()?),
             base_delta_seq: u64::from_le_bytes(bytes[80..88].try_into().ok()?),
+            logical_version_count: u32::from_le_bytes(bytes[88..92].try_into().ok()?),
+            logical_version_bytes: u64::from_le_bytes(bytes[96..104].try_into().ok()?),
+        })
+    }
+}
+
+/// A pool-checkpoint entry preserving the logical LSN of one collection,
+/// including deleted collections whose version still rejects stale writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionVersionEntry {
+    /// The collection within this pool.
+    pub collection_id: [u8; 16],
+    /// Global LSN of the last published mutation touching the collection.
+    pub last_write_lsn: u64,
+}
+
+impl CollectionVersionEntry {
+    #[must_use]
+    /// Encodes this entry in fixed-width little-endian form.
+    pub fn encode(self) -> [u8; COLLECTION_VERSION_ENTRY_LEN] {
+        let mut bytes = [0; COLLECTION_VERSION_ENTRY_LEN];
+        bytes[..16].copy_from_slice(&self.collection_id);
+        bytes[16..24].copy_from_slice(&self.last_write_lsn.to_le_bytes());
+        bytes
+    }
+
+    #[must_use]
+    /// Decodes exactly one collection-version entry.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; COLLECTION_VERSION_ENTRY_LEN] = bytes.try_into().ok()?;
+        Some(Self {
+            collection_id: bytes[..16].try_into().ok()?,
+            last_write_lsn: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
         })
     }
 }

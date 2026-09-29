@@ -13,10 +13,12 @@
 //! Layout (all little-endian, fixed width — see [`crate::index::format`]):
 //!
 //! ```text
-//!   [CheckpointHeader 64B]
-//!   [CollectionDirEntry * count, 40B each]
+//!   [CheckpointHeader 104B]
+//!   [CollectionDirEntry * count, 56B each]
 //!   [collection 0 raw slots: capacity * 8B]
 //!   [collection 1 raw slots: capacity * 8B]
+//!   [PackTableEntry * pack_table_count, 20B each]
+//!   [CollectionVersionEntry * logical_version_count, 24B each]
 //!   ...
 //! ```
 //!
@@ -36,8 +38,9 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use super::format::{
-    CheckpointHeader, CollectionDirEntry, PackTableEntry, CHECKPOINT_HEADER_LEN,
-    COLLECTION_DIR_ENTRY_LEN, PACK_TABLE_ENTRY_LEN,
+    CheckpointHeader, CollectionDirEntry, CollectionVersionEntry, PackTableEntry,
+    CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN, COLLECTION_VERSION_ENTRY_LEN,
+    PACK_TABLE_ENTRY_LEN,
 };
 use crate::packfile::PackId;
 
@@ -74,12 +77,18 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
 /// reads for tag collisions on cold start.
 ///
+/// Bumped to 9: the checkpoint carries a sorted logical-version table after
+/// the pack table. The version table includes tombstoned collection IDs, so
+/// stale expectations remain stale after their WAL groups are reclaimed.
+/// A v8 checkpoint is rejected and rebuilt; no version tokens existed before
+/// this version, so the first v9 checkpoint establishes their baseline.
+///
 /// Bumped to 8: the pack table's [`PackTableEntry`] stores the 16-byte
 /// [`PackId`] identity (v7 used the 32-byte form), so each entry shrank from
 /// 36 to 20 bytes. The magic/version check below rejects a v7 file outright,
 /// forcing the normal full-rescan fallback rather than misreading the
 /// narrower entries.
-pub const CHECKPOINT_VERSION: u32 = 8;
+pub const CHECKPOINT_VERSION: u32 = 9;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 
@@ -143,6 +152,9 @@ pub struct LoadedCheckpoint {
     /// local slot rather than trusting the slot number directly. See the
     /// `CHECKPOINT_VERSION` doc comment for why.
     pub pack_table: Vec<(u16, PackId)>,
+    /// Per-pool logical versions captured through `covered_lsn`, including
+    /// IDs of collections deleted after their last live record was written.
+    pub logical_versions: Vec<([u8; 16], u64)>,
 }
 
 /// One collection's raw slots, homes, and tails in the checkpoint mapping.
@@ -243,6 +255,7 @@ pub fn write_checkpoint(
     base_delta_seq: u64,
     collections: &[([u8; 16], u64, &[u8])],
     pack_table: &[(u16, PackId)],
+    logical_versions: &[([u8; 16], u64)],
 ) -> std::io::Result<()> {
     let pack_table_count = u32::try_from(pack_table.len())
         .map_err(|_| std::io::Error::other("too many packs for checkpoint pack table u32"))?;
@@ -250,6 +263,24 @@ pub fn write_checkpoint(
         .ok()
         .and_then(|n| n.checked_mul(PACK_TABLE_ENTRY_LEN as u64))
         .ok_or_else(|| std::io::Error::other("checkpoint pack table size overflow"))?;
+    let logical_version_count = u32::try_from(logical_versions.len())
+        .map_err(|_| std::io::Error::other("too many logical versions for checkpoint u32"))?;
+    let logical_version_bytes = u64::try_from(logical_versions.len())
+        .ok()
+        .and_then(|n| n.checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64))
+        .ok_or_else(|| std::io::Error::other("checkpoint logical-version size overflow"))?;
+    if logical_versions
+        .windows(2)
+        .any(|pair| pair[0].0 >= pair[1].0)
+        || logical_versions
+            .iter()
+            .any(|(_, version)| *version > covered_lsn)
+    {
+        return Err(std::io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checkpoint logical versions must be sorted, unique, and covered by its LSN",
+        ));
+    }
 
     let count = u32::try_from(collections.len())
         .map_err(|_| std::io::Error::other("too many collections for checkpoint u32"))?;
@@ -292,7 +323,8 @@ pub fn write_checkpoint(
     let total_len = CHECKPOINT_HEADER_LEN
         .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
         .saturating_add(usize::try_from(body_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(pack_table_bytes).unwrap_or(usize::MAX));
+        .saturating_add(usize::try_from(pack_table_bytes).unwrap_or(usize::MAX))
+        .saturating_add(usize::try_from(logical_version_bytes).unwrap_or(usize::MAX));
     // Reserve the header first, then build the body directly into the final
     // buffer. This avoids retaining a second checkpoint-sized body merely to
     // calculate the CRC carried by the header.
@@ -386,6 +418,17 @@ pub fn write_checkpoint(
     for &(slot, pack_id) in pack_table {
         buf.extend_from_slice(&PackTableEntry { slot, pack_id }.encode());
     }
+    // Phase 5: persist logical versions, sorted by collection id so the section
+    // is deterministic and can be validated without allocating a hash set.
+    for &(collection_id, last_write_lsn) in logical_versions {
+        buf.extend_from_slice(
+            &CollectionVersionEntry {
+                collection_id,
+                last_write_lsn,
+            }
+            .encode(),
+        );
+    }
 
     let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
 
@@ -403,6 +446,8 @@ pub fn write_checkpoint(
         pack_table_count,
         pack_table_bytes,
         base_delta_seq,
+        logical_version_count,
+        logical_version_bytes,
     };
     buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
@@ -492,8 +537,18 @@ pub fn read_checkpoint_with_policy(
     {
         return None;
     }
+    if header.logical_version_bytes
+        != u64::from(header.logical_version_count)
+            .checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64)?
+    {
+        return None;
+    }
     let pack_table_base = slot_base.checked_add(usize::try_from(body_bytes).ok()?)?;
-    if buf.len() != pack_table_base.checked_add(usize::try_from(header.pack_table_bytes).ok()?)? {
+    let logical_versions_base =
+        pack_table_base.checked_add(usize::try_from(header.pack_table_bytes).ok()?)?;
+    if buf.len()
+        != logical_versions_base.checked_add(usize::try_from(header.logical_version_bytes).ok()?)?
+    {
         return None;
     }
 
@@ -587,6 +642,25 @@ pub fn read_checkpoint_with_policy(
         pack_table.push((entry.slot, entry.pack_id));
     }
 
+    let mut logical_versions = Vec::with_capacity(header.logical_version_count as usize);
+    let mut previous_id = None;
+    for i in 0..header.logical_version_count as usize {
+        let entry_offset =
+            logical_versions_base.checked_add(i.checked_mul(COLLECTION_VERSION_ENTRY_LEN)?)?;
+        let entry_bytes: [u8; COLLECTION_VERSION_ENTRY_LEN] = buf
+            .get(entry_offset..entry_offset.saturating_add(COLLECTION_VERSION_ENTRY_LEN))?
+            .try_into()
+            .ok()?;
+        let entry = CollectionVersionEntry::decode(&entry_bytes)?;
+        if previous_id.is_some_and(|previous| previous >= entry.collection_id)
+            || entry.last_write_lsn > header.covered_lsn
+        {
+            return None;
+        }
+        previous_id = Some(entry.collection_id);
+        logical_versions.push((entry.collection_id, entry.last_write_lsn));
+    }
+
     Some(LoadedCheckpoint {
         fingerprint: header.pack_fingerprint,
         covered_lsn: header.covered_lsn,
@@ -594,6 +668,7 @@ pub fn read_checkpoint_with_policy(
         collections,
         mmap,
         pack_table,
+        logical_versions,
     })
 }
 

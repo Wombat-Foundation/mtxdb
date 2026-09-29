@@ -7511,6 +7511,69 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
     drop(fresh_b);
 }
 
+/// Collection logical versions remain stable after their WAL group is covered,
+/// reclaimed, and the writer is reopened from its pool checkpoint.
+#[test]
+#[cfg(feature = "multi-reader")]
+fn shared_checkpoint_preserves_collection_versions_after_reclaim() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("version_checkpoint_wal");
+    let store_dir = test_dir("version_checkpoint_store");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(91),
+            &NodeData::new(bytes::Bytes::from_static(b"versioned")),
+        )
+        .unwrap();
+    coordinator.sync().unwrap();
+    let expected = coordinator.collection_version(ShardType::State, &TEST_COLLECTION);
+    store.sync_all().unwrap();
+
+    let checkpoint = crate::index::checkpoint::read_checkpoint(
+        &PackfileStorage::index_checkpoint_path(&store_dir),
+    )
+    .expect("sync_all writes a valid checkpoint");
+    assert_eq!(
+        checkpoint
+            .logical_versions
+            .iter()
+            .find(|(id, _)| id == &TEST_COLLECTION)
+            .map(|(_, version)| *version),
+        Some(expected)
+    );
+    drop(store);
+    drop(coordinator);
+
+    let (journal, scan) = Journal::open_shared(&wal).unwrap();
+    assert!(
+        scan.groups.is_empty(),
+        "checkpoint coverage reclaimed the WAL group"
+    );
+    let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+    let reopened = PackfileStorage::open(store_dir.clone()).unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+        .unwrap();
+    assert_eq!(
+        recovered.collection_version(ShardType::State, &TEST_COLLECTION),
+        expected,
+        "the checkpoint restores an idle collection's logical version"
+    );
+    drop(reopened);
+}
+
 /// A shared segment may only be reclaimed up to the minimum durable
 /// coverage across every pool that has frames in it.
 #[test]

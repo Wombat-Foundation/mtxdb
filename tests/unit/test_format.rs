@@ -27,6 +27,8 @@ fn fixed_width_records_round_trip() {
         pack_table_count: 2,
         pack_table_bytes: 24,
         base_delta_seq: 0x0123_4567_89AB,
+        logical_version_count: 0,
+        logical_version_bytes: 0,
     };
     assert_eq!(CheckpointHeader::decode(&header.encode()), Some(header));
 
@@ -48,5 +50,14 @@ fn fixed_width_records_round_trip() {
     assert_eq!(
         PackTableEntry::decode(&pack_entry.encode()),
         Some(pack_entry)
+    );
+
+    let version_entry = CollectionVersionEntry {
+        collection_id: [6; 16],
+        last_write_lsn: 7,
+    };
+    assert_eq!(
+        CollectionVersionEntry::decode(&version_entry.encode()),
+        Some(version_entry)
     );
 }
