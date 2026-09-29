@@ -347,6 +347,15 @@ impl DatabaseLayout {
     }
 
     fn upgrade_descriptor(path: &Path) -> io::Result<()> {
+        struct TempFileGuard<'a>(&'a Path, bool);
+        impl Drop for TempFileGuard<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    let _ = fs::remove_file(self.0);
+                }
+            }
+        }
+
         let (temporary, mut file) = loop {
             let suffix = UPGRADE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = format!(
@@ -369,62 +378,14 @@ impl DatabaseLayout {
             }
         };
 
-        let result = (|| {
-            file.write_all(&db_meta_bytes())?;
-            file.sync_all()?;
-            replace_file(&temporary, path)?;
-            if let Some(parent) = path.parent() {
-                crate::shard::sync_directory(parent)?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+        let mut guard = TempFileGuard(&temporary, false);
+        file.write_all(&db_meta_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        guard.1 = true;
+        if let Some(parent) = path.parent() {
+            crate::shard::sync_directory(parent)?;
         }
-        result
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
-}
-
-#[cfg(windows)]
-fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const REPLACEFILE_WRITE_THROUGH: u32 = 1;
-    extern "system" {
-        fn ReplaceFileW(
-            replaced_file_name: *const u16,
-            replacement_file_name: *const u16,
-            backup_file_name: *const u16,
-            replace_flags: u32,
-            exclude: *mut std::ffi::c_void,
-            reserved: *mut std::ffi::c_void,
-        ) -> i32;
-    }
-
-    let mut replaced = to.as_os_str().encode_wide().collect::<Vec<_>>();
-    replaced.push(0);
-    let mut replacement = from.as_os_str().encode_wide().collect::<Vec<_>>();
-    replacement.push(0);
-    // SAFETY: both paths are NUL-terminated UTF-16 buffers valid for the
-    // duration of the call; the optional pointers are explicitly null.
-    let replaced = unsafe {
-        ReplaceFileW(
-            replaced.as_ptr(),
-            replacement.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if replaced == 0 {
-        Err(io::Error::last_os_error())
-    } else {
         Ok(())
     }
 }

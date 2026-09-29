@@ -705,7 +705,7 @@ impl SharedDatabase {
     /// Returns an error if staging is inactive, the coordinator is poisoned,
     /// or the journal group cannot be appended.
     pub fn publish_transaction(&self, stage: &TxnStage) -> io::Result<()> {
-        stage.publish(ShardType::ALL.map(|_| Some(self.coordinator.as_ref())))
+        stage.publish([Some(self.coordinator.as_ref()); ShardType::ALL.len()])
     }
 }
 
