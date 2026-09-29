@@ -1195,20 +1195,21 @@ impl PackfileStorage {
             // overlay boundary below covers that separate path.
             let collection_lock = self.put_mutex(collection_id);
             let _collection_guard = collection_lock.lock();
-            let mut sampled = (0u64, 0u64);
+            // Sample the version once and wait for the read boundary to cover
+            // it. `boundary` is a true lower bound on the data's coverage, so
+            // `boundary >= version` proves the data reflects every write at or
+            // below `version` and the token names exactly that state; the
+            // caller's conditional commit still rejects a collection that has
+            // moved on. Re-sampling the version inside the loop would chase a
+            // goalpost that continuous publication always moves; holding it
+            // fixed converges, because the group that advanced the collection
+            // is published and its materialization is what lifts the boundary.
+            let version = journal.collection_version(pool, collection_id);
+            let mut boundary = 0u64;
             for _ in 0..ATTEMPTS {
-                // Sample the version before the data. `boundary` is a true
-                // lower bound on the data's coverage, so `boundary >= version`
-                // proves the data reflects every write at or below `version`:
-                // return that version as the token, with no need for a
-                // quiescent window. Requiring the version to be unchanged
-                // across the read starves a hot collection under continuous
-                // publication. Sampling the version first (not last) keeps
-                // `version` older than the data, so the boundary can still
-                // cover it while writers keep advancing the collection.
-                let version = journal.collection_version(pool, collection_id);
-                let (data, boundary) = self.get_read_committed_bounded(collection_id, ids, true)?;
-                sampled = (version, boundary);
+                let (data, read_boundary) =
+                    self.get_read_committed_bounded(collection_id, ids, true)?;
+                boundary = read_boundary;
                 if boundary >= version {
                     return Ok((data, version));
                 }
@@ -1216,8 +1217,7 @@ impl PackfileStorage {
             }
             Err(StorageError::WouldBlock(format!(
                 "collection version kept advancing during the read; retry \
-                 (version={}, boundary={})",
-                sampled.0, sampled.1
+                 (version={version}, boundary={boundary})"
             )))
         }
         #[cfg(not(feature = "multi-reader"))]
