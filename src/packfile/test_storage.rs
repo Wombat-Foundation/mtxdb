@@ -9468,6 +9468,114 @@ fn scan_collection_at_snapshot_requires_a_journal() {
 }
 
 #[test]
+fn scan_collections_at_snapshot_binds_one_boundary() {
+    let dir = test_dir("scan_collections_one_boundary");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+
+    let collection_a = [0xa1u8; 16];
+    let collection_b = [0xb2u8; 16];
+    let a_before = distinct_id(0x11);
+    let b_before = distinct_id(0x22);
+    let a_after = distinct_id(0x33);
+    let b_after = distinct_id(0x44);
+
+    store
+        .put(
+            &collection_a,
+            &a_before,
+            &NodeData::new(bytes::Bytes::from_static(b"a-before")),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection_b,
+            &b_before,
+            &NodeData::new(bytes::Bytes::from_static(b"b-before")),
+        )
+        .unwrap();
+
+    // Passed in reverse order: the result is ordered by collection id, and
+    // each scan is paired with the collection it came from.
+    let (scans, cursor, _lease) = store
+        .scan_collections_at_snapshot(&[collection_b, collection_a])
+        .unwrap();
+    assert_eq!(scans.len(), 2);
+    assert_eq!(scans[0].0, collection_a);
+    assert_eq!(scans[1].0, collection_b);
+
+    store
+        .put(
+            &collection_a,
+            &a_after,
+            &NodeData::new(bytes::Bytes::from_static(b"a-after")),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection_b,
+            &b_after,
+            &NodeData::new(bytes::Bytes::from_static(b"b-after")),
+        )
+        .unwrap();
+    let journal = store.journal().unwrap();
+    journal.sync().unwrap();
+
+    let mut scans = scans.into_iter();
+    let (_, scan_a) = scans.next().unwrap();
+    let (_, scan_b) = scans.next().unwrap();
+    let scanned_a: Vec<NodeId> = scan_a.map(|entry| entry.unwrap().0).collect();
+    let scanned_b: Vec<NodeId> = scan_b.map(|entry| entry.unwrap().0).collect();
+    assert_eq!(
+        scanned_a,
+        vec![a_before],
+        "every scan is fixed at the one shared cursor"
+    );
+    assert_eq!(scanned_b, vec![b_before]);
+
+    let changes = journal.changes_since(&cursor, 16).unwrap();
+    let replayed: Vec<NodeId> = changes
+        .groups
+        .iter()
+        .flat_map(|group| group.entries.iter())
+        .filter_map(|entry| match &entry.mutation {
+            JournalMutation::Put { node_id, .. } => Some(*node_id),
+            JournalMutation::DeleteCollection { .. } => None,
+        })
+        .collect();
+    assert_eq!(replayed, vec![a_after, b_after]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_collections_at_snapshot_deduplicates_collections() {
+    let dir = test_dir("scan_collections_dedup");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+
+    let collection = [0xc3u8; 16];
+    let (scans, _cursor, _lease) = store
+        .scan_collections_at_snapshot(&[collection, collection, collection])
+        .unwrap();
+    assert_eq!(scans.len(), 1, "duplicate ids collapse to one scan");
+    assert_eq!(scans[0].0, collection);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_collections_at_snapshot_requires_a_journal() {
+    let dir = test_dir("scan_collections_without_wal");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let Err(error) = store.scan_collections_at_snapshot(&[[0x93u8; 16]]) else {
+        panic!("replayable scans require a journal");
+    };
+    assert!(error.is_unsupported(), "expected Unsupported, got {error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scan_collection_at_snapshot_excludes_the_read_journal_overlay() {
     let dir = test_dir("scan_collection_replay_with_reader_overlay");
     let wal = dir.join("wal.bin");

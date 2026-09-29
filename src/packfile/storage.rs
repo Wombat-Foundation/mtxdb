@@ -18,7 +18,7 @@ use crate::index::{EntryUndo, InsertError, LossyIndex};
 #[cfg(feature = "multi-reader")]
 use crate::journal::pool_tag;
 use crate::journal::{
-    pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator,
+    pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator, JournalCursor,
     JournalReplayLease, Mutation as JournalMutation,
 };
 use crate::packfile::{self, FrameMetadata, PackId, Record};
@@ -1440,6 +1440,13 @@ pub struct CollectionScan<'a> {
     pinned: HashMap<u16, Arc<Shard>>,
     pending: std::vec::IntoIter<ScanWork>,
 }
+
+/// One collection's replayable scan, paired with the collection it came from.
+///
+/// [`PackfileStorage::scan_collections_at_snapshot`] returns one of these per
+/// requested collection so a caller can match a scan to its collection without
+/// relying on input order.
+pub type CollectionScanPair<'a> = ([u8; 16], CollectionScan<'a>);
 
 /// One pending emission for a [`CollectionScan`]: either locators to resolve
 /// lazily through the pinned generation, or an overlay payload the durable
@@ -4000,14 +4007,7 @@ impl PackfileStorage {
     pub fn scan_collection_at_snapshot(
         &self,
         collection_id: &[u8; 16],
-    ) -> Result<
-        (
-            CollectionScan<'_>,
-            crate::journal::JournalCursor,
-            JournalReplayLease,
-        ),
-        StorageError,
-    > {
+    ) -> Result<(CollectionScan<'_>, JournalCursor, JournalReplayLease), StorageError> {
         let put_lock = self.put_mutex(collection_id);
         let mut put_guard = Some(put_lock.lock());
 
@@ -4022,14 +4022,108 @@ impl PackfileStorage {
         // proceed, but their records are irrelevant to this collection.
         self.shards.flush_all()?;
 
+        let (cursor, lease) = self.capture_replay_boundary(&journal)?;
+
+        #[cfg(test)]
+        if let Some(hook) = self.replay_snapshot_hook.lock().take() {
+            hook();
+        }
+
+        let scan = self.scan_collection_packs_locked(collection_id, &mut put_guard)?;
+        Ok((scan, cursor, lease))
+    }
+
+    /// Sync the journal and pin a cursor at this pool's materialized watermark,
+    /// floored below any published-but-not-yet-materialized transaction and by
+    /// durable checkpoint coverage when the retained WAL prefix is empty.
+    ///
+    /// Refuses while a transaction overlay is materializing: the materialized
+    /// packs are not yet a stable boundary, so a scan captured then could mix
+    /// pre- and post-materialization state.
+    fn capture_replay_boundary(
+        &self,
+        journal: &JournalCoordinator,
+    ) -> Result<(JournalCursor, JournalReplayLease), StorageError> {
+        #[cfg(feature = "multi-reader")]
+        {
+            let _transaction_lifecycle = self.transaction_overlay_lifecycle.lock();
+            if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
+                return Err(StorageError::WouldBlock(
+                    "cannot capture a replayable scan while a transaction is materializing"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        journal.sync().map_err(StorageError::Io)?;
+        let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
+        let cursor = journal
+            .replay_cursor(covered_lsn)
+            .map_err(StorageError::Io)?;
+        let lease = journal
+            .pin_replay_cursor(&cursor)
+            .map_err(StorageError::Io)?;
+        Ok((cursor, lease))
+    }
+
+    /// Take scans of multiple collections at one shared durable journal
+    /// boundary.
+    ///
+    /// Collection IDs are sorted and deduplicated; returned scans follow that
+    /// order. Their collection put mutexes are acquired in the same sorted
+    /// order, then held through the shared WAL boundary capture and until shard
+    /// handles and file-length bounds for every scan are open. This ensures a
+    /// write to any requested collection is either represented by its scan at
+    /// the shared cursor or left for replay after it. The mutexes are released
+    /// before walking pack metadata and before the lazy scans are returned.
+    ///
+    /// The returned replay lease pins history after the shared cursor until the
+    /// caller has caught up (or advances the lease) across all the collections.
+    /// This API is scoped to one `PackfileStorage`/pool; cross-pool snapshots
+    /// must use a shared-database boundary API.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` when no journal is enabled, `WouldBlock` while a
+    /// transaction is already being materialized, or propagates pack/WAL
+    /// errors. It also returns an expired-cursor error if reclaim wins the race
+    /// before the replay lease is installed; in that case retry the snapshot.
+    pub fn scan_collections_at_snapshot(
+        &self,
+        collection_ids: &[[u8; 16]],
+    ) -> Result<
+        (
+            Vec<CollectionScanPair<'_>>,
+            crate::journal::JournalCursor,
+            JournalReplayLease,
+        ),
+        StorageError,
+    > {
+        let mut collection_ids = collection_ids.to_vec();
+        collection_ids.sort_unstable();
+        collection_ids.dedup();
+
+        // Every caller acquires multiple collection locks in this canonical
+        // order, avoiding deadlocks with other multi-collection operations.
+        let put_locks: Vec<_> = collection_ids
+            .iter()
+            .map(|collection_id| self.put_mutex(collection_id))
+            .collect();
+        let put_guards: Vec<_> = put_locks.iter().map(|lock| lock.lock()).collect();
+
+        let journal = self.journal().ok_or_else(|| {
+            StorageError::Unsupported(
+                "replayable collection scans require an enabled journal".to_owned(),
+            )
+        })?;
+
+        // Flush before taking the transaction lifecycle lock, as in the
+        // single-collection entry point. The requested collection locks are
+        // held, so their buffered puts cannot cross the boundary.
+        self.shards.flush_all()?;
+
         let capture_boundary =
             || -> Result<(crate::journal::JournalCursor, JournalReplayLease), StorageError> {
                 journal.sync().map_err(StorageError::Io)?;
-
-                // This is the pool-specific materialized watermark (floored below
-                // any published-but-not-yet-materialized transaction), also
-                // floored by durable checkpoint coverage when the retained WAL
-                // prefix is empty.
                 let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
                 let cursor = journal
                     .replay_cursor(covered_lsn)
@@ -4054,13 +4148,66 @@ impl PackfileStorage {
         #[cfg(not(feature = "multi-reader"))]
         let (cursor, lease) = capture_boundary()?;
 
-        #[cfg(test)]
-        if let Some(hook) = self.replay_snapshot_hook.lock().take() {
-            hook();
+        // Open every scanner and capture every file-length boundary before
+        // releasing any requested collection's put lock. The subsequent pack
+        // walk uses retained handles, so repack may safely unlink old shards.
+        let mut prepared = Vec::with_capacity(collection_ids.len());
+        for collection_id in &collection_ids {
+            // Own the generation `Arc` so it stays pinned while the pack walk
+            // runs after every collection put lock has been released.
+            let generation = self.generation(collection_id).map(|guard| (*guard).clone());
+            let shards = self.shards.all_shards();
+            let scanners = if generation.is_some() {
+                Self::open_collection_scan_shards(&shards)?
+            } else {
+                Vec::new()
+            };
+            prepared.push((*collection_id, generation, shards, scanners));
         }
+        drop(put_guards);
 
-        let scan = self.scan_collection_packs_locked(collection_id, &mut put_guard)?;
-        Ok((scan, cursor, lease))
+        let mut scans = Vec::with_capacity(prepared.len());
+        for (collection_id, generation, shards, scanners) in prepared {
+            scans.push((
+                collection_id,
+                self.finish_collection_pack_scan(
+                    generation.as_deref(),
+                    &shards,
+                    scanners,
+                    &collection_id,
+                )?,
+            ));
+        }
+        Ok((scans, cursor, lease))
+    }
+
+    /// Finish a collection scan after its shard handles and lengths have been
+    /// captured and the collection put lock has been released.
+    fn finish_collection_pack_scan(
+        &self,
+        generation: Option<&RoomGeneration>,
+        shards: &[(u16, Arc<Shard>)],
+        scanners: Vec<(u64, packfile::PackfileScanner)>,
+        collection_id: &[u8; 16],
+    ) -> Result<CollectionScan<'_>, StorageError> {
+        let keys = Self::scan_collection_keys(scanners, collection_id)?;
+        let mut pinned = HashMap::new();
+        let mut work = Vec::new();
+        if let Some(generation) = generation {
+            Self::append_collection_locator_work(
+                keys,
+                &generation.index,
+                &HashMap::new(),
+                shards,
+                &mut pinned,
+                &mut work,
+            );
+        }
+        Ok(CollectionScan {
+            store: self,
+            pinned,
+            pending: work.into_iter(),
+        })
     }
 
     /// Build the pinned scan while the caller's collection put mutex remains
