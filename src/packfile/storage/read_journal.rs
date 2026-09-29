@@ -1189,12 +1189,12 @@ impl PackfileStorage {
             let Some(journal) = self.journal() else {
                 return Ok((self.get_read_committed(collection_id, ids)?, 0));
             };
-            // Direct packfile puts hold this mutex while appending the record
-            // and publishing its journal mutation. Transactions publish first
-            // and materialize later, so this lock alone is insufficient; the
-            // overlay boundary below covers that separate path.
-            let collection_lock = self.put_mutex(collection_id);
-            let _collection_guard = collection_lock.lock();
+            // Do not hold the collection's put_mutex across this wait: a
+            // transaction's materialization applies its mutation through that
+            // same mutex, so holding it would block the very materialization
+            // that lifts the boundary. A direct put racing the read is still
+            // caught by the version gate, which rejects a collection that has
+            // moved on.
             // Sample the version once and wait for the read boundary to cover
             // it. `boundary` is a true lower bound on the data's coverage, so
             // `boundary >= version` proves the data reflects every write at or
