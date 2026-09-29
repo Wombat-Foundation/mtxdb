@@ -1780,9 +1780,13 @@ impl JournalCoordinator {
     /// workers skip refreshes after this writer starts publishing.
     ///
     /// The store that enables a journal calls this so read-only workers can
-    /// sample `(epoch, visible_lsn)` with a plain atomic load instead of a
+    /// sample `(epoch, revision)` with atomic loads instead of a
     /// per-call `fs::metadata`. A store that never calls it leaves the signal
     /// absent, and workers fall back to the stat-based refresh.
+    ///
+    /// # Errors
+    /// Propagates signal-file and OS entropy errors. A failed attempt is
+    /// cached, so later calls return the same error without retrying.
     pub(crate) fn enable_publish_signal(&self) -> io::Result<()> {
         let result = self.publish_signal.get_or_init(|| {
             PublishSignal::writer(&self.path)
@@ -2126,6 +2130,9 @@ impl JournalCoordinator {
     /// path and writer incarnation. It must be reacquired after a writer
     /// restart; if reclaim has already removed required history,
     /// [`Self::changes_since`] reports an expired-cursor error.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` when no publish signal is installed.
     pub(crate) fn replay_cursor(&self, lsn: u64) -> io::Result<JournalCursor> {
         let signal = self.publish_signal().ok_or_else(|| {
             io::Error::new(
@@ -2144,6 +2151,11 @@ impl JournalCoordinator {
     /// is dropped. The pin and reclaim share the `sync_lock` -> `journal` lock
     /// order, so reclaim either observes this lease or completes first and
     /// causes an explicit expired-cursor error here.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a different segment, `Unsupported` without a
+    /// publish signal, `InvalidData` for a previous writer incarnation or
+    /// reclaimed history, and `Other` if lease IDs are exhausted.
     pub(crate) fn pin_replay_cursor(
         &self,
         cursor: &JournalCursor,
@@ -2225,10 +2237,17 @@ impl JournalCoordinator {
     /// calls. Hold a [`JournalReplayLease`] from the snapshot cursor while
     /// paging if reclaim must not expire it during a long replay.
     ///
+    /// `limit` bounds the number of groups, not entries or bytes. Shared-journal
+    /// pages include all pools and collections; callers filter the entries
+    /// they need.
+    ///
     /// # Errors
-    /// Returns `InvalidInput` for a foreign cursor or zero page size, and
-    /// `InvalidData` when the writer incarnation differs or the cursor's
-    /// required history has been reclaimed.
+    /// Returns `InvalidInput` for a foreign cursor or zero page size,
+    /// `Unsupported` without a publish signal, and `InvalidData` when the writer
+    /// incarnation differs, required history has been reclaimed, or reclaim
+    /// changes the segment's base LSN during the read. A concurrent reclaim
+    /// may allow retrying the same cursor if its history remains available.
+    /// Also propagates segment I/O and validation errors.
     pub fn changes_since(
         &self,
         cursor: &JournalCursor,
@@ -3387,14 +3406,16 @@ impl JournalCoordinator {
     /// `covered_lsn` while preserving any newer groups.
     ///
     /// Intended to run after a checkpoint durably records that LSN as applied,
-    /// so it reclaims only data the packfiles already represent. Mutations that
-    /// are published but not yet committed are untouched: they live in memory
-    /// until the next [`Self::sync_through`]. Numbering is preserved across the
-    /// rewrite.
+    /// so it reclaims only data the packfiles already represent. Published
+    /// groups are already appended; [`Self::sync_through`] makes them durable.
+    /// Numbering is preserved across the rewrite. Active replay leases may
+    /// reduce the reclaim boundary below
+    /// `covered_lsn`.
     ///
     /// # Errors
-    /// Returns an error if the journal is poisoned or the segment cannot be
-    /// rewritten.
+    /// Returns `InvalidInput` if the effective reclaim boundary reaches an LSN
+    /// that has not been appended. Also propagates poison, segment-read,
+    /// validation, and rewrite errors.
     pub fn reclaim_through(&self, covered_lsn: u64) -> io::Result<Reclaim> {
         // Wait out any in-flight fsync: the rewrite replaces the segment file,
         // and a sync must not flush a handle to the replaced inode.

@@ -258,10 +258,13 @@ impl Drop for FallbackReadGuard {
 }
 
 impl ReadJournal {
+    /// Whether this overlay has a mapped publish signal for refresh checks.
     pub(super) fn publish_signal_active(&self) -> bool {
         self.publish_signal.is_some()
     }
 
+    /// Create an unscanned overlay whose durable index covers LSNs through
+    /// `covered`. `pool` filters shared-journal entries; `None` accepts all pools.
     pub(super) fn empty(
         path: PathBuf,
         covered: u64,
@@ -530,6 +533,9 @@ impl ReadJournal {
         self.refresh_checked(accept_reclaimed_prefix, || true)
     }
 
+    /// Refresh as in [`Self::refresh`], checking `still_covered` before accepting
+    /// a reclaimed prefix beyond this reader's coverage. An incremental-scan
+    /// error triggers a full scan; metadata and full-scan errors propagate.
     fn refresh_checked(
         &mut self,
         accept_reclaimed_prefix: bool,
@@ -657,6 +663,8 @@ impl ReadJournal {
 }
 
 impl PackfileStorage {
+    /// Refresh the worker overlay unless its publish generation is unchanged.
+    /// Returns `NeedsReload` for a coverage gap and propagates refresh errors.
     fn refresh_worker_overlay(
         &self,
         overlay: &mut ReadJournal,
@@ -1000,6 +1008,11 @@ impl PackfileStorage {
         }
     }
 
+    /// Install and refresh an overlay for the loaded index's durable coverage.
+    ///
+    /// `pool` selects shared-journal entries; `None` accepts all pools. Signal
+    /// mapping failures fall back to metadata checks. A refresh failure removes
+    /// the installed overlay and returns the error.
     fn enable_read_journal_inner(
         &self,
         path: impl AsRef<std::path::Path>,

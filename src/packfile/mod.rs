@@ -58,7 +58,7 @@ pub const PACK_FILENAME_PREFIX_HEX: usize = 16;
 pub struct PackId(pub [u8; PACK_ID_LEN]);
 
 impl PackId {
-    /// Generate a fresh random address from the operating system's CSPRNG.
+    /// Generate a fresh nonzero random address from the operating system's CSPRNG.
     ///
     /// Fills the full [`PACK_ID_LEN`] bytes from the operating system's CSPRNG
     /// (`/dev/urandom` on unix, `BCryptGenRandom` on Windows). The identity is
@@ -211,9 +211,8 @@ impl PackId {
         Some((bytes, digits.len()))
     }
 
-    /// Parse a full address from 32 lowercase hex digits (as stored in the
-    /// header, and as accepted by `--json`/`--long` displays and exact
-    /// selectors).
+    /// Parse a full address from exactly 32 lowercase hex digits, without a
+    /// `0x` prefix.
     ///
     /// # Errors
     /// Returns `None` for the wrong length, any non-lowercase-hex character,
@@ -445,7 +444,8 @@ pub struct PackfileScanner {
 ///
 /// # Errors
 /// Returns an I/O error if the packfile cannot be opened or its header cannot
-/// be read.
+/// be read or validated, or its length cannot be obtained. A file that
+/// [`read_header`] identifies as a non-packfile yields an empty scanner.
 pub fn scan_packfile_iter(path: &Path, verify_payload: bool) -> io::Result<PackfileScanner> {
     let file = File::open(path)?;
     scan_packfile_iter_from_file(file, verify_payload)
@@ -454,6 +454,11 @@ pub fn scan_packfile_iter(path: &Path, verify_payload: bool) -> io::Result<Packf
 /// Build a scanner from an already-open shard handle. Collection snapshots
 /// open each shard while holding the collection lock, then perform the
 /// potentially long scan after releasing that lock.
+///
+/// The handle must be positioned at the start of the header. Captures its
+/// current length and uses the same `verify_payload` behavior as
+/// [`scan_packfile_iter`]. A non-packfile yields an empty scanner; metadata,
+/// header-read, and header-validation errors propagate.
 pub(crate) fn scan_packfile_iter_from_file(
     file: File,
     verify_payload: bool,
@@ -1485,10 +1490,9 @@ pub fn read_version(reader: &mut impl Read) -> io::Result<Option<u8>> {
 
 /// Read and validate a shard file's reserved header.
 ///
-/// Returns `Ok(None)` only for something that genuinely isn't an mdb
-/// packfile at all — an empty file, or one whose first bytes don't match
-/// [`MAGIC`]. Everything else that's wrong is a real `Err`, not a quiet
-/// `None`, specifically so a caller (or one of the `scan_*` functions,
+/// Returns `Ok(None)` for a file shorter than the four-byte magic or whose
+/// first four bytes don't match [`MAGIC`]. Everything else that's wrong is a
+/// real `Err`, not a quiet `None`, specifically so a caller (or one of the `scan_*` functions,
 /// which all propagate this via `?`) can't mistake "this store is a
 /// format I don't understand" for "this store has no data":
 ///
@@ -1500,8 +1504,9 @@ pub fn read_version(reader: &mut impl Read) -> io::Result<Option<u8>> {
 ///
 /// # Errors
 /// Returns `io::Error` (`Unsupported`) if the version doesn't match
-/// [`VERSION`], or (`InvalidData`) if the header is truncated or its CRC
-/// doesn't match, or on I/O failure.
+/// [`VERSION`], or (`InvalidData`) if the header is truncated after the magic,
+/// declares the wrong length, has a CRC mismatch, or contains an all-zero pack
+/// ID. Other I/O errors propagate.
 ///
 /// # Panics
 /// Never in practice: every internal `try_into`/`from_le_bytes` slices a
@@ -1608,17 +1613,18 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 
 /// Open or create a packfile, writing the header if it's new.
 ///
-/// `pack_id` is the caller's expectation for this file — derived from its
-/// filename. On creation it is written into the new header; on opening an
-/// existing file it is cross-checked against what the header actually says
-/// (they must match exactly on the full 128-bit id), so a shard file
-/// that's been copied or renamed inconsistently with its own recorded identity
-/// is caught here rather than silently trusted.
+/// With `create` set, opens for writing and initializes and syncs the header
+/// of an empty file. Otherwise opens an existing file read-only.
+///
+/// `pack_id` is the caller's expected full identity, written on initialization
+/// and checked against an existing header. This function does not validate the
+/// filename, which may contain only a prefix of the identity.
 ///
 /// # Errors
-/// Returns `io::Error` on open/write failure, `io::ErrorKind::InvalidData`
-/// if the existing header is invalid or its CRC fails, or if the header's
-/// recorded id doesn't match what the filename says it should be.
+/// Propagates open, metadata, header-write, and sync errors. Returns
+/// `InvalidInput` when initializing with an all-zero ID, `Unsupported` for an
+/// unsupported header version, or `InvalidData` for an invalid header or an
+/// identity mismatch.
 pub fn open_packfile(path: &Path, create: bool, pack_id: &PackId) -> io::Result<File> {
     if create {
         let mut options = OpenOptions::new();
@@ -1978,11 +1984,14 @@ fn validate_extracted_frame(frame_buf: &[u8], frame_len: u32) -> io::Result<()> 
 /// and optional frame metadata) are copied without decompressing or re-serializing,
 /// ensuring byte-level fidelity. If the source pack ends in a torn tail, extraction
 /// stops cleanly at the last valid frame and records `torn_tail: true` in the returned
-/// stats.
+/// stats. The destination is created or truncated, then flushed and synced on
+/// success; an error may leave partial output. The caller must ensure it is a
+/// different file from the source.
 ///
 /// # Errors
-/// Returns an I/O error if files cannot be opened/created, if `source_path` does not
-/// have a valid pack header, or if any frame has invalid framing or CRC mismatch.
+/// Propagates file I/O, header-validation, header-write, and sync errors,
+/// including `InvalidInput` for an all-zero `dest_pack_id`. Invalid frame
+/// lengths, framing, or CRCs return `InvalidData`.
 pub fn extract_packfile_collection(
     source_path: &Path,
     dest_path: &Path,
