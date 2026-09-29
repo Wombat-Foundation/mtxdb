@@ -2814,35 +2814,127 @@ fn cold_record_token_seeds_from_frame_metadata() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A legacy v4 frame carries no `last_write_lsn`; its record reads as version
-/// `0` once the WAL that could name it is gone.
+/// A frame whose record token is `0` — a legacy v4 frame with no
+/// `last_write_lsn` tag, or a write made without a journal — reads as version
+/// `0`, not as a never-written sentinel.
 #[cfg(feature = "multi-reader")]
 #[test]
-fn legacy_frame_without_write_lsn_reads_version_zero() {
+fn zero_token_frame_reads_version_zero() {
     let root = test_root("record_legacy_zero");
+    let db = SharedDatabase::open(root.clone()).unwrap();
     let pool = ShardType::State;
     let collection = [0x76u8; 16];
     let key = node(1);
+    // Apply directly with a zero token and no publication, modelling a legacy
+    // frame or a write made without a journal.
+    let mutation = crate::journal::Mutation::Put {
+        collection_id: collection,
+        node_id: key,
+        payload: b"legacy".to_vec(),
+    };
+    db.pool(pool)
+        .apply_transaction_mutation(&mutation, 0)
+        .unwrap();
+
+    let reader = db.begin_transaction();
+    let (records, versions) = reader
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"legacy");
+    assert_eq!(versions[0], 0, "a zero-token frame reads as version 0");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A direct (autocommit) put stamps a non-zero token into its frame, so the
+/// token survives reclamation of the WAL group and a reopen.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn direct_put_token_survives_reclaim_and_reopen() {
+    let root = test_root("record_direct_reclaim");
+    let pool = ShardType::State;
+    let collection = [0x77u8; 16];
+    let key = node(1);
+    let write_version;
     {
         let db = SharedDatabase::open(root.clone()).unwrap();
-        // A direct autocommit put writes no metadata, so the frame is legacy.
         db.pool(pool)
             .put(
                 &collection,
                 &key,
-                &NodeData::new(bytes::Bytes::from_static(b"legacy")),
+                &NodeData::new(bytes::Bytes::from_static(b"direct")),
             )
             .unwrap();
+        let reader = db.begin_transaction();
+        let (records, versions) = reader
+            .get_with_record_versions(pool, &collection, &[key])
+            .unwrap();
+        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"direct");
+        write_version = versions[0];
+        assert!(
+            write_version > 0,
+            "a direct put now stamps a non-zero token"
+        );
         db.pool(pool).sync_all().unwrap();
     }
+    // Reclaim the WAL group; the frame's own stamp must still name the token.
     let _ = std::fs::remove_file(root.join("wal.bin"));
     let db = SharedDatabase::open(root.clone()).unwrap();
     let reader = db.begin_transaction();
     let (records, versions) = reader
         .get_with_record_versions(pool, &collection, &[key])
         .unwrap();
-    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"legacy");
-    assert_eq!(versions[0], 0, "a legacy frame reads as version 0");
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"direct");
+    assert_eq!(
+        versions[0], write_version,
+        "a direct-put token must survive reclaim and reopen"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A direct put that was published but not checkpointed is replayed on reopen,
+/// and the replayed frame carries the group's token rather than a zero one.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn unsynced_direct_put_replays_with_its_token() {
+    let root = test_root("record_direct_replay");
+    let pool = ShardType::State;
+    let collection = [0x78u8; 16];
+    let key = node(1);
+    let write_version;
+    {
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        db.pool(pool)
+            .put(
+                &collection,
+                &key,
+                &NodeData::new(bytes::Bytes::from_static(b"direct")),
+            )
+            .unwrap();
+        let reader = db.begin_transaction();
+        let (_, versions) = reader
+            .get_with_record_versions(pool, &collection, &[key])
+            .unwrap();
+        write_version = versions[0];
+        assert!(write_version > 0);
+        // Deliberately no sync: the group is durable in the WAL only and the
+        // next open must replay it with the group's token.
+    }
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    assert_eq!(
+        db.pool(pool)
+            .record_last_write_lsn(&collection, &key)
+            .unwrap(),
+        Some(write_version),
+        "replay must stamp the recovered frame with the group token"
+    );
+    let reader = db.begin_transaction();
+    let (records, versions) = reader
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"direct");
+    assert_eq!(versions[0], write_version);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

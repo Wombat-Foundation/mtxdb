@@ -8110,6 +8110,12 @@ impl PackfileStorage {
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
+        let receipt_lsn = self.publish_mutation(|| JournalMutation::Put {
+            collection_id: *collection_id,
+            node_id: *id,
+            payload: data.bytes.to_vec(),
+        })?;
+        let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
@@ -8117,11 +8123,7 @@ impl PackfileStorage {
             metadata,
         };
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
-        self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
-        })?;
+        self.note_published_materialized(receipt_lsn);
         if let Some(shard) = self.shards.get_shard(slot) {
             progress
                 .pending_shard_collections
@@ -8217,6 +8219,18 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
     ) -> Result<(u16, u64, u64), StorageError> {
+        // Publish the group before writing its frame so the frame can carry the
+        // group's LSN as its record version. This mirrors the transaction path:
+        // the group is durable and visible from the WAL (and replayed on
+        // reopen), and the frame materializes it. A frame write that fails after
+        // publication is recovered by `replay_journal`, which stamps the same
+        // LSN, so the mutation never becomes an orphan.
+        let receipt_lsn = self.publish_mutation(|| JournalMutation::Put {
+            collection_id: *collection_id,
+            node_id: *id,
+            payload: data.bytes.to_vec(),
+        })?;
+        let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
@@ -8224,12 +8238,29 @@ impl PackfileStorage {
             metadata,
         };
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
-        self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
-        })?;
+        self.note_published_materialized(receipt_lsn);
         Ok((slot, offset, disk_bytes))
+    }
+
+    /// Merge a group's LSN into a frame's metadata as its `last_write_lsn`.
+    /// `None` (no journal, or replaying a group that already carries it) leaves
+    /// the metadata as given.
+    fn stamp_last_write_lsn(
+        metadata: Option<FrameMetadata>,
+        receipt_lsn: Option<u64>,
+    ) -> Option<FrameMetadata> {
+        match (metadata, receipt_lsn) {
+            (Some(mut metadata), Some(lsn)) => {
+                metadata.last_write_lsn = Some(lsn);
+                Some(metadata)
+            }
+            (Some(metadata), None) => Some(metadata),
+            (None, Some(lsn)) => Some(FrameMetadata {
+                last_write_lsn: Some(lsn),
+                ..FrameMetadata::default()
+            }),
+            (None, None) => None,
+        }
     }
 
     /// Store a record after verifying that its bytes hash to `expected_digest`,
@@ -9174,9 +9205,10 @@ impl StorageEngine for PackfileStorage {
         // mutex and bypass this deletion's serialization.
         self.remove_collection_shard_counts(collection_id);
         self.persist_deleted_collection(collection_id)?;
-        self.publish_mutation(|| JournalMutation::DeleteCollection {
+        let receipt_lsn = self.publish_mutation(|| JournalMutation::DeleteCollection {
             collection_id: *collection_id,
         })?;
+        self.note_published_materialized(receipt_lsn);
         Ok(())
     }
 
@@ -9748,13 +9780,24 @@ impl PackfileStorage {
                             node_id,
                             payload,
                         } => {
+                            // Stamp the recovered group's LSN so a replayed
+                            // frame carries the same record token it would have
+                            // had at its original materialization.
+                            let metadata = FrameMetadata {
+                                last_write_lsn: Some(entry.lsn),
+                                ..FrameMetadata::default()
+                            };
                             let data = NodeData::new(bytes::Bytes::from(payload.clone()));
-                            self.put(collection_id, node_id, &data)?;
+                            self.put_internal(collection_id, node_id, &data, Some(metadata))?;
                         }
                         JournalMutation::DeleteCollection { collection_id } => {
                             self.delete_collection(collection_id)?;
                         }
                     }
+                    // The index now reflects this group, so let versioned reads
+                    // certify it.
+                    #[cfg(feature = "multi-reader")]
+                    self.note_materialized_lsn(entry.lsn);
                     replayed = replayed.saturating_add(1);
                 }
             }
@@ -9995,14 +10038,22 @@ impl PackfileStorage {
             .map(|receipt| receipt.last_lsn)
             .map(Some)
             .map_err(StorageError::Io);
-        if let Ok(Some(lsn)) = result {
-            #[cfg(feature = "multi-reader")]
-            self.note_materialized_lsn(lsn);
-            #[cfg(not(feature = "multi-reader"))]
-            let _ = lsn;
+        if let Ok(Some(_)) = &result {
             self.record_published_mutation(started);
         }
         result
+    }
+
+    /// Record that this store's index now holds the mutation published at
+    /// `lsn`, so versioned reads may certify it. Called by each write path only
+    /// after the frame or deletion is applied, never at publication time.
+    fn note_published_materialized(&self, lsn: Option<u64>) {
+        #[cfg(feature = "multi-reader")]
+        if let Some(lsn) = lsn {
+            self.note_materialized_lsn(lsn);
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        let _ = lsn;
     }
 
     /// Apply a mutation staged by a database transaction without publishing
