@@ -1211,6 +1211,10 @@ impl PackfileStorage {
                     self.get_read_committed_bounded(collection_id, ids, true)?;
                 boundary = read_boundary;
                 if boundary >= version {
+                    debug_assert!(
+                        boundary <= self.durable_read_boundary(),
+                        "certified read boundary {boundary} exceeds the materialized coverage"
+                    );
                     return Ok((data, version));
                 }
                 // The boundary lags by an in-flight group; its materialization

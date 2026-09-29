@@ -2155,6 +2155,69 @@ fn retrying_commit_and_recovery_can_run_concurrently() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The unmaterialized floor is the only thing that keeps a versioned read from
+/// certifying a published-but-unmaterialized group. It must be pinned while
+/// such a group exists and released once the group reaches the packs, or every
+/// versioned read wedges behind a phantom publication.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn unmaterialized_floor_pins_until_group_is_materialized() {
+    use std::sync::Arc;
+
+    let root = test_root("unmaterialized_floor");
+    let database = SharedDatabase::open(root.clone()).unwrap();
+    let collection = [0x5au8; 16];
+    let pool = ShardType::State;
+
+    let settled = database.begin_transaction();
+    settled
+        .put(
+            pool,
+            collection,
+            node(1),
+            &NodeData::new(bytes::Bytes::from_static(b"settled")),
+        )
+        .unwrap();
+    settled.commit().unwrap();
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        u64::MAX,
+        "a fully materialized group must not hold the floor down"
+    );
+
+    let pending = database.begin_transaction();
+    pending
+        .put(
+            pool,
+            collection,
+            node(2),
+            &NodeData::new(bytes::Bytes::from_static(b"pending")),
+        )
+        .unwrap();
+    let mut overlay = Some(activate_for(&database, &pending.stage));
+    database.publish_transaction(&pending.stage).unwrap();
+    let receipt = pending.stage.published_receipt().unwrap();
+    assert!(
+        database.coordinator().unmaterialized_floor() < receipt.first_lsn,
+        "a published-but-unmaterialized group must pin the floor below its first frame"
+    );
+
+    pending.stage.begin_materialization().unwrap();
+    database
+        .register_new_recovery_stage(Arc::clone(&pending.stage), receipt, &mut overlay)
+        .unwrap();
+    drop(pending);
+    database.recover_pending_transactions().unwrap();
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        u64::MAX,
+        "materialization must release the floor"
+    );
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn published_transaction_is_visible_before_materialization() {
     let root = test_root("transaction_overlay");
@@ -2584,7 +2647,7 @@ fn open_with_policies_applies_per_pool_settings() {
 fn concurrent_versioned_rmw_keeps_every_update() {
     use std::sync::Arc;
 
-    const WORKERS: u8 = 8;
+    const WORKERS: u8 = 16;
 
     let root = test_root("concurrent_versioned_rmw");
     let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
