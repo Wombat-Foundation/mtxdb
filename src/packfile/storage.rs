@@ -8239,6 +8239,7 @@ impl PackfileStorage {
             content_digest: Some(digest),
             digest_algorithm: algorithm,
             role: role.map(<[u8]>::to_vec),
+            last_write_lsn: None,
             unknown: Vec::new(),
         };
         self.put_internal(collection_id, id, data, Some(metadata))

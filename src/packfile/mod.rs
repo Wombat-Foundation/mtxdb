@@ -370,6 +370,13 @@ pub const META_TAG_ROLE: u8 = 0x03;
 /// reader should assume the default algorithm (SHA-256) for older writers.
 pub const META_TAG_DIGEST_ALGORITHM: u8 = 0x04;
 
+/// TLV type: the LSN of the journal group that last wrote this record, an
+/// 8-byte little-endian value. Absent means a legacy v4 frame, whose version
+/// readers treat as `0`. This is the per-record optimistic-concurrency token:
+/// a conditional write names the LSN it observed and is rejected if the record
+/// has since been rewritten by a later group.
+pub const META_TAG_LAST_WRITE_LSN: u8 = 0x05;
+
 /// Per-frame flag: the 4-byte checksum field holds zeros, not a real CRC32,
 /// and must not be verified by any reader. Written when the store was
 /// configured with [`ChecksumPolicy::Disabled`] — the flag, not the checksum
@@ -571,6 +578,9 @@ pub struct FrameMetadata {
     pub digest_algorithm: DigestAlgorithm,
     /// Role/schema identifier, if supplied.
     pub role: Option<Vec<u8>>,
+    /// LSN of the journal group that last wrote this record. Absent on a
+    /// legacy v4 frame, which a reader treats as version `0`.
+    pub last_write_lsn: Option<u64>,
     /// Tags this build does not interpret, preserved verbatim so a
     /// read/rewrite cycle does not discard a newer writer's fields.
     pub unknown: Vec<(u8, Vec<u8>)>,
@@ -585,6 +595,7 @@ impl FrameMetadata {
         self.logical_id.is_none()
             && self.content_digest.is_none()
             && self.role.is_none()
+            && self.last_write_lsn.is_none()
             && self.unknown.is_empty()
     }
 
@@ -610,6 +621,9 @@ impl FrameMetadata {
         }
         if let Some(role) = &self.role {
             push_tlv(&mut tlv, META_TAG_ROLE, role)?;
+        }
+        if let Some(lsn) = self.last_write_lsn {
+            push_tlv(&mut tlv, META_TAG_LAST_WRITE_LSN, &lsn.to_le_bytes())?;
         }
         for (tag, value) in &self.unknown {
             push_tlv(&mut tlv, *tag, value)?;
@@ -694,6 +708,9 @@ impl FrameMetadata {
                     metadata.digest_algorithm = DigestAlgorithm::from_id(id);
                 }
                 META_TAG_ROLE => metadata.role = Some(value.to_vec()),
+                META_TAG_LAST_WRITE_LSN => {
+                    metadata.last_write_lsn = Some(expect_u64(value, "last_write_lsn")?);
+                }
                 _ => metadata.unknown.push((tag, value.to_vec())),
             }
             cursor = value_end;
@@ -719,6 +736,12 @@ fn push_tlv(out: &mut Vec<u8>, tag: u8, value: &[u8]) -> io::Result<()> {
 fn expect_32(value: &[u8], field: &str) -> io::Result<[u8; 32]> {
     <[u8; 32]>::try_from(value)
         .map_err(|_| invalid_data(&format!("frame metadata: {field} must be 32 bytes")))
+}
+
+fn expect_u64(value: &[u8], field: &str) -> io::Result<u64> {
+    <[u8; 8]>::try_from(value)
+        .map(u64::from_le_bytes)
+        .map_err(|_| invalid_data(&format!("frame metadata: {field} must be 8 bytes")))
 }
 
 fn invalid_data(message: &str) -> io::Error {

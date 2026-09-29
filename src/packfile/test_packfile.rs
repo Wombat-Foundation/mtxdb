@@ -109,6 +109,7 @@ fn test_metadata_roundtrip() {
         content_digest: Some([0x22; 32]),
         digest_algorithm: DigestAlgorithm::Sha256,
         role: Some(b"canonical_event".to_vec()),
+        last_write_lsn: Some(0x0102_0304_0506_0708),
         unknown: vec![(0x7f, vec![1, 2, 3])],
     };
     let record = Record {
@@ -134,6 +135,33 @@ fn test_metadata_roundtrip() {
         .unwrap()
         .unwrap();
     assert_eq!(skipped.metadata.as_ref(), Some(&metadata));
+}
+
+/// The per-record write LSN is a forward-compatible optional tag: absent
+/// means a legacy v4 frame (version 0), it round-trips exactly, and a value
+/// that is not eight bytes is rejected rather than silently ignored.
+#[test]
+fn test_last_write_lsn_metadata_tag() {
+    assert_eq!(FrameMetadata::default().last_write_lsn, None);
+
+    let metadata = FrameMetadata {
+        last_write_lsn: Some(0xDEAD_BEEF_0102_0304),
+        ..FrameMetadata::default()
+    };
+    assert!(!metadata.is_empty());
+    let encoded = metadata.encode().unwrap();
+    let (decoded, consumed) = FrameMetadata::decode(&encoded).unwrap();
+    assert_eq!(consumed, encoded.len());
+    assert_eq!(decoded.last_write_lsn, Some(0xDEAD_BEEF_0102_0304));
+
+    let mut malformed = vec![METADATA_VERSION];
+    let mut tlv = vec![META_TAG_LAST_WRITE_LSN];
+    tlv.extend_from_slice(&4u32.to_le_bytes());
+    tlv.extend_from_slice(&[1, 2, 3, 4]);
+    malformed.extend_from_slice(&u32::try_from(tlv.len()).unwrap().to_le_bytes());
+    malformed.extend_from_slice(&tlv);
+    let err = FrameMetadata::decode(&malformed).unwrap_err();
+    assert!(err.to_string().contains("last_write_lsn"));
 }
 
 /// The metadata flag must be set only when metadata is present; a record
@@ -1085,6 +1113,7 @@ fn test_extract_packfile_collection_slices_target_collection_verbatim() {
             content_digest: Some([0xD1; 32]),
             digest_algorithm: DigestAlgorithm::Blake3,
             role: Some(b"event".to_vec()),
+            last_write_lsn: Some(0x99),
             unknown: vec![(0x7f, vec![0xDE, 0xAD])],
         }),
     };
