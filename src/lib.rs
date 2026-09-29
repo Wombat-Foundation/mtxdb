@@ -62,11 +62,11 @@ pub use database::{
 pub use index::LossyIndex;
 #[cfg(feature = "multi-reader")]
 pub use journal::SharedWalLock;
+#[cfg(feature = "multi-reader")]
+pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};
 pub use journal::{
     DurabilityStats, DurabilityToken, DurableWaitLatency, GroupCommitConfig, GroupDirectoryStats,
 };
-#[cfg(feature = "multi-reader")]
-pub use journal::{StagedLookup, TxnStage, TxnStageState};
 pub use layout::{enclosing_root, is_database_root, DatabaseLayout, ShardType};
 #[cfg(feature = "multi-reader")]
 pub use matrix_policy::matrix_pool_policies;

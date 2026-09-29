@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::layout::ShardType;
 use crate::template::{CollectionMetadata, FrameIdPolicy, COLLECTION_METADATA_RECORD_ID};
 
 /// A 128-bit lookup identity for a record within a collection.
@@ -550,6 +551,19 @@ pub enum StorageError {
     Internal(String),
     /// A record collision occurred: an existing record conflicts with the requested key or content identity.
     Collision(String),
+    /// A conditional commit was rejected because a collection's logical version
+    /// no longer matches the value the caller staged. Retryable: re-read the
+    /// collection through a versioned read and re-apply the update.
+    StaleRead {
+        /// Pool holding the collection.
+        pool: ShardType,
+        /// Collection whose logical version did not match.
+        collection_id: [u8; 16],
+        /// Logical version the caller expected.
+        expected: u64,
+        /// Logical version observed when the commit was validated.
+        actual: u64,
+    },
 }
 
 impl StorageError {
@@ -565,6 +579,13 @@ impl StorageError {
     #[must_use]
     pub fn is_unsupported(&self) -> bool {
         matches!(self, Self::Unsupported(_))
+    }
+
+    /// Whether this error is a retryable collection-version conflict from a
+    /// conditional-commit precondition.
+    #[must_use]
+    pub fn is_stale_read(&self) -> bool {
+        matches!(self, Self::StaleRead { .. })
     }
 }
 
@@ -630,6 +651,15 @@ impl std::fmt::Display for StorageError {
             Self::Corrupt(msg) => write!(f, "corrupt data: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
             Self::Collision(msg) => write!(f, "record collision: {msg}"),
+            Self::StaleRead {
+                pool,
+                collection_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "stale read on {pool:?} collection {collection_id:?}: expected version {expected}, found {actual}"
+            ),
         }
     }
 }
@@ -671,6 +701,9 @@ impl From<StorageError> for std::io::Error {
             StorageError::Internal(message) => std::io::Error::other(message),
             StorageError::Collision(message) => {
                 std::io::Error::new(std::io::ErrorKind::AlreadyExists, message)
+            }
+            StorageError::StaleRead { .. } => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, error.to_string())
             }
         }
     }

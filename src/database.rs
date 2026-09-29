@@ -225,6 +225,27 @@ impl DatabaseTransaction<'_> {
         self.stage.stage_delete_collection(pool, collection_id)
     }
 
+    /// Stage a collection-version precondition. [`Self::commit`] rejects the
+    /// transaction with [`StorageError::StaleRead`] if the collection's logical
+    /// version at publication differs from `expected`.
+    ///
+    /// The token is only a valid compare-and-swap safeguard when it is read
+    /// together with the data it guards: a version read after the data can be
+    /// newer than the data and let a stale update pass.
+    ///
+    /// # Errors
+    /// Returns an error if the transaction has already been committed or
+    /// aborted.
+    pub fn expect_collection_version(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        expected: u64,
+    ) -> io::Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        self.stage.stage_expectation(pool, collection_id, expected)
+    }
+
     /// Read records through this transaction: its own staged writes first,
     /// then the live pool. Results are in the order of `node_ids`.
     ///
@@ -286,6 +307,13 @@ impl DatabaseTransaction<'_> {
         let _lifecycle = self.lifecycle.lock();
         if self.stage.state() == TxnStageState::Active {
             if self.stage.is_empty() {
+                let expectations = self.stage.expectations();
+                if !expectations.is_empty() {
+                    self.database
+                        .coordinator
+                        .check_expectations(&expectations)
+                        .map_err(stale_read_from_publish)?;
+                }
                 self.stage
                     .mark_empty_published()
                     .map_err(StorageError::Io)?;
@@ -302,7 +330,7 @@ impl DatabaseTransaction<'_> {
             self.database.commit_phases.publish.add(started.elapsed());
             if let Err(error) = published {
                 drop(overlay.take());
-                return Err(StorageError::Io(error));
+                return Err(stale_read_from_publish(error));
             }
             let Some(receipt) = self.stage.published_receipt() else {
                 // An empty transaction has no journal group to recover. The
@@ -734,6 +762,23 @@ pub(crate) fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> Result<u64, Storag
         watermark = watermark.max(PackfileStorage::read_journal_lsn(&dir));
     }
     Ok(watermark.saturating_add(1))
+}
+
+/// Convert a publish-path error into a typed storage error, surfacing a
+/// collection-version conflict as [`StorageError::StaleRead`].
+fn stale_read_from_publish(error: std::io::Error) -> StorageError {
+    if let Some(stale) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<crate::journal::StaleVersion>())
+    {
+        return StorageError::StaleRead {
+            pool: stale.pool,
+            collection_id: stale.collection_id,
+            expected: stale.expected,
+            actual: stale.actual,
+        };
+    }
+    StorageError::Io(error)
 }
 
 /// Index of `shard` in the fixed `[State, EventDag, Edges, ServerInfo]` pool array.

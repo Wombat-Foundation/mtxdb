@@ -195,6 +195,8 @@ pub enum TxnStageState {
 struct TxnStageData {
     pools: [Vec<Mutation>; ShardType::ALL.len()],
     applied: [Vec<bool>; ShardType::ALL.len()],
+    /// Collection-version preconditions validated at publication.
+    expectations: Vec<CollectionExpectation>,
     bytes: usize,
     /// Successful pool appends. Retrying a callback after a partial error
     /// resumes at the failed pool instead of duplicating earlier groups.
@@ -215,6 +217,50 @@ pub enum StagedLookup {
     /// Nothing staged names the record; the live store decides.
     Absent,
 }
+
+/// A collection-version precondition staged on a transaction.
+///
+/// The commit rejects with [`crate::storage::StorageError::StaleRead`] if the
+/// collection's logical version at publication differs from `expected`. The
+/// version is the global LSN of the last mutation touching the collection, so
+/// it is only a valid compare-and-swap token when the caller read it together
+/// with the data it is updating (see the versioned read path); a separate read
+/// after the data can observe a version newer than the data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollectionExpectation {
+    /// Pool holding the collection.
+    pub pool: ShardType,
+    /// Collection whose logical version must match.
+    pub collection_id: [u8; 16],
+    /// Logical version the caller read alongside the data.
+    pub expected: u64,
+}
+
+/// A failed collection-version precondition, carried inside the publish path's
+/// [`std::io::Error`] so the transaction layer can surface it as
+/// [`crate::storage::StorageError::StaleRead`].
+#[cfg(feature = "multi-reader")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StaleVersion {
+    pub(crate) pool: ShardType,
+    pub(crate) collection_id: [u8; 16],
+    pub(crate) expected: u64,
+    pub(crate) actual: u64,
+}
+
+#[cfg(feature = "multi-reader")]
+impl std::fmt::Display for StaleVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale read on {:?} collection {:?}: expected version {}, found {}",
+            self.pool, self.collection_id, self.expected, self.actual
+        )
+    }
+}
+
+#[cfg(feature = "multi-reader")]
+impl std::error::Error for StaleVersion {}
 
 /// Transaction-local mutation buffer used by
 /// [`crate::database::DatabaseTransaction`].
@@ -260,6 +306,7 @@ impl TxnStage {
             data: Mutex::new(TxnStageData {
                 pools: std::array::from_fn(|_| Vec::new()),
                 applied: std::array::from_fn(|_| Vec::new()),
+                expectations: Vec::new(),
                 bytes: 0,
                 appended: [false; ShardType::ALL.len()],
                 receipt: None,
@@ -373,6 +420,7 @@ impl TxnStage {
         if self.state.load(Ordering::Acquire) == Self::ACTIVE {
             data.pools.iter_mut().for_each(Vec::clear);
             data.applied.iter_mut().for_each(Vec::clear);
+            data.expectations.clear();
             data.bytes = 0;
             self.state.store(Self::DISCARDED, Ordering::Release);
         }
@@ -641,6 +689,34 @@ impl TxnStage {
         Ok(())
     }
 
+    /// Stage a collection-version precondition for validation at publication.
+    ///
+    /// # Errors
+    /// Returns an error if the stage has already been discarded or published.
+    pub fn stage_expectation(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        expected: u64,
+    ) -> io::Result<()> {
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        data.expectations.push(CollectionExpectation {
+            pool,
+            collection_id,
+            expected,
+        });
+        Ok(())
+    }
+
+    /// Snapshot the staged collection-version preconditions.
+    #[must_use]
+    pub fn expectations(&self) -> Vec<CollectionExpectation> {
+        self.data.lock().expectations.clone()
+    }
+
     /// Append staged pool groups in dependency order: edges, event-DAG,
     /// then state. Does not fsync; the ordinary coalesced sync remains the
     /// durability boundary. Repeated calls are safe, including after a
@@ -715,7 +791,8 @@ impl TxnStage {
                                 .then_some((*pool, data.pools[index].as_slice()))
                         })
                         .collect::<Vec<_>>();
-                    let receipt = coordinator.publish_tagged_groups(&batches)?;
+                    let receipt =
+                        coordinator.publish_tagged_groups_checked(&batches, &data.expectations)?;
                     data.appended.fill(true);
                     data.receipt = Some(receipt);
                     self.mark_journal_published()?;
@@ -740,7 +817,11 @@ impl TxnStage {
             let coordinator = coordinators[pool_index(pool)].ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "staged pool has no journal")
             })?;
-            let receipt = coordinator.publish_group_tagged(pool, &data.pools[index])?;
+            let receipt = coordinator.publish_group_tagged_checked(
+                pool,
+                &data.pools[index],
+                &data.expectations,
+            )?;
             data.appended[index] = true;
             data.receipt = Some(receipt);
         }
@@ -1647,6 +1728,16 @@ pub struct JournalCoordinator {
     /// coverage the checkpoint lacks and let reclaim drop another pool's
     /// uncovered frames. See [`Self::committed_lsn_for_pool`].
     pool_committed: Mutex<HashMap<ShardType, u64>>,
+    /// Logical version of each collection: the global LSN of the last published
+    /// mutation that touched it, keyed by `(pool, collection_id)`. Bumped in
+    /// [`Self::publish_groups`] at the point the group becomes visible, so a
+    /// conditional commit's validation and the version advance are one step
+    /// under the publication lock. Seeded from the recovered segment on open;
+    /// reclaim drops the WAL history a version was derived from, so a collection
+    /// whose last write is reclaimed reads `0` after a reopen until its next
+    /// write (checkpoint persistence is the follow-up that closes this).
+    #[cfg(feature = "multi-reader")]
+    collection_versions: Mutex<HashMap<(ShardType, [u8; 16]), u64>>,
     /// First LSNs of transaction groups that are published but whose writes are
     /// not yet all in the packs. See [`Self::publish_groups`].
     unmaterialized: Mutex<std::collections::BTreeSet<u64>>,
@@ -1804,6 +1895,25 @@ impl JournalCoordinator {
                 }
             }
         }
+        // Seed each collection's logical version from the retained segment. A
+        // version whose group was already reclaimed is not recoverable here and
+        // reads as 0 until the collection is written again.
+        #[cfg(feature = "multi-reader")]
+        let mut collection_versions: HashMap<(ShardType, [u8; 16]), u64> = HashMap::new();
+        #[cfg(feature = "multi-reader")]
+        for group in &scan.groups {
+            for entry in &group.entries {
+                let Some(pool) = entry.pool else { continue };
+                let collection_id = match &entry.mutation {
+                    Mutation::Put { collection_id, .. }
+                    | Mutation::DeleteCollection { collection_id } => *collection_id,
+                };
+                let version = collection_versions
+                    .entry((pool, collection_id))
+                    .or_insert(0);
+                *version = (*version).max(entry.lsn);
+            }
+        }
         Self {
             journal: Mutex::new(journal),
             path,
@@ -1826,6 +1936,8 @@ impl JournalCoordinator {
             #[cfg(feature = "multi-reader")]
             coverage: Mutex::new(coverage),
             pool_committed: Mutex::new(pool_committed),
+            #[cfg(feature = "multi-reader")]
+            collection_versions: Mutex::new(collection_versions),
             unmaterialized: Mutex::new(std::collections::BTreeSet::new()),
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
@@ -1932,6 +2044,20 @@ impl JournalCoordinator {
             *entry = lsn;
             self.coverage_epoch.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    /// Logical version of `collection_id` in `pool`: the global LSN of the last
+    /// published mutation that touched it, or `0` when none is known (never
+    /// written, or its last write predates the retained segment). See the
+    /// tracker field docs for the reclaim/reopen caveat.
+    #[must_use]
+    #[cfg(feature = "multi-reader")]
+    pub fn collection_version(&self, pool: ShardType, collection_id: &[u8; 16]) -> u64 {
+        self.collection_versions
+            .lock()
+            .get(&(pool, *collection_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Highest committed group `last_lsn` that carried at least one frame for
@@ -2847,7 +2973,7 @@ impl JournalCoordinator {
     /// exhausted, or the append fails. A partial append poisons the
     /// underlying journal; publication is rejected until reopen/recovery.
     pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(None, mutations)], false)?
+        self.publish_groups(&[(None, mutations)], false, &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -2865,7 +2991,28 @@ impl JournalCoordinator {
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(Some(pool), mutations)], false)?
+        self.publish_groups(&[(Some(pool), mutations)], false, &[])?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
+            })
+    }
+
+    /// Like [`Self::publish_group_tagged`], validating `expectations` inside the
+    /// publication critical section. A mismatch rejects the commit with an
+    /// [`io::ErrorKind::WouldBlock`] error wrapping a [`StaleVersion`] instead
+    /// of appending, so no group is published.
+    ///
+    /// # Errors
+    /// Returns a stale-version error if a collection's logical version differs
+    /// from its expectation, or the usual publication errors.
+    #[cfg(feature = "multi-reader")]
+    pub fn publish_group_tagged_checked(
+        &self,
+        pool: ShardType,
+        mutations: &[Mutation],
+        expectations: &[CollectionExpectation],
+    ) -> io::Result<CommitReceipt> {
+        self.publish_groups(&[(Some(pool), mutations)], false, expectations)?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -2886,16 +3033,76 @@ impl JournalCoordinator {
         &self,
         batches: &[(ShardType, &[Mutation])],
     ) -> io::Result<CommitReceipt> {
+        self.publish_tagged_groups_checked(batches, &[])
+    }
+
+    /// Like [`Self::publish_tagged_groups`], validating `expectations` inside
+    /// the publication critical section before the group is appended.
+    ///
+    /// # Errors
+    /// Returns a stale-version error if a collection's logical version differs
+    /// from its expectation, or the usual publication errors.
+    #[cfg(feature = "multi-reader")]
+    pub fn publish_tagged_groups_checked(
+        &self,
+        batches: &[(ShardType, &[Mutation])],
+        expectations: &[CollectionExpectation],
+    ) -> io::Result<CommitReceipt> {
         let staged = batches
             .iter()
             .map(|(pool, mutations)| (Some(*pool), *mutations))
             .collect::<Vec<_>>();
-        self.publish_groups(&staged, true)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot publish an empty transaction group",
-            )
-        })
+        self.publish_groups(&staged, true, expectations)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot publish an empty transaction group",
+                )
+            })
+    }
+
+    /// Validate `expectations` against the live collection versions. The caller
+    /// must hold the publication lock, which also serializes the version bumps,
+    /// so a passing check cannot race a competing publish.
+    #[cfg(feature = "multi-reader")]
+    fn validate_expectations(&self, expectations: &[CollectionExpectation]) -> io::Result<()> {
+        if expectations.is_empty() {
+            return Ok(());
+        }
+        let versions = self.collection_versions.lock();
+        for expectation in expectations {
+            let actual = versions
+                .get(&(expectation.pool, expectation.collection_id))
+                .copied()
+                .unwrap_or(0);
+            if actual != expectation.expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    StaleVersion {
+                        pool: expectation.pool,
+                        collection_id: expectation.collection_id,
+                        expected: expectation.expected,
+                        actual,
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate `expectations` under the publication lock without publishing.
+    /// Used by an expectation-only commit that has no mutations to append.
+    ///
+    /// # Errors
+    /// Returns a stale-version error if any collection's logical version
+    /// differs from its expectation.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn check_expectations(
+        &self,
+        expectations: &[CollectionExpectation],
+    ) -> io::Result<()> {
+        let _publication = self.publication.lock();
+        self.validate_expectations(expectations)
     }
 
     /// Single publication path. Holds `publication` for the whole append so
@@ -2912,8 +3119,13 @@ impl JournalCoordinator {
         &self,
         staged: &[(Option<ShardType>, &[Mutation])],
         transaction: bool,
+        expectations: &[CollectionExpectation],
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
+        #[cfg(feature = "multi-reader")]
+        self.validate_expectations(expectations)?;
+        #[cfg(not(feature = "multi-reader"))]
+        let _ = expectations;
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -2979,6 +3191,24 @@ impl JournalCoordinator {
             .fetch_max(receipt.last_lsn, Ordering::Release);
         self.visible_lsn
             .fetch_max(receipt.last_lsn, Ordering::Release);
+        // Advance every mutated collection's logical version to this group's
+        // LSN, still under the publication lock, so a later conditional commit
+        // validates against the version this group published.
+        #[cfg(feature = "multi-reader")]
+        {
+            let mut versions = self.collection_versions.lock();
+            for (pool, mutations) in staged {
+                let Some(pool) = pool else { continue };
+                for mutation in *mutations {
+                    let collection_id = match mutation {
+                        Mutation::Put { collection_id, .. }
+                        | Mutation::DeleteCollection { collection_id } => *collection_id,
+                    };
+                    let version = versions.entry((*pool, collection_id)).or_insert(0);
+                    *version = (*version).max(receipt.last_lsn);
+                }
+            }
+        }
         // Publish the read-committed change boundary for cross-process workers
         // at the exact point the group becomes visible, before any fsync: a
         // reader may observe a published-but-not-yet-durable group.

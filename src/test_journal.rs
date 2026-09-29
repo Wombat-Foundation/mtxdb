@@ -3341,3 +3341,143 @@ fn group_directory_accounting_follows_appends_and_reclaims() {
     assert!(GroupDirectoryStats::worst_case_bytes() < (1 << 30));
     fs::remove_file(&path).unwrap();
 }
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn collection_version_advances_with_each_publish() {
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("collection_version_publish");
+    let (journal, scan) = Journal::open_shared(dir.0.join("shared.wal")).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+    assert_eq!(
+        coordinator.collection_version(ShardType::State, &[7; 16]),
+        0,
+        "an unwritten collection has no version"
+    );
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(7, 1, b"one")])
+        .unwrap();
+    assert_eq!(
+        coordinator.collection_version(ShardType::State, &[7; 16]),
+        first.last_lsn
+    );
+    let second = coordinator
+        .publish_group_tagged(ShardType::State, &[put(7, 2, b"two")])
+        .unwrap();
+    assert_eq!(
+        coordinator.collection_version(ShardType::State, &[7; 16]),
+        second.last_lsn
+    );
+    assert_eq!(
+        coordinator.collection_version(ShardType::EventDag, &[7; 16]),
+        0,
+        "the same collection id in another pool is independent"
+    );
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn collection_version_is_recovered_from_the_segment() {
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("collection_version_recovery");
+    let path = dir.0.join("shared.wal");
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+    let receipt = coordinator
+        .publish_group_tagged(ShardType::Edges, &[put(9, 1, b"edge")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    drop(coordinator);
+
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let recovered = JournalCoordinator::new(journal, &scan);
+    assert_eq!(
+        recovered.collection_version(ShardType::Edges, &[9; 16]),
+        receipt.last_lsn,
+        "a retained group's collection version survives a reopen"
+    );
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn expectations_are_staged_and_discarded_with_the_transaction() {
+    use super::CollectionExpectation;
+    use crate::layout::ShardType;
+
+    let stage = TxnStage::new();
+    assert!(stage.expectations().is_empty());
+    stage
+        .stage_expectation(ShardType::State, [4; 16], 42)
+        .unwrap();
+    assert_eq!(
+        stage.expectations(),
+        vec![CollectionExpectation {
+            pool: ShardType::State,
+            collection_id: [4; 16],
+            expected: 42,
+        }]
+    );
+    stage.discard();
+    assert!(
+        stage.expectations().is_empty(),
+        "discard drops staged expectations"
+    );
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn stale_expectations_reject_the_publish_without_appending() {
+    use super::{CollectionExpectation, StaleVersion};
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("stale_expectation");
+    let (journal, scan) = Journal::open_shared(dir.0.join("shared.wal")).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(7, 1, b"one")])
+        .unwrap();
+    let matching = CollectionExpectation {
+        pool: ShardType::State,
+        collection_id: [7; 16],
+        expected: first.last_lsn,
+    };
+    let second = coordinator
+        .publish_group_tagged_checked(ShardType::State, &[put(7, 2, b"two")], &[matching])
+        .unwrap();
+    assert_eq!(
+        coordinator.collection_version(ShardType::State, &[7; 16]),
+        second.last_lsn
+    );
+
+    // The first version is now stale; a second commit built on it must be
+    // rejected without appending, leaving the clock at the second group.
+    let error = coordinator
+        .publish_group_tagged_checked(
+            ShardType::State,
+            &[put(7, 3, b"three")],
+            &[CollectionExpectation {
+                pool: ShardType::State,
+                collection_id: [7; 16],
+                expected: first.last_lsn,
+            }],
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    let conflict = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<StaleVersion>())
+        .expect("stale-version payload");
+    assert_eq!(conflict.expected, first.last_lsn);
+    assert_eq!(conflict.actual, second.last_lsn);
+    assert_eq!(
+        coordinator.collection_version(ShardType::State, &[7; 16]),
+        second.last_lsn,
+        "a rejected publish must not advance the clock"
+    );
+}
