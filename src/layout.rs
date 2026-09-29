@@ -39,6 +39,11 @@ fn db_meta_pool_list() -> Vec<u8> {
     }
     list
 }
+
+/// Pool list written by the three-pool layout before `ServerInfo` was added.
+/// It is recognized only as an upgrade source; new descriptors always use the
+/// current [`ShardType::ALL`] list.
+const LEGACY_DB_META_POOL_LIST: &[u8] = b"mtpl-state\nmtpl-event\nmtpl-edges\n";
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
@@ -70,6 +75,17 @@ fn validate_db_meta(contents: &[u8]) -> bool {
     contents[DB_META_HEADER_LEN..] == db_meta_pool_list()[..]
 }
 
+fn is_legacy_db_meta(contents: &[u8]) -> bool {
+    contents.len() == DB_META_HEADER_LEN.saturating_add(LEGACY_DB_META_POOL_LIST.len())
+        && &contents[..4] == DB_META_MAGIC
+        && contents[4] == DB_META_VERSION
+        && contents[DB_META_HEADER_LEN..] == LEGACY_DB_META_POOL_LIST[..]
+}
+
+fn recognized_db_meta(contents: &[u8]) -> bool {
+    validate_db_meta(contents) || is_legacy_db_meta(contents)
+}
+
 /// Whether `root` is a database root: it has a valid `db.meta`. `Ok(false)`
 /// when there is no descriptor at all.
 ///
@@ -83,7 +99,7 @@ pub fn is_database_root(root: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if !validate_db_meta(&contents) {
+    if !recognized_db_meta(&contents) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -112,7 +128,7 @@ pub fn enclosing_root(dir: &Path) -> io::Result<Option<PathBuf>> {
             continue;
         }
         let contents = fs::read(&meta_path)?;
-        if !validate_db_meta(&contents) {
+        if !recognized_db_meta(&contents) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -189,7 +205,9 @@ impl DatabaseLayout {
         let meta_path = root.join(DB_META_FILENAME);
         if meta_path.exists() {
             let contents = fs::read(&meta_path)?;
-            if !validate_db_meta(&contents) {
+            if is_legacy_db_meta(&contents) {
+                Self::upgrade_descriptor(&meta_path)?;
+            } else if !validate_db_meta(&contents) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -258,7 +276,7 @@ impl DatabaseLayout {
             ));
         }
         let contents = fs::read(&meta_path)?;
-        if !validate_db_meta(&contents) {
+        if !recognized_db_meta(&contents) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -324,6 +342,22 @@ impl DatabaseLayout {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn upgrade_descriptor(path: &Path) -> io::Result<()> {
+        let temporary = path.with_extension("meta.upgrade");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        file.write_all(&db_meta_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            OpenOptions::new().read(true).open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 
