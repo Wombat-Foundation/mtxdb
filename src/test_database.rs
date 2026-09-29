@@ -45,7 +45,7 @@ fn prepare_partial_materialization(
     let mutation = transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
     database
         .pool(ShardType::State)
-        .apply_transaction_mutation(&mutation)
+        .apply_transaction_mutation(&mutation, 0)
         .unwrap();
     transaction
         .stage
@@ -2346,7 +2346,7 @@ fn partial_materialization_retries_through_overlay_and_drains_it() {
         transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
     database
         .pool(ShardType::State)
-        .apply_transaction_mutation(&state_mutation)
+        .apply_transaction_mutation(&state_mutation, 0)
         .unwrap();
     transaction
         .stage
@@ -2417,7 +2417,7 @@ fn dropped_partial_transaction_recovers_from_wal_and_drains_overlay() {
         transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
     database
         .pool(ShardType::State)
-        .apply_transaction_mutation(&state_mutation)
+        .apply_transaction_mutation(&state_mutation, 0)
         .unwrap();
     transaction
         .stage
@@ -2714,6 +2714,314 @@ fn concurrent_versioned_rmw_keeps_every_update() {
         .map_or_else(Vec::new, |record| record.bytes.to_vec());
     final_list.sort_unstable();
     assert_eq!(final_list, (1..=WORKERS).collect::<Vec<u8>>());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A record's write token is stable across re-reads and across a reopen, where
+/// it is seeded from the retained WAL plus, for reclaimed groups, the frame's
+/// `last_write_lsn`.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn record_versions_are_stable_and_survive_reopen() {
+    let root = test_root("record_version_reopen");
+    let pool = ShardType::State;
+    let collection = [0x74u8; 16];
+    let key = node(1);
+    let write_version;
+    {
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let txn = db.begin_transaction();
+        txn.put(
+            pool,
+            collection,
+            key,
+            &NodeData::new(bytes::Bytes::from_static(b"one")),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let reader = db.begin_transaction();
+        let (records, versions) = reader
+            .get_with_record_versions(pool, &collection, &[key])
+            .unwrap();
+        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"one");
+        write_version = versions[0];
+        assert!(write_version > 0, "a written record has a non-zero token");
+        let again = db.begin_transaction();
+        let (_, versions2) = again
+            .get_with_record_versions(pool, &collection, &[key])
+            .unwrap();
+        assert_eq!(versions2[0], write_version, "warm token is stable");
+        db.pool(pool).sync_all().unwrap();
+    }
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let reader = db.begin_transaction();
+    let (records, versions) = reader
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"one");
+    assert_eq!(
+        versions[0], write_version,
+        "reopened token must match the original write"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A record the live map does not know (its WAL group was reclaimed) is seeded
+/// from its frame's own `last_write_lsn`.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn cold_record_token_seeds_from_frame_metadata() {
+    let root = test_root("record_frame_seed");
+    let pool = ShardType::State;
+    let collection = [0x75u8; 16];
+    let key = node(1);
+    let write_version;
+    {
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        let txn = db.begin_transaction();
+        txn.put(
+            pool,
+            collection,
+            key,
+            &NodeData::new(bytes::Bytes::from_static(b"one")),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let reader = db.begin_transaction();
+        let (_, versions) = reader
+            .get_with_record_versions(pool, &collection, &[key])
+            .unwrap();
+        write_version = versions[0];
+        db.pool(pool).sync_all().unwrap();
+    }
+    // Drop the retained WAL so the reopen cannot seed the token from it; the
+    // only remaining source is the record's frame metadata.
+    let _ = std::fs::remove_file(root.join("wal.bin"));
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let reader = db.begin_transaction();
+    let (records, versions) = reader
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"one");
+    assert_eq!(
+        versions[0], write_version,
+        "cold token must seed from the frame's last_write_lsn"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A legacy v4 frame carries no `last_write_lsn`; its record reads as version
+/// `0` once the WAL that could name it is gone.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn legacy_frame_without_write_lsn_reads_version_zero() {
+    let root = test_root("record_legacy_zero");
+    let pool = ShardType::State;
+    let collection = [0x76u8; 16];
+    let key = node(1);
+    {
+        let db = SharedDatabase::open(root.clone()).unwrap();
+        // A direct autocommit put writes no metadata, so the frame is legacy.
+        db.pool(pool)
+            .put(
+                &collection,
+                &key,
+                &NodeData::new(bytes::Bytes::from_static(b"legacy")),
+            )
+            .unwrap();
+        db.pool(pool).sync_all().unwrap();
+    }
+    let _ = std::fs::remove_file(root.join("wal.bin"));
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let reader = db.begin_transaction();
+    let (records, versions) = reader
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"legacy");
+    assert_eq!(versions[0], 0, "a legacy frame reads as version 0");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Removing a collection leaves its records absent, but their token resolves to
+/// the delete's LSN so a pre-delete token is stale and a delete token passes.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn absent_record_resolves_to_collection_delete_lsn() {
+    let root = test_root("record_delete_token");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let pool = ShardType::State;
+    let collection = [0x73u8; 16];
+    let key = node(1);
+    let seed = db.begin_transaction();
+    seed.put(
+        pool,
+        collection,
+        key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.commit().unwrap();
+    let write_version = {
+        let reader = db.begin_transaction();
+        let (records, versions) = reader
+            .get_with_record_versions(pool, &collection, &[key])
+            .unwrap();
+        assert!(records[0].is_some());
+        assert!(versions[0] > 0);
+        versions[0]
+    };
+
+    let deleter = db.begin_transaction();
+    deleter.delete_collection(pool, collection).unwrap();
+    deleter.commit().unwrap();
+
+    let after = db.begin_transaction();
+    let (records, versions) = after
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    assert!(records[0].is_none(), "the record is gone after the delete");
+    let delete_version = versions[0];
+    assert!(
+        delete_version > write_version,
+        "the absent token must advance to the delete LSN: {delete_version} vs {write_version}"
+    );
+
+    let stale = db.begin_transaction();
+    stale
+        .expect_record_version(pool, collection, key, write_version)
+        .unwrap();
+    let error = stale.commit().unwrap_err();
+    assert!(
+        error.is_stale_read(),
+        "a pre-delete token must be rejected: {error}"
+    );
+
+    let fresh = db.begin_transaction();
+    fresh
+        .expect_record_version(pool, collection, key, delete_version)
+        .unwrap();
+    fresh.commit().unwrap();
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Per-record tokens only conflict for the same record: two writers touching
+/// different records of one collection both commit.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn disjoint_record_writes_do_not_conflict() {
+    use std::sync::{Arc, Barrier};
+
+    let root = test_root("record_disjoint");
+    let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let pool = ShardType::State;
+    let collection = [0x72u8; 16];
+    let keys = [node(1), node(2)];
+    let barrier = Arc::new(Barrier::new(keys.len()));
+    let handles: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let key = *key;
+            std::thread::spawn(move || {
+                barrier.wait();
+                let txn = db.begin_transaction();
+                let (records, versions) = txn
+                    .get_with_record_versions(pool, &collection, &[key])
+                    .unwrap();
+                assert!(records[0].is_none());
+                txn.expect_record_version(pool, collection, key, versions[0])
+                    .unwrap();
+                txn.put(
+                    pool,
+                    collection,
+                    key,
+                    &NodeData::new(bytes::Bytes::from(vec![u8::try_from(index).unwrap() + 1])),
+                )
+                .unwrap();
+                txn.commit()
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    for key in keys {
+        assert!(db.pool(pool).get(&collection, &key).unwrap().is_some());
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Per-record tokens conflict for the same record: the second writer holding a
+/// stale token is rejected.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn same_record_write_conflicts() {
+    let root = test_root("record_same_key_conflict");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let pool = ShardType::State;
+    let collection = [0x71u8; 16];
+    let key = node(1);
+    let seed = db.begin_transaction();
+    seed.put(
+        pool,
+        collection,
+        key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.commit().unwrap();
+
+    let first = db.begin_transaction();
+    let second = db.begin_transaction();
+    let (_, first_versions) = first
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    let (_, second_versions) = second
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(first_versions, second_versions);
+    let version = first_versions[0];
+    assert!(version > 0);
+
+    first
+        .expect_record_version(pool, collection, key, version)
+        .unwrap();
+    first
+        .put(
+            pool,
+            collection,
+            key,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    first.commit().unwrap();
+
+    second
+        .expect_record_version(pool, collection, key, version)
+        .unwrap();
+    second
+        .put(
+            pool,
+            collection,
+            key,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    let error = second.commit().unwrap_err();
+    assert!(
+        error.is_stale_read(),
+        "a stale same-record token must be rejected: {error}"
+    );
 
     drop(db);
     let _ = std::fs::remove_dir_all(&root);

@@ -2206,6 +2206,29 @@ impl JournalCoordinator {
         entry.nodes.get(node_id).copied().or(entry.deleted_at)
     }
 
+    /// Seed a cold record's version from durable state (its frame metadata).
+    /// Never overwrites a live entry, and a collection that was deleted
+    /// resolves an absent record to its delete LSN rather than the seed.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn seed_record_version(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+        lsn: u64,
+    ) -> u64 {
+        let mut map = self.record_versions.lock();
+        let entry = map.entry((pool, collection_id)).or_default();
+        if let Some(existing) = entry.nodes.get(&node_id) {
+            return *existing;
+        }
+        if let Some(deleted) = entry.deleted_at {
+            return deleted;
+        }
+        entry.nodes.insert(node_id, lsn);
+        lsn
+    }
+
     /// Snapshot the logical versions this pool's checkpoint can safely claim.
     /// Versions above `covered_lsn` remain represented by retained WAL and
     /// must not be folded into the checkpoint baseline.

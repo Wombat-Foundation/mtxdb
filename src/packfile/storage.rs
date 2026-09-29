@@ -6525,6 +6525,22 @@ impl PackfileStorage {
         pinned: &HashMap<u16, Arc<Shard>>,
         track: bool,
     ) -> Result<Option<NodeData>, StorageError> {
+        Ok(self
+            .resolve_with_lsn_from_pinned(id, candidates, pinned, track)?
+            .map(|(data, _)| data))
+    }
+
+    /// Like [`Self::resolve_from_pinned`], also returning the decoded frame's
+    /// per-record write LSN. Only a record decoded from disk carries one; a
+    /// caller using it to seed an optimistic token must consult the coordinator
+    /// for records served from the in-memory cache.
+    fn resolve_with_lsn_from_pinned(
+        &self,
+        id: &NodeId,
+        candidates: &[(u16, u64)],
+        pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+    ) -> Result<Option<(NodeData, Option<u64>)>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for &(slot, offset) in candidates {
             let Some(shard) = pinned.get(&slot) else {
@@ -6552,6 +6568,8 @@ impl PackfileStorage {
                         continue;
                     }
 
+                    let last_write_lsn =
+                        record.metadata.and_then(|metadata| metadata.last_write_lsn);
                     let data = NodeData {
                         bytes: record.data,
                         children: Vec::new(),
@@ -6562,7 +6580,7 @@ impl PackfileStorage {
                     // The cache remains populated by writes and swizzling,
                     // where it stores work that cannot be recovered by a
                     // simple mmap range.
-                    return Ok(Some(data));
+                    return Ok(Some((data, last_write_lsn)));
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -6574,6 +6592,29 @@ impl PackfileStorage {
             return Err(err);
         }
         Ok(None)
+    }
+
+    /// The per-record write LSN recorded in a durable record's frame, for
+    /// seeding a cold optimistic token. `None` when the record is absent or
+    /// carries no `last_write_lsn` tag (a legacy v4 frame, read as version 0).
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn record_last_write_lsn(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+    ) -> Result<Option<u64>, StorageError> {
+        let gen_guard = self.generation(collection_id);
+        let Some(generation) = gen_guard.as_deref() else {
+            return Ok(None);
+        };
+        let candidates: Vec<(u16, u64)> = generation.index.lookup_all(id).collect();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
+        Ok(self
+            .resolve_with_lsn_from_pinned(id, &candidates, &pinned, false)?
+            .and_then(|(_, lsn)| lsn))
     }
 
     // repack_collection_rewrite and repack_collection_topo were retired: both scanned
@@ -9971,6 +10012,7 @@ impl PackfileStorage {
     pub(crate) fn apply_transaction_mutation(
         &self,
         mutation: &JournalMutation,
+        write_lsn: u64,
     ) -> Result<(), StorageError> {
         JOURNAL_SUPPRESSED.with(|suppressed| {
             let previous = suppressed.replace(true);
@@ -9979,11 +10021,21 @@ impl PackfileStorage {
                     collection_id,
                     node_id,
                     payload,
-                } => self.put(
-                    collection_id,
-                    node_id,
-                    &NodeData::new(bytes::Bytes::from(payload.clone())),
-                ),
+                } => {
+                    // Stamp the group's LSN so a cold read can seed this
+                    // record's optimistic token from its frame after the WAL
+                    // group is reclaimed.
+                    let metadata = FrameMetadata {
+                        last_write_lsn: Some(write_lsn),
+                        ..FrameMetadata::default()
+                    };
+                    self.put_internal(
+                        collection_id,
+                        node_id,
+                        &NodeData::new(bytes::Bytes::from(payload.clone())),
+                        Some(metadata),
+                    )
+                }
                 JournalMutation::DeleteCollection { collection_id } => {
                     self.delete_collection(collection_id)
                 }

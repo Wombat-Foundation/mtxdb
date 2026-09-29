@@ -1238,6 +1238,112 @@ impl PackfileStorage {
             Ok((self.get_read_committed(collection_id, ids)?, 0))
         }
     }
+
+    /// Read records with each record's write LSN, sampled so that every
+    /// returned record version is covered by the returned data. A caller can
+    /// stage a per-record precondition from the pair instead of the coarser
+    /// collection version.
+    ///
+    /// A record absent because its collection was deleted resolves to the
+    /// delete LSN, and a legacy v4 frame with no `last_write_lsn` tag resolves
+    /// to `0`. A cold record (written before this process, its group reclaimed)
+    /// is seeded from its frame metadata the first time it is read.
+    ///
+    /// # Errors
+    /// Propagates read errors, including a fail-closed overlay gap, and returns
+    /// [`StorageError::WouldBlock`] if the versions keep advancing.
+    pub fn get_with_record_versions(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, Vec<u64>), StorageError> {
+        #[cfg(feature = "multi-reader")]
+        {
+            const ATTEMPTS: usize = 64;
+            let Some(pool) =
+                crate::journal::pool_from_tag(self.journal_pool.load(Ordering::Acquire))
+            else {
+                return Ok((
+                    self.get_read_committed(collection_id, ids)?,
+                    vec![0; ids.len()],
+                ));
+            };
+            let Some(journal) = self.journal() else {
+                return Ok((
+                    self.get_read_committed(collection_id, ids)?,
+                    vec![0; ids.len()],
+                ));
+            };
+            let version = journal.collection_version(pool, collection_id);
+            let mut boundary = 0u64;
+            for attempt in 0..ATTEMPTS {
+                let (data, read_boundary) =
+                    self.get_read_committed_bounded(collection_id, ids, true)?;
+                boundary = read_boundary;
+                if boundary >= version {
+                    if let Some(versions) = self.record_versions_for_read(
+                        &journal,
+                        pool,
+                        collection_id,
+                        ids,
+                        &data,
+                        boundary,
+                    )? {
+                        return Ok((data, versions));
+                    }
+                }
+                if attempt < 2 {
+                    std::thread::yield_now();
+                } else {
+                    journal.wait_for_materialized(std::time::Duration::from_micros(50));
+                }
+            }
+            Err(StorageError::WouldBlock(format!(
+                "record versions kept advancing during the read; retry \
+                 (version={version}, boundary={boundary})"
+            )))
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        {
+            Ok((
+                self.get_read_committed(collection_id, ids)?,
+                vec![0; ids.len()],
+            ))
+        }
+    }
+
+    /// Resolve each requested record's version against the coordinator map,
+    /// cold-seeding a durable record from its frame metadata. Returns `None`
+    /// when a version exceeds `boundary`, meaning the data that was read does
+    /// not yet cover it and the caller must retry.
+    #[cfg(feature = "multi-reader")]
+    fn record_versions_for_read(
+        &self,
+        journal: &crate::journal::JournalCoordinator,
+        pool: crate::layout::ShardType,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+        data: &[Option<NodeData>],
+        boundary: u64,
+    ) -> Result<Option<Vec<u64>>, StorageError> {
+        let mut versions = Vec::with_capacity(ids.len());
+        for (index, id) in ids.iter().enumerate() {
+            let mut version = journal.record_version(pool, collection_id, id);
+            if version.is_none() && data[index].is_some() {
+                // A record the live map does not know is durable and cold;
+                // seed its token from the frame's own write LSN (legacy
+                // frames carry none, read as version 0).
+                let lsn = self.record_last_write_lsn(collection_id, id)?.unwrap_or(0);
+                version = Some(journal.seed_record_version(pool, *collection_id, *id, lsn));
+            }
+            let version = version.unwrap_or(0);
+            if version > boundary {
+                return Ok(None);
+            }
+            versions.push(version);
+        }
+        Ok(Some(versions))
+    }
 }
 
 #[cfg(test)]

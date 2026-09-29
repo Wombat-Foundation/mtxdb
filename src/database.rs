@@ -246,6 +246,28 @@ impl DatabaseTransaction<'_> {
         self.stage.stage_expectation(pool, collection_id, expected)
     }
 
+    /// Stage a per-record version precondition. [`Self::commit`] rejects the
+    /// transaction with [`StorageError::StaleRead`] if the record's write LSN
+    /// at publication differs from `expected`. `expected` is the token returned
+    /// by [`Self::get_with_record_versions`] for the same record (the
+    /// collection's delete LSN when the record was absent, or `0` for a legacy
+    /// frame).
+    ///
+    /// # Errors
+    /// Returns an error if the transaction has already been committed or
+    /// aborted.
+    pub fn expect_record_version(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+        expected: u64,
+    ) -> io::Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        self.stage
+            .stage_record_expectation(pool, collection_id, node_id, expected)
+    }
+
     /// Read records through this transaction: its own staged writes first,
     /// then the live pool. Results are in the order of `node_ids`.
     ///
@@ -345,6 +367,57 @@ impl DatabaseTransaction<'_> {
             results[slot] = value;
         }
         Ok((results, version))
+    }
+
+    /// Read records through the transaction's own staged writes first, then
+    /// the live store, returning each record's write LSN alongside them.
+    ///
+    /// Pass a token to [`Self::expect_record_version`] to make the commit
+    /// conditional on that exact record not having changed since this read.
+    /// This transaction's own staged writes are uncommitted and have no
+    /// published version, so their token is `0`; read before staging writes
+    /// when using the tokens as preconditions.
+    ///
+    /// # Errors
+    /// Returns an error if the live pool cannot be read.
+    pub fn get_with_record_versions(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[NodeId],
+    ) -> Result<(Vec<Option<crate::storage::NodeData>>, Vec<u64>), StorageError> {
+        let _lifecycle = self.lifecycle.lock();
+        let staged = self.stage.lookup_many(pool, collection_id, node_ids);
+        let mut results = Vec::with_capacity(node_ids.len());
+        let mut versions = vec![0u64; node_ids.len()];
+        let mut live_slots = Vec::new();
+        let mut live_ids = Vec::new();
+        for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
+            match lookup {
+                StagedLookup::Put(payload) => {
+                    results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
+                        payload,
+                    ))));
+                }
+                StagedLookup::Deleted => results.push(None),
+                StagedLookup::Absent => {
+                    results.push(None);
+                    live_slots.push(slot);
+                    live_ids.push(*node_id);
+                }
+            }
+        }
+        if !live_ids.is_empty() {
+            let (live, live_versions) = self
+                .database
+                .pool(pool)
+                .get_with_record_versions(collection_id, &live_ids)?;
+            for ((slot, value), version) in live_slots.into_iter().zip(live).zip(live_versions) {
+                results[slot] = value;
+                versions[slot] = version;
+            }
+        }
+        Ok((results, versions))
     }
 
     /// Read node payloads and the collection version without copying the
@@ -757,13 +830,19 @@ impl SharedDatabase {
     }
 
     fn materialize_transaction(&self, stage: &TxnStage) -> Result<(), StorageError> {
+        // The published group's last LSN is stamped into each record it writes,
+        // so a record's optimistic token survives reclaim of the group's WAL.
+        let write_lsn = stage
+            .published_receipt()
+            .map_or(0, |receipt| receipt.last_lsn);
         let batches = stage.snapshot_mutations();
         for pool in ShardType::ALL {
             for (index, mutation) in batches[shard_index(pool)].iter().enumerate() {
                 if stage.mutation_applied(pool, index) {
                     continue;
                 }
-                self.pool(pool).apply_transaction_mutation(mutation)?;
+                self.pool(pool)
+                    .apply_transaction_mutation(mutation, write_lsn)?;
                 stage
                     .mark_mutation_applied(pool, index)
                     .map_err(StorageError::Io)?;
