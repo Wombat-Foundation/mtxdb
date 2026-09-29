@@ -55,6 +55,8 @@ pub struct PoolPolicies {
     pub event_dag: PoolPolicy,
     /// Policy for the edges pool (`ShardType::Edges`).
     pub edges: PoolPolicy,
+    /// Policy for server metadata and federation key records.
+    pub server_info: PoolPolicy,
 }
 
 impl PoolPolicies {
@@ -65,6 +67,7 @@ impl PoolPolicies {
             ShardType::State => &self.state,
             ShardType::EventDag => &self.event_dag,
             ShardType::Edges => &self.edges,
+            ShardType::ServerInfo => &self.server_info,
         }
     }
 }
@@ -75,7 +78,7 @@ impl PoolPolicies {
 pub struct SharedDatabase {
     layout: DatabaseLayout,
     coordinator: Arc<JournalCoordinator>,
-    pools: [Arc<PackfileStorage>; 3],
+    pools: [Arc<PackfileStorage>; 4],
     /// Published transactions whose materialization still needs to be
     /// completed. The queue owns the transaction stage, so dropping a caller's
     /// handle cannot orphan the visibility overlay.
@@ -437,8 +440,8 @@ impl SharedDatabase {
             store.replay_journal()?;
             pools.push(Arc::new(store));
         }
-        let pools: [Arc<PackfileStorage>; 3] = pools.try_into().map_err(|_| {
-            StorageError::Internal("a shared database must open exactly three pools".into())
+        let pools: [Arc<PackfileStorage>; 4] = pools.try_into().map_err(|_| {
+            StorageError::Internal("a shared database must open exactly four pools".into())
         })?;
 
         // This process owns every pool, so it can make a lagging one checkpoint
@@ -503,6 +506,12 @@ impl SharedDatabase {
     #[must_use]
     pub fn edges(&self) -> &Arc<PackfileStorage> {
         self.pool(ShardType::Edges)
+    }
+
+    /// The server-info store (`ShardType::ServerInfo`).
+    #[must_use]
+    pub fn server_info(&self) -> &Arc<PackfileStorage> {
+        self.pool(ShardType::ServerInfo)
     }
 
     /// Begin a storage transaction whose writes are invisible until commit.
@@ -688,7 +697,7 @@ impl SharedDatabase {
 
     /// Publish one transaction-owned mutation group through the shared WAL.
     ///
-    /// All mutations staged for the three pools are appended as one tagged
+    /// All mutations staged for the four pools are appended as one tagged
     /// journal group. A later durability operation may fsync that group, but
     /// readers see either the complete group or none of it.
     ///
@@ -696,11 +705,7 @@ impl SharedDatabase {
     /// Returns an error if staging is inactive, the coordinator is poisoned,
     /// or the journal group cannot be appended.
     pub fn publish_transaction(&self, stage: &TxnStage) -> io::Result<()> {
-        stage.publish(
-            Some(&self.coordinator),
-            Some(&self.coordinator),
-            Some(&self.coordinator),
-        )
+        stage.publish([Some(self.coordinator.as_ref()); ShardType::ALL.len()])
     }
 }
 
@@ -731,12 +736,13 @@ pub(crate) fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> Result<u64, Storag
     Ok(watermark.saturating_add(1))
 }
 
-/// Index of `shard` in the fixed `[State, EventDag, Edges]` pool array.
+/// Index of `shard` in the fixed `[State, EventDag, Edges, ServerInfo]` pool array.
 const fn shard_index(shard: ShardType) -> usize {
     match shard {
         ShardType::State => 0,
         ShardType::EventDag => 1,
         ShardType::Edges => 2,
+        ShardType::ServerInfo => 3,
     }
 }
 

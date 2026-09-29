@@ -9626,6 +9626,7 @@ fn scan_collection_at_snapshot_rejects_an_active_transaction_overlay() {
 }
 
 #[test]
+#[cfg(feature = "multi-reader")]
 fn read_only_handles_cannot_take_replayable_snapshots() {
     let dir = test_dir("scan_collection_replay_read_only");
     let wal = dir.join("wal.bin");

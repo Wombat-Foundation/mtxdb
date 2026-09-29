@@ -10,8 +10,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static DESCRIPTOR_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static UPGRADE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TempFileGuard(PathBuf);
 
@@ -26,7 +28,6 @@ impl Drop for TempFileGuard {
         let _ = fs::remove_file(&self.0);
     }
 }
-
 /// Immutable descriptor at a database root.
 ///
 /// Layout: `magic(4) | version(1) | reserved(8) | pool list`. The reserved
@@ -56,6 +57,11 @@ fn db_meta_pool_list() -> Vec<u8> {
     }
     list
 }
+
+/// Pool list written by the three-pool layout before `ServerInfo` was added.
+/// It is recognized only as an upgrade source; new descriptors always use the
+/// current [`ShardType::ALL`] list.
+const LEGACY_DB_META_POOL_LIST: &[u8] = b"mtpl-state\nmtpl-event\nmtpl-edges\n";
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
@@ -87,6 +93,17 @@ fn validate_db_meta(contents: &[u8]) -> bool {
     contents[DB_META_HEADER_LEN..] == db_meta_pool_list()[..]
 }
 
+fn is_legacy_db_meta(contents: &[u8]) -> bool {
+    contents.len() == DB_META_HEADER_LEN.saturating_add(LEGACY_DB_META_POOL_LIST.len())
+        && &contents[..4] == DB_META_MAGIC
+        && contents[4] == DB_META_VERSION
+        && contents[DB_META_HEADER_LEN..] == LEGACY_DB_META_POOL_LIST[..]
+}
+
+fn recognized_db_meta(contents: &[u8]) -> bool {
+    validate_db_meta(contents) || is_legacy_db_meta(contents)
+}
+
 /// Whether `root` is a database root: it has a valid `db.meta`. `Ok(false)`
 /// when there is no descriptor at all.
 ///
@@ -100,7 +117,7 @@ pub fn is_database_root(root: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if !validate_db_meta(&contents) {
+    if !recognized_db_meta(&contents) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -129,7 +146,7 @@ pub fn enclosing_root(dir: &Path) -> io::Result<Option<PathBuf>> {
             continue;
         }
         let contents = fs::read(&meta_path)?;
-        if !validate_db_meta(&contents) {
+        if !recognized_db_meta(&contents) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -152,11 +169,13 @@ pub enum ShardType {
     EventDag,
     /// Edges pool: houses previous-event edges (`PREV`) and auth-chain edges (`AUTH`).
     Edges,
+    /// Server metadata, including federation signing keys and raw key responses.
+    ServerInfo,
 }
 
 impl ShardType {
     /// Every shard type defined by the current database layout.
-    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::Edges];
+    pub const ALL: [Self; 4] = [Self::State, Self::EventDag, Self::Edges, Self::ServerInfo];
 
     /// Stable on-disk directory name for this pool.
     #[must_use]
@@ -165,6 +184,7 @@ impl ShardType {
             Self::State => "mtpl-state",
             Self::EventDag => "mtpl-event",
             Self::Edges => "mtpl-edges",
+            Self::ServerInfo => "mtpl-server-info",
         }
     }
 
@@ -180,6 +200,7 @@ impl ShardType {
             Self::State => *b"STAT",
             Self::EventDag => *b"EVNT",
             Self::Edges => *b"EDGE",
+            Self::ServerInfo => *b"SINF",
         }
     }
 }
@@ -202,7 +223,9 @@ impl DatabaseLayout {
         let meta_path = root.join(DB_META_FILENAME);
         if meta_path.exists() {
             let contents = fs::read(&meta_path)?;
-            if !validate_db_meta(&contents) {
+            if is_legacy_db_meta(&contents) {
+                Self::upgrade_descriptor(&meta_path)?;
+            } else if !validate_db_meta(&contents) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -271,7 +294,7 @@ impl DatabaseLayout {
             ));
         }
         let contents = fs::read(&meta_path)?;
-        if !validate_db_meta(&contents) {
+        if !recognized_db_meta(&contents) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -363,12 +386,14 @@ impl DatabaseLayout {
     ) -> io::Result<()> {
         match hard_link(temporary, path) {
             Ok(()) => {
-                Self::sync_and_sweep_descriptor_parent(path);
+                Self::sync_descriptor_parent(path);
+                Self::sweep_descriptor_temps(path, "create");
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 Self::validate_existing_descriptor(path)?;
-                Self::sync_and_sweep_descriptor_parent(path);
+                Self::sync_descriptor_parent(path);
+                Self::sweep_descriptor_temps(path, "create");
                 Ok(())
             }
             // A concurrent opener can install the canonical file and sweep
@@ -390,7 +415,8 @@ impl DatabaseLayout {
                 // replace-capable fallback.
                 match fs::rename(temporary, path) {
                     Ok(()) => {
-                        Self::sync_and_sweep_descriptor_parent(path);
+                        Self::sync_descriptor_parent(path);
+                        Self::sweep_descriptor_temps(path, "create");
                         Ok(())
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -406,7 +432,7 @@ impl DatabaseLayout {
         }
     }
 
-    fn sync_and_sweep_descriptor_parent(path: &Path) {
+    fn sync_descriptor_parent(path: &Path) {
         // The descriptor contents are synced before installation. Directory
         // sync is best-effort: some supported filesystems reject it, and a
         // lost first-install directory entry can be safely recreated on the
@@ -417,16 +443,19 @@ impl DatabaseLayout {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let _ = crate::shard::sync_directory(parent);
+    }
 
-        // Only reap this descriptor protocol's regular-file temps. This runs
-        // after a valid canonical descriptor exists. If it removes another
-        // opener's temp, that opener handles NotFound by validating the
-        // canonical descriptor above. Cleanup must never fail initialization.
+    fn sweep_descriptor_temps(path: &Path, kind: &str) {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let prefix = format!(
-            ".{}.create.",
+            ".{}.{}.",
             path.file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or(DB_META_FILENAME)
+                .unwrap_or(DB_META_FILENAME),
+            kind,
         );
         if let Ok(entries) = fs::read_dir(parent) {
             for entry in entries.flatten() {
@@ -452,6 +481,114 @@ impl DatabaseLayout {
                 format!("unrecognized mtxdb database descriptor: {}", path.display()),
             ))
         }
+    }
+
+    fn upgrade_descriptor(path: &Path) -> io::Result<()> {
+        let lock_path = path.with_file_name(".db.meta.upgrade.lock");
+        let _upgrade_lock = loop {
+            match crate::shard::ShardPool::acquire_lock_path(&lock_path) {
+                Ok(lock) => break lock,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        // Another opener may have completed the replacement while we waited
+        // for the lock. Never replace a current descriptor with a second
+        // upgrade attempt.
+        let contents = fs::read(path)?;
+        if validate_db_meta(&contents) {
+            Self::sweep_descriptor_temps(path, "upgrade");
+            return Ok(());
+        }
+        if !is_legacy_db_meta(&contents) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("descriptor changed during upgrade: {}", path.display()),
+            ));
+        }
+
+        let (temporary, file) = loop {
+            let suffix = UPGRADE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                ".{}.upgrade.{}.{}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("db.meta"),
+                std::process::id(),
+                suffix,
+            );
+            let temporary = path.with_file_name(name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+
+        let _temporary_guard = TempFileGuard::new(temporary.clone());
+        // Close the temp before the guard attempts cleanup on Windows.
+        let mut file = file;
+        file.write_all(&db_meta_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        atomic_replace_file(&temporary, path)?;
+        // The file contents were synced before replacement. Parent sync is
+        // best-effort on filesystems that do not support directory fsync.
+        Self::sync_descriptor_parent(path);
+        // The upgrade lock excludes active upgraders while orphan temps are
+        // reaped; failures here are cleanup-only and never fail initialization.
+        Self::sweep_descriptor_temps(path, "upgrade");
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let replaced: Vec<u16> = to.as_os_str().encode_wide().chain([0]).collect();
+    let replacement: Vec<u16> = from.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: both strings are nul-terminated UTF-16 paths owned for the
+    // duration of the call; the optional backup and reserved pointers are
+    // null as permitted by ReplaceFileW.
+    let result = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            0x00000001, // REPLACEFILE_WRITE_THROUGH
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 

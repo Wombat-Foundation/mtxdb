@@ -412,6 +412,7 @@ fn collection_id_is_deterministic_and_pool_separated() {
     let state = Some(*b"STAT");
     let prev = Some(*b"PREV");
     let auth = Some(*b"AUTH");
+    let forward = Some(*b"FWD ");
     assert_eq!(
         derive_collection_id(event_dag, room),
         derive_collection_id(event_dag, room)
@@ -424,6 +425,10 @@ fn collection_id_is_deterministic_and_pool_separated() {
     assert_ne!(
         derive_collection_id(prev, room),
         derive_collection_id(auth, room)
+    );
+    assert_ne!(
+        derive_collection_id(forward, room),
+        derive_collection_id(prev, room)
     );
     // A different key yields a different id for the same tag.
     assert_ne!(

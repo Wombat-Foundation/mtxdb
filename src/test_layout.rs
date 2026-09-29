@@ -31,6 +31,30 @@ fn a_descriptor_listing_the_old_pool_names_is_rejected() {
 }
 
 #[test]
+fn upgrades_a_three_pool_descriptor_and_creates_server_info_pool() {
+    let root = test_dir("upgrade_server_info");
+    let layout = DatabaseLayout::open(root.clone()).unwrap();
+    drop(layout);
+
+    let meta_path = root.join(DB_META_FILENAME);
+    let mut contents = fs::read(&meta_path).unwrap();
+    let header_len = contents.len() - super::db_meta_pool_list().len();
+    contents.truncate(header_len);
+    contents.extend_from_slice(super::LEGACY_DB_META_POOL_LIST);
+    fs::write(&meta_path, contents).unwrap();
+    fs::remove_dir_all(root.join("pools/mtpl-server-info")).unwrap();
+
+    let layout = DatabaseLayout::open(root.clone()).unwrap();
+    assert!(root.join("pools/mtpl-server-info").is_dir());
+    assert_eq!(fs::read(&meta_path).unwrap(), super::db_meta_bytes());
+    assert_eq!(
+        layout.pool_dir(ShardType::ServerInfo).unwrap(),
+        root.join("pools/mtpl-server-info")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn initializes_named_pool_layout() {
     let root = test_dir("initialize");
     let layout = DatabaseLayout::open(root.clone()).unwrap();

@@ -352,10 +352,10 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
         .unwrap();
 
     stage
-        .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+        .publish(ShardType::ALL.map(|_| Some(&coordinator)))
         .unwrap();
     stage
-        .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+        .publish(ShardType::ALL.map(|_| Some(&coordinator)))
         .unwrap();
 
     let scan = Journal::scan_read_only(&path).unwrap();
@@ -401,7 +401,7 @@ fn transaction_stage_publishes_after_autocommit_groups_in_lsn_order() {
         )
         .unwrap();
     stage
-        .publish(Some(&coordinator), Some(&coordinator), Some(&coordinator))
+        .publish(ShardType::ALL.map(|_| Some(&coordinator)))
         .unwrap();
 
     // The autocommit write keeps its own complete group ahead of the
@@ -2019,7 +2019,7 @@ fn changes_since_does_not_publish_visible_but_undurable_groups() {
     let cursor = coordinator.replay_cursor(0).unwrap();
 
     let before_sync = coordinator.changes_since(&cursor, 10).unwrap();
-    assert!(before_sync.groups.is_empty());
+    assert_eq!(before_sync.groups, Vec::new());
     assert!(!before_sync.has_more);
 
     coordinator.sync().unwrap();
@@ -2863,7 +2863,7 @@ fn claim_retries_when_a_commit_lands_between_claim_and_recheck() {
     assert!(!coordinator.claim_threshold_wake());
     fs::remove_file(coordinator.path()).unwrap();
 }
-/// A shared segment with tagged groups spread across the three pools.
+/// A shared segment with tagged groups spread across all pools.
 #[cfg(feature = "multi-reader")]
 fn shared_journal_with_groups(label: &str, groups: u8) -> (Journal, std::path::PathBuf) {
     use crate::layout::ShardType;
@@ -2871,9 +2871,14 @@ fn shared_journal_with_groups(label: &str, groups: u8) -> (Journal, std::path::P
     let _ = fs::remove_file(&path);
     let (mut journal, _) = Journal::open_shared(&path).unwrap();
     for i in 0..groups {
-        let first = ShardType::ALL[usize::from(i) % 3];
-        let second =
-            ShardType::ALL[usize::from(i).checked_add(1).expect("index fits in usize") % 3];
+        let first = ShardType::ALL[usize::from(i)
+            .checked_rem(ShardType::ALL.len())
+            .expect("pool list is non-empty")];
+        let second = ShardType::ALL[usize::from(i)
+            .checked_add(1)
+            .expect("index fits in usize")
+            .checked_rem(ShardType::ALL.len())
+            .expect("pool list is non-empty")];
         journal
             .append_group_tagged_with_sequence(
                 &[
