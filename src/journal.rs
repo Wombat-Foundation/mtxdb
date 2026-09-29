@@ -1676,6 +1676,17 @@ pub struct JournalCoordinator {
     next_replay_lease: AtomicU64,
 }
 
+/// Directory-derived boundaries for one [`JournalCoordinator::changes_since`]
+/// page: the base LSN to guard against a concurrent reclaim, the byte offset to
+/// begin reading at, the offset to stop at (through at most `limit + 1` durable
+/// groups), and whether the in-memory directory matched the file.
+struct ChangesWindow {
+    base_lsn: u64,
+    start: u64,
+    end: u64,
+    directory_trusted: bool,
+}
+
 impl JournalCoordinator {
     /// Build a coordinator from an opened journal and its recovery scan.
     #[must_use]
@@ -1914,13 +1925,13 @@ impl JournalCoordinator {
                         self.bump_publish_signal();
                     }
                     let reclaimed = reclaimed.map(Some);
-                    let coverage = self.coverage.lock();
-                    if lease_limited {
-                        // Throttle forced checkpoints like a stall, but do not
-                        // count it or remediate pools; warn in the emergency zone
-                        // that a replay lease is holding the segment.
-                        self.record_lease_hold(&journal);
-                    } else {
+                    if !lease_limited {
+                        // A cut held back only by an active replay lease is not a
+                        // pool-coverage stall. Recording one would drive forced
+                        // checkpoints and warning logs for as long as a rebuild
+                        // pins its own window; the next reclaim after the lease
+                        // is dropped records the real outcome.
+                        let coverage = self.coverage.lock();
                         self.record_reclaim_outcome(&journal, &coverage.covered);
                     }
                     return reclaimed;
@@ -2223,6 +2234,36 @@ impl JournalCoordinator {
         cursor: &JournalCursor,
         limit: usize,
     ) -> io::Result<JournalChangesPage> {
+        self.validate_changes_request(cursor, limit)?;
+        let incarnation = self.replay_incarnation(cursor)?;
+
+        // Sample the durable high-water mark *before* reading the WAL. A group
+        // at or below it was appended and fsynced before this read, so the
+        // full-segment scan below cannot miss it. Sampling after the read could
+        // include a group appended in between that the scan never saw, letting
+        // the page report `has_more == false` with a durable group outstanding.
+        let durable_lsn = self.committed_lsn();
+
+        // Capture the directory boundary and the byte range needed for at most
+        // `limit + 1` durable groups. The extra group determines `has_more`.
+        // Holding the journal lock makes these offsets consistent with reclaim
+        // and append; the actual I/O happens after releasing it.
+        let window = self.changes_window(cursor, limit, durable_lsn)?;
+
+        // A test can force a commit after the horizon and byte range are fixed
+        // but before the WAL is read. That group belongs to a later pass.
+        #[cfg(test)]
+        if let Some(hook) = take_changes_since_before_read_hook() {
+            hook();
+        }
+
+        let scan = self.scan_changes(cursor, &window)?;
+        self.validate_changes_scan(cursor, incarnation, &window, &scan)?;
+        Ok(self.changes_page(cursor, incarnation, durable_lsn, limit, scan))
+    }
+
+    /// Validate a [`Self::changes_since`] request's cursor and page size.
+    fn validate_changes_request(&self, cursor: &JournalCursor, limit: usize) -> io::Result<()> {
         if cursor.path != self.path {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2235,7 +2276,13 @@ impl JournalCoordinator {
                 "journal changes page size must be nonzero",
             ));
         }
+        Ok(())
+    }
 
+    /// The writer incarnation a [`Self::changes_since`] cursor must match, or an
+    /// error when no publish signal is installed or the cursor is from a
+    /// previous writer.
+    fn replay_incarnation(&self, cursor: &JournalCursor) -> io::Result<u64> {
         let signal = self.publish_signal().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2249,27 +2296,95 @@ impl JournalCoordinator {
                 "journal cursor belongs to a previous writer incarnation",
             ));
         }
+        Ok(incarnation)
+    }
 
-        // Sample the durable high-water mark *before* reading the WAL. A group
-        // at or below it was appended and fsynced before this read, so the
-        // full-segment scan below cannot miss it. Sampling after the read could
-        // include a group appended in between that the scan never saw, letting
-        // the page report `has_more == false` with a durable group outstanding.
-        let durable_lsn = self.committed_lsn();
-
-        // A test can force a commit after the horizon is fixed but before the
-        // WAL is read: the group lands inside the scan yet beyond the horizon,
-        // so the page must not claim it and a later pass must return it.
-        #[cfg(test)]
-        if let Some(hook) = take_changes_since_before_read_hook() {
-            hook();
+    /// Capture the [`ChangesWindow`] for a page: the directory-derived byte
+    /// range through at most `limit + 1` durable groups, the base LSN to guard
+    /// against a concurrent reclaim, and whether the in-memory directory
+    /// matched the file.
+    fn changes_window(
+        &self,
+        cursor: &JournalCursor,
+        limit: usize,
+        durable_lsn: u64,
+    ) -> io::Result<ChangesWindow> {
+        let journal = self.journal.lock();
+        if cursor.lsn.saturating_add(1) < journal.base_lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal cursor expired at LSN {}; retained history starts at {}",
+                    cursor.lsn, journal.base_lsn
+                ),
+            ));
         }
+        let first = journal
+            .groups
+            .partition_point(|group| group.last_lsn <= cursor.lsn);
+        let start = first
+            .checked_sub(1)
+            .and_then(|index| journal.groups.get(index))
+            .map_or(FILE_HEADER_LEN as u64, |group| group.end_offset);
+        let mut durable_groups = journal
+            .groups
+            .iter()
+            .skip(first)
+            .take_while(|group| group.last_lsn <= durable_lsn);
+        let end = durable_groups
+            .by_ref()
+            .take(limit.saturating_add(1))
+            .last()
+            .map_or(start, |group| group.end_offset);
+        Ok(ChangesWindow {
+            base_lsn: journal.base_lsn,
+            start,
+            end,
+            directory_trusted: journal.directory_matches_file(),
+        })
+    }
 
-        let scan = Journal::scan_read_only(&self.path)?;
+    /// Read the segment region a [`Self::changes_since`] page needs: the bounded
+    /// tail when the directory was trustworthy, else the whole segment.
+    fn scan_changes(&self, cursor: &JournalCursor, window: &ChangesWindow) -> io::Result<Scan> {
+        if window.directory_trusted {
+            Journal::scan_read_only_range(
+                &self.path,
+                window.start,
+                window.end,
+                cursor.lsn.saturating_add(1),
+            )
+        } else {
+            Journal::scan_read_only(&self.path)
+        }
+    }
+
+    /// Re-check the writer incarnation and the reclaim guard after the WAL read,
+    /// so a restart or in-place reclaim between capture and read is not mistaken
+    /// for stable history.
+    fn validate_changes_scan(
+        &self,
+        cursor: &JournalCursor,
+        incarnation: u64,
+        window: &ChangesWindow,
+        scan: &Scan,
+    ) -> io::Result<()> {
+        let signal = self.publish_signal().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "replay requires an installed publish signal",
+            )
+        })?;
         if signal.snapshot().0 != incarnation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "journal writer restarted while reading changes",
+            ));
+        }
+        if scan.base_lsn != window.base_lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal segment was reclaimed while reading changes; retry from the cursor",
             ));
         }
         if cursor.lsn.saturating_add(1) < scan.base_lsn {
@@ -2281,7 +2396,19 @@ impl JournalCoordinator {
                 ),
             ));
         }
+        Ok(())
+    }
 
+    /// Select the durable groups after `cursor` into a page capped at `limit`,
+    /// and derive the next cursor and `has_more` from one extra group.
+    fn changes_page(
+        &self,
+        cursor: &JournalCursor,
+        incarnation: u64,
+        durable_lsn: u64,
+        limit: usize,
+        scan: Scan,
+    ) -> JournalChangesPage {
         let mut following = scan
             .groups
             .into_iter()
@@ -2289,7 +2416,7 @@ impl JournalCoordinator {
         let selected: Vec<CommittedGroup> = following.by_ref().take(limit).collect();
         let has_more = following.next().is_some();
         let through_lsn = selected.last().map_or(cursor.lsn, |group| group.last_lsn);
-        Ok(JournalChangesPage {
+        JournalChangesPage {
             groups: selected,
             next_cursor: JournalCursor {
                 path: self.path.clone(),
@@ -2299,7 +2426,7 @@ impl JournalCoordinator {
             through_lsn,
             has_more,
             horizon_lsn: durable_lsn,
-        })
+        }
     }
 
     /// Path of the journal segment used by this coordinator.
@@ -3363,6 +3490,19 @@ impl Journal {
         start: u64,
         expected_lsn: u64,
     ) -> io::Result<Scan> {
+        Self::scan_read_only_range(path, start, u64::MAX, expected_lsn)
+    }
+
+    /// Scan complete groups only through `end`, an absolute group boundary.
+    /// This keeps paged replay from reading and decoding later groups that do
+    /// not belong to the requested page.
+    #[allow(clippy::verbose_file_reads)]
+    fn scan_read_only_range(
+        path: impl AsRef<Path>,
+        start: u64,
+        end: u64,
+        expected_lsn: u64,
+    ) -> io::Result<Scan> {
         let path = path.as_ref();
         let mut file = match File::open(path) {
             Ok(file) => file,
@@ -3377,10 +3517,11 @@ impl Journal {
         let mut header = vec![0; FILE_HEADER_LEN];
         file.read_exact(&mut header)?;
         let (version, _base_sequence, base_lsn) = validate_file_header(&header)?;
-        if start >= len {
+        let scan_end = end.min(len);
+        if start >= scan_end {
             return Ok(Scan {
                 groups: Vec::new(),
-                valid_len: start.min(len),
+                valid_len: start.min(scan_end),
                 truncated_tail: false,
                 base_lsn,
                 consumed_tail: Vec::new(),
@@ -3389,7 +3530,8 @@ impl Journal {
         }
         file.seek(SeekFrom::Start(start))?;
         let mut tail = Vec::new();
-        file.read_to_end(&mut tail)?;
+        file.take(scan_end.saturating_sub(start))
+            .read_to_end(&mut tail)?;
         scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, version, || {
             read_durable_len_from_header(&header, version, len)
         })

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
+use parking_lot::{MutexGuard, RwLock};
 
 use crate::cache::{NodeCache, PinnedNodes};
 use crate::csr::Csr;
@@ -3942,9 +3942,9 @@ impl PackfileStorage {
     /// with it, so the scan yields exactly the keys [`Self::get`] would resolve
     /// at that boundary — one live record per key, never a superseded version —
     /// and excludes records appended after the boundary (the incremental path's
-    /// responsibility). If a concurrent repack swaps the generation, which can
-    /// retire the pinned shards, the scan restarts against the new generation,
-    /// mirroring `get`.
+    /// responsibility). The generation and open shard handles stay pinned for
+    /// the scan, so a concurrent repack may retire those shards without
+    /// changing the snapshot being read.
     ///
     /// When a read-committed journal overlay is installed, its committed puts
     /// are merged in and win over the durable index (matching
@@ -3966,11 +3966,11 @@ impl PackfileStorage {
         // Puts update a non-mmap index in place without replacing its
         // generation. Serialize snapshot construction with those updates so
         // every locator we resolve belongs to the captured pack-length
-        // boundary. The guard is released before the lazy iterator is
-        // returned, so draining the scan does not block later puts.
+        // boundary. Shard handles are opened before the guard is released;
+        // the full metadata scan and lazy payload reads do not block later puts.
         let put_lock = self.put_mutex(collection_id);
-        let _put_guard = put_lock.lock();
-        self.scan_collection_locked(collection_id)
+        let mut put_guard = Some(put_lock.lock());
+        self.scan_collection_locked(collection_id, &mut put_guard)
     }
 
     /// Take a collection scan paired with a durable journal cursor.
@@ -4009,7 +4009,7 @@ impl PackfileStorage {
         StorageError,
     > {
         let put_lock = self.put_mutex(collection_id);
-        let _put_guard = put_lock.lock();
+        let mut put_guard = Some(put_lock.lock());
 
         let journal = self.journal().ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
@@ -4060,15 +4060,17 @@ impl PackfileStorage {
             hook();
         }
 
-        let scan = self.scan_collection_packs_locked(collection_id)?;
+        let scan = self.scan_collection_packs_locked(collection_id, &mut put_guard)?;
         Ok((scan, cursor, lease))
     }
 
-    /// Build the pinned scan while the caller holds this collection's put
-    /// mutex. Shared by the ordinary and cursor-bearing entry points.
+    /// Build the pinned scan while the caller's collection put mutex remains
+    /// held. The shared scan helper releases it after opening the snapshot's
+    /// shard handles.
     fn scan_collection_locked(
         &self,
         collection_id: &[u8; 16],
+        put_guard: &mut Option<MutexGuard<'_, ()>>,
     ) -> Result<CollectionScan<'_>, StorageError> {
         // Snapshot the read-committed overlay once: committed-but-unflushed
         // puts, plus the per-collection delete boundary a reader's stale index
@@ -4094,7 +4096,7 @@ impl PackfileStorage {
             }
         };
 
-        self.scan_collection_with_overlay(collection_id, &overlay_puts, overlay_deletes)
+        self.scan_collection_with_overlay(collection_id, &overlay_puts, overlay_deletes, put_guard)
     }
 
     /// Snapshot only materialized pack records. The replayable scan uses this
@@ -4103,9 +4105,10 @@ impl PackfileStorage {
     fn scan_collection_packs_locked(
         &self,
         collection_id: &[u8; 16],
+        put_guard: &mut Option<MutexGuard<'_, ()>>,
     ) -> Result<CollectionScan<'_>, StorageError> {
         let overlay_puts = HashMap::new();
-        self.scan_collection_with_overlay(collection_id, &overlay_puts, false)
+        self.scan_collection_with_overlay(collection_id, &overlay_puts, false, put_guard)
     }
 
     fn scan_collection_with_overlay(
@@ -4113,87 +4116,117 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         overlay_puts: &HashMap<NodeId, NodeData>,
         overlay_deletes: bool,
+        put_guard: &mut Option<MutexGuard<'_, ()>>,
     ) -> Result<CollectionScan<'_>, StorageError> {
-        loop {
-            let gen_guard = self.generation(collection_id);
-            let shards = self.shards.all_shards();
-            let mut pinned: HashMap<u16, Arc<Shard>> = HashMap::new();
-            let mut work: Vec<ScanWork> = Vec::new();
+        let generation = self.generation(collection_id);
+        let shards = self.shards.all_shards();
 
-            // A delete visible only in the overlay means the reader's durable
-            // index may still hold pre-delete records, so it cannot be trusted
-            // for this collection; the overlay puts are the whole answer.
-            if !overlay_deletes && gen_guard.is_some() {
-                let ends: HashMap<u16, u64> = shards
-                    .iter()
-                    .map(|(slot, shard)| (*slot, shard.file_len()))
-                    .collect();
-                let mut keys: Vec<NodeId> = Vec::new();
-                let mut seen: HashSet<NodeId> = HashSet::new();
-                for (slot, shard) in &shards {
-                    let end = ends[slot];
-                    for entry in packfile::scan_packfile_iter(&shard.path, false)? {
-                        let (record_collection, hash, offset) = entry?;
-                        if record_collection != *collection_id {
-                            continue;
-                        }
-                        // The scanner streams in file order, so crossing the
-                        // captured length means every later entry is
-                        // post-boundary.
-                        if offset >= end {
-                            break;
-                        }
-                        if seen.insert(hash) {
-                            keys.push(hash);
-                        }
-                    }
+        // A delete visible only in the overlay means the reader's durable
+        // index may still hold pre-delete records, so it cannot be trusted
+        // for this collection; the overlay puts are the whole answer.
+        let scanners = if !overlay_deletes && generation.is_some() {
+            Self::open_collection_scan_shards(&shards)?
+        } else {
+            Vec::new()
+        };
+
+        // The generation, file lengths, and open file handles now pin the
+        // snapshot boundary. Releasing the collection lock here lets writers
+        // proceed while the metadata scan walks every shard; retained handles
+        // remain readable if repack unlinks a shard.
+        drop(put_guard.take());
+
+        let keys = Self::scan_collection_keys(scanners, collection_id)?;
+        let mut pinned = HashMap::new();
+        let mut work = Vec::new();
+        if let Some(generation) = generation.as_deref() {
+            Self::append_collection_locator_work(
+                keys,
+                &generation.index,
+                overlay_puts,
+                &shards,
+                &mut pinned,
+                &mut work,
+            );
+        }
+
+        // Durable keys shadowed by the overlay were skipped above, so each
+        // overlay put is appended once.
+        work.extend(
+            overlay_puts
+                .iter()
+                .map(|(id, data)| ScanWork::Data(*id, data.clone())),
+        );
+
+        Ok(CollectionScan {
+            store: self,
+            pinned,
+            pending: work.into_iter(),
+        })
+    }
+
+    fn open_collection_scan_shards(
+        shards: &[(u16, Arc<Shard>)],
+    ) -> Result<Vec<(u64, packfile::PackfileScanner)>, StorageError> {
+        shards
+            .iter()
+            .map(|(_, shard)| {
+                let file = std::fs::File::open(&shard.path)?;
+                let end = shard.file_len();
+                let scanner = packfile::scan_packfile_iter_from_file(file, false)?;
+                Ok((end, scanner))
+            })
+            .collect()
+    }
+
+    fn scan_collection_keys(
+        scanners: Vec<(u64, packfile::PackfileScanner)>,
+        collection_id: &[u8; 16],
+    ) -> Result<Vec<NodeId>, StorageError> {
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        for (end, scanner) in scanners {
+            for entry in scanner {
+                let (record_collection, hash, offset) = entry?;
+                if record_collection != *collection_id {
+                    continue;
                 }
-                let index = gen_guard.as_deref().map(|generation| &generation.index);
-                for id in keys {
-                    if overlay_puts.contains_key(&id) {
-                        // The overlay value is newer than the durable one.
-                        continue;
-                    }
-                    let candidates: Vec<(u16, u64)> =
-                        index.map_or_else(Vec::new, |index| index.lookup_all(&id).collect());
-                    if candidates.is_empty() {
-                        continue;
-                    }
-                    for &(slot, _) in &candidates {
-                        if let Some((_, shard)) = shards.iter().find(|(s, _)| *s == slot) {
-                            pinned.entry(slot).or_insert_with(|| Arc::clone(shard));
-                        }
-                    }
-                    work.push(ScanWork::Locators(id, candidates));
+                // The scanner streams in file order, so crossing the captured
+                // length means every later entry is post-boundary.
+                if offset >= end {
+                    break;
+                }
+                if seen.insert(hash) {
+                    keys.push(hash);
                 }
             }
+        }
+        Ok(keys)
+    }
 
-            // Retry if a repack swapped the generation between the pin and the
-            // walk, exactly as `get` does: the pinned shards may be retired.
-            let still_current = match gen_guard.as_ref() {
-                Some(loaded) => {
-                    let current = self.generation(collection_id);
-                    Self::same_generation(current.as_ref(), loaded)
-                }
-                None => true,
-            };
-            if !still_current {
+    fn append_collection_locator_work(
+        keys: Vec<NodeId>,
+        index: &LossyIndex,
+        overlay_puts: &HashMap<NodeId, NodeData>,
+        shards: &[(u16, Arc<Shard>)],
+        pinned: &mut HashMap<u16, Arc<Shard>>,
+        work: &mut Vec<ScanWork>,
+    ) {
+        for id in keys {
+            if overlay_puts.contains_key(&id) {
+                // The overlay value is newer than the durable one.
                 continue;
             }
-
-            // Durable keys shadowed by the overlay were skipped above, so each
-            // overlay put is appended once.
-            work.extend(
-                overlay_puts
-                    .iter()
-                    .map(|(id, data)| ScanWork::Data(*id, data.clone())),
-            );
-
-            return Ok(CollectionScan {
-                store: self,
-                pinned,
-                pending: work.into_iter(),
-            });
+            let candidates: Vec<(u16, u64)> = index.lookup_all(&id).collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            for &(slot, _) in &candidates {
+                if let Some((_, shard)) = shards.iter().find(|(s, _)| *s == slot) {
+                    pinned.entry(slot).or_insert_with(|| Arc::clone(shard));
+                }
+            }
+            work.push(ScanWork::Locators(id, candidates));
         }
     }
 

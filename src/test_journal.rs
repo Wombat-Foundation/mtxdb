@@ -8,11 +8,42 @@ use std::fs;
 use std::io::Write as _;
 #[cfg(feature = "multi-reader")]
 use std::path::Path;
-#[cfg(feature = "multi-reader")]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+static REPLAY_TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct ReplayTestDir(PathBuf);
+
+impl ReplayTestDir {
+    fn new(label: &str) -> Self {
+        loop {
+            let id = REPLAY_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mtxdb_replay_{label}_{}_{}",
+                std::process::id(),
+                id
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("create replay test directory: {error}"),
+            }
+        }
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.0.join("journal.wal")
+    }
+}
+
+impl Drop for ReplayTestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn temp_path(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -1968,15 +1999,17 @@ fn open_arc(label: &str) -> Arc<JournalCoordinator> {
     Arc::new(JournalCoordinator::new(journal, &scan))
 }
 
-fn open_replay_arc(label: &str) -> Arc<JournalCoordinator> {
-    let coordinator = open_arc(label);
+fn open_replay_arc(dir: &ReplayTestDir) -> Arc<JournalCoordinator> {
+    let (journal, scan) = Journal::open(dir.journal_path()).unwrap();
+    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
     coordinator.enable_publish_signal().unwrap();
     coordinator
 }
 
 #[test]
 fn changes_since_pages_complete_groups_in_order() {
-    let coordinator = open_replay_arc("changes_since_pages");
+    let dir = ReplayTestDir::new("changes_since_pages");
+    let coordinator = open_replay_arc(&dir);
     let first = coordinator
         .publish_group(&[Mutation::Put {
             collection_id: [1; 16],
@@ -2008,7 +2041,8 @@ fn changes_since_pages_complete_groups_in_order() {
 
 #[test]
 fn changes_since_does_not_publish_visible_but_undurable_groups() {
-    let coordinator = open_replay_arc("changes_since_undurable");
+    let dir = ReplayTestDir::new("changes_since_undurable");
+    let coordinator = open_replay_arc(&dir);
     coordinator
         .publish_group(&[Mutation::Put {
             collection_id: [1; 16],
@@ -2029,7 +2063,8 @@ fn changes_since_does_not_publish_visible_but_undurable_groups() {
 
 #[test]
 fn changes_since_reports_cursor_expired_after_reclaim() {
-    let coordinator = open_replay_arc("changes_since_expired");
+    let dir = ReplayTestDir::new("changes_since_expired");
+    let coordinator = open_replay_arc(&dir);
     let receipt = coordinator
         .publish_group(&[Mutation::Put {
             collection_id: [1; 16],
@@ -2047,7 +2082,8 @@ fn changes_since_reports_cursor_expired_after_reclaim() {
 
 #[test]
 fn replay_lease_pins_the_original_cursor_until_drop() {
-    let coordinator = open_replay_arc("changes_since_lease");
+    let dir = ReplayTestDir::new("changes_since_lease");
+    let coordinator = open_replay_arc(&dir);
     let first = coordinator
         .publish_group(&[put(1, 1, b"snapshot")])
         .unwrap();
@@ -2075,8 +2111,8 @@ fn replay_lease_pins_the_original_cursor_until_drop() {
 fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
     use crate::layout::ShardType;
 
-    let path = temp_path("shared_replay_lease");
-    let _ = fs::remove_file(&path);
+    let dir = ReplayTestDir::new("shared_replay_lease");
+    let path = dir.journal_path();
     let (journal, scan) = Journal::open_shared(&path).unwrap();
     let coordinator = JournalCoordinator::new(journal, &scan);
     coordinator.enable_publish_signal().unwrap();
@@ -2104,7 +2140,6 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
     coordinator.reclaim_shared().unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    let _ = fs::remove_file(path);
 }
 
 /// A reclaim the lease alone holds back is not a pool-coverage stall: it must
@@ -2114,8 +2149,8 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
 fn lease_limited_shared_reclaim_is_not_recorded_as_a_stall() {
     use crate::layout::ShardType;
 
-    let path = temp_path("shared_replay_lease_stall");
-    let _ = fs::remove_file(&path);
+    let dir = ReplayTestDir::new("shared_replay_lease_stall");
+    let path = dir.journal_path();
     let (journal, scan) = Journal::open_shared(&path).unwrap();
     let coordinator = JournalCoordinator::new(journal, &scan);
     coordinator.enable_publish_signal().unwrap();
@@ -2153,12 +2188,12 @@ fn lease_limited_shared_reclaim_is_not_recorded_as_a_stall() {
         1,
         "without the lease the lease-free outcome is recorded"
     );
-    let _ = fs::remove_file(path);
 }
 
 #[test]
 fn changes_since_rejects_a_cursor_from_a_previous_writer_incarnation() {
-    let coordinator = open_replay_arc("changes_since_restart");
+    let dir = ReplayTestDir::new("changes_since_restart");
+    let coordinator = open_replay_arc(&dir);
     let path = coordinator.path();
     coordinator
         .publish_group(&[Mutation::Put {
@@ -2183,7 +2218,8 @@ fn changes_since_rejects_a_cursor_from_a_previous_writer_incarnation() {
 /// claim it, and a later pass must return it.
 #[test]
 fn changes_since_does_not_claim_a_commit_beyond_its_horizon() {
-    let coordinator = open_replay_arc("changes_since_horizon_window");
+    let dir = ReplayTestDir::new("changes_since_horizon_window");
+    let coordinator = open_replay_arc(&dir);
     let first = coordinator
         .publish_group(&[Mutation::Put {
             collection_id: [1; 16],

@@ -448,6 +448,16 @@ pub struct PackfileScanner {
 /// be read.
 pub fn scan_packfile_iter(path: &Path, verify_payload: bool) -> io::Result<PackfileScanner> {
     let file = File::open(path)?;
+    scan_packfile_iter_from_file(file, verify_payload)
+}
+
+/// Build a scanner from an already-open shard handle. Collection snapshots
+/// open each shard while holding the collection lock, then perform the
+/// potentially long scan after releasing that lock.
+pub(crate) fn scan_packfile_iter_from_file(
+    file: File,
+    verify_payload: bool,
+) -> io::Result<PackfileScanner> {
     let file_end = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let done = read_header(&mut reader)?.is_none();
