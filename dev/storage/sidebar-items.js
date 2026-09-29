@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["DigestAlgorithm","DigestHasher","NodeRef","StorageError"],"fn":["content_digest"],"struct":["InMemoryStorage","NodeData"],"trait":["StorageEngine"],"type":["Digest32","NodeId"]};

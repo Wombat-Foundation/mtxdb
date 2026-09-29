@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["EventIdPolicy","MatrixRoomVersion","RedactionPolicy","ReferenceHashEncoding","ReferenceHashInputPolicy","RoomIdPolicy","StateResolutionPolicy","ValidationProfile"],"struct":["RoomMetadata"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["MAX_TXN_STAGE_BYTES"],"enum":["Mutation"],"struct":["CommitReceipt","CommittedGroup","DurabilityStats","DurabilityToken","DurableWaitLatency","GroupCommitConfig","GroupDirectoryStats","Journal","JournalCoordinator","JournalEntry","JournalSyncTimings","Reclaim","Scan"]};

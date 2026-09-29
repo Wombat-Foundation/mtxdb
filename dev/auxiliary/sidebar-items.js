@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["auxiliary_collection_id","auxiliary_key_digest"],"struct":["AuxiliaryIndex"],"type":["AuxiliaryKeyDigest"]};
