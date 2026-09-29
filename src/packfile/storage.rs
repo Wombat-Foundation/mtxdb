@@ -10282,7 +10282,19 @@ impl PackfileStorage {
                 self.delta_log_cap()
             );
         }
+        // Shared-WAL reclaim must anchor collection logical versions in the
+        // checkpoint itself. A delta-only coverage claim currently carries
+        // index redo but not the version table, so using it here could reclaim
+        // the only WAL copy of a collection's latest version. Until version
+        // tables are included in delta batches, require the full checkpoint
+        // path whenever shared-WAL version tracking is enabled.
+        #[cfg(feature = "multi-reader")]
+        let checkpoint_versions_require_anchor =
+            pool_from_tag(self.journal_pool.load(Ordering::Acquire)).is_some();
+        #[cfg(not(feature = "multi-reader"))]
+        let checkpoint_versions_require_anchor = false;
         if journal_needs_reclaim
+            && !checkpoint_versions_require_anchor
             && !rotating
             && self.delta_base_is_usable()
             && self.packs_match_checkpoint_table()

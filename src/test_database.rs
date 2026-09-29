@@ -1707,13 +1707,13 @@ fn a_checkpoint_does_not_claim_an_unmaterialized_transaction() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Two pools carry frames and each advances its coverage by a delta batch,
-/// never a full checkpoint. The shared segment is reclaimed only once both
-/// have reported: after the first pool's step the second still holds it,
-/// and after the second's the reclaimed segment holds no covered group.
+/// Shared-WAL coverage advances only after each pool writes the checkpoint
+/// version table. The shared segment is reclaimed only once both have
+/// reported: after the first pool's step the second still holds it, and after
+/// the second's the reclaimed segment holds no covered group.
 #[cfg(feature = "multi-reader")]
 #[test]
-fn shared_reclaim_waits_for_every_pools_delta_coverage_batch() {
+fn shared_reclaim_waits_for_every_pools_version_checkpoint() {
     let (db, root) = small_segment_database("shared_delta_coverage");
     let pools = [ShardType::State, ShardType::EventDag];
     let coordinator = db.coordinator();
@@ -1731,10 +1731,9 @@ fn shared_reclaim_waits_for_every_pools_delta_coverage_batch() {
     db.pool(ShardType::EventDag).sync_all().unwrap();
     let timings = db.pool(ShardType::EventDag).sync_timings().unwrap();
     assert!(
-        timings.checkpoint.is_zero(),
-        "EventDag must advance by a delta batch"
+        !timings.checkpoint.is_zero(),
+        "EventDag coverage must anchor its logical-version table"
     );
-    assert!(!timings.delta_log.is_zero());
     assert_eq!(
         coordinator.segment_len(),
         before,
@@ -1745,8 +1744,8 @@ fn shared_reclaim_waits_for_every_pools_delta_coverage_batch() {
     db.pool(ShardType::State).sync_all().unwrap();
     let timings = db.pool(ShardType::State).sync_timings().unwrap();
     assert!(
-        timings.checkpoint.is_zero(),
-        "State must advance by a delta batch"
+        !timings.checkpoint.is_zero(),
+        "State coverage must anchor its logical-version table"
     );
     assert!(
         coordinator.segment_len() < before,
