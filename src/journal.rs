@@ -1402,6 +1402,31 @@ pub struct JournalChangesPage {
     pub through_lsn: u64,
     /// Whether another currently durable group follows this page.
     pub has_more: bool,
+    /// Durable high-water mark sampled *before* the WAL read. Every durable
+    /// group at or below it is represented by this page's scan, so a caller
+    /// can tell exactly which replay horizon the page covers. `has_more`
+    /// refers to this horizon, not to groups that become durable later.
+    pub horizon_lsn: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A one-shot hook run inside [`JournalCoordinator::changes_since`] after
+    /// the durable horizon is sampled but before the WAL is read, so a test can
+    /// force a commit that lands inside the scan yet beyond the fixed horizon.
+    static CHANGES_SINCE_BEFORE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Install the [`CHANGES_SINCE_BEFORE_READ`] hook for the current thread.
+#[cfg(test)]
+pub(crate) fn set_changes_since_before_read_hook(hook: impl FnOnce() + 'static) {
+    CHANGES_SINCE_BEFORE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn take_changes_since_before_read_hook() -> Option<Box<dyn FnOnce()>> {
+    CHANGES_SINCE_BEFORE_READ.with(std::cell::RefCell::take)
 }
 
 struct BackgroundCommitter {
@@ -2050,7 +2075,11 @@ impl JournalCoordinator {
 
     /// Read a bounded page of complete, durable groups after `cursor`.
     ///
-    /// Pages preserve group boundaries and journal order. Reclaim is allowed
+    /// Pages preserve group boundaries and journal order. The durable horizon
+    /// is sampled before the segment is read and returned as
+    /// [`JournalChangesPage::horizon_lsn`]: `has_more` and the returned groups
+    /// are complete with respect to that horizon, so a group that becomes
+    /// durable after the sample is never silently skipped. Reclaim is allowed
     /// to remove history; if it has advanced past the cursor, this returns an
     /// `InvalidData` error so the caller can discard its partial rebuild and
     /// take a fresh snapshot. This method does not retain a lease across page
@@ -2092,6 +2121,21 @@ impl JournalCoordinator {
             ));
         }
 
+        // Sample the durable high-water mark *before* reading the WAL. A group
+        // at or below it was appended and fsynced before this read, so the
+        // full-segment scan below cannot miss it. Sampling after the read could
+        // include a group appended in between that the scan never saw, letting
+        // the page report `has_more == false` with a durable group outstanding.
+        let durable_lsn = self.committed_lsn();
+
+        // A test can force a commit after the horizon is fixed but before the
+        // WAL is read: the group lands inside the scan yet beyond the horizon,
+        // so the page must not claim it and a later pass must return it.
+        #[cfg(test)]
+        if let Some(hook) = take_changes_since_before_read_hook() {
+            hook();
+        }
+
         let scan = Journal::scan_read_only(&self.path)?;
         if signal.snapshot().0 != incarnation {
             return Err(io::Error::new(
@@ -2109,7 +2153,6 @@ impl JournalCoordinator {
             ));
         }
 
-        let durable_lsn = self.committed_lsn();
         let mut following = scan
             .groups
             .into_iter()
@@ -2126,6 +2169,7 @@ impl JournalCoordinator {
             },
             through_lsn,
             has_more,
+            horizon_lsn: durable_lsn,
         })
     }
 

@@ -1,5 +1,6 @@
 use super::{
-    BackgroundFailure, BackgroundState, GroupCommitConfig, Journal, JournalCoordinator, Mutation,
+    set_changes_since_before_read_hook, BackgroundFailure, BackgroundState, GroupCommitConfig,
+    Journal, JournalCoordinator, Mutation,
 };
 #[cfg(feature = "multi-reader")]
 use super::{TxnStage, TxnStageState};
@@ -2064,6 +2065,57 @@ fn changes_since_rejects_a_cursor_from_a_previous_writer_incarnation() {
     reopened.enable_publish_signal().unwrap();
     let error = reopened.changes_since(&cursor, 10).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// A commit that lands after the durable horizon is fixed but before the WAL is
+/// read is inside the scan yet beyond the page's horizon. The page must not
+/// claim it, and a later pass must return it.
+#[test]
+fn changes_since_does_not_claim_a_commit_beyond_its_horizon() {
+    let coordinator = open_replay_arc("changes_since_horizon_window");
+    let first = coordinator
+        .publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [1; 16],
+            payload: b"one".to_vec(),
+        }])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(0).unwrap();
+
+    let late = Arc::clone(&coordinator);
+    set_changes_since_before_read_hook(move || {
+        late.publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [2; 16],
+            payload: b"two".to_vec(),
+        }])
+        .unwrap();
+        late.sync().unwrap();
+    });
+
+    let page = coordinator.changes_since(&cursor, 10).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, first.last_lsn);
+    assert_eq!(page.horizon_lsn, first.last_lsn);
+    assert!(!page.has_more);
+    assert_eq!(page.next_cursor.lsn(), first.last_lsn);
+    // The late group is durable now, but lies beyond the fixed horizon.
+    assert!(
+        page.horizon_lsn < coordinator.committed_lsn(),
+        "the late group must lie beyond the page's horizon"
+    );
+    assert!(
+        page.groups
+            .iter()
+            .all(|group| group.last_lsn <= page.horizon_lsn),
+        "a page must never return a group beyond its claimed horizon"
+    );
+
+    let next = coordinator.changes_since(&page.next_cursor, 10).unwrap();
+    assert_eq!(next.groups.len(), 1);
+    assert_eq!(next.groups[0].last_lsn, coordinator.committed_lsn());
+    assert!(next.horizon_lsn >= next.groups[0].last_lsn);
 }
 
 fn wait_until(mut condition: impl FnMut() -> bool, label: &str) {
