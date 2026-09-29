@@ -1914,13 +1914,13 @@ impl JournalCoordinator {
                         self.bump_publish_signal();
                     }
                     let reclaimed = reclaimed.map(Some);
-                    if !lease_limited {
-                        // A cut held back only by an active replay lease is not a
-                        // pool-coverage stall. Recording one would drive forced
-                        // checkpoints and warning logs for as long as a rebuild
-                        // pins its own window; the next reclaim after the lease
-                        // is dropped records the real outcome.
-                        let coverage = self.coverage.lock();
+                    let coverage = self.coverage.lock();
+                    if lease_limited {
+                        // Throttle forced checkpoints like a stall, but do not
+                        // count it or remediate pools; warn in the emergency zone
+                        // that a replay lease is holding the segment.
+                        self.record_lease_hold(&journal);
+                    } else {
                         self.record_reclaim_outcome(&journal, &coverage.covered);
                     }
                     return reclaimed;
