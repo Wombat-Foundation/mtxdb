@@ -10,7 +10,7 @@
 //! Set `MTXDB_BENCH_ROOT` to place scratch files on a chosen device.
 //!
 //! Knobs: `MTXDB_RP_WRITERS_PER_POOL` (default 1), `MTXDB_RP_READERS` (2),
-//! `MTXDB_RP_WRITES` per pool (500), `MTXDB_RP_BATCH` (32), `MTXDB_RP_PAGE`
+//! `MTXDB_RP_WRITES` per pool (5000), `MTXDB_RP_BATCH` (32), `MTXDB_RP_PAGE`
 //! (64), `MTXDB_RP_SEED_GROUPS_PER_POOL` (1000), and `MTXDB_RP_PAYLOAD` (128).
 #![allow(
     clippy::arithmetic_side_effects,
@@ -85,7 +85,7 @@ fn per_second(count: u128, duration: Duration) -> u128 {
     count.saturating_mul(1_000_000_000) / duration.as_nanos().max(1)
 }
 
-fn setup(label: &str, seed_groups: usize, payload_size: usize) -> BenchDb {
+fn setup(label: &str, seed_groups: usize, payload_size: usize, checkpoint_seed: bool) -> BenchDb {
     let parent =
         std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     fs::create_dir_all(&parent).expect("create benchmark root");
@@ -131,8 +131,18 @@ fn setup(label: &str, seed_groups: usize, payload_size: usize) -> BenchDb {
                 .expect("seed pack and journal");
         }
     }
-    for store in &stores {
-        store.sync_all().expect("sync seeded pool");
+    if checkpoint_seed {
+        for store in &stores {
+            store.sync_all().expect("sync seeded pool");
+        }
+    } else {
+        // Flush pack bytes and make the WAL durable without writing checkpoint
+        // coverage. The fallback arm takes a cursor next, then checkpoints
+        // under its lease so reclaim can advance exactly through that cursor.
+        for store in &stores {
+            store.flush_all().expect("flush seeded pack pool");
+        }
+        journal.sync().expect("sync seeded journal");
     }
     BenchDb {
         stores,
@@ -145,12 +155,12 @@ fn setup(label: &str, seed_groups: usize, payload_size: usize) -> BenchDb {
 fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
     let writers_per_pool = env_usize("MTXDB_RP_WRITERS_PER_POOL", 1);
     let readers = env_usize("MTXDB_RP_READERS", 2);
-    let writes = env_usize("MTXDB_RP_WRITES", 500);
+    let writes = env_usize("MTXDB_RP_WRITES", 5_000);
     let batch = env_usize("MTXDB_RP_BATCH", 32);
     let page_size = env_usize("MTXDB_RP_PAGE", 64);
     let seed_groups = env_usize("MTXDB_RP_SEED_GROUPS_PER_POOL", 1_000);
     let payload_size = env_usize("MTXDB_RP_PAYLOAD", 128);
-    let db = setup(label, seed_groups, payload_size);
+    let db = setup(label, seed_groups, payload_size, true);
 
     // Capture all eight collections together; the resulting cursor is the
     // common replay start for every reader thread.
@@ -282,7 +292,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                 } else if done.load(Ordering::Acquire) == worker_count {
                     break;
                 } else {
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::yield_now();
                 }
             }
             latencies
@@ -389,23 +399,43 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Force a cursor-offset fallback in an isolated database: reclaim through a
-/// snapshot cursor, append a small durable suffix, then page using the stale
-/// byte offset while retaining a valid LSN boundary.
+/// Force a cursor-offset fallback in an isolated database: report coverage
+/// through the group before the cursor, reclaim that prefix, append one durable
+/// group, then page from the cursor's stale offset at a still-valid LSN.
 fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     let payload_size = env_usize("MTXDB_RP_PAYLOAD", 128);
-    let db = setup("forced_fallback", 128, payload_size);
+    let seed_groups = env_usize("MTXDB_RP_FALLBACK_SEED_GROUPS", 4_096);
+    let db = setup("forced_fallback", seed_groups, payload_size, false);
     let (scans, cursor, lease) = db.stores[3]
         .scan_collections_at_snapshot(&db.collections)
         .expect("take fallback-arm snapshot");
     drop(scans);
-    drop(lease);
 
-    let reclaimed = db.journal.reclaim_shared()?;
-    if reclaimed.is_none() {
-        println!("case=forced_fallback skipped=no_reclaimable_seed_prefix");
-        return Ok(());
+    let covered_lsn = cursor
+        .lsn()
+        .checked_sub(1)
+        .ok_or("fallback benchmark needs a nonzero cursor LSN")?;
+    for pool in POOLS {
+        db.journal.report_pool_coverage(pool, covered_lsn);
     }
+    let reclaimed = db
+        .journal
+        .reclaim_shared()?
+        .ok_or("fallback benchmark failed to reclaim the covered seed prefix")?;
+    if reclaimed.reclaimed_bytes == 0 {
+        return Err("fallback benchmark reclaim removed no WAL bytes".into());
+    }
+    let retained = Journal::scan_read_only(db.journal.path())?;
+    if retained.base_lsn != cursor.lsn() {
+        return Err(format!(
+            "expected reclaim base {} to preserve cursor {}, got {}",
+            cursor.lsn(),
+            cursor.lsn(),
+            retained.base_lsn
+        )
+        .into());
+    }
+    drop(lease);
 
     db.stores[3].put(
         &db.collections[0],
@@ -419,13 +449,21 @@ fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     let page = db.journal.changes_since(&cursor, 16)?;
     let elapsed = started.elapsed();
     let after = db.journal.replay_page_stats();
+    let full_scan_fallbacks = after
+        .full_scan_fallbacks
+        .saturating_sub(before.full_scan_fallbacks);
+    if full_scan_fallbacks != 1 || page.groups.len() != 1 {
+        return Err(format!(
+            "expected one reclaimed-offset full-scan fallback returning one group; got fallbacks={full_scan_fallbacks}, groups={}",
+            page.groups.len()
+        )
+        .into());
+    }
     println!(
         "case=forced_fallback groups={} latency_ms={:.3} full_scan_fallbacks={} resumed_pages={}",
         page.groups.len(),
         elapsed.as_secs_f64() * 1e3,
-        after
-            .full_scan_fallbacks
-            .saturating_sub(before.full_scan_fallbacks),
+        full_scan_fallbacks,
         after.resumed_pages.saturating_sub(before.resumed_pages)
     );
     Ok(())
