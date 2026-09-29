@@ -756,3 +756,25 @@ fn validate_identity_collision_and_namespace_rejection() {
 fn derive_collection_id_panics_on_unknown_namespace() {
     let _ = derive_collection_id(Some(*b"EDGE"), b"!room:example.com");
 }
+
+#[test]
+fn namespace_bias_constants_match_blake3() {
+    for (namespace, bias) in [
+        (b"EVNT", NAMESPACE_BIAS_EVNT),
+        (b"PREV", NAMESPACE_BIAS_PREV),
+        (b"AUTH", NAMESPACE_BIAS_AUTH),
+        (b"STAT", NAMESPACE_BIAS_STAT),
+        (b"FWD ", NAMESPACE_BIAS_FWD),
+        (b"INTL", NAMESPACE_BIAS_INTL),
+    ] {
+        let mut input = Vec::from(&b"mtxdb/namespace/v1/"[..]);
+        input.extend_from_slice(namespace);
+        assert_eq!(
+            *blake3::hash(&input).as_bytes(),
+            bias,
+            "bias for {:?}",
+            core::str::from_utf8(namespace)
+        );
+        assert_eq!(namespace_bias(*namespace), Some(bias));
+    }
+}

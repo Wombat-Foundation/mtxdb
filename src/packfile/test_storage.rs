@@ -550,10 +550,7 @@ fn read_committed_gap_without_checkpoint_is_retryable() {
         .get_read_committed(&collection, &[node])
         .expect_err("the unrecoverable gap must fail");
     assert!(
-        matches!(
-            error,
-            StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock
-        ),
+        error.is_would_block(),
         "a missing checkpoint must be reported as retryable, got {error:?}"
     );
 }

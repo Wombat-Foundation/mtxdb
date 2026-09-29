@@ -1,6 +1,6 @@
 use super::{
-    set_changes_since_before_read_hook, BackgroundFailure, BackgroundState, GroupCommitConfig,
-    Journal, JournalCoordinator, Mutation,
+    set_changes_since_before_read_hook, set_changes_since_force_untrusted, BackgroundFailure,
+    BackgroundState, GroupCommitConfig, Journal, JournalCoordinator, Mutation,
 };
 #[cfg(feature = "multi-reader")]
 use super::{TxnStage, TxnStageState};
@@ -2039,6 +2039,48 @@ fn changes_since_pages_complete_groups_in_order() {
     assert_eq!(page_two.through_lsn, second.last_lsn);
 }
 
+/// Without a trustworthy directory, `changes_since` must still page by resuming
+/// from the cursor's own byte offset rather than rescanning the prefix.
+#[test]
+fn changes_since_resumes_incrementally_without_a_directory() {
+    let dir = ReplayTestDir::new("changes_since_incremental");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [1; 16],
+            payload: b"one".to_vec(),
+        }])
+        .unwrap();
+    let second = coordinator
+        .publish_group(&[Mutation::Put {
+            collection_id: [1; 16],
+            node_id: [2; 16],
+            payload: b"two".to_vec(),
+        }])
+        .unwrap();
+    coordinator.sync().unwrap();
+
+    let start = coordinator.replay_cursor(0).unwrap();
+    set_changes_since_force_untrusted(true);
+
+    let page_one = coordinator.changes_since(&start, 1).unwrap();
+    assert_eq!(page_one.groups.len(), 1);
+    assert_eq!(page_one.groups[0].last_lsn, first.last_lsn);
+    assert!(page_one.has_more);
+    assert!(
+        page_one.next_cursor.resume_offset > start.resume_offset,
+        "the next page resumes past the group it already returned"
+    );
+
+    let page_two = coordinator.changes_since(&page_one.next_cursor, 1).unwrap();
+    assert_eq!(page_two.groups.len(), 1);
+    assert_eq!(page_two.groups[0].last_lsn, second.last_lsn);
+    assert!(!page_two.has_more);
+
+    set_changes_since_force_untrusted(false);
+}
+
 #[test]
 fn changes_since_does_not_publish_visible_but_undurable_groups() {
     let dir = ReplayTestDir::new("changes_since_undurable");
@@ -2101,6 +2143,60 @@ fn replay_lease_pins_the_original_cursor_until_drop() {
     assert!(!page.has_more);
     drop(lease);
 
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// Advancing a lease past a page it has durably applied lets reclaim pass that
+/// page, so a long rebuild does not pin the whole retained WAL.
+#[test]
+fn replay_lease_advance_lets_reclaim_pass_consumed_pages() {
+    let dir = ReplayTestDir::new("changes_since_lease_advance");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+
+    // Un-advanced, the lease holds the cut at the snapshot LSN, so the page is
+    // still readable.
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+
+    // Once the page is applied, advancing the floor releases the snapshot.
+    lease.advance(page.through_lsn);
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// A stale or out-of-order `advance` must never lower the floor.
+#[test]
+fn replay_lease_advance_is_monotonic() {
+    let dir = ReplayTestDir::new("changes_since_lease_monotonic");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    lease.advance(second.last_lsn);
+    lease.advance(first.last_lsn);
+
+    // The floor stays at `second`, so reclaim may drop the snapshot and expire
+    // the cursor. A lowered floor would clamp the cut to `first` and keep the
+    // page readable.
     coordinator.reclaim_through(second.last_lsn).unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

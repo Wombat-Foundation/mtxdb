@@ -2205,10 +2205,9 @@ impl ShardPool {
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
             let Some(mapping) = guard.as_ref().cloned() else {
-                return Err(StorageError::Io(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "shard could not be mapped",
-                )));
+                return Err(StorageError::Unsupported(
+                    "shard could not be mapped".to_owned(),
+                ));
             };
             drop(guard);
             let mem = mapping.as_ref();
@@ -2320,10 +2319,9 @@ impl ShardPool {
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
             let Some(mapping) = guard.as_ref().cloned() else {
-                return Err(StorageError::Io(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "shard could not be mapped",
-                )));
+                return Err(StorageError::Unsupported(
+                    "shard could not be mapped".to_owned(),
+                ));
             };
             drop(guard);
             let mem = mapping.as_ref();
@@ -2415,10 +2413,9 @@ impl ShardPool {
         for attempt in 0..2 {
             let guard = shard.mmap().map_err(StorageError::Io)?;
             let Some(mapping) = guard.as_ref().cloned() else {
-                return Err(StorageError::Io(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "shard could not be mapped",
-                )));
+                return Err(StorageError::Unsupported(
+                    "shard could not be mapped".to_owned(),
+                ));
             };
             drop(guard);
             let mem = mapping.as_ref();

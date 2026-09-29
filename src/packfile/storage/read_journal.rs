@@ -851,10 +851,10 @@ impl PackfileStorage {
         }
         let advanced = self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts;
         if reload_failed || advanced {
-            Err(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "read-committed reload failed or checkpoint coverage advanced; retry the read",
-            )))
+            Err(StorageError::WouldBlock(
+                "read-committed reload failed or checkpoint coverage advanced; retry the read"
+                    .to_owned(),
+            ))
         } else {
             Err(StorageError::Corrupt(
                 "read-committed journal segment skips LSNs not covered by the loaded checkpoint"

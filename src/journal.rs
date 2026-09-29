@@ -1388,6 +1388,12 @@ pub struct JournalCursor {
     path: PathBuf,
     incarnation: u64,
     lsn: u64,
+    /// Absolute file offset of the first byte after the group at `lsn`, so the
+    /// next [`JournalCoordinator::changes_since`] page reads only the appended
+    /// tail instead of rescanning the retained prefix. A reclaim rewrite moves
+    /// the surviving groups, invalidating this hint; the read detects that and
+    /// rebuilds from the file header.
+    resume_offset: u64,
 }
 
 impl JournalCursor {
@@ -1401,13 +1407,32 @@ impl JournalCursor {
 /// RAII pin that prevents journal reclaim from passing a replay cursor.
 ///
 /// Keep this value alive while consuming pages from the cursor. Dropping it
-/// releases the retained-history guarantee; it deliberately pins the original
-/// cursor rather than advancing with individual pages, so an interrupted or
-/// partially applied replay can safely resume from its starting snapshot.
+/// releases the retained-history guarantee. Until [`Self::advance`] is called
+/// it pins the original cursor rather than advancing with individual pages, so
+/// an interrupted or partially applied replay can safely resume from its
+/// starting snapshot.
 #[must_use = "dropping the replay lease allows journal reclaim to expire its cursor"]
 pub struct JournalReplayLease {
     registry: Arc<ReplayLeaseRegistry>,
     id: u64,
+}
+
+impl JournalReplayLease {
+    /// Raise this lease's floor to `through_lsn`, letting reclaim pass every
+    /// group at or below it.
+    ///
+    /// Call this once the page through `through_lsn` has been durably applied:
+    /// the history below it is then no longer needed, so a long rebuild does not
+    /// pin the whole retained WAL. Advancing gives up the ability to resume from
+    /// the original snapshot, so only advance past pages that are safely
+    /// persisted. The floor is monotonic: a stale or out-of-order call can never
+    /// lower it.
+    pub fn advance(&self, through_lsn: u64) {
+        let mut pins = self.registry.pins.lock();
+        if let Some(pin) = pins.get_mut(&self.id) {
+            *pin = (*pin).max(through_lsn);
+        }
+    }
 }
 
 impl Drop for JournalReplayLease {
@@ -1459,6 +1484,32 @@ pub(crate) fn set_changes_since_before_read_hook(hook: impl FnOnce() + 'static) 
 #[cfg(test)]
 fn take_changes_since_before_read_hook() -> Option<Box<dyn FnOnce()>> {
     CHANGES_SINCE_BEFORE_READ.with(std::cell::RefCell::take)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set, [`JournalCoordinator::changes_since`] treats the in-memory
+    /// group directory as untrusted, so a test can exercise the incremental
+    /// resume path that has no directory cap.
+    static CHANGES_SINCE_FORCE_UNTRUSTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Force [`JournalCoordinator::changes_since`] to distrust the directory on the
+/// current thread. Used by tests of the incremental resume path.
+#[cfg(test)]
+pub(crate) fn set_changes_since_force_untrusted(force: bool) {
+    CHANGES_SINCE_FORCE_UNTRUSTED.with(|cell| cell.set(force));
+}
+
+#[cfg(test)]
+fn changes_since_force_untrusted() -> bool {
+    CHANGES_SINCE_FORCE_UNTRUSTED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn changes_since_force_untrusted() -> bool {
+    false
 }
 
 struct BackgroundCommitter {
@@ -1678,11 +1729,11 @@ pub struct JournalCoordinator {
 
 /// Directory-derived boundaries for one [`JournalCoordinator::changes_since`]
 /// page: the base LSN to guard against a concurrent reclaim, the byte offset to
-/// begin reading at, the offset to stop at (through at most `limit + 1` durable
-/// groups), and whether the in-memory directory matched the file.
+/// stop reading at (through at most `limit + 1` durable groups), and whether the
+/// in-memory directory matched the file. The read starts at the cursor's own
+/// resume offset, so the directory is only needed to cap the read.
 struct ChangesWindow {
     base_lsn: u64,
-    start: u64,
     end: u64,
     directory_trusted: bool,
 }
@@ -2133,10 +2184,12 @@ impl JournalCoordinator {
                 "replay cursors require an installed publish signal",
             )
         })?;
+        let resume_offset = self.journal.lock().resume_offset_for(lsn);
         Ok(JournalCursor {
             path: self.path.clone(),
             incarnation: signal.snapshot().0,
             lsn,
+            resume_offset,
         })
     }
 
@@ -2238,13 +2291,13 @@ impl JournalCoordinator {
         let incarnation = self.replay_incarnation(cursor)?;
 
         // Sample the durable high-water mark *before* reading the WAL. A group
-        // at or below it was appended and fsynced before this read, so the
-        // full-segment scan below cannot miss it. Sampling after the read could
-        // include a group appended in between that the scan never saw, letting
-        // the page report `has_more == false` with a durable group outstanding.
+        // at or below it was appended and fsynced before this read, so the tail
+        // scan below cannot miss it. Sampling after the read could include a
+        // group appended in between that the scan never saw, letting the page
+        // report `has_more == false` with a durable group outstanding.
         let durable_lsn = self.committed_lsn();
 
-        // Capture the directory boundary and the byte range needed for at most
+        // Capture the directory boundary and the byte offset needed for at most
         // `limit + 1` durable groups. The extra group determines `has_more`.
         // Holding the journal lock makes these offsets consistent with reclaim
         // and append; the actual I/O happens after releasing it.
@@ -2322,10 +2375,6 @@ impl JournalCoordinator {
         let first = journal
             .groups
             .partition_point(|group| group.last_lsn <= cursor.lsn);
-        let start = first
-            .checked_sub(1)
-            .and_then(|index| journal.groups.get(index))
-            .map_or(FILE_HEADER_LEN as u64, |group| group.end_offset);
         let mut durable_groups = journal
             .groups
             .iter()
@@ -2335,28 +2384,44 @@ impl JournalCoordinator {
             .by_ref()
             .take(limit.saturating_add(1))
             .last()
-            .map_or(start, |group| group.end_offset);
+            .map_or(cursor.resume_offset, |group| group.end_offset);
         Ok(ChangesWindow {
             base_lsn: journal.base_lsn,
-            start,
             end,
-            directory_trusted: journal.directory_matches_file(),
+            directory_trusted: journal.directory_matches_file() && !changes_since_force_untrusted(),
         })
     }
 
-    /// Read the segment region a [`Self::changes_since`] page needs: the bounded
-    /// tail when the directory was trustworthy, else the whole segment.
+    /// Read the segment region a [`Self::changes_since`] page needs, resuming at
+    /// the cursor's own byte offset so the retained prefix is never re-decoded.
+    /// The directory only caps the read; when it is untrusted the read runs to
+    /// the end of the segment.
+    ///
+    /// A resume offset is invalidated by a reclaim rewrite, a replacement, or a
+    /// rotation. Any failure therefore falls back to a full scan, and
+    /// [`Self::validate_changes_scan`] decides whether the cursor survived.
     fn scan_changes(&self, cursor: &JournalCursor, window: &ChangesWindow) -> io::Result<Scan> {
-        if window.directory_trusted {
-            Journal::scan_read_only_range(
-                &self.path,
-                window.start,
-                window.end,
-                cursor.lsn.saturating_add(1),
-            )
+        let end = if window.directory_trusted {
+            window.end
         } else {
-            Journal::scan_read_only(&self.path)
+            u64::MAX
+        };
+        // A reclaim rewrites the retained prefix, moving every surviving group,
+        // so the cursor's offset can point past the new end. That read succeeds
+        // with no groups even though the window says groups follow; treat it as
+        // invalid and rebuild. An empty read is only trusted when the window
+        // itself holds no group past the offset.
+        if let Ok(scan) = Journal::scan_read_only_range(
+            &self.path,
+            cursor.resume_offset,
+            end,
+            cursor.lsn.saturating_add(1),
+        ) {
+            if !scan.groups.is_empty() || end == cursor.resume_offset {
+                return Ok(scan);
+            }
         }
+        Journal::scan_read_only(&self.path)
     }
 
     /// Re-check the writer incarnation and the reclaim guard after the WAL read,
@@ -2412,8 +2477,19 @@ impl JournalCoordinator {
         let mut following = scan
             .groups
             .into_iter()
-            .filter(|group| group.last_lsn > cursor.lsn && group.last_lsn <= durable_lsn);
-        let selected: Vec<CommittedGroup> = following.by_ref().take(limit).collect();
+            .zip(scan.group_ends)
+            .filter(|(group, _)| group.last_lsn > cursor.lsn && group.last_lsn <= durable_lsn);
+        let mut selected = Vec::new();
+        let mut resume_offset = cursor.resume_offset;
+        while selected.len() < limit {
+            match following.next() {
+                Some((group, end)) => {
+                    resume_offset = end;
+                    selected.push(group);
+                }
+                None => break,
+            }
+        }
         let has_more = following.next().is_some();
         let through_lsn = selected.last().map_or(cursor.lsn, |group| group.last_lsn);
         JournalChangesPage {
@@ -2422,6 +2498,7 @@ impl JournalCoordinator {
                 path: self.path.clone(),
                 incarnation,
                 lsn: through_lsn,
+                resume_offset,
             },
             through_lsn,
             has_more,
@@ -4143,6 +4220,18 @@ impl Journal {
             .last()
             .map_or(FILE_HEADER_LEN as u64, |group| group.end_offset);
         directory_end == self.file_len
+    }
+
+    /// Absolute file offset where the group following `lsn` begins: the end of
+    /// the last directory group at or before `lsn`, or the file header when no
+    /// group precedes it. Used as a replay cursor's resume hint so a later page
+    /// reads only the appended tail.
+    fn resume_offset_for(&self, lsn: u64) -> u64 {
+        self.groups
+            .partition_point(|group| group.last_lsn <= lsn)
+            .checked_sub(1)
+            .and_then(|index| self.groups.get(index))
+            .map_or(FILE_HEADER_LEN as u64, |group| group.end_offset)
     }
 
     /// The newest LSN through which a shared segment may be reclaimed, given

@@ -4012,10 +4012,9 @@ impl PackfileStorage {
         let mut put_guard = Some(put_lock.lock());
 
         let journal = self.journal().ok_or_else(|| {
-            StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "replayable collection scans require an enabled journal",
-            ))
+            StorageError::Unsupported(
+                "replayable collection scans require an enabled journal".to_owned(),
+            )
         })?;
 
         // Flush before taking the transaction lifecycle lock. A target-
@@ -4045,10 +4044,10 @@ impl PackfileStorage {
         let (cursor, lease) = {
             let _transaction_lifecycle = self.transaction_overlay_lifecycle.lock();
             if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
-                return Err(StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "cannot capture a replayable scan while a transaction is materializing",
-                )));
+                return Err(StorageError::WouldBlock(
+                    "cannot capture a replayable scan while a transaction is materializing"
+                        .to_owned(),
+                ));
             }
             capture_boundary()?
         };

@@ -536,6 +536,10 @@ pub trait StorageEngine: Send + Sync {
 pub enum StorageError {
     /// An underlying I/O operation failed.
     Io(std::io::Error),
+    /// The operation was blocked by current storage activity and can be retried.
+    WouldBlock(String),
+    /// The requested operation is not supported by this storage configuration.
+    Unsupported(String),
     /// The requested node was not found.
     NotFound(NodeId),
     /// The node's content did not match its requested hash.
@@ -553,14 +557,14 @@ impl StorageError {
     /// storage activity.
     #[must_use]
     pub fn is_would_block(&self) -> bool {
-        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        matches!(self, Self::WouldBlock(_))
     }
 
     /// Whether this storage configuration does not support the requested
     /// operation.
     #[must_use]
     pub fn is_unsupported(&self) -> bool {
-        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::Unsupported)
+        matches!(self, Self::Unsupported(_))
     }
 }
 
@@ -619,6 +623,8 @@ impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::WouldBlock(msg) => write!(f, "operation blocked: {msg}"),
+            Self::Unsupported(msg) => write!(f, "unsupported operation: {msg}"),
             Self::NotFound(id) => write!(f, "node not found: {id:?}"),
             Self::VerificationFailed(id) => write!(f, "verification failed for node {id:?}"),
             Self::Corrupt(msg) => write!(f, "corrupt data: {msg}"),
@@ -647,6 +653,12 @@ impl From<StorageError> for std::io::Error {
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::Io(error) => error,
+            StorageError::WouldBlock(message) => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, message)
+            }
+            StorageError::Unsupported(message) => {
+                std::io::Error::new(std::io::ErrorKind::Unsupported, message)
+            }
             StorageError::NotFound(_) => {
                 std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string())
             }
