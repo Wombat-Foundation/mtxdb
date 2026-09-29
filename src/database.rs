@@ -347,6 +347,32 @@ impl DatabaseTransaction<'_> {
         Ok((results, version))
     }
 
+    /// Read node payloads and the collection version without copying the
+    /// payload bytes. The returned [`bytes::Bytes`] handles share the storage
+    /// buffers owned by the underlying read; only the small result containers
+    /// are newly allocated.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage errors from the versioned read.
+    pub fn get_with_collection_version_bytes(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[NodeId],
+    ) -> Result<(Vec<Option<bytes::Bytes>>, u64), StorageError> {
+        self.get_with_collection_version(pool, collection_id, node_ids)
+            .map(|(records, version)| {
+                (
+                    records
+                        .into_iter()
+                        .map(|record| record.map(|data| data.bytes))
+                        .collect(),
+                    version,
+                )
+            })
+    }
+
     /// Commit the staged mutations. Pack/index application is performed once;
     /// journal publication can be retried if the post-commit callback fails.
     ///
@@ -712,6 +738,12 @@ impl SharedDatabase {
         {
             let item = queue.swap_remove(index);
             // Its writes are all in the packs now, so pool coverage may pass it.
+            let touched = item.stage.touched_pools();
+            for (index, pool) in ShardType::ALL.into_iter().enumerate() {
+                if touched[index] {
+                    self.pool(pool).note_materialized_lsn(item.receipt.last_lsn);
+                }
+            }
             self.coordinator
                 .transaction_materialized(item.receipt.first_lsn);
             drop(item.overlay);

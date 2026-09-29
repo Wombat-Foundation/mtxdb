@@ -1071,11 +1071,25 @@ impl PackfileStorage {
         // returned guard keeps the applied overlay locked for the lookup below,
         // so another reader cannot reset it in between.
         let guard = self.refresh_read_journal()?;
-        // Capture the boundary from the same overlay state the lookup reads, so
-        // it cannot advance between sampling the data and reporting the LSN.
-        let boundary = guard
-            .as_ref()
-            .map_or(u64::MAX, |overlay| overlay.observed_lsn);
+        // Capture the boundary from the same state the lookup reads, so it
+        // cannot advance between sampling the data and reporting the LSN. With
+        // an overlay that is the applied LSN. Without one the live index is the
+        // source, so bound it by what this handle has actually materialized: a
+        // synthetic `u64::MAX` would let a reader pair data that predates a
+        // publication with the collection version that publication already
+        // advanced, since publication runs before the group reaches the index.
+        let boundary = match guard.as_ref() {
+            Some(overlay) => overlay.observed_lsn,
+            None => self.materialized_lsn.load(Ordering::Acquire),
+        };
+        if std::env::var_os("MTXDB_TRACE_VERSION").is_some() {
+            eprintln!(
+                "RCM coll={:02x?} guard={} boundary={boundary} materialized={}",
+                collection_id,
+                guard.is_some(),
+                self.materialized_lsn.load(Ordering::Acquire)
+            );
+        }
 
         // No overlay is installed (a writer with no transaction in flight):
         // the live index is the whole answer, so skip the per-id bookkeeping
@@ -1163,7 +1177,18 @@ impl PackfileStorage {
             for _ in 0..ATTEMPTS {
                 let version = journal.collection_version(pool, collection_id);
                 let (data, boundary) = self.get_read_committed_bounded(collection_id, ids)?;
-                if boundary >= version && journal.collection_version(pool, collection_id) == version
+                // An active overlay reports its observed LSN and may safely
+                // satisfy the read before pack materialization. Only replace
+                // the synthetic no-overlay MAX boundary with the in-memory
+                // materialization watermark; otherwise a valid overlay read
+                // would be forced to wait for durable index catch-up.
+                let effective_boundary = if boundary == u64::MAX {
+                    self.materialized_lsn()
+                } else {
+                    boundary
+                };
+                if effective_boundary >= version
+                    && journal.collection_version(pool, collection_id) == version
                 {
                     return Ok((data, version));
                 }

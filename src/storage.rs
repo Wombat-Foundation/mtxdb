@@ -279,6 +279,29 @@ pub trait StorageEngine: Send + Sync {
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError>;
 
+    /// Fetch multiple node payloads without retaining the [`NodeData`] wrapper.
+    ///
+    /// The returned [`bytes::Bytes`] values share the payload allocation from
+    /// the underlying read; extracting them does not copy the node bytes.
+    /// Implementations inherit this adapter from [`Self::get_many`], so the
+    /// storage-specific read and visibility semantics remain identical.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the errors returned by [`Self::get_many`].
+    fn get_many_bytes(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<bytes::Bytes>>, StorageError> {
+        self.get_many(collection_id, ids).map(|records| {
+            records
+                .into_iter()
+                .map(|record| record.map(|data| data.bytes))
+                .collect()
+        })
+    }
+
     /// Store a new node within a collection. The caller must ensure the node
     /// is not already present (content-addressed: identical data produces
     /// identical hash).

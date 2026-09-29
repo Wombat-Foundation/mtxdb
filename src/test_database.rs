@@ -1920,6 +1920,63 @@ fn versioned_transaction_read_rejects_stale_commit_and_retries() {
 
 #[cfg(feature = "multi-reader")]
 #[test]
+fn versioned_transaction_byte_read_preserves_payload_without_reencoding() {
+    let root = test_root("versioned_transaction_bytes");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let pool = ShardType::Edges;
+    let collection = [0x74; 16];
+    let key = node(1);
+
+    let writer = db.begin_transaction();
+    writer
+        .put(pool, collection, key, &data(b"zero-copy-payload"))
+        .unwrap();
+    writer.commit().unwrap();
+
+    let reader = db.begin_transaction();
+    let (records, _version) = reader
+        .get_with_collection_version_bytes(pool, &collection, &[key])
+        .unwrap();
+    assert_eq!(records[0].as_deref(), Some(&b"zero-copy-payload"[..]));
+
+    drop(reader);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(feature = "multi-reader")]
+#[test]
+fn versioned_read_retries_when_publication_is_not_materialized() {
+    let root = test_root("versioned_read_unmaterialized");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let pool = ShardType::Edges;
+    let collection = [0x75; 16];
+    let key = node(1);
+
+    let transaction = db.begin_transaction();
+    transaction
+        .put(pool, collection, key, &data(b"published-not-materialized"))
+        .unwrap();
+    // Deliberately publish without installing an overlay or materializing the
+    // transaction. A no-overlay read must not claim MAX coverage here.
+    db.publish_transaction(&transaction.stage).unwrap();
+
+    let error = db
+        .pool(pool)
+        .get_with_collection_version(&collection, &[key])
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::storage::StorageError::WouldBlock(_)),
+        "expected a retryable read while materialization is pending, got {error:?}"
+    );
+
+    drop(transaction);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(feature = "multi-reader")]
+#[test]
 fn versioned_point_reads_match_their_token_during_concurrent_publication() {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2506,6 +2563,118 @@ fn open_with_policies_applies_per_pool_settings() {
         db.edges().checksum_policy(),
         crate::packfile::ChecksumPolicy::WriteOnly
     );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every concurrent versioned read-modify-write must survive. The version
+/// token has to cover the data it is paired with: if a reader can observe a
+/// just-published version alongside pre-publication data, its conditional
+/// commit validates against that version and overwrites another writer's
+/// update. A lost token means exactly that hole.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn concurrent_versioned_rmw_keeps_every_update() {
+    use std::sync::Arc;
+
+    let root = test_root("concurrent_versioned_rmw");
+    let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let pool = ShardType::Edges;
+    let collection = [0x7au8; 16];
+    let key = node(1);
+
+    let seed = db.begin_transaction();
+    seed.put(pool, collection, key, &NodeData::new(bytes::Bytes::new()))
+        .unwrap();
+    seed.commit().unwrap();
+
+    const WORKERS: u8 = 8;
+    let barrier = Arc::new(Barrier::new(usize::from(WORKERS)));
+    let reads: Arc<std::sync::Mutex<Vec<(Vec<u8>, u64)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let commits: Arc<std::sync::Mutex<Vec<(u8, u64, Vec<u8>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Serialize only the commit + version sample, so the sampled version is the
+    // exact LSN this transaction published. Reads (and the failed commits they
+    // lead to) stay fully concurrent, which is the behavior under test.
+    let commit_serial: Arc<std::sync::Mutex<()>> = Arc::new(std::sync::Mutex::new(()));
+    let handles: Vec<_> = (0..WORKERS)
+        .map(|worker| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let reads = Arc::clone(&reads);
+            let commits = Arc::clone(&commits);
+            let commit_serial = Arc::clone(&commit_serial);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let token = worker + 1;
+                loop {
+                    let transaction = db.begin_transaction();
+                    let (records, version) =
+                        match transaction.get_with_collection_version(pool, &collection, &[key]) {
+                            Ok(sampled) => sampled,
+                            Err(error) if error.is_would_block() => continue,
+                            Err(error) => panic!("versioned read failed: {error}"),
+                        };
+                    let mut list = records[0]
+                        .as_ref()
+                        .map_or_else(Vec::new, |record| record.bytes.to_vec());
+                    if !list.contains(&token) {
+                        list.push(token);
+                    }
+                    let written = list.clone();
+                    reads.lock().unwrap().push((written.clone(), version));
+                    transaction
+                        .expect_collection_version(pool, collection, version)
+                        .unwrap();
+                    transaction
+                        .put(
+                            pool,
+                            collection,
+                            key,
+                            &NodeData::new(bytes::Bytes::from(list)),
+                        )
+                        .unwrap();
+                    match transaction.commit() {
+                        Ok(()) => {
+                            let commit_lsn = db.coordinator().collection_version(pool, &collection);
+                            commits.lock().unwrap().push((token, commit_lsn, written));
+                            break;
+                        }
+                        Err(error) if error.is_stale_read() => continue,
+                        Err(error) => panic!("commit failed: {error}"),
+                    }
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // A read that returned `version` must reflect every update published at or
+    // below it. The exact publish LSN comes from the commit receipt, so the
+    // first violation names the read and the token it should have seen.
+    let commits = commits.lock().unwrap();
+    for (list, version) in reads.lock().unwrap().iter() {
+        for (token, commit_lsn, _written) in commits.iter() {
+            assert!(
+                *commit_lsn == 0 || *commit_lsn > *version || list.contains(token),
+                "read at version {version} lost token {token} published at {commit_lsn}; list={list:?}"
+            );
+        }
+    }
+    drop(commits);
+
+    let mut final_list = db
+        .pool(pool)
+        .get_read_committed(&collection, &[key])
+        .unwrap()[0]
+        .as_ref()
+        .map_or_else(Vec::new, |record| record.bytes.to_vec());
+    final_list.sort_unstable();
+    assert_eq!(final_list, (1..=WORKERS).collect::<Vec<u8>>());
+
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

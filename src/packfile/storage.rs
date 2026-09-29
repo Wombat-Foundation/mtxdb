@@ -1966,6 +1966,10 @@ pub struct PackfileStorage {
     // build configurations share one open path, but never reads it back.
     #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     read_covered_lsn: AtomicU64,
+    /// Journal LSN through which this handle's in-memory index has applied
+    /// mutations. Unlike durable coverage, this advances immediately after a
+    /// published autocommit is written or a transaction group is materialized.
+    materialized_lsn: AtomicU64,
     /// The journal LSN this pool's packs are known to durably cover, so a reopen
     /// need not replay at or below it. Read from disk once at open
     /// ([`Self::read_journal_lsn`]) and advanced by whatever makes more of the
@@ -2779,6 +2783,7 @@ impl PackfileStorage {
             #[cfg(all(test, feature = "multi-reader"))]
             transaction_overlay_scanned: AtomicU64::new(0),
             read_covered_lsn,
+            materialized_lsn: AtomicU64::new(read_covered),
             durable_coverage: Arc::new(AtomicU64::new(durable_coverage)),
             checkpoint_worker: parking_lot::Mutex::new(None),
             background_checkpoint: AtomicBool::new(false),
@@ -9894,6 +9899,19 @@ impl PackfileStorage {
         }
     }
 
+    /// Return the LSN through which this handle's in-memory index is current.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn materialized_lsn(&self) -> u64 {
+        self.materialized_lsn.load(Ordering::Acquire)
+    }
+
+    /// Record that this handle's in-memory index now includes a published
+    /// mutation or transaction group through `lsn`.
+    #[cfg(feature = "multi-reader")]
+    pub(crate) fn note_materialized_lsn(&self, lsn: u64) {
+        self.materialized_lsn.fetch_max(lsn, Ordering::Release);
+    }
+
     /// Publish one mutation to the journal, if enabled. Returns the assigned
     /// LSN, or `None` when no journal is configured.
     ///
@@ -9938,7 +9956,9 @@ impl PackfileStorage {
             .map(|receipt| receipt.last_lsn)
             .map(Some)
             .map_err(StorageError::Io);
-        if result.is_ok() {
+        if let Ok(Some(lsn)) = result {
+            #[cfg(feature = "multi-reader")]
+            self.note_materialized_lsn(lsn);
             self.record_published_mutation(started);
         }
         result
