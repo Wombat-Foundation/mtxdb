@@ -1,4 +1,7 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::index::format::*;
+use mtxdb::packfile::{PackId, PACK_ID_LEN};
 
 #[test]
 fn fixed_width_records_round_trip() {
@@ -40,7 +43,7 @@ fn fixed_width_records_round_trip() {
 
     let pack_entry = PackTableEntry {
         slot: 3,
-        pack_id: PackId([0xAB; crate::packfile::PACK_ID_LEN]),
+        pack_id: PackId([0xAB; PACK_ID_LEN]),
     };
     assert_eq!(
         PackTableEntry::decode(&pack_entry.encode()),

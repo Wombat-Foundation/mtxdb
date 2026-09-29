@@ -232,7 +232,3 @@ pub fn validate_sequence(records: &[RedoRecord], base_sequence: u64) -> Result<(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "test_redo.rs"]
-mod tests;

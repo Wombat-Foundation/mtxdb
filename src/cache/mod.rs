@@ -362,8 +362,3 @@ impl Default for PinnedNodes {
         Self::new()
     }
 }
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-#[path = "test_cache.rs"]
-mod tests;

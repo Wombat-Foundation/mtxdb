@@ -1,4 +1,6 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::dag::*;
 
 #[test]
 fn test_graph_edge_packing() {

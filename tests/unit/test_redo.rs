@@ -1,11 +1,15 @@
-use super::*;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::index::redo::*;
+use mtxdb::index::IndexEntry;
+use mtxdb::packfile::{PackId, PACK_ID_LEN};
 
 fn set(seq: u64) -> RedoRecord {
     RedoRecord {
         collection_id: [0xC1; 16],
         op: RedoOp::Set {
             full_hash: [0xA5; 16],
-            pack_id: PackId([7; crate::packfile::PACK_ID_LEN]),
+            pack_id: PackId([7; PACK_ID_LEN]),
             offset: 4096,
             record_len: 61,
         },
@@ -75,7 +79,7 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
     let mut record = set(1);
     record.op = RedoOp::Set {
         full_hash: [1; 16],
-        pack_id: PackId([1; crate::packfile::PACK_ID_LEN]),
+        pack_id: PackId([1; PACK_ID_LEN]),
         offset: too_far,
         record_len: 61,
     };
@@ -90,7 +94,7 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
     let mut ok = set(1);
     ok.op = RedoOp::Set {
         full_hash: [1; 16],
-        pack_id: PackId([1; crate::packfile::PACK_ID_LEN]),
+        pack_id: PackId([1; PACK_ID_LEN]),
         offset: IndexEntry::MAX_OFFSET,
         record_len: 61,
     };

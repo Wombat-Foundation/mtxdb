@@ -292,8 +292,3 @@ impl Default for ActiveRoomFrontier {
         Self::new()
     }
 }
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-#[path = "test_dag.rs"]
-mod tests;

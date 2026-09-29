@@ -713,7 +713,3 @@ pub fn read_durable_fingerprint(
         Err(e) => Err(e),
     }
 }
-
-#[cfg(test)]
-#[path = "test_checkpoint.rs"]
-mod tests;

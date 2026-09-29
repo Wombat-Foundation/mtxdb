@@ -1,6 +1,12 @@
-use super::*;
-use crate::index::IndexConfig;
-use crate::index::LossyIndex;
+#![allow(clippy::tests_outside_test_module)]
+
+use mtxdb::index::checkpoint::*;
+use mtxdb::index::format::{CheckpointHeader, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN};
+use mtxdb::index::IndexConfig;
+use mtxdb::index::LossyIndex;
+use mtxdb::packfile::{PackId, PACK_ID_LEN};
+use std::io::Write;
+use std::sync::Arc;
 
 fn hash_for(seed: u16, i: usize) -> [u8; 16] {
     let mut hash = [0u8; 16];
@@ -10,7 +16,7 @@ fn hash_for(seed: u16, i: usize) -> [u8; 16] {
 
 /// Deterministic [`PackId`] fixture from a small integer.
 fn pid(n: u64) -> PackId {
-    let mut bytes = [0u8; crate::packfile::PACK_ID_LEN];
+    let mut bytes = [0u8; PACK_ID_LEN];
     bytes[..8].copy_from_slice(&n.to_be_bytes());
     PackId(bytes)
 }

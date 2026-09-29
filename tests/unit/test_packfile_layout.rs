@@ -1,14 +1,18 @@
-use super::*;
-use crate::packfile::{write_header, write_record, Record};
+#![allow(clippy::tests_outside_test_module)]
+
 use bytes::Bytes;
+use mtxdb::packfile::layout::*;
+use mtxdb::packfile::{write_header, write_record, PackId, Record, PACK_ID_LEN};
+use std::fs::File;
+use std::io;
 
 fn pack_id_for(n: u64) -> PackId {
-    let mut bytes = [0u8; crate::packfile::PACK_ID_LEN];
+    let mut bytes = [0u8; PACK_ID_LEN];
     bytes[..8].copy_from_slice(&n.to_be_bytes());
     // Explicit nonzero marker in the trailing byte so `n == 0` is still a
     // valid identity (the all-zero address is reserved); the filename
     // prefix is unchanged.
-    bytes[crate::packfile::PACK_ID_LEN - 1] = 0xA5;
+    bytes[PACK_ID_LEN - 1] = 0xA5;
     PackId(bytes)
 }
 
@@ -60,7 +64,7 @@ fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
 
 #[test]
 fn avoidable_spread_excludes_a_collections_required_spill() {
-    let capacity = crate::shard::MAX_SHARD_BYTES;
+    let capacity = mtxdb::shard::MAX_SHARD_BYTES;
     let mut ideal = CollectionPhysicalLayout {
         disk_bytes: capacity.saturating_add(100),
         ..CollectionPhysicalLayout::default()
