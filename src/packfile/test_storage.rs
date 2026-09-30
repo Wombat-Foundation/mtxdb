@@ -10318,3 +10318,53 @@ fn with_read_snapshot_scopes_the_pin_to_the_callback() {
     assert_eq!(fresh[0].as_ref().unwrap().bytes.as_ref(), b"new");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The snapshot pin-hold and overlay lock-wait histograms are opt-in and move
+/// when a snapshot is taken and dropped.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_snapshot_pin_and_lock_wait_are_timed() {
+    let dir = test_dir("read_snapshot_timings");
+    let wal = dir.join("wal.bin");
+    let collection = [0x6au8; 16];
+    let key = distinct_id(0x0a);
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x90u8; 16],
+        &[0x90u8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: key,
+            payload: b"v".to_vec(),
+        }])
+        .unwrap();
+    drop(journal);
+
+    let store = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    store.enable_read_journal(&wal).unwrap();
+    store.set_stats_enabled(true);
+
+    let snapshot = store.read_snapshot().unwrap();
+    assert!(snapshot.get(&collection, &[key]).unwrap()[0].is_some());
+    drop(snapshot);
+
+    let stats = store.stats();
+    assert!(
+        stats.read_snapshot_pin_latency.calls >= 1,
+        "a taken snapshot must record its pin hold time"
+    );
+    assert!(
+        stats.read_journal_lock_wait.calls >= 1,
+        "refresh must record the overlay lock wait"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

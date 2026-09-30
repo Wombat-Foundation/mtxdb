@@ -818,7 +818,16 @@ impl PackfileStorage {
             // `lock_arc` hands back a guard that owns a clone of the overlay
             // mutex's `Arc`, so a caller can hold it past this borrow (a
             // `ReadSnapshot` pins the overlay across several reads).
+            let lock_started = self
+                .stats_enabled
+                .load(Ordering::Relaxed)
+                .then(std::time::Instant::now);
             let mut guard = self.read_journal.lock_arc();
+            if let Some(started) = lock_started {
+                self.operation_timings
+                    .read_journal_lock_wait
+                    .observe(started.elapsed());
+            }
             let Some(overlay) = guard.as_mut() else {
                 return Ok(guard);
             };
@@ -1431,6 +1440,20 @@ pub struct ReadSnapshot {
     overlay: parking_lot::ArcMutexGuard<parking_lot::RawMutex, Option<ReadJournal>>,
     boundary: u64,
     incarnation: Option<u64>,
+    /// Set only while timing is enabled; observed into
+    /// `read_snapshot_pin_latency` on drop.
+    pin_started: Option<std::time::Instant>,
+}
+
+impl Drop for ReadSnapshot {
+    fn drop(&mut self) {
+        if let Some(started) = self.pin_started {
+            self.storage
+                .operation_timings
+                .read_snapshot_pin
+                .observe(started.elapsed());
+        }
+    }
 }
 
 impl PackfileStorage {
@@ -1446,11 +1469,16 @@ impl PackfileStorage {
             None => self.durable_read_boundary(),
         };
         let incarnation = overlay.as_ref().and_then(ReadJournal::publish_epoch);
+        let pin_started = self
+            .stats_enabled
+            .load(Ordering::Relaxed)
+            .then(std::time::Instant::now);
         Ok(ReadSnapshot {
             storage: Arc::clone(self),
             overlay,
             boundary,
             incarnation,
+            pin_started,
         })
     }
 

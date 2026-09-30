@@ -818,6 +818,8 @@ struct OperationTimings {
     get_many_with_refresh: OperationLatencyTotals,
     put: OperationLatencyTotals,
     put_many: OperationLatencyTotals,
+    read_snapshot_pin: OperationLatencyTotals,
+    read_journal_lock_wait: OperationLatencyTotals,
 }
 
 impl OperationTimings {
@@ -827,6 +829,8 @@ impl OperationTimings {
         self.get_many_with_refresh.reset();
         self.put.reset();
         self.put_many.reset();
+        self.read_snapshot_pin.reset();
+        self.read_journal_lock_wait.reset();
     }
 }
 
@@ -10821,6 +10825,8 @@ impl PackfileStorage {
             get_many_with_refresh_latency: self.operation_timings.get_many_with_refresh.snapshot(),
             put_latency: self.operation_timings.put.snapshot(),
             put_many_latency: self.operation_timings.put_many.snapshot(),
+            read_snapshot_pin_latency: self.operation_timings.read_snapshot_pin.snapshot(),
+            read_journal_lock_wait: self.operation_timings.read_journal_lock_wait.snapshot(),
             last_open_timings: self.open_timings(),
             last_sync_timings: self.sync_timings(),
             sync_totals: self.sync_totals.snapshot(),
@@ -11157,6 +11163,16 @@ pub struct RuntimeStats {
     pub put_latency: OperationLatency,
     /// Opt-in wall-clock latency for batched writes.
     pub put_many_latency: OperationLatency,
+    /// Opt-in hold time of a `ReadSnapshot`: capture to drop, i.e. how long the
+    /// pinned read-journal overlay guard was held. The distribution (not just
+    /// the mean) shows whether the pin is ever long-lived enough to matter.
+    pub read_snapshot_pin_latency: OperationLatency,
+    /// Opt-in wait to acquire the read-journal overlay mutex in
+    /// `refresh_read_journal`, across every read-committed/snapshot caller. A
+    /// rising tail here is the signal that the pinned guard is a real
+    /// contention point (the motivation for an immutable, atomically-swapped
+    /// overlay).
+    pub read_journal_lock_wait: OperationLatency,
     /// Per-phase breakdown of the most recent open.
     pub last_open_timings: Option<OpenTimings>,
     /// Per-phase breakdown of the most recent sync.
@@ -11470,6 +11486,8 @@ impl Default for RuntimeStats {
             get_many_with_refresh_latency: OperationLatency::default(),
             put_latency: OperationLatency::default(),
             put_many_latency: OperationLatency::default(),
+            read_snapshot_pin_latency: OperationLatency::default(),
+            read_journal_lock_wait: OperationLatency::default(),
             last_open_timings: None,
             last_sync_timings: None,
             sync_totals: SyncTotalsSnapshot::default(),
