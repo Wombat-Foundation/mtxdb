@@ -3927,7 +3927,8 @@ fn pool_label(database: &Path, shard_type: ShardType) -> String {
 /// Cost: opens every selected database and globs every selected pool's pack
 /// directory. This is fine once per `info` invocation, but must not be called
 /// per-selector inside a multi-selector command — hoist the pool walk and
-/// reuse it instead.
+/// reuse it instead. Discovery failures are skipped; an invalid database
+/// selection yields an empty inventory.
 fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
     let Ok(dirs) = valid_database_dirs(cli) else {
         return Vec::new();
@@ -3966,7 +3967,8 @@ fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
 ///
 /// Same cost caveat as [`pack_locations_in_selected_pools`]: a single `info`
 /// disambiguation is fine, a per-selector loop in a multi-selector command is
-/// not.
+/// not. Unreadable databases and pools are skipped; returns `false` if no
+/// readable pool reports a match.
 fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
     let Ok(dirs) = valid_database_dirs(cli) else {
         return false;
@@ -4014,18 +4016,22 @@ fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarge
 /// 1-16 hex filename prefix that resolves to exactly one pack (ambiguity errors
 /// and asks for the full address); `--collection` accepts an exact 32-hex id or
 /// a canonical `!room` sigil. Either errors if nothing of that type matches.
+/// `--pack` also rejects a single address present in multiple selected pools.
 ///
 /// Without it, classification is inferred by the digits after the canonical
 /// lowercase `0x` prefix: 1-16 name a pack prefix, exactly 32 can name either a
 /// full pack address or a collection, and any other count is an error. A
-/// selector without a `0x` prefix is handed to the collection parser (which
-/// accepts only a canonical sigil such as `!room`); an uppercase `0X` prefix is
-/// rejected rather than guessed at. For an ambiguous 32-hex selector the
-/// database is checked:
+/// selector without a `0x` prefix is classified as a collection without
+/// validation; an uppercase `0X` prefix is rejected. Short pack prefixes are
+/// also classified without validation; callers must parse them before use.
+/// For an ambiguous 32-hex selector the database is checked:
 /// - If only an existing pack matches, it resolves as [`InfoTarget::Pack`].
 /// - If only a collection exists (or neither exists yet), it resolves as [`InfoTarget::Collection`].
 /// - If both a live pack and a collection match the same ID, an error requires
 ///   an explicit `--pack` or `--collection` (with the exact 32-hex id).
+///
+/// Returns the target plus the reusable pack inventory when pack
+/// classification required a discovery walk.
 fn classify_info_selector_with_inventory(
     cli: &Cli,
     selector: &str,
@@ -4686,6 +4692,9 @@ impl PackIssueLevel {
     }
 }
 
+/// Read a canonical filename's full pack ID and file length, checking prefix
+/// agreement with the header. Noncanonical names are reported separately;
+/// I/O and header-validation failures become `PackIdentity::Invalid`.
 fn pack_identity(path: &Path) -> PackIdentity {
     let stem = path
         .file_stem()
@@ -5424,6 +5433,10 @@ fn print_pack_info(
     }
 }
 
+/// Display matching packs in the selected pools. An optional inventory must
+/// belong to this database and avoids repeating discovery. Ambiguous prefixes
+/// and discovery errors propagate; a missing pack is an error only when a
+/// specific pool is selected.
 fn cmd_info_pack(
     cli: &Cli,
     selector: &str,
@@ -6325,6 +6338,10 @@ enum PackSelector {
 }
 
 impl PackSelector {
+    /// Parse a lowercase `0x`-prefixed full address or 1–16 hex digit prefix.
+    ///
+    /// Rejects malformed selectors and the full all-zero address. A zero prefix
+    /// is allowed; existence and uniqueness are checked separately by `resolve`.
     fn parse(selector: &str) -> anyhow::Result<Self> {
         let Some(hex) = selector.strip_prefix("0x") else {
             bail!(

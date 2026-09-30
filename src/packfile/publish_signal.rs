@@ -90,6 +90,9 @@ impl PublishSignal {
     /// different value and resyncs. The revision is deliberately preserved
     /// across opens, so a new epoch can never be paired with a revision value
     /// that the new writer will later reissue.
+    ///
+    /// # Errors
+    /// Propagates file open, metadata, resize, mapping, and OS entropy errors.
     pub(crate) fn writer(segment: &Path) -> io::Result<Self> {
         let path = Self::path_for(segment);
         let file = OpenOptions::new()
@@ -116,7 +119,9 @@ impl PublishSignal {
     }
 
     /// Map the generation file read-only, or `Ok(None)` when it is absent or
-    /// not yet fully sized (so the caller falls back to the stat path).
+    /// not yet fully sized, or still has a zero epoch (so the caller falls
+    /// back to the stat path). Other open, metadata, and mapping errors
+    /// propagate.
     pub(crate) fn reader(segment: &Path) -> io::Result<Option<Self>> {
         let path = Self::path_for(segment);
         let file = match File::open(&path) {
@@ -171,6 +176,7 @@ impl PublishSignal {
         self.atomic(REVISION_OFFSET).fetch_add(1, Ordering::Release);
     }
 
+    /// Return the start of the mapping, valid while this signal is alive.
     fn base(&self) -> *const u8 {
         match &self.mapping {
             Mapping::Writable(mapping) => mapping.as_ptr(),
@@ -178,6 +184,8 @@ impl PublishSignal {
         }
     }
 
+    /// Borrow the atomic at byte offset 0 (epoch) or 8 (revision).
+    /// Callers must use one of these two aligned, in-bounds offsets.
     #[allow(unsafe_code)]
     // An mmap base is page-aligned and `offset` is 0 or 8, so the cast is
     // 8-byte aligned; clippy cannot see that through the raw pointer.
@@ -198,9 +206,11 @@ impl PublishSignal {
 /// Map the signal file writable, isolating the unsafe call (see `map_pack`).
 ///
 /// # Safety
-/// The caller must hold the file open for the mapping's lifetime and must not
-/// shrink it while the mapping exists. Both hold: the returned `MmapMut` owns
-/// the mapping and the file is only ever grown to `SIGNAL_LEN` at creation.
+/// The file must be at least `SIGNAL_LEN` bytes and must not be shrunk while
+/// mapped. The mapping remains valid after the file handle is closed.
+///
+/// # Errors
+/// Propagates memory-mapping errors.
 #[allow(unsafe_code)]
 fn map_writable(file: &File) -> io::Result<memmap2::MmapMut> {
     debug_assert!(
@@ -215,9 +225,11 @@ fn map_writable(file: &File) -> io::Result<memmap2::MmapMut> {
 /// Map the signal file read-only, isolating the unsafe call.
 ///
 /// # Safety
-/// The caller must hold the file open for the mapping's lifetime and must not
-/// shrink it while the mapping exists. Both hold: the returned `Mmap` owns the
-/// mapping and a writer only ever grows the file to `SIGNAL_LEN`.
+/// The file must be at least `SIGNAL_LEN` bytes and must not be shrunk while
+/// mapped. The mapping remains valid after the file handle is closed.
+///
+/// # Errors
+/// Propagates memory-mapping errors.
 #[allow(unsafe_code)]
 fn map_readable(file: &File) -> io::Result<memmap2::Mmap> {
     debug_assert!(

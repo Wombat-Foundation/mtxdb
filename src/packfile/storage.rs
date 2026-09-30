@@ -3950,13 +3950,10 @@ impl PackfileStorage {
     /// Stream every live record of one collection from a single consistent
     /// snapshot.
     ///
-    /// The snapshot is a pinned generation plus the pack-file lengths captured
-    /// with it, so the scan yields exactly the keys [`Self::get`] would resolve
-    /// at that boundary — one live record per key, never a superseded version —
-    /// and excludes records appended after the boundary (the incremental path's
-    /// responsibility). The generation and open shard handles stay pinned for
-    /// the scan, so a concurrent repack may retire those shards without
-    /// changing the snapshot being read.
+    /// The scan captures a generation and pack-file lengths, resolving keys
+    /// found within those lengths through the generation's index. Candidate
+    /// locators and open shard handles are retained for lazy payload reads, so
+    /// a concurrent repack may retire those shards while they remain readable.
     ///
     /// When a read-committed journal overlay is installed, its committed puts
     /// are merged in and win over the durable index (matching
@@ -3964,13 +3961,15 @@ impl PackfileStorage {
     /// yet reflect suppresses durable records entirely, so a live multi-reader
     /// store is scanned completely.
     ///
-    /// The scan covers bytes durable on disk at the boundary: writes still
-    /// buffered in this process are not included, since a rebuild exists to
-    /// recover what a crash left on disk.
+    /// The pack scan covers the captured file lengths without flushing or
+    /// syncing them. Writes still buffered in this process are excluded unless
+    /// supplied by the journal overlay; file-visible bytes need not be fsynced.
+    /// Records are yielded as `(NodeId, NodeData)` with no guaranteed ordering.
     ///
     /// # Errors
-    /// Propagates pack-file read errors and journal-refresh errors
-    /// ([`StorageError::Corrupt`] / [`StorageError::Io`]).
+    /// Propagates pack metadata-scan and journal-refresh errors, including
+    /// [`StorageError::Io`] with `WouldBlock` when a read-journal reload must
+    /// be retried. Payload-read errors are yielded by the returned iterator.
     pub fn scan_collection(
         &self,
         collection_id: &[u8; 16],
@@ -4262,6 +4261,12 @@ impl PackfileStorage {
         self.scan_collection_with_overlay(collection_id, &overlay_puts, false, put_guard)
     }
 
+    /// Build lazy scan work, letting `overlay_puts` replace pack values.
+    ///
+    /// `overlay_deletes` suppresses all pack records for this collection. The
+    /// caller holds its put mutex in `put_guard`; this releases the guard after
+    /// capturing the generation, file lengths, and open handles. Pack-open and
+    /// metadata-scan errors propagate.
     fn scan_collection_with_overlay(
         &self,
         collection_id: &[u8; 16],
@@ -4330,6 +4335,8 @@ impl PackfileStorage {
         })
     }
 
+    /// Open metadata scanners paired with each shard's captured byte length.
+    /// Open, metadata, and header-validation errors propagate.
     fn open_collection_scan_shards(
         shards: &[(u16, Arc<Shard>)],
     ) -> Result<Vec<(u64, packfile::PackfileScanner)>, StorageError> {
@@ -4344,6 +4351,8 @@ impl PackfileStorage {
             .collect()
     }
 
+    /// Collect distinct hashes for `collection_id` before each captured byte
+    /// length, in first-seen order. Scanner errors propagate.
     fn scan_collection_keys(
         scanners: Vec<(u64, packfile::PackfileScanner)>,
         collection_id: &[u8; 16],
@@ -4369,6 +4378,8 @@ impl PackfileStorage {
         Ok(keys)
     }
 
+    /// Append indexed candidates for keys not shadowed by `overlay_puts`,
+    /// pinning available shard handles. Keys without candidates are skipped.
     fn append_collection_locator_work(
         keys: Vec<NodeId>,
         index: &LossyIndex,
@@ -6815,49 +6826,21 @@ impl PackfileStorage {
         Ok((all_hashes, adjacency))
     }
 
-    /// Rewrite a collection's records in topological order, optionally performing
-    /// garbage collection — this is the engine's one repack entry point.
-    ///
-    /// If live roots are configured for this collection (see
-    /// [`Self::set_live_roots`]), traverses outward from them via
-    /// `extract_edges` and drops anything not reached: only reachable
-    /// records are read from disk during the traversal, so unreachable
-    /// data is never even fetched, not just excluded from the output.
-    ///
-    /// If no live roots are configured (`set_live_roots` was never called,
-    /// or was called with an empty list), nothing is known to be garbage,
-    /// so every scanned record is preserved, still deduplicated and
-    /// rewritten in topological order — rather than risk deleting live
-    /// data on the assumption that "no roots" means "nothing is live".
-    ///
-    /// All shards this call will read from are pinned (held via an
-    /// `Arc<Shard>` for the whole call) before any writes happen, so a
-    /// rotation triggered by this call's own writes can never retire a
-    /// shard this
-    /// call still needs to read stale data from.
-    ///
-    /// Returns `(kept, dropped)`: the number of records written to the new
-    /// generation, and the number of scanned records found unreachable and
-    /// discarded.
-    ///
-    /// # Errors
-    /// Returns `StorageError` on I/O or corruption.
     /// Builds this repack's deduped `hash → (slot, offset)` map,
     /// incrementally where possible, and returns the previous
     /// [`RepackIncrementalState`] (moved out, not cloned) so the caller can
     /// reuse its `adjacency` cache when deciding which nodes need fresh disk
     /// reads.
     ///
-    /// On the incremental path the previous `live_map` is extended in-place
+    /// On the incremental path a copy of the previous `live_map` is extended
     /// with only the newly-appended entries from each shard (O(delta) scan
-    /// work per repack call rather than O(total)). On the cold-start path
-    /// (first repack for this collection) every shard is scanned from byte
-    /// zero.
+    /// work per repack call rather than O(total)). The first call, or a change
+    /// in a previously scanned slot's pack identity, triggers a full scan.
     ///
     /// Returns `(hash_to_shard_offset, Some(prev))` on the incremental path
     /// and `(hash_to_shard_offset, None)` on the cold-start path. The caller
     /// must pass `prev` to the adjacency helpers to unlock the incremental
-    /// BFS optimisation; when it is `None` the caller uses the full-scan
+    /// BFS optimization; when it is `None` the caller uses the full-scan
     /// adjacency helpers instead.
     ///
     /// # Errors
@@ -7324,8 +7307,37 @@ impl PackfileStorage {
             .collect()
     }
 
+    /// Rewrite a collection's records in topological order, optionally performing
+    /// garbage collection.
+    ///
+    /// If live roots are configured for this collection (see
+    /// [`Self::set_live_roots`]), traverses outward from them via
+    /// `extract_edges` and drops anything not reached: only reachable
+    /// records are read from disk during the traversal, so unreachable
+    /// data is never even fetched, not just excluded from the output.
+    ///
+    /// If no live roots are configured (`set_live_roots` was never called,
+    /// or was called with an empty list), nothing is known to be garbage,
+    /// so every scanned record is preserved, still deduplicated and
+    /// rewritten in topological order — rather than risk deleting live
+    /// data on the assumption that "no roots" means "nothing is live".
+    ///
+    /// All shards this call will read from are pinned (held via an
+    /// `Arc<Shard>` for the whole call) before any writes happen, so a
+    /// rotation triggered by this call's own writes can never retire a
+    /// shard this
+    /// call still needs to read stale data from.
+    ///
+    /// Returns `(kept, dropped)`: the number of records written to the new
+    /// generation, and the number of scanned records found unreachable and
+    /// discarded.
+    ///
+    /// Shard writes are synced before success. Checkpoint and inspection
+    /// sidecar persistence are best-effort.
+    ///
     /// # Errors
-    /// Returns `StorageError` on I/O or corruption.
+    /// Returns `StorageError` on I/O or corruption, including a cycle in the
+    /// live graph.
     ///
     /// # Panics
     /// Panics if any hash in the CSR exceeds `u32::MAX` local ID space.
@@ -9624,8 +9636,10 @@ impl PackfileStorage {
     /// packfiles are the sync point — is unchanged until it is called).
     ///
     /// # Errors
-    /// Returns `StorageError` if the journal segment cannot be opened or its
-    /// committed prefix cannot be validated.
+    /// Returns [`StorageError::Internal`] for a pool inside a database root;
+    /// such pools must use `enable_shared_journal` (with `multi-reader`).
+    /// Propagates root-inspection, journal-open, recovery, and publish-signal
+    /// setup errors, including OS entropy failures, as [`StorageError::Io`].
     pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
         self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
@@ -9709,7 +9723,9 @@ impl PackfileStorage {
     /// already covered).
     ///
     /// # Errors
-    /// Returns `InvalidInput` if a journal is already enabled on this store.
+    /// Returns [`StorageError::Internal`] if a journal is already enabled, or
+    /// [`StorageError::Io`] if publish-signal setup fails, including OS entropy
+    /// failures.
     #[cfg(feature = "multi-reader")]
     pub fn enable_shared_journal(
         &self,

@@ -18,6 +18,7 @@ static UPGRADE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct TempFileGuard(PathBuf);
 
 impl TempFileGuard {
+    /// Remove `path` on drop, ignoring cleanup errors.
     fn new(path: PathBuf) -> Self {
         Self(path)
     }
@@ -341,6 +342,11 @@ impl DatabaseLayout {
         Ok(())
     }
 
+    /// Install a complete database descriptor from a synced temporary file.
+    ///
+    /// Accepts a valid descriptor installed by a concurrent opener. File creation,
+    /// write, sync, installation, and validation errors propagate; temporary-file
+    /// cleanup and parent-directory sync are best-effort.
     fn write_descriptor(path: &Path) -> io::Result<()> {
         let (temporary, file) = loop {
             let suffix = DESCRIPTOR_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -379,6 +385,13 @@ impl DatabaseLayout {
         })
     }
 
+    /// Install the synced first-create descriptor at `temporary` into `path`.
+    ///
+    /// Uses `hard_link`, falling back to rename on `Unsupported` or
+    /// `PermissionDenied`. An existing destination or a concurrently removed
+    /// temporary file is accepted only if the destination validates. Other
+    /// installation and validation errors propagate. Parent sync and cleanup
+    /// are best-effort. This replacement-capable fallback is not for upgrades.
     fn install_descriptor_temp(
         temporary: &Path,
         path: &Path,
@@ -432,6 +445,7 @@ impl DatabaseLayout {
         }
     }
 
+    /// Attempt to sync the descriptor's parent directory, ignoring failures.
     fn sync_descriptor_parent(path: &Path) {
         // The descriptor contents are synced before installation. Directory
         // sync is best-effort: some supported filesystems reject it, and a
@@ -445,6 +459,9 @@ impl DatabaseLayout {
         let _ = crate::shard::sync_directory(parent);
     }
 
+    /// Remove regular sibling files named `.<descriptor>.<kind>.*`.
+    ///
+    /// Directory-read, metadata, and removal failures are ignored.
     fn sweep_descriptor_temps(path: &Path, kind: &str) {
         let parent = path
             .parent()
@@ -471,6 +488,10 @@ impl DatabaseLayout {
         }
     }
 
+    /// Validate the current descriptor format and pool list at `path`.
+    ///
+    /// Propagates read errors and returns `InvalidData` for an unrecognized
+    /// descriptor.
     fn validate_existing_descriptor(path: &Path) -> io::Result<()> {
         let contents = fs::read(path)?;
         if validate_db_meta(&contents) {
@@ -483,6 +504,12 @@ impl DatabaseLayout {
         }
     }
 
+    /// Replace a recognized legacy descriptor with the current pool list.
+    ///
+    /// Waits for the upgrade lock and succeeds without replacement if another
+    /// opener already upgraded it. Lock, read, write, file-sync, and replacement
+    /// errors propagate; an unrecognized descriptor returns `InvalidData`.
+    /// Parent-directory sync and temporary-file cleanup are best-effort.
     fn upgrade_descriptor(path: &Path) -> io::Result<()> {
         let lock_path = path.with_file_name(".db.meta.upgrade.lock");
         let _upgrade_lock = loop {
