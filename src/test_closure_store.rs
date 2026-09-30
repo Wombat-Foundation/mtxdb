@@ -413,7 +413,10 @@ fn concurrent_readers_never_see_a_mixed_generation() {
                 scope.spawn(|| {
                     let ids: Vec<u32> = (1..CRASH_IDS).collect();
                     let mut reads = 0u32;
-                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    // Read at least once even if the writer finishes before this
+                    // thread is scheduled, so a loaded machine cannot fail the
+                    // `reads > 0` check below.
+                    loop {
                         let (generation, blobs) = store().get_many(&db, &ids).unwrap();
                         let generation = generation.expect("a generation is always published");
                         for (id, blob) in ids.iter().zip(&blobs) {
@@ -424,6 +427,9 @@ fn concurrent_readers_never_see_a_mixed_generation() {
                             );
                         }
                         reads += 1;
+                        if done.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
                     }
                     reads
                 })
