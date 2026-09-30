@@ -10,10 +10,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 static DESCRIPTOR_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-static UPGRADE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TempFileGuard(PathBuf);
 
@@ -31,25 +29,25 @@ impl Drop for TempFileGuard {
 }
 /// Immutable descriptor at a database root.
 ///
-/// Layout: `magic(4) | version(1) | reserved(8) | pool list`. The reserved
-/// bytes are zero-filled and unused today; they exist so a future format
-/// revision can add a field without another exact-byte-equality break, the
-/// same way `pool.meta` carries a version byte. Not deployed anywhere yet,
-/// so the descriptor is parsed (magic + version + pool list), not compared
-/// byte-for-byte — a mismatched version is rejected with a specific error
-/// rather than silently misparsed. Every root has one shared WAL at its root,
-/// so the descriptor records no WAL layout; version 1 descriptors, which did,
-/// are rejected. The shipped CLI, C ABI, and WASI entry
-/// points validate this root and open their selected named pool through this
-/// type; [`PackfileStorage`](crate::PackfileStorage) remains available as a
+/// Layout: `magic(4) | version(1) | seed(8) | version_len(1) | created_by |
+/// pool list`. The seed is random and nonzero, written once when the root is
+/// created; every pool's index seed derives from it (see
+/// [`DatabaseLayout::pool_seed`]), so a reader knows a pool's seed before the
+/// pool exists on disk. `created_by` is the `mtxdb` version that created the
+/// root (diagnostic only). The descriptor is parsed, not compared
+/// byte-for-byte: a mismatched version is rejected rather than misparsed.
+/// Every root has one shared WAL at its root, so the descriptor records no WAL
+/// layout. The shipped CLI, C ABI, and WASI entry points validate this root and
+/// open their selected named pool through this type;
+/// [`PackfileStorage`](crate::PackfileStorage) remains available as a
 /// lower-level single-pool API.
 const DB_META_MAGIC: &[u8; 4] = b"MTXD";
-const DB_META_VERSION: u8 = 2;
-const DB_META_RESERVED_LEN: usize = 8;
+const DB_META_VERSION: u8 = 3;
+const DB_META_SEED_LEN: usize = 8;
 /// The pool list a descriptor must carry, built from the pool directory names
 /// so it can never drift from them. A root whose descriptor lists other names
-/// (an older layout) is rejected by [`validate_db_meta`] instead of being
-/// opened with its data orphaned in directories nothing reads.
+/// is rejected by [`parse_db_meta`] instead of being opened with its data
+/// orphaned in directories nothing reads.
 fn db_meta_pool_list() -> Vec<u8> {
     let mut list = Vec::new();
     for shard_type in ShardType::ALL {
@@ -59,50 +57,129 @@ fn db_meta_pool_list() -> Vec<u8> {
     list
 }
 
-/// Pool list written by the three-pool layout before `ServerInfo` was added.
-/// It is recognized only as an upgrade source; new descriptors always use the
-/// current [`ShardType::ALL`] list.
-const LEGACY_DB_META_POOL_LIST: &[u8] = b"mtpl-state\nmtpl-event\nmtpl-edges\n";
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
-/// `magic + version` header length shared by the writer and the validator.
-const DB_META_HEADER_LEN: usize = 4 + 1 + DB_META_RESERVED_LEN;
+/// `magic + version + seed + version_len` header length.
+const DB_META_FIXED_LEN: usize = 4 + 1 + DB_META_SEED_LEN + 1;
+
+/// A parsed, valid database descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbMeta {
+    seed: u64,
+    created_by: String,
+}
+
+/// A fresh nonzero random seed.
+fn random_seed() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    loop {
+        let seed = RandomState::new().build_hasher().finish();
+        if seed != 0 {
+            return seed;
+        }
+    }
+}
+
 /// Build the on-disk descriptor bytes for a database root.
-fn db_meta_bytes() -> Vec<u8> {
+fn db_meta_bytes(seed: u64) -> Vec<u8> {
     let pool_list = db_meta_pool_list();
-    let mut buf = Vec::with_capacity(DB_META_HEADER_LEN.saturating_add(pool_list.len()));
+    let created_by = env!("CARGO_PKG_VERSION").as_bytes();
+    let created_by = &created_by[..created_by.len().min(usize::from(u8::MAX))];
+    let mut buf = Vec::with_capacity(
+        DB_META_FIXED_LEN
+            .saturating_add(created_by.len())
+            .saturating_add(pool_list.len()),
+    );
     buf.extend_from_slice(DB_META_MAGIC);
     buf.push(DB_META_VERSION);
-    buf.extend_from_slice(&[0u8; DB_META_RESERVED_LEN]);
+    buf.extend_from_slice(&seed.to_le_bytes());
+    buf.push(u8::try_from(created_by.len()).unwrap_or(u8::MAX));
+    buf.extend_from_slice(created_by);
     buf.extend_from_slice(&pool_list);
     buf
 }
 
-/// Validate a descriptor read from disk: correct magic, a version this build
-/// understands, and the expected pool list.
-fn validate_db_meta(contents: &[u8]) -> bool {
-    if contents.len() < DB_META_HEADER_LEN {
-        return false;
+/// Parse a descriptor read from disk: correct magic, a version this build
+/// understands, a nonzero seed, and the expected pool list.
+fn parse_db_meta(contents: &[u8]) -> Option<DbMeta> {
+    if contents.len() < DB_META_FIXED_LEN
+        || &contents[..4] != DB_META_MAGIC
+        || contents[4] != DB_META_VERSION
+    {
+        return None;
     }
-    if &contents[..4] != DB_META_MAGIC {
-        return false;
+    let seed = u64::from_le_bytes(contents[5..5 + DB_META_SEED_LEN].try_into().ok()?);
+    if seed == 0 {
+        return None;
     }
-    if contents[4] != DB_META_VERSION {
-        return false;
-    }
-    contents[DB_META_HEADER_LEN..] == db_meta_pool_list()[..]
+    let version_len = usize::from(contents[DB_META_FIXED_LEN - 1]);
+    let created_end = DB_META_FIXED_LEN.checked_add(version_len)?;
+    let created_by =
+        String::from_utf8(contents.get(DB_META_FIXED_LEN..created_end)?.to_vec()).ok()?;
+    (contents[created_end..] == db_meta_pool_list()[..]).then_some(DbMeta { seed, created_by })
 }
 
-fn is_legacy_db_meta(contents: &[u8]) -> bool {
-    contents.len() == DB_META_HEADER_LEN.saturating_add(LEGACY_DB_META_POOL_LIST.len())
-        && &contents[..4] == DB_META_MAGIC
-        && contents[4] == DB_META_VERSION
-        && contents[DB_META_HEADER_LEN..] == LEGACY_DB_META_POOL_LIST[..]
+fn read_db_meta(path: &Path) -> io::Result<DbMeta> {
+    parse_db_meta(&fs::read(path)?).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unrecognized mtxdb database descriptor: {}", path.display()),
+        )
+    })
 }
 
-fn recognized_db_meta(contents: &[u8]) -> bool {
-    validate_db_meta(contents) || is_legacy_db_meta(contents)
+/// The index seed of the pool at `pool_dir` when it lives at
+/// `<root>/pools/<pool>` inside a database root; `None` for a standalone pool
+/// directory, which keeps its own `pool.meta`.
+///
+/// # Errors
+/// Returns `InvalidData` if the enclosing `db.meta` is unrecognized.
+pub fn enclosing_pool_seed(pool_dir: &Path) -> io::Result<Option<u64>> {
+    let Some(name) = pool_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(shard_type) = ShardType::ALL.into_iter().find(|t| t.as_str() == name) else {
+        return Ok(None);
+    };
+    let Some(pools) = pool_dir
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == "pools"))
+    else {
+        return Ok(None);
+    };
+    let Some(root) = pools.parent() else {
+        return Ok(None);
+    };
+    let meta_path = root.join(DB_META_FILENAME);
+    if !meta_path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(pool_seed(read_db_meta(&meta_path)?.seed, shard_type)))
+}
+
+/// The `mtxdb` version that created the database root enclosing `pool_dir`.
+#[must_use]
+pub fn enclosing_created_by(pool_dir: &Path) -> Option<String> {
+    let root = pool_dir.parent()?.parent()?;
+    read_db_meta(&root.join(DB_META_FILENAME))
+        .ok()
+        .map(|meta| meta.created_by)
+}
+
+/// Derive a pool's index seed from the root seed and the pool's tag. Never zero.
+fn pool_seed(root_seed: u64, shard_type: ShardType) -> u64 {
+    let mut label = Vec::with_capacity(12);
+    label.extend_from_slice(&root_seed.to_le_bytes());
+    label.extend_from_slice(&shard_type.physical_pool_tag());
+    let digest = crate::storage::DigestAlgorithm::Blake3.digest(&label);
+    let seed = u64::from_le_bytes(digest[..8].try_into().unwrap_or([1; 8]));
+    if seed == 0 {
+        1
+    } else {
+        seed
+    }
 }
 
 /// Whether `root` is a database root: it has a valid `db.meta`. `Ok(false)`
@@ -118,7 +195,7 @@ pub fn is_database_root(root: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if !recognized_db_meta(&contents) {
+    if parse_db_meta(&contents).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -147,7 +224,7 @@ pub fn enclosing_root(dir: &Path) -> io::Result<Option<PathBuf>> {
             continue;
         }
         let contents = fs::read(&meta_path)?;
-        if !recognized_db_meta(&contents) {
+        if parse_db_meta(&contents).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -210,6 +287,7 @@ impl ShardType {
 #[derive(Debug, Clone)]
 pub struct DatabaseLayout {
     root: PathBuf,
+    seed: u64,
 }
 
 impl DatabaseLayout {
@@ -222,26 +300,21 @@ impl DatabaseLayout {
         fs::create_dir_all(&root)?;
         Self::reject_legacy_flat_store(&root)?;
         let meta_path = root.join(DB_META_FILENAME);
-        if meta_path.exists() {
-            let contents = fs::read(&meta_path)?;
-            if is_legacy_db_meta(&contents) {
-                Self::upgrade_descriptor(&meta_path)?;
-            } else if !validate_db_meta(&contents) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "unrecognized mtxdb database descriptor: {}",
-                        meta_path.display()
-                    ),
-                ));
-            }
-        } else {
+        if !meta_path.exists() {
             Self::write_descriptor(&meta_path)?;
         }
+        let seed = read_db_meta(&meta_path)?.seed;
         for shard_type in ShardType::ALL {
             fs::create_dir_all(root.join("pools").join(shard_type.as_str()))?;
         }
-        Ok(Self { root })
+        Ok(Self { root, seed })
+    }
+
+    /// The index seed of `shard_type`'s pool, derived from the root seed so it
+    /// is known before the pool exists on disk.
+    #[must_use]
+    pub fn pool_seed(&self, shard_type: ShardType) -> u64 {
+        pool_seed(self.seed, shard_type)
     }
 
     /// Return a named pool's directory, creating its parent directory.
@@ -294,18 +367,9 @@ impl DatabaseLayout {
                 format!("missing database descriptor: {}", meta_path.display()),
             ));
         }
-        let contents = fs::read(&meta_path)?;
-        if !recognized_db_meta(&contents) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unrecognized mtxdb database descriptor: {}",
-                    meta_path.display()
-                ),
-            ));
-        }
+        let seed = read_db_meta(&meta_path)?.seed;
         Self::reject_legacy_flat_store(&root)?;
-        Ok(Self { root })
+        Ok(Self { root, seed })
     }
 
     /// The database root this layout was opened from.
@@ -374,7 +438,7 @@ impl DatabaseLayout {
         // paths `file` then closes first, and on Windows the guard's
         // `remove_file` is not blocked by the still-open handle.
         let mut file = file;
-        file.write_all(&db_meta_bytes())?;
+        file.write_all(&db_meta_bytes(random_seed()))?;
         file.sync_all()?;
         drop(file);
 
@@ -391,7 +455,7 @@ impl DatabaseLayout {
     /// `PermissionDenied`. An existing destination or a concurrently removed
     /// temporary file is accepted only if the destination validates. Other
     /// installation and validation errors propagate. Parent sync and cleanup
-    /// are best-effort. This replacement-capable fallback is not for upgrades.
+    /// are best-effort.
     fn install_descriptor_temp(
         temporary: &Path,
         path: &Path,
@@ -422,10 +486,13 @@ impl DatabaseLayout {
                 // Some filesystems do not support hard links (and some report
                 // that as `PermissionDenied`). The source is a fully synced
                 // sibling temp and first-create bytes are deterministic, so
-                // same-directory rename is a safe atomic install fallback. Any
-                // other error is a real fault and is propagated below. Version
-                // upgrades use a separate path and must not rely on this
-                // replace-capable fallback.
+                // same-directory rename is an atomic install fallback. The seed
+                // is random, so never replace a descriptor another opener has
+                // already installed (checked above). Any other error is a real
+                // fault and is propagated below.
+                if path.exists() {
+                    return Self::validate_existing_descriptor(path);
+                }
                 match fs::rename(temporary, path) {
                     Ok(()) => {
                         Self::sync_descriptor_parent(path);
@@ -493,129 +560,7 @@ impl DatabaseLayout {
     /// Propagates read errors and returns `InvalidData` for an unrecognized
     /// descriptor.
     fn validate_existing_descriptor(path: &Path) -> io::Result<()> {
-        let contents = fs::read(path)?;
-        if validate_db_meta(&contents) {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unrecognized mtxdb database descriptor: {}", path.display()),
-            ))
-        }
-    }
-
-    /// Replace a recognized legacy descriptor with the current pool list.
-    ///
-    /// Waits for the upgrade lock and succeeds without replacement if another
-    /// opener already upgraded it. Lock, read, write, file-sync, and replacement
-    /// errors propagate; an unrecognized descriptor returns `InvalidData`.
-    /// Parent-directory sync and temporary-file cleanup are best-effort.
-    fn upgrade_descriptor(path: &Path) -> io::Result<()> {
-        let lock_path = path.with_file_name(".db.meta.upgrade.lock");
-        let _upgrade_lock = loop {
-            match crate::shard::ShardPool::acquire_lock_path(&lock_path) {
-                Ok(lock) => break lock,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error),
-            }
-        };
-
-        // Another opener may have completed the replacement while we waited
-        // for the lock. Never replace a current descriptor with a second
-        // upgrade attempt.
-        let contents = fs::read(path)?;
-        if validate_db_meta(&contents) {
-            Self::sweep_descriptor_temps(path, "upgrade");
-            return Ok(());
-        }
-        if !is_legacy_db_meta(&contents) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("descriptor changed during upgrade: {}", path.display()),
-            ));
-        }
-
-        let (temporary, file) = loop {
-            let suffix = UPGRADE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let name = format!(
-                ".{}.upgrade.{}.{}",
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("db.meta"),
-                std::process::id(),
-                suffix,
-            );
-            let temporary = path.with_file_name(name);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-            {
-                Ok(file) => break (temporary, file),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        };
-
-        let _temporary_guard = TempFileGuard::new(temporary.clone());
-        // Close the temp before the guard attempts cleanup on Windows.
-        let mut file = file;
-        file.write_all(&db_meta_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        atomic_replace_file(&temporary, path)?;
-        // The file contents were synced before replacement. Parent sync is
-        // best-effort on filesystems that do not support directory fsync.
-        Self::sync_descriptor_parent(path);
-        // The upgrade lock excludes active upgraders while orphan temps are
-        // reaped; failures here are cleanup-only and never fail initialization.
-        Self::sweep_descriptor_temps(path, "upgrade");
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
-}
-
-#[cfg(windows)]
-fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn ReplaceFileW(
-            replaced_file_name: *const u16,
-            replacement_file_name: *const u16,
-            backup_file_name: *const u16,
-            replace_flags: u32,
-            exclude: *mut std::ffi::c_void,
-            reserved: *mut std::ffi::c_void,
-        ) -> i32;
-    }
-
-    let replaced: Vec<u16> = to.as_os_str().encode_wide().chain([0]).collect();
-    let replacement: Vec<u16> = from.as_os_str().encode_wide().chain([0]).collect();
-    // SAFETY: both strings are nul-terminated UTF-16 paths owned for the
-    // duration of the call; the optional backup and reserved pointers are
-    // null as permitted by ReplaceFileW.
-    let result = unsafe {
-        ReplaceFileW(
-            replaced.as_ptr(),
-            replacement.as_ptr(),
-            std::ptr::null(),
-            0x00000001, // REPLACEFILE_WRITE_THROUGH
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if result == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+        read_db_meta(path).map(|_| ())
     }
 }
 

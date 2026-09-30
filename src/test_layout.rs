@@ -54,26 +54,65 @@ fn a_descriptor_listing_the_old_pool_names_is_rejected() {
 }
 
 #[test]
-fn upgrades_a_three_pool_descriptor_and_creates_server_info_pool() {
-    let root = test_dir("upgrade_server_info");
+fn pool_seeds_are_nonzero_distinct_and_stable_across_reopens() {
+    let root = test_dir("pool_seeds");
     let layout = DatabaseLayout::open(root.clone()).unwrap();
-    drop(layout);
+    let seeds: Vec<u64> = ShardType::ALL
+        .iter()
+        .map(|t| layout.pool_seed(*t))
+        .collect();
+    assert!(seeds.iter().all(|seed| *seed != 0));
+    let mut unique = seeds.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), seeds.len(), "each pool gets its own seed");
 
-    let meta_path = root.join(DB_META_FILENAME);
-    let mut contents = fs::read(&meta_path).unwrap();
-    let header_len = contents.len() - super::db_meta_pool_list().len();
-    contents.truncate(header_len);
-    contents.extend_from_slice(super::LEGACY_DB_META_POOL_LIST);
-    fs::write(&meta_path, contents).unwrap();
-    fs::remove_dir_all(root.join("pools/mtpl-server-info")).unwrap();
+    let reopened = DatabaseLayout::open(root.clone()).unwrap();
+    let read_only = DatabaseLayout::open_read_only(root.clone()).unwrap();
+    for shard_type in ShardType::ALL {
+        assert_eq!(layout.pool_seed(shard_type), reopened.pool_seed(shard_type));
+        assert_eq!(
+            layout.pool_seed(shard_type),
+            read_only.pool_seed(shard_type)
+        );
+        let dir = layout.pool_dir(shard_type).unwrap();
+        assert_eq!(
+            super::enclosing_pool_seed(&dir).unwrap(),
+            Some(layout.pool_seed(shard_type))
+        );
+    }
 
-    let layout = DatabaseLayout::open(root.clone()).unwrap();
-    assert!(root.join("pools/mtpl-server-info").is_dir());
-    assert_eq!(fs::read(&meta_path).unwrap(), super::db_meta_bytes());
-    assert_eq!(
-        layout.pool_dir(ShardType::ServerInfo).unwrap(),
-        root.join("pools/mtpl-server-info")
+    let other = test_dir("pool_seeds_other");
+    let other_layout = DatabaseLayout::open(other.clone()).unwrap();
+    assert_ne!(
+        layout.pool_seed(ShardType::State),
+        other_layout.pool_seed(ShardType::State),
+        "two roots must not share a seed"
     );
+    assert_eq!(
+        super::enclosing_pool_seed(&root.join("not-a-pool")).unwrap(),
+        None
+    );
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(other);
+}
+
+#[test]
+fn a_zero_seed_or_old_version_descriptor_is_rejected() {
+    let root = test_dir("bad_descriptor");
+    drop(DatabaseLayout::open(root.clone()).unwrap());
+    let meta_path = root.join(DB_META_FILENAME);
+    let good = fs::read(&meta_path).unwrap();
+
+    let mut zero = good.clone();
+    zero[5..13].fill(0);
+    fs::write(&meta_path, zero).unwrap();
+    assert!(DatabaseLayout::open(root.clone()).is_err());
+
+    let mut old = good;
+    old[4] = 2;
+    fs::write(&meta_path, old).unwrap();
+    assert!(DatabaseLayout::open_read_only(root.clone()).is_err());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -113,9 +152,7 @@ fn concurrent_first_open_installs_one_complete_descriptor() {
         worker.join().unwrap();
     }
 
-    assert!(super::validate_db_meta(
-        &fs::read(root.path().join(DB_META_FILENAME)).unwrap()
-    ));
+    assert!(super::parse_db_meta(&fs::read(root.path().join(DB_META_FILENAME)).unwrap()).is_some());
     assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -131,7 +168,7 @@ fn descriptor_install_falls_back_to_rename_when_hard_links_are_unavailable() {
     fs::create_dir_all(root.path()).unwrap();
     let temporary = root.path().join(".db.meta.create.test");
     let descriptor = root.path().join(DB_META_FILENAME);
-    fs::write(&temporary, super::db_meta_bytes()).unwrap();
+    fs::write(&temporary, super::db_meta_bytes(0x1234_5678_9abc_def1)).unwrap();
 
     super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |_, _| {
         Err(std::io::Error::new(
@@ -141,7 +178,7 @@ fn descriptor_install_falls_back_to_rename_when_hard_links_are_unavailable() {
     })
     .unwrap();
 
-    assert!(super::validate_db_meta(&fs::read(&descriptor).unwrap()));
+    assert!(super::parse_db_meta(&fs::read(&descriptor).unwrap()).is_some());
     assert!(!temporary.exists());
 }
 
@@ -151,11 +188,11 @@ fn descriptor_install_accepts_a_temp_swept_by_a_concurrent_opener() {
     fs::create_dir_all(root.path()).unwrap();
     let temporary = root.path().join(".db.meta.create.racing.1");
     let descriptor = root.path().join(DB_META_FILENAME);
-    fs::write(&temporary, super::db_meta_bytes()).unwrap();
+    fs::write(&temporary, super::db_meta_bytes(0x1234_5678_9abc_def1)).unwrap();
 
     super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |temp, target| {
         fs::remove_file(temp)?;
-        fs::write(target, super::db_meta_bytes())?;
+        fs::write(target, super::db_meta_bytes(0x1234_5678_9abc_def1))?;
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "concurrent opener swept the temp after install",
@@ -163,7 +200,7 @@ fn descriptor_install_accepts_a_temp_swept_by_a_concurrent_opener() {
     })
     .unwrap();
 
-    assert!(super::validate_db_meta(&fs::read(&descriptor).unwrap()));
+    assert!(super::parse_db_meta(&fs::read(&descriptor).unwrap()).is_some());
 }
 
 #[test]
@@ -201,7 +238,7 @@ fn read_only_open_never_initializes_a_root() {
 fn rejects_a_descriptor_with_an_unknown_version() {
     let root = test_dir("bad_version");
     fs::create_dir_all(&root).unwrap();
-    let mut bytes = super::db_meta_bytes();
+    let mut bytes = super::db_meta_bytes(0x1234_5678_9abc_def1);
     bytes[4] = super::DB_META_VERSION.wrapping_add(1);
     fs::write(root.join(DB_META_FILENAME), &bytes).unwrap();
     let err = DatabaseLayout::open(root).unwrap_err();
@@ -254,7 +291,11 @@ fn read_only_open_rejects_a_corrupt_descriptor() {
 fn read_only_open_rejects_a_legacy_flat_store() {
     let root = test_dir("read_only_legacy");
     fs::create_dir_all(&root).unwrap();
-    fs::write(root.join(DB_META_FILENAME), super::db_meta_bytes()).unwrap();
+    fs::write(
+        root.join(DB_META_FILENAME),
+        super::db_meta_bytes(0x1234_5678_9abc_def1),
+    )
+    .unwrap();
     fs::write(root.join("shard_0000_0000000000000000.pack"), b"legacy").unwrap();
     let err = DatabaseLayout::open_read_only(root).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -288,7 +329,7 @@ fn a_root_keeps_its_wal_at_the_root() {
 fn a_version_one_descriptor_is_rejected() {
     let root = test_dir("version_one");
     fs::create_dir_all(&root).unwrap();
-    let mut bytes = super::db_meta_bytes();
+    let mut bytes = super::db_meta_bytes(0x1234_5678_9abc_def1);
     bytes[4] = 1;
     bytes[5] = 1; // the old WAL-layout byte
     fs::write(root.join(DB_META_FILENAME), &bytes).unwrap();

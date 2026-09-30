@@ -365,7 +365,9 @@ struct PoolMeta {
 /// unreadable file returns `None` rather than erroring.
 #[must_use]
 pub fn store_created_by_version(base_dir: &Path) -> Option<String> {
-    let data = fs::read(base_dir.join(POOL_META_FILENAME)).ok()?;
+    let Ok(data) = fs::read(base_dir.join(POOL_META_FILENAME)) else {
+        return crate::layout::enclosing_created_by(base_dir);
+    };
     if data.len() < POOL_META_FIXED_LEN || &data[0..4] != b"MTXP" || data[4] != POOL_META_VERSION {
         return None;
     }
@@ -1008,6 +1010,7 @@ impl ShardPool {
     fn initialize_empty_pool(
         base_dir: &Path,
         mut bucket_seed: u64,
+        seed_from_root: bool,
         writable: bool,
     ) -> io::Result<(u64, Duration, Duration)> {
         if !writable {
@@ -1032,7 +1035,9 @@ impl ShardPool {
         }
 
         let t_pool_meta_persist = Instant::now();
-        Self::persist_pool_meta_at_sync_dir(base_dir, bucket_seed, false)?;
+        if !seed_from_root {
+            Self::persist_pool_meta_at_sync_dir(base_dir, bucket_seed, false)?;
+        }
         let pool_meta_persist_time = t_pool_meta_persist.elapsed();
 
         // No pack is created here: an empty pool is just `pool.meta`, and the
@@ -1044,11 +1049,16 @@ impl ShardPool {
 
     /// Restore `bucket_seed` from `pool.meta`. Returns `(bucket_seed,
     /// pool_meta_restore_time)`.
-    fn restore_pool_meta_state(base_dir: &Path) -> io::Result<(u64, Duration)> {
+    fn restore_pool_meta_state(base_dir: &Path) -> io::Result<(u64, bool, Duration)> {
         let started = Instant::now();
+        // A pool inside a database root takes its seed from the root
+        // descriptor and never reads or writes `pool.meta`.
+        if let Some(seed) = crate::layout::enclosing_pool_seed(base_dir)? {
+            return Ok((seed, true, started.elapsed()));
+        }
         let restored_meta = Self::restore_pool_meta(base_dir)?;
         let bucket_seed = restored_meta.map_or(0u64, |meta| meta.bucket_seed);
-        Ok((bucket_seed, started.elapsed()))
+        Ok((bucket_seed, false, started.elapsed()))
     }
 
     /// Restore persisted stats from `shard_stats.bin`. Returns
@@ -1203,11 +1213,13 @@ impl ShardPool {
         // Restore bucket_seed from pool.meta if available. A corrupt pool.meta
         // is a hard error.
         let metadata_started = Instant::now();
-        let (bucket_seed, pool_meta_restore_time) = Self::restore_pool_meta_state(&base_dir)?;
+        let (bucket_seed, seed_from_root, pool_meta_restore_time) =
+            Self::restore_pool_meta_state(&base_dir)?;
 
         let (pool_meta_persist_time, initial_pack_create_time, bucket_seed) =
             if shards.iter().all(std::option::Option::is_none) {
-                let (bs, pmp, ipc) = Self::initialize_empty_pool(&base_dir, bucket_seed, writable)?;
+                let (bs, pmp, ipc) =
+                    Self::initialize_empty_pool(&base_dir, bucket_seed, seed_from_root, writable)?;
                 (pmp, ipc, bs)
             } else {
                 (Duration::ZERO, Duration::ZERO, bucket_seed)

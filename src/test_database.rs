@@ -3130,8 +3130,8 @@ fn files_under(dir: &std::path::Path, out: &mut Vec<String>) {
     }
 }
 
-/// A fresh shared database holds one root lock and one `pool.meta` per pool:
-/// no per-pool `.mtxdb.lock`, no `store.meta`, and no pack until a pool is
+/// A fresh shared database holds one root lock and descriptor: no per-pool
+/// `.mtxdb.lock`, `pool.meta` or `store.meta`, and no pack until a pool is
 /// written.
 #[test]
 fn a_fresh_shared_database_creates_only_the_files_it_needs() {
@@ -3147,7 +3147,7 @@ fn a_fresh_shared_database_creates_only_the_files_it_needs() {
             .is_some_and(|e| e == "pack")),
         "{names:?}"
     );
-    assert_eq!(names.iter().filter(|n| *n == "pool.meta").count(), 4);
+    assert!(!names.iter().any(|n| n == "pool.meta"), "{names:?}");
 
     database
         .pool(ShardType::State)
@@ -3165,4 +3165,46 @@ fn a_fresh_shared_database_creates_only_the_files_it_needs() {
         1,
         "only the written pool gets a pack: {after:?}"
     );
+}
+
+/// Every pool's data reads back through the read-only path workers use, with
+/// the seed derived from `db.meta` and no `pool.meta` on disk.
+#[test]
+fn pools_written_through_a_shared_database_read_back_read_only() {
+    let root = test_root("seed-read-back");
+    let collection = [3u8; 16];
+    {
+        let database = SharedDatabase::open(root.clone()).unwrap();
+        for (index, shard) in ShardType::ALL.into_iter().enumerate() {
+            let id = u8::try_from(index).unwrap().saturating_add(1);
+            let payload = [id; 8];
+            database
+                .pool(shard)
+                .put(
+                    &collection,
+                    &node(id),
+                    &NodeData::new(bytes::Bytes::from(payload.to_vec())),
+                )
+                .unwrap();
+        }
+        database.coordinator().sync().unwrap();
+    }
+    let mut names = Vec::new();
+    files_under(&root, &mut names);
+    assert!(!names.iter().any(|n| n == "pool.meta"), "{names:?}");
+
+    let layout = crate::layout::DatabaseLayout::open_read_only(root.clone()).unwrap();
+    for (index, shard) in ShardType::ALL.into_iter().enumerate() {
+        let id = u8::try_from(index).unwrap().saturating_add(1);
+        let reader =
+            PackfileStorage::open_read_only(layout.pool_dir_read_only(shard).unwrap()).unwrap();
+        assert_eq!(
+            reader
+                .get(&collection, &node(id))
+                .unwrap()
+                .map(|d| d.bytes.to_vec()),
+            Some(vec![id; 8]),
+            "{shard:?}"
+        );
+    }
 }
