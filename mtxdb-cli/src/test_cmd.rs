@@ -1,5 +1,5 @@
 use super::{
-    blake3_digest, build_event_dag, canonical_column_width, cmd_collections, cmd_get,
+    build_event_dag, canonical_column_width, cmd_collections, cmd_get,
     cmd_import_file, cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
     collection_canonical_id, compile_import_template, compute_state_groups_partial,
     decode_event_json_record, decode_hamt_node, decode_hamt_root, decode_mtx_adjacency,
@@ -227,6 +227,7 @@ fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() 
         0,
         &[],
         &[],
+        &[],
     )
     .unwrap();
     let mut report = MetaReport::default();
@@ -259,6 +260,7 @@ fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
         0,
         &[],
         &[],
+        &[],
     )
     .unwrap();
     let mut report = MetaReport::default();
@@ -283,6 +285,7 @@ fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
         mtxdb::index::checkpoint::pack_fingerprint(&[]),
         0,
         0,
+        &[],
         &[],
         &[],
     )
@@ -850,6 +853,7 @@ fn export_envelope_carries_exact_bytes_and_frame_metadata() {
         content_digest: Some([0x44u8; 32]),
         digest_algorithm: DigestAlgorithm::Blake3,
         role: Some(b"event".to_vec()),
+        last_write_lsn: None,
         unknown: vec![(0x7f, vec![0xDE, 0xAD])],
     };
     // Deliberately non-canonical JSON (spaces) so a reserialized payload
@@ -3831,25 +3835,21 @@ fn state_set_merge_takes_first_wins() {
 #[test]
 fn state_set_empty_digest_is_empty_base64url() {
     let s = StateSet::new();
-    let digest = s.digest_base64url();
-    let expected = blake3_digest(&[]);
     assert_eq!(
-        digest,
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected[..])
+        s.digest_base64url(),
+        "IAgj5RWLN3TBG1xhhQradi-CZBRKm-vsPrrFoq3eZ7g"
     );
 }
 
-/// Pins the BLAKE3 state-set digest so switching algorithm (or changing
-/// the `(type, state_key, event_id)` framing) is a visible, deliberate
-/// format break rather than a silent re-identification of every state
-/// group.
+/// Pins the unkeyed LtHash state-group digest so changing the state-group
+/// framing remains a visible, deliberate format break.
 #[test]
 fn state_set_digest_golden_vector() {
     let mut s = StateSet::new();
     s.set("m.room.name", "", "$old".into());
     assert_eq!(
         s.digest_base64url(),
-        "OKDTgyf8lcTKVnc1KyNz-rvgFxdOhu3TM6leFuxVpas"
+        "5R3algqm8kMJV3bPLH_1HE2pvDgb2kzriUo6HfWmlDs"
     );
 }
 

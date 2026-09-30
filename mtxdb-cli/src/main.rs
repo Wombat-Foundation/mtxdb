@@ -1,6 +1,7 @@
 //! CLI for the mtxdb content-addressed storage engine.
 
 mod cmd;
+mod state_hamt;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -347,12 +348,21 @@ fn sub_stats() -> Command {
 
 fn sub_memory() -> Command {
     Command::new("memory")
-        .about("Show or evict mtxdb-owned decoded-node caches")
+        .about("Inspect or evict mtxdb's in-process decoded-node caches")
+        .long_about(
+            "Inspect or evict mtxdb's in-process decoded-node caches.\n\n"
+                .to_owned()
+                + "This reports heap objects decoded by the current mtxdb process only. "
+                + "It does not include durable records, indexes, memory-mapped files, or "
+                + "the operating system's filesystem page cache. A one-shot CLI process "
+                + "starts with an empty decoded-node cache; this is primarily useful to "
+                + "long-lived embedders.",
+        )
         .arg(
             Arg::new("evict")
                 .long("evict")
                 .action(ArgAction::SetTrue)
-                .help("Evict decoded nodes owned by this process; does not flush the OS page cache"),
+                .help("Evict decoded nodes held by this process; does not flush the OS page cache"),
         )
 }
 
