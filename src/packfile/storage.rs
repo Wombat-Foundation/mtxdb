@@ -3934,6 +3934,35 @@ impl PackfileStorage {
         )
     }
 
+    /// Return the decoded-node caches currently resident in this process.
+    pub fn resident_cache_stats(&self) -> ResidentCacheStats {
+        let mut stats = ResidentCacheStats::default();
+        for collection_id in self.collection_ids() {
+            let Some(generation) = self.generation(&collection_id) else {
+                continue;
+            };
+            stats.collections = stats.collections.saturating_add(1);
+            stats.entries = stats.entries.saturating_add(generation.cache.len());
+            stats.hits = stats.hits.saturating_add(generation.cache.hits());
+            stats.misses = stats.misses.saturating_add(generation.cache.misses());
+        }
+        stats
+    }
+
+    /// Evict every decoded node owned by this store. Durable records and the
+    /// operating system's file/page cache are unaffected.
+    pub fn evict_resident_caches(&self) -> usize {
+        let mut evicted = 0usize;
+        for collection_id in self.collection_ids() {
+            let Some(generation) = self.generation(&collection_id) else {
+                continue;
+            };
+            evicted = evicted.saturating_add(generation.cache.len());
+            generation.cache.clear();
+        }
+        evicted
+    }
+
     fn put_mutex(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
         let mut locks = self.put_locks.lock();
         locks.entry(*collection_id).or_default().clone()
@@ -11018,6 +11047,19 @@ pub struct CacheStats {
     pub misses: u64,
     /// Hit rate as a fraction in `[0.0, 1.0]`.
     pub hit_rate: f64,
+}
+
+/// Snapshot of decoded-node caches resident in a live [`PackfileStorage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentCacheStats {
+    /// Number of collections with a live decoded-node cache.
+    pub collections: usize,
+    /// Number of decoded nodes currently held by those caches.
+    pub entries: usize,
+    /// Cumulative cache hits across those collections.
+    pub hits: u64,
+    /// Cumulative cache misses across those collections.
+    pub misses: u64,
 }
 
 /// Point-in-time snapshot of a store's runtime counters and the persisted

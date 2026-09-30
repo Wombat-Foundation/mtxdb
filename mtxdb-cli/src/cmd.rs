@@ -260,6 +260,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Info { .. } => "info",
         Commands::Sync { .. } => "sync",
         Commands::Stats { .. } => "stats",
+        Commands::Memory { .. } => "memory",
         Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
         Commands::Export { .. } => "export",
@@ -332,6 +333,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
+        Commands::Memory { evict } => cmd_memory(cli, *evict),
         Commands::Meta {
             target,
             json,
@@ -2848,6 +2850,54 @@ fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
         }
     }
     run_multi_dir(cli, |sub_cli| cmd_stats_single(sub_cli, json))
+}
+
+fn cmd_memory(cli: &Cli, evict: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_memory_single(sub_cli, evict))
+}
+
+fn cmd_memory_single(cli: &Cli, evict: bool) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let selected = cli.shard_type;
+    let mut reported = false;
+
+    for shard_type in cli.shard_types() {
+        let pool = if selected.is_some() {
+            Some(pool_dir(&layout, shard_type)?)
+        } else {
+            existing_pool_dir(&layout, shard_type)?
+        };
+        let Some(pool) = pool else {
+            continue;
+        };
+        let store = PackfileStorage::open_read_only(pool).context("failed to open store")?;
+        let before = store.resident_cache_stats();
+        let evicted = if evict {
+            store.evict_resident_caches()
+        } else {
+            0
+        };
+        let after = store.resident_cache_stats();
+        println!(
+            "{}: collections={}, entries={}{} hits={}, misses={}",
+            shard_type.as_str(),
+            after.collections,
+            after.entries,
+            if evict {
+                format!(", evicted={evicted}, before={}", before.entries)
+            } else {
+                String::new()
+            },
+            after.hits,
+            after.misses
+        );
+        reported = true;
+    }
+
+    if !reported && selected.is_none() {
+        bail!("no shard pools found")
+    }
+    Ok(())
 }
 
 #[allow(

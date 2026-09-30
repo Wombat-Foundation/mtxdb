@@ -112,6 +112,9 @@ pub(crate) enum Commands {
     Stats {
         json: bool,
     },
+    Memory {
+        evict: bool,
+    },
     Meta {
         target: String,
         json: bool,
@@ -243,6 +246,7 @@ fn build_cli() -> Command {
         .subcommand(sub_shards())
         .subcommand(sub_collections())
         .subcommand(sub_stats())
+        .subcommand(sub_memory())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
@@ -338,6 +342,17 @@ fn sub_stats() -> Command {
                 .long("json")
                 .action(ArgAction::SetTrue)
                 .help("Emit machine-readable JSON instead of a table"),
+        )
+}
+
+fn sub_memory() -> Command {
+    Command::new("memory")
+        .about("Show or evict mtxdb-owned decoded-node caches")
+        .arg(
+            Arg::new("evict")
+                .long("evict")
+                .action(ArgAction::SetTrue)
+                .help("Evict decoded nodes owned by this process; does not flush the OS page cache"),
         )
 }
 
@@ -986,6 +1001,9 @@ fn parse_cli() -> Cli {
         },
         Some(("stats", m)) => Commands::Stats {
             json: m.get_flag("json"),
+        },
+        Some(("memory", m)) => Commands::Memory {
+            evict: m.get_flag("evict"),
         },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),
