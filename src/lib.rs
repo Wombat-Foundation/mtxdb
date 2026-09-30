@@ -54,6 +54,8 @@ pub mod state_group;
 pub mod storage;
 /// Executable policy primitives for application collection templates.
 pub mod template;
+/// Persisted, ordered timeline index with copy-on-write roots.
+pub mod timeline;
 
 pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
@@ -104,4 +106,8 @@ pub use template::{
     MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT,
     MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH, NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_FWD,
     NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
+};
+pub use timeline::{
+    timeline_collection_id, EventRef, TimelineCursor, TimelineEntry, TimelineIndex, TimelinePage,
+    TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
 };
