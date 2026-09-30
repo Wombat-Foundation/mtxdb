@@ -1488,18 +1488,24 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
     writeln!(out, "// room prefix: 0x{}", hex::encode(room_prefix)).unwrap();
-    writeln!(out, "// room ID: {room_id:?}").unwrap();
-    writeln!(out, "// root node id: 0x{}", hex::encode(root_hash)).unwrap();
+    writeln!(out, "// room ID: {room_id}").unwrap();
+    writeln!(
+        out,
+        "// root MTHN node id: 0x{}",
+        hex::encode(&root_hash[..16])
+    )
+    .unwrap();
+    writeln!(out, "// root node id: 0x{}", hex::encode(&root_hash[..16])).unwrap();
     writeln!(out, "// lattice: {LATTICE_LEN} bytes (1024 u16 lanes)").unwrap();
     writeln!(
         out,
-        "// state-group id (LtHash): {}",
+        "// state-group id (LtHash): 0x{}",
         hex::encode(state_group_id)
     )
     .unwrap();
     writeln!(
         out,
-        "// lattice digest (BLAKE3): {}",
+        "// logical digest (BLAKE3): 0x{}",
         hex::encode(lattice_digest)
     )
     .unwrap();
@@ -1610,8 +1616,8 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
         let hash = &bytes[start..start + HASH_LEN];
         writeln!(
             out,
-            "  child[{child_index}] slot={slot}: node_id=0x{}",
-            hex::encode(hash)
+            "  child[{child_index}] slot={slot}: node_id: 0x{}",
+            hex::encode(&hash[..16])
         )
         .unwrap();
         child_index += 1;
@@ -2575,7 +2581,7 @@ fn print_pack_physical_layout(
         let largest = stats.map_or(0, |stats| stats.largest_segment_bytes);
         println!(
             "{}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
-            pack_id.filename_stem(),
+            format!("0x{}", &pack_id.as_hex()[..16]),
             fmt_bytes(largest)
         );
     }
@@ -2800,9 +2806,9 @@ fn cmd_shards_coalesced(
                 "{:<db_width$}  {:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
                 row.db_label,
                 format!(
-                    "{}{}",
-                    row.pack_id.filename_stem(),
-                    if row.is_active { "*" } else { " " }
+                    "0x{}{}",
+                    &row.pack_id.as_hex()[..16],
+                    if row.is_active { " *" } else { "  " }
                 ),
                 row.version,
                 fmt_bytes(row.file_bytes),
@@ -3936,13 +3942,9 @@ fn print_shard_table(
         println!(
             "{:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
             format!(
-                "{}{}",
-                pack_id.filename_stem(),
-                if active_pack_id == Some(pack_id) {
-                    "*"
-                } else {
-                    " "
-                }
+                "0x{}{}",
+                &pack_id.as_hex()[..16],
+                if active_pack_id == Some(pack_id) { " *" } else { "  " }
             ),
             version,
             fmt_bytes(file_bytes),

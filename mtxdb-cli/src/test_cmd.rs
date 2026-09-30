@@ -2820,7 +2820,7 @@ fn hamt_state_group_root() {
     assert!(text.contains(room_id));
     assert!(text.contains("abababababababab"));
     assert!(text.contains("2048 bytes"));
-    assert!(text.contains("lattice digest (BLAKE3): "));
+    assert!(text.contains("logical digest (BLAKE3): "));
 }
 
 #[test]
