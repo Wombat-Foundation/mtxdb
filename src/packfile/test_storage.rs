@@ -10275,20 +10275,46 @@ fn with_read_snapshot_scopes_the_pin_to_the_callback() {
     let store = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
     store.enable_read_journal(&wal).unwrap();
 
-    let read = store
-        .with_read_snapshot(|snapshot| {
-            let read = snapshot.get_many(&[(&collection, &[key]), (&other, &[other_key])])?;
-            Ok((
-                read[0][0].as_ref().unwrap().bytes.clone(),
-                read[1][0].as_ref().unwrap().bytes.clone(),
-            ))
-        })
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let callback_store = std::sync::Arc::clone(&store);
+    let callback_entered = std::sync::Arc::clone(&entered);
+    let callback_release = std::sync::Arc::clone(&release);
+    let callback = std::thread::spawn(move || {
+        callback_store
+            .with_read_snapshot(|snapshot| {
+                let first = snapshot.get(&collection, &[key])?;
+                callback_entered.wait();
+                callback_release.wait();
+                let second = snapshot.get(&collection, &[key])?;
+                Ok((
+                    first[0].as_ref().unwrap().bytes.clone(),
+                    second[0].as_ref().unwrap().bytes.clone(),
+                ))
+            })
+            .unwrap()
+    });
+
+    // Publish after the first read but before the second. The callback must
+    // remain pinned to its original boundary and see the old value twice.
+    entered.wait();
+    let (mut writer, _) = Journal::open(&wal).unwrap();
+    writer
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: key,
+            payload: b"new".to_vec(),
+        }])
         .unwrap();
+    drop(writer);
+    release.wait();
+
+    let read = callback.join().unwrap();
     assert_eq!(read.0.as_ref(), b"scoped");
-    assert_eq!(read.1.as_ref(), b"other");
+    assert_eq!(read.1.as_ref(), b"scoped");
 
     // The pin is released once the callback returns.
     let fresh = store.get_read_committed(&collection, &[key]).unwrap();
-    assert_eq!(fresh[0].as_ref().unwrap().bytes.as_ref(), b"scoped");
+    assert_eq!(fresh[0].as_ref().unwrap().bytes.as_ref(), b"new");
     let _ = fs::remove_dir_all(&dir);
 }
