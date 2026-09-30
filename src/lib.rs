@@ -51,6 +51,9 @@ pub mod packfile;
 pub mod record_class;
 /// Fixed-size shard file pool that packfiles are written into.
 pub mod shard;
+/// Room-scoped dense `u32` short ids and compact adjacency lists.
+#[cfg(feature = "multi-reader")]
+pub mod short_id;
 /// Matrix state-group instance identity and record layout.
 pub mod state_group;
 /// Core node/storage types and the top-level `StorageEngine`.
@@ -62,6 +65,8 @@ pub mod timeline;
 
 #[cfg(all(test, feature = "multi-reader"))]
 mod test_logical_head;
+#[cfg(all(test, feature = "multi-reader"))]
+mod test_short_id;
 
 pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
