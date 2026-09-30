@@ -10232,3 +10232,63 @@ fn read_snapshot_survives_reclaiming_the_group_it_applied() {
     drop(writer);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `with_read_snapshot` scopes the pin to the callback: reads inside see one
+/// boundary, and the pin is released before the call returns.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn with_read_snapshot_scopes_the_pin_to_the_callback() {
+    let dir = test_dir("with_read_snapshot");
+    let wal = dir.join("wal.bin");
+    let collection = [0x67u8; 16];
+    let other = [0x68u8; 16];
+    let key = distinct_id(0x07);
+    let other_key = distinct_id(0x08);
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x92u8; 16],
+        &[0x92u8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[
+            JournalMutation::Put {
+                collection_id: collection,
+                node_id: key,
+                payload: b"scoped".to_vec(),
+            },
+            JournalMutation::Put {
+                collection_id: other,
+                node_id: other_key,
+                payload: b"other".to_vec(),
+            },
+        ])
+        .unwrap();
+    drop(journal);
+
+    let store = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    store.enable_read_journal(&wal).unwrap();
+
+    let read = store
+        .with_read_snapshot(|snapshot| {
+            let read = snapshot.get_many(&[(&collection, &[key]), (&other, &[other_key])])?;
+            Ok((
+                read[0][0].as_ref().unwrap().bytes.clone(),
+                read[1][0].as_ref().unwrap().bytes.clone(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(read.0.as_ref(), b"scoped");
+    assert_eq!(read.1.as_ref(), b"other");
+
+    // The pin is released once the callback returns.
+    let fresh = store.get_read_committed(&collection, &[key]).unwrap();
+    assert_eq!(fresh[0].as_ref().unwrap().bytes.as_ref(), b"scoped");
+    let _ = fs::remove_dir_all(&dir);
+}

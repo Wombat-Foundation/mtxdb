@@ -1453,6 +1453,23 @@ impl PackfileStorage {
             incarnation,
         })
     }
+
+    /// Run `read` against a snapshot pinned for the whole callback.
+    ///
+    /// This is the Rust-only lexical form of [`Self::read_snapshot`]: the
+    /// snapshot is passed by reference, so it cannot escape the closure and its
+    /// boundary cannot be released early. Cross-call and Python-visible callers
+    /// use the owned [`ReadSnapshot`] handle instead.
+    ///
+    /// # Errors
+    /// Propagates snapshot-capture failures and whatever `read` returns.
+    pub fn with_read_snapshot<R>(
+        self: &Arc<Self>,
+        read: impl FnOnce(&ReadSnapshot) -> Result<R, StorageError>,
+    ) -> Result<R, StorageError> {
+        let snapshot = self.read_snapshot()?;
+        read(&snapshot)
+    }
 }
 
 impl ReadSnapshot {
