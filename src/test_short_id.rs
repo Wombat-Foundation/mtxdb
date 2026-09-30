@@ -398,3 +398,45 @@ fn concurrent_writers_are_idempotent_and_never_overwrite() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn lookup_never_allocates() {
+    let root = test_root("lookup");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    assert_eq!(index().lookup(&db, b"$a").unwrap(), None);
+    // A miss left no trace: the first real allocation still gets id 1.
+    assert_eq!(index().get_or_create(&db, &[b"$a"]).unwrap(), vec![1]);
+    assert_eq!(index().lookup(&db, b"$a").unwrap(), Some(1));
+    assert_eq!(index().lookup(&db, b"$b").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_lowered_max_id_refuses_inside_the_transaction() {
+    let root = test_root("max-id");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let small = index().with_max_id(3);
+    assert_eq!(
+        small.get_or_create(&db, &[b"$a", b"$b", b"$c"]).unwrap(),
+        vec![1, 2, 3]
+    );
+    // A batch that would cross the limit is refused whole: the new key past the
+    // limit is not published, and neither is the key before it in the batch.
+    let error = small.get_or_create(&db, &[b"$d", b"$e"]).unwrap_err();
+    assert!(matches!(error, StorageError::Internal(_)), "{error}");
+    assert_eq!(small.lookup(&db, b"$d").unwrap(), None);
+    assert_eq!(small.lookup(&db, b"$e").unwrap(), None);
+    // Existing ids still resolve and re-asking for them still works.
+    assert_eq!(small.get_or_create(&db, &[b"$c"]).unwrap(), vec![3]);
+    // The limit cannot be raised above the hard ceiling.
+    assert_eq!(
+        index()
+            .with_max_id(u32::MAX)
+            .get_or_create(&db, &[b"$z"])
+            .unwrap(),
+        vec![4]
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}

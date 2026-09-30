@@ -291,6 +291,7 @@ impl ShortIdVerifyReport {
 pub struct ShortIdIndex {
     pool: ShardType,
     collection_id: [u8; 16],
+    max_id: u32,
 }
 
 impl ShortIdIndex {
@@ -300,7 +301,17 @@ impl ShortIdIndex {
         Self {
             pool,
             collection_id,
+            max_id: SHORT_ID_MAX,
         }
+    }
+
+    /// Lower the largest id this scope may allocate (at most [`SHORT_ID_MAX`]),
+    /// for consumers whose ids must fit a narrower type. Reaching it is a hard
+    /// error inside the allocation transaction, so nothing is published.
+    #[must_use]
+    pub fn with_max_id(mut self, max_id: u32) -> Self {
+        self.max_id = max_id.min(SHORT_ID_MAX);
+        self
     }
 
     /// Look up or allocate the short id of every key, in order.
@@ -315,6 +326,30 @@ impl ShortIdIndex {
         keys: &[&[u8]],
     ) -> Result<Vec<u32>, StorageError> {
         self.write_with_retry(db, keys, None).map(|(ids, _)| ids)
+    }
+
+    /// The short id of `key` if it has one; never allocates.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure, a corrupt record, or a hash collision
+    /// with a different key.
+    pub fn lookup(&self, db: &SharedDatabase, key: &[u8]) -> Result<Option<u32>, StorageError> {
+        let txn = db.begin_transaction();
+        let (records, _) =
+            txn.get_with_record_versions(self.pool, &self.collection_id, &[forward_id(key)])?;
+        match records.into_iter().next().flatten() {
+            None => Ok(None),
+            Some(record) => {
+                let (short_id, stored_key) = decode_forward(&record.bytes)?;
+                if stored_key == key {
+                    Ok(Some(short_id))
+                } else {
+                    Err(StorageError::Collision(
+                        "short-id key hash collision between different keys".to_owned(),
+                    ))
+                }
+            }
+        }
     }
 
     /// Allocate ids for `owner` and every edge target, then store each family's
@@ -599,7 +634,7 @@ impl ShortIdIndex {
             } else if let Some(short_id) = seen.get(key) {
                 allocation.ids.push(*short_id);
             } else {
-                if next > SHORT_ID_MAX {
+                if next > self.max_id {
                     return Err(StorageError::Internal(
                         "short-id space exhausted for this scope".to_owned(),
                     ));
