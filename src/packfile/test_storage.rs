@@ -10368,3 +10368,85 @@ fn read_snapshot_pin_and_lock_wait_are_timed() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A snapshot reports each record's durable group token: records written in the
+/// same journal group share it, and a later group advances it.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_snapshot_reports_the_durable_group_token() {
+    let dir = test_dir("read_snapshot_record_versions");
+    let wal = dir.join("wal.bin");
+    let collection = [0x6bu8; 16];
+    let other = [0x6cu8; 16];
+    let key = distinct_id(0x0b);
+    let other_key = distinct_id(0x0c);
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x8fu8; 16],
+        &[0x8fu8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[
+            JournalMutation::Put {
+                collection_id: collection,
+                node_id: key,
+                payload: b"v".to_vec(),
+            },
+            JournalMutation::Put {
+                collection_id: other,
+                node_id: other_key,
+                payload: b"w".to_vec(),
+            },
+        ])
+        .unwrap();
+    drop(journal);
+
+    let store = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    store.enable_read_journal(&wal).unwrap();
+
+    let snapshot = store.read_snapshot().unwrap();
+    let (data, versions) = snapshot
+        .get_with_record_versions(&collection, &[key])
+        .unwrap();
+    let (other_data, other_versions) = snapshot
+        .get_with_record_versions(&other, &[other_key])
+        .unwrap();
+    assert!(data[0].is_some() && other_data[0].is_some());
+    assert!(
+        versions[0] > 0,
+        "a committed group must yield a durable token"
+    );
+    assert!(
+        other_versions[0] > 0,
+        "the second record's token must also be durable"
+    );
+    drop(snapshot);
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: key,
+            payload: b"v2".to_vec(),
+        }])
+        .unwrap();
+    drop(journal);
+
+    let snapshot = store.read_snapshot().unwrap();
+    let (_, later) = snapshot
+        .get_with_record_versions(&collection, &[key])
+        .unwrap();
+    assert!(
+        later[0] > versions[0],
+        "a later group must advance the token"
+    );
+    drop(snapshot);
+    let _ = fs::remove_dir_all(&dir);
+}

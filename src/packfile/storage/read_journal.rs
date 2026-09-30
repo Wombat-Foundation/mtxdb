@@ -1423,6 +1423,51 @@ impl PackfileStorage {
         }
         Ok(Some(versions))
     }
+
+    /// Resolve the durable write token for each record of a snapshot read.
+    ///
+    /// The token is the LSN of the journal group that last wrote the record:
+    /// the pinned overlay carries it directly, and a record served from the
+    /// durable index is seeded from its frame's `last_write_lsn` tag. This is
+    /// the ordered commit token a caller needs to make a record-versioned read
+    /// authoritative without a second authority, and unlike the coordinator map
+    /// it is available to a read-only worker. A record resolved absent by a
+    /// collection delete reports the delete LSN; an absent or legacy record
+    /// reports `0`.
+    fn snapshot_record_versions(
+        &self,
+        overlay: Option<&ReadJournal>,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+        data: &[Option<NodeData>],
+    ) -> Result<Vec<u64>, StorageError> {
+        let mut versions = vec![0u64; ids.len()];
+        if let Some(overlay) = overlay {
+            if let Some(committed) = overlay.puts.get(collection_id) {
+                for (index, id) in ids.iter().enumerate() {
+                    if let Some((_, lsn)) = committed.get(id) {
+                        versions[index] = *lsn;
+                    }
+                }
+            }
+            if let Some(delete_lsn) = overlay.delete_lsn.get(collection_id) {
+                for (index, _) in ids.iter().enumerate() {
+                    if data[index].is_none() && versions[index] == 0 {
+                        versions[index] = *delete_lsn;
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "multi-reader")]
+        for (index, id) in ids.iter().enumerate() {
+            if versions[index] == 0 && data[index].is_some() {
+                versions[index] = self.record_last_write_lsn(collection_id, id)?.unwrap_or(0);
+            }
+        }
+        #[cfg(not(feature = "multi-reader"))]
+        let _ = data;
+        Ok(versions)
+    }
 }
 
 /// A read-only view pinned to one journal boundary, taken by
@@ -1580,6 +1625,39 @@ impl ReadSnapshot {
         self.check_publication()?;
         self.check_journal_lsn()?;
         result
+    }
+
+    /// Read one collection at this snapshot's boundary, returning each record's
+    /// durable write token alongside it.
+    ///
+    /// The token is the LSN of the journal group that last wrote the record (or
+    /// the delete LSN for a record resolved absent by a collection delete, or
+    /// `0` for a legacy frame with none). Two records committed in the same
+    /// group share a token, so a caller can pair a room's metadata with the
+    /// generation-scoped FWD collection it names and compare one authoritative
+    /// publication token instead of a separate SQL source version.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub fn get_with_record_versions(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, Vec<u64>), StorageError> {
+        self.check_publication()?;
+        self.check_journal_lsn()?;
+        let data =
+            self.storage
+                .read_snapshot_collection(self.overlay.as_ref(), collection_id, ids)?;
+        let versions = self.storage.snapshot_record_versions(
+            self.overlay.as_ref(),
+            collection_id,
+            ids,
+            &data,
+        )?;
+        self.check_publication()?;
+        self.check_journal_lsn()?;
+        Ok((data, versions))
     }
 
     /// Read several collections at this snapshot's boundary, in order.
