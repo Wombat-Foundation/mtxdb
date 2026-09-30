@@ -116,6 +116,16 @@ zstd = ["dep:zstd", "dep:zstd-sys"]
 # "process model" entries for the deployment-shape reasoning.
 multi-reader = []
 
+# Roaring-backed `u32` bitmap sets (`bitmap_set`): generic set algebra over
+# domain-tagged ordinal spaces, for auth-chain closures and other large or
+# frequently-intersected index sets (membership intersections, relation
+# fan-out, candidate sets, query AND/OR/NOT). Off by default; carries the
+# `roaring` dependency. Set algebra is pure computation needing no
+# transactions, so this is independent of `multi-reader`; only persistence
+# (the auth-closure builder) needs both features. See
+# docs/docs/auth-chain-closures-plan.md.
+bitmaps = ["dep:roaring"]
+
 [dependencies]
 arc-swap = "1"
 blake3 = "=1.5.5"
@@ -124,6 +134,7 @@ crc32fast = "1.4"
 fs2 = "0.4"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
+roaring = { version = "0.10.12", optional = true }
 sha2 = "0.10"
 zstd = { version = "0.13", default-features = false, optional = true }
 

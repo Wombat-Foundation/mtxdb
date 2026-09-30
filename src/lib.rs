@@ -14,6 +14,9 @@
 
 /// Named application-owned lookup indexes sharing the normal packfile engine.
 pub mod auxiliary;
+/// Domain-tagged `u32` bitmap sets with generic set algebra.
+#[cfg(feature = "bitmaps")]
+pub mod bitmap_set;
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
 pub mod cache;
 /// Persisted closure generations published through a logical head.
@@ -77,10 +80,14 @@ mod test_logical_head;
 mod test_matrix_adjacency;
 #[cfg(all(test, feature = "multi-reader"))]
 mod test_short_id;
+#[cfg(all(test, feature = "bitmaps"))]
+mod test_bitmap_set;
 
 pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
 };
+#[cfg(feature = "bitmaps")]
+pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
 pub use cache::NodeCache;
 #[cfg(feature = "multi-reader")]
 pub use database::{
