@@ -268,9 +268,12 @@ impl ReadJournal {
     /// overlay, or a worker whose sidecar was unavailable). A restart installs
     /// a fresh epoch, so a change names a different writer incarnation.
     pub(super) fn publish_epoch(&self) -> Option<u64> {
-        self.publish_signal
-            .as_ref()
-            .map(|signal| signal.snapshot().0)
+        self.publish_token().map(|token| token.0)
+    }
+
+    /// The current writer incarnation and publication revision.
+    pub(super) fn publish_token(&self) -> Option<(u64, u64)> {
+        self.publish_signal.as_ref().map(|signal| signal.snapshot())
     }
 
     /// Create an unscanned overlay whose durable index covers LSNs through
@@ -1440,6 +1443,8 @@ pub struct ReadSnapshot {
     overlay: parking_lot::ArcMutexGuard<parking_lot::RawMutex, Option<ReadJournal>>,
     boundary: u64,
     incarnation: Option<u64>,
+    publish_token: Option<(u64, u64)>,
+    captured_lsn: u64,
     /// Set only while timing is enabled; observed into
     /// `read_snapshot_pin_latency` on drop.
     pin_started: Option<std::time::Instant>,
@@ -1469,6 +1474,8 @@ impl PackfileStorage {
             None => self.durable_read_boundary(),
         };
         let incarnation = overlay.as_ref().and_then(ReadJournal::publish_epoch);
+        let publish_token = overlay.as_ref().and_then(ReadJournal::publish_token);
+        let captured_lsn = overlay.as_ref().map_or(0, |value| value.observed_lsn);
         let pin_started = self
             .stats_enabled
             .load(Ordering::Relaxed)
@@ -1478,6 +1485,8 @@ impl PackfileStorage {
             overlay,
             boundary,
             incarnation,
+            publish_token,
+            captured_lsn,
             pin_started,
         })
     }
@@ -1518,20 +1527,36 @@ impl ReadSnapshot {
         self.incarnation
     }
 
-    /// Fail closed if the writer restarted since the snapshot was captured.
-    /// The pinned overlay cannot observe the restart itself, so a changed
-    /// epoch must be surfaced rather than silently reading a stale view.
-    fn check_incarnation(&self) -> Result<(), StorageError> {
-        let Some(expected) = self.incarnation else {
+    /// Fail closed if any publication or writer restart occurred since the
+    /// snapshot was captured. The pinned overlay cannot observe the publication
+    /// itself, so a changed signal must be surfaced rather than returning a
+    /// mixed metadata/FWD view.
+    fn check_publication(&self) -> Result<(), StorageError> {
+        let Some(expected) = self.publish_token else {
             return Ok(());
         };
-        let current = self.overlay.as_ref().and_then(ReadJournal::publish_epoch);
-        if current == Some(expected) {
+        let current = self.overlay.as_ref().and_then(ReadJournal::publish_token);
+        if current != Some(expected) {
+            return Err(StorageError::WouldBlock(format!(
+                "publication changed during the snapshot (was {expected:?}, now {current:?}); \
+                 retry the read"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_journal_lsn(&self) -> Result<(), StorageError> {
+        if self.publish_token.is_some() {
+            return Ok(());
+        }
+        let current = PackfileStorage::read_journal_lsn(&self.storage.base_dir);
+        if current <= self.captured_lsn {
             Ok(())
         } else {
             Err(StorageError::WouldBlock(format!(
-                "writer incarnation changed during the snapshot (was {expected}, now {current:?}); \
-                 retry the read"
+                "journal advanced during the snapshot (was {}, now {current}); \
+                 retry the read",
+                self.captured_lsn
             )))
         }
     }
@@ -1547,9 +1572,14 @@ impl ReadSnapshot {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
-        self.check_incarnation()?;
-        self.storage
-            .read_snapshot_collection(self.overlay.as_ref(), collection_id, ids)
+        self.check_publication()?;
+        self.check_journal_lsn()?;
+        let result =
+            self.storage
+                .read_snapshot_collection(self.overlay.as_ref(), collection_id, ids);
+        self.check_publication()?;
+        self.check_journal_lsn()?;
+        result
     }
 
     /// Read several collections at this snapshot's boundary, in order.
