@@ -72,6 +72,8 @@ pub mod template;
 /// Persisted, ordered timeline index with copy-on-write roots.
 pub mod timeline;
 
+#[cfg(all(test, feature = "bitmaps"))]
+mod test_bitmap_set;
 #[cfg(all(test, feature = "multi-reader"))]
 mod test_closure_store;
 #[cfg(all(test, feature = "multi-reader"))]
@@ -80,8 +82,6 @@ mod test_logical_head;
 mod test_matrix_adjacency;
 #[cfg(all(test, feature = "multi-reader"))]
 mod test_short_id;
-#[cfg(all(test, feature = "bitmaps"))]
-mod test_bitmap_set;
 
 pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,

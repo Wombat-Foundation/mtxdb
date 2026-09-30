@@ -188,7 +188,6 @@ impl BitmapSet {
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] if the domains differ.
-    #[must_use]
     pub fn union(&self, other: &Self) -> Result<Self, StorageError> {
         self.check_domain(other)?;
         Ok(Self {
@@ -201,7 +200,6 @@ impl BitmapSet {
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] if the domains differ.
-    #[must_use]
     pub fn intersection(&self, other: &Self) -> Result<Self, StorageError> {
         self.check_domain(other)?;
         Ok(Self {
@@ -214,7 +212,10 @@ impl BitmapSet {
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] if the domains differ.
-    #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "`-` is bitmap set difference, not integer arithmetic"
+    )]
     pub fn difference(&self, other: &Self) -> Result<Self, StorageError> {
         self.check_domain(other)?;
         Ok(Self {
@@ -259,7 +260,9 @@ impl BitmapSet {
         let bitmap = RoaringBitmap::deserialize_from(&mut payload)
             .map_err(|error| StorageError::Corrupt(format!("bitmap-set payload: {error}")))?;
         if !payload.is_empty() {
-            return Err(StorageError::Corrupt("bitmap-set trailing bytes".to_owned()));
+            return Err(StorageError::Corrupt(
+                "bitmap-set trailing bytes".to_owned(),
+            ));
         }
         Ok(Self {
             domain: DomainTag::new(domain),
