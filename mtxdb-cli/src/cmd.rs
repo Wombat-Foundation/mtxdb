@@ -1489,7 +1489,7 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
     writeln!(out, "// room prefix: 0x{}", hex::encode(room_prefix)).unwrap();
     writeln!(out, "// room ID: {room_id:?}").unwrap();
-    writeln!(out, "// root hash: {}...", hex::encode(&root_hash[..8])).unwrap();
+    writeln!(out, "// root node id: 0x{}", hex::encode(root_hash)).unwrap();
     writeln!(out, "// lattice: {LATTICE_LEN} bytes (1024 u16 lanes)").unwrap();
     writeln!(
         out,
@@ -1610,8 +1610,8 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
         let hash = &bytes[start..start + HASH_LEN];
         writeln!(
             out,
-            "  child[{child_index}] slot={slot}: {}...",
-            hex::encode(&hash[..8])
+            "  child[{child_index}] slot={slot}: node_id=0x{}",
+            hex::encode(hash)
         )
         .unwrap();
         child_index += 1;
@@ -2414,27 +2414,58 @@ fn cmd_collections_in_dir(
     }
     println!();
     if layout {
+        if canonical {
+            println!(
+                "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                "total",
+                "",
+                total_nodes,
+                "",
+                "",
+                if disk_known {
+                    fmt_disk_megabytes(total_disk_bytes)
+                } else {
+                    "?".to_owned()
+                },
+                "",
+                "",
+                ""
+            );
+        } else {
+            println!(
+                "  {:<34}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                "total",
+                total_nodes,
+                "",
+                "",
+                if disk_known {
+                    fmt_disk_megabytes(total_disk_bytes)
+                } else {
+                    "?".to_owned()
+                },
+                "",
+                "",
+                ""
+            );
+        }
+    } else if canonical {
         println!(
-            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "  {:<34}  {:<canonical_field_width$}  {total_nodes:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
             "total",
             "",
-            total_nodes,
             "",
             "",
+            fmt_index_kilobytes(total_memory),
             if disk_known {
                 fmt_disk_megabytes(total_disk_bytes)
             } else {
                 "?".to_owned()
             },
-            "",
-            "",
-            ""
         );
     } else {
         println!(
-            "  {:<34}  {:<canonical_field_width$}  {total_nodes:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
+            "  {:<34}  {total_nodes:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
             "total",
-            "",
             "",
             "",
             fmt_index_kilobytes(total_memory),
