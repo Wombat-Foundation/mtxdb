@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 const POOL: ShardType = ShardType::Edges;
 const SCOPE: [u8; 16] = [0x53; 16];
-const AUTH: EdgeFamily = EdgeFamily::immutable(1);
-const RELATIONS: EdgeFamily = EdgeFamily::typed_union(3);
+const IMMUTABLE_EDGES: EdgeFamily = EdgeFamily::immutable(1);
+const TYPED_UNION_EDGES: EdgeFamily = EdgeFamily::typed_union(3);
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mtxdb-short-id-{name}-{}", std::process::id()));
@@ -34,7 +34,7 @@ fn allocation_is_dense_stable_and_idempotent() {
     let back = index().resolve(&db, &[1, 4, 99]).unwrap();
     assert_eq!(back, vec![Some(b"$a".to_vec()), Some(b"$d".to_vec()), None]);
     assert!(index()
-        .verify(&db, &[AUTH, RELATIONS])
+        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
         .unwrap()
         .is_consistent());
     drop(db);
@@ -45,33 +45,45 @@ fn allocation_is_dense_stable_and_idempotent() {
 fn record_edges_is_atomic_immutable_and_leaf_safe() {
     let root = test_root("edges");
     let db = SharedDatabase::open(root.clone()).unwrap();
-    let (create, none) = index().record_edges(&db, b"$create", AUTH, &[]).unwrap();
+    let (create, none) = index()
+        .record_edges(&db, b"$create", IMMUTABLE_EDGES, &[])
+        .unwrap();
     assert!(none.is_empty());
     // A leaf has a present, empty edge list, distinct from an unknown id.
-    assert_eq!(index().edges(&db, create, AUTH).unwrap(), Some(vec![]));
-    assert_eq!(index().edges(&db, 500, AUTH).unwrap(), None);
+    assert_eq!(
+        index().edges(&db, create, IMMUTABLE_EDGES).unwrap(),
+        Some(vec![])
+    );
+    assert_eq!(index().edges(&db, 500, IMMUTABLE_EDGES).unwrap(), None);
 
     let (child, targets) = index()
-        .record_edges(&db, b"$child", AUTH, &[b"$create", b"$power", b"$create"])
+        .record_edges(
+            &db,
+            b"$child",
+            IMMUTABLE_EDGES,
+            &[b"$create", b"$power", b"$create"],
+        )
         .unwrap();
     assert_eq!(targets.len(), 2);
     assert_eq!(
         index()
-            .edges(&db, child, AUTH)
+            .edges(&db, child, IMMUTABLE_EDGES)
             .unwrap()
             .map(|e| e.iter().map(|x| x.target).collect::<Vec<_>>()),
         Some(targets.clone())
     );
     // Same set again is a no-op; a different set is a collision.
     index()
-        .record_edges(&db, b"$child", AUTH, &[b"$power", b"$create"])
+        .record_edges(&db, b"$child", IMMUTABLE_EDGES, &[b"$power", b"$create"])
         .unwrap();
     let error = index()
-        .record_edges(&db, b"$child", AUTH, &[b"$create"])
+        .record_edges(&db, b"$child", IMMUTABLE_EDGES, &[b"$create"])
         .unwrap_err();
     assert!(matches!(error, StorageError::Collision(_)), "{error}");
 
-    let report = index().verify(&db, &[AUTH, RELATIONS]).unwrap();
+    let report = index()
+        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
+        .unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     assert_eq!(report.edge_lists_checked, 2);
     drop(db);
@@ -83,7 +95,9 @@ fn reopen_preserves_ids_and_purge_resets_the_scope() {
     let root = test_root("reopen");
     {
         let db = SharedDatabase::open(root.clone()).unwrap();
-        index().record_edges(&db, b"$x", AUTH, &[b"$y"]).unwrap();
+        index()
+            .record_edges(&db, b"$x", IMMUTABLE_EDGES, &[b"$y"])
+            .unwrap();
     }
     let db = SharedDatabase::open(root.clone()).unwrap();
     assert_eq!(
@@ -128,7 +142,7 @@ fn concurrent_allocators_never_share_or_duplicate_ids() {
     ids.dedup();
     assert_eq!(ids.len(), by_key.len(), "no two keys share an id");
     assert!(index()
-        .verify(&db, &[AUTH, RELATIONS])
+        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
         .unwrap()
         .is_consistent());
     drop(db);
@@ -147,7 +161,7 @@ fn exhaustion_is_a_hard_error_and_publishes_nothing() {
     );
     // ...the next allocation fails, including mid-batch, and aborts whole.
     let error = index()
-        .record_edges(&db, b"$over", AUTH, &[b"$last", b"$also-new"])
+        .record_edges(&db, b"$over", IMMUTABLE_EDGES, &[b"$last", b"$also-new"])
         .unwrap_err();
     assert!(matches!(error, StorageError::Internal(_)), "{error}");
     assert_eq!(
@@ -191,7 +205,7 @@ fn corrupt_counter_is_reported_not_repaired() {
 
 fn kinds(db: &SharedDatabase, id: u32) -> Vec<(u32, u16)> {
     index()
-        .edges(db, id, RELATIONS)
+        .edges(db, id, TYPED_UNION_EDGES)
         .unwrap()
         .unwrap()
         .iter()
@@ -210,7 +224,7 @@ fn union_family_merges_typed_edges_across_writes() {
             &db,
             b"$reply",
             &[FamilyEdges {
-                family: RELATIONS,
+                family: TYPED_UNION_EDGES,
                 edges: &[edge(b"$orig", 7), edge(b"$orig", 9)],
             }],
         )
@@ -222,7 +236,7 @@ fn union_family_merges_typed_edges_across_writes() {
             &db,
             b"$reply",
             &[FamilyEdges {
-                family: RELATIONS,
+                family: TYPED_UNION_EDGES,
                 edges: &[edge(b"$orig", 9), edge(b"$other", 7)],
             }],
         )
@@ -236,7 +250,7 @@ fn union_family_merges_typed_edges_across_writes() {
         "sorted by (target, kind), de-duplicated"
     );
     assert!(index()
-        .verify(&db, &[AUTH, RELATIONS])
+        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
         .unwrap()
         .is_consistent());
     drop(db);
@@ -253,11 +267,11 @@ fn families_are_independent_per_owner_in_one_transaction() {
             b"$e",
             &[
                 FamilyEdges {
-                    family: AUTH,
+                    family: IMMUTABLE_EDGES,
                     edges: &[EdgeKey::plain(b"$create")],
                 },
                 FamilyEdges {
-                    family: RELATIONS,
+                    family: TYPED_UNION_EDGES,
                     edges: &[EdgeKey {
                         target: b"$create",
                         kind: 2,
@@ -275,7 +289,7 @@ fn families_are_independent_per_owner_in_one_transaction() {
             &db,
             b"$e",
             &[FamilyEdges {
-                family: AUTH,
+                family: IMMUTABLE_EDGES,
                 edges: &[EdgeKey::plain(b"$other-auth")],
             }],
         )
@@ -294,7 +308,7 @@ fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
             &db,
             b"$e",
             &[FamilyEdges {
-                family: RELATIONS,
+                family: TYPED_UNION_EDGES,
                 edges: &[EdgeKey {
                     target: b"$t",
                     kind: 1,
@@ -315,7 +329,7 @@ fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
             &db,
             b"$x",
             &[FamilyEdges {
-                family: AUTH,
+                family: IMMUTABLE_EDGES,
                 edges: &[EdgeKey {
                     target: b"$t",
                     kind: 5,
@@ -345,7 +359,7 @@ fn concurrent_union_writers_lose_no_edges() {
                             db,
                             b"$owner",
                             &[FamilyEdges {
-                                family: RELATIONS,
+                                family: TYPED_UNION_EDGES,
                                 edges: &[EdgeKey {
                                     target: target.as_bytes(),
                                     kind: 4,
@@ -360,7 +374,10 @@ fn concurrent_union_writers_lose_no_edges() {
     let owner = index().get_or_create(&db, &[b"$owner"]).unwrap()[0];
     let stored = kinds(&db, owner);
     assert_eq!(stored.len(), 24, "every concurrent union write survived");
-    assert!(index().verify(&db, &[RELATIONS]).unwrap().is_consistent());
+    assert!(index()
+        .verify(&db, &[TYPED_UNION_EDGES])
+        .unwrap()
+        .is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

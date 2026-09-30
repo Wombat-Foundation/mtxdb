@@ -20,9 +20,9 @@
 //!   from an absent record.
 //!
 //! An [`EdgeFamily`] fixes the record's merge policy and whether edges are
-//! typed. [`EdgeMerge::Immutable`] families (Matrix `prev`/`auth`) treat a
+//! typed. [`EdgeMerge::Immutable`] families (for example a graph's parent or dependency edges) treat a
 //! different list for an existing owner as a collision. [`EdgeMerge::Union`]
-//! families (Matrix `relations`) merge repeated writes by set union under a CAS
+//! families (for example typed cross-references that arrive over time) merge repeated writes by set union under a CAS
 //! on the edge record. The merge policy and typing are stored in the record and
 //! checked on every access, so a caller cannot reinterpret a family.
 //!
