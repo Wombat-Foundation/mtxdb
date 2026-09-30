@@ -90,13 +90,15 @@ ROW_MATRIX = re.compile(
 )
 
 ROW_MATRIX_TIMELINE = re.compile(
-    r"^bench:\s+matrix_timeline\s+BACKEND=(?P<backend>\w+)\s+ROOMS=(?P<rooms>\d+)"
-    r"\s+EVENTS=(?P<events>\d+)\s+PAGE=(?P<page>\d+)"
-    r"\s+WRITE_MS=(?P<write>[\d.]+)\s+BYTES=(?P<bytes>\d+)\s+EVICTED=(?P<evicted>\w+)"
-    r"\s+WARM_FWD_PAGES=(?P<warm_fwd_pages>\d+)\s+WARM_BWD_PAGES=(?P<warm_bwd_pages>\d+)"
-    r"\s+WARM_FWD_PAGE_US=(?P<warm_fwd>[\d.]+)\s+WARM_BWD_PAGE_US=(?P<warm_bwd>[\d.]+)"
-    r"\s+COLD_FWD_PAGE_US=(?P<cold_fwd>[\d.]+)\s+COLD_BWD_PAGE_US=(?P<cold_bwd>[\d.]+)",
-    re.MULTILINE,
+    r"""
+    ^bench:\s+matrix_timeline\s+BACKEND=(?P<backend>\w+)\s+ROOMS=(?P<rooms>\d+)
+    \s+EVENTS=(?P<events>\d+)\s+PAGE=(?P<page>\d+)
+    \s+WRITE_MS=(?P<write>[\d.]+)\s+BYTES=(?P<bytes>\d+)\s+EVICTED=(?P<evicted>true|false)
+    \s+WARM_FWD_PAGES=(?P<warm_fwd_pages>\d+)\s+WARM_BWD_PAGES=(?P<warm_bwd_pages>\d+)
+    \s+WARM_FWD_PAGE_US=(?P<warm_fwd>[\d.]+)\s+WARM_BWD_PAGE_US=(?P<warm_bwd>[\d.]+)
+    \s+COLD_FWD_PAGE_US=(?P<cold_fwd>[\d.]+)\s+COLD_BWD_PAGE_US=(?P<cold_bwd>[\d.]+)
+    """,
+    re.MULTILINE | re.VERBOSE,
 )
 
 ROW_IMPORT = re.compile(
