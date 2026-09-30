@@ -1,21 +1,21 @@
 use super::{
-    build_event_dag, canonical_column_width, cmd_collections, cmd_get,
-    cmd_import_file, cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-    collection_canonical_id, compile_import_template, compute_state_groups_partial,
-    decode_event_json_record, decode_hamt_node, decode_hamt_root, decode_mtx_adjacency,
-    default_matrix_import_template, derive_template_key, display_collection_role,
-    encode_mtx_adjacency, event_id, event_room_id, event_short_id, export_envelope_line,
-    extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id,
-    glob_pack_files, import_pdu_events, interleaving_worth_noting, listing_shard_types,
-    load_state_groups, matrix_batch_has_create, matrix_event_id_for_template, matrix_event_node_id,
-    matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
-    meta_pools, meta_raw, mtx_relationships, pack_identity, parse_federation_input,
-    parse_pack_id_selector, parse_pack_selectors, plan_matrix_edges, pretty_print_payload,
-    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    split_canonical_display, template_collection_id, template_node_id, topological_event_order,
-    valid_state_group_id, verify_auth_chain_edges, write_matrix_edges, CollectionTemplate,
-    MatrixRoomExtension, MetaReport, MtxAdjacency, PackIdentity, StateGroupLoad, StateSet,
-    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import_file, cmd_info,
+    cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync, collection_canonical_id,
+    compile_import_template, compute_state_groups_partial, decode_event_json_record,
+    decode_hamt_node, decode_hamt_root, decode_mtx_adjacency, default_matrix_import_template,
+    derive_template_key, display_collection_role, encode_mtx_adjacency, event_id, event_room_id,
+    event_short_id, export_envelope_line, extract_pointer_string, fmt_disk_megabytes,
+    fmt_megabytes, format_canonical_display, format_id, glob_pack_files, import_pdu_events,
+    interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
+    matrix_event_id_for_template, matrix_event_node_id, matrix_room_collection_id,
+    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
+    mtx_relationships, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, plan_matrix_edges, pretty_print_payload, redacted_event_bytes,
+    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
+    template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
+    verify_auth_chain_edges, write_matrix_edges, CollectionTemplate, MatrixRoomExtension,
+    MetaReport, MtxAdjacency, PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{Cli, Commands};
 use bytes::Bytes;
@@ -91,6 +91,64 @@ fn scan_reports_truncated_auxiliary_envelope() {
     assert_eq!(
         scan_payload_suffix(b"AUX1", ShardType::State),
         Some("4 bytes (malformed AUX1 envelope)".to_owned())
+    );
+}
+
+#[test]
+fn scan_renders_the_event_to_state_group_pointer() {
+    let mut payload = b"AUX1".to_vec();
+    payload.extend_from_slice(&[0xabu8; 32]);
+    payload.extend_from_slice(&[0x12u8; STATE_GROUP_ID_LENGTH]);
+    assert_eq!(
+        scan_payload_suffix(&payload, ShardType::State),
+        Some(format!("PTR: 0x{}", "12".repeat(16)))
+    );
+}
+
+#[test]
+fn scan_decodes_a_state_group_instance() {
+    let instance = mtxdb::StateGroupInstance {
+        parents: vec![[0x11; 16], [0x22; 16]],
+        lthash: [0x33; 32],
+        root_id: [0x44; 16],
+    };
+    let payload = mtxdb::encode_state_group_record(&instance);
+    // The one-line cell stays empty so `--verbose`/`--decode` prints the
+    // recognized multi-line form instead.
+    assert!(scan_payload_suffix(&payload, ShardType::State).is_none());
+    let decoded = super::decode_state_group(&payload).expect("STGP decode");
+    let text = String::from_utf8(decoded).unwrap();
+    assert!(text.contains("STGP state-group instance"));
+    assert!(text.contains(&"11".repeat(16)));
+    assert!(text.contains(&"33".repeat(32)));
+    assert!(text.contains(&"44".repeat(16)));
+    assert!(pretty_print_payload(&payload).is_some());
+}
+
+#[test]
+fn immutable_record_filter_skips_duplicates_and_rejects_collisions() {
+    use mtxdb::storage::InMemoryStorage;
+    let store = InMemoryStorage::new();
+    let collection = [0u8; 16];
+    let id = [1u8; 16];
+
+    let fresh =
+        super::filter_new_records(&store, &collection, vec![(id, NodeData::from_slice(b"a"))])
+            .unwrap();
+    assert_eq!(fresh.len(), 1);
+    store
+        .put_many(&collection, &[(id, NodeData::from_slice(b"a"))])
+        .unwrap();
+
+    let fresh =
+        super::filter_new_records(&store, &collection, vec![(id, NodeData::from_slice(b"a"))])
+            .unwrap();
+    assert!(fresh.is_empty(), "identical payload is skipped");
+
+    assert!(
+        super::filter_new_records(&store, &collection, vec![(id, NodeData::from_slice(b"b"))])
+            .is_err(),
+        "a differing payload under the same id is a hard collision"
     );
 }
 
@@ -1738,8 +1796,8 @@ fn importer_loads_complete_cached_state_groups_without_recomputing() {
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
     let event = import_event("$cached", "@alice", "!room");
-    let cached_group = "A".repeat(STATE_GROUP_ID_LENGTH);
-    aux.put(b"$cached", cached_group.as_bytes()).unwrap();
+    let cached_group = [b'A'; STATE_GROUP_ID_LENGTH];
+    aux.put(b"$cached", &cached_group).unwrap();
     let state_writes_before = state_store.stats().put_many_calls;
     let mut established = HashSet::new();
     established.insert(collection_id);
@@ -1777,8 +1835,8 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     let state_store = PackfileStorage::open(dir.join("state")).unwrap();
     let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, OLD_NAMESPACE);
     old_aux.ensure_metadata().unwrap();
-    let stale = "A".repeat(STATE_GROUP_ID_LENGTH);
-    old_aux.put(b"$cached", stale.as_bytes()).unwrap();
+    let stale = [b'A'; STATE_GROUP_ID_LENGTH];
+    old_aux.put(b"$cached", &stale).unwrap();
     let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
 
     let event = import_event("$cached", "@alice", "!room");
@@ -1798,14 +1856,12 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     )
     .unwrap();
 
-    // v1 cannot see the old entry, so the import recomputes and persists a
-    // real digest; the old namespace is left untouched as dead weight.
-    let recomputed = new_aux.get(b"$cached").unwrap().expect("v1 mapping");
-    assert_ne!(recomputed.as_slice(), stale.as_bytes());
-    assert!(valid_state_group_id(
-        std::str::from_utf8(&recomputed).unwrap()
-    ));
-    assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.into_bytes()));
+    // v3 cannot see the old entry, so the import recomputes and persists a
+    // real instance id; the old namespace is left untouched as dead weight.
+    let recomputed = new_aux.get(b"$cached").unwrap().expect("v3 mapping");
+    assert_ne!(recomputed.as_slice(), stale.as_slice());
+    assert!(valid_state_group_id(&recomputed));
+    assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.to_vec()));
 }
 
 #[test]
@@ -1851,9 +1907,7 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     )
     .unwrap();
     let state_group = aux.get(b"$child").unwrap().expect("repaired mapping");
-    assert!(valid_state_group_id(
-        std::str::from_utf8(&state_group).unwrap()
-    ));
+    assert!(valid_state_group_id(&state_group));
 }
 
 /// Open every pack in a pool and total the records it physically holds.
@@ -3289,23 +3343,16 @@ fn matrix_edges_drop_unrepresentable_relation_kind() {
 }
 
 #[test]
-fn compute_state_groups_shares_state_across_events_and_merges_forks() {
-    // Reference: what each event's state group must be, computed by
-    // materializing the full state set for every event.
+fn compute_state_groups_inherit_and_split_on_derivation() {
     let mut events = Vec::new();
     events.push(owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
     ));
     let mut prev = "$create".to_owned();
-    let mut expected_state = StateSet::new();
-    expected_state.set("m.room.create", "", "$create".to_owned());
-    let mut expected: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    expected.insert("$create".into(), expected_state.digest_base64url());
     // A long chain: every 50th event is a state event, the rest messages.
     for i in 0..5000u32 {
         let id = format!("$e{i}");
         let json = if i % 50 == 0 {
-            expected_state.set("m.room.member", &format!("@u{i}:x"), id.clone());
             format!(
                 r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.member","state_key":"@u{i}:x","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
             )
@@ -3314,18 +3361,11 @@ fn compute_state_groups_shares_state_across_events_and_merges_forks() {
                 r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
             )
         };
-        expected.insert(id.clone(), expected_state.digest_base64url());
         events.push(owned_value(&json));
         prev = id;
     }
     // Fork off the tip: two branches set the same key differently, then a
-    // merge event lists both parents. The first parent must win.
-    let mut left_state = StateSet::new();
-    left_state.entries = expected_state.entries.clone();
-    left_state.set("m.room.topic", "", "$left".to_owned());
-    let mut right_state = StateSet::new();
-    right_state.entries = expected_state.entries.clone();
-    right_state.set("m.room.topic", "", "$right".to_owned());
+    // merge event lists both parents.
     events.push(owned_value(&format!(
         r#"{{"event_id":"$left","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
     )));
@@ -3335,19 +3375,19 @@ fn compute_state_groups_shares_state_across_events_and_merges_forks() {
     events.push(owned_value(
         r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$left","$right"],"content":{}}"#,
     ));
-    expected.insert("$left".into(), left_state.digest_base64url());
-    expected.insert("$right".into(), right_state.digest_base64url());
-    expected.insert("$merge".into(), left_state.digest_base64url());
 
-    let groups = compute_state_groups_partial(&events, &[]).groups;
-    assert_eq!(groups.len(), expected.len());
-    for (event_id, want) in &expected {
-        assert_eq!(&groups[event_id], want, "state group for {event_id}");
-    }
-    // Messages between two state events share one group; a state event
-    // starts a new one.
+    let groups = compute_state_groups_partial(&events, &[], "!r:x").groups;
+    assert_eq!(groups.len(), events.len());
+    // Messages between two state events share one instance; a state event
+    // starts a new derivation.
     assert_eq!(groups["$e1"], groups["$e49"]);
     assert_ne!(groups["$e49"], groups["$e50"]);
+    assert_ne!(groups["$create"], groups["$e0"]);
+    // The forks differ, and the merge is its own derivation even though the
+    // resolved state matches the first parent (first-wins).
+    assert_ne!(groups["$left"], groups["$right"]);
+    assert_ne!(groups["$merge"], groups["$left"]);
+    assert_ne!(groups["$merge"], groups["$right"]);
 }
 
 #[test]
@@ -3362,7 +3402,8 @@ fn rejected_events_never_contribute_state_and_soft_failed_only_in_the_client_vie
         let after = owned_value(
             r#"{"event_id":"$after","room_id":"!r:x","type":"m.room.message","prev_events":["$bad"],"content":{}}"#,
         );
-        super::compute_state_groups_partial_in_view(&[create, flagged, after], &[], view).groups
+        super::compute_state_groups_partial_in_view(&[create, flagged, after], &[], view, "!r:x")
+            .groups
     };
     let federated = super::StateView::Federated;
     let client = super::StateView::Client;
@@ -3410,40 +3451,33 @@ fn compute_state_groups_assigns_groups_per_event() {
     let msg = owned_value(
         r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join"],"content":{"body":"hi"}}"#,
     );
-    let groups = compute_state_groups_partial(&[create, member, msg], &[]).groups;
-    // All three events should have a state group.
+    let groups = compute_state_groups_partial(&[create, member, msg], &[], "!r:x").groups;
+    // All three events should have a state-group instance.
     assert!(groups.contains_key("$create"));
     assert!(groups.contains_key("$join"));
     assert!(groups.contains_key("$msg"));
-    // State group IDs are valid unpadded base64url.
     for sg in groups.values() {
-        assert_ne!(sg, "");
-        assert!(sg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(valid_state_group_id(sg));
     }
+    // The message inherits its parent's instance; the state event starts a new
+    // derivation.
+    assert_ne!(groups["$create"], groups["$join"]);
+    assert_eq!(groups["$join"], groups["$msg"]);
 }
 
 #[test]
 fn compute_state_groups_empty_input() {
-    let groups = compute_state_groups_partial(&[], &[]).groups;
+    let groups = compute_state_groups_partial(&[], &[], "!r:x").groups;
     assert!(groups.is_empty());
 }
 
 #[test]
-fn state_group_id_validation_requires_a_base64url_digest() {
-    let golden = StateSet::new().digest_base64url();
-    assert_eq!(golden.len(), STATE_GROUP_ID_LENGTH);
+fn state_group_id_validation_requires_a_128_bit_instance_id() {
+    let golden = [b'A'; STATE_GROUP_ID_LENGTH];
     assert!(valid_state_group_id(&golden));
-    assert!(!valid_state_group_id(
-        &"A".repeat(golden.len().saturating_sub(1))
-    ));
-    assert!(!valid_state_group_id(
-        &"A".repeat(golden.len().saturating_add(1))
-    ));
-    let almost_digest = "A".repeat(golden.len().saturating_sub(1));
-    assert!(!valid_state_group_id(&format!("{almost_digest}$")));
-    assert!(!valid_state_group_id(&format!("{almost_digest}.")));
+    assert!(!valid_state_group_id(&[0u8; STATE_GROUP_ID_LENGTH - 1]));
+    assert!(!valid_state_group_id(&[0u8; STATE_GROUP_ID_LENGTH + 1]));
+    assert!(!valid_state_group_id(&[]));
 }
 
 #[test]
@@ -3453,11 +3487,11 @@ fn state_group_cache_loads_complete_values_and_falls_back_on_missing_or_invalid(
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
-    let first = "A".repeat(STATE_GROUP_ID_LENGTH);
-    let second = "B".repeat(STATE_GROUP_ID_LENGTH);
+    let first = [b'A'; STATE_GROUP_ID_LENGTH];
+    let second = [b'B'; STATE_GROUP_ID_LENGTH];
     aux.put_many(&[
-        (b"first".as_slice(), first.as_bytes()),
-        (b"second".as_slice(), second.as_bytes()),
+        (b"first".as_slice(), first.as_slice()),
+        (b"second".as_slice(), second.as_slice()),
     ])
     .unwrap();
     let ids = vec!["first".to_owned(), "second".to_owned()];
@@ -3485,7 +3519,7 @@ fn state_group_cache_loads_complete_values_and_falls_back_on_missing_or_invalid(
 #[test]
 fn state_groups_from_values_treats_a_cardinality_mismatch_as_invalid() {
     let ids = vec!["first".to_owned(), "second".to_owned()];
-    let value = Some("A".repeat(STATE_GROUP_ID_LENGTH).into_bytes());
+    let value = Some(vec![b'A'; STATE_GROUP_ID_LENGTH]);
     assert!(matches!(
         super::state_groups_from_values(&ids, vec![value.clone()]),
         StateGroupLoad::Invalid { .. }
@@ -3516,7 +3550,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     let incomplete = owned_value(
         r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$parent"],"content":{}}"#,
     );
-    let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[]);
+    let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[], "!r:x");
     assert!(!first.groups.contains_key("$child"));
     assert!(!first.unresolved.is_empty());
     assert_eq!(aux.get(b"$child").unwrap(), None);
@@ -3524,20 +3558,18 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     let parent = owned_value(
         r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.create","content":{}}"#,
     );
-    let repaired = compute_state_groups_partial(&[parent, incomplete], &[]);
+    let repaired = compute_state_groups_partial(&[parent, incomplete], &[], "!r:x");
     assert!(repaired.groups.contains_key("$child"));
     assert!(repaired.unresolved.is_empty());
     let entries: Vec<(&[u8], &[u8])> = repaired
         .groups
         .iter()
-        .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
+        .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
         .collect();
     aux.put_many(&entries).unwrap();
     let repaired_id = aux.get(b"$child").unwrap().unwrap();
     assert_eq!(repaired_id.len(), STATE_GROUP_ID_LENGTH);
-    assert!(valid_state_group_id(
-        std::str::from_utf8(&repaired_id).unwrap()
-    ));
+    assert!(valid_state_group_id(&repaired_id));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -3561,7 +3593,7 @@ fn partial_state_groups_report_cycles() {
     let second = owned_value(
         r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.message","prev_events":["$first"],"content":{}}"#,
     );
-    let result = compute_state_groups_partial(&[first, second], &[]);
+    let result = compute_state_groups_partial(&[first, second], &[], "!r:x");
     assert!(result.groups.is_empty());
     assert_eq!(result.unresolved.len(), 2);
 }
@@ -3574,12 +3606,16 @@ fn compute_state_groups_deterministic() {
     let member = owned_value(
         r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
     );
-    let g1 = compute_state_groups_partial(&[create.clone(), member.clone()], &[]).groups;
-    let g2 = compute_state_groups_partial(&[create, member], &[]).groups;
+    let g1 = compute_state_groups_partial(&[create.clone(), member.clone()], &[], "!r:x").groups;
+    let g2 = compute_state_groups_partial(&[create, member], &[], "!r:x").groups;
     assert_eq!(g1, g2);
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture exercises several batch-composition invariants together"
+)]
 fn compute_state_groups_is_stable_across_overlapping_batches() {
     let create = owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
@@ -3612,6 +3648,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             merge.clone(),
         ],
         &[],
+        "!r:x",
     );
     let with_fork = compute_state_groups_partial(
         &[
@@ -3623,6 +3660,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             sibling.clone(),
         ],
         &[],
+        "!r:x",
     );
     let with_orphan = compute_state_groups_partial(
         &[
@@ -3634,6 +3672,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             orphan,
         ],
         &[],
+        "!r:x",
     );
     let with_auth_chain = compute_state_groups_partial(
         &[
@@ -3644,6 +3683,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             merge.clone(),
         ],
         &[sibling],
+        "!r:x",
     );
     let reordered = compute_state_groups_partial(
         &[
@@ -3654,6 +3694,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             create.clone(),
         ],
         &[],
+        "!r:x",
     );
     let without_branch_b = compute_state_groups_partial(
         &[
@@ -3663,6 +3704,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             merge.clone(),
         ],
         &[],
+        "!r:x",
     );
 
     assert_eq!(base.groups["$join"], with_fork.groups["$join"]);
@@ -3701,19 +3743,21 @@ fn compute_state_groups_uses_first_prev_as_tie_break_for_now() {
 
     // The walker currently resolves a same-key conflict by taking the
     // first prev_events entry. This is not full Matrix state resolution;
-    // changing it requires a state-group namespace bump.
+    // changing it requires a state-group namespace bump. The merge still gets
+    // its own instance because it has two distinct parents.
     let first_groups = compute_state_groups_partial(
         &[create.clone(), first.clone(), second.clone(), merge_first],
         &[],
+        "!r:x",
     )
     .groups;
     let second_groups =
-        compute_state_groups_partial(&[create, first, second, merge_second], &[]).groups;
+        compute_state_groups_partial(&[create, first, second, merge_second], &[], "!r:x").groups;
 
     assert_ne!(first_groups["$first"], first_groups["$second"]);
-    assert_eq!(first_groups["$merge-first"], first_groups["$first"]);
+    assert_ne!(first_groups["$merge-first"], first_groups["$first"]);
     assert_ne!(first_groups["$merge-first"], first_groups["$second"]);
-    assert_eq!(second_groups["$merge-second"], second_groups["$second"]);
+    assert_ne!(second_groups["$merge-second"], second_groups["$second"]);
     assert_ne!(second_groups["$merge-second"], second_groups["$first"]);
 }
 
@@ -3841,7 +3885,7 @@ fn state_set_empty_digest_is_empty_base64url() {
     );
 }
 
-/// Pins the unkeyed LtHash state-group digest so changing the state-group
+/// Pins the unkeyed `LtHash` state-group digest so changing the state-group
 /// framing remains a visible, deliberate format break.
 #[test]
 fn state_set_digest_golden_vector() {

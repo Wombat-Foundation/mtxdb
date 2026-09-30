@@ -15,10 +15,10 @@ use mtxdb::packfile::PackId;
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
-    derive_collection_id, frame_digest, record_logical_id, CollectionKeyRule, CollectionMetadata,
-    CollectionTemplate, DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput,
-    FrameIdPolicy, MatrixRoomVersion, PackfileStorage, PayloadPolicy, RecordIdentityRule,
-    ShardType,
+    derive_collection_id, frame_digest, record_logical_id, state_group_instance_id,
+    CollectionKeyRule, CollectionMetadata, CollectionTemplate, DatabaseLayout, DigestAlgorithm,
+    EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion, PackfileStorage,
+    PayloadPolicy, RecordIdentityRule, ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -26,12 +26,10 @@ use simd_json::OwnedValue;
 use crate::{Cli, Commands, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
-const STATE_GROUP_DIGEST_BYTES: usize = 32;
-const BASE64_BITS_PER_CHARACTER: usize = 6;
-const STATE_GROUP_ID_LENGTH: usize =
-    (STATE_GROUP_DIGEST_BYTES * 8).div_ceil(BASE64_BITS_PER_CHARACTER);
+/// Byte width of an STGP state-group instance id (128-bit).
+const STATE_GROUP_ID_LENGTH: usize = 16;
 
-/// Auxiliary namespace for the derived `event_id -> state_group_id` cache.
+/// Auxiliary namespace for the derived `event_id -> state-group instance` cache.
 ///
 /// The namespace is versioned. These values are derived data, so any change to
 /// the derivation (hashing, resolution rules, ordering) must bump the suffix.
@@ -46,17 +44,21 @@ const STATE_GROUP_ID_LENGTH: usize =
 /// v2: the state-group id changed from a BLAKE3 digest of the sorted entries to
 /// the unkeyed `LtHash` digest used by Synapse/sithnapse and materialized into
 /// each `MTHR` root.
-const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v2";
+///
+/// v3: the value is a raw 128-bit `STGP` state-group *instance* id, derived from
+/// the sorted parent instance ids and the state `LtHash`, instead of the
+/// base64url `LtHash` digest. The `STGP` record holds the parent links and the
+/// shared `STAT` root id, so equal state content reached through different
+/// parents stays distinct.
+const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v3";
 
-fn valid_state_group_id(value: &str) -> bool {
+/// Whether `value` is a well-formed 128-bit STGP state-group instance id.
+fn valid_state_group_id(value: &[u8]) -> bool {
     value.len() == STATE_GROUP_ID_LENGTH
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 enum StateGroupLoad {
-    Complete(HashMap<String, String>),
+    Complete(HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>),
     Missing,
     Invalid {
         event_id: String,
@@ -83,19 +85,15 @@ fn state_groups_from_values(event_ids: &[String], values: Vec<Option<Vec<u8>>>) 
         let Some(value) = value else {
             return StateGroupLoad::Missing;
         };
-        let Ok(value) = String::from_utf8(value) else {
-            return StateGroupLoad::Invalid {
-                event_id: event_id.clone(),
-                reason: "invalid UTF-8",
-            };
-        };
         if !valid_state_group_id(&value) {
             return StateGroupLoad::Invalid {
                 event_id: event_id.clone(),
-                reason: "invalid state-group ID format",
+                reason: "invalid state-group instance ID width",
             };
         }
-        groups.insert(event_id.clone(), value);
+        let mut id = [0u8; STATE_GROUP_ID_LENGTH];
+        id.copy_from_slice(&value);
+        groups.insert(event_id.clone(), id);
     }
     StateGroupLoad::Complete(groups)
 }
@@ -776,8 +774,9 @@ fn existing_pool_dir(
     match layout.pool_dir_read_only(shard_type) {
         Ok(path) => Ok(Some(path)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to open {} shard pool", shard_type.as_str())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to open {} shard pool", shard_type.as_str()))
+        }
     }
 }
 
@@ -1626,6 +1625,38 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decode an `STGP\x01` state-group instance record into a readable form: its
+/// parent instance ids, state `LtHash` digest, and shared `STAT` root id.
+/// Returns `None` for any other payload.
+fn decode_state_group(bytes: &[u8]) -> Option<Vec<u8>> {
+    let instance = mtxdb::decode_state_group_record(bytes).ok()?;
+    let mut out = Vec::new();
+    writeln!(out, "// STGP state-group instance (v1)").unwrap();
+    writeln!(
+        out,
+        "// {} parent(s), {} bytes",
+        instance.parents.len(),
+        bytes.len()
+    )
+    .unwrap();
+    if instance.parents.is_empty() {
+        writeln!(out, "  parents: (none)").unwrap();
+    } else {
+        writeln!(out, "  parents:").unwrap();
+        for parent in &instance.parents {
+            writeln!(out, "    0x{}", hex::encode(parent)).unwrap();
+        }
+    }
+    writeln!(
+        out,
+        "  lthash (state identity): 0x{}",
+        hex::encode(instance.lthash)
+    )
+    .unwrap();
+    writeln!(out, "  STAT root id: 0x{}", hex::encode(instance.root_id)).unwrap();
+    Some(out)
+}
+
 /// Try to skip a HAMT leaf encoded as two length-prefixed strings: K (a
 /// JSON-encoded `(EventType, StateKey)` array) and V (`EventId`). Advances
 /// `cursor` past the leaf on success. This matches
@@ -1725,6 +1756,9 @@ fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     if let Some(hamt) = decode_hamt_node(bytes) {
         return Some(hamt);
+    }
+    if let Some(state_group) = decode_state_group(bytes) {
+        return Some(state_group);
     }
     let (format_version, metadata, json) = decode_event_json_record(bytes)?;
     let mut output = Vec::new();
@@ -2580,8 +2614,8 @@ fn print_pack_physical_layout(
         let excess = runs.saturating_sub(collections as u64);
         let largest = stats.map_or(0, |stats| stats.largest_segment_bytes);
         println!(
-            "{}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
-            format!("0x{}", &pack_id.as_hex()[..16]),
+            "0x{}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
+            &pack_id.as_hex()[..16],
             fmt_bytes(largest)
         );
     }
@@ -3944,7 +3978,11 @@ fn print_shard_table(
             format!(
                 "0x{}{}",
                 &pack_id.as_hex()[..16],
-                if active_pack_id == Some(pack_id) { " *" } else { "  " }
+                if active_pack_id == Some(pack_id) {
+                    " *"
+                } else {
+                    "  "
+                }
             ),
             version,
             fmt_bytes(file_bytes),
@@ -5908,72 +5946,154 @@ fn collection_metadata_for(
     }
 }
 
-/// Build and persist the state HAMTs for every distinct state set of a room.
+/// Build and persist the state HAMTs and `STGP` derivation records for a room.
 ///
-/// Returns the number of records written. Node ids are the first 16 bytes of
-/// each node's structural hash; each root uses a domain-separated id derived
-/// from the room and state-group id, so roots and structural-hash nodes cannot
-/// collide. A record already present with identical bytes is skipped; a
-/// different value under the same id is a hard error.
+/// `STAT` content is materialized once per distinct state `LtHash`; every
+/// derivation, including merges that reach the same state through different
+/// parents, gets its own `STGP` record whose id is derived from the sorted
+/// parent instance ids and the `LtHash`. Returns the number of records written.
+/// Node ids are the first 16 bytes of each node's structural hash; roots use a
+/// domain-separated id derived from the room and `LtHash`, so roots and
+/// structural-hash nodes cannot collide. A record already present with
+/// identical bytes is skipped; a different value under the same id is a hard
+/// error.
 fn materialize_state_hamts(
     state_store: &PackfileStorage,
     room_id: &str,
-    state_sets: &HashMap<String, StateSet>,
+    instances: &HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
 ) -> anyhow::Result<usize> {
-    let Some(collection_id) = crate::state_hamt::state_hamt_collection_id(room_id) else {
+    let Some(stat_collection) = crate::state_hamt::state_hamt_collection_id(room_id) else {
+        return Ok(0);
+    };
+    let Some(stgp_collection) = mtxdb::state_group_collection_id(room_id) else {
         return Ok(0);
     };
     let room_prefix = crate::state_hamt::room_hamt_prefix(room_id);
 
-    let mut seen: HashMap<[u8; 16], bytes::Bytes> = HashMap::new();
-    let mut records: Vec<(NodeId, NodeData)> = Vec::new();
+    let mut seen_stat: HashMap<[u8; 16], bytes::Bytes> = HashMap::new();
+    let mut stat_records: Vec<(NodeId, NodeData)> = Vec::new();
+    let mut seen_stgp: HashMap<[u8; 16], bytes::Bytes> = HashMap::new();
+    let mut stgp_records: Vec<(NodeId, NodeData)> = Vec::new();
+    let mut content_done: HashSet<[u8; 32]> = HashSet::new();
 
-    for (state_group_id, set) in state_sets {
-        if set.entries.is_empty() {
+    for (instance_id, instance) in instances {
+        if instance.set.entries.is_empty() {
             continue;
         }
-        let mut entries: Vec<(String, String, String)> = set
-            .entries
-            .iter()
-            .map(|((event_type, state_key), event_id)| {
-                (event_type.clone(), state_key.clone(), event_id.clone())
-            })
-            .collect();
-        entries.sort();
-        let built = crate::state_hamt::build_state_hamt(room_id, &room_prefix, &entries)
-            .map_err(|error| anyhow!(error))?;
-        let actual = crate::state_hamt::encode_state_group_id(&built.state_group_id);
-        if &actual != state_group_id {
-            bail!("state HAMT digest mismatch for room {room_id}: {actual} != {state_group_id}");
+        if content_done.insert(instance.lthash) {
+            let mut entries: Vec<(String, String, String)> = instance
+                .set
+                .entries
+                .iter()
+                .map(|((event_type, state_key), event_id)| {
+                    (event_type.clone(), state_key.clone(), event_id.clone())
+                })
+                .collect();
+            entries.sort();
+            let built = crate::state_hamt::build_state_hamt(room_id, &room_prefix, &entries)
+                .map_err(|error| anyhow!(error))?;
+            if built.state_group_id != instance.lthash {
+                bail!("state HAMT digest mismatch for room {room_id}");
+            }
+            for (hash, node_bytes) in built.nodes {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&hash[..16]);
+                push_hamt_record(
+                    &mut seen_stat,
+                    &mut stat_records,
+                    id,
+                    bytes::Bytes::from(node_bytes),
+                )?;
+            }
+            let root_node =
+                crate::state_hamt::state_hamt_root_node_id(room_id, &built.state_group_id);
+            push_hamt_record(
+                &mut seen_stat,
+                &mut stat_records,
+                root_node,
+                bytes::Bytes::from(built.root_record),
+            )?;
         }
-        for (hash, node_bytes) in built.nodes {
-            let mut id = [0u8; 16];
-            id.copy_from_slice(&hash[..16]);
-            push_hamt_record(&mut seen, &mut records, id, bytes::Bytes::from(node_bytes))?;
-        }
-        let root_node = crate::state_hamt::state_hamt_root_node_id(room_id, &built.state_group_id);
+
+        let record = mtxdb::StateGroupInstance {
+            parents: instance.parents.clone(),
+            lthash: instance.lthash,
+            root_id: crate::state_hamt::state_hamt_root_node_id(room_id, &instance.lthash),
+        };
         push_hamt_record(
-            &mut seen,
-            &mut records,
-            root_node,
-            bytes::Bytes::from(built.root_record),
+            &mut seen_stgp,
+            &mut stgp_records,
+            *instance_id,
+            bytes::Bytes::from(mtxdb::encode_state_group_record(&record)),
         )?;
     }
 
+    let stat_records = filter_new_records(state_store, &stat_collection, stat_records)?;
+    if !stat_records.is_empty() {
+        ensure_collection_metadata(state_store, &stat_collection, &state_hamt_metadata(room_id))?;
+        state_store.put_many(&stat_collection, &stat_records)?;
+    }
+    let stgp_records = filter_new_records(state_store, &stgp_collection, stgp_records)?;
+    if !stgp_records.is_empty() {
+        ensure_collection_metadata(
+            state_store,
+            &stgp_collection,
+            &state_group_metadata(room_id),
+        )?;
+        state_store.put_many(&stgp_collection, &stgp_records)?;
+    }
+    Ok(stat_records.len().saturating_add(stgp_records.len()))
+}
+
+/// Drop records already present in `collection` and reject an id already bound
+/// to different bytes.
+///
+/// `STAT` content and `STGP` instance records are immutable, so a write must
+/// never overwrite an existing payload: a differing payload under the same id
+/// is a hard collision, not a last-writer-wins update.
+fn filter_new_records<S: StorageEngine + ?Sized>(
+    state_store: &S,
+    collection_id: &[u8; 16],
+    records: Vec<(NodeId, NodeData)>,
+) -> anyhow::Result<Vec<(NodeId, NodeData)>> {
     if records.is_empty() {
-        return Ok(0);
+        return Ok(records);
     }
-    let metadata = state_hamt_metadata(room_id);
-    match state_store.get_collection_metadata(&collection_id)? {
-        Some(existing) if existing == metadata => {}
+    let ids: Vec<NodeId> = records.iter().map(|(id, _)| *id).collect();
+    let existing = state_store.get_many_bytes(collection_id, &ids)?;
+    let mut fresh = Vec::new();
+    for ((id, data), existing) in records.into_iter().zip(existing) {
+        match existing {
+            None => fresh.push((id, data)),
+            Some(bytes) if bytes == data.bytes => {}
+            Some(_) => bail!(
+                "immutable record {} in collection {} already exists with different bytes",
+                format_id(&id),
+                format_id(collection_id)
+            ),
+        }
+    }
+    Ok(fresh)
+}
+
+/// Ensure `collection` carries exactly `metadata`, tolerating an unchanged
+/// re-import and rejecting a conflicting definition.
+fn ensure_collection_metadata(
+    state_store: &PackfileStorage,
+    collection_id: &[u8; 16],
+    metadata: &CollectionMetadata,
+) -> anyhow::Result<()> {
+    match state_store.get_collection_metadata(collection_id)? {
+        Some(existing) if &existing == metadata => Ok(()),
         Some(_) => bail!(
-            "state HAMT collection {} has conflicting metadata",
-            format_id(&collection_id)
+            "collection {} has conflicting metadata",
+            format_id(collection_id)
         ),
-        None => state_store.ensure_collection_metadata(&collection_id, &metadata)?,
+        None => {
+            state_store.ensure_collection_metadata(collection_id, metadata)?;
+            Ok(())
+        }
     }
-    state_store.put_many(&collection_id, &records)?;
-    Ok(records.len())
 }
 
 /// Insert a HAMT record unless an identical one was already queued.
@@ -6014,6 +6134,22 @@ fn state_hamt_metadata(room_id: &str) -> CollectionMetadata {
         extension: None,
         role: Some("state_hamt".to_owned()),
         schema: Some("sithnapse.state-hamt.v1".to_owned()),
+    }
+}
+
+/// Genesis metadata for a room's `STGP` state-group instance collection.
+fn state_group_metadata(room_id: &str) -> CollectionMetadata {
+    CollectionMetadata {
+        member_namespace: Some(*b"STGP"),
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("state_group".to_owned()),
+        schema: Some("sithnapse.state-group.v1".to_owned()),
     }
 }
 
@@ -6316,6 +6452,8 @@ fn classify_record_payload(data: &[u8]) -> &'static str {
         "HAMT node"
     } else if data.starts_with(b"MTHR") {
         "HAMT state-group root"
+    } else if data.starts_with(b"STGP") {
+        "state-group instance"
     } else if data.starts_with(b"AUX1") {
         "auxiliary index value"
     } else if decode_event_json_record(data).is_some() {
@@ -7033,13 +7171,17 @@ fn scan_pack(
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = format_id(collection_id);
         let id_hex = format_id(node_id);
-        let need_record = opts.verbose || opts.header || opts.decode.is_some();
+        let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
+        // State scans render the event -> state-group mapping inline, so they
+        // read frames even without `--verbose`/`--decode`; other shards keep
+        // the read-free default.
+        let need_record = should_decode || opts.header || shard_type == ShardType::State;
         let data = need_record
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
             .transpose()?;
         let payload = data
             .as_ref()
-            .map(|data| scan_payload_cell(&data.data, shard_type));
+            .map(|data| scan_payload_cell(&data.data, shard_type, should_decode));
         println!(
             "{}",
             scan_table_row(&collection_hex, &id_hex, *offset, payload.as_deref())
@@ -7049,7 +7191,6 @@ fn scan_pack(
                 print_scan_record_header(record, collection_id);
             }
         }
-        let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
         if should_decode {
             if let Some(data) =
                 data.filter(|data| scan_payload_suffix(&data.data, shard_type).is_none())
@@ -7094,9 +7235,14 @@ fn scan_table_row(location: &str, id: &str, offset: u64, payload: Option<&str>) 
 
 /// The PAYLOAD cell for one row: a decodable payload prints below the row
 /// instead (its formatted form spans lines), so the cell just says so.
-fn scan_payload_cell(data: &[u8], shard_type: ShardType) -> String {
-    scan_payload_suffix(data, shard_type)
-        .unwrap_or_else(|| format!("{} bytes (decoded below)", data.len()))
+fn scan_payload_cell(data: &[u8], shard_type: ShardType, decodes_below: bool) -> String {
+    scan_payload_suffix(data, shard_type).unwrap_or_else(|| {
+        if decodes_below {
+            format!("{} bytes (decoded below)", data.len())
+        } else {
+            format!("{} bytes", data.len())
+        }
+    })
 }
 
 /// Print every physical frame for a collection across all packs. This is a
@@ -7431,7 +7577,8 @@ fn print_collection_record(
         print_scan_table_header("PACK", scan_payload_label(context.shard_type));
         context.header_printed = true;
     }
-    let need_record = context.mode.verbose() || context.header || context.decode.is_some();
+    let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
+    let need_record = should_decode || context.header || context.shard_type == ShardType::State;
     let data = need_record
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
@@ -7439,7 +7586,7 @@ fn print_collection_record(
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             "collection metadata".to_owned()
         } else {
-            scan_payload_cell(&data.data, context.shard_type)
+            scan_payload_cell(&data.data, context.shard_type, should_decode)
         }
     });
     println!(
@@ -7456,7 +7603,6 @@ fn print_collection_record(
             print_scan_record_header(record, &context.collection_id);
         }
     }
-    let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
     if should_decode {
         if let Some(data) =
             data.filter(|data| scan_payload_suffix(&data.data, context.shard_type).is_none())
@@ -7541,13 +7687,17 @@ fn print_scan_payload(data: &[u8], decode: Option<&str>) {
     let rendered = if let Some(mode) = decode {
         match mode {
             "json" => pretty_json_stream(data),
-            "hamt" => decode_hamt_root(data).or_else(|| decode_hamt_node(data)),
+            "hamt" => decode_hamt_root(data)
+                .or_else(|| decode_hamt_node(data))
+                .or_else(|| decode_state_group(data)),
             "state" => {
                 if data.len() == 8 {
                     let state_group = u64::from_be_bytes(data.try_into().unwrap());
                     Some(format!("PTR: 0x{state_group:016x}\n").into_bytes())
                 } else {
-                    decode_hamt_root(data).or_else(|| decode_hamt_node(data))
+                    decode_hamt_root(data)
+                        .or_else(|| decode_hamt_node(data))
+                        .or_else(|| decode_state_group(data))
                 }
             }
             "raw" => Some(hex_bytes(data).into_bytes()),
@@ -7581,12 +7731,14 @@ fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
         // portion instead of incorrectly calling the whole envelope opaque.
         const AUXILIARY_VALUE_OFFSET: usize = 4 + 32;
         if data.len() < AUXILIARY_VALUE_OFFSET {
-            return Some(format!(
-                "{} bytes (malformed AUX1 envelope)",
-                data.len()
-            ));
+            return Some(format!("{} bytes (malformed AUX1 envelope)", data.len()));
         }
         let value = &data[AUXILIARY_VALUE_OFFSET..];
+        // A 16-byte value in the state shard is an `event -> STGP instance`
+        // pointer; render it in the same `PTR:` form as the legacy pointer.
+        if value.len() == STATE_GROUP_ID_LENGTH {
+            return Some(format!("PTR: {}", format_id(value)));
+        }
         let rendered = std::str::from_utf8(value)
             .ok()
             .filter(|text| text.bytes().all(|byte| !byte.is_ascii_control()))
@@ -8988,9 +9140,8 @@ fn import_pdu_events(
                 }
             }
         }
-        to_write.sort_by_key(|(node_id, _)| {
-            order_by_node.get(node_id).copied().unwrap_or(usize::MAX)
-        });
+        to_write
+            .sort_by_key(|(node_id, _)| order_by_node.get(node_id).copied().unwrap_or(usize::MAX));
     }
 
     // Genesis metadata precedes the batch's records, so it is the collection's
@@ -9049,14 +9200,16 @@ fn import_pdu_events(
             }
         }
     }
-    let mut computed_state_sets: HashMap<String, StateSet> = HashMap::new();
+    let mut computed_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> =
+        HashMap::new();
     let unresolved_count = if loaded {
         0
     } else {
-        let state_computation = compute_state_groups_partial(events, auth_chain);
+        let state_computation =
+            compute_state_groups_partial(events, auth_chain, &resolved.canonical_id);
         let unresolved = state_computation.unresolved;
         state_groups = state_computation.groups;
-        computed_state_sets = state_computation.state_sets;
+        computed_instances = state_computation.instances;
         if !unresolved.is_empty() {
             eprintln!(
                 "warning: partial state-group computation: {} event(s) have missing parents or are in cycles; resolvable events were retained",
@@ -9092,17 +9245,17 @@ fn import_pdu_events(
         // a benign last-writer win.
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
-            .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
+            .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
         if let Err(error) = aux.put_many(&entries) {
             eprintln!("warning: unable to persist state groups: {error}");
         }
     }
-    if !computed_state_sets.is_empty() {
-        match materialize_state_hamts(state_store, &resolved.canonical_id, &computed_state_sets) {
+    if !computed_instances.is_empty() {
+        match materialize_state_hamts(state_store, &resolved.canonical_id, &computed_instances) {
             Ok(written) => eprintln!(
                 "  state HAMT: {written} records materialized for {} state groups",
-                computed_state_sets.len()
+                computed_instances.len()
             ),
             Err(error) => eprintln!("warning: unable to persist state HAMT: {error}"),
         }
@@ -9658,8 +9811,7 @@ fn topological_event_order_with_template(
             node_ids.insert(event_short_id(event_id), node_id);
         }
     }
-    let sorted = topo_sort_dag_with_tie_break(&frontier, &reverse_map, Some(&node_ids))
-        .ok();
+    let sorted = topo_sort_dag_with_tie_break(&frontier, &reverse_map, Some(&node_ids)).ok();
     Ok(sorted.map(|sorted| event_order_map(&frontier, &reverse_map, sorted)))
 }
 
@@ -9686,11 +9838,20 @@ fn event_order_map(
 /// be resolved. `unresolved` contains events blocked by missing parents or
 /// cycles.
 struct PartialStateComputation {
-    groups: HashMap<String, String>,
+    groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
     unresolved: Vec<String>,
-    /// One representative state set per state-group id, retained so an import
-    /// can materialize each distinct state as a HAMT root.
-    state_sets: HashMap<String, StateSet>,
+    /// One record per derived state-group instance, retained so an import can
+    /// materialize its `STGP` record and (deduplicated) `STAT` content.
+    instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+}
+
+/// One resolved state-group derivation: the parent instance ids it descends
+/// from, the resulting state `LtHash`, and the state set to materialize into
+/// the shared `STAT` content.
+struct StateInstance {
+    parents: Vec<[u8; STATE_GROUP_ID_LENGTH]>,
+    lthash: [u8; 32],
+    set: StateSet,
 }
 
 /// Compute state groups for a set of events by walking the event DAG in
@@ -9700,22 +9861,27 @@ struct PartialStateComputation {
 /// the DAG so that `auth_edges` resolve correctly, but only PDU state
 /// events contribute to the state set.
 ///
-/// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
-/// `LtHash` digest of the state set) for resolvable events. Each event inherits
-/// the state from its `prev_events` and applies its own state change (if it is
-/// a state event with `state_key`). Events blocked by missing parents or
-/// cycles are reported separately in `unresolved`.
+/// Returns a map from `event_id` -> 128-bit `STGP` state-group instance id for
+/// resolvable events. Each event inherits the state from its `prev_events` and
+/// applies its own state change (if it is a state event with `state_key`). A
+/// state-changing event, or a merge whose parents do not already share a single
+/// instance, derives a new instance keyed by the parent instance ids and the
+/// state `LtHash`; an ordinary event that changes nothing reuses its parent's
+/// instance. Events blocked by missing parents or cycles are reported
+/// separately in `unresolved`.
 fn compute_state_groups_partial(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
+    room_id: &str,
 ) -> PartialStateComputation {
-    compute_state_groups_partial_in_view(events, auth_chain, StateView::Federated)
+    compute_state_groups_partial_in_view(events, auth_chain, StateView::Federated, room_id)
 }
 
 fn compute_state_groups_partial_in_view(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
     view: StateView,
+    room_id: &str,
 ) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
@@ -9741,7 +9907,7 @@ fn compute_state_groups_partial_in_view(
         return PartialStateComputation {
             groups: HashMap::new(),
             unresolved: Vec::new(),
-            state_sets: HashMap::new(),
+            instances: HashMap::new(),
         };
     }
 
@@ -9756,22 +9922,33 @@ fn compute_state_groups_partial_in_view(
         }
     }
 
-    let result = walk_state_groups(&frontier, &sorted, &reverse_map, &events_by_sid, view);
+    let result = walk_state_groups(
+        room_id,
+        &frontier,
+        &sorted,
+        &reverse_map,
+        &events_by_sid,
+        view,
+    );
 
     PartialStateComputation {
         groups: result.0,
         unresolved,
-        state_sets: result.1,
+        instances: result.1,
     }
 }
 
 fn walk_state_groups(
+    room_id: &str,
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     sorted: &[usize],
     reverse_map: &HashMap<u64, String>,
     events_by_sid: &HashMap<u64, &OwnedValue>,
     view: StateView,
-) -> (HashMap<String, String>, HashMap<String, StateSet>) {
+) -> (
+    HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
+    HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+) {
     // How many resident children still need each event's state. Once the last
     // child is processed the state is dropped, so memory follows the DAG's
     // frontier width instead of holding one state per event for the whole run.
@@ -9787,15 +9964,20 @@ fn walk_state_groups(
         }
     }
 
-    let empty = SharedState::new(StateSet::new());
+    let empty_set = StateSet::new();
+    let empty = SharedState::new(
+        empty_set,
+        state_group_instance_id(room_id, &[], &StateSet::new().lthash()),
+    );
     let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
-    let mut result: HashMap<String, String> = HashMap::new();
-    let mut state_sets: HashMap<String, StateSet> = HashMap::new();
+    let mut result: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
+    let mut instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> = HashMap::new();
 
     for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
+        let mut parent_instances: Vec<[u8; STATE_GROUP_ID_LENGTH]> = Vec::new();
         for edge in frontier.prev_edges(idx) {
             if !edge.is_resident() {
                 continue;
@@ -9803,6 +9985,7 @@ fn walk_state_groups(
             let parent_id = frontier.nodes[edge.arena_index()].short_id;
             parent_ids.push(parent_id);
             if let Some(parent_state) = state_at.get(&parent_id) {
+                parent_instances.push(parent_state.instance);
                 parents.push(Arc::clone(parent_state));
             }
         }
@@ -9818,7 +10001,7 @@ fn walk_state_groups(
             [first, rest @ ..]
                 if rest
                     .iter()
-                    .all(|p| Arc::ptr_eq(p, first) || p.digest == first.digest) =>
+                    .all(|p| Arc::ptr_eq(p, first) || p.lthash == first.lthash) =>
             {
                 Arc::clone(first)
             }
@@ -9827,11 +10010,15 @@ fn walk_state_groups(
                 for parent in &parents {
                     merged.merge(&parent.set);
                 }
-                SharedState::new(merged)
+                let instance =
+                    state_group_instance_id(room_id, &parent_instances, &merged.lthash());
+                SharedState::new(merged, instance)
             }
         };
 
-        // Only a state event produces a new state set.
+        // Only a state event produces a new state set. A merge whose parents
+        // do not already share one instance derives a new instance too, so the
+        // merge topology survives even when the state does not change.
         let state = match events_by_sid.get(&short_id) {
             Some(ev) if is_state_event(ev) && !view.excludes(ev) => {
                 let key = state_key(ev);
@@ -9839,16 +10026,26 @@ fn walk_state_groups(
                 let eid = event_id(ev).unwrap_or("").to_owned();
                 let mut set = base.set.clone();
                 set.set(state_type, &key, eid);
-                SharedState::new(set)
+                let instance = state_group_instance_id(room_id, &parent_instances, &set.lthash());
+                SharedState::new(set, instance)
             }
-            _ => base,
+            _ if distinct_instances(&parent_instances) > 1 => {
+                let instance = state_group_instance_id(room_id, &parent_instances, &base.lthash);
+                SharedState::new(base.set.clone(), instance)
+            }
+            _ => Arc::clone(&base),
         };
 
+        instances
+            .entry(state.instance)
+            .or_insert_with(|| StateInstance {
+                parents: canonical_parents(&parent_instances),
+                lthash: state.lthash,
+                set: state.set.clone(),
+            });
+
         if let Some(eid) = reverse_map.get(&short_id) {
-            state_sets
-                .entry(state.digest.clone())
-                .or_insert_with(|| state.set.clone());
-            result.insert(eid.clone(), state.digest.clone());
+            result.insert(eid.clone(), state.instance);
         }
         for parent_id in parent_ids {
             if let Some(count) = remaining_children.get_mut(&parent_id) {
@@ -9862,7 +10059,23 @@ fn walk_state_groups(
             state_at.insert(short_id, state);
         }
     }
-    (result, state_sets)
+    (result, instances)
+}
+
+/// Number of distinct instance ids in `instances`.
+fn distinct_instances(instances: &[[u8; STATE_GROUP_ID_LENGTH]]) -> usize {
+    let mut ids = instances.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len()
+}
+
+/// Sort and deduplicate parent instance ids for a canonical record.
+fn canonical_parents(parents: &[[u8; STATE_GROUP_ID_LENGTH]]) -> Vec<[u8; STATE_GROUP_ID_LENGTH]> {
+    let mut canonical = parents.to_vec();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical
 }
 
 /// Return the events whose `prev_events` reference a parent absent from this
@@ -9977,17 +10190,23 @@ fn partial_topo_sort_dag(
     (sorted, unresolved)
 }
 
-/// A state set with its state-group digest computed once, so events that share
-/// a state also share the digest instead of re-sorting and re-hashing it.
+/// A state set with its `LtHash` and state-group instance id computed once, so
+/// events that share a state also share them instead of re-sorting and
+/// re-hashing.
 struct SharedState {
     set: StateSet,
-    digest: String,
+    lthash: [u8; 32],
+    instance: [u8; STATE_GROUP_ID_LENGTH],
 }
 
 impl SharedState {
-    fn new(set: StateSet) -> Arc<Self> {
-        let digest = set.digest_base64url();
-        Arc::new(Self { set, digest })
+    fn new(set: StateSet, instance: [u8; STATE_GROUP_ID_LENGTH]) -> Arc<Self> {
+        let lthash = set.lthash();
+        Arc::new(Self {
+            set,
+            lthash,
+            instance,
+        })
     }
 }
 
@@ -10021,13 +10240,13 @@ impl StateSet {
         }
     }
 
-    /// Deterministic state-group ID: the unkeyed `LtHash` digest over the
-    /// logical `(type, state_key, event_id)` entries.
+    /// Unkeyed `LtHash` digest over the logical `(type, state_key, event_id)`
+    /// entries: the state identity shared by every derivation that reaches it.
     ///
     /// `LtHash` addition is commutative, so entry order does not matter. This
-    /// matches `sithnapse`'s state-group identity and the `state_group_id`
-    /// embedded in every materialized `MTHR` root.
-    fn digest_base64url(&self) -> String {
+    /// matches `sithnapse`'s state identity and the lattice embedded in every
+    /// materialized `MTHR` root.
+    fn lthash(&self) -> [u8; 32] {
         let entries: Vec<(String, String, String)> = self
             .entries
             .iter()
@@ -10035,8 +10254,13 @@ impl StateSet {
                 (event_type.clone(), state_key.clone(), event_id.clone())
             })
             .collect();
-        let id = crate::state_hamt::state_group_id(&entries);
-        crate::state_hamt::encode_state_group_id(&id)
+        crate::state_hamt::state_group_id(&entries)
+    }
+
+    /// The `LtHash` digest as unpadded base64url, for golden tests.
+    #[cfg(test)]
+    fn digest_base64url(&self) -> String {
+        crate::state_hamt::encode_state_group_id(&self.lthash())
     }
 }
 

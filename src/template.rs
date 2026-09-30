@@ -166,6 +166,8 @@ pub const MEMBER_NAMESPACE_PREV: [u8; 4] = *b"PREV";
 pub const MEMBER_NAMESPACE_AUTH: [u8; 4] = *b"AUTH";
 /// Member namespace for state collections (`b"STAT"`).
 pub const MEMBER_NAMESPACE_STAT: [u8; 4] = *b"STAT";
+/// Member namespace for state-group instance records (`b"STGP"`).
+pub const MEMBER_NAMESPACE_STGP: [u8; 4] = *b"STGP";
 /// Member namespace for generation-scoped forward-edge collections (`b"FWD "`).
 pub const MEMBER_NAMESPACE_FWD: [u8; 4] = *b"FWD ";
 /// Member namespace for internal system collections (`b"INTL"`).
@@ -203,6 +205,14 @@ pub const NAMESPACE_BIAS_STAT: [u8; 32] = [
     0x45, 0x9d, 0x81, 0xae, 0xce, 0xde, 0x93, 0x9f, 0x16, 0xbe, 0xf2, 0x35, 0xf7, 0x89, 0xeb, 0x7d,
 ];
 
+/// Fixed 32-byte namespace bias constant for `b"STGP"`.
+///
+/// Computed as `BLAKE3-256("mtxdb/namespace/v1/STGP")`.
+pub const NAMESPACE_BIAS_STGP: [u8; 32] = [
+    0x4c, 0x9e, 0x1c, 0xc2, 0xb2, 0x7b, 0xd8, 0x0e, 0x22, 0x2c, 0xb7, 0x0f, 0x7b, 0xce, 0xc3, 0xc0,
+    0x55, 0xd3, 0x40, 0x36, 0x4b, 0x8f, 0xe7, 0x8c, 0xda, 0xdf, 0x03, 0x37, 0xb8, 0x56, 0x38, 0xae,
+];
+
 /// Fixed 32-byte namespace bias constant for `b"FWD "`.
 ///
 /// Computed as `BLAKE3-256("mtxdb/namespace/v1/FWD ")`.
@@ -221,7 +231,7 @@ pub const NAMESPACE_BIAS_INTL: [u8; 32] = [
 
 /// Map a 4-byte member namespace to its fixed 32-byte bias constant.
 ///
-/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `FWD `, `INTL`).
+/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`).
 /// Returns `None` for unrecognized namespaces (such as physical pool tags like `b"EDGE"`).
 #[must_use]
 pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
@@ -246,6 +256,12 @@ pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
         && namespace[3] == b'T'
     {
         Some(NAMESPACE_BIAS_STAT)
+    } else if namespace[0] == b'S'
+        && namespace[1] == b'T'
+        && namespace[2] == b'G'
+        && namespace[3] == b'P'
+    {
+        Some(NAMESPACE_BIAS_STGP)
     } else if namespace[0] == b'I'
         && namespace[1] == b'N'
         && namespace[2] == b'T'

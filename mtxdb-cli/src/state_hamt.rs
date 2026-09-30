@@ -56,11 +56,9 @@ pub(crate) fn build_state_hamt(
         lattice.insert(event_type, state_key, event_id);
     }
 
-    let hamt_entries = entries
-        .iter()
-        .map(|(event_type, state_key, event_id)| {
-            (state_hamt_leaf_key(event_type, state_key), event_id.clone())
-        });
+    let hamt_entries = entries.iter().map(|(event_type, state_key, event_id)| {
+        (state_hamt_leaf_key(event_type, state_key), event_id.clone())
+    });
     let (handle, root) = build_hamt_root_handle(structural_key, &lattice, hamt_entries)
         .map_err(|error| format!("failed to build state HAMT for {room_id}: {error:?}"))?;
 
@@ -68,7 +66,8 @@ pub(crate) fn build_state_hamt(
     let mut nodes = Vec::new();
     collect_persisted_nodes(&root, &mut seen, &mut nodes);
 
-    let root_record = encode_state_hamt_root(room_prefix, room_id, &handle.structural_hash, &lattice);
+    let root_record =
+        encode_state_hamt_root(room_prefix, room_id, &handle.structural_hash, &lattice);
     Ok(BuiltStateHamt {
         root_hash: handle.structural_hash,
         state_group_id: handle.state_group_id,
@@ -178,8 +177,8 @@ pub(crate) fn state_hamt_root_node_id(namespace: &str, state_group_id: &[u8; 32]
     id
 }
 
-/// Base64url-encode a state-group id for the `event_id -> state_group_id` aux
-/// index.
+/// Base64url-encode a state-group `LtHash` digest, for golden tests.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn encode_state_group_id(id: &[u8; 32]) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -241,7 +240,7 @@ mod tests {
         vec![
             (
                 "m.room.create".to_owned(),
-                "".to_owned(),
+                String::new(),
                 "$create:example.org".to_owned(),
             ),
             (
@@ -251,7 +250,7 @@ mod tests {
             ),
             (
                 "m.room.name".to_owned(),
-                "".to_owned(),
+                String::new(),
                 "$name:example.org".to_owned(),
             ),
         ]

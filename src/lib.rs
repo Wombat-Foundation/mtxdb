@@ -44,8 +44,12 @@ pub mod layout;
 pub mod matrix_policy;
 /// On-disk packfile format and the storage engine built on top of it.
 pub mod packfile;
+/// Per-record retention, durability, and ordering policy.
+pub mod record_class;
 /// Fixed-size shard file pool that packfiles are written into.
 pub mod shard;
+/// Matrix state-group instance identity and record layout.
+pub mod state_group;
 /// Core node/storage types and the top-level `StorageEngine`.
 pub mod storage;
 /// Executable policy primitives for application collection templates.
@@ -71,14 +75,21 @@ pub use layout::{enclosing_root, is_database_root, DatabaseLayout, ShardType};
 #[cfg(feature = "multi-reader")]
 pub use matrix_policy::matrix_pool_policies;
 pub use matrix_policy::{
-    EventIdPolicy, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
+    EventIdPolicy, MatrixRecordClass, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
 };
 pub use packfile::{
     storage::{OperationLatency, PackfileStorage, ReadPlanPolicy},
     FrameMetadata, Record,
 };
+pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
 pub use shard::{LockHolderInfo, ShardPool};
+pub use state_group::{
+    decode_state_group_record, encode_state_group_record, state_group_collection_id,
+    state_group_instance_full_id, state_group_instance_id, StateGroupId, StateGroupInstance,
+    StateGroupRelation, STATE_GROUP_DOMAIN_PREFIX, STATE_GROUP_RECORD_MAGIC,
+    STATE_GROUP_RECORD_VERSION,
+};
 pub use storage::{
     content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,
 };
@@ -91,6 +102,6 @@ pub use template::{
     PayloadPolicy, RecordIdentityRule, COLLECTION_METADATA_RECORD_ID,
     COLLECTION_TEMPLATE_FORMAT_V1, MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT,
     MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT,
-    NAMESPACE_BIAS_AUTH, NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_FWD, NAMESPACE_BIAS_INTL,
-    NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT,
+    MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH, NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_FWD,
+    NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
 };

@@ -14,6 +14,8 @@
     reason = "the Matrix adapter keeps its complete version-policy table ahead of optional verification/state features"
 )]
 
+use crate::record_class::{Durability, OrderingPolicy, RecordClass, Retention};
+
 /// The validation claim made for imported Matrix source records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationProfile {
@@ -342,3 +344,96 @@ pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
         },
     }
 }
+
+/// A Matrix storage workload with its own retention/durability/ordering policy.
+///
+/// These are the per-record classes the Matrix adapter assigns to each hot
+/// store. Immutable history (events, DAG edges, state groups) shares the engine
+/// with update-heavy projections; only the [`RecordClass`] differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixRecordClass {
+    /// Presence heartbeats; latest value only and disposable on crash.
+    Presence,
+    /// Read receipts; the latest value is normally sufficient.
+    Receipts,
+    /// Per-user/per-room account data; keeps version history.
+    AccountData,
+    /// Current room state and membership projections.
+    CurrentState,
+    /// Events and DAG edges; immutable topologically and stream ordered history.
+    Events,
+    /// Per-room state-group instances: one per derivation.
+    ///
+    /// The layers stay distinct:
+    /// - the instance id is unique per derivation/version;
+    /// - stored parent links form the DAG topology;
+    /// - the state-group `LtHash` is the state identity;
+    /// - the HAMT root id references shared, content-addressed materialization.
+    ///
+    /// Parents must precede descendants during materialization/replay. A merge
+    /// may have several predecessors, so this is a partial order, not a linear
+    /// sequence. Successors need not exist when a group is written; the stored
+    /// parent links are enough to order it later.
+    StateGroup,
+    /// Shared, content-addressed HAMT roots and nodes.
+    ///
+    /// Equal state sets resolve to the same root, so this materialization is
+    /// deduplicated across state-group instances and carries no ordering of its
+    /// own.
+    StateHamtContent,
+    /// `event → state-group` mappings, stored as compact root-id links.
+    ///
+    /// This is a pure lookup index; the referenced state group carries the
+    /// ordering, not the mapping.
+    StateGroupMapping,
+}
+
+impl MatrixRecordClass {
+    /// The engine-level record class for this Matrix workload.
+    #[must_use]
+    pub const fn record_class(self) -> RecordClass {
+        match self {
+            Self::Presence => RecordClass::new(
+                Retention::EphemeralLatest,
+                Durability::Volatile,
+                OrderingPolicy::None,
+            ),
+            Self::Receipts => RecordClass::new(
+                Retention::LatestOnly,
+                Durability::GroupCommit,
+                OrderingPolicy::Stream,
+            ),
+            Self::AccountData => RecordClass::new(
+                Retention::Versioned,
+                Durability::GroupCommit,
+                OrderingPolicy::None,
+            ),
+            Self::CurrentState => RecordClass::new(
+                Retention::Versioned,
+                Durability::Synchronous,
+                OrderingPolicy::None,
+            ),
+            Self::Events => RecordClass::new(
+                Retention::Immutable,
+                Durability::Synchronous,
+                OrderingPolicy::TopologicalAndStream,
+            ),
+            Self::StateGroup => RecordClass::new(
+                Retention::Immutable,
+                Durability::Synchronous,
+                OrderingPolicy::Topological,
+            ),
+            // Both are write-once: shared HAMT content dedupes by root, and the
+            // event mapping is a single link per key.
+            Self::StateHamtContent | Self::StateGroupMapping => RecordClass::new(
+                Retention::Immutable,
+                Durability::Synchronous,
+                OrderingPolicy::None,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "test_matrix_policy.rs"]
+mod tests;

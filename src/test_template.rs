@@ -764,6 +764,7 @@ fn namespace_bias_constants_match_blake3() {
         (b"PREV", NAMESPACE_BIAS_PREV),
         (b"AUTH", NAMESPACE_BIAS_AUTH),
         (b"STAT", NAMESPACE_BIAS_STAT),
+        (b"STGP", NAMESPACE_BIAS_STGP),
         (b"FWD ", NAMESPACE_BIAS_FWD),
         (b"INTL", NAMESPACE_BIAS_INTL),
     ] {
