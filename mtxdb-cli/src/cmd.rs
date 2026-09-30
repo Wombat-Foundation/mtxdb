@@ -9523,7 +9523,7 @@ fn topo_sort_dag(
 fn topo_sort_dag_with_tie_break(
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     reverse_map: &HashMap<u64, String>,
-    operational_ids: Option<&HashMap<u64, [u8; 16]>>,
+    node_ids: Option<&HashMap<u64, [u8; 16]>>,
 ) -> Result<Vec<usize>, Vec<String>> {
     let n = frontier.nodes.len();
     if n == 0 {
@@ -9555,13 +9555,13 @@ fn topo_sort_dag_with_tie_break(
     let mut queue: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
     for (idx, &deg) in in_degree.iter().enumerate() {
         if deg == 0 {
-            let event_id = reverse_map
+            let node_id = reverse_map
                 .get(&frontier.nodes[idx].short_id)
                 .cloned()
                 .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id));
-            let tie = operational_ids
+            let tie = node_ids
                 .and_then(|ids| ids.get(&frontier.nodes[idx].short_id))
-                .map_or_else(|| event_id.into_bytes(), |id| id.to_vec());
+                .map_or_else(|| node_id.into_bytes(), |id| id.to_vec());
             queue.push(Reverse((tie, idx)));
         }
     }
@@ -9574,13 +9574,13 @@ fn topo_sort_dag_with_tie_break(
                 .checked_sub(1)
                 .expect("DAG in-degree underflow");
             if in_degree[child] == 0 {
-                let event_id = reverse_map
+                let node_id = reverse_map
                     .get(&frontier.nodes[child].short_id)
                     .cloned()
                     .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[child].short_id));
-                let tie = operational_ids
+                let tie = node_ids
                     .and_then(|ids| ids.get(&frontier.nodes[child].short_id))
-                    .map_or_else(|| event_id.into_bytes(), |id| id.to_vec());
+                    .map_or_else(|| node_id.into_bytes(), |id| id.to_vec());
                 queue.push(Reverse((tie, child)));
             }
         }
@@ -9617,15 +9617,15 @@ fn topological_event_order_with_template(
     template: &CollectionTemplate,
 ) -> anyhow::Result<Option<HashMap<String, usize>>> {
     let (frontier, _id_map, reverse_map) = build_event_dag(events);
-    let mut operational_ids = HashMap::new();
+    let mut node_ids = HashMap::new();
     for event in events {
         if let (Some(event_id), Some(node_id)) =
             (event_id(event), template_node_id(template, event)?)
         {
-            operational_ids.insert(event_short_id(event_id), node_id);
+            node_ids.insert(event_short_id(event_id), node_id);
         }
     }
-    let sorted = topo_sort_dag_with_tie_break(&frontier, &reverse_map, Some(&operational_ids))
+    let sorted = topo_sort_dag_with_tie_break(&frontier, &reverse_map, Some(&node_ids))
         .ok();
     Ok(sorted.map(|sorted| event_order_map(&frontier, &reverse_map, sorted)))
 }
