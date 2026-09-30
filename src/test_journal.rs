@@ -2106,7 +2106,10 @@ fn changes_since_keeps_an_idle_tail_on_the_resume_path() {
     set_changes_since_force_untrusted(true);
     let full_scans = changes_since_full_scans();
     let page = coordinator.changes_since(&cursor, 8).unwrap();
-    assert!(page.groups.is_empty());
+    assert!(
+        page.groups.is_empty(),
+        "an idle tail must not return any groups"
+    );
     assert!(!page.has_more);
     assert_eq!(page.next_cursor.resume_offset, cursor.resume_offset);
     assert_eq!(
@@ -3409,7 +3412,10 @@ fn expectations_are_staged_and_discarded_with_the_transaction() {
     use crate::layout::ShardType;
 
     let stage = TxnStage::new();
-    assert!(stage.expectations().is_empty());
+    assert!(
+        stage.expectations().is_empty(),
+        "a fresh stage must not carry any expectations"
+    );
     stage
         .stage_expectation(ShardType::State, [4; 16], 42)
         .unwrap();

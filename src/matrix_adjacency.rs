@@ -138,6 +138,13 @@ impl MatrixAdjacency {
         }
     }
 
+    /// The room's event short-id scope. It is also the ordinal space that
+    /// auth-closure bitmaps over this room are built in.
+    #[must_use]
+    pub const fn events_index(&self) -> ShortIdIndex {
+        self.events
+    }
+
     /// Record an event's `prev`, `auth` and (optional) relation in one
     /// transaction, allocating short ids for the event and every referenced
     /// event. Returns the event's short id.

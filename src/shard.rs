@@ -345,8 +345,13 @@ const STATS_HEADER_LEN: usize = 4 + 1 + 8;
 /// reserve here.
 const POOL_META_FILENAME: &str = "pool.meta";
 
-/// Pool metadata format version.
-const POOL_META_VERSION: u8 = 3;
+/// Pool metadata format version. v4 also records the creating `mtxdb`
+/// version, which replaced the separate one-time `store.meta` file.
+const POOL_META_VERSION: u8 = 4;
+
+/// `pool.meta` bytes before the creator version string:
+/// magic(4) + version(1) + `bucket_seed`(8) + `version_len`(1).
+const POOL_META_FIXED_LEN: usize = 14;
 
 /// Parsed pool metadata from `pool.meta`.
 #[derive(Debug, Clone, Copy)]
@@ -355,60 +360,18 @@ struct PoolMeta {
     bucket_seed: u64,
 }
 
-/// Filename for the one-time store-creation marker: records which
-/// `mtxdb` version created this store. Written once, when the very
-/// first shard is created, and never rewritten — unlike `pool.meta`, it
-/// has no in-place-updated field, so it needs no version-preservation
-/// dance across later opens.
-const STORE_META_FILENAME: &str = "store.meta";
-
-/// Store metadata format version.
-const STORE_META_VERSION: u8 = 1;
-
-/// Write the one-time store-creation marker, recording the `mtxdb`
-/// version (`CARGO_PKG_VERSION`) that created this store. Best-effort: a
-/// failure here doesn't fail store creation, since this is diagnostic
-/// metadata, not data the engine depends on to operate correctly.
-fn persist_store_meta(base_dir: &Path) {
-    let version = env!("CARGO_PKG_VERSION").as_bytes();
-    let Ok(version_len) = u8::try_from(version.len()) else {
-        return; // never true for a real semver string; just don't write garbage
-    };
-    let mut buf = Vec::with_capacity(6usize.saturating_add(version.len()));
-    buf.extend_from_slice(b"MTXS");
-    buf.push(STORE_META_VERSION);
-    buf.push(version_len);
-    buf.extend_from_slice(version);
-
-    let final_path = base_dir.join(STORE_META_FILENAME);
-    let tmp_path = final_path.with_extension(format!("meta.tmp.{}", std::process::id()));
-    let result = (|| -> io::Result<()> {
-        let mut tmp = File::create(&tmp_path)?;
-        tmp.write_all(&buf)?;
-        drop(tmp);
-        fs::rename(&tmp_path, &final_path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-}
-
-/// Read back the `mtxdb` version that created this store, if the
-/// store was created by a build new enough to record it (`store.meta`
-/// predates this feature, so an older store — or one with an unreadable
-/// or corrupt marker — returns `None` rather than erroring: this is
-/// diagnostic-only information).
+/// Read back the `mtxdb` version that created this pool, recorded in
+/// `pool.meta` when the pool was first created. Diagnostic only: a missing or
+/// unreadable file returns `None` rather than erroring.
 #[must_use]
 pub fn store_created_by_version(base_dir: &Path) -> Option<String> {
-    let data = fs::read(base_dir.join(STORE_META_FILENAME)).ok()?;
-    if data.len() < 6 || &data[0..4] != b"MTXS" || data[4] != STORE_META_VERSION {
+    let data = fs::read(base_dir.join(POOL_META_FILENAME)).ok()?;
+    if data.len() < POOL_META_FIXED_LEN || &data[0..4] != b"MTXP" || data[4] != POOL_META_VERSION {
         return None;
     }
-    let version_len = usize::from(data[5]);
-    let version_end = 6usize.checked_add(version_len)?;
-    let version_bytes = data.get(6..version_end)?;
-    String::from_utf8(version_bytes.to_vec()).ok()
+    let version_len = usize::from(data[POOL_META_FIXED_LEN.checked_sub(1)?]);
+    let version_end = POOL_META_FIXED_LEN.checked_add(version_len)?;
+    String::from_utf8(data.get(POOL_META_FIXED_LEN..version_end)?.to_vec()).ok()
 }
 
 /// Disambiguates concurrent `persist_stats` tmp filenames within this
@@ -713,8 +676,6 @@ pub struct ShardOpenTimings {
     pub pool_meta_restore: Duration,
     /// Reading and restoring persisted snapshot counters from `shard_stats.bin`.
     pub persisted_stats_restore: Duration,
-    /// Writing store.meta version marker via best-effort atomic write (fresh pool only; ZERO on existing pool).
-    pub store_meta_write: Duration,
     /// Persisting pool.meta reservation and syncing file contents (fresh pool only; ZERO on existing pool).
     pub pool_meta_persist: Duration,
     /// Creating the initial packfile atomically, writing its header, syncing,
@@ -1038,9 +999,8 @@ impl ShardPool {
     }
 
     /// Bootstrap a brand-new pool: create the first pack file, persist
-    /// `pool.meta` (with a fresh seed if needed), and write `store.meta`.
-    /// Returns `(bucket_seed, store_meta_write_time, pool_meta_persist_time,
-    /// initial_pack_create_time)`.
+    /// `pool.meta` (with a fresh seed if needed).
+    /// Returns `(bucket_seed, pool_meta_persist_time, initial_pack_create_time)`.
     ///
     /// # Errors
     /// Returns `io::Error` if the pool is empty and not writable.
@@ -1050,7 +1010,7 @@ impl ShardPool {
         shards: &mut [Option<Arc<Shard>>],
         mut bucket_seed: u64,
         writable: bool,
-    ) -> io::Result<(u64, Duration, Duration, Duration)> {
+    ) -> io::Result<(u64, Duration, Duration)> {
         if !writable {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1060,12 +1020,6 @@ impl ShardPool {
                 ),
             ));
         }
-
-        let t_store_meta = Instant::now();
-        if !base_dir.join(STORE_META_FILENAME).exists() {
-            persist_store_meta(base_dir);
-        }
-        let store_meta_write_time = t_store_meta.elapsed();
 
         if bucket_seed == 0 {
             use std::collections::hash_map::RandomState;
@@ -1087,7 +1041,6 @@ impl ShardPool {
 
         Ok((
             bucket_seed,
-            store_meta_write_time,
             pool_meta_persist_time,
             initial_pack_create_time,
         ))
@@ -1134,7 +1087,6 @@ impl ShardPool {
     ) -> Self {
         let metadata_subphases_sum = timings
             .pool_meta_restore
-            .saturating_add(timings.store_meta_write)
             .saturating_add(timings.pool_meta_persist)
             .saturating_add(timings.initial_pack_create)
             .saturating_add(timings.persisted_stats_restore);
@@ -1217,13 +1169,13 @@ impl ShardPool {
         let metadata_started = Instant::now();
         let (bucket_seed, pool_meta_restore_time) = Self::restore_pool_meta_state(&base_dir)?;
 
-        let (store_meta_write_time, pool_meta_persist_time, initial_pack_create_time, bucket_seed) =
+        let (pool_meta_persist_time, initial_pack_create_time, bucket_seed) =
             if shards.iter().all(std::option::Option::is_none) {
-                let (bs, smw, pmp, ipc) =
+                let (bs, pmp, ipc) =
                     Self::initialize_empty_pool(&base_dir, &mut shards, bucket_seed, writable)?;
-                (smw, pmp, ipc, bs)
+                (pmp, ipc, bs)
             } else {
-                (Duration::ZERO, Duration::ZERO, Duration::ZERO, bucket_seed)
+                (Duration::ZERO, Duration::ZERO, bucket_seed)
             };
 
         // Restoring is a pure read of shard_stats.bin applied to our own
@@ -1254,7 +1206,6 @@ impl ShardPool {
                 metadata_restore: metadata_restore_time,
                 pool_meta_restore: pool_meta_restore_time,
                 persisted_stats_restore: persisted_stats_restore_time,
-                store_meta_write: store_meta_write_time,
                 pool_meta_persist: pool_meta_persist_time,
                 initial_pack_create: initial_pack_create_time,
                 total,
@@ -1561,10 +1512,15 @@ impl ShardPool {
         bucket_seed: u64,
         sync_dir: bool,
     ) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(13);
+        let version = env!("CARGO_PKG_VERSION").as_bytes();
+        // A semver string never exceeds 255 bytes; truncate rather than fail.
+        let version = &version[..version.len().min(usize::from(u8::MAX))];
+        let mut buf = Vec::with_capacity(POOL_META_FIXED_LEN.saturating_add(version.len()));
         buf.extend_from_slice(b"MTXP");
         buf.push(POOL_META_VERSION);
         buf.extend_from_slice(&bucket_seed.to_le_bytes());
+        buf.push(u8::try_from(version.len()).unwrap_or(u8::MAX));
+        buf.extend_from_slice(version);
 
         let final_path = Self::pool_meta_path(base_dir);
         let tmp_path = final_path.with_extension(format!("meta.tmp.{}", std::process::id()));
@@ -1598,11 +1554,11 @@ impl ShardPool {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if data.len() < 13 {
+        if data.len() < POOL_META_FIXED_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "pool.meta is truncated ({} bytes, expected >= 13)",
+                    "pool.meta is truncated ({} bytes, expected >= {POOL_META_FIXED_LEN})",
                     data.len()
                 ),
             ));

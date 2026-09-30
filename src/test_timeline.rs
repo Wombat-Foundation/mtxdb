@@ -143,7 +143,10 @@ fn empty_index_pages_nothing() {
     let index = TimelineIndex::open(&engine, "test");
     index.build(&[]).unwrap();
     let page = index.page(&[1u8; 16], None, true, 5).unwrap();
-    assert!(page.entries.is_empty());
+    assert!(
+        page.entries.is_empty(),
+        "an empty index must page no entries"
+    );
     assert!(page.next_cursor.is_none());
     assert!(index.head().unwrap().is_some());
 }

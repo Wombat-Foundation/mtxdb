@@ -1434,6 +1434,15 @@ impl PackfileStorage {
     /// it is available to a read-only worker. A record resolved absent by a
     /// collection delete reports the delete LSN; an absent or legacy record
     /// reports `0`.
+    #[cfg_attr(
+        not(feature = "multi-reader"),
+        allow(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "the durable frame token is only read on the multi-reader path, so the \
+                      fallible lookup (and its `Result`) only exists there"
+        )
+    )]
     fn snapshot_record_versions(
         &self,
         overlay: Option<&ReadJournal>,

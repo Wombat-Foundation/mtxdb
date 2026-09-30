@@ -149,8 +149,6 @@ pub struct OpenTimings {
     pub pool_meta_restore: std::time::Duration,
     /// Reading and restoring persisted snapshot counters from `shard_stats.bin`.
     pub persisted_stats_restore: std::time::Duration,
-    /// Writing store.meta version marker via best-effort atomic write (fresh pool only; ZERO on existing pool).
-    pub store_meta_write: std::time::Duration,
     /// Persisting pool.meta reservation and syncing file contents (fresh pool only; ZERO on existing pool).
     pub pool_meta_persist: std::time::Duration,
     /// Creating the initial packfile atomically, writing its header, syncing,
@@ -216,7 +214,6 @@ impl Default for OpenTimings {
             metadata_restore: std::time::Duration::ZERO,
             pool_meta_restore: std::time::Duration::ZERO,
             persisted_stats_restore: std::time::Duration::ZERO,
-            store_meta_write: std::time::Duration::ZERO,
             pool_meta_persist: std::time::Duration::ZERO,
             initial_pack_create: std::time::Duration::ZERO,
             metadata_unattributed: std::time::Duration::ZERO,
@@ -2447,7 +2444,6 @@ impl PackfileStorage {
             timings.metadata_restore = shard_timings.metadata_restore;
             timings.pool_meta_restore = shard_timings.pool_meta_restore;
             timings.persisted_stats_restore = shard_timings.persisted_stats_restore;
-            timings.store_meta_write = shard_timings.store_meta_write;
             timings.pool_meta_persist = shard_timings.pool_meta_persist;
             timings.initial_pack_create = shard_timings.initial_pack_create;
             timings.metadata_unattributed = shard_timings.metadata_unattributed;
@@ -5079,6 +5075,13 @@ impl PackfileStorage {
     /// Snapshot this pool's logical versions through the checkpoint coverage
     /// boundary. Versions above that boundary remain in the retained WAL and
     /// must not be claimed by the checkpoint.
+    #[cfg_attr(
+        not(feature = "multi-reader"),
+        allow(
+            clippy::unused_self,
+            reason = "the journal and pool are only consulted on the multi-reader path"
+        )
+    )]
     fn checkpoint_logical_versions(&self, covered_lsn: Option<u64>) -> Vec<([u8; 16], u64)> {
         #[cfg(feature = "multi-reader")]
         if let (Some(journal), Some(pool), Some(covered_lsn)) = (
@@ -10101,6 +10104,13 @@ impl PackfileStorage {
     /// Record that this store's index now holds the mutation published at
     /// `lsn`, so versioned reads may certify it. Called by each write path only
     /// after the frame or deletion is applied, never at publication time.
+    #[cfg_attr(
+        not(feature = "multi-reader"),
+        allow(
+            clippy::unused_self,
+            reason = "the materialized LSN is only recorded on the multi-reader path"
+        )
+    )]
     fn note_published_materialized(&self, lsn: Option<u64>) {
         #[cfg(feature = "multi-reader")]
         if let Some(lsn) = lsn {
@@ -10373,17 +10383,20 @@ impl PackfileStorage {
             return false;
         };
         #[cfg(feature = "multi-reader")]
-        let this_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
+        {
+            let this_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
+            if !journal.should_force_reclaim_checkpoint(this_pool) {
+                return false;
+            }
+            match this_pool {
+                Some(pool) => journal.committed_lsn_for_pool(pool) > self.durable_coverage(),
+                None => true,
+            }
+        }
         #[cfg(not(feature = "multi-reader"))]
-        let this_pool = None;
-        if !journal.should_force_reclaim_checkpoint(this_pool) {
-            return false;
+        {
+            journal.should_force_reclaim_checkpoint(None)
         }
-        #[cfg(feature = "multi-reader")]
-        if let Some(pool) = pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
-            return journal.committed_lsn_for_pool(pool) > self.durable_coverage();
-        }
-        true
     }
 
     /// Whether a delta log continues the checkpoint this session is based on, so

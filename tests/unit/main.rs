@@ -25,3 +25,5 @@ mod test_index_checkpoint;
 mod test_matrix_policy;
 mod test_packfile_layout;
 mod test_redo;
+#[cfg(all(feature = "multi-reader", feature = "bitmaps"))]
+mod test_repack_closure;

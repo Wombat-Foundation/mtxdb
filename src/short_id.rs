@@ -314,6 +314,26 @@ impl ShortIdIndex {
         self
     }
 
+    /// The pool and collection this scope addresses.
+    #[must_use]
+    pub const fn scope(&self) -> (ShardType, [u8; 16]) {
+        (self.pool, self.collection_id)
+    }
+
+    /// The next id this scope will allocate; ids `1..next` are assigned.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt counter.
+    pub fn counter(&self, db: &SharedDatabase) -> Result<u32, StorageError> {
+        let txn = db.begin_transaction();
+        let (records, _) =
+            txn.get_with_record_versions(self.pool, &self.collection_id, &[COUNTER_ID])?;
+        match records.into_iter().next().flatten() {
+            Some(record) => decode_counter(&record.bytes),
+            None => Ok(1),
+        }
+    }
+
     /// Look up or allocate the short id of every key, in order.
     ///
     /// # Errors

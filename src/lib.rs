@@ -12,6 +12,10 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::module_name_repetitions)]
 
+/// Transitive auth closures: pure in-memory computation under `bitmaps`, plus
+/// the persisted generation layer under `multi-reader`.
+#[cfg(feature = "bitmaps")]
+pub mod auth_closure;
 /// Named application-owned lookup indexes sharing the normal packfile engine.
 pub mod auxiliary;
 /// Domain-tagged `u32` bitmap sets with generic set algebra.
@@ -58,6 +62,9 @@ pub mod matrix_policy;
 pub mod packfile;
 /// Per-record retention, durability, and ordering policy.
 pub mod record_class;
+/// Public façade and error surface over a room's auth closures.
+#[cfg(all(feature = "multi-reader", feature = "bitmaps"))]
+pub mod room_auth;
 /// Fixed-size shard file pool that packfiles are written into.
 pub mod shard;
 /// Room-scoped dense `u32` short ids and compact adjacency lists.
@@ -72,6 +79,8 @@ pub mod template;
 /// Persisted, ordered timeline index with copy-on-write roots.
 pub mod timeline;
 
+#[cfg(all(test, feature = "multi-reader", feature = "bitmaps"))]
+mod test_auth_closure;
 #[cfg(all(test, feature = "bitmaps"))]
 mod test_bitmap_set;
 #[cfg(all(test, feature = "multi-reader"))]

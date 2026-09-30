@@ -48,7 +48,10 @@ fn record_edges_is_atomic_immutable_and_leaf_safe() {
     let root = test_root("edges");
     let db = SharedDatabase::open(root.clone()).unwrap();
     let (create, none) = index().record_edges(&db, b"$create", PLAIN, &[]).unwrap();
-    assert!(none.is_empty());
+    assert!(
+        none.is_empty(),
+        "recording only a leaf edge must collect no touched neighbours"
+    );
     // A leaf has a present, empty edge list, distinct from an unknown id.
     assert_eq!(index().edges(&db, create, PLAIN).unwrap(), Some(vec![]));
     assert_eq!(index().edges(&db, 500, PLAIN).unwrap(), None);
