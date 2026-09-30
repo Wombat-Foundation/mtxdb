@@ -1058,8 +1058,20 @@ fn force_index_checkpoint_rewrites_with_and_without_pending_delta() {
     let store = PackfileStorage::open(dir.clone()).unwrap();
     store.enable_journal(&wal).unwrap();
 
-    // Empty delta log: no mutations yet. A normal sync would be a no-op;
-    // forcing still writes a checkpoint with no committed coverage.
+    // The pool creates its first pack lazily, so that first write changes the
+    // pack set and takes a full checkpoint. Do it up front so the steps below
+    // start from a steady state.
+    store
+        .put(
+            &TEST_COLLECTION,
+            &[0x10; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"w")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    // Empty delta log: no further mutations yet. A normal sync would be a
+    // no-op; forcing still writes a checkpoint at the current coverage.
     store.force_index_checkpoint().unwrap();
     let empty = crate::index::checkpoint::read_checkpoint(&checkpoint_path).unwrap();
 

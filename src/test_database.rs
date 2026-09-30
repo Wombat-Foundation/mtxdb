@@ -3118,3 +3118,51 @@ fn same_record_write_conflicts() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn files_under(dir: &std::path::Path, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            files_under(&entry.path(), out);
+        } else {
+            out.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// A fresh shared database holds one root lock and one `pool.meta` per pool:
+/// no per-pool `.mtxdb.lock`, no `store.meta`, and no pack until a pool is
+/// written.
+#[test]
+fn a_fresh_shared_database_creates_only_the_files_it_needs() {
+    let root = test_root("lean-layout");
+    let database = SharedDatabase::open(root.clone()).unwrap();
+    let mut names = Vec::new();
+    files_under(&root, &mut names);
+    assert!(!names.iter().any(|n| n == ".mtxdb.lock"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "store.meta"), "{names:?}");
+    assert!(
+        !names.iter().any(|n| std::path::Path::new(n)
+            .extension()
+            .is_some_and(|e| e == "pack")),
+        "{names:?}"
+    );
+    assert_eq!(names.iter().filter(|n| *n == "pool.meta").count(), 4);
+
+    database
+        .pool(ShardType::State)
+        .put(&[1; 16], &node(1), &data(b"x"))
+        .unwrap();
+    let mut after = Vec::new();
+    files_under(&root, &mut after);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|n| std::path::Path::new(n)
+                .extension()
+                .is_some_and(|e| e == "pack"))
+            .count(),
+        1,
+        "only the written pool gets a pack: {after:?}"
+    );
+}

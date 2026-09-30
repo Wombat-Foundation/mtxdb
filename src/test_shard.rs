@@ -1309,3 +1309,58 @@ fn bytes_present_at_open_are_not_counted_as_unsynced() {
     let reopened = ShardPool::open(dir).unwrap();
     assert_eq!(reopened.unsynced_bytes(), 0);
 }
+
+fn pack_count(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pack")
+        })
+        .count()
+}
+
+/// An unused pool is just `pool.meta`: the first pack appears with the first
+/// write, and a read-only open of the empty pool succeeds with no shards.
+#[test]
+fn a_new_pool_creates_no_pack_until_the_first_write() {
+    let dir = test_dir("lazy_first_pack");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    assert_eq!(pack_count(&dir), 0, "open must not create a pack");
+    assert!(dir.join(POOL_META_FILENAME).exists());
+    assert_eq!(pool.shard_count(), 0);
+    assert!(
+        !dir.join("store.meta").exists(),
+        "creator version lives in pool.meta"
+    );
+    assert_eq!(
+        store_created_by_version(&dir).as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    let record = test_record(1, 1, b"first");
+    let (slot, offset, _) = pool.put_record_with_len(&record).unwrap();
+    assert_eq!(pack_count(&dir), 1, "the first write creates the pack");
+    assert_eq!(pool.shard_count(), 1);
+    pool.sync_all().unwrap();
+    drop(pool);
+
+    let reopened = ShardPool::open_read_only(dir.clone()).unwrap();
+    assert_eq!(reopened.shard_count(), 1);
+    assert_eq!(reopened.get_shard(slot).unwrap().slot, slot);
+    let _ = offset;
+}
+
+#[test]
+fn a_read_only_open_of_an_empty_pool_succeeds_and_a_missing_pool_fails() {
+    let dir = test_dir("lazy_read_only_empty");
+    drop(ShardPool::open(dir.clone()).unwrap());
+    let reader = ShardPool::open_read_only(dir.clone()).unwrap();
+    assert_eq!(reader.shard_count(), 0);
+    assert!(reader.try_active_shard().is_err());
+    assert!(ShardPool::open_read_only(dir.join("absent")).is_err());
+}

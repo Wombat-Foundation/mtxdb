@@ -1007,11 +1007,15 @@ impl ShardPool {
     #[allow(clippy::too_many_arguments)]
     fn initialize_empty_pool(
         base_dir: &Path,
-        shards: &mut [Option<Arc<Shard>>],
         mut bucket_seed: u64,
         writable: bool,
     ) -> io::Result<(u64, Duration, Duration)> {
         if !writable {
+            // A pool whose `pool.meta` exists but which has no pack yet is
+            // valid and empty: packs are created lazily on the first write.
+            if bucket_seed != 0 {
+                return Ok((bucket_seed, Duration::ZERO, Duration::ZERO));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -1031,19 +1035,11 @@ impl ShardPool {
         Self::persist_pool_meta_at_sync_dir(base_dir, bucket_seed, false)?;
         let pool_meta_persist_time = t_pool_meta_persist.elapsed();
 
-        let t_initial_pack = Instant::now();
-        let (file, path, pack_id) = Self::create_packfile_atomically(base_dir, &[])?;
-        let file_len = file.metadata()?.len();
-        shards[0] = Some(Arc::new(Shard::new(0, pack_id, file, path, file_len)));
-
+        // No pack is created here: an empty pool is just `pool.meta`, and the
+        // first write creates the first pack (see `try_active_shard`).
         sync_directory(base_dir)?;
-        let initial_pack_create_time = t_initial_pack.elapsed();
 
-        Ok((
-            bucket_seed,
-            pool_meta_persist_time,
-            initial_pack_create_time,
-        ))
+        Ok((bucket_seed, pool_meta_persist_time, Duration::ZERO))
     }
 
     /// Restore `bucket_seed` from `pool.meta`. Returns `(bucket_seed,
@@ -1211,8 +1207,7 @@ impl ShardPool {
 
         let (pool_meta_persist_time, initial_pack_create_time, bucket_seed) =
             if shards.iter().all(std::option::Option::is_none) {
-                let (bs, pmp, ipc) =
-                    Self::initialize_empty_pool(&base_dir, &mut shards, bucket_seed, writable)?;
+                let (bs, pmp, ipc) = Self::initialize_empty_pool(&base_dir, bucket_seed, writable)?;
                 (pmp, ipc, bs)
             } else {
                 (Duration::ZERO, Duration::ZERO, bucket_seed)
@@ -1492,17 +1487,17 @@ impl ShardPool {
     /// exists and the slot is still occupied, otherwise a freshly assigned
     /// home (the pool's current active shard, the same fallback every collection
     /// used before per-collection routing existed).
-    fn shard_for_collection(&self, collection_id: &[u8; 16]) -> Arc<Shard> {
+    fn shard_for_collection(&self, collection_id: &[u8; 16]) -> io::Result<Arc<Shard>> {
         if let Some(id) = self.collection_home.read().get(collection_id).copied() {
             if let Some(shard) = self.get_shard(id) {
-                return shard;
+                return Ok(shard);
             }
         }
-        let shard = self.active_shard();
+        let shard = self.try_active_shard()?;
         self.collection_home
             .write()
             .insert(*collection_id, shard.slot);
-        shard
+        Ok(shard)
     }
 
     /// A collection's home shard just filled up: rotate the pool forward (unless
@@ -1520,7 +1515,7 @@ impl ShardPool {
                 self.rotate()?;
             }
         }
-        let shard = self.active_shard();
+        let shard = self.try_active_shard()?;
         self.collection_home
             .write()
             .insert(*collection_id, shard.slot);
@@ -1816,18 +1811,49 @@ impl ShardPool {
         self.shards.read().iter().filter(|s| s.is_some()).count()
     }
 
-    /// Get the current active write shard.
+    /// Get the current active write shard, creating the pool's first pack if
+    /// the pool has none yet (packs are created lazily on the first write).
+    ///
+    /// # Errors
+    /// Returns an I/O error if the first pack cannot be created, or
+    /// `NotFound` for a read-only pool with no pack.
+    pub fn try_active_shard(&self) -> io::Result<Arc<Shard>> {
+        let existing = |pool: &Self| {
+            let id = *pool.active_write.lock();
+            pool.shards
+                .read()
+                .get(id as usize)
+                .and_then(std::clone::Clone::clone)
+        };
+        if let Some(shard) = existing(self) {
+            return Ok(shard);
+        }
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "read-only pool has no pack",
+            ));
+        }
+        let _guard = self.rotation_lock.lock();
+        if let Some(shard) = existing(self) {
+            return Ok(shard);
+        }
+        let slot = *self.active_write.lock();
+        let (file, path, pack_id) = Self::create_packfile_atomically(&self.base_dir, &[])?;
+        let file_len = file.metadata()?.len();
+        let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));
+        sync_directory(&self.base_dir)?;
+        self.shards.write()[slot as usize] = Some(Arc::clone(&shard));
+        Ok(shard)
+    }
+
+    /// [`Self::try_active_shard`] for callers that cannot handle an I/O error.
     ///
     /// # Panics
-    /// Panics if the active write shard slot is `None` (invariant:
-    /// `open()` always ensures at least shard 0 exists).
+    /// Panics if the active shard cannot be created.
     #[must_use]
     pub fn active_shard(&self) -> Arc<Shard> {
-        let id = *self.active_write.lock();
-        self.shards
-            .read()
-            .get(id as usize)
-            .and_then(std::clone::Clone::clone)
+        self.try_active_shard()
             .expect("active write shard must exist")
     }
 
@@ -1892,7 +1918,7 @@ impl ShardPool {
     /// # Errors
     /// Returns an I/O or encoding error if the record cannot be appended.
     pub fn put_record_with_len(&self, record: &Record) -> io::Result<(u16, u64, u64)> {
-        let mut shard = self.shard_for_collection(&record.collection_id);
+        let mut shard = self.shard_for_collection(&record.collection_id)?;
         loop {
             if shard.is_poisoned() {
                 return Err(io::Error::other(format!(

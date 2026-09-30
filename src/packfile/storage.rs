@@ -2413,6 +2413,7 @@ impl PackfileStorage {
 
     /// Open a writable pool that belongs to a shared database. The database
     /// root's writer lock covers it, so the pool creates no `.mtxdb.lock`.
+    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
         compress: bool,
