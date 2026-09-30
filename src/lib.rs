@@ -40,6 +40,9 @@ pub mod index;
 pub mod journal;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
+/// Stable logical-ID to current physical-record pointers.
+#[cfg(feature = "multi-reader")]
+pub mod logical_head;
 /// Matrix-specific room-version policy.
 pub mod matrix_policy;
 /// On-disk packfile format and the storage engine built on top of it.
@@ -56,6 +59,9 @@ pub mod storage;
 pub mod template;
 /// Persisted, ordered timeline index with copy-on-write roots.
 pub mod timeline;
+
+#[cfg(all(test, feature = "multi-reader"))]
+mod test_logical_head;
 
 pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
@@ -74,6 +80,11 @@ pub use journal::{
     DurabilityStats, DurabilityToken, DurableWaitLatency, GroupCommitConfig, GroupDirectoryStats,
 };
 pub use layout::{enclosing_root, is_database_root, DatabaseLayout, ShardType};
+#[cfg(feature = "multi-reader")]
+pub use logical_head::{
+    decode_logical_head, encode_logical_head, LogicalHead, LogicalHeadRead, LogicalHeadValue,
+    LOGICAL_HEAD_MAGIC, LOGICAL_HEAD_VERSION,
+};
 #[cfg(feature = "multi-reader")]
 pub use matrix_policy::matrix_pool_policies;
 pub use matrix_policy::{
