@@ -16,6 +16,9 @@
 pub mod auxiliary;
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
 pub mod cache;
+/// Persisted closure generations published through a logical head.
+#[cfg(feature = "multi-reader")]
+pub mod closure_store;
 /// Compressed sparse row graph for deterministic topological ordering.
 pub mod csr;
 /// In-memory dependency DAG used to track unresolved node references.
@@ -63,6 +66,8 @@ pub mod template;
 /// Persisted, ordered timeline index with copy-on-write roots.
 pub mod timeline;
 
+#[cfg(all(test, feature = "multi-reader"))]
+mod test_closure_store;
 #[cfg(all(test, feature = "multi-reader"))]
 mod test_logical_head;
 #[cfg(all(test, feature = "multi-reader"))]
