@@ -107,6 +107,13 @@ name = "compare_external"
 path = "compare_external.rs"
 harness = false
 
+# Matrix-shaped matched workload; semantic scenarios are added as native APIs
+# land, without changing the existing four-way synthetic comparison.
+[[bench]]
+name = "matrix_workload"
+path = "matrix_workload.rs"
+harness = false
+
 # Plain-autocommit vs staged-transaction writes through the shared WAL.
 [[bench]]
 name = "txn_commit"
