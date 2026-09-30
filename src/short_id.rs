@@ -1,10 +1,10 @@
-//! Room-scoped dense `u32` short ids and `u32` adjacency lists.
+//! Room-scoped dense `u32` short ids and compact adjacency families.
 //!
 //! This is the generic substrate for graph workloads that need compact integer
 //! ids (auth-chain closure bitmaps, relation walks). It knows nothing about
 //! Matrix: a *scope* (one collection, e.g. a room) maps opaque key bytes to
-//! sequentially allocated `u32` ids, and stores an immutable sorted `u32` edge
-//! list per id. The schema-aware layer decides what the keys and edges mean.
+//! sequentially allocated `u32` ids, and stores per-id **adjacency** as named
+//! *families*. The schema-aware layer decides what keys and families mean.
 //!
 //! Records, all in one collection so a scope purges with one
 //! `delete_collection`:
@@ -14,21 +14,31 @@
 //!   truncated hash, so the stored key is compared on every hit and a mismatch
 //!   is reported as a collision, never silently merged;
 //! - **reverse** (`SIDR`): `id -> key bytes`;
-//! - **edges** (`SIDE`): `id -> [u32]`, always at least the 5-byte header, so a
-//!   known leaf with zero edges is distinguishable from an absent record.
+//! - **edges** (`SIDE`): `(family, id) -> sorted [Edge]`, where an [`Edge`] is a
+//!   `u32` target plus, for typed families, a `u16` kind. A record is never
+//!   empty (it has a header), so a known owner with zero edges is distinguishable
+//!   from an absent record.
 //!
-//! Allocation and edge writes commit in one [`DatabaseTransaction`] guarded by
-//! the engine's per-record compare-and-swap (the counter plus every forward
-//! record that was absent when read). A lost race surfaces as
-//! `StorageError::StaleRead` and the operation re-reads and retries, finding the
-//! winner's mapping. There is no partial state to repair: the counter, forward,
-//! reverse and edge records publish together or not at all.
+//! An [`EdgeFamily`] fixes the record's merge policy and whether edges are
+//! typed. [`EdgeMerge::Immutable`] families (Matrix `prev`/`auth`) treat a
+//! different list for an existing owner as a collision. [`EdgeMerge::Union`]
+//! families (Matrix `relations`) merge repeated writes by set union under a CAS
+//! on the edge record. The merge policy and typing are stored in the record and
+//! checked on every access, so a caller cannot reinterpret a family.
+//!
+//! Allocation and every family's edge write commit in one
+//! [`DatabaseTransaction`] guarded by the engine's per-record compare-and-swap
+//! (the counter, every forward record that was absent, and every edge record
+//! that was read). A lost race surfaces as `StorageError::StaleRead` and the
+//! operation re-reads and retries, finding the winner's state. There is no
+//! partial state to repair: counter, forward, reverse and edge records publish
+//! together or not at all.
 //!
 //! Ids start at 1 and never wrap; exhausting `u32` is a checked error. The
 //! CAS is atomic within the single writer process; it is unavailable without the
 //! `multi-reader` feature, like the transaction layer it uses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use bytes::Bytes;
 
@@ -37,7 +47,7 @@ use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 
 /// Wire version shared by every short-id record.
-pub const SHORT_ID_FORMAT_VERSION: u8 = 1;
+pub const SHORT_ID_FORMAT_VERSION: u8 = 2;
 /// Largest id that may be allocated.
 pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 
@@ -50,8 +60,114 @@ const COUNTER_ID: NodeId = *b"MTXD-SID-CNTR-v1";
 const REVERSE_PREFIX: [u8; 8] = *b"MTXSIDR\0";
 const EDGES_PREFIX: [u8; 8] = *b"MTXSIDE\0";
 
+const FLAG_TYPED: u8 = 0b01;
+const FLAG_UNION: u8 = 0b10;
+
 /// Maximum optimistic-retry rounds before a stale read is returned.
 const MAX_ATTEMPTS: usize = 64;
+
+/// How repeated writes of one owner's edge set within a family combine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMerge {
+    /// The first set wins; a different set later is a collision error.
+    Immutable,
+    /// Repeated writes merge by set union, under a CAS on the edge record.
+    Union,
+}
+
+/// A named adjacency family within a scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeFamily {
+    /// Family number; part of the edge record's address.
+    pub id: u16,
+    /// Merge policy for repeated writes.
+    pub merge: EdgeMerge,
+    /// Whether each edge carries a `u16` kind (otherwise the kind is always 0).
+    pub typed: bool,
+}
+
+impl EdgeFamily {
+    /// An untyped family whose edge list never changes once written.
+    #[must_use]
+    pub const fn immutable(id: u16) -> Self {
+        Self {
+            id,
+            merge: EdgeMerge::Immutable,
+            typed: false,
+        }
+    }
+
+    /// A typed family whose edge set grows by union.
+    #[must_use]
+    pub const fn typed_union(id: u16) -> Self {
+        Self {
+            id,
+            merge: EdgeMerge::Union,
+            typed: true,
+        }
+    }
+
+    const fn flags(self) -> u8 {
+        let typed = if self.typed { FLAG_TYPED } else { 0 };
+        let union = match self.merge {
+            EdgeMerge::Union => FLAG_UNION,
+            EdgeMerge::Immutable => 0,
+        };
+        typed | union
+    }
+
+    const fn entry_len(self) -> usize {
+        if self.typed {
+            6
+        } else {
+            4
+        }
+    }
+}
+
+/// A resolved edge: target short id plus kind (0 for untyped families).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Edge {
+    /// Target short id.
+    pub target: u32,
+    /// Kind id (0 when the family is untyped).
+    pub kind: u16,
+}
+
+/// An edge to a not-yet-resolved key, as supplied by the caller.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeKey<'a> {
+    /// Target key bytes; allocated a short id if new.
+    pub target: &'a [u8],
+    /// Kind id (must be 0 for untyped families).
+    pub kind: u16,
+}
+
+impl<'a> EdgeKey<'a> {
+    /// An untyped edge to `target`.
+    #[must_use]
+    pub const fn plain(target: &'a [u8]) -> Self {
+        Self { target, kind: 0 }
+    }
+}
+
+/// The edges to record for one family of the owner.
+#[derive(Debug, Clone, Copy)]
+pub struct FamilyEdges<'a> {
+    /// The family.
+    pub family: EdgeFamily,
+    /// Its edges; sorted and de-duplicated on write.
+    pub edges: &'a [EdgeKey<'a>],
+}
+
+/// Outcome of [`ShortIdIndex::record_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedEvent {
+    /// The owner's short id.
+    pub id: u32,
+    /// The stored (merged) edge list of each requested family, in request order.
+    pub edges: Vec<Vec<Edge>>,
+}
 
 fn forward_id(key: &[u8]) -> NodeId {
     let digest = DigestAlgorithm::Blake3.digest(key);
@@ -64,6 +180,12 @@ fn indexed_id(prefix: [u8; 8], short_id: u32) -> NodeId {
     let mut id = [0u8; 16];
     id[..8].copy_from_slice(&prefix);
     id[8..12].copy_from_slice(&short_id.to_be_bytes());
+    id
+}
+
+fn edges_record_id(short_id: u32, family: u16) -> NodeId {
+    let mut id = indexed_id(EDGES_PREFIX, short_id);
+    id[12..14].copy_from_slice(&family.to_be_bytes());
     id
 }
 
@@ -119,29 +241,48 @@ fn encode_reverse(key: &[u8]) -> Vec<u8> {
     out
 }
 
-fn encode_edges(targets: &[u32]) -> Result<Vec<u8>, StorageError> {
-    let count = u32::try_from(targets.len())
+fn encode_edges(family: EdgeFamily, edges: &[Edge]) -> Result<Vec<u8>, StorageError> {
+    let count = u32::try_from(edges.len())
         .map_err(|_| StorageError::Internal("short-id edge list too long".to_owned()))?;
     let mut out = header(EDGES_MAGIC);
+    out.push(family.flags());
     out.extend_from_slice(&count.to_be_bytes());
-    for target in targets {
-        out.extend_from_slice(&target.to_be_bytes());
+    for edge in edges {
+        out.extend_from_slice(&edge.target.to_be_bytes());
+        if family.typed {
+            out.extend_from_slice(&edge.kind.to_be_bytes());
+        }
     }
     Ok(out)
 }
 
-fn decode_edges(bytes: &[u8]) -> Result<Vec<u32>, StorageError> {
+fn decode_edges(family: EdgeFamily, bytes: &[u8]) -> Result<Vec<Edge>, StorageError> {
     let body = check_header(bytes, EDGES_MAGIC, "edges")?;
-    if body.len() < 4 {
+    if body.len() < 5 {
         return Err(StorageError::Corrupt("short-id edges length".to_owned()));
     }
-    let count = read_u32(&body[..4], "edges")? as usize;
-    let list = &body[4..];
-    if count.checked_mul(4) != Some(list.len()) {
+    if body[0] != family.flags() {
+        return Err(StorageError::Collision(format!(
+            "short-id family {} was stored with different merge/typing flags",
+            family.id
+        )));
+    }
+    let count = read_u32(&body[1..5], "edges")? as usize;
+    let list = &body[5..];
+    if count.checked_mul(family.entry_len()) != Some(list.len()) {
         return Err(StorageError::Corrupt("short-id edges length".to_owned()));
     }
-    list.chunks_exact(4)
-        .map(|chunk| read_u32(chunk, "edges"))
+    list.chunks_exact(family.entry_len())
+        .map(|chunk| {
+            Ok(Edge {
+                target: read_u32(&chunk[..4], "edges")?,
+                kind: if family.typed {
+                    u16::from_be_bytes([chunk[4], chunk[5]])
+                } else {
+                    0
+                },
+            })
+        })
         .collect()
 }
 
@@ -195,52 +336,86 @@ impl ShortIdIndex {
         self.write_with_retry(db, keys, None).map(|(ids, _)| ids)
     }
 
-    /// Allocate ids for `key` and every target, then store `key`'s immutable
-    /// edge list, all in one transaction. Returns `(key id, sorted target ids)`.
+    /// Allocate ids for `owner` and every edge target, then store each family's
+    /// edge list for `owner`, all in one transaction.
     ///
-    /// Targets are sorted and de-duplicated. A repeat with the same set is a
-    /// no-op; a different set for an existing key is a collision error, because
-    /// the edge list is immutable once written.
+    /// Edges are sorted and de-duplicated. Per family: an
+    /// [`EdgeMerge::Immutable`] list that matches the stored one is a no-op and
+    /// a different one is a collision error; an [`EdgeMerge::Union`] list merges
+    /// with the stored one. Returns the owner's id and each family's stored list.
     ///
     /// # Errors
-    /// As [`Self::get_or_create`], plus a collision error when `key` already has
-    /// a different edge list.
+    /// As [`Self::get_or_create`], plus a collision error for an immutable
+    /// family whose list differs, a family reused with different flags, or a
+    /// non-zero kind on an untyped family.
+    pub fn record_event(
+        &self,
+        db: &SharedDatabase,
+        owner: &[u8],
+        families: &[FamilyEdges<'_>],
+    ) -> Result<RecordedEvent, StorageError> {
+        for family in families {
+            if !family.family.typed && family.edges.iter().any(|edge| edge.kind != 0) {
+                return Err(StorageError::Internal(
+                    "untyped edge family given a non-zero kind".to_owned(),
+                ));
+            }
+        }
+        let mut keys: Vec<&[u8]> = vec![owner];
+        for family in families {
+            keys.extend(family.edges.iter().map(|edge| edge.target));
+        }
+        self.write_with_retry(db, &keys, Some(families))
+            .map(|(_, recorded)| recorded)
+    }
+
+    /// Convenience for one untyped family: record `owner`'s edges to `targets`
+    /// in `family`. Returns `(owner id, sorted target ids)`.
+    ///
+    /// # Errors
+    /// As [`Self::record_event`].
     pub fn record_edges(
         &self,
         db: &SharedDatabase,
-        key: &[u8],
+        owner: &[u8],
+        family: EdgeFamily,
         targets: &[&[u8]],
     ) -> Result<(u32, Vec<u32>), StorageError> {
-        let mut keys: Vec<&[u8]> = Vec::with_capacity(targets.len().saturating_add(1));
-        keys.push(key);
-        keys.extend_from_slice(targets);
-        let (ids, _) = self.write_with_retry(db, &keys, Some(0))?;
-        let mut target_ids: Vec<u32> = ids[1..].to_vec();
-        target_ids.sort_unstable();
-        target_ids.dedup();
-        Ok((ids[0], target_ids))
+        let edges: Vec<EdgeKey<'_>> = targets.iter().map(|t| EdgeKey::plain(t)).collect();
+        let recorded = self.record_event(
+            db,
+            owner,
+            &[FamilyEdges {
+                family,
+                edges: &edges,
+            }],
+        )?;
+        let targets = recorded.edges[0].iter().map(|edge| edge.target).collect();
+        Ok((recorded.id, targets))
     }
 
-    /// The edge list of `short_id`, or `None` if none was recorded.
+    /// The edge list of `short_id` in `family`, or `None` if none was recorded.
     ///
     /// # Errors
-    /// Returns an error on a read failure or a corrupt record.
+    /// Returns an error on a read failure, a corrupt record, or a family stored
+    /// with different flags.
     pub fn edges(
         &self,
         db: &SharedDatabase,
         short_id: u32,
-    ) -> Result<Option<Vec<u32>>, StorageError> {
+        family: EdgeFamily,
+    ) -> Result<Option<Vec<Edge>>, StorageError> {
         let txn = db.begin_transaction();
         let (records, _) = txn.get_with_record_versions(
             self.pool,
             &self.collection_id,
-            &[indexed_id(EDGES_PREFIX, short_id)],
+            &[edges_record_id(short_id, family.id)],
         )?;
         records
             .into_iter()
             .next()
             .flatten()
-            .map(|record| decode_edges(&record.bytes))
+            .map(|record| decode_edges(family, &record.bytes))
             .transpose()
     }
 
@@ -309,13 +484,17 @@ impl ShortIdIndex {
     }
 
     /// Check the scope's invariants: every id below the counter has a reverse
-    /// record whose key maps forward to the same id, and every edge list decodes
-    /// with targets that resolve.
+    /// record whose key maps forward to the same id, and every edge list in
+    /// `families` decodes with targets that resolve.
     ///
     /// # Errors
     /// Returns an error only if a record cannot be read; invariant violations
     /// are reported in the returned report.
-    pub fn verify(&self, db: &SharedDatabase) -> Result<ShortIdVerifyReport, StorageError> {
+    pub fn verify(
+        &self,
+        db: &SharedDatabase,
+        families: &[EdgeFamily],
+    ) -> Result<ShortIdVerifyReport, StorageError> {
         let txn = db.begin_transaction();
         let (counter, _) =
             txn.get_with_record_versions(self.pool, &self.collection_id, &[COUNTER_ID])?;
@@ -351,17 +530,22 @@ impl ShortIdIndex {
                     .problems
                     .push(format!("id {short_id}: reverse has no forward record")),
             }
-            if let Some(edges) = get(indexed_id(EDGES_PREFIX, short_id))? {
+            for family in families {
+                let Some(edges) = get(edges_record_id(short_id, family.id))? else {
+                    continue;
+                };
                 report.edge_lists_checked = report.edge_lists_checked.saturating_add(1);
-                for target in decode_edges(&edges.bytes)? {
-                    if target == 0 || target >= next {
+                for edge in decode_edges(*family, &edges.bytes)? {
+                    if edge.target == 0 || edge.target >= next {
                         report.problems.push(format!(
-                            "id {short_id}: edge target {target} is out of range"
+                            "id {short_id}: family {} target {} is out of range",
+                            family.id, edge.target
                         ));
-                    } else if get(indexed_id(REVERSE_PREFIX, target))?.is_none() {
-                        report
-                            .problems
-                            .push(format!("id {short_id}: edge target {target} unresolved"));
+                    } else if get(indexed_id(REVERSE_PREFIX, edge.target))?.is_none() {
+                        report.problems.push(format!(
+                            "id {short_id}: family {} target {} unresolved",
+                            family.id, edge.target
+                        ));
                     }
                 }
             }
@@ -369,21 +553,23 @@ impl ShortIdIndex {
         Ok(report)
     }
 
-    /// `edge_owner` is the index in `keys` whose edge list is written from the
-    /// remaining keys (`Some(0)`), or `None` for a plain allocation.
+    /// `families` is `Some` when `keys[0]` owns the edge lists built from the
+    /// remaining keys (in family order), or `None` for a plain allocation.
     fn write_with_retry(
         &self,
         db: &SharedDatabase,
         keys: &[&[u8]],
-        edge_owner: Option<usize>,
-    ) -> Result<(Vec<u32>, Option<Vec<u32>>), StorageError> {
+        families: Option<&[FamilyEdges<'_>]>,
+    ) -> Result<(Vec<u32>, RecordedEvent), StorageError> {
         let mut last = None;
         for _ in 0..MAX_ATTEMPTS {
             let txn = db.begin_transaction();
-            match self.attempt(&txn, keys, edge_owner) {
-                Ok(outcome) if !outcome.commit_needed => return Ok((outcome.ids, outcome.edges)),
+            match self.attempt(&txn, keys, families) {
+                Ok(outcome) if !outcome.commit_needed => {
+                    return Ok((outcome.ids, outcome.recorded))
+                }
                 Ok(outcome) => match txn.commit() {
-                    Ok(()) => return Ok((outcome.ids, outcome.edges)),
+                    Ok(()) => return Ok((outcome.ids, outcome.recorded)),
                     Err(error) if error.is_stale_read() => last = Some(error),
                     Err(error) => return Err(error),
                 },
@@ -394,34 +580,32 @@ impl ShortIdIndex {
         Err(last.unwrap_or_else(|| StorageError::Internal("short-id retry budget".to_owned())))
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one read, validate and stage pass keeps the CAS token discipline in one place"
-    )]
-    fn attempt(
+    /// Resolve every key to an id, allocating for keys absent from the store.
+    fn allocate(
         &self,
         txn: &DatabaseTransaction<'_>,
         keys: &[&[u8]],
-        edge_owner: Option<usize>,
-    ) -> Result<Attempt, StorageError> {
-        // Read the counter and every forward record (plus the owner's edge
-        // record) together, before staging anything: staged records report
-        // token 0, and the tokens must match the data they guard.
+    ) -> Result<Allocation, StorageError> {
+        // Read the counter and every forward record together, before staging
+        // anything: staged records report token 0, and the tokens must match
+        // the data they guard.
         let mut read_ids: Vec<NodeId> = Vec::with_capacity(keys.len().saturating_add(1));
         read_ids.push(COUNTER_ID);
         read_ids.extend(keys.iter().map(|key| forward_id(key)));
         let (records, tokens) =
             txn.get_with_record_versions(self.pool, &self.collection_id, &read_ids)?;
-
         let mut next = match &records[0] {
             Some(record) => decode_counter(&record.bytes)?,
             None => 1,
         };
         let counter_token = tokens[0];
-
-        let mut ids: Vec<u32> = Vec::with_capacity(keys.len());
-        let mut fresh: HashMap<&[u8], u32> = HashMap::new();
-        let mut staged: Vec<(NodeId, Vec<u8>, Option<u64>)> = Vec::new();
+        let mut allocation = Allocation {
+            ids: Vec::with_capacity(keys.len()),
+            fresh: Vec::new(),
+            staged: Vec::new(),
+            counter: (counter_token, next),
+        };
+        let mut seen: HashMap<&[u8], u32> = HashMap::new();
         for (index, key) in keys.iter().enumerate() {
             let slot = index.saturating_add(1);
             if let Some(record) = &records[slot] {
@@ -431,9 +615,9 @@ impl ShortIdIndex {
                         "short-id key hash collision between different keys".to_owned(),
                     ));
                 }
-                ids.push(short_id);
-            } else if let Some(short_id) = fresh.get(key) {
-                ids.push(*short_id);
+                allocation.ids.push(short_id);
+            } else if let Some(short_id) = seen.get(key) {
+                allocation.ids.push(*short_id);
             } else {
                 if next > SHORT_ID_MAX {
                     return Err(StorageError::Internal(
@@ -442,59 +626,117 @@ impl ShortIdIndex {
                 }
                 let short_id = next;
                 next = next.saturating_add(1);
-                fresh.insert(key, short_id);
-                ids.push(short_id);
-                let forward = forward_id(key);
-                staged.push((forward, encode_forward(short_id, key), Some(tokens[slot])));
-                staged.push((
+                seen.insert(key, short_id);
+                allocation.fresh.push(short_id);
+                allocation.ids.push(short_id);
+                allocation.staged.push((
+                    forward_id(key),
+                    encode_forward(short_id, key),
+                    Some(tokens[slot]),
+                ));
+                allocation.staged.push((
                     indexed_id(REVERSE_PREFIX, short_id),
                     encode_reverse(key),
                     None,
                 ));
             }
         }
+        allocation.counter.1 = next;
+        Ok(allocation)
+    }
 
-        let mut edges = None;
-        if let Some(owner) = edge_owner {
-            let mut targets: Vec<u32> = ids
+    /// Merge the requested edge lists with what is stored and stage the changes.
+    fn stage_edges(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        allocation: &mut Allocation,
+        families: &[FamilyEdges<'_>],
+    ) -> Result<Vec<Vec<Edge>>, StorageError> {
+        let owner = allocation.ids[0];
+        // Read every existing edge record of the owner in one call, before
+        // staging, so each token matches the data it guards. A freshly
+        // allocated owner has none.
+        let existing: Vec<Option<(Option<NodeData>, u64)>> = if allocation.fresh.contains(&owner) {
+            vec![None; families.len()]
+        } else {
+            let ids: Vec<NodeId> = families
                 .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != owner)
-                .map(|(_, id)| *id)
+                .map(|f| edges_record_id(owner, f.family.id))
                 .collect();
-            targets.sort_unstable();
-            targets.dedup();
-            let edge_id = indexed_id(EDGES_PREFIX, ids[owner]);
-            let encoded = encode_edges(&targets)?;
-            // Edge records are addressed by the owner's id, which may have been
-            // allocated just now: only read an existing record when it was not.
-            if fresh.contains_key(keys[owner]) {
-                staged.push((edge_id, encoded, None));
-            } else {
-                let (existing, edge_tokens) =
-                    txn.get_with_record_versions(self.pool, &self.collection_id, &[edge_id])?;
-                match existing.into_iter().next().flatten() {
-                    Some(record) if record.bytes.as_ref() == encoded.as_slice() => {}
-                    Some(_) => {
+            let (records, tokens) =
+                txn.get_with_record_versions(self.pool, &self.collection_id, &ids)?;
+            records.into_iter().zip(tokens).map(Some).collect()
+        };
+        let mut lists = Vec::with_capacity(families.len());
+        let mut cursor = 1usize;
+        for (family, existing) in families.iter().zip(existing) {
+            let mut wanted: BTreeSet<Edge> = BTreeSet::new();
+            for edge in family.edges {
+                wanted.insert(Edge {
+                    target: allocation.ids[cursor],
+                    kind: edge.kind,
+                });
+                cursor = cursor.saturating_add(1);
+            }
+            let (stored, token) = match existing {
+                Some((Some(record), token)) => (
+                    Some(decode_edges(family.family, &record.bytes)?),
+                    Some(token),
+                ),
+                Some((None, token)) => (None, Some(token)),
+                None => (None, None),
+            };
+            let merged: Vec<Edge> = match (&stored, family.family.merge) {
+                (Some(stored), EdgeMerge::Immutable) => {
+                    let wanted: Vec<Edge> = wanted.into_iter().collect();
+                    if *stored != wanted {
                         return Err(StorageError::Collision(
                             "short-id edge list differs from the recorded one".to_owned(),
                         ));
                     }
-                    None => staged.push((edge_id, encoded, Some(edge_tokens[0]))),
+                    wanted
                 }
+                (Some(stored), EdgeMerge::Union) => {
+                    wanted.extend(stored.iter().copied());
+                    wanted.into_iter().collect()
+                }
+                (None, _) => wanted.into_iter().collect(),
+            };
+            if stored.as_ref() != Some(&merged) {
+                allocation.staged.push((
+                    edges_record_id(owner, family.family.id),
+                    encode_edges(family.family, &merged)?,
+                    token,
+                ));
             }
-            edges = Some(targets);
+            lists.push(merged);
         }
+        Ok(lists)
+    }
 
-        if staged.is_empty() {
+    fn attempt(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        keys: &[&[u8]],
+        families: Option<&[FamilyEdges<'_>]>,
+    ) -> Result<Attempt, StorageError> {
+        let mut allocation = self.allocate(txn, keys)?;
+        let edges = match families {
+            Some(families) => self.stage_edges(txn, &mut allocation, families)?,
+            None => Vec::new(),
+        };
+        let ids = allocation.ids.clone();
+        let recorded = RecordedEvent { id: ids[0], edges };
+        if allocation.staged.is_empty() {
             return Ok(Attempt {
+                recorded,
                 ids,
-                edges,
                 commit_needed: false,
             });
         }
-        if !fresh.is_empty() {
-            txn.expect_record_version(self.pool, self.collection_id, COUNTER_ID, counter_token)?;
+        if !allocation.fresh.is_empty() {
+            let (token, next) = allocation.counter;
+            txn.expect_record_version(self.pool, self.collection_id, COUNTER_ID, token)?;
             txn.put(
                 self.pool,
                 self.collection_id,
@@ -502,7 +744,7 @@ impl ShortIdIndex {
                 &NodeData::new(Bytes::from(encode_counter(next))),
             )?;
         }
-        for (id, payload, token) in staged {
+        for (id, payload, token) in allocation.staged {
             if let Some(token) = token {
                 txn.expect_record_version(self.pool, self.collection_id, id, token)?;
             }
@@ -514,15 +756,26 @@ impl ShortIdIndex {
             )?;
         }
         Ok(Attempt {
+            recorded,
             ids,
-            edges,
             commit_needed: true,
         })
     }
 }
 
-struct Attempt {
+struct Allocation {
+    /// Short id of each input key, in order.
     ids: Vec<u32>,
-    edges: Option<Vec<u32>>,
+    /// Ids allocated by this attempt.
+    fresh: Vec<u32>,
+    /// `(record id, payload, CAS token)`; a `None` token means a fresh record.
+    staged: Vec<(NodeId, Vec<u8>, Option<u64>)>,
+    /// `(counter token, next id after this attempt)`.
+    counter: (u64, u32),
+}
+
+struct Attempt {
+    recorded: RecordedEvent,
+    ids: Vec<u32>,
     commit_needed: bool,
 }

@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 const POOL: ShardType = ShardType::Edges;
 const SCOPE: [u8; 16] = [0x53; 16];
+const AUTH: EdgeFamily = EdgeFamily::immutable(1);
+const RELATIONS: EdgeFamily = EdgeFamily::typed_union(3);
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mtxdb-short-id-{name}-{}", std::process::id()));
@@ -31,7 +33,10 @@ fn allocation_is_dense_stable_and_idempotent() {
     );
     let back = index().resolve(&db, &[1, 4, 99]).unwrap();
     assert_eq!(back, vec![Some(b"$a".to_vec()), Some(b"$d".to_vec()), None]);
-    assert!(index().verify(&db).unwrap().is_consistent());
+    assert!(index()
+        .verify(&db, &[AUTH, RELATIONS])
+        .unwrap()
+        .is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -40,27 +45,33 @@ fn allocation_is_dense_stable_and_idempotent() {
 fn record_edges_is_atomic_immutable_and_leaf_safe() {
     let root = test_root("edges");
     let db = SharedDatabase::open(root.clone()).unwrap();
-    let (create, none) = index().record_edges(&db, b"$create", &[]).unwrap();
+    let (create, none) = index().record_edges(&db, b"$create", AUTH, &[]).unwrap();
     assert!(none.is_empty());
     // A leaf has a present, empty edge list, distinct from an unknown id.
-    assert_eq!(index().edges(&db, create).unwrap(), Some(vec![]));
-    assert_eq!(index().edges(&db, 500).unwrap(), None);
+    assert_eq!(index().edges(&db, create, AUTH).unwrap(), Some(vec![]));
+    assert_eq!(index().edges(&db, 500, AUTH).unwrap(), None);
 
     let (child, targets) = index()
-        .record_edges(&db, b"$child", &[b"$create", b"$power", b"$create"])
+        .record_edges(&db, b"$child", AUTH, &[b"$create", b"$power", b"$create"])
         .unwrap();
     assert_eq!(targets.len(), 2);
-    assert_eq!(index().edges(&db, child).unwrap(), Some(targets.clone()));
+    assert_eq!(
+        index()
+            .edges(&db, child, AUTH)
+            .unwrap()
+            .map(|e| e.iter().map(|x| x.target).collect::<Vec<_>>()),
+        Some(targets.clone())
+    );
     // Same set again is a no-op; a different set is a collision.
     index()
-        .record_edges(&db, b"$child", &[b"$power", b"$create"])
+        .record_edges(&db, b"$child", AUTH, &[b"$power", b"$create"])
         .unwrap();
     let error = index()
-        .record_edges(&db, b"$child", &[b"$create"])
+        .record_edges(&db, b"$child", AUTH, &[b"$create"])
         .unwrap_err();
     assert!(matches!(error, StorageError::Collision(_)), "{error}");
 
-    let report = index().verify(&db).unwrap();
+    let report = index().verify(&db, &[AUTH, RELATIONS]).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     assert_eq!(report.edge_lists_checked, 2);
     drop(db);
@@ -72,7 +83,7 @@ fn reopen_preserves_ids_and_purge_resets_the_scope() {
     let root = test_root("reopen");
     {
         let db = SharedDatabase::open(root.clone()).unwrap();
-        index().record_edges(&db, b"$x", &[b"$y"]).unwrap();
+        index().record_edges(&db, b"$x", AUTH, &[b"$y"]).unwrap();
     }
     let db = SharedDatabase::open(root.clone()).unwrap();
     assert_eq!(
@@ -116,7 +127,10 @@ fn concurrent_allocators_never_share_or_duplicate_ids() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), by_key.len(), "no two keys share an id");
-    assert!(index().verify(&db).unwrap().is_consistent());
+    assert!(index()
+        .verify(&db, &[AUTH, RELATIONS])
+        .unwrap()
+        .is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -133,7 +147,7 @@ fn exhaustion_is_a_hard_error_and_publishes_nothing() {
     );
     // ...the next allocation fails, including mid-batch, and aborts whole.
     let error = index()
-        .record_edges(&db, b"$over", &[b"$last", b"$also-new"])
+        .record_edges(&db, b"$over", AUTH, &[b"$last", b"$also-new"])
         .unwrap_err();
     assert!(matches!(error, StorageError::Internal(_)), "{error}");
     assert_eq!(
@@ -171,6 +185,182 @@ fn corrupt_counter_is_reported_not_repaired() {
     }
     let error = index().get_or_create(&db, &[b"$b"]).unwrap_err();
     assert!(matches!(error, StorageError::Corrupt(_)), "{error}");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn kinds(db: &SharedDatabase, id: u32) -> Vec<(u32, u16)> {
+    index()
+        .edges(db, id, RELATIONS)
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|edge| (edge.target, edge.kind))
+        .collect()
+}
+
+#[test]
+fn union_family_merges_typed_edges_across_writes() {
+    let root = test_root("union");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let edge = |target: &'static [u8], kind| EdgeKey { target, kind };
+    // A reply and a reaction to the same target differ by kind, not target.
+    let first = index()
+        .record_event(
+            &db,
+            b"$reply",
+            &[FamilyEdges {
+                family: RELATIONS,
+                edges: &[edge(b"$orig", 7), edge(b"$orig", 9)],
+            }],
+        )
+        .unwrap();
+    assert_eq!(first.edges[0].len(), 2);
+    // A later import adds a new edge and repeats an old one: union, not conflict.
+    index()
+        .record_event(
+            &db,
+            b"$reply",
+            &[FamilyEdges {
+                family: RELATIONS,
+                edges: &[edge(b"$orig", 9), edge(b"$other", 7)],
+            }],
+        )
+        .unwrap();
+    let orig = index().get_or_create(&db, &[b"$orig"]).unwrap()[0];
+    let other = index().get_or_create(&db, &[b"$other"]).unwrap()[0];
+    let reply = first.id;
+    assert_eq!(
+        kinds(&db, reply),
+        vec![(orig, 7), (orig, 9), (other, 7)],
+        "sorted by (target, kind), de-duplicated"
+    );
+    assert!(index()
+        .verify(&db, &[AUTH, RELATIONS])
+        .unwrap()
+        .is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn families_are_independent_per_owner_in_one_transaction() {
+    let root = test_root("families");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let recorded = index()
+        .record_event(
+            &db,
+            b"$e",
+            &[
+                FamilyEdges {
+                    family: AUTH,
+                    edges: &[EdgeKey::plain(b"$create")],
+                },
+                FamilyEdges {
+                    family: RELATIONS,
+                    edges: &[EdgeKey {
+                        target: b"$create",
+                        kind: 2,
+                    }],
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(recorded.edges.len(), 2);
+    assert_eq!(recorded.edges[0][0].kind, 0, "untyped family has kind 0");
+    assert_eq!(recorded.edges[1][0].kind, 2);
+    // The immutable family rejects a change while the union family still grows.
+    let error = index()
+        .record_event(
+            &db,
+            b"$e",
+            &[FamilyEdges {
+                family: AUTH,
+                edges: &[EdgeKey::plain(b"$other-auth")],
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
+    let root = test_root("flags");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    index()
+        .record_event(
+            &db,
+            b"$e",
+            &[FamilyEdges {
+                family: RELATIONS,
+                edges: &[EdgeKey {
+                    target: b"$t",
+                    kind: 1,
+                }],
+            }],
+        )
+        .unwrap();
+    // Same family number, read as immutable/untyped: refused, not misparsed.
+    let wrong = EdgeFamily::immutable(3);
+    let id = index().get_or_create(&db, &[b"$e"]).unwrap()[0];
+    assert!(matches!(
+        index().edges(&db, id, wrong),
+        Err(StorageError::Collision(_))
+    ));
+    // A kind on an untyped family is a caller error.
+    let error = index()
+        .record_event(
+            &db,
+            b"$x",
+            &[FamilyEdges {
+                family: AUTH,
+                edges: &[EdgeKey {
+                    target: b"$t",
+                    kind: 5,
+                }],
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Internal(_)), "{error}");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn concurrent_union_writers_lose_no_edges() {
+    let root = test_root("union-race");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let targets: Vec<String> = (0..24).map(|i| format!("$t{i}")).collect();
+    std::thread::scope(|scope| {
+        for thread in 0..6usize {
+            let db = &db;
+            let targets = &targets;
+            scope.spawn(move || {
+                for round in 0..8usize {
+                    let target = &targets[(thread * 8 + round) % targets.len()];
+                    index()
+                        .record_event(
+                            db,
+                            b"$owner",
+                            &[FamilyEdges {
+                                family: RELATIONS,
+                                edges: &[EdgeKey {
+                                    target: target.as_bytes(),
+                                    kind: 4,
+                                }],
+                            }],
+                        )
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let owner = index().get_or_create(&db, &[b"$owner"]).unwrap()[0];
+    let stored = kinds(&db, owner);
+    assert_eq!(stored.len(), 24, "every concurrent union write survived");
+    assert!(index().verify(&db, &[RELATIONS]).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

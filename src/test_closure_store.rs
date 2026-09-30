@@ -1,5 +1,5 @@
 use super::closure_store::*;
-use super::short_id::ShortIdIndex;
+use super::short_id::{EdgeFamily, ShortIdIndex};
 use crate::database::SharedDatabase;
 use crate::layout::ShardType;
 use crate::storage::StorageError;
@@ -152,7 +152,8 @@ fn scope_purge_is_atomic_with_the_short_id_scope() {
     let root = test_root("purge");
     let db = SharedDatabase::open(root.clone()).unwrap();
     let ids = ShortIdIndex::new(POOL, SCOPE);
-    ids.record_edges(&db, b"$a", &[b"$b"]).unwrap();
+    ids.record_edges(&db, b"$a", EdgeFamily::immutable(1), &[b"$b"])
+        .unwrap();
     build(&db, 1, 1..3);
     build(&db, 2, 1..3);
 
