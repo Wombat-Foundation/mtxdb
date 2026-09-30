@@ -852,7 +852,14 @@ impl ShardPool {
     fn discover_pack_files(base_dir: &Path) -> io::Result<Vec<(packfile::PackId, PathBuf)>> {
         let mut pack_files = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for entry in fs::read_dir(base_dir)? {
+        // An absent directory is an empty pool (see `pool_path`): packs are
+        // created lazily, along with the directory, on the first write.
+        let entries = match fs::read_dir(base_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(pack_files),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
             let entry = entry?;
             let path = entry.path();
             if !path.extension().is_some_and(|e| e == "pack") {
@@ -1041,8 +1048,11 @@ impl ShardPool {
         let pool_meta_persist_time = t_pool_meta_persist.elapsed();
 
         // No pack is created here: an empty pool is just `pool.meta`, and the
-        // first write creates the first pack (see `try_active_shard`).
-        sync_directory(base_dir)?;
+        // first write creates the first pack (see `try_active_shard`). A rooted
+        // pool wrote nothing and may not have a directory yet.
+        if !seed_from_root {
+            sync_directory(base_dir)?;
+        }
 
         Ok((bucket_seed, pool_meta_persist_time, Duration::ZERO))
     }
@@ -1180,9 +1190,13 @@ impl ShardPool {
         take_writer_lock: bool,
     ) -> io::Result<Self> {
         let open_started = Instant::now();
-        if writable {
+        // A member of a shared database creates its directory with its first
+        // pack; an absent rooted pool is simply empty, for readers too.
+        let rooted_member =
+            !take_writer_lock || crate::layout::enclosing_pool_seed(&base_dir)?.is_some();
+        if writable && !rooted_member {
             fs::create_dir_all(&base_dir)?;
-        } else if !base_dir.is_dir() {
+        } else if !writable && !rooted_member && !base_dir.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -1851,6 +1865,7 @@ impl ShardPool {
             return Ok(shard);
         }
         let slot = *self.active_write.lock();
+        fs::create_dir_all(&self.base_dir)?;
         let (file, path, pack_id) = Self::create_packfile_atomically(&self.base_dir, &[])?;
         let file_len = file.metadata()?.len();
         let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));

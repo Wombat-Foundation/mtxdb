@@ -604,13 +604,13 @@ impl SharedDatabase {
         let layout = DatabaseLayout::open(root)?;
         let wal_path = layout.shared_wal_path();
         let lock = SharedWalLock::acquire(layout.root())?;
-        let seed_lsn = shared_wal_seed_lsn(&layout)?;
+        let seed_lsn = shared_wal_seed_lsn(&layout);
         let (journal, scan) = Journal::open_shared_with_base(&wal_path, seed_lsn)?;
         let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
 
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
         for shard in ShardType::ALL {
-            let dir = layout.pool_dir(shard)?;
+            let dir = layout.pool_path(shard);
             let policy = policies.for_shard(shard);
             let store =
                 PackfileStorage::open_shared_member(dir, policy.compress, policy.checksum_policy)?;
@@ -915,15 +915,13 @@ impl SharedDatabase {
 /// that disagrees with the pools' recorded coverage. Open a root through
 /// [`SharedDatabase::open`] instead.
 ///
-/// # Errors
-/// Returns an error if a pool directory cannot be created or read.
-pub(crate) fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> Result<u64, StorageError> {
+pub(crate) fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> u64 {
     let mut watermark = 0_u64;
     for shard in ShardType::ALL {
-        let dir = layout.pool_dir(shard)?;
+        let dir = layout.pool_path(shard);
         watermark = watermark.max(PackfileStorage::read_journal_lsn(&dir));
     }
-    Ok(watermark.saturating_add(1))
+    watermark.saturating_add(1)
 }
 
 /// Convert a publish-path error into a typed storage error, surfacing a

@@ -2443,7 +2443,12 @@ impl PackfileStorage {
         checksum_policy: packfile::ChecksumPolicy,
         take_writer_lock: bool,
     ) -> Result<Self, std::io::Error> {
-        fs::create_dir_all(&base_dir)?;
+        // Only a standalone writer creates its directory here. A member of a
+        // shared database creates it with its first pack, and a reader never
+        // creates anything.
+        if writable && take_writer_lock {
+            fs::create_dir_all(&base_dir)?;
+        }
 
         let started = std::time::Instant::now();
         let mut timings = OpenTimings::default();
@@ -4808,7 +4813,13 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on write or rename failure.
+    #[allow(clippy::too_many_lines)]
     pub fn persist_shard_collections(&self) -> Result<(), StorageError> {
+        // A pool with no pack has no collections to record, and may not have
+        // a directory yet.
+        if self.shards.shard_count() == 0 {
+            return Ok(());
+        }
         if self
             .shard_collections_recovery_failed
             .load(Ordering::Acquire)
@@ -11463,6 +11474,9 @@ impl CheckpointTail {
         }
         let tail_started = std::time::Instant::now();
         let mut done = CheckpointBreakdown::default();
+        // An idle pool of a shared database has no directory until it has
+        // something to persist; a checkpoint reporting WAL coverage is one.
+        fs::create_dir_all(&self.base_dir).map_err(StorageError::Io)?;
         let path = PackfileStorage::index_checkpoint_path(&self.base_dir);
         let write_started = std::time::Instant::now();
         let blobs: Vec<([u8; 16], u64, &[u8])> = self

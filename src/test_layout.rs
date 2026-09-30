@@ -122,7 +122,14 @@ fn initializes_named_pool_layout() {
     let layout = DatabaseLayout::open(root.clone()).unwrap();
     assert!(root.join(DB_META_FILENAME).is_file());
     for shard_type in ShardType::ALL {
-        assert!(root.join("pools").join(shard_type.as_str()).is_dir());
+        assert!(
+            !root.join("pools").join(shard_type.as_str()).exists(),
+            "init creates only the root; pools appear on first write"
+        );
+        assert_eq!(
+            layout.pool_path(shard_type),
+            root.join("pools").join(shard_type.as_str())
+        );
     }
     assert_eq!(
         layout.pool_dir(ShardType::State).unwrap(),

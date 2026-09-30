@@ -304,9 +304,6 @@ impl DatabaseLayout {
             Self::write_descriptor(&meta_path)?;
         }
         let seed = read_db_meta(&meta_path)?.seed;
-        for shard_type in ShardType::ALL {
-            fs::create_dir_all(root.join("pools").join(shard_type.as_str()))?;
-        }
         Ok(Self { root, seed })
     }
 
@@ -327,6 +324,14 @@ impl DatabaseLayout {
         let path = self.root.join("pools").join(shard_type.as_str());
         fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    /// A named pool's directory path, without creating or checking it. An
+    /// absent directory is an empty pool: the pool creates it with its first
+    /// pack.
+    #[must_use]
+    pub fn pool_path(&self, shard_type: ShardType) -> PathBuf {
+        self.root.join("pools").join(shard_type.as_str())
     }
 
     /// Return a named pool's directory without creating it or any parent.

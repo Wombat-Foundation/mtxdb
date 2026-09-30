@@ -1085,8 +1085,7 @@ fn run_bounded_wal_rounds(name: &str, active: &[ShardType], defer_rewrites: bool
         .filter(|pool| !active.contains(pool))
         .collect();
     order.extend_from_slice(active);
-    let lsn_of =
-        |pool: ShardType| PackfileStorage::read_journal_lsn(&db.layout().pool_dir(pool).unwrap());
+    let lsn_of = |pool: ShardType| PackfileStorage::read_journal_lsn(&db.layout().pool_path(pool));
     let mut idle_lsn: Vec<Option<u64>> = vec![None; ShardType::ALL.len()];
     let mut active_advanced = vec![false; ShardType::ALL.len()];
     let mut next = 0u64;
@@ -2544,6 +2543,7 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
 fn a_missing_wal_is_seeded_above_the_pools_recorded_coverage() {
     let root = test_root("seed_missing_wal");
     drop(crate::layout::DatabaseLayout::open(root.clone()).unwrap());
+    std::fs::create_dir_all(root.join("pools/mtpl-state")).unwrap();
     std::fs::write(
         root.join("pools/mtpl-state/journal.lsn"),
         7u64.to_le_bytes(),
@@ -3207,4 +3207,70 @@ fn pools_written_through_a_shared_database_read_back_read_only() {
             "{shard:?}"
         );
     }
+}
+
+fn pool_dirs(root: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root.join("pools"))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// `init` creates only the root. A pool's directory and first pack appear with
+/// its first write, and only for the pool that was written.
+#[test]
+fn pools_are_created_by_their_first_write() {
+    let root = test_root("lazy-pools");
+    let database = SharedDatabase::open(root.clone()).unwrap();
+    assert!(pool_dirs(&root).is_empty(), "{:?}", pool_dirs(&root));
+    for shard in ShardType::ALL {
+        assert!(database
+            .pool(shard)
+            .get(&[9; 16], &node(1))
+            .unwrap()
+            .is_none());
+    }
+    assert!(
+        pool_dirs(&root).is_empty(),
+        "reads must not create a pool: {:?}",
+        pool_dirs(&root)
+    );
+
+    database
+        .pool(ShardType::Edges)
+        .put(&[9; 16], &node(1), &data(b"edge"))
+        .unwrap();
+    assert_eq!(pool_dirs(&root), vec!["mtpl-edges".to_owned()]);
+    database.coordinator().sync().unwrap();
+    drop(database);
+
+    let reopened = SharedDatabase::open(root.clone()).unwrap();
+    assert_eq!(pool_dirs(&root), vec!["mtpl-edges".to_owned()]);
+    assert_eq!(
+        reopened
+            .pool(ShardType::Edges)
+            .get(&[9; 16], &node(1))
+            .unwrap()
+            .map(|d| d.bytes.to_vec()),
+        Some(b"edge".to_vec())
+    );
+}
+
+/// A read-only open of a pool that does not exist yet is an empty pool and
+/// creates nothing.
+#[test]
+fn a_read_only_open_of_an_absent_pool_is_empty_and_creates_nothing() {
+    let root = test_root("absent-pool-read-only");
+    drop(SharedDatabase::open(root.clone()).unwrap());
+    let layout = crate::layout::DatabaseLayout::open_read_only(root.clone()).unwrap();
+    for shard in ShardType::ALL {
+        let reader = PackfileStorage::open_read_only(layout.pool_path(shard)).unwrap();
+        assert!(reader.get(&[9; 16], &node(1)).unwrap().is_none());
+    }
+    assert!(pool_dirs(&root).is_empty(), "{:?}", pool_dirs(&root));
 }
