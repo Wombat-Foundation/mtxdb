@@ -46,6 +46,9 @@ pub mod layout;
 /// Stable logical-ID to current physical-record pointers.
 #[cfg(feature = "multi-reader")]
 pub mod logical_head;
+/// Matrix event adjacency (`prev`, `auth`, relations) over the short-id primitives.
+#[cfg(feature = "multi-reader")]
+pub mod matrix_adjacency;
 /// Matrix-specific room-version policy.
 pub mod matrix_policy;
 /// On-disk packfile format and the storage engine built on top of it.
@@ -70,6 +73,8 @@ pub mod timeline;
 mod test_closure_store;
 #[cfg(all(test, feature = "multi-reader"))]
 mod test_logical_head;
+#[cfg(all(test, feature = "multi-reader"))]
+mod test_matrix_adjacency;
 #[cfg(all(test, feature = "multi-reader"))]
 mod test_short_id;
 
