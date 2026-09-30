@@ -8941,6 +8941,25 @@ fn import_pdu_events(
         .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
     let edge_plan = plan_matrix_edges(&edge_store, template, events)?;
 
+    // Keep physical event order causal even when the input is newest-first.
+    // This is especially important for establishment batches: the metadata
+    // frame must lead, but the event frames should still be parent-before-child.
+    if let Some(order) = topological_event_order_with_template(events, template)? {
+        let mut order_by_node = HashMap::with_capacity(order.len());
+        for event in events {
+            if let (Some(event_id), Some(node_id)) =
+                (event_id(event), template_node_id(template, event)?)
+            {
+                if let Some(position) = order.get(event_id) {
+                    order_by_node.insert(node_id, *position);
+                }
+            }
+        }
+        to_write.sort_by_key(|(node_id, _)| {
+            order_by_node.get(node_id).copied().unwrap_or(usize::MAX)
+        });
+    }
+
     // Genesis metadata precedes the batch's records, so it is the collection's
     // first frame and is durable no later than any application record. A
     // failure here aborts the batch: proceeding would write records into a
@@ -8952,21 +8971,6 @@ fn import_pdu_events(
         store.create_or_put_established(&collection_id, &metadata, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     } else if !to_write.is_empty() {
-        if let Some(order) = topological_event_order(events) {
-            let mut order_by_node = HashMap::with_capacity(order.len());
-            for event in events {
-                if let (Some(event_id), Some(node_id)) =
-                    (event_id(event), template_node_id(template, event)?)
-                {
-                    if let Some(position) = order.get(event_id) {
-                        order_by_node.insert(node_id, *position);
-                    }
-                }
-            }
-            to_write.sort_by_key(|(node_id, _)| {
-                order_by_node.get(node_id).copied().unwrap_or(usize::MAX)
-            });
-        }
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
@@ -9508,9 +9512,18 @@ fn extract_event_edge_ids(
 /// Returns events in topological order (parents before children), or
 /// `Err` with the list of events involved in a cycle or whose parents
 /// are missing from the DAG.
+#[cfg(test)]
 fn topo_sort_dag(
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     reverse_map: &HashMap<u64, String>,
+) -> Result<Vec<usize>, Vec<String>> {
+    topo_sort_dag_with_tie_break(frontier, reverse_map, None)
+}
+
+fn topo_sort_dag_with_tie_break(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    reverse_map: &HashMap<u64, String>,
+    operational_ids: Option<&HashMap<u64, [u8; 16]>>,
 ) -> Result<Vec<usize>, Vec<String>> {
     let n = frontier.nodes.len();
     if n == 0 {
@@ -9539,19 +9552,22 @@ fn topo_sort_dag(
     }
 
     // Seed the queue with nodes that have zero in-degree.
-    let mut queue: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
+    let mut queue: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
     for (idx, &deg) in in_degree.iter().enumerate() {
         if deg == 0 {
             let event_id = reverse_map
                 .get(&frontier.nodes[idx].short_id)
                 .cloned()
                 .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id));
-            queue.push(Reverse((event_id, idx)));
+            let tie = operational_ids
+                .and_then(|ids| ids.get(&frontier.nodes[idx].short_id))
+                .map_or_else(|| event_id.into_bytes(), |id| id.to_vec());
+            queue.push(Reverse((tie, idx)));
         }
     }
 
     let mut sorted = Vec::with_capacity(n);
-    while let Some(Reverse((_, idx))) = queue.pop() {
+    while let Some(Reverse((_tie, idx))) = queue.pop() {
         sorted.push(idx);
         for &child in &children[idx] {
             in_degree[child] = in_degree[child]
@@ -9562,7 +9578,10 @@ fn topo_sort_dag(
                     .get(&frontier.nodes[child].short_id)
                     .cloned()
                     .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[child].short_id));
-                queue.push(Reverse((event_id, child)));
+                let tie = operational_ids
+                    .and_then(|ids| ids.get(&frontier.nodes[child].short_id))
+                    .map_or_else(|| event_id.into_bytes(), |id| id.to_vec());
+                queue.push(Reverse((tie, child)));
             }
         }
     }
@@ -9586,21 +9605,46 @@ fn topo_sort_dag(
     }
 }
 
+#[cfg(test)]
 fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usize>> {
     let (frontier, _id_map, reverse_map) = build_event_dag(events);
     let sorted = topo_sort_dag(&frontier, &reverse_map).ok()?;
-    Some(
-        sorted
-            .into_iter()
-            .enumerate()
-            .filter_map(|(order, index)| {
-                reverse_map
-                    .get(&frontier.nodes[index].short_id)
-                    .cloned()
-                    .map(|event_id| (event_id, order))
-            })
-            .collect(),
-    )
+    Some(event_order_map(&frontier, &reverse_map, sorted))
+}
+
+fn topological_event_order_with_template(
+    events: &[OwnedValue],
+    template: &CollectionTemplate,
+) -> anyhow::Result<Option<HashMap<String, usize>>> {
+    let (frontier, _id_map, reverse_map) = build_event_dag(events);
+    let mut operational_ids = HashMap::new();
+    for event in events {
+        if let (Some(event_id), Some(node_id)) =
+            (event_id(event), template_node_id(template, event)?)
+        {
+            operational_ids.insert(event_short_id(event_id), node_id);
+        }
+    }
+    let sorted = topo_sort_dag_with_tie_break(&frontier, &reverse_map, Some(&operational_ids))
+        .ok();
+    Ok(sorted.map(|sorted| event_order_map(&frontier, &reverse_map, sorted)))
+}
+
+fn event_order_map(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    reverse_map: &HashMap<u64, String>,
+    sorted: Vec<usize>,
+) -> HashMap<String, usize> {
+    sorted
+        .into_iter()
+        .enumerate()
+        .filter_map(|(order, index)| {
+            reverse_map
+                .get(&frontier.nodes[index].short_id)
+                .cloned()
+                .map(|event_id| (event_id, order))
+        })
+        .collect()
 }
 
 /// Results from a partial state-group walk.
