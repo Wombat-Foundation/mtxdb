@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 const POOL: ShardType = ShardType::Edges;
 const SCOPE: [u8; 16] = [0x53; 16];
-const IMMUTABLE_EDGES: EdgeFamily = EdgeFamily::immutable(1);
-const TYPED_UNION_EDGES: EdgeFamily = EdgeFamily::typed_union(3);
+const PLAIN: EdgeFamily = EdgeFamily::plain(1);
+const TYPED: EdgeFamily = EdgeFamily::typed(3);
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mtxdb-short-id-{name}-{}", std::process::id()));
@@ -34,7 +34,7 @@ fn allocation_is_dense_stable_and_idempotent() {
     let back = index().resolve(&db, &[1, 4, 99]).unwrap();
     assert_eq!(back, vec![Some(b"$a".to_vec()), Some(b"$d".to_vec()), None]);
     assert!(index()
-        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
+        .verify(&db, &[PLAIN, TYPED])
         .unwrap()
         .is_consistent());
     drop(db);
@@ -45,45 +45,33 @@ fn allocation_is_dense_stable_and_idempotent() {
 fn record_edges_is_atomic_immutable_and_leaf_safe() {
     let root = test_root("edges");
     let db = SharedDatabase::open(root.clone()).unwrap();
-    let (create, none) = index()
-        .record_edges(&db, b"$create", IMMUTABLE_EDGES, &[])
-        .unwrap();
+    let (create, none) = index().record_edges(&db, b"$create", PLAIN, &[]).unwrap();
     assert!(none.is_empty());
     // A leaf has a present, empty edge list, distinct from an unknown id.
-    assert_eq!(
-        index().edges(&db, create, IMMUTABLE_EDGES).unwrap(),
-        Some(vec![])
-    );
-    assert_eq!(index().edges(&db, 500, IMMUTABLE_EDGES).unwrap(), None);
+    assert_eq!(index().edges(&db, create, PLAIN).unwrap(), Some(vec![]));
+    assert_eq!(index().edges(&db, 500, PLAIN).unwrap(), None);
 
     let (child, targets) = index()
-        .record_edges(
-            &db,
-            b"$child",
-            IMMUTABLE_EDGES,
-            &[b"$create", b"$power", b"$create"],
-        )
+        .record_edges(&db, b"$child", PLAIN, &[b"$create", b"$power", b"$create"])
         .unwrap();
     assert_eq!(targets.len(), 2);
     assert_eq!(
         index()
-            .edges(&db, child, IMMUTABLE_EDGES)
+            .edges(&db, child, PLAIN)
             .unwrap()
             .map(|e| e.iter().map(|x| x.target).collect::<Vec<_>>()),
         Some(targets.clone())
     );
     // Same set again is a no-op; a different set is a collision.
     index()
-        .record_edges(&db, b"$child", IMMUTABLE_EDGES, &[b"$power", b"$create"])
+        .record_edges(&db, b"$child", PLAIN, &[b"$power", b"$create"])
         .unwrap();
     let error = index()
-        .record_edges(&db, b"$child", IMMUTABLE_EDGES, &[b"$create"])
+        .record_edges(&db, b"$child", PLAIN, &[b"$create"])
         .unwrap_err();
     assert!(matches!(error, StorageError::Collision(_)), "{error}");
 
-    let report = index()
-        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
-        .unwrap();
+    let report = index().verify(&db, &[PLAIN, TYPED]).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     assert_eq!(report.edge_lists_checked, 2);
     drop(db);
@@ -95,9 +83,7 @@ fn reopen_preserves_ids_and_purge_resets_the_scope() {
     let root = test_root("reopen");
     {
         let db = SharedDatabase::open(root.clone()).unwrap();
-        index()
-            .record_edges(&db, b"$x", IMMUTABLE_EDGES, &[b"$y"])
-            .unwrap();
+        index().record_edges(&db, b"$x", PLAIN, &[b"$y"]).unwrap();
     }
     let db = SharedDatabase::open(root.clone()).unwrap();
     assert_eq!(
@@ -142,7 +128,7 @@ fn concurrent_allocators_never_share_or_duplicate_ids() {
     ids.dedup();
     assert_eq!(ids.len(), by_key.len(), "no two keys share an id");
     assert!(index()
-        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
+        .verify(&db, &[PLAIN, TYPED])
         .unwrap()
         .is_consistent());
     drop(db);
@@ -161,7 +147,7 @@ fn exhaustion_is_a_hard_error_and_publishes_nothing() {
     );
     // ...the next allocation fails, including mid-batch, and aborts whole.
     let error = index()
-        .record_edges(&db, b"$over", IMMUTABLE_EDGES, &[b"$last", b"$also-new"])
+        .record_edges(&db, b"$over", PLAIN, &[b"$last", b"$also-new"])
         .unwrap_err();
     assert!(matches!(error, StorageError::Internal(_)), "{error}");
     assert_eq!(
@@ -203,9 +189,9 @@ fn corrupt_counter_is_reported_not_repaired() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-fn kinds(db: &SharedDatabase, id: u32) -> Vec<(u32, u16)> {
+fn typed_edges(db: &SharedDatabase, id: u32) -> Vec<(u32, u16)> {
     index()
-        .edges(db, id, TYPED_UNION_EDGES)
+        .edges(db, id, TYPED)
         .unwrap()
         .unwrap()
         .iter()
@@ -214,43 +200,55 @@ fn kinds(db: &SharedDatabase, id: u32) -> Vec<(u32, u16)> {
 }
 
 #[test]
-fn union_family_merges_typed_edges_across_writes() {
-    let root = test_root("union");
+fn typed_family_keeps_kinds_sorted_and_rejects_changes() {
+    let root = test_root("typed");
     let db = SharedDatabase::open(root.clone()).unwrap();
     let edge = |target: &'static [u8], kind| EdgeKey { target, kind };
-    // A reply and a reaction to the same target differ by kind, not target.
+    // Two edges to one target that differ only by kind are both kept.
     let first = index()
         .record_event(
             &db,
-            b"$reply",
+            b"$src",
             &[FamilyEdges {
-                family: TYPED_UNION_EDGES,
-                edges: &[edge(b"$orig", 7), edge(b"$orig", 9)],
-            }],
-        )
-        .unwrap();
-    assert_eq!(first.edges[0].len(), 2);
-    // A later import adds a new edge and repeats an old one: union, not conflict.
-    index()
-        .record_event(
-            &db,
-            b"$reply",
-            &[FamilyEdges {
-                family: TYPED_UNION_EDGES,
-                edges: &[edge(b"$orig", 9), edge(b"$other", 7)],
+                family: TYPED,
+                edges: &[edge(b"$orig", 9), edge(b"$orig", 7), edge(b"$orig", 9)],
             }],
         )
         .unwrap();
     let orig = index().get_or_create(&db, &[b"$orig"]).unwrap()[0];
-    let other = index().get_or_create(&db, &[b"$other"]).unwrap()[0];
-    let reply = first.id;
-    assert_eq!(
-        kinds(&db, reply),
-        vec![(orig, 7), (orig, 9), (other, 7)],
-        "sorted by (target, kind), de-duplicated"
-    );
+    assert_eq!(typed_edges(&db, first.id), vec![(orig, 7), (orig, 9)]);
+    // The same list again is a no-op (idempotent re-import).
+    index()
+        .record_event(
+            &db,
+            b"$src",
+            &[FamilyEdges {
+                family: TYPED,
+                edges: &[edge(b"$orig", 7), edge(b"$orig", 9)],
+            }],
+        )
+        .unwrap();
+    // A different list, including a changed kind, is a collision, never a merge.
+    for changed in [
+        vec![edge(b"$orig", 7)],
+        vec![edge(b"$orig", 7), edge(b"$orig", 9), edge(b"$other", 7)],
+        vec![edge(b"$orig", 7), edge(b"$orig", 10)],
+    ] {
+        let error = index()
+            .record_event(
+                &db,
+                b"$src",
+                &[FamilyEdges {
+                    family: TYPED,
+                    edges: &changed,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    }
+    assert_eq!(typed_edges(&db, first.id), vec![(orig, 7), (orig, 9)]);
     assert!(index()
-        .verify(&db, &[IMMUTABLE_EDGES, TYPED_UNION_EDGES])
+        .verify(&db, &[PLAIN, TYPED])
         .unwrap()
         .is_consistent());
     drop(db);
@@ -267,11 +265,11 @@ fn families_are_independent_per_owner_in_one_transaction() {
             b"$e",
             &[
                 FamilyEdges {
-                    family: IMMUTABLE_EDGES,
+                    family: PLAIN,
                     edges: &[EdgeKey::plain(b"$create")],
                 },
                 FamilyEdges {
-                    family: TYPED_UNION_EDGES,
+                    family: TYPED,
                     edges: &[EdgeKey {
                         target: b"$create",
                         kind: 2,
@@ -283,18 +281,30 @@ fn families_are_independent_per_owner_in_one_transaction() {
     assert_eq!(recorded.edges.len(), 2);
     assert_eq!(recorded.edges[0][0].kind, 0, "untyped family has kind 0");
     assert_eq!(recorded.edges[1][0].kind, 2);
-    // The immutable family rejects a change while the union family still grows.
+    // A conflicting list in one family fails the whole transaction: the other
+    // family's (valid) write is not applied either.
+    let other_owner = index().get_or_create(&db, &[b"$f"]).unwrap()[0];
     let error = index()
         .record_event(
             &db,
             b"$e",
-            &[FamilyEdges {
-                family: IMMUTABLE_EDGES,
-                edges: &[EdgeKey::plain(b"$other-auth")],
-            }],
+            &[
+                FamilyEdges {
+                    family: PLAIN,
+                    edges: &[EdgeKey::plain(b"$different")],
+                },
+                FamilyEdges {
+                    family: EdgeFamily::plain(9),
+                    edges: &[EdgeKey::plain(b"$new-family")],
+                },
+            ],
         )
         .unwrap_err();
     assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    let e = index().get_or_create(&db, &[b"$e"]).unwrap()[0];
+    assert_eq!(index().edges(&db, e, EdgeFamily::plain(9)).unwrap(), None);
+    assert_eq!(index().edges(&db, other_owner, PLAIN).unwrap(), None);
+    assert_eq!(index().resolve(&db, &[e + 100]).unwrap(), vec![None]);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -308,7 +318,7 @@ fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
             &db,
             b"$e",
             &[FamilyEdges {
-                family: TYPED_UNION_EDGES,
+                family: TYPED,
                 edges: &[EdgeKey {
                     target: b"$t",
                     kind: 1,
@@ -316,11 +326,10 @@ fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
             }],
         )
         .unwrap();
-    // Same family number, read as immutable/untyped: refused, not misparsed.
-    let wrong = EdgeFamily::immutable(3);
+    // Same family number, read as untyped: refused, not misparsed.
     let id = index().get_or_create(&db, &[b"$e"]).unwrap()[0];
     assert!(matches!(
-        index().edges(&db, id, wrong),
+        index().edges(&db, id, EdgeFamily::plain(3)),
         Err(StorageError::Collision(_))
     ));
     // A kind on an untyped family is a caller error.
@@ -329,7 +338,7 @@ fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
             &db,
             b"$x",
             &[FamilyEdges {
-                family: IMMUTABLE_EDGES,
+                family: PLAIN,
                 edges: &[EdgeKey {
                     target: b"$t",
                     kind: 5,
@@ -342,42 +351,50 @@ fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Identical concurrent writers all succeed (idempotent); a writer with a
+/// different list loses with a collision and never overwrites the winner.
 #[test]
-fn concurrent_union_writers_lose_no_edges() {
-    let root = test_root("union-race");
+fn concurrent_writers_are_idempotent_and_never_overwrite() {
+    let root = test_root("race-idempotent");
     let db = SharedDatabase::open(root.clone()).unwrap();
-    let targets: Vec<String> = (0..24).map(|i| format!("$t{i}")).collect();
-    std::thread::scope(|scope| {
-        for thread in 0..6usize {
-            let db = &db;
-            let targets = &targets;
-            scope.spawn(move || {
-                for round in 0..8usize {
-                    let target = &targets[(thread * 8 + round) % targets.len()];
+    let outcomes: Vec<Result<(), StorageError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8usize)
+            .map(|thread| {
+                let db = &db;
+                scope.spawn(move || {
+                    // Even threads agree on one list; odd threads propose another.
+                    let target: &[u8] = if thread % 2 == 0 { b"$a" } else { b"$b" };
                     index()
                         .record_event(
                             db,
                             b"$owner",
                             &[FamilyEdges {
-                                family: TYPED_UNION_EDGES,
-                                edges: &[EdgeKey {
-                                    target: target.as_bytes(),
-                                    kind: 4,
-                                }],
+                                family: TYPED,
+                                edges: &[EdgeKey { target, kind: 1 }],
                             }],
                         )
-                        .unwrap();
-                }
-            });
-        }
+                        .map(|_| ())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    let wins = outcomes.iter().filter(|o| o.is_ok()).count();
+    assert!(
+        (4..=8).contains(&wins),
+        "one side's list is stored, all its writers agree"
+    );
+    assert!(outcomes
+        .iter()
+        .filter_map(|o| o.as_ref().err())
+        .all(|e| matches!(e, StorageError::Collision(_))));
     let owner = index().get_or_create(&db, &[b"$owner"]).unwrap()[0];
-    let stored = kinds(&db, owner);
-    assert_eq!(stored.len(), 24, "every concurrent union write survived");
-    assert!(index()
-        .verify(&db, &[TYPED_UNION_EDGES])
-        .unwrap()
-        .is_consistent());
+    assert_eq!(
+        typed_edges(&db, owner).len(),
+        1,
+        "exactly one list survived"
+    );
+    assert!(index().verify(&db, &[TYPED]).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

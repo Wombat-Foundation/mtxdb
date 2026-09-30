@@ -12,19 +12,20 @@
 //! - **counter** (`SIDC`): the next id to allocate;
 //! - **forward** (`SIDF`): `hash(key) -> id + key bytes`. The node id is a
 //!   truncated hash, so the stored key is compared on every hit and a mismatch
-//!   is reported as a collision, never silently merged;
+//!   is reported as a collision, never silently list;
 //! - **reverse** (`SIDR`): `id -> key bytes`;
 //! - **edges** (`SIDE`): `(family, id) -> sorted [Edge]`, where an [`Edge`] is a
 //!   `u32` target plus, for typed families, a `u16` kind. A record is never
 //!   empty (it has a header), so a known owner with zero edges is distinguishable
 //!   from an absent record.
 //!
-//! An [`EdgeFamily`] fixes the record's merge policy and whether edges are
-//! typed. [`EdgeMerge::Immutable`] families (for example a graph's parent or dependency edges) treat a
-//! different list for an existing owner as a collision. [`EdgeMerge::Union`]
-//! families (for example typed cross-references that arrive over time) merge repeated writes by set union under a CAS
-//! on the edge record. The merge policy and typing are stored in the record and
-//! checked on every access, so a caller cannot reinterpret a family.
+//! An [`EdgeFamily`] fixes whether edges are typed. Edge lists are **immutable
+//! once written**: writing the same list again is a no-op and a different list
+//! for an existing owner is a collision. Mutable visibility (for example
+//! redaction or rejection of the owning record) is not modelled here; callers
+//! filter at read time against their own authoritative state. The typing is
+//! stored in each record and checked on every access, so a caller cannot
+//! reinterpret a family.
 //!
 //! Allocation and every family's edge write commit in one
 //! [`DatabaseTransaction`] guarded by the engine's per-record compare-and-swap
@@ -61,59 +62,39 @@ const REVERSE_PREFIX: [u8; 8] = *b"MTXSIDR\0";
 const EDGES_PREFIX: [u8; 8] = *b"MTXSIDE\0";
 
 const FLAG_TYPED: u8 = 0b01;
-const FLAG_UNION: u8 = 0b10;
 
 /// Maximum optimistic-retry rounds before a stale read is returned.
 const MAX_ATTEMPTS: usize = 64;
 
-/// How repeated writes of one owner's edge set within a family combine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EdgeMerge {
-    /// The first set wins; a different set later is a collision error.
-    Immutable,
-    /// Repeated writes merge by set union, under a CAS on the edge record.
-    Union,
-}
-
-/// A named adjacency family within a scope.
+/// A named adjacency family within a scope. Its edge lists are immutable once
+/// written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeFamily {
     /// Family number; part of the edge record's address.
     pub id: u16,
-    /// Merge policy for repeated writes.
-    pub merge: EdgeMerge,
     /// Whether each edge carries a `u16` kind (otherwise the kind is always 0).
     pub typed: bool,
 }
 
 impl EdgeFamily {
-    /// An untyped family whose edge list never changes once written.
+    /// An untyped family.
     #[must_use]
-    pub const fn immutable(id: u16) -> Self {
-        Self {
-            id,
-            merge: EdgeMerge::Immutable,
-            typed: false,
-        }
+    pub const fn plain(id: u16) -> Self {
+        Self { id, typed: false }
     }
 
-    /// A typed family whose edge set grows by union.
+    /// A family whose edges each carry a `u16` kind.
     #[must_use]
-    pub const fn typed_union(id: u16) -> Self {
-        Self {
-            id,
-            merge: EdgeMerge::Union,
-            typed: true,
-        }
+    pub const fn typed(id: u16) -> Self {
+        Self { id, typed: true }
     }
 
     const fn flags(self) -> u8 {
-        let typed = if self.typed { FLAG_TYPED } else { 0 };
-        let union = match self.merge {
-            EdgeMerge::Union => FLAG_UNION,
-            EdgeMerge::Immutable => 0,
-        };
-        typed | union
+        if self.typed {
+            FLAG_TYPED
+        } else {
+            0
+        }
     }
 
     const fn entry_len(self) -> usize {
@@ -165,7 +146,7 @@ pub struct FamilyEdges<'a> {
 pub struct RecordedEvent {
     /// The owner's short id.
     pub id: u32,
-    /// The stored (merged) edge list of each requested family, in request order.
+    /// The stored edge list of each requested family, in request order.
     pub edges: Vec<Vec<Edge>>,
 }
 
@@ -263,7 +244,7 @@ fn decode_edges(family: EdgeFamily, bytes: &[u8]) -> Result<Vec<Edge>, StorageEr
     }
     if body[0] != family.flags() {
         return Err(StorageError::Collision(format!(
-            "short-id family {} was stored with different merge/typing flags",
+            "short-id family {} was stored with different typing",
             family.id
         )));
     }
@@ -339,15 +320,14 @@ impl ShortIdIndex {
     /// Allocate ids for `owner` and every edge target, then store each family's
     /// edge list for `owner`, all in one transaction.
     ///
-    /// Edges are sorted and de-duplicated. Per family: an
-    /// [`EdgeMerge::Immutable`] list that matches the stored one is a no-op and
-    /// a different one is a collision error; an [`EdgeMerge::Union`] list merges
-    /// with the stored one. Returns the owner's id and each family's stored list.
+    /// Edges are sorted and de-duplicated. Per family, a list that matches the
+    /// stored one is a no-op and a different one is a collision error. Returns
+    /// the owner's id and each family's stored list.
     ///
     /// # Errors
-    /// As [`Self::get_or_create`], plus a collision error for an immutable
-    /// family whose list differs, a family reused with different flags, or a
-    /// non-zero kind on an untyped family.
+    /// As [`Self::get_or_create`], plus a collision error for a family whose
+    /// list differs from the stored one or that was stored with different
+    /// typing, or an error for a non-zero kind on an untyped family.
     pub fn record_event(
         &self,
         db: &SharedDatabase,
@@ -686,30 +666,22 @@ impl ShortIdIndex {
                 Some((None, token)) => (None, Some(token)),
                 None => (None, None),
             };
-            let merged: Vec<Edge> = match (&stored, family.family.merge) {
-                (Some(stored), EdgeMerge::Immutable) => {
-                    let wanted: Vec<Edge> = wanted.into_iter().collect();
-                    if *stored != wanted {
-                        return Err(StorageError::Collision(
-                            "short-id edge list differs from the recorded one".to_owned(),
-                        ));
-                    }
-                    wanted
+            let list: Vec<Edge> = wanted.into_iter().collect();
+            if let Some(stored) = &stored {
+                if *stored != list {
+                    return Err(StorageError::Collision(
+                        "short-id edge list differs from the recorded one".to_owned(),
+                    ));
                 }
-                (Some(stored), EdgeMerge::Union) => {
-                    wanted.extend(stored.iter().copied());
-                    wanted.into_iter().collect()
-                }
-                (None, _) => wanted.into_iter().collect(),
-            };
-            if stored.as_ref() != Some(&merged) {
+            }
+            if stored.is_none() {
                 allocation.staged.push((
                     edges_record_id(owner, family.family.id),
-                    encode_edges(family.family, &merged)?,
+                    encode_edges(family.family, &list)?,
                     token,
                 ));
             }
-            lists.push(merged);
+            lists.push(list);
         }
         Ok(lists)
     }
