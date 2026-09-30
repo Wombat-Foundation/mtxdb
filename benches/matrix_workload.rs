@@ -24,6 +24,9 @@
 //!
 //! Env knobs (all optional):
 //! - `MTXDB_BENCH_ROOT` redirects scratch data off a RAM-backed tmpfs.
+//! - `MTXDB_BENCH_TIMELINE_DIAGNOSTICS=1` additionally prints the
+//!   `EXPLAIN QUERY PLAN` for both directions and sweeps page sizes, emitted
+//!   as `diag:` lines that the regression parser deliberately ignores.
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
@@ -46,6 +49,8 @@ const EVENTS_PER_ROOM: usize = 2_000;
 const BATCH_SIZE: usize = 32;
 const LOOKUPS: usize = 10_000;
 const TIMELINE_PAGE: usize = 100;
+/// Page sizes swept only under `MTXDB_BENCH_TIMELINE_DIAGNOSTICS`.
+const TIMELINE_DIAG_PAGE_SIZES: [usize; 6] = [25, 50, 100, 250, 500, 1_000];
 const SEED: u64 = 0x4d_54_58_44_42_2d_4d_58;
 
 #[derive(Clone)]
@@ -297,6 +302,12 @@ trait TimelineBackend: Backend {
     /// Up to `limit` depths in `room`, inclusive of `cursor`, in `forward`
     /// (ascending) or backward (descending) order.
     fn page(&self, room: [u8; 16], cursor: u64, forward: bool, limit: usize) -> Vec<u64>;
+
+    /// Human-readable `EXPLAIN QUERY PLAN` lines for one direction, if the
+    /// engine exposes them. Defaults to none for engines that don't.
+    fn explain(&self, _room: [u8; 16], _forward: bool) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl TimelineBackend for SqliteBackend {
@@ -318,6 +329,22 @@ impl TimelineBackend for SqliteBackend {
             .unwrap();
         rows.map(|row| u64::try_from(row.unwrap()).unwrap())
             .collect()
+    }
+
+    fn explain(&self, room: [u8; 16], forward: bool) -> Vec<String> {
+        let sql = if forward {
+            "EXPLAIN QUERY PLAN SELECT depth FROM events \
+             WHERE room_id = ?1 AND depth >= ?2 ORDER BY depth ASC LIMIT ?3"
+        } else {
+            "EXPLAIN QUERY PLAN SELECT depth FROM events \
+             WHERE room_id = ?1 AND depth <= ?2 ORDER BY depth DESC LIMIT ?3"
+        };
+        let conn = self.conn.as_ref().unwrap();
+        let mut statement = conn.prepare(sql).unwrap();
+        let rows = statement
+            .query_map(params![room, 0i64, 100i64], |row| row.get::<_, String>(3))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
     }
 }
 
@@ -434,15 +461,6 @@ fn run<B: Backend>(mut backend: B, dataset: &Dataset, ids: &[NodeId]) {
     );
 }
 
-struct TimelineTiming {
-    fwd_pages: usize,
-    bwd_pages: usize,
-    fwd_events: usize,
-    bwd_events: usize,
-    fwd_page_us: f64,
-    bwd_page_us: f64,
-}
-
 fn elapsed_us(started: Instant, divisor: usize) -> f64 {
     if divisor == 0 {
         0.0
@@ -451,59 +469,107 @@ fn elapsed_us(started: Instant, divisor: usize) -> f64 {
     }
 }
 
-/// Walk every room's timeline forward and backward, one page at a time.
-fn time_timeline<B: TimelineBackend>(backend: &B, rooms: &[[u8; 16]]) -> TimelineTiming {
-    let mut fwd_pages = 0usize;
-    let mut fwd_events = 0usize;
-    let fwd_started = Instant::now();
+/// Walk one direction across every room's timeline, one page at a time.
+/// Returns `(pages, events, microseconds per page)`.
+fn time_direction<B: TimelineBackend>(
+    backend: &B,
+    rooms: &[[u8; 16]],
+    forward: bool,
+    page_size: usize,
+) -> (usize, usize, f64) {
+    let mut pages = 0usize;
+    let mut events = 0usize;
+    let started = Instant::now();
     for &room in rooms {
-        let mut cursor = 0u64;
+        let mut cursor = if forward { 0 } else { u64::MAX };
         loop {
-            let page = backend.page(room, cursor, true, TIMELINE_PAGE);
+            let page = backend.page(room, cursor, forward, page_size);
             if page.is_empty() {
                 break;
             }
-            fwd_pages += 1;
-            fwd_events += page.len();
-            let last = page[page.len() - 1];
-            if page.len() < TIMELINE_PAGE {
+            pages += 1;
+            events += page.len();
+            // The last element is the far edge of the page: the largest depth
+            // when descending, the smallest when ascending.
+            let edge = page[page.len() - 1];
+            if page.len() < page_size {
                 break;
             }
-            cursor = last.saturating_add(1);
+            if forward {
+                cursor = edge.saturating_add(1);
+            } else if edge == 0 {
+                break;
+            } else {
+                cursor = edge - 1;
+            }
         }
     }
-    let fwd_page_us = elapsed_us(fwd_started, fwd_pages);
+    (pages, events, elapsed_us(started, pages))
+}
 
-    let mut bwd_pages = 0usize;
-    let mut bwd_events = 0usize;
-    let bwd_started = Instant::now();
-    for &room in rooms {
-        let mut cursor = u64::MAX;
-        loop {
-            let page = backend.page(room, cursor, false, TIMELINE_PAGE);
-            if page.is_empty() {
-                break;
+/// Opt-in, `diag:`-prefixed diagnostics: the query plans plus a page-size
+/// sweep, so B-tree direction cost can be told apart from page-size and
+/// first-touch effects. `bench:` regression metrics are untouched.
+fn run_timeline_diagnostics<B: TimelineBackend>(backend: &mut B, rooms: &[[u8; 16]], path: &Path) {
+    if let Some(&room) = rooms.first() {
+        for (label, forward) in [("fwd", true), ("rev", false)] {
+            for line in backend.explain(room, forward) {
+                println!(
+                    "diag: matrix_timeline_plan BACKEND={} DIR={} PLAN={}",
+                    backend.name(),
+                    label,
+                    line
+                );
             }
-            bwd_pages += 1;
-            bwd_events += page.len();
-            // Descending pages end on the smallest depth in the page.
-            let first = page[page.len() - 1];
-            if page.len() < TIMELINE_PAGE || first == 0 {
-                break;
-            }
-            cursor = first - 1;
         }
     }
-    let bwd_page_us = elapsed_us(bwd_started, bwd_pages);
 
-    TimelineTiming {
-        fwd_pages,
-        bwd_pages,
-        fwd_events,
-        bwd_events,
-        fwd_page_us,
-        bwd_page_us,
+    for &page_size in &TIMELINE_DIAG_PAGE_SIZES {
+        let (warm_fwd_pages, _, warm_fwd_us) = time_direction(backend, rooms, true, page_size);
+        let (warm_bwd_pages, _, warm_bwd_us) = time_direction(backend, rooms, false, page_size);
+        for (label, pages, page_us) in [
+            ("fwd", warm_fwd_pages, warm_fwd_us),
+            ("rev", warm_bwd_pages, warm_bwd_us),
+        ] {
+            println!(
+                "diag: matrix_timeline_sweep BACKEND={} CACHE=warm PAGE={} DIR={} PAGES={} PAGE_US={:.3}",
+                backend.name(),
+                page_size,
+                label,
+                pages,
+                page_us
+            );
+        }
+
+        // Each cold direction gets its own eviction, as in the default row.
+        backend.close();
+        let fwd_evicted = evict_dir(path);
+        backend.open();
+        let (cold_fwd_pages, _, cold_fwd_us) = time_direction(backend, rooms, true, page_size);
+
+        backend.close();
+        let rev_evicted = evict_dir(path);
+        backend.open();
+        let (cold_bwd_pages, _, cold_bwd_us) = time_direction(backend, rooms, false, page_size);
+        for (label, pages, page_us, evicted) in [
+            ("fwd", cold_fwd_pages, cold_fwd_us, fwd_evicted),
+            ("rev", cold_bwd_pages, cold_bwd_us, rev_evicted),
+        ] {
+            println!(
+                "diag: matrix_timeline_sweep BACKEND={} CACHE=cold PAGE={} DIR={} PAGES={} PAGE_US={:.3} EVICTED={}",
+                backend.name(),
+                page_size,
+                label,
+                pages,
+                page_us,
+                evicted
+            );
+        }
     }
+}
+
+fn timeline_diagnostics_enabled() -> bool {
+    std::env::var_os("MTXDB_BENCH_TIMELINE_DIAGNOSTICS").is_some_and(|value| value != "0")
 }
 
 fn run_timeline<B: TimelineBackend>(mut backend: B, dataset: &Dataset) {
@@ -514,29 +580,53 @@ fn run_timeline<B: TimelineBackend>(mut backend: B, dataset: &Dataset) {
     let bytes = directory_bytes(&path);
     let rooms = dataset.rooms();
 
-    let warm = time_timeline(&backend, &rooms);
+    // Warm each direction with no eviction.
+    let (warm_fwd_pages, warm_fwd_events, warm_fwd_us) =
+        time_direction(&backend, &rooms, true, TIMELINE_PAGE);
+    let (warm_bwd_pages, warm_bwd_events, warm_bwd_us) =
+        time_direction(&backend, &rooms, false, TIMELINE_PAGE);
+
+    // Cold each direction under its own eviction, so neither inherits the
+    // other's first-touch cost. This is what keeps the direction comparison
+    // honest; measuring them back-to-back on one cache does not.
+    backend.close();
+    let mut evicted = evict_dir(&path);
+    backend.open();
+    let (cold_fwd_pages, cold_fwd_events, cold_fwd_us) =
+        time_direction(&backend, &rooms, true, TIMELINE_PAGE);
 
     backend.close();
-    let evicted = evict_dir(&path);
+    evicted &= evict_dir(&path);
     backend.open();
-    let cold = time_timeline(&backend, &rooms);
+    let (cold_bwd_pages, cold_bwd_events, cold_bwd_us) =
+        time_direction(&backend, &rooms, false, TIMELINE_PAGE);
 
     let expected = ROOM_COUNT * EVENTS_PER_ROOM;
     assert_eq!(
-        warm.fwd_events, expected,
+        warm_fwd_events, expected,
         "warm forward pages must cover every event"
     );
     assert_eq!(
-        warm.bwd_events, expected,
+        warm_bwd_events, expected,
         "warm backward pages must cover every event"
     );
     assert_eq!(
-        cold.fwd_events, expected,
+        cold_fwd_events, expected,
         "cold forward pages must cover every event"
     );
     assert_eq!(
-        cold.bwd_events, expected,
+        cold_bwd_events, expected,
         "cold backward pages must cover every event"
+    );
+    // Same page count each way is the observable form of "identical event
+    // sets in reverse order".
+    assert_eq!(
+        warm_fwd_pages, warm_bwd_pages,
+        "timeline must page identically forward and backward"
+    );
+    assert_eq!(
+        cold_fwd_pages, cold_bwd_pages,
+        "cold timeline must page identically forward and backward"
     );
 
     println!(
@@ -552,13 +642,17 @@ fn run_timeline<B: TimelineBackend>(mut backend: B, dataset: &Dataset) {
         write_ms,
         bytes,
         evicted,
-        warm.fwd_pages,
-        warm.bwd_pages,
-        warm.fwd_page_us,
-        warm.bwd_page_us,
-        cold.fwd_page_us,
-        cold.bwd_page_us,
+        warm_fwd_pages,
+        warm_bwd_pages,
+        warm_fwd_us,
+        warm_bwd_us,
+        cold_fwd_us,
+        cold_bwd_us,
     );
+
+    if timeline_diagnostics_enabled() {
+        run_timeline_diagnostics(&mut backend, &rooms, &path);
+    }
 }
 
 /// Best-effort page-cache eviction via `vmtouch -e`, which only drops *clean,
