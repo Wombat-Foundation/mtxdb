@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::closure_store::*;
 use super::short_id::{EdgeFamily, ShortIdIndex};
 use crate::database::SharedDatabase;
@@ -21,7 +23,18 @@ fn store() -> ClosureStore {
 fn build(db: &SharedDatabase, tag: u8, ids: std::ops::Range<u32>) -> ClosureHead {
     let store = store();
     let mut builder = store.begin(db).unwrap();
-    let blobs: Vec<(u32, Vec<u8>)> = ids.clone().map(|id| (id, vec![tag, id as u8])).collect();
+    let blobs: Vec<(u32, Vec<u8>)> = ids
+        .clone()
+        .map(|id| {
+            (
+                id,
+                vec![
+                    tag,
+                    u8::try_from(id).expect("test closure id must fit in a byte"),
+                ],
+            )
+        })
+        .collect();
     let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(i, b)| (*i, b.as_slice())).collect();
     builder.add(db, &refs).unwrap();
     builder.publish(db, ids.end).unwrap()
@@ -111,10 +124,12 @@ fn reopen_preserves_head_and_orphans_are_reclaimed() {
     {
         let db = SharedDatabase::open(root.clone()).unwrap();
         build(&db, 4, 1..4);
-        // A crash mid-build: generation written, head never swapped.
-        let mut crashed = store().begin(&db).unwrap();
-        crashed.add(&db, &[(1, b"partial".as_slice())]).unwrap();
-        std::mem::forget(crashed);
+        // A crash mid-build: generation written, head never swapped. The
+        // builder has no destructor; ending this scope models abandoning it.
+        {
+            let mut crashed = store().begin(&db).unwrap();
+            crashed.add(&db, &[(1, b"partial".as_slice())]).unwrap();
+        }
     }
     let db = SharedDatabase::open(root.clone()).unwrap();
     let head = store().head(&db).unwrap().unwrap();
@@ -180,7 +195,10 @@ const CRASH_IDS: u32 = 7;
 
 /// Blob for `id` in `generation`: lets a reader detect a mixed generation.
 fn blob_for(generation: u64, id: u32) -> Vec<u8> {
-    vec![generation as u8, id as u8]
+    vec![
+        u8::try_from(generation).expect("test generation must fit in a byte"),
+        u8::try_from(id).expect("test closure id must fit in a byte"),
+    ]
 }
 
 fn publish_full(db: &SharedDatabase) -> ClosureHead {
@@ -256,7 +274,11 @@ fn assert_complete_snapshot(db: &SharedDatabase) -> ClosureHead {
         .expect("a generation is published");
     let ids: Vec<u32> = (1..head.source_next).collect();
     let (generation, blobs) = store().get_many(db, &ids).unwrap();
-    assert_eq!(generation, Some(head.generation));
+    assert_eq!(
+        generation,
+        Some(head.generation),
+        "all closure records must come from the published generation"
+    );
     for (id, blob) in ids.iter().zip(blobs) {
         assert_eq!(
             blob,
@@ -265,7 +287,10 @@ fn assert_complete_snapshot(db: &SharedDatabase) -> ClosureHead {
             head.generation
         );
     }
-    assert!(store().verify(db).unwrap().is_consistent());
+    assert!(
+        store().verify(db).unwrap().is_consistent(),
+        "published closure generation must verify"
+    );
     head
 }
 

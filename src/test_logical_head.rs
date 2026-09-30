@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::logical_head::*;
 use crate::database::SharedDatabase;
 use crate::layout::ShardType;

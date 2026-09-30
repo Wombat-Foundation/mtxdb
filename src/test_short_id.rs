@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::short_id::*;
 use crate::database::SharedDatabase;
 use crate::layout::ShardType;

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::matrix_adjacency::*;
 use crate::database::SharedDatabase;
 use crate::layout::ShardType;
