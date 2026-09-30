@@ -10,20 +10,30 @@
 //! The persisted key is the total order
 //!
 //! ```text
-//! (room_id, timeline_order, node_id, event_ref)
+//! (room_id, topological_ordering, stream_ordering, node_id, event_ref)
 //! ```
 //!
+//! This mirrors Synapse's `events_order_room (room_id, topological_ordering,
+//! stream_ordering)` history order.
+//!
 //! - `room_id` scopes the index; a timeline read is a room-prefix range.
-//! - `timeline_order` is caller-supplied (Matrix: topological depth). It is
-//!   **persisted**; the index never recomputes it. The caller must define a
+//! - `topological_ordering` (Matrix: depth) and `stream_ordering` are
+//!   caller-supplied, signed 64-bit and **persisted**; the index never
+//!   recomputes them. `stream_ordering` is signed because Synapse gives
+//!   backfilled events negative stream positions. The caller must define a
 //!   deterministic fallback for events without a computable position (missing
-//!   parents, cycles) before building, because the in-memory DAG order cannot be
-//!   regenerated reliably after reopening.
+//!   parents, cycles) before building, because the in-memory DAG order cannot
+//!   be regenerated reliably after reopening.
 //! - `node_id` is the operational 128-bit id of the stored event and the
-//!   total-order tie-break, so equal `timeline_order` values never tie.
+//!   tie-break after the two orderings, so equal positions never tie.
 //! - `event_ref` is a caller-supplied 32-byte event identity (reference hash),
 //!   kept as the final disambiguator so two ids for the same content stay
 //!   distinct and ordered deterministically.
+//!
+//! **Prototype.** This is a copy-on-write leaf index, not the production
+//! ordered-run format (memtable, sorted runs, fences, blooms, compaction); see
+//! `docs/docs/2026-09-30-ordered-index-reconciliation.md`. The `TML*` formats
+//! are not stable.
 //!
 //! Layout (all content-addressed, immutable except the head):
 //! - **leaf** (`TMLF`): up to [`TIMELINE_LEAF_CAP`] sorted entries;
@@ -47,7 +57,7 @@ use crate::template::{
 };
 
 /// Version byte of every timeline record and the cursor encoding.
-pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
+pub const TIMELINE_FORMAT_VERSION: u8 = 0x02;
 /// Maximum entries per leaf record.
 pub const TIMELINE_LEAF_CAP: usize = 128;
 
@@ -66,23 +76,42 @@ pub const TIMELINE_HEAD_ID: NodeId = *b"MTXD-TML-HEAD-v1";
 /// A caller-supplied event identity (reference hash).
 pub type EventRef = [u8; 32];
 
-const ENTRY_LEN: usize = 16 + 8 + 16 + 32;
+const ENTRY_LEN: usize = 16 + 8 + 8 + 16 + 32;
 const LEAF_HEADER_LEN: usize = 7;
 const ROOT_HEADER_LEN: usize = 17;
 const ROOT_LEAF_LEN: usize = ENTRY_LEN + 16;
 const HEAD_LEN: usize = 5 + 16 + 8;
-const CURSOR_LEN: usize = 5 + 16 + 16 + 8 + 16 + 32;
+const CURSOR_LEN: usize = 5 + 16 + ENTRY_LEN;
 const MAX_NODE_ID: NodeId = [0xff; 16];
 const MAX_EVENT_REF: EventRef = [0xff; 32];
 
-/// One ordered entry: the full `(room, order, node, event_ref)` key.
+/// Order-preserving big-endian encoding of a signed position: flipping the
+/// sign bit makes byte order equal numeric order, so the wire key is
+/// byte-comparable.
+fn encode_position(value: i64) -> [u8; 8] {
+    let mut bytes = value.to_be_bytes();
+    bytes[0] ^= 0x80;
+    bytes
+}
+
+fn decode_position(mut bytes: [u8; 8]) -> i64 {
+    bytes[0] ^= 0x80;
+    i64::from_be_bytes(bytes)
+}
+
+/// One ordered entry: the full
+/// `(room, topological_ordering, stream_ordering, node, event_ref)` key.
+///
+/// Field order is the sort order (`derive(Ord)` compares in declaration order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TimelineEntry {
     /// Room scope; the leading key component.
     pub room_id: [u8; 16],
-    /// Caller-supplied timeline order (e.g. topological depth).
-    pub order: u64,
-    /// The event's operational 128-bit node id; total-order tie-break.
+    /// Caller-supplied topological ordering (Matrix: depth).
+    pub topological_ordering: i64,
+    /// Caller-supplied stream ordering; negative for backfilled events.
+    pub stream_ordering: i64,
+    /// The event's operational 128-bit node id; tie-break after the orderings.
     pub node_id: NodeId,
     /// Caller-supplied 32-byte event identity; final disambiguator.
     pub event_ref: EventRef,
@@ -91,10 +120,17 @@ pub struct TimelineEntry {
 impl TimelineEntry {
     /// Construct an entry.
     #[must_use]
-    pub const fn new(room_id: [u8; 16], order: u64, node_id: NodeId, event_ref: EventRef) -> Self {
+    pub const fn new(
+        room_id: [u8; 16],
+        topological_ordering: i64,
+        stream_ordering: i64,
+        node_id: NodeId,
+        event_ref: EventRef,
+    ) -> Self {
         Self {
             room_id,
-            order,
+            topological_ordering,
+            stream_ordering,
             node_id,
             event_ref,
         }
@@ -102,7 +138,8 @@ impl TimelineEntry {
 
     fn encode_into(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.room_id);
-        out.extend_from_slice(&self.order.to_be_bytes());
+        out.extend_from_slice(&encode_position(self.topological_ordering));
+        out.extend_from_slice(&encode_position(self.stream_ordering));
         out.extend_from_slice(&self.node_id);
         out.extend_from_slice(&self.event_ref);
     }
@@ -111,20 +148,23 @@ impl TimelineEntry {
         if bytes.len() != ENTRY_LEN {
             return Err(StorageError::Corrupt("timeline entry length".to_owned()));
         }
+        let position = |range: std::ops::Range<usize>, what: &str| {
+            <[u8; 8]>::try_from(&bytes[range])
+                .map(decode_position)
+                .map_err(|_| StorageError::Corrupt(format!("timeline entry {what}")))
+        };
         let mut room_id = [0u8; 16];
         room_id.copy_from_slice(&bytes[..16]);
-        let order = u64::from_be_bytes(
-            bytes[16..24]
-                .try_into()
-                .map_err(|_| StorageError::Corrupt("timeline entry order".to_owned()))?,
-        );
+        let topological_ordering = position(16..24, "topological ordering")?;
+        let stream_ordering = position(24..32, "stream ordering")?;
         let mut node_id = [0u8; 16];
-        node_id.copy_from_slice(&bytes[24..40]);
+        node_id.copy_from_slice(&bytes[32..48]);
         let mut event_ref = [0u8; 32];
-        event_ref.copy_from_slice(&bytes[40..ENTRY_LEN]);
+        event_ref.copy_from_slice(&bytes[48..ENTRY_LEN]);
         Ok(Self {
             room_id,
-            order,
+            topological_ordering,
+            stream_ordering,
             node_id,
             event_ref,
         })
@@ -132,26 +172,19 @@ impl TimelineEntry {
 }
 
 /// An opaque, stable cursor naming the snapshot root plus the last entry read.
+///
+/// It carries the full ordering key, so both directions resume exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineCursor {
     root_id: NodeId,
-    room_id: [u8; 16],
-    order: u64,
-    node_id: NodeId,
-    event_ref: EventRef,
+    entry: TimelineEntry,
 }
 
 impl TimelineCursor {
     /// Build a cursor for `root_id` at `entry`.
     #[must_use]
     pub const fn new(root_id: NodeId, entry: TimelineEntry) -> Self {
-        Self {
-            root_id,
-            room_id: entry.room_id,
-            order: entry.order,
-            node_id: entry.node_id,
-            event_ref: entry.event_ref,
-        }
+        Self { root_id, entry }
     }
 
     /// The snapshot root this cursor pins.
@@ -163,12 +196,7 @@ impl TimelineCursor {
     /// The entry this cursor names.
     #[must_use]
     pub const fn entry(&self) -> TimelineEntry {
-        TimelineEntry {
-            room_id: self.room_id,
-            order: self.order,
-            node_id: self.node_id,
-            event_ref: self.event_ref,
-        }
+        self.entry
     }
 
     /// Encode the cursor as opaque, versioned bytes.
@@ -178,10 +206,7 @@ impl TimelineCursor {
         out.extend_from_slice(&TIMELINE_CURSOR_MAGIC);
         out.push(TIMELINE_FORMAT_VERSION);
         out.extend_from_slice(&self.root_id);
-        out.extend_from_slice(&self.room_id);
-        out.extend_from_slice(&self.order.to_be_bytes());
-        out.extend_from_slice(&self.node_id);
-        out.extend_from_slice(&self.event_ref);
+        self.entry.encode_into(&mut out);
         out
     }
 
@@ -189,10 +214,6 @@ impl TimelineCursor {
     ///
     /// Returns `None` for a wrong magic, version, or length.
     #[must_use]
-    #[allow(
-        clippy::similar_names,
-        reason = "root_id/room_id are the wire field names"
-    )]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != CURSOR_LEN
             || bytes[..4] != TIMELINE_CURSOR_MAGIC
@@ -202,20 +223,8 @@ impl TimelineCursor {
         }
         let mut root_id = [0u8; 16];
         root_id.copy_from_slice(&bytes[5..21]);
-        let mut room_id = [0u8; 16];
-        room_id.copy_from_slice(&bytes[21..37]);
-        let order = u64::from_be_bytes(bytes[37..45].try_into().ok()?);
-        let mut node_id = [0u8; 16];
-        node_id.copy_from_slice(&bytes[45..61]);
-        let mut event_ref = [0u8; 32];
-        event_ref.copy_from_slice(&bytes[61..CURSOR_LEN]);
-        Some(Self {
-            root_id,
-            room_id,
-            order,
-            node_id,
-            event_ref,
-        })
+        let entry = TimelineEntry::decode(&bytes[21..CURSOR_LEN]).ok()?;
+        Some(Self { root_id, entry })
     }
 }
 
@@ -245,11 +254,11 @@ fn content_id(payload: &[u8]) -> NodeId {
 }
 
 fn room_start(room_id: &[u8; 16]) -> TimelineEntry {
-    TimelineEntry::new(*room_id, 0, [0u8; 16], [0u8; 32])
+    TimelineEntry::new(*room_id, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32])
 }
 
 fn room_end(room_id: &[u8; 16]) -> TimelineEntry {
-    TimelineEntry::new(*room_id, u64::MAX, MAX_NODE_ID, MAX_EVENT_REF)
+    TimelineEntry::new(*room_id, i64::MAX, i64::MAX, MAX_NODE_ID, MAX_EVENT_REF)
 }
 
 /// A persisted timeline index over an existing storage engine.
@@ -379,7 +388,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
 
         let (root_id, key) = match cursor {
             Some(cursor) => {
-                if cursor.room_id != *room_id {
+                if cursor.entry.room_id != *room_id {
                     return Err(StorageError::Corrupt(
                         "timeline cursor names a different room".to_owned(),
                     ));

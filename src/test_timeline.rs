@@ -1,13 +1,13 @@
 use super::*;
 use crate::storage::InMemoryStorage;
 
-fn entry(room_id: [u8; 16], order: u64, seed: u8) -> TimelineEntry {
+fn entry(room_id: [u8; 16], order: i64, seed: u8) -> TimelineEntry {
     let mut node_id = [0u8; 16];
     node_id[0] = seed;
     node_id[15] = 0x11;
     let mut event_ref = [0u8; 32];
     event_ref[0] = seed;
-    TimelineEntry::new(room_id, order, node_id, event_ref)
+    TimelineEntry::new(room_id, order, i64::from(seed), node_id, event_ref)
 }
 
 fn sorted_reference(entries: &[TimelineEntry], room_id: &[u8; 16]) -> Vec<TimelineEntry> {
@@ -64,8 +64,8 @@ fn forward_pages_cover_a_room_in_order() {
     let index = TimelineIndex::open(&engine, "test");
     let mut entries = Vec::new();
     for seed in 0..40u8 {
-        entries.push(entry([1u8; 16], u64::from(seed / 2), seed));
-        entries.push(entry([2u8; 16], u64::from(seed), seed + 100));
+        entries.push(entry([1u8; 16], i64::from(seed / 2), seed));
+        entries.push(entry([2u8; 16], i64::from(seed), seed + 100));
     }
     index.build(&entries).unwrap();
 
@@ -80,7 +80,7 @@ fn reverse_pages_are_forward_reversed() {
     let index = TimelineIndex::open(&engine, "test");
     let mut entries = Vec::new();
     for seed in 0..37u8 {
-        entries.push(entry([1u8; 16], u64::from(seed), seed));
+        entries.push(entry([1u8; 16], i64::from(seed), seed));
     }
     index.build(&entries).unwrap();
 
@@ -96,7 +96,7 @@ fn cursor_pins_its_snapshot_across_a_rebuild() {
     let engine = InMemoryStorage::new();
     let index = TimelineIndex::open(&engine, "test");
     let first: Vec<TimelineEntry> = (0..10u8)
-        .map(|seed| entry([1u8; 16], u64::from(seed), seed))
+        .map(|seed| entry([1u8; 16], i64::from(seed), seed))
         .collect();
     index.build(&first).unwrap();
 
@@ -106,7 +106,7 @@ fn cursor_pins_its_snapshot_across_a_rebuild() {
 
     // Rebuild with more entries; the head now names a different root.
     let mut later = first.clone();
-    later.extend((10..20u8).map(|seed| entry([1u8; 16], u64::from(seed), seed)));
+    later.extend((10..20u8).map(|seed| entry([1u8; 16], i64::from(seed), seed)));
     index.build(&later).unwrap();
 
     // Continuing the old cursor still reads the original snapshot only.
@@ -119,7 +119,7 @@ fn cursor_pins_its_snapshot_across_a_rebuild() {
     }
     assert_eq!(rest.len(), 8);
     assert!(
-        rest.iter().all(|entry| entry.order < 10),
+        rest.iter().all(|entry| entry.topological_ordering < 10),
         "old snapshot only"
     );
 }
@@ -146,4 +146,61 @@ fn empty_index_pages_nothing() {
     assert!(page.entries.is_empty());
     assert!(page.next_cursor.is_none());
     assert!(index.head().unwrap().is_some());
+}
+
+fn full(room: [u8; 16], topological: i64, stream: i64, seed: u8) -> TimelineEntry {
+    let mut node_id = [0u8; 16];
+    node_id[0] = seed;
+    TimelineEntry::new(room, topological, stream, node_id, [seed; 32])
+}
+
+#[test]
+fn order_is_topological_then_stream_then_node() {
+    let room = [1u8; 16];
+    // Shuffled on purpose; includes backfilled (negative) stream positions and
+    // equal positions that only `node_id` can separate.
+    let entries = vec![
+        full(room, 5, 10, 1),
+        full(room, 2, 99, 2),
+        full(room, 5, -4, 3),
+        full(room, 5, 10, 0),
+        full(room, -1, 7, 4),
+        full(room, 2, i64::MIN, 5),
+    ];
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "test");
+    index.build(&entries).unwrap();
+
+    let keys: Vec<(i64, i64, u8)> = collect(&index, &room, true, 2)
+        .iter()
+        .map(|e| (e.topological_ordering, e.stream_ordering, e.node_id[0]))
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (-1, 7, 4),
+            (2, i64::MIN, 5),
+            (2, 99, 2),
+            (5, -4, 3),
+            (5, 10, 0),
+            (5, 10, 1),
+        ]
+    );
+    let mut backward = collect(&index, &room, false, 2);
+    backward.reverse();
+    assert_eq!(backward, collect(&index, &room, true, 5));
+}
+
+#[test]
+fn wire_encoding_is_byte_comparable_and_roundtrips() {
+    let room = [1u8; 16];
+    let values = [i64::MIN, -5, -1, 0, 1, 7, i64::MAX];
+    for pair in values.windows(2) {
+        assert!(encode_position(pair[0]) < encode_position(pair[1]));
+    }
+    for value in values {
+        assert_eq!(decode_position(encode_position(value)), value);
+    }
+    let cursor = TimelineCursor::new([9u8; 16], full(room, -3, i64::MIN, 6));
+    assert_eq!(TimelineCursor::decode(&cursor.encode()), Some(cursor));
 }
