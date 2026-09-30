@@ -613,7 +613,7 @@ impl SharedDatabase {
             let dir = layout.pool_dir(shard)?;
             let policy = policies.for_shard(shard);
             let store =
-                PackfileStorage::open_with_policies(dir, policy.compress, policy.checksum_policy)?;
+                PackfileStorage::open_shared_member(dir, policy.compress, policy.checksum_policy)?;
             store.enable_shared_journal(Arc::clone(&coordinator), shard)?;
             store.replay_journal()?;
             pools.push(Arc::new(store));

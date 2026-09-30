@@ -1133,6 +1133,46 @@ impl ShardPool {
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
     ) -> io::Result<Self> {
+        Self::open_internal_locked(
+            base_dir,
+            writable,
+            max_shard_bytes,
+            compress,
+            checksum_policy,
+            true,
+        )
+    }
+
+    /// Open a writable pool that is one member of a shared database. The
+    /// database root's writer lock already guarantees a single writer for every
+    /// pool, so no per-pool `.mtxdb.lock` file is created.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_with_policies`], except it never reports a
+    /// contended pool lock.
+    pub(crate) fn open_shared_member(
+        base_dir: PathBuf,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+    ) -> io::Result<Self> {
+        Self::open_internal_locked(
+            base_dir,
+            true,
+            MAX_SHARD_BYTES,
+            compress,
+            checksum_policy,
+            false,
+        )
+    }
+
+    fn open_internal_locked(
+        base_dir: PathBuf,
+        writable: bool,
+        max_shard_bytes: u64,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+        take_writer_lock: bool,
+    ) -> io::Result<Self> {
         let open_started = Instant::now();
         if writable {
             fs::create_dir_all(&base_dir)?;
@@ -1147,7 +1187,7 @@ impl ShardPool {
         }
 
         let writer_lock_started = Instant::now();
-        let writer_lock = writable
+        let writer_lock = (writable && take_writer_lock)
             .then(|| Self::acquire_writer_lock(&base_dir))
             .transpose()?;
         let writer_lock_time = writer_lock_started.elapsed();

@@ -2390,7 +2390,6 @@ impl PackfileStorage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_lines)]
     fn open_with_options(
         base_dir: PathBuf,
         cache_capacity: usize,
@@ -2400,13 +2399,58 @@ impl PackfileStorage {
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
     ) -> Result<Self, std::io::Error> {
+        Self::open_with_options_locked(
+            base_dir,
+            cache_capacity,
+            swizzle,
+            writable,
+            max_shard_bytes,
+            compress,
+            checksum_policy,
+            true,
+        )
+    }
+
+    /// Open a writable pool that belongs to a shared database. The database
+    /// root's writer lock covers it, so the pool creates no `.mtxdb.lock`.
+    pub(crate) fn open_shared_member(
+        base_dir: PathBuf,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options_locked(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            true,
+            None,
+            compress,
+            checksum_policy,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    fn open_with_options_locked(
+        base_dir: PathBuf,
+        cache_capacity: usize,
+        swizzle: Option<SwizzleFn>,
+        writable: bool,
+        max_shard_bytes: Option<u64>,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+        take_writer_lock: bool,
+    ) -> Result<Self, std::io::Error> {
         fs::create_dir_all(&base_dir)?;
 
         let started = std::time::Instant::now();
         let mut timings = OpenTimings::default();
 
         let shard_open_started = std::time::Instant::now();
-        let shards = if writable {
+        let shards = if writable && !take_writer_lock {
+            ShardPool::open_shared_member(base_dir.clone(), compress, checksum_policy)?
+        } else if writable {
             match max_shard_bytes {
                 // Custom rotation thresholds are only used by benchmarks/
                 // tests today, none of which also need to disable
