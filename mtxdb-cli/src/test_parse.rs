@@ -165,6 +165,16 @@ fn test_read_plan_flag_parsing() {
 }
 
 #[test]
+fn scan_rejects_unknown_decode_format() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "scan", "0x01", "--decode=hff"])
+        .is_err());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "scan", "0x01", "--decode=hamt"])
+        .is_ok());
+}
+
+#[test]
 fn test_read_plan_mode_maps_to_policy() {
     assert_eq!(read_plan_from_mode("plain"), ReadPlanPolicy::disabled());
     assert_eq!(read_plan_from_mode("prefetch"), ReadPlanPolicy::prefetch());

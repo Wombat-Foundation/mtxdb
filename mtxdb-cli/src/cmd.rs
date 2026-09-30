@@ -760,6 +760,21 @@ fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<Pa
         .with_context(|| format!("failed to open {} shard pool", shard_type.as_str()))
 }
 
+/// Return an existing pool without treating a missing optional pool as an
+/// error.  This matters for `-t all` when a database predates a newer pool
+/// such as `mtpl-server-info`; read-only inspection must not create it.
+fn existing_pool_dir(
+    layout: &DatabaseLayout,
+    shard_type: ShardType,
+) -> anyhow::Result<Option<PathBuf>> {
+    match layout.pool_dir_read_only(shard_type) {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to open {} shard pool", shard_type.as_str())),
+    }
+}
+
 /// The directory of a specific pool, regardless of `--shard-type`.
 fn pool_dir_for(cli: &Cli, shard_type: ShardType) -> anyhow::Result<PathBuf> {
     pool_dir(&open_layout(cli)?, shard_type)
@@ -6661,7 +6676,9 @@ fn cmd_scan_single(
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
-            let pool_dir = pool_dir(&db_layout, shard_type)?;
+            let Some(pool_dir) = existing_pool_dir(&db_layout, shard_type)? else {
+                continue;
+            };
             let Ok(pool) = ShardPool::open_read_only(pool_dir) else {
                 continue;
             };
@@ -7016,7 +7033,9 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
-            let pool_dir = pool_dir(&db_layout, shard_type)?;
+            let Some(pool_dir) = existing_pool_dir(&db_layout, shard_type)? else {
+                continue;
+            };
             let frames = cmd_scan_collection_in_pool(
                 &pool_dir,
                 collection_id,
@@ -7326,6 +7345,25 @@ fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
     if shard_type == ShardType::State && data.len() == 8 {
         let state_group = u64::from_be_bytes(data.try_into().ok()?);
         return Some(format!("PTR: 0x{state_group:016x}"));
+    }
+    if data.starts_with(b"AUX1") {
+        // Auxiliary values retain their four-byte magic and full 32-byte
+        // key digest on disk.  The scanner does not have the logical key
+        // needed to verify that digest, but it can still render the value
+        // portion instead of incorrectly calling the whole envelope opaque.
+        const AUXILIARY_VALUE_OFFSET: usize = 4 + 32;
+        if data.len() < AUXILIARY_VALUE_OFFSET {
+            return Some(format!(
+                "{} bytes (malformed AUX1 envelope)",
+                data.len()
+            ));
+        }
+        let value = &data[AUXILIARY_VALUE_OFFSET..];
+        let rendered = std::str::from_utf8(value)
+            .ok()
+            .filter(|text| text.bytes().all(|byte| !byte.is_ascii_control()))
+            .map_or_else(|| hex_bytes(value), ToOwned::to_owned);
+        return Some(format!("AUX1 value: {rendered}"));
     }
     if pretty_print_payload(data).is_some() {
         return None;

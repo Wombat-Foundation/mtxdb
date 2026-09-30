@@ -76,6 +76,25 @@ fn state_scan_decodes_big_endian_state_group_payload() {
 }
 
 #[test]
+fn scan_renders_auxiliary_envelope_value() {
+    let mut payload = b"AUX1".to_vec();
+    payload.extend_from_slice(&[0xabu8; 32]);
+    payload.extend_from_slice(b"state-group-id");
+    assert_eq!(
+        scan_payload_suffix(&payload, ShardType::State),
+        Some("AUX1 value: state-group-id".to_owned())
+    );
+}
+
+#[test]
+fn scan_reports_truncated_auxiliary_envelope() {
+    assert_eq!(
+        scan_payload_suffix(b"AUX1", ShardType::State),
+        Some("4 bytes (malformed AUX1 envelope)".to_owned())
+    );
+}
+
+#[test]
 fn canonical_collection_display_aligns_roles_and_reserves_total_column() {
     let short = "!short (event)".to_owned();
     let long = "!a-much-longer-room-id (event)".to_owned();

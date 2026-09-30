@@ -531,6 +531,7 @@ fn sub_scan() -> Command {
                 .num_args(0..=1)
                 .default_missing_value("auto")
                 .require_equals(true)
+                .value_parser(["auto", "json", "hamt", "state", "raw"])
                 .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
         )
         .arg(
