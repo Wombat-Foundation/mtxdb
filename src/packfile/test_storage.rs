@@ -9928,3 +9928,307 @@ fn scan_collection_merges_the_read_committed_overlay() {
     assert_eq!(find(overlay_only).as_deref(), Some(&b"new"[..]));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A snapshot pins one boundary across several collections: a publication
+/// that lands after capture is invisible to it, and a fresh read sees it.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_snapshot_pins_a_boundary_across_collections() {
+    let dir = test_dir("read_snapshot_pins");
+    let wal = dir.join("wal.bin");
+    let collection = [0x61u8; 16];
+    let other = [0x62u8; 16];
+    let key = distinct_id(0x01);
+    let other_key = distinct_id(0x02);
+
+    // Seed a durable shard so a read-only handle can open.
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x97u8; 16],
+        &[0x97u8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[
+            JournalMutation::Put {
+                collection_id: collection,
+                node_id: key,
+                payload: b"old".to_vec(),
+            },
+            JournalMutation::Put {
+                collection_id: other,
+                node_id: other_key,
+                payload: b"other-old".to_vec(),
+            },
+        ])
+        .unwrap();
+
+    let store = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    store.enable_read_journal(&wal).unwrap();
+
+    let snapshot = store.read_snapshot().unwrap();
+
+    // A later publication to the same key must not be observed by the pinned
+    // snapshot, even though it lands while the snapshot is held.
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: key,
+            payload: b"new".to_vec(),
+        }])
+        .unwrap();
+    drop(journal);
+
+    let read = snapshot
+        .get_many(&[(&collection, &[key]), (&other, &[other_key])])
+        .unwrap();
+    assert_eq!(read[0][0].as_ref().unwrap().bytes.as_ref(), b"old");
+    assert_eq!(read[1][0].as_ref().unwrap().bytes.as_ref(), b"other-old");
+    drop(snapshot);
+
+    // A fresh read refreshes and observes the new value.
+    let after = store.get_read_committed(&collection, &[key]).unwrap();
+    assert_eq!(after[0].as_ref().unwrap().bytes.as_ref(), b"new");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A snapshot must not resurrect records a later collection delete removes.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_snapshot_does_not_resurrect_a_later_delete() {
+    let dir = test_dir("read_snapshot_delete");
+    let wal = dir.join("wal.bin");
+    let collection = [0x63u8; 16];
+    let key = distinct_id(0x03);
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x95u8; 16],
+        &[0x95u8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: key,
+            payload: b"before".to_vec(),
+        }])
+        .unwrap();
+
+    let store = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    store.enable_read_journal(&wal).unwrap();
+
+    let snapshot = store.read_snapshot().unwrap();
+    assert_eq!(
+        snapshot.get(&collection, &[key]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"before"
+    );
+
+    // Delete the whole collection after capture: the pinned snapshot keeps its
+    // pre-delete view.
+    journal
+        .append_group(&[JournalMutation::DeleteCollection {
+            collection_id: collection,
+        }])
+        .unwrap();
+    drop(journal);
+
+    assert_eq!(
+        snapshot.get(&collection, &[key]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"before",
+        "the pinned snapshot must not observe the later delete"
+    );
+    drop(snapshot);
+
+    assert!(
+        store.get_read_committed(&collection, &[key]).unwrap()[0].is_none(),
+        "a fresh read observes the delete"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A writer restart changes the publish-signal epoch; a held snapshot must
+/// fail closed rather than serve a stale view, and a fresh snapshot must
+/// resync.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_snapshot_rejects_a_writer_restart() {
+    let dir = test_dir("read_snapshot_incarnation");
+    let wal = dir.join("wal.bin");
+    let collection = [0x64u8; 16];
+    let key = distinct_id(0x04);
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x94u8; 16],
+        &[0x94u8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer
+        .put(
+            &collection,
+            &key,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+
+    let store =
+        std::sync::Arc::new(PackfileStorage::open_read_committed(dir.clone(), &wal).unwrap());
+    let snapshot = store.read_snapshot().unwrap();
+    assert!(
+        snapshot.incarnation().is_some(),
+        "the writer's publish signal must be mapped"
+    );
+    assert!(snapshot.get(&collection, &[key]).unwrap()[0].is_some());
+
+    // Restart the writer while the snapshot is held: a fresh journal installs
+    // a new epoch, so the pinned snapshot must fail closed rather than serve a
+    // stale view.
+    drop(writer);
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer
+        .put(
+            &collection,
+            &key,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+
+    match snapshot.get(&collection, &[key]) {
+        Err(crate::storage::StorageError::WouldBlock(_)) => {}
+        other => panic!("expected WouldBlock after a writer restart, got {other:?}"),
+    }
+    drop(snapshot);
+
+    // A fresh snapshot resyncs to the new incarnation and sees the new value.
+    let fresh = store.read_snapshot().unwrap();
+    assert_eq!(
+        fresh.get(&collection, &[key]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"second"
+    );
+    drop(fresh);
+    drop(writer);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A snapshot taken on a writer handle with no read overlay reads the live
+/// index.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_snapshot_reads_the_live_index_without_an_overlay() {
+    let dir = test_dir("read_snapshot_no_overlay");
+    let collection = [0x65u8; 16];
+    let key = distinct_id(0x05);
+
+    let store = std::sync::Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+    store
+        .put(
+            &collection,
+            &key,
+            &NodeData::new(bytes::Bytes::from_static(b"live")),
+        )
+        .unwrap();
+
+    let snapshot = store.read_snapshot().unwrap();
+    assert!(snapshot.incarnation().is_none());
+    assert_eq!(
+        snapshot.get(&collection, &[key]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"live"
+    );
+    drop(snapshot);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A pinned snapshot survives reclamation of the journal groups it applied:
+/// the overlay entry is in memory, so materializing and checkpointing the
+/// group underneath it must not change what the snapshot reads.
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_snapshot_survives_reclaiming_the_group_it_applied() {
+    let dir = test_dir("read_snapshot_reclaim");
+    let wal = dir.join("wal.bin");
+    let collection = [0x66u8; 16];
+    let key = distinct_id(0x06);
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x93u8; 16],
+        &[0x93u8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer
+        .put(
+            &collection,
+            &key,
+            &NodeData::new(bytes::Bytes::from_static(b"kept")),
+        )
+        .unwrap();
+
+    let store =
+        std::sync::Arc::new(PackfileStorage::open_read_committed(dir.clone(), &wal).unwrap());
+    let snapshot = store.read_snapshot().unwrap();
+    assert_eq!(
+        snapshot.get(&collection, &[key]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"kept"
+    );
+
+    // Materialize and checkpoint the group underneath the held snapshot.
+    writer.sync_all().unwrap();
+
+    assert_eq!(
+        snapshot.get(&collection, &[key]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"kept",
+        "a pinned snapshot must survive reclamation of the groups it applied"
+    );
+    drop(snapshot);
+    drop(writer);
+    let _ = fs::remove_dir_all(&dir);
+}

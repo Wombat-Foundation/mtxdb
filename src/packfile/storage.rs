@@ -33,6 +33,7 @@ use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
 mod read_journal;
 use read_journal::ReadJournal;
+pub use read_journal::ReadSnapshot;
 
 thread_local! {
     /// Suppresses journal publication while a committed transaction applies
@@ -1933,7 +1934,11 @@ pub struct PackfileStorage {
     /// Enabled on a read-only store so a worker can observe committed-but-
     /// unflushed journal groups that the durable fingerprint gate deliberately
     /// hides. See [`Self::enable_read_journal`].
-    read_journal: parking_lot::Mutex<Option<ReadJournal>>,
+    ///
+    /// Held in an `Arc` so a [`ReadSnapshot`] can pin the overlay across
+    /// several reads with an owned [`parking_lot::ArcMutexGuard`], independent
+    /// of the store borrow.
+    read_journal: Arc<parking_lot::Mutex<Option<ReadJournal>>>,
     /// Number of in-process transactions whose published groups are still
     /// being materialized. While non-zero, ordinary reads consult the journal
     /// overlay before the live index.
@@ -2774,7 +2779,7 @@ impl PackfileStorage {
             journal_pool: std::sync::atomic::AtomicU8::new(0),
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
-            read_journal: parking_lot::Mutex::new(None),
+            read_journal: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "multi-reader")]
             parked_transaction_overlay: parking_lot::Mutex::new(None),
             #[cfg(feature = "multi-reader")]

@@ -263,6 +263,16 @@ impl ReadJournal {
         self.publish_signal.is_some()
     }
 
+    /// The writer incarnation (publish-signal epoch) this overlay was built
+    /// against, or `None` when no signal is mapped (a writer's in-process
+    /// overlay, or a worker whose sidecar was unavailable). A restart installs
+    /// a fresh epoch, so a change names a different writer incarnation.
+    pub(super) fn publish_epoch(&self) -> Option<u64> {
+        self.publish_signal
+            .as_ref()
+            .map(|signal| signal.snapshot().0)
+    }
+
     /// Create an unscanned overlay whose durable index covers LSNs through
     /// `covered`. `pool` filters shared-journal entries; `None` accepts all pools.
     pub(super) fn empty(
@@ -787,7 +797,8 @@ impl PackfileStorage {
     /// otherwise expose an empty or partially rebuilt overlay to another reader.
     pub(super) fn refresh_read_journal(
         &self,
-    ) -> Result<parking_lot::MutexGuard<'_, Option<ReadJournal>>, StorageError> {
+    ) -> Result<parking_lot::ArcMutexGuard<parking_lot::RawMutex, Option<ReadJournal>>, StorageError>
+    {
         const RELOAD_ATTEMPTS: usize = 8;
         const MAX_BACKOFF_MS: u64 = 64;
         self.read_refreshes.fetch_add(1, Ordering::Relaxed);
@@ -804,7 +815,10 @@ impl PackfileStorage {
         // retryable, even if a later attempt's reload succeeds.
         let mut reload_failed = false;
         for attempt in 0..RELOAD_ATTEMPTS {
-            let mut guard = self.read_journal.lock();
+            // `lock_arc` hands back a guard that owns a clone of the overlay
+            // mutex's `Arc`, so a caller can hold it past this borrow (a
+            // `ReadSnapshot` pins the overlay across several reads).
+            let mut guard = self.read_journal.lock_arc();
             let Some(overlay) = guard.as_mut() else {
                 return Ok(guard);
             };
@@ -1108,40 +1122,21 @@ impl PackfileStorage {
         // No overlay is installed (a writer with no transaction in flight):
         // the live index is the whole answer, so skip the per-id bookkeeping
         // below.
-        if guard.is_none() {
+        let Some(overlay) = guard.as_ref() else {
             drop(guard);
             let _fallback = FallbackReadGuard::enter();
             return Ok((self.get_many_with_refresh(collection_id, ids)?, boundary));
-        }
+        };
 
         let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
-        let mut unresolved: Vec<usize> = Vec::new();
-        {
-            if let Some(overlay) = guard.as_ref() {
-                match overlay.puts.get(collection_id) {
-                    Some(committed) => {
-                        for (index, id) in ids.iter().enumerate() {
-                            match committed.get(id) {
-                                Some((payload, _)) => {
-                                    results[index] = Some(NodeData::new(payload.clone()));
-                                }
-                                None => unresolved.push(index),
-                            }
-                        }
-                    }
-                    None => unresolved.extend(0..ids.len()),
-                }
-                // A delete the checkpoint does not yet cover means the durable
-                // index may still hold pre-delete records, so falling back for
-                // missing keys would resurrect them. Return the overlay's view
-                // (post-delete puts only) until the delete is covered.
-                if overlay.delete_lsn.contains_key(collection_id) {
-                    return Ok((results, boundary));
-                }
-            } else {
-                unresolved.extend(0..ids.len());
-            }
-        }
+        // A delete the checkpoint does not yet cover means the durable index
+        // may still hold pre-delete records, so falling back for missing keys
+        // would resurrect them. Return the overlay's view (post-delete puts
+        // only) until the delete is covered.
+        let Some(unresolved) = Self::overlay_lookup(overlay, collection_id, ids, &mut results)
+        else {
+            return Ok((results, boundary));
+        };
         drop(guard);
 
         if !unresolved.is_empty() {
@@ -1155,6 +1150,65 @@ impl PackfileStorage {
             }
         }
         Ok((results, boundary))
+    }
+
+    /// Fill `results` from `overlay`'s committed puts for `collection_id`,
+    /// returning the indices the overlay did not resolve. `None` means a
+    /// committed collection delete shadows the durable index, so the overlay's
+    /// post-delete view is final and the caller must not fall back.
+    fn overlay_lookup(
+        overlay: &ReadJournal,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+        results: &mut [Option<NodeData>],
+    ) -> Option<Vec<usize>> {
+        let mut unresolved = Vec::new();
+        match overlay.puts.get(collection_id) {
+            Some(committed) => {
+                for (index, id) in ids.iter().enumerate() {
+                    match committed.get(id) {
+                        Some((payload, _)) => results[index] = Some(NodeData::new(payload.clone())),
+                        None => unresolved.push(index),
+                    }
+                }
+            }
+            None => unresolved.extend(0..ids.len()),
+        }
+        if overlay.delete_lsn.contains_key(collection_id) {
+            None
+        } else {
+            Some(unresolved)
+        }
+    }
+
+    /// Read `collection_id` through a snapshot's already-pinned overlay. Unlike
+    /// [`Self::get_read_committed_bounded`], the caller keeps the overlay guard
+    /// held across the durable fallback, so every read in the snapshot observes
+    /// the same overlay state.
+    fn read_snapshot_collection(
+        &self,
+        overlay: Option<&ReadJournal>,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        let Some(overlay) = overlay else {
+            let _fallback = FallbackReadGuard::enter();
+            return self.get_many_with_refresh(collection_id, ids);
+        };
+        let mut results: Vec<Option<NodeData>> = vec![None; ids.len()];
+        let Some(unresolved) = Self::overlay_lookup(overlay, collection_id, ids, &mut results)
+        else {
+            return Ok(results);
+        };
+        if !unresolved.is_empty() {
+            let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();
+            let _fallback = FallbackReadGuard::enter();
+            let durable = self.get_many_with_refresh(collection_id, &durable_ids)?;
+            for (index, value) in unresolved.into_iter().zip(durable) {
+                results[index] = value;
+            }
+        }
+        Ok(results)
     }
 
     /// The highest LSN this handle's live index is known to have applied: the
@@ -1356,6 +1410,115 @@ impl PackfileStorage {
             versions.push(version);
         }
         Ok(Some(versions))
+    }
+}
+
+/// A read-only view pinned to one journal boundary, taken by
+/// [`PackfileStorage::read_snapshot`].
+///
+/// Every [`Self::get`] observes the same applied overlay, so a multi-collection
+/// read — for example a room's forward-index metadata and the generation-scoped
+/// collection that metadata names — cannot straddle a publication that lands
+/// between the reads. This replaces the meta -> FWD -> meta seqlock with one
+/// pinned boundary.
+///
+/// The pin is deliberately short-lived: it holds the overlay mutex, so another
+/// read-committed reader blocks on [`PackfileStorage::get_read_committed`] for
+/// the duration. Take it, perform the few point reads that must be mutually
+/// consistent, and drop it.
+pub struct ReadSnapshot {
+    storage: Arc<PackfileStorage>,
+    overlay: parking_lot::ArcMutexGuard<parking_lot::RawMutex, Option<ReadJournal>>,
+    boundary: u64,
+    incarnation: Option<u64>,
+}
+
+impl PackfileStorage {
+    /// Capture one read-committed boundary for a multi-read snapshot.
+    ///
+    /// # Errors
+    /// Propagates the same refresh/reload failures as
+    /// [`Self::get_read_committed`].
+    pub fn read_snapshot(self: &Arc<Self>) -> Result<ReadSnapshot, StorageError> {
+        let overlay = self.refresh_read_journal()?;
+        let boundary = match overlay.as_ref() {
+            Some(overlay) => overlay.observed_lsn.min(self.durable_read_boundary()),
+            None => self.durable_read_boundary(),
+        };
+        let incarnation = overlay.as_ref().and_then(ReadJournal::publish_epoch);
+        Ok(ReadSnapshot {
+            storage: Arc::clone(self),
+            overlay,
+            boundary,
+            incarnation,
+        })
+    }
+}
+
+impl ReadSnapshot {
+    /// The highest LSN whose groups are fully reflected in this snapshot's
+    /// reads: the same lower bound
+    /// [`PackfileStorage::get_with_collection_version`] reports, so a caller
+    /// pairing the data with a logical version can reject a token above it.
+    #[must_use]
+    pub fn boundary(&self) -> u64 {
+        self.boundary
+    }
+
+    /// The writer incarnation this snapshot was captured against, or `None`
+    /// when no publish signal is mapped. A changed value means the writer
+    /// restarted and the pinned overlay may be stale.
+    #[must_use]
+    pub fn incarnation(&self) -> Option<u64> {
+        self.incarnation
+    }
+
+    /// Fail closed if the writer restarted since the snapshot was captured.
+    /// The pinned overlay cannot observe the restart itself, so a changed
+    /// epoch must be surfaced rather than silently reading a stale view.
+    fn check_incarnation(&self) -> Result<(), StorageError> {
+        let Some(expected) = self.incarnation else {
+            return Ok(());
+        };
+        let current = self.overlay.as_ref().and_then(ReadJournal::publish_epoch);
+        if current == Some(expected) {
+            Ok(())
+        } else {
+            Err(StorageError::WouldBlock(format!(
+                "writer incarnation changed during the snapshot (was {expected}, now {current:?}); \
+                 retry the read"
+            )))
+        }
+    }
+
+    /// Read one collection at this snapshot's boundary.
+    ///
+    /// # Errors
+    /// Propagates storage errors; a fail-closed overlay gap is reported the
+    /// same way as [`PackfileStorage::get_read_committed`], and a writer
+    /// restart during the snapshot returns [`StorageError::WouldBlock`].
+    pub fn get(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        self.check_incarnation()?;
+        self.storage
+            .read_snapshot_collection(self.overlay.as_ref(), collection_id, ids)
+    }
+
+    /// Read several collections at this snapshot's boundary, in order.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub fn get_many(
+        &self,
+        reads: &[(&[u8; 16], &[NodeId])],
+    ) -> Result<Vec<Vec<Option<NodeData>>>, StorageError> {
+        reads
+            .iter()
+            .map(|(collection, ids)| self.get(collection, ids))
+            .collect()
     }
 }
 
